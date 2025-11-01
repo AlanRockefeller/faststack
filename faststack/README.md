@@ -35,7 +35,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - `J` / `Right Arrow`: Next Image
 - `K` / `Left Arrow`: Previous Image
 - `G`: Toggle Grid View
-- `S`: Add/Remove current RAW to/from selection set
+- `S`: Stack all of the selected stacks with Helicon Focus
 - `[`: Begin new stack group
 - `]`: End current stack group
 - `Space`: Toggle Flag

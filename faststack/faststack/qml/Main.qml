@@ -4,10 +4,27 @@ import QtQuick.Controls 2.15
 
 ApplicationWindow {
     id: root
-    width: 1280
-    height: 720
-    visible: true
+    width: Screen.width
+    height: Screen.height
+    visibility: Window.FullScreen
     title: "FastStack - " + (uiState && uiState.currentFilename ? uiState.currentFilename : "No folder loaded")
+
+    property color currentBackgroundColor: "#212121" // Default dark background
+    property color currentTextColor: "white" // Default light text
+
+    background: Rectangle { color: root.currentBackgroundColor }
+
+    function toggleTheme() {
+        if (root.currentBackgroundColor === "#212121") { // Currently dark
+            root.currentBackgroundColor = "white"
+            root.currentTextColor = "black"
+        } else { // Currently light
+            root.currentBackgroundColor = "#212121"
+            root.currentTextColor = "white"
+        }
+        // Update colors of specific elements if needed, e.g., footer labels
+        // For now, rely on default text colors or explicit bindings
+    }
 
     // Expose the Python UIState object to QML
     // This is set from Python via setContextProperty("uiState", ...)
@@ -23,32 +40,46 @@ ApplicationWindow {
 
     // Status bar
     footer: Rectangle {
+        id: footerRect
+        implicitHeight: footerRow.implicitHeight + 10 // Add some padding
+        anchors.left: parent.left
+        anchors.right: parent.right
+        color: "#80000000" // Semi-transparent black
+
         Row {
+            id: footerRow
             spacing: 10
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.left: parent.left
+            anchors.leftMargin: 10
             Label {
-                text: `Image: ${uiState && uiState.currentIndex !== null ? uiState.currentIndex + 1 : 'N/A'} / ${uiState && uiState.imageCount !== null ? uiState.imageCount : 'N/A'}`
+                text: `Image: ${uiState.currentIndex + 1} / ${uiState.imageCount}`
+                color: root.currentTextColor
             }
             Label {
-                text: ` | File: ${uiState && uiState.currentFilename ? uiState.currentFilename : 'N/A'}`
+                text: ` | File: ${uiState.currentFilename || 'N/A'}`
+                color: root.currentTextColor
             }
             Label {
-                text: ` | Flag: ${uiState && uiState.isFlagged ? uiState.isFlagged : 'N/A'}`
-                color: uiState && uiState.isFlagged ? "lightgreen" : "white"
+                text: ` | Flag: ${uiState.isFlagged}`
+                color: uiState.isFlagged ? "lightgreen" : root.currentTextColor
             }
             Label {
-                text: ` | Rejected: ${uiState && uiState.isRejected ? uiState.isRejected : 'N/A'}`
-                color: uiState && uiState.isRejected ? "red" : "white"
+                text: ` | Rejected: ${uiState.isRejected}`
+                color: uiState.isRejected ? "red" : root.currentTextColor
             }
             Rectangle {
-                color: uiState && uiState.stackInfoText ? "#404000" : "transparent" // Dark yellow background
+                color: uiState.stackInfoText ? "orange" : "transparent" // Brighter background
                 radius: 3
                 implicitWidth: stackInfoLabel.implicitWidth + 10
                 implicitHeight: stackInfoLabel.implicitHeight + 5
                 Label {
                     id: stackInfoLabel
                     anchors.centerIn: parent
-                    text: `Stack: ${uiState && uiState.stackInfoText ? uiState.stackInfoText : 'N/A'}`
-                    color: uiState && uiState.stackInfoText ? "yellow" : "white"
+                    text: `Stack: ${uiState.stackInfoText || 'N/A'}`
+                    color: "black" // Black text for contrast on orange
+                    font.bold: true
+                    font.pixelSize: 16
                     onTextChanged: function() { console.log("Stack info text changed:", stackInfoLabel.text) }
                 }
             }
@@ -75,9 +106,31 @@ ApplicationWindow {
             }
         }
         Menu {
+            title: "&View"
+            Action {
+                text: "Toggle Light/Dark Mode"
+                onTriggered: root.toggleTheme()
+            }
+        }
+        Menu {
+            title: "&Actions"
+            Action {
+                text: "Run Stacks"
+                onTriggered: uiState.launch_helicon()
+            }
+            Action {
+                text: "Clear Stacks"
+                onTriggered: uiState.clear_all_stacks()
+            }
+            Action {
+                text: "Show Stacks"
+                onTriggered: showStacksDialog.open()
+            }
+        }
+        Menu {
             title: "&Help"
             Action {
-                text: "&About"
+                text: "&Key Bindings"
                 onTriggered: aboutDialog.open()
             }
         }
@@ -85,11 +138,15 @@ ApplicationWindow {
 
     Dialog {
         id: aboutDialog
-        title: "About FastStack"
+        title: "Key Bindings"
         standardButtons: Dialog.Ok
         modal: true
         width: 400
-        height: 300
+        height: 400
+
+        background: Rectangle {
+            color: root.currentBackgroundColor
+        }
 
         contentItem: Text {
             text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
@@ -111,6 +168,27 @@ ApplicationWindow {
                   "&nbsp;&nbsp;Enter: Launch Helicon Focus"
             padding: 10
             wrapMode: Text.WordWrap
+            color: root.currentTextColor
+        }
+    }
+
+    Dialog {
+        id: showStacksDialog
+        title: "Stack Information"
+        standardButtons: Dialog.Ok
+        modal: true
+        width: 400
+        height: 300
+
+        background: Rectangle {
+            color: root.currentBackgroundColor
+        }
+
+        contentItem: Text {
+            text: uiState.get_stack_summary // Access property directly
+            padding: 10
+            wrapMode: Text.WordWrap
+            color: root.currentTextColor
         }
     }
 }

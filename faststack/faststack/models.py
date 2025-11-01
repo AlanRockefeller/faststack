@@ -16,6 +16,7 @@ class EntryMetadata:
     """Sidecar metadata for a single image entry."""
     flag: bool = False
     reject: bool = False
+    stack_id: Optional[int] = None
 
 
 @dataclasses.dataclass

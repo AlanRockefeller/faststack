@@ -20,7 +20,12 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
         True if the process was launched successfully, False otherwise.
     """
     helicon_exe = config.get("helicon", "exe")
-    if not Path(helicon_exe).is_file():
+    if not helicon_exe or not isinstance(helicon_exe, str):
+        log.error("Helicon Focus executable path not configured or invalid.")
+        return False, None
+
+    helicon_path = Path(helicon_exe)
+    if not helicon_path.is_file():
         log.error(f"Helicon Focus executable not found at: {helicon_exe}")
         # In a real app, this would trigger a dialog to find the exe.
         return False, None

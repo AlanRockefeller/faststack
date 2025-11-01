@@ -10,8 +10,9 @@ Item {
     // The main image display
     Image {
         id: mainImage
-        anchors.fill: parent
-        source: uiState && uiState.currentImageSource ? uiState.currentImageSource : ""
+        width: parent.width
+        height: parent.height
+        source: uiState && uiState.imageCount > 0 ? uiState.currentImageSource : ""
         fillMode: Image.PreserveAspectFit
         cache: false // We do our own caching in Python
 
@@ -49,35 +50,5 @@ Item {
         }
     }
 
-    // Overlay for metadata
-    Rectangle {
-        anchors.bottom: parent.bottom
-        anchors.left: parent.left
-        anchors.right: parent.right
-        height: 40
-        color: "#80000000" // Semi-transparent black
 
-        Row {
-            anchors.verticalCenter: parent.verticalCenter
-            anchors.left: parent.left
-            anchors.leftMargin: 10
-            spacing: 15
-
-            Text {
-                text: uiState && uiState.currentFilename ? uiState.currentFilename : ""
-                color: "white"
-                font.pixelSize: 14
-            }
-            Text {
-                text: uiState && uiState.isFlagged ? `[${uiState.isFlagged ? 'F' : ''}]` : ""
-                color: "lightgreen"
-                font.bold: true
-            }
-             Text {
-                text: uiState && uiState.isRejected ? `[${uiState.isRejected ? 'X' : ''}]` : ""
-                color: "red"
-                font.bold: true
-            }
-        }
-    }
 }

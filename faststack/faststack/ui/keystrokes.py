@@ -27,8 +27,9 @@ class Keybinder:
             Qt.Key.Key_BracketRight: self.main_window.end_current_stack,
 
             # Actions
-            Qt.Key.Key_S: self.main_window.launch_helicon,
+            Qt.Key.Key_S: self.main_window.toggle_selection,
             Qt.Key.Key_Enter: self.main_window.launch_helicon,
+            Qt.Key.Key_Return: self.main_window.launch_helicon,
 
             # Stack Management
             Qt.Key.Key_C: self.main_window.clear_all_stacks,
