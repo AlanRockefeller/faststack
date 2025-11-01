@@ -1,5 +1,8 @@
 # FastStack
 
+# Version 0.1 - October 31, 2025
+# By Alan Rockefeller
+
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW files for focus stacking.
 
 This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive prefetching, and byte-aware LRU caches to provide a fluid experience when reviewing thousands of images.
