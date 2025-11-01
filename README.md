@@ -1,1 +1,0 @@
-﻿FastStack Project Root
