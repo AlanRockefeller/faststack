@@ -11,7 +11,7 @@ Item {
     Image {
         id: mainImage
         anchors.fill: parent
-        source: uiState.currentImageSource // Bound to the UIState property
+        source: uiState && uiState.currentImageSource ? uiState.currentImageSource : ""
         fillMode: Image.PreserveAspectFit
         cache: false // We do our own caching in Python
 
@@ -64,17 +64,17 @@ Item {
             spacing: 15
 
             Text {
-                text: uiState.currentFilename
+                text: uiState && uiState.currentFilename ? uiState.currentFilename : ""
                 color: "white"
                 font.pixelSize: 14
             }
             Text {
-                text: `[${uiState.isFlagged ? 'F' : ''}]`
+                text: uiState && uiState.isFlagged ? `[${uiState.isFlagged ? 'F' : ''}]` : ""
                 color: "lightgreen"
                 font.bold: true
             }
              Text {
-                text: `[${uiState.isRejected ? 'X' : ''}]`
+                text: uiState && uiState.isRejected ? `[${uiState.isRejected ? 'X' : ''}]` : ""
                 color: "red"
                 font.bold: true
             }

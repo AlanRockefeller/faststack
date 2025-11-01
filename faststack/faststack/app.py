@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Optional, List, Dict
 
+import os
 import typer
 from PySide6.QtCore import QUrl, QTimer, QObject, QEvent
 from PySide6.QtGui import QGuiApplication
@@ -25,17 +26,18 @@ from faststack.ui.keystrokes import Keybinder
 log = logging.getLogger(__name__)
 
 class AppController(QObject):
-    def __init__(self, image_dir: Path):
+    def __init__(self, image_dir: Path, engine: QQmlApplicationEngine):
         super().__init__()
         self.image_dir = image_dir
         self.image_files: List[ImageFile] = []
         self.current_index: int = 0
         self.ui_refresh_generation = 0
         self.main_window: Optional[QObject] = None
+        self.engine = engine
 
         # -- Backend Components --
-        self.sidecar = SidecarManager(self.image_dir)
         self.watcher = Watcher(self.image_dir, self.refresh_image_list)
+        self.sidecar = SidecarManager(self.image_dir, self.watcher)
         
         # -- Caching & Prefetching --
         cache_size_bytes = config.getint('core', 'cache_bytes', int(1.5 * 1024**3))
@@ -51,8 +53,8 @@ class AppController(QObject):
         self.keybinder = Keybinder(self)
 
         # -- Stacking State --
-        self.selection_set = set()
-        self.current_stack_id = 1
+        self.stack_start_index: Optional[int] = None
+        self.stacks: List[List[int]] = []
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
@@ -64,6 +66,7 @@ class AppController(QObject):
         """Loads images, sidecar data, and starts services."""
         self.refresh_image_list()
         self.current_index = self.sidecar.data.last_index
+        self.stacks = self.sidecar.data.stacks # Load stacks from sidecar
         self.watcher.start()
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
@@ -117,13 +120,17 @@ class AppController(QObject):
     def get_current_metadata(self) -> Dict:
         if not self.image_files:
             return {}
+        
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem)
+        
+        stack_info = self._get_stack_info(self.current_index)
+
         return {
             "filename": self.image_files[self.current_index].path.name,
             "flag": meta.flag,
             "reject": meta.reject,
-            "stack_id": meta.stack_id or -1,
+            "stack_info_text": stack_info,
         }
 
     def toggle_current_flag(self):
@@ -140,43 +147,86 @@ class AppController(QObject):
         self.sidecar.save()
         self.ui_state.metadataChanged.emit()
 
-    def toggle_selection(self):
-        raw_path = self.image_files[self.current_index].raw_pair
-        if raw_path:
-            if raw_path in self.selection_set:
-                self.selection_set.remove(raw_path)
-                log.info(f"Removed {raw_path.name} from selection.")
-            else:
-                self.selection_set.add(raw_path)
-                log.info(f"Added {raw_path.name} to selection.")
-
     def begin_new_stack(self):
-        # Find the max stack ID and increment
-        max_id = 0
-        for meta in self.sidecar.data.entries.values():
-            if meta.stack_id and meta.stack_id > max_id:
-                max_id = meta.stack_id
-        self.current_stack_id = max_id + 1
-        log.info(f"Started new stack with ID: {self.current_stack_id}")
+        self.stack_start_index = self.current_index
+        log.info(f"Stack start marked at index {self.stack_start_index}")
+        self.ui_state.metadataChanged.emit() # Update UI to show start marker
 
     def end_current_stack(self):
-        # This is mostly a conceptual action in this model
-        log.info(f"Ended stack {self.current_stack_id}")
+        log.info(f"end_current_stack called. stack_start_index: {self.stack_start_index}")
+        if self.stack_start_index is not None:
+            start = min(self.stack_start_index, self.current_index)
+            end = max(self.stack_start_index, self.current_index)
+            self.stacks.append([start, end])
+            self.stacks.sort() # Keep stacks sorted by start index
+            self.sidecar.data.stacks = self.stacks
+            self.sidecar.save()
+            log.info(f"Defined new stack: [{start}, {end}]")
+            self.stack_start_index = None
+            self.ui_state.metadataChanged.emit()
+        else:
+            log.warning("No stack start marked. Press '[' first.")
 
     def launch_helicon(self):
-        if not self.selection_set:
-            log.warning("No images selected for Helicon Focus.")
+        if not self.stacks:
+            log.warning("No stacks defined to launch Helicon Focus.")
             return
-        
-        sorted_files = sorted(list(self.selection_set))
-        launch_helicon_focus(sorted_files)
+
+        all_raw_files = []
+        for i, (start, end) in enumerate(self.stacks):
+            for idx in range(start, end + 1):
+                if idx < len(self.image_files) and self.image_files[idx].raw_pair:
+                    all_raw_files.append(self.image_files[idx].raw_pair)
+            
+        if all_raw_files:
+            log.info(f"Launching Helicon Focus with {len(all_raw_files)} RAW files from all stacks.")
+            success, tmp_path = launch_helicon_focus(all_raw_files)
+            if success and tmp_path:
+                # Schedule delayed deletion of the temporary file
+                QTimer.singleShot(5000, lambda: self._delete_temp_file(tmp_path))
+        else:
+            log.warning("No valid RAW files found in any defined stack.")
+
+    def _delete_temp_file(self, tmp_path: Path):
+        if tmp_path.exists():
+            try:
+                os.remove(tmp_path)
+                log.info(f"Deleted temporary file: {tmp_path}")
+            except OSError as e:
+                log.error(f"Error deleting temporary file {tmp_path}: {e}")
+
+    def clear_all_stacks(self):
+        log.info("Clearing all defined stacks.")
+        self.stacks = []
+        self.sidecar.data.stacks = self.stacks
+        self.sidecar.save()
+        self.ui_state.metadataChanged.emit() # Refresh UI to show no stacks
 
     def shutdown(self):
         log.info("Application shutting down.")
+        # Clear QML context property to prevent TypeErrors during shutdown
+        if self.engine:
+            log.info("Clearing uiState context property in QML.")
+            self.engine.rootContext().setContextProperty("uiState", None)
+            del self.engine # Explicitly delete the engine
+
         self.watcher.stop()
         self.prefetcher.shutdown()
         self.sidecar.set_last_index(self.current_index)
         self.sidecar.save()
+
+    def _get_stack_info(self, index: int) -> str:
+        info = ""
+        for i, (start, end) in enumerate(self.stacks):
+            if start <= index <= end:
+                count_in_stack = end - start + 1
+                pos_in_stack = index - start + 1
+                info = f"Stack {i+1} ({pos_in_stack}/{count_in_stack})"
+                break
+        if not info and self.stack_start_index is not None and self.stack_start_index == index:
+            info = "Stack Start Marked"
+        log.info(f"_get_stack_info for index {index}: {info}")
+        return info
 
 def main(image_dir: Path = typer.Argument(..., help="Directory of images to view")):
     """FastStack Application Entry Point"""
@@ -192,9 +242,8 @@ def main(image_dir: Path = typer.Argument(..., help="Directory of images to view
     app.setOrganizationDomain("faststack.dev")
     app.setApplicationName("FastStack")
 
-    controller = AppController(image_dir)
-    
     engine = QQmlApplicationEngine()
+    controller = AppController(image_dir, engine)
     image_provider = ImageProvider(controller)
     engine.addImageProvider("provider", image_provider)
 

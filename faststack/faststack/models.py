@@ -16,14 +16,15 @@ class EntryMetadata:
     """Sidecar metadata for a single image entry."""
     flag: bool = False
     reject: bool = False
-    stack_id: Optional[int] = None
+
 
 @dataclasses.dataclass
 class Sidecar:
     """Represents the entire sidecar JSON file."""
-    version: int = 1
+    version: int = 2
     last_index: int = 0
     entries: Dict[str, EntryMetadata] = dataclasses.field(default_factory=dict)
+    stacks: List[List[int]] = dataclasses.field(default_factory=list)
 
 @dataclasses.dataclass
 class DecodedImage:

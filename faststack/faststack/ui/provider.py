@@ -88,9 +88,9 @@ class UIState(QObject):
     def isRejected(self):
         return self.app_controller.get_current_metadata().get("reject", False)
 
-    @Property(int, notify=metadataChanged)
-    def stackId(self):
-        return self.app_controller.get_current_metadata().get("stack_id", -1)
+    @Property(str, notify=metadataChanged)
+    def stackInfoText(self):
+        return self.app_controller.get_current_metadata().get("stack_info_text", "")
 
     # --- Slots for QML to call ---
     @Slot()

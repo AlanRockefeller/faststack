@@ -10,9 +10,18 @@ from faststack.models import Sidecar, EntryMetadata
 log = logging.getLogger(__name__)
 
 class SidecarManager:
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, watcher):
         self.path = directory / "faststack.json"
+        self.watcher = watcher
         self.data = self.load()
+
+    def stop_watcher(self):
+        if self.watcher:
+            self.watcher.stop()
+
+    def start_watcher(self):
+        if self.watcher:
+            self.watcher.start()
 
     def load(self) -> Sidecar:
         """Loads sidecar data from disk if it exists, otherwise returns a new object."""
@@ -22,15 +31,20 @@ class SidecarManager:
         try:
             with self.path.open("r") as f:
                 data = json.load(f)
+                if data.get("version") != 2:
+                    log.warning("Old sidecar format detected. Starting fresh.")
+                    return Sidecar()
+
                 # Reconstruct nested objects
                 entries = { 
                     stem: EntryMetadata(**meta) 
                     for stem, meta in data.get("entries", {}).items()
                 }
                 return Sidecar(
-                    version=data.get("version", 1),
+                    version=data.get("version", 2),
                     last_index=data.get("last_index", 0),
                     entries=entries,
+                    stacks=data.get("stacks", []),
                 )
         except (json.JSONDecodeError, TypeError) as e:
             log.error(f"Failed to load or parse sidecar file {self.path}: {e}")
@@ -40,7 +54,11 @@ class SidecarManager:
     def save(self):
         """Saves the sidecar data to disk atomically."""
         temp_path = self.path.with_suffix(".tmp")
+        was_watcher_running = False
         try:
+            if self.watcher and self.watcher.is_alive():
+                self.stop_watcher()
+                was_watcher_running = True
             with temp_path.open("w") as f:
                 # Convert to a dict that json.dump can handle
                 serializable_data = {
@@ -49,16 +67,20 @@ class SidecarManager:
                     "entries": {
                         stem: meta.__dict__
                         for stem, meta in self.data.entries.items()
-                    }
+                    },
+                    "stacks": self.data.stacks,
                 }
                 json.dump(serializable_data, f, indent=2)
             
             # Atomic rename
-            temp_path.rename(self.path)
+            temp_path.replace(self.path)
             log.debug(f"Saved sidecar file to {self.path}")
 
         except (IOError, TypeError) as e:
             log.error(f"Failed to save sidecar file {self.path}: {e}")
+        finally:
+            if was_watcher_running:
+                self.start_watcher()
 
     def get_metadata(self, image_stem: str) -> EntryMetadata:
         """Gets metadata for an image, creating it if it doesn't exist."""

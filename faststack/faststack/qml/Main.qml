@@ -7,7 +7,7 @@ ApplicationWindow {
     width: 1280
     height: 720
     visible: true
-    title: "FastStack - " + (uiState.currentFilename || "No folder loaded")
+    title: "FastStack - " + (uiState && uiState.currentFilename ? uiState.currentFilename : "No folder loaded")
 
     // Expose the Python UIState object to QML
     // This is set from Python via setContextProperty("uiState", ...)
@@ -26,21 +26,31 @@ ApplicationWindow {
         Row {
             spacing: 10
             Label {
-                text: `Image: ${uiState.currentIndex + 1} / ${uiState.imageCount}`
+                text: `Image: ${uiState && uiState.currentIndex !== null ? uiState.currentIndex + 1 : 'N/A'} / ${uiState && uiState.imageCount !== null ? uiState.imageCount : 'N/A'}`
             }
             Label {
-                text: ` | File: ${uiState.currentFilename}`
+                text: ` | File: ${uiState && uiState.currentFilename ? uiState.currentFilename : 'N/A'}`
             }
             Label {
-                text: ` | Flag: ${uiState.isFlagged}`
-                color: uiState.isFlagged ? "lightgreen" : "white"
+                text: ` | Flag: ${uiState && uiState.isFlagged ? uiState.isFlagged : 'N/A'}`
+                color: uiState && uiState.isFlagged ? "lightgreen" : "white"
             }
             Label {
-                text: ` | Rejected: ${uiState.isRejected}`
-                color: uiState.isRejected ? "red" : "white"
+                text: ` | Rejected: ${uiState && uiState.isRejected ? uiState.isRejected : 'N/A'}`
+                color: uiState && uiState.isRejected ? "red" : "white"
             }
-            Label {
-                text: ` | Stack: ${uiState.stackId !== -1 ? uiState.stackId : 'N/A'}`
+            Rectangle {
+                color: uiState && uiState.stackInfoText ? "#404000" : "transparent" // Dark yellow background
+                radius: 3
+                implicitWidth: stackInfoLabel.implicitWidth + 10
+                implicitHeight: stackInfoLabel.implicitHeight + 5
+                Label {
+                    id: stackInfoLabel
+                    anchors.centerIn: parent
+                    text: `Stack: ${uiState && uiState.stackInfoText ? uiState.stackInfoText : 'N/A'}`
+                    color: uiState && uiState.stackInfoText ? "yellow" : "white"
+                    onTextChanged: function() { console.log("Stack info text changed:", stackInfoLabel.text) }
+                }
             }
         }
     }
@@ -95,7 +105,8 @@ ApplicationWindow {
                   "&nbsp;&nbsp;X: Toggle Reject<br>" +
                   "&nbsp;&nbsp;S: Add to selection for Helicon<br>" +
                   "&nbsp;&nbsp;[: Begin new stack<br>" +
-                  "&nbsp;&nbsp;]: End current stack<br><br>" +
+                  "&nbsp;&nbsp;]: End current stack<br>" +
+                  "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
                   "<b>Actions:</b><br>" +
                   "&nbsp;&nbsp;Enter: Launch Helicon Focus"
             padding: 10
