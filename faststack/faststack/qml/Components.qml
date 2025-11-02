@@ -10,8 +10,7 @@ Item {
     // The main image display
     Image {
         id: mainImage
-        width: parent.width
-        height: parent.height
+        anchors.fill: parent
         source: uiState && uiState.imageCount > 0 ? uiState.currentImageSource : ""
         fillMode: Image.PreserveAspectFit
         cache: false // We do our own caching in Python

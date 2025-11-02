@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faststack"
-version = "0.2"
+version = "0.3"
 authors = [
     { name="Alan Rockefeller", email="alanrockefeller@gmail.com" },
 ]
-description = "Ultra-fast JPG Viewer for RAW Stacking Selection"
+description = "Ultra-fast JPG Viewer for Focus Stacking Selection"
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = [

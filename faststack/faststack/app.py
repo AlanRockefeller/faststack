@@ -4,12 +4,13 @@ import logging
 import sys
 from pathlib import Path
 from typing import Optional, List, Dict
+from datetime import date
 
 import os
 import typer
 import concurrent.futures
 from PySide6.QtCore import QUrl, QTimer, QObject, QEvent
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import QApplication, QFileDialog
 from PySide6.QtQml import QQmlApplicationEngine
 
 from faststack.config import config
@@ -41,7 +42,8 @@ class AppController(QObject):
         self.sidecar = SidecarManager(self.image_dir, self.watcher)
         
         # -- Caching & Prefetching --
-        cache_size_bytes = config.getint('core', 'cache_bytes', int(1.5 * 1024**3))
+        cache_size_gb = config.getfloat('core', 'cache_size_gb', 1.5)
+        cache_size_bytes = int(cache_size_gb * 1024**3)
         self.image_cache = ByteLRUCache(max_bytes=cache_size_bytes, size_of=get_decoded_image_size)
         self.prefetcher = Prefetcher(
             image_files=self.image_files,
@@ -76,6 +78,9 @@ class AppController(QObject):
         self.watcher.start()
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
+
+        theme = config.get('core', 'theme')
+        self.main_window.setProperty('isDarkTheme', theme == 'dark')
 
     def refresh_image_list(self):
         """Rescans the directory for images."""
@@ -153,6 +158,8 @@ class AppController(QObject):
             "flag": meta.flag,
             "reject": meta.reject,
             "stack_info_text": stack_info,
+            "stacked": meta.stacked,
+            "stacked_date": meta.stacked_date,
         }
 
     def toggle_current_flag(self):
@@ -216,7 +223,7 @@ class AppController(QObject):
             raw_files_to_process.extend(sorted(list(self.selected_raws))) # Sort for consistent order
         elif self.stacks:
             log.info("No selection, launching Helicon with all defined stacks.")
-            for i, (start, end) in enumerate(self.stacks):
+            for start, end in self.stacks:
                 for idx in range(start, end + 1):
                     if idx < len(self.image_files) and self.image_files[idx].raw_pair:
                         raw_files_to_process.append(self.image_files[idx].raw_pair)
@@ -232,10 +239,23 @@ class AppController(QObject):
             if success and tmp_path:
                 # Schedule delayed deletion of the temporary file
                 QTimer.singleShot(5000, lambda: self._delete_temp_file(tmp_path))
-            
-            # Clear selection after launching
-            self.selected_raws.clear()
-            self.sync_ui_state()
+
+                # Record stacking metadata
+                today = date.today().isoformat()
+                for raw_path in unique_raw_files:
+                    # Find the corresponding image file to get the stem
+                    for img_file in self.image_files:
+                        if img_file.raw_pair == raw_path:
+                            stem = img_file.path.stem
+                            meta = self.sidecar.get_metadata(stem)
+                            meta.stacked = True
+                            meta.stacked_date = today
+                            break
+                self.sidecar.save()
+                
+                # Clear selection after launching
+                self.selected_raws.clear()
+                self.sync_ui_state()
         else:
             log.warning("No valid RAW files found to launch Helicon.")
 
@@ -254,12 +274,65 @@ class AppController(QObject):
         self.sidecar.save()
         self.ui_state.metadataChanged.emit() # Refresh UI to show no stacks
 
+    def get_helicon_path(self):
+        return config.get('helicon', 'exe')
+
+    def set_helicon_path(self, path):
+        config.set('helicon', 'exe', path)
+        config.save()
+
+    def open_file_dialog(self):
+        dialog = QFileDialog()
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilter("Executables (*.exe)")
+        if dialog.exec():
+            return dialog.selectedFiles()[0]
+        return ""
+
+    def check_path_exists(self, path):
+        return os.path.exists(path)
+
+    def get_cache_size(self):
+        return config.getfloat('core', 'cache_size_gb')
+
+    def set_cache_size(self, size):
+        config.set('core', 'cache_size_gb', size)
+        config.save()
+
+    def get_prefetch_radius(self):
+        return config.getint('core', 'prefetch_radius')
+
+    def set_prefetch_radius(self, radius):
+        config.set('core', 'prefetch_radius', radius)
+        config.save()
+
+    def get_theme(self):
+        return 0 if config.get('core', 'theme') == 'dark' else 1
+
+    def set_theme(self, theme_index):
+        theme = 'dark' if theme_index == 0 else 'light'
+        config.set('core', 'theme', theme)
+        config.save()
+
+    def get_default_directory(self):
+        return config.get('core', 'default_directory')
+
+    def set_default_directory(self, path):
+        config.set('core', 'default_directory', path)
+        config.save()
+
+    def open_directory_dialog(self):
+        dialog = QFileDialog()
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        if dialog.exec():
+            return dialog.selectedFiles()[0]
+        return ""
+
     def shutdown(self):
         log.info("Application shutting down.")
         # Clear QML context property to prevent TypeErrors during shutdown
         if self.engine:
             log.info("Clearing uiState context property in QML.")
-            self.engine.rootContext().setContextProperty("uiState", None)
             del self.engine # Explicitly delete the engine
 
         self.watcher.stop()
@@ -280,16 +353,24 @@ class AppController(QObject):
         log.info(f"_get_stack_info for index {index}: {info}")
         return info
 
-def main(image_dir: Path = typer.Argument(..., help="Directory of images to view")):
+def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of images to view")):
     """FastStack Application Entry Point"""
     setup_logging()
     log.info("Starting FastStack")
+
+    if image_dir is None:
+        image_dir_str = config.get('core', 'default_directory')
+        if not image_dir_str:
+            log.error("No image directory provided and no default directory set in the settings.")
+            # In a real app, we might open a dialog here to ask for a directory.
+            sys.exit(1)
+        image_dir = Path(image_dir_str)
 
     if not image_dir.is_dir():
         log.error(f"Image directory not found: {image_dir}")
         sys.exit(1)
 
-    app = QGuiApplication(sys.argv)
+    app = QApplication(sys.argv)
     app.setOrganizationName("FastStack")
     app.setOrganizationDomain("faststack.dev")
     app.setApplicationName("FastStack")

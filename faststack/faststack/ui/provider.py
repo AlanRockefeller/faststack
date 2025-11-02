@@ -88,6 +88,14 @@ class UIState(QObject):
     def isRejected(self):
         return self.app_controller.get_current_metadata().get("reject", False)
 
+    @Property(bool, notify=metadataChanged)
+    def isStacked(self):
+        return self.app_controller.get_current_metadata().get("stacked", False)
+
+    @Property(str, notify=metadataChanged)
+    def stackedDate(self):
+        return self.app_controller.get_current_metadata().get("stacked_date", "")
+
     @Property(str, notify=metadataChanged)
     def stackInfoText(self):
         return self.app_controller.get_current_metadata().get("stack_info_text", "")
@@ -123,3 +131,55 @@ class UIState(QObject):
     @Slot()
     def clear_all_stacks(self):
         self.app_controller.clear_all_stacks()
+
+    @Slot(result=str)
+    def get_helicon_path(self):
+        return self.app_controller.get_helicon_path()
+
+    @Slot(str)
+    def set_helicon_path(self, path):
+        self.app_controller.set_helicon_path(path)
+
+    @Slot(result=str)
+    def open_file_dialog(self):
+        return self.app_controller.open_file_dialog()
+
+    @Slot(str, result=bool)
+    def check_path_exists(self, path):
+        return self.app_controller.check_path_exists(path)
+
+    @Slot(result=float)
+    def get_cache_size(self):
+        return self.app_controller.get_cache_size()
+
+    @Slot(float)
+    def set_cache_size(self, size):
+        self.app_controller.set_cache_size(size)
+
+    @Slot(result=int)
+    def get_prefetch_radius(self):
+        return self.app_controller.get_prefetch_radius()
+
+    @Slot(int)
+    def set_prefetch_radius(self, radius):
+        self.app_controller.set_prefetch_radius(radius)
+
+    @Slot(result=int)
+    def get_theme(self):
+        return self.app_controller.get_theme()
+
+    @Slot(int)
+    def set_theme(self, theme_index):
+        self.app_controller.set_theme(theme_index)
+
+    @Slot(result=str)
+    def get_default_directory(self):
+        return self.app_controller.get_default_directory()
+
+    @Slot(str)
+    def set_default_directory(self, path):
+        self.app_controller.set_default_directory(path)
+
+    @Slot(result=str)
+    def open_directory_dialog(self):
+        return self.app_controller.open_directory_dialog()

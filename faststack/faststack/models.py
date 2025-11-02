@@ -17,6 +17,8 @@ class EntryMetadata:
     flag: bool = False
     reject: bool = False
     stack_id: Optional[int] = None
+    stacked: bool = False
+    stacked_date: Optional[str] = None
 
 
 @dataclasses.dataclass
