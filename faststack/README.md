@@ -1,6 +1,6 @@
 # FastStack
 
-# Version 0.1 - October 31, 2025
+# Version 0.2 - November 1, 2025
 # By Alan Rockefeller
 
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW files for focus stacking.
@@ -35,7 +35,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - `J` / `Right Arrow`: Next Image
 - `K` / `Left Arrow`: Previous Image
 - `G`: Toggle Grid View
-- `S`: Stack all of the selected stacks with Helicon Focus
+- `S`: Toggle selection of current image for stacking
 - `[`: Begin new stack group
 - `]`: End current stack group
 - `Space`: Toggle Flag

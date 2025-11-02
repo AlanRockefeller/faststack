@@ -9,21 +9,14 @@ ApplicationWindow {
     visibility: Window.FullScreen
     title: "FastStack - " + (uiState && uiState.currentFilename ? uiState.currentFilename : "No folder loaded")
 
-    property color currentBackgroundColor: "#212121" // Default dark background
-    property color currentTextColor: "white" // Default light text
+    property bool isDarkTheme: true
+    property color currentBackgroundColor: isDarkTheme ? "#212121" : "white"
+    property color currentTextColor: isDarkTheme ? "white" : "black"
 
     background: Rectangle { color: root.currentBackgroundColor }
 
     function toggleTheme() {
-        if (root.currentBackgroundColor === "#212121") { // Currently dark
-            root.currentBackgroundColor = "white"
-            root.currentTextColor = "black"
-        } else { // Currently light
-            root.currentBackgroundColor = "#212121"
-            root.currentTextColor = "white"
-        }
-        // Update colors of specific elements if needed, e.g., footer labels
-        // For now, rely on default text colors or explicit bindings
+        isDarkTheme = !isDarkTheme
     }
 
     // Expose the Python UIState object to QML
@@ -67,6 +60,11 @@ ApplicationWindow {
             Label {
                 text: ` | Rejected: ${uiState.isRejected}`
                 color: uiState.isRejected ? "red" : root.currentTextColor
+            }
+            Label {
+                text: ` | Stacked: ${uiState.stackedDate}`
+                color: "lightgreen"
+                visible: uiState.isStacked
             }
             Rectangle {
                 color: uiState.stackInfoText ? "orange" : "transparent" // Brighter background

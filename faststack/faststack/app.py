@@ -4,6 +4,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Optional, List, Dict
+from datetime import date
 
 import os
 import typer
@@ -153,6 +154,8 @@ class AppController(QObject):
             "flag": meta.flag,
             "reject": meta.reject,
             "stack_info_text": stack_info,
+            "stacked": meta.stacked,
+            "stacked_date": meta.stacked_date,
         }
 
     def toggle_current_flag(self):
@@ -216,7 +219,7 @@ class AppController(QObject):
             raw_files_to_process.extend(sorted(list(self.selected_raws))) # Sort for consistent order
         elif self.stacks:
             log.info("No selection, launching Helicon with all defined stacks.")
-            for i, (start, end) in enumerate(self.stacks):
+            for start, end in self.stacks:
                 for idx in range(start, end + 1):
                     if idx < len(self.image_files) and self.image_files[idx].raw_pair:
                         raw_files_to_process.append(self.image_files[idx].raw_pair)
@@ -232,10 +235,23 @@ class AppController(QObject):
             if success and tmp_path:
                 # Schedule delayed deletion of the temporary file
                 QTimer.singleShot(5000, lambda: self._delete_temp_file(tmp_path))
-            
-            # Clear selection after launching
-            self.selected_raws.clear()
-            self.sync_ui_state()
+
+                # Record stacking metadata
+                today = date.today().isoformat()
+                for raw_path in unique_raw_files:
+                    # Find the corresponding image file to get the stem
+                    for img_file in self.image_files:
+                        if img_file.raw_pair == raw_path:
+                            stem = img_file.path.stem
+                            meta = self.sidecar.get_metadata(stem)
+                            meta.stacked = True
+                            meta.stacked_date = today
+                            break
+                self.sidecar.save()
+                
+                # Clear selection after launching
+                self.selected_raws.clear()
+                self.sync_ui_state()
         else:
             log.warning("No valid RAW files found to launch Helicon.")
 

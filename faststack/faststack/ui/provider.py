@@ -88,6 +88,14 @@ class UIState(QObject):
     def isRejected(self):
         return self.app_controller.get_current_metadata().get("reject", False)
 
+    @Property(bool, notify=metadataChanged)
+    def isStacked(self):
+        return self.app_controller.get_current_metadata().get("stacked", False)
+
+    @Property(str, notify=metadataChanged)
+    def stackedDate(self):
+        return self.app_controller.get_current_metadata().get("stacked_date", "")
+
     @Property(str, notify=metadataChanged)
     def stackInfoText(self):
         return self.app_controller.get_current_metadata().get("stack_info_text", "")
