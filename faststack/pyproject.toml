@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faststack"
-version = "0.1.0"
+version = "0.2"
 authors = [
-    { name="Gemini", email="gemini@google.com" },
+    { name="Alan Rockefeller", email="alanrockefeller@gmail.com" },
 ]
 description = "Ultra-fast JPG Viewer for RAW Stacking Selection"
 readme = "README.md"

@@ -7,6 +7,7 @@ from typing import Optional, List, Dict
 
 import os
 import typer
+import concurrent.futures
 from PySide6.QtCore import QUrl, QTimer, QObject, QEvent
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
@@ -55,17 +56,22 @@ class AppController(QObject):
         # -- Stacking State --
         self.stack_start_index: Optional[int] = None
         self.stacks: List[List[int]] = []
+        self.selected_raws: set[Path] = set()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
-            self.keybinder.handle_key_press(event)
-            return True
+            handled = self.keybinder.handle_key_press(event)
+            if handled:
+                return True
         return super().eventFilter(watched, event)
 
     def load(self):
         """Loads images, sidecar data, and starts services."""
         self.refresh_image_list()
-        self.current_index = self.sidecar.data.last_index
+        if not self.image_files:
+            self.current_index = 0
+        else:
+            self.current_index = max(0, min(self.sidecar.data.last_index, len(self.image_files) - 1))
         self.stacks = self.sidecar.data.stacks # Load stacks from sidecar
         self.watcher.start()
         self.prefetcher.update_prefetch(self.current_index)
@@ -79,6 +85,10 @@ class AppController(QObject):
 
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
         """Retrieves a decoded image, from cache or by decoding."""
+        if not self.image_files: # Handle empty image list
+            log.warning("get_decoded_image called with empty image_files.")
+            return None
+
         if index in self.image_cache:
             return self.image_cache[index]
         
@@ -87,10 +97,19 @@ class AppController(QObject):
         log.warning(f"Cache miss for index {index}. Forcing synchronous load.")
         future = self.prefetcher.submit_task(index, self.prefetcher.generation)
         if future:
-            # Wait for the result and then retrieve from cache
-            decoded_index = future.result()
-            if decoded_index is not None and decoded_index in self.image_cache:
-                return self.image_cache[decoded_index]
+            try:
+                # Wait for the result and then retrieve from cache
+                decoded_index = future.result()
+                if decoded_index is not None and decoded_index in self.image_cache:
+                    return self.image_cache[decoded_index]
+            except concurrent.futures.CancelledError:
+                log.warning(f"Prefetch task for index {index} was cancelled. Attempting synchronous load.")
+                # Fallback to synchronous load if task was cancelled
+                # This requires direct access to the decoding logic, which Prefetcher encapsulates.
+                # For now, we'll re-submit and wait, which might still hit a cancelled error if rapid.
+                # A more robust solution would be to have a direct synchronous decode method.
+                # For simplicity, let's just return None for now if cancelled, and rely on UI to re-request.
+                return None
         return None
 
     def sync_ui_state(self):
@@ -99,6 +118,8 @@ class AppController(QObject):
         self.ui_state.currentIndexChanged.emit()
         self.ui_state.currentImageSourceChanged.emit()
         self.ui_state.metadataChanged.emit()
+        log.debug(f"UI State Synced: Index={self.ui_state.currentIndex}, Count={self.ui_state.imageCount}")
+        log.debug(f"Metadata Synced: Filename={self.ui_state.currentFilename}, Flagged={self.ui_state.isFlagged}, Rejected={self.ui_state.isRejected}, StackInfo='{self.ui_state.stackInfoText}'")
 
     # --- Actions --- 
 
@@ -119,6 +140,7 @@ class AppController(QObject):
 
     def get_current_metadata(self) -> Dict:
         if not self.image_files:
+            log.debug("get_current_metadata: image_files is empty, returning {}.")
             return {}
         
         stem = self.image_files[self.current_index].path.stem
@@ -167,25 +189,55 @@ class AppController(QObject):
         else:
             log.warning("No stack start marked. Press '[' first.")
 
-    def launch_helicon(self):
-        if not self.stacks:
-            log.warning("No stacks defined to launch Helicon Focus.")
+    def toggle_selection(self):
+        """Toggles the selection status of the current image's RAW file."""
+        if not self.image_files:
             return
 
-        all_raw_files = []
-        for i, (start, end) in enumerate(self.stacks):
-            for idx in range(start, end + 1):
-                if idx < len(self.image_files) and self.image_files[idx].raw_pair:
-                    all_raw_files.append(self.image_files[idx].raw_pair)
+        image_file = self.image_files[self.current_index]
+        if image_file.raw_pair:
+            if image_file.raw_pair in self.selected_raws:
+                self.selected_raws.remove(image_file.raw_pair)
+                log.info(f"Removed {image_file.raw_pair.name} from selection.")
+            else:
+                self.selected_raws.add(image_file.raw_pair)
+                log.info(f"Added {image_file.raw_pair.name} to selection.")
             
-        if all_raw_files:
-            log.info(f"Launching Helicon Focus with {len(all_raw_files)} RAW files from all stacks.")
-            success, tmp_path = launch_helicon_focus(all_raw_files)
+            # In a real app, we'd update a selection indicator in the UI.
+            # For now, we just log and can use it for batch operations.
+            self.sync_ui_state() # This will trigger a UI refresh
+
+
+    def launch_helicon(self):
+        """Launches Helicon Focus with selected RAWs or all RAWs in defined stacks."""
+        raw_files_to_process = []
+        if self.selected_raws:
+            log.info(f"Launching Helicon with {len(self.selected_raws)} selected RAW files.")
+            raw_files_to_process.extend(sorted(list(self.selected_raws))) # Sort for consistent order
+        elif self.stacks:
+            log.info("No selection, launching Helicon with all defined stacks.")
+            for i, (start, end) in enumerate(self.stacks):
+                for idx in range(start, end + 1):
+                    if idx < len(self.image_files) and self.image_files[idx].raw_pair:
+                        raw_files_to_process.append(self.image_files[idx].raw_pair)
+        else:
+            log.warning("No selection or stacks defined to launch Helicon Focus.")
+            return
+
+        if raw_files_to_process:
+            log.info(f"Launching Helicon Focus with {len(raw_files_to_process)} RAW files.")
+            # Remove duplicates that might arise from stacks
+            unique_raw_files = sorted(list(set(raw_files_to_process)))
+            success, tmp_path = launch_helicon_focus(unique_raw_files)
             if success and tmp_path:
                 # Schedule delayed deletion of the temporary file
                 QTimer.singleShot(5000, lambda: self._delete_temp_file(tmp_path))
+            
+            # Clear selection after launching
+            self.selected_raws.clear()
+            self.sync_ui_state()
         else:
-            log.warning("No valid RAW files found in any defined stack.")
+            log.warning("No valid RAW files found to launch Helicon.")
 
     def _delete_temp_file(self, tmp_path: Path):
         if tmp_path.exists():

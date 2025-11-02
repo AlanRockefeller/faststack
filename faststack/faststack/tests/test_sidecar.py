@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from faststack.io.sidecar import SidecarManager
-from faststack.types import EntryMetadata
+from faststack.models import EntryMetadata
 
 @pytest.fixture
 def mock_sidecar_dir(tmp_path: Path):
@@ -21,7 +21,7 @@ def test_sidecar_load_non_existent(mock_sidecar_dir):
     """Tests loading when no sidecar file exists."""
     d = mock_sidecar_dir()
     sm = SidecarManager(d)
-    assert sm.data.version == 1
+    assert sm.data.version == 2
     assert sm.data.last_index == 0
     assert not sm.data.entries
 

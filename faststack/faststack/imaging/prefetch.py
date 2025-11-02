@@ -23,8 +23,9 @@ class Prefetcher:
         self.generation = 0
 
     def set_image_files(self, image_files: List[ImageFile]):
-        self.image_files = image_files
-        self.cancel_all()
+        if self.image_files != image_files:
+            self.image_files = image_files
+            self.cancel_all()
 
     def update_prefetch(self, current_index: int):
         """Updates the prefetching queue based on the current image index."""
@@ -61,8 +62,10 @@ class Prefetcher:
 
     def _decode_and_cache(self, image_file: ImageFile, index: int, generation: int) -> Optional[int]:
         """The actual work done by the thread pool."""
-        if generation != self.generation:
-            log.debug(f"Skipping stale task for index {index} (gen {generation} != {self.generation})")
+        local_generation = self.generation # Capture current generation for this worker
+
+        if generation != local_generation:
+            log.debug(f"Skipping stale task for index {index} (gen {generation} != {local_generation})")
             return None
 
         try:
@@ -71,6 +74,11 @@ class Prefetcher:
             
             buffer = decode_jpeg_rgb(jpeg_bytes)
             if buffer is not None:
+                # Re-check generation before caching to prevent race conditions
+                if self.generation != local_generation:
+                    log.debug(f"Generation changed for index {index} before caching. Skipping cache_put.")
+                    return None
+
                 h, w, _ = buffer.shape
                 # In a real Qt app, we would create the QImage here in the main thread
                 # For now, we'll just store the raw buffer data.

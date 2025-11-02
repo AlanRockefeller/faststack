@@ -92,6 +92,17 @@ class UIState(QObject):
     def stackInfoText(self):
         return self.app_controller.get_current_metadata().get("stack_info_text", "")
 
+    @Property(str, notify=metadataChanged)
+    def get_stack_summary(self):
+        if not self.app_controller.stacks:
+            return "No stacks defined."
+
+        summary = f"Found {len(self.app_controller.stacks)} stacks:\n\n"
+        for i, (start, end) in enumerate(self.app_controller.stacks):
+            count = end - start + 1
+            summary += f"Stack {i+1}: {count} photos (indices {start}-{end})\n"
+        return summary
+
     # --- Slots for QML to call ---
     @Slot()
     def nextImage(self):
@@ -104,3 +115,11 @@ class UIState(QObject):
     @Slot()
     def toggleFlag(self):
         self.app_controller.toggle_current_flag()
+
+    @Slot()
+    def launch_helicon(self):
+        self.app_controller.launch_helicon()
+
+    @Slot()
+    def clear_all_stacks(self):
+        self.app_controller.clear_all_stacks()
