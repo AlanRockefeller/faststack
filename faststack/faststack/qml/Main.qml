@@ -1,16 +1,19 @@
 import QtQuick
 import QtQuick.Window
 import QtQuick.Controls 2.15
+import QtQuick.Layouts 1.15
+import "."
 
 ApplicationWindow {
     id: root
     width: Screen.width
     height: Screen.height
-    visibility: Window.FullScreen
-    title: "FastStack - " + (uiState && uiState.currentFilename ? uiState.currentFilename : "No folder loaded")
+    visibility: Window.Maximized
+    flags: Qt.FramelessWindowHint
+    title: "FastStack"
 
     property bool isDarkTheme: true
-    property color currentBackgroundColor: isDarkTheme ? "#212121" : "white"
+    property color currentBackgroundColor: isDarkTheme ? "#000000" : "white"
     property color currentTextColor: isDarkTheme ? "white" : "black"
 
     background: Rectangle { color: root.currentBackgroundColor }
@@ -26,6 +29,7 @@ ApplicationWindow {
     Loader {
         id: mainViewLoader
         anchors.fill: parent
+        anchors.topMargin: titleBar.height
         source: "Components.qml"
     }
 
@@ -39,13 +43,11 @@ ApplicationWindow {
         anchors.right: parent.right
         color: "#80000000" // Semi-transparent black
 
-        Row {
+        RowLayout {
             id: footerRow
             spacing: 10
-            anchors.verticalCenter: parent.verticalCenter
-            anchors.left: parent.left
-            anchors.leftMargin: 10
             Label {
+                Layout.leftMargin: 10
                 text: `Image: ${uiState.currentIndex + 1} / ${uiState.imageCount}`
                 color: root.currentTextColor
             }
@@ -67,6 +69,7 @@ ApplicationWindow {
                 visible: uiState.isStacked
             }
             Rectangle {
+                Layout.fillWidth: true
                 color: uiState.stackInfoText ? "orange" : "transparent" // Brighter background
                 radius: 3
                 implicitWidth: stackInfoLabel.implicitWidth + 10
@@ -78,60 +81,158 @@ ApplicationWindow {
                     color: "black" // Black text for contrast on orange
                     font.bold: true
                     font.pixelSize: 16
-                    onTextChanged: function() { console.log("Stack info text changed:", stackInfoLabel.text) }
                 }
             }
         }
     }
 
-    // Menu Bar
-    menuBar: MenuBar {
-        Menu {
-            title: "&File"
-            Action {
-                text: "&Open Folder..."
-                onTriggered: {
-                    // This would trigger a file dialog in Python
-                }
-            }
-            Action {
-                text: "&Settings..."
-            }
+    header: Rectangle {
+        id: titleBar
+        height: 30
+        color: root.currentBackgroundColor
 
-            Action {
-                text: "&Exit"
-                onTriggered: Qt.quit()
+        MouseArea {
+            anchors.fill: parent
+            property point lastMousePos: Qt.point(0, 0)
+            onPressed: function(mouse) {
+                lastMousePos = Qt.point(mouse.x, mouse.y)
+            }
+            onPositionChanged: function(mouse) {
+                var delta = Qt.point(mouse.x - lastMousePos.x, mouse.y - lastMousePos.y)
+                root.x += delta.x
+                root.y += delta.y
             }
         }
-        Menu {
-            title: "&View"
-            Action {
-                text: "Toggle Light/Dark Mode"
-                onTriggered: root.toggleTheme()
-            }
-        }
-        Menu {
-            title: "&Actions"
-            Action {
-                text: "Run Stacks"
-                onTriggered: uiState.launch_helicon()
-            }
-            Action {
-                text: "Clear Stacks"
-                onTriggered: uiState.clear_all_stacks()
-            }
-            Action {
-                text: "Show Stacks"
-                onTriggered: showStacksDialog.open()
-            }
-        }
-        Menu {
-            title: "&Help"
-            Action {
-                text: "&Key Bindings"
-                onTriggered: aboutDialog.open()
-            }
-        }
+
+                RowLayout {
+
+                    id: menuAndControls
+
+                    anchors.fill: parent
+
+        
+
+                    MenuBar {
+
+                        id: menuBar
+
+                        Layout.preferredWidth: 300 // Give it some width
+
+        
+
+                        palette.buttonText: root.currentTextColor
+
+                        palette.button: root.currentBackgroundColor
+
+                        palette.window: root.currentBackgroundColor
+
+                        palette.text: root.currentTextColor
+
+        
+
+                        Menu {
+
+                            title: "&File"
+
+                            Action { text: "&Open Folder..." }
+
+                            Action {
+
+                                text: "&Settings..."
+
+                                onTriggered: {
+
+                                    settingsDialog.heliconPath = uiState.get_helicon_path()
+
+                                    settingsDialog.cacheSize = uiState.get_cache_size()
+
+                                    settingsDialog.prefetchRadius = uiState.get_prefetch_radius()
+
+                                    settingsDialog.theme = uiState.get_theme()
+
+                                    settingsDialog.defaultDirectory = uiState.get_default_directory()
+
+                                    settingsDialog.open()
+
+                                }
+
+                            }
+
+                            Action { text: "&Exit"; onTriggered: Qt.quit() }
+
+                        }
+
+                        Menu {
+
+                            title: "&View"
+
+                            Action { text: "Toggle Light/Dark Mode"; onTriggered: root.toggleTheme() }
+
+                        }
+
+                        Menu {
+
+                            title: "&Actions"
+
+                            Action { text: "Run Stacks"; onTriggered: uiState.launch_helicon() }
+
+                            Action { text: "Clear Stacks"; onTriggered: uiState.clear_all_stacks() }
+
+                            Action { text: "Show Stacks"; onTriggered: showStacksDialog.open() }
+
+                        }
+
+                        Menu {
+
+                            title: "&Help"
+
+                            Action { text: "&Key Bindings"; onTriggered: aboutDialog.open() }
+
+                        }
+
+                    }
+
+        
+
+                    Item { Layout.fillWidth: true } // Spacer
+
+        
+
+                    Row {
+
+                        // Removed anchors
+
+                        spacing: 10
+
+        
+
+                        Button {
+
+                            text: "-"
+
+                            onClicked: root.showMinimized()
+
+                        }
+
+                        Button {
+
+                            text: "[]"
+
+                            onClicked: root.visibility === Window.Maximized ? root.showNormal() : root.showMaximized()
+
+                        }
+
+                        Button {
+
+                            text: "X"
+
+                            onClicked: Qt.quit()
+
+                        }
+
+                    }
+
+                }
     }
 
     Dialog {
@@ -188,5 +289,9 @@ ApplicationWindow {
             wrapMode: Text.WordWrap
             color: root.currentTextColor
         }
+    }
+
+    SettingsDialog {
+        id: settingsDialog
     }
 }

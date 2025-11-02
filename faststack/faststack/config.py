@@ -10,8 +10,10 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "core": {
-        "cache_bytes": str(int(1.5 * 1024**3)), # 1.5 GB
+        "cache_size_gb": "1.5",
         "prefetch_radius": "4",
+        "theme": "dark",
+        "default_directory": "",
     },
     "helicon": {
         "exe": "C:\\Program Files\\Helicon Software\\Helicon Focus 8\\HeliconFocus.exe",

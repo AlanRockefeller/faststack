@@ -1,5 +1,15 @@
 # ChangeLog
 
+## Version 0.3
+
+### New Features
+- Implemented a "Settings" dialog with the following configurable options:
+  - Helicon Focus executable path (with validation).
+  - Image cache size (in GB).
+  - Image prefetch radius.
+  - Application theme (Dark/Light).
+  - Default image directory.
+
 ## Version 0.2
 
 ### New Features
@@ -14,7 +24,6 @@
   - The footer in `Main.qml` displays "Stacked: [date]" for previously stacked images.
 
 ### Changes
-- The "About" menu item has been changed to "Key Bindings" and now displays the application's key bindings.
 - Pressing the 'Enter' key will now launch Helicon Focus with the selected RAW files. If no files are selected, it will launch with all defined stacks.
 - Refactored the theme toggling logic in `Main.qml` to use a boolean `isDarkTheme` property for more robustness.
 
@@ -28,3 +37,7 @@
 - Fixed a `TypeError` in tests caused by a missing `stack_id` field in the `EntryMetadata` model.
 - Resolved a QML issue where `anchors.fill` conflicted with manual positioning, preventing panning and zooming.
 - Corrected the `launch_helicon` method to only clear the `selected_raws` set if Helicon Focus is launched successfully.
+- Resolved `TypeError` and `Invalid property assignment` errors in QML related to settings dialog initialization and property bindings.
+- Fixed QML warnings related to invalid anchor usage in `Main.qml`.
+- Fixed missing minimize, maximize, and close buttons by correctly configuring the custom title bar.
+- Resolved QML warnings about `mouse` parameter not being declared in `MouseArea` signal handlers.
