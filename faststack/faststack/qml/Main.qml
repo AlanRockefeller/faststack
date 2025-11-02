@@ -12,14 +12,21 @@ ApplicationWindow {
     flags: Qt.FramelessWindowHint
     title: "FastStack"
 
-    property bool isDarkTheme: true
+    property bool isDarkTheme: uiState.get_theme() === 0
     property color currentBackgroundColor: isDarkTheme ? "#000000" : "white"
     property color currentTextColor: isDarkTheme ? "white" : "black"
 
     background: Rectangle { color: root.currentBackgroundColor }
 
     function toggleTheme() {
-        isDarkTheme = !isDarkTheme
+        uiState.set_theme(isDarkTheme ? 1 : 0) // 0 for dark, 1 for light
+    }
+
+    Connections {
+        target: uiState
+        function onThemeChanged() {
+            root.isDarkTheme = uiState.get_theme() === 0
+        }
     }
 
     // Expose the Python UIState object to QML

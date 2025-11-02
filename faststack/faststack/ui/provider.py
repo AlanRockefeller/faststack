@@ -56,6 +56,7 @@ class UIState(QObject):
     imageCountChanged = Signal()
     currentImageSourceChanged = Signal()
     metadataChanged = Signal()
+    themeChanged = Signal()
 
     def __init__(self, app_controller):
         super().__init__()

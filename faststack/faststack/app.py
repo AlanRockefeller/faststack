@@ -313,6 +313,7 @@ class AppController(QObject):
         theme = 'dark' if theme_index == 0 else 'light'
         config.set('core', 'theme', theme)
         config.save()
+        self.ui_state.themeChanged.emit()
 
     def get_default_directory(self):
         return config.get('core', 'default_directory')
@@ -361,9 +362,13 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
     if image_dir is None:
         image_dir_str = config.get('core', 'default_directory')
         if not image_dir_str:
-            log.error("No image directory provided and no default directory set in the settings.")
-            # In a real app, we might open a dialog here to ask for a directory.
-            sys.exit(1)
+            log.warning("No image directory provided and no default directory set. Opening directory selection dialog.")
+            from PySide6.QtWidgets import QFileDialog
+            selected_dir = QFileDialog.getExistingDirectory(None, "Select Image Directory")
+            if not selected_dir:
+                log.error("No image directory selected. Exiting.")
+                sys.exit(1)
+            image_dir_str = selected_dir
         image_dir = Path(image_dir_str)
 
     if not image_dir.is_dir():
