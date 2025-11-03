@@ -6,15 +6,16 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from typing import List, Dict, Optional, Callable
 
 from faststack.models import ImageFile, DecodedImage
-from faststack.imaging.jpeg import decode_jpeg_rgb
+from faststack.imaging.jpeg import decode_jpeg_rgb, decode_jpeg_resized
 
 log = logging.getLogger(__name__)
 
 class Prefetcher:
-    def __init__(self, image_files: List[ImageFile], cache_put: Callable, prefetch_radius: int):
+    def __init__(self, image_files: List[ImageFile], cache_put: Callable, prefetch_radius: int, get_display_info: Callable):
         self.image_files = image_files
         self.cache_put = cache_put
         self.prefetch_radius = prefetch_radius
+        self.get_display_info = get_display_info
         self.executor = ThreadPoolExecutor(
             max_workers=min(4, os.cpu_count() or 1),
             thread_name_prefix="Prefetcher"
@@ -55,12 +56,14 @@ class Prefetcher:
             return self.futures[index] # Already submitted
 
         image_file = self.image_files[index]
-        future = self.executor.submit(self._decode_and_cache, image_file, index, generation)
+        display_width, display_height, display_generation = self.get_display_info()
+
+        future = self.executor.submit(self._decode_and_cache, image_file, index, generation, display_width, display_height, display_generation)
         self.futures[index] = future
         log.debug(f"Submitted prefetch task for index {index}")
         return future
 
-    def _decode_and_cache(self, image_file: ImageFile, index: int, generation: int) -> Optional[int]:
+    def _decode_and_cache(self, image_file: ImageFile, index: int, generation: int, display_width: int, display_height: int, display_generation: int) -> Optional[tuple[int, int]]:
         """The actual work done by the thread pool."""
         local_generation = self.generation # Capture current generation for this worker
 
@@ -72,7 +75,7 @@ class Prefetcher:
             with open(image_file.path, "rb") as f:
                 jpeg_bytes = f.read()
             
-            buffer = decode_jpeg_rgb(jpeg_bytes)
+            buffer = decode_jpeg_resized(jpeg_bytes, display_width, display_height)
             if buffer is not None:
                 # Re-check generation before caching to prevent race conditions
                 if self.generation != local_generation:
@@ -89,9 +92,10 @@ class Prefetcher:
                     bytes_per_line=w * 3,
                     format=None # Placeholder for QImage.Format.Format_RGB888
                 )
-                self.cache_put(index, decoded_image)
-                log.debug(f"Successfully decoded and cached image at index {index}")
-                return index
+                cache_key = f"{index}_{display_generation}"
+                self.cache_put(cache_key, decoded_image)
+                log.debug(f"Successfully decoded and cached image at index {index} for display gen {display_generation}")
+                return index, display_generation
         except Exception as e:
             log.error(f"Error decoding image {image_file.path} at index {index}: {e}")
         

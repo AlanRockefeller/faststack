@@ -1,5 +1,16 @@
 # ChangeLog
 
+## Version 0.4
+
+### New Features
+- **Two-tier caching system:** Implemented a two-tier caching system to prefetch display-sized images, significantly improving performance and reducing GPU memory usage.
+- **"Preload All Images" feature:** Added a new menu option under "Actions" to preload all images in the current directory into the cache, ensuring quick access even for unviewed images.
+- **Progress bar for preloading:** Introduced a visual progress bar in the footer to display the status of the "Preload All Images" operation.
+
+### Changes
+- **Theming improvements:** Adjusted the Material theme to ensure the menubar background is black in dark mode, providing a more consistent user experience.
+- **Window behavior:** Changed the application window to a borderless fullscreen mode, allowing for normal Alt-Tab behavior and better integration with the operating system.
+
 ## Version 0.3
 
 ### New Features

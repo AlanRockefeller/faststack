@@ -15,6 +15,24 @@ Item {
         fillMode: Image.PreserveAspectFit
         cache: false // We do our own caching in Python
 
+        Component.onCompleted: {
+            if (width > 0 && height > 0) {
+                uiState.onDisplaySizeChanged(width, height)
+            }
+        }
+
+        onWidthChanged: {
+            if (width > 0 && height > 0) {
+                uiState.onDisplaySizeChanged(width, height)
+            }
+        }
+
+        onHeightChanged: {
+            if (width > 0 && height > 0) {
+                uiState.onDisplaySizeChanged(width, height)
+            }
+        }
+
         // Zoom and Pan logic would go here
         // For example, using PinchArea or MouseArea
         MouseArea {
