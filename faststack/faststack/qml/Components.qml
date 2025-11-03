@@ -33,7 +33,7 @@ Item {
             }
         }
 
-        onScaleChanged: {
+        function updateZoomState() {
             if (scaleTransform.xScale > 1.1 && !uiState.isZoomed) {
                 uiState.setZoomed(true);
             } else if (scaleTransform.xScale <= 1.0 && uiState.isZoomed) {
@@ -46,6 +46,8 @@ Item {
                 id: scaleTransform
                 origin.x: mainImage.width / 2
                 origin.y: mainImage.height / 2
+                onXScaleChanged: mainImage.updateZoomState()
+                onYScaleChanged: mainImage.updateZoomState()
             },
             Translate {
                 id: panTransform
