@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Window
 import QtQuick.Controls 2.15
+import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import "."
 
@@ -8,9 +9,13 @@ ApplicationWindow {
     id: root
     width: Screen.width
     height: Screen.height
-    visibility: Window.Maximized
+    x: 0
+    y: 0
+    visibility: Window.Windowed
     flags: Qt.FramelessWindowHint
     title: "FastStack"
+
+    Material.theme: isDarkTheme ? Material.Dark : Material.Light
 
     property bool isDarkTheme: uiState.get_theme() === 0
     property color currentBackgroundColor: isDarkTheme ? "#000000" : "white"
@@ -76,6 +81,20 @@ ApplicationWindow {
                 visible: uiState.isStacked
             }
             Rectangle {
+                visible: uiState.isPreloading
+                Layout.preferredWidth: 200
+                height: 10 // give it some height
+                color: "gray"
+                border.color: "red"
+                border.width: 1
+
+                Rectangle {
+                    color: "lightblue"
+                    width: parent.width * (uiState.preloadProgress / 100)
+                    height: parent.height
+                }
+            }
+            Rectangle {
                 Layout.fillWidth: true
                 color: uiState.stackInfoText ? "orange" : "transparent" // Brighter background
                 radius: 3
@@ -119,21 +138,63 @@ ApplicationWindow {
 
         
 
-                    MenuBar {
-
-                        id: menuBar
-
-                        Layout.preferredWidth: 300 // Give it some width
+                                        MenuBar {
 
         
 
-                        palette.buttonText: root.currentTextColor
+                    
 
-                        palette.button: root.currentBackgroundColor
+        
 
-                        palette.window: root.currentBackgroundColor
+                                            id: menuBar
 
-                        palette.text: root.currentTextColor
+        
+
+                    
+
+        
+
+                                            Layout.preferredWidth: 300 // Give it some width
+
+        
+
+                    
+
+        
+
+                                            background: Rectangle {
+
+        
+
+                                                color: root.currentBackgroundColor
+
+        
+
+                                            }
+
+        
+
+                    
+
+        
+
+                                            palette.buttonText: root.currentTextColor
+
+        
+
+                                            palette.button: root.currentBackgroundColor
+
+        
+
+                                            palette.window: root.currentBackgroundColor
+
+        
+
+                                            palette.text: root.currentTextColor
+
+        
+
+                    
 
         
 
@@ -186,6 +247,8 @@ ApplicationWindow {
                             Action { text: "Clear Stacks"; onTriggered: uiState.clear_all_stacks() }
 
                             Action { text: "Show Stacks"; onTriggered: showStacksDialog.open() }
+
+                            Action { text: "Preload All Images"; onTriggered: uiState.preloadAllImages() }
 
                         }
 

@@ -72,3 +72,22 @@ def _get_turbojpeg_scaling_factor(width: int, height: int, max_dim: int) -> Opti
         if (width * n / 8) <= max_dim and (height * n / 8) <= max_dim:
             return (n, 8)
     return None # Should not happen if max_dim is reasonable
+
+
+def decode_jpeg_resized(
+    jpeg_bytes: bytes, width: int, height: int
+) -> Optional[np.ndarray]:
+    """Decodes and resizes a JPEG to fit within the given dimensions."""
+    if width == 0 or height == 0:
+        # Fallback to full decode if size is not specified
+        return decode_jpeg_rgb(jpeg_bytes)
+
+    try:
+        from io import BytesIO
+
+        img = Image.open(BytesIO(jpeg_bytes))
+        img.thumbnail((width, height), Image.Resampling.LANCZOS)  # High quality downsampling
+        return np.array(img.convert("RGB"))
+    except Exception as e:
+        log.error(f"Pillow failed to decode and resize image: {e}")
+        return None

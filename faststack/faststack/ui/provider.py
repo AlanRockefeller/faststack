@@ -57,10 +57,34 @@ class UIState(QObject):
     currentImageSourceChanged = Signal()
     metadataChanged = Signal()
     themeChanged = Signal()
+    preloadingStateChanged = Signal()
+    preloadProgressChanged = Signal()
 
     def __init__(self, app_controller):
         super().__init__()
         self.app_controller = app_controller
+        self._is_preloading = False
+        self._preload_progress = 0
+
+    @Property(bool, notify=preloadingStateChanged)
+    def isPreloading(self):
+        return self._is_preloading
+
+    @isPreloading.setter
+    def isPreloading(self, value):
+        if self._is_preloading != value:
+            self._is_preloading = value
+            self.preloadingStateChanged.emit()
+
+    @Property(int, notify=preloadProgressChanged)
+    def preloadProgress(self):
+        return self._preload_progress
+
+    @preloadProgress.setter
+    def preloadProgress(self, value):
+        if self._preload_progress != value:
+            self._preload_progress = value
+            self.preloadProgressChanged.emit()
 
     @Property(int, notify=currentIndexChanged)
     def currentIndex(self):
@@ -184,3 +208,11 @@ class UIState(QObject):
     @Slot(result=str)
     def open_directory_dialog(self):
         return self.app_controller.open_directory_dialog()
+
+    @Slot()
+    def preloadAllImages(self):
+        self.app_controller.preload_all_images()
+
+    @Slot(int, int)
+    def onDisplaySizeChanged(self, width: int, height: int):
+        self.app_controller.on_display_size_changed(width, height)

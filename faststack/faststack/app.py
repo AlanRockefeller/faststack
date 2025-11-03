@@ -9,7 +9,7 @@ from datetime import date
 import os
 import typer
 import concurrent.futures
-from PySide6.QtCore import QUrl, QTimer, QObject, QEvent
+from PySide6.QtCore import QUrl, QTimer, QObject, QEvent, Signal
 from PySide6.QtWidgets import QApplication, QFileDialog
 from PySide6.QtQml import QQmlApplicationEngine
 
@@ -25,9 +25,15 @@ from faststack.imaging.prefetch import Prefetcher
 from faststack.ui.provider import ImageProvider, UIState
 from faststack.ui.keystrokes import Keybinder
 
+import threading
+
 log = logging.getLogger(__name__)
 
 class AppController(QObject):
+    class ProgressReporter(QObject):
+        progress_updated = Signal(int)
+        finished = Signal()
+
     def __init__(self, image_dir: Path, engine: QQmlApplicationEngine):
         super().__init__()
         self.image_dir = image_dir
@@ -36,6 +42,10 @@ class AppController(QObject):
         self.ui_refresh_generation = 0
         self.main_window: Optional[QObject] = None
         self.engine = engine
+
+        self.display_width = 0
+        self.display_height = 0
+        self.display_generation = 0
 
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self.refresh_image_list)
@@ -48,8 +58,10 @@ class AppController(QObject):
         self.prefetcher = Prefetcher(
             image_files=self.image_files,
             cache_put=self.image_cache.__setitem__,
-            prefetch_radius=config.getint('core', 'prefetch_radius', 4)
+            prefetch_radius=config.getint('core', 'prefetch_radius', 4),
+            get_display_info=self.get_display_info
         )
+        self.preload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="PreloadAll")
 
         # -- UI State --
         self.ui_state = UIState(self)
@@ -59,6 +71,24 @@ class AppController(QObject):
         self.stack_start_index: Optional[int] = None
         self.stacks: List[List[int]] = []
         self.selected_raws: set[Path] = set()
+
+    def get_display_info(self):
+        return self.display_width, self.display_height, self.display_generation
+
+    def get_display_info(self):
+        return self.display_width, self.display_height, self.display_generation
+
+    def on_display_size_changed(self, width: int, height: int):
+        if self.display_width == width and self.display_height == height:
+            return # No change
+
+        log.info(f"Display size changed to: {width}x{height}")
+        self.display_width = width
+        self.display_height = height
+        self.display_generation += 1
+        self.image_cache.clear()
+        self.prefetcher.update_prefetch(self.current_index)
+        self.sync_ui_state() # To refresh the image
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
@@ -92,26 +122,27 @@ class AppController(QObject):
             log.warning("get_decoded_image called with empty image_files.")
             return None
 
-        if index in self.image_cache:
-            return self.image_cache[index]
+        _, _, display_gen = self.get_display_info()
+        cache_key = f"{index}_{display_gen}"
+
+        if cache_key in self.image_cache:
+            return self.image_cache[cache_key]
         
         # If not in cache, this was likely a cache miss. 
         # The prefetcher should have it, but we can do a blocking load if needed.
-        log.warning(f"Cache miss for index {index}. Forcing synchronous load.")
+        log.warning(f"Cache miss for index {index} (gen: {display_gen}). Forcing synchronous load.")
         future = self.prefetcher.submit_task(index, self.prefetcher.generation)
         if future:
             try:
                 # Wait for the result and then retrieve from cache
-                decoded_index = future.result()
-                if decoded_index is not None and decoded_index in self.image_cache:
-                    return self.image_cache[decoded_index]
+                result = future.result()
+                if result:
+                    decoded_index, decoded_display_gen = result
+                    cache_key = f"{decoded_index}_{decoded_display_gen}"
+                    if cache_key in self.image_cache:
+                        return self.image_cache[cache_key]
             except concurrent.futures.CancelledError:
                 log.warning(f"Prefetch task for index {index} was cancelled. Attempting synchronous load.")
-                # Fallback to synchronous load if task was cancelled
-                # This requires direct access to the decoding logic, which Prefetcher encapsulates.
-                # For now, we'll re-submit and wait, which might still hit a cancelled error if rapid.
-                # A more robust solution would be to have a direct synchronous decode method.
-                # For simplicity, let's just return None for now if cancelled, and rely on UI to re-request.
                 return None
         return None
 
@@ -327,6 +358,61 @@ class AppController(QObject):
             return dialog.selectedFiles()[0]
         return ""
 
+    def preload_all_images(self):
+        if self.ui_state.isPreloading:
+            log.info("Preloading is already in progress.")
+            return
+
+        log.info("Starting to preload all images.")
+        self.ui_state.isPreloading = True
+        self.ui_state.preloadProgress = 0
+
+        self.reporter = self.ProgressReporter()
+        self.reporter.progress_updated.connect(self._update_preload_progress)
+        self.reporter.finished.connect(self._finish_preloading)
+
+        def _preload_and_report_progress():
+            log.info(f"Preloading images.")
+            
+            futures = []
+            for i in range(len(self.image_files)):
+                future = self.prefetcher.submit_task(i, self.prefetcher.generation)
+                if future:
+                    futures.append(future)
+            
+            num_futures = len(futures)
+            if num_futures == 0:
+                self.reporter.finished.emit()
+                return
+
+            log.info(f"Submitted {num_futures} preloading tasks.")
+            completed_count = 0
+            lock = threading.Lock()
+
+            def _on_future_done(future):
+                nonlocal completed_count
+                with lock:
+                    completed_count += 1
+                    progress = int((completed_count / num_futures) * 100)
+                    self.reporter.progress_updated.emit(progress)
+
+                if completed_count == num_futures:
+                    self.reporter.finished.emit()
+
+            for future in futures:
+                future.add_done_callback(_on_future_done)
+
+        self.preload_executor.submit(_preload_and_report_progress)
+
+    def _update_preload_progress(self, progress: int):
+        log.debug(f"Updating preload progress in UI: {progress}%")
+        self.ui_state.preloadProgress = progress
+
+    def _finish_preloading(self):
+        self.ui_state.isPreloading = False
+        self.ui_state.preloadProgress = 0
+        log.info("Finished preloading all images.")
+
     def shutdown(self):
         log.info("Application shutting down.")
         # Clear QML context property to prevent TypeErrors during shutdown
@@ -336,6 +422,7 @@ class AppController(QObject):
 
         self.watcher.stop()
         self.prefetcher.shutdown()
+        self.preload_executor.shutdown(wait=False)
         self.sidecar.set_last_index(self.current_index)
         self.sidecar.save()
 
@@ -356,6 +443,8 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
     """FastStack Application Entry Point"""
     setup_logging()
     log.info("Starting FastStack")
+
+    os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
 
     app = QApplication(sys.argv) # Moved here
 

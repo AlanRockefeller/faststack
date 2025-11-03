@@ -27,9 +27,10 @@ def setup_logging():
     handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG)
     root_logger.addHandler(handler)
 
     # Configure logging for key modules
     logging.getLogger("faststack.imaging.cache").setLevel(logging.DEBUG)
     logging.getLogger("faststack.imaging.prefetch").setLevel(logging.DEBUG)
+    logging.getLogger("PIL").setLevel(logging.INFO)
