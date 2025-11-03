@@ -7,12 +7,12 @@ import "."
 
 ApplicationWindow {
     id: root
-    width: Screen.width
-    height: Screen.height
-    x: 0
-    y: 0
-    visibility: Window.Windowed
-    flags: Qt.FramelessWindowHint
+    visible: true
+    width: 1200
+    height: 800
+    minimumWidth: 800
+    minimumHeight: 500
+    flags: Qt.FramelessWindowHint | Qt.Window
     title: "FastStack"
 
     Material.theme: isDarkTheme ? Material.Dark : Material.Light
