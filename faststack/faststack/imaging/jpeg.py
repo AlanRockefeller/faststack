@@ -51,7 +51,17 @@ def decode_jpeg_thumb_rgb(
             # Find the best scaling factor
             scaling_factor = _get_turbojpeg_scaling_factor(width, height, max_dim)
             
-            return jpeg_decoder.decode(jpeg_bytes, scaling_factor=scaling_factor, pixel_format=TJPF_RGB, flags=TJFLAG_FASTDCT)
+            decoded = jpeg_decoder.decode(
+                jpeg_bytes,
+                scaling_factor=scaling_factor,
+                pixel_format=TJPF_RGB,
+                flags=TJFLAG_FASTDCT,
+            )
+            if decoded.shape[0] > max_dim or decoded.shape[1] > max_dim:
+                img = Image.fromarray(decoded)
+                img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+                return np.array(img)
+            return decoded
         except Exception as e:
             log.exception(f"PyTurboJPEG failed to decode thumbnail: {e}. Trying Pillow.")
 

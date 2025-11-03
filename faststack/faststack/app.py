@@ -72,21 +72,38 @@ class AppController(QObject):
         self.stacks: List[List[int]] = []
         self.selected_raws: set[Path] = set()
 
+        self._metadata_cache = {}
+        self._metadata_cache_index = -1
+
+        self.resize_timer = QTimer()
+        self.resize_timer.setSingleShot(True)
+        self.resize_timer.timeout.connect(self._handle_resize)
+        self.pending_width = None
+        self.pending_height = None
+
     def get_display_info(self):
         if self.is_zoomed:
             return 0, 0, self.display_generation
         return self.display_width, self.display_height, self.display_generation
 
     def on_display_size_changed(self, width: int, height: int):
+        """Debounces display size change events to prevent spamming resizes."""
         if self.display_width == width and self.display_height == height:
-            return # No change
+            return
+        
+        # Debounce resize events
+        self.pending_width = width
+        self.pending_height = height
+        self.resize_timer.start(150)  # 150ms debounce
 
-        log.info(f"Display size changed to: {width}x{height}")
-        self.display_width = width
-        self.display_height = height
+    def _handle_resize(self):
+        """Actual resize handler, called after debounce period."""
+        log.info(f"Display size changed to: {self.pending_width}x{self.pending_height}")
+        self.display_width = self.pending_width
+        self.display_height = self.pending_height
         self.display_generation += 1
         self.image_cache.clear()
-        self.prefetcher.cancel_all() # Clear existing prefetch tasks
+        self.prefetcher.cancel_all()
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state() # To refresh the image
 
@@ -119,6 +136,8 @@ class AppController(QObject):
         self.stacks = self.sidecar.data.stacks # Load stacks from sidecar
         self.watcher.start()
         self.prefetcher.update_prefetch(self.current_index)
+        
+        # Defer initial UI sync until after images are loaded
         self.sync_ui_state()
 
 
@@ -126,6 +145,7 @@ class AppController(QObject):
         """Rescans the directory for images."""
         self.image_files = find_images(self.image_dir)
         self.prefetcher.set_image_files(self.image_files)
+        self._metadata_cache_index = (-1, -1) # Invalidate cache
         self.ui_state.imageCountChanged.emit()
 
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
@@ -161,6 +181,7 @@ class AppController(QObject):
     def sync_ui_state(self):
         """Forces the UI to update by emitting all state change signals."""
         self.ui_refresh_generation += 1
+        self._metadata_cache_index = (-1, -1)  # Invalidate cache
         self.ui_state.currentIndexChanged.emit()
         self.ui_state.currentImageSourceChanged.emit()
         self.ui_state.metadataChanged.emit()
@@ -189,25 +210,33 @@ class AppController(QObject):
             log.debug("get_current_metadata: image_files is empty, returning {}.")
             return {}
         
+        # Cache hit check
+        cache_key = (self.current_index, self.ui_refresh_generation)
+        if cache_key == self._metadata_cache_index:
+            return self._metadata_cache
+        
+        # Compute and cache
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem)
-        
         stack_info = self._get_stack_info(self.current_index)
-
-        return {
+        
+        self._metadata_cache = {
             "filename": self.image_files[self.current_index].path.name,
             "flag": meta.flag,
             "reject": meta.reject,
-            "stack_info_text": stack_info,
             "stacked": meta.stacked,
-            "stacked_date": meta.stacked_date,
+            "stacked_date": meta.stacked_date or "",
+            "stack_info_text": stack_info
         }
+        self._metadata_cache_index = cache_key
+        return self._metadata_cache
 
     def toggle_current_flag(self):
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem)
         meta.flag = not meta.flag
         self.sidecar.save()
+        self._metadata_cache_index = (-1, -1) # Invalidate cache
         self.ui_state.metadataChanged.emit()
 
     def toggle_current_reject(self):
@@ -215,11 +244,13 @@ class AppController(QObject):
         meta = self.sidecar.get_metadata(stem)
         meta.reject = not meta.reject
         self.sidecar.save()
+        self._metadata_cache_index = (-1, -1) # Invalidate cache
         self.ui_state.metadataChanged.emit()
 
     def begin_new_stack(self):
         self.stack_start_index = self.current_index
         log.info(f"Stack start marked at index {self.stack_start_index}")
+        self._metadata_cache_index = (-1, -1) # Invalidate cache
         self.ui_state.metadataChanged.emit() # Update UI to show start marker
 
     def end_current_stack(self):
@@ -233,6 +264,7 @@ class AppController(QObject):
             self.sidecar.save()
             log.info(f"Defined new stack: [{start}, {end}]")
             self.stack_start_index = None
+            self._metadata_cache_index = (-1, -1) # Invalidate cache
             self.ui_state.metadataChanged.emit()
         else:
             log.warning("No stack start marked. Press '[' first.")
@@ -305,6 +337,7 @@ class AppController(QObject):
                         meta.stacked_date = today
                         break
             self.sidecar.save()
+            self._metadata_cache_index = (-1, -1) # Invalidate cache
 
     def _delete_temp_file(self, tmp_path: Path):
         if tmp_path.exists():
@@ -319,6 +352,7 @@ class AppController(QObject):
         self.stacks = []
         self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
+        self._metadata_cache_index = (-1, -1) # Invalidate cache
         self.ui_state.metadataChanged.emit() # Refresh UI to show no stacks
 
     def get_helicon_path(self):
@@ -352,6 +386,8 @@ class AppController(QObject):
     def set_prefetch_radius(self, radius):
         config.set('core', 'prefetch_radius', radius)
         config.save()
+        self.prefetcher.prefetch_radius = radius
+        self.prefetcher.update_prefetch(self.current_index)
 
     def get_theme(self):
         return 0 if config.get('core', 'theme') == 'dark' else 1
@@ -391,9 +427,16 @@ class AppController(QObject):
 
         # Use existing prefetch executor (better resource utilization)
         total = len(self.image_files)
+        
+        if total == 0:
+            log.info("No images to preload.")
+            self.reporter.progress_updated.emit(100) # Or 0, depending on desired UX
+            self.reporter.finished.emit()
+            return
+
         completed = 0
         
-        def _on_done(future):
+        def _on_done(_future):
             nonlocal completed
             completed += 1
             progress = int((completed / total) * 100)
