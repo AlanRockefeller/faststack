@@ -15,12 +15,28 @@ class ImageDirectoryEventHandler(FileSystemEventHandler):
         super().__init__()
         self.callback = callback
 
-    def on_any_event(self, event):
-        # Ignore temporary files created during atomic saves and the sidecar file itself
+    def on_created(self, event):
         if event.src_path.endswith(".tmp") or event.src_path.endswith("faststack.json"):
             return
-        log.info(f"Detected filesystem change: {event}. Triggering refresh.")
+        log.info(f"Detected file creation: {event}. Triggering refresh.")
         self.callback()
+
+    def on_deleted(self, event):
+        if event.src_path.endswith(".tmp") or event.src_path.endswith("faststack.json"):
+            return
+        log.info(f"Detected file deletion: {event}. Triggering refresh.")
+        self.callback()
+
+    def on_moved(self, event):
+        if event.src_path.endswith(".tmp") or event.src_path.endswith("faststack.json"):
+            return
+        log.info(f"Detected file move: {event}. Triggering refresh.")
+        self.callback()
+
+    def on_modified(self, event):
+        # This is a no-op to prevent spurious refreshes from file modifications
+        # that don't change the content (e.g., antivirus scans).
+        pass
 
 class Watcher:
     """Manages the filesystem observer."""

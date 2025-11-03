@@ -46,6 +46,7 @@ class AppController(QObject):
         self.display_width = 0
         self.display_height = 0
         self.display_generation = 0
+        self.is_zoomed = False
 
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self.refresh_image_list)
@@ -61,7 +62,6 @@ class AppController(QObject):
             prefetch_radius=config.getint('core', 'prefetch_radius', 4),
             get_display_info=self.get_display_info
         )
-        self.preload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="PreloadAll")
 
         # -- UI State --
         self.ui_state = UIState(self)
@@ -73,9 +73,8 @@ class AppController(QObject):
         self.selected_raws: set[Path] = set()
 
     def get_display_info(self):
-        return self.display_width, self.display_height, self.display_generation
-
-    def get_display_info(self):
+        if self.is_zoomed:
+            return 0, 0, self.display_generation
         return self.display_width, self.display_height, self.display_generation
 
     def on_display_size_changed(self, width: int, height: int):
@@ -87,8 +86,21 @@ class AppController(QObject):
         self.display_height = height
         self.display_generation += 1
         self.image_cache.clear()
+        self.prefetcher.cancel_all() # Clear existing prefetch tasks
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state() # To refresh the image
+
+    def set_zoomed(self, zoomed: bool):
+        if self.is_zoomed == zoomed:
+            return
+        self.is_zoomed = zoomed
+        log.info(f"Zoom state changed to: {zoomed}")
+        self.display_generation += 1 # Invalidate cache
+        self.image_cache.clear()
+        self.prefetcher.cancel_all()
+        self.prefetcher.update_prefetch(self.current_index)
+        self.sync_ui_state()
+        self.ui_state.isZoomedChanged.emit()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
@@ -246,47 +258,53 @@ class AppController(QObject):
 
     def launch_helicon(self):
         """Launches Helicon Focus with selected RAWs or all RAWs in defined stacks."""
-        raw_files_to_process = []
         if self.selected_raws:
             log.info(f"Launching Helicon with {len(self.selected_raws)} selected RAW files.")
-            raw_files_to_process.extend(sorted(list(self.selected_raws))) # Sort for consistent order
+            self._launch_helicon_with_files(sorted(list(self.selected_raws)))
+            self.selected_raws.clear()
+
         elif self.stacks:
-            log.info("No selection, launching Helicon with all defined stacks.")
+            log.info(f"Launching Helicon for {len(self.stacks)} defined stacks.")
             for start, end in self.stacks:
+                raw_files_to_process = []
                 for idx in range(start, end + 1):
                     if idx < len(self.image_files) and self.image_files[idx].raw_pair:
                         raw_files_to_process.append(self.image_files[idx].raw_pair)
+                
+                if raw_files_to_process:
+                    self._launch_helicon_with_files(raw_files_to_process)
+                else:
+                    log.warning(f"No valid RAW files found for stack [{start}, {end}].")
+            
+            self.clear_all_stacks()
+
         else:
             log.warning("No selection or stacks defined to launch Helicon Focus.")
             return
 
-        if raw_files_to_process:
-            log.info(f"Launching Helicon Focus with {len(raw_files_to_process)} RAW files.")
-            # Remove duplicates that might arise from stacks
-            unique_raw_files = sorted(list(set(raw_files_to_process)))
-            success, tmp_path = launch_helicon_focus(unique_raw_files)
-            if success and tmp_path:
-                # Schedule delayed deletion of the temporary file
-                QTimer.singleShot(5000, lambda: self._delete_temp_file(tmp_path))
+        self.sync_ui_state()
 
-                # Record stacking metadata
-                today = date.today().isoformat()
-                for raw_path in unique_raw_files:
-                    # Find the corresponding image file to get the stem
-                    for img_file in self.image_files:
-                        if img_file.raw_pair == raw_path:
-                            stem = img_file.path.stem
-                            meta = self.sidecar.get_metadata(stem)
-                            meta.stacked = True
-                            meta.stacked_date = today
-                            break
-                self.sidecar.save()
-                
-                # Clear selection after launching
-                self.selected_raws.clear()
-                self.sync_ui_state()
-        else:
-            log.warning("No valid RAW files found to launch Helicon.")
+    def _launch_helicon_with_files(self, raw_files: List[Path]):
+        """Helper to launch Helicon with a specific list of files."""
+        log.info(f"Launching Helicon Focus with {len(raw_files)} RAW files.")
+        unique_raw_files = sorted(list(set(raw_files)))
+        success, tmp_path = launch_helicon_focus(unique_raw_files)
+        if success and tmp_path:
+            # Schedule delayed deletion of the temporary file
+            QTimer.singleShot(5000, lambda: self._delete_temp_file(tmp_path))
+
+            # Record stacking metadata
+            today = date.today().isoformat()
+            for raw_path in unique_raw_files:
+                # Find the corresponding image file to get the stem
+                for img_file in self.image_files:
+                    if img_file.raw_pair == raw_path:
+                        stem = img_file.path.stem
+                        meta = self.sidecar.get_metadata(stem)
+                        meta.stacked = True
+                        meta.stacked_date = today
+                        break
+            self.sidecar.save()
 
     def _delete_temp_file(self, tmp_path: Path):
         if tmp_path.exists():
@@ -371,38 +389,22 @@ class AppController(QObject):
         self.reporter.progress_updated.connect(self._update_preload_progress)
         self.reporter.finished.connect(self._finish_preloading)
 
-        def _preload_and_report_progress():
-            log.info(f"Preloading images.")
-            
-            futures = []
-            for i in range(len(self.image_files)):
-                future = self.prefetcher.submit_task(i, self.prefetcher.generation)
-                if future:
-                    futures.append(future)
-            
-            num_futures = len(futures)
-            if num_futures == 0:
+        # Use existing prefetch executor (better resource utilization)
+        total = len(self.image_files)
+        completed = 0
+        
+        def _on_done(future):
+            nonlocal completed
+            completed += 1
+            progress = int((completed / total) * 100)
+            self.reporter.progress_updated.emit(progress)
+            if completed == total:
                 self.reporter.finished.emit()
-                return
-
-            log.info(f"Submitted {num_futures} preloading tasks.")
-            completed_count = 0
-            lock = threading.Lock()
-
-            def _on_future_done(future):
-                nonlocal completed_count
-                with lock:
-                    completed_count += 1
-                    progress = int((completed_count / num_futures) * 100)
-                    self.reporter.progress_updated.emit(progress)
-
-                if completed_count == num_futures:
-                    self.reporter.finished.emit()
-
-            for future in futures:
-                future.add_done_callback(_on_future_done)
-
-        self.preload_executor.submit(_preload_and_report_progress)
+        
+        for i in range(total):
+            future = self.prefetcher.submit_task(i, self.prefetcher.generation)
+            if future:
+                future.add_done_callback(_on_done)
 
     def _update_preload_progress(self, progress: int):
         log.debug(f"Updating preload progress in UI: {progress}%")
@@ -422,7 +424,6 @@ class AppController(QObject):
 
         self.watcher.stop()
         self.prefetcher.shutdown()
-        self.preload_executor.shutdown(wait=False)
         self.sidecar.set_last_index(self.current_index)
         self.sidecar.save()
 

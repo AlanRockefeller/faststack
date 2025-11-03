@@ -138,128 +138,48 @@ ApplicationWindow {
 
         
 
-                                        MenuBar {
-
-        
-
-                    
-
-        
-
-                                            id: menuBar
-
-        
-
-                    
-
-        
-
-                                            Layout.preferredWidth: 300 // Give it some width
-
-        
-
-                    
-
-        
-
-                                            background: Rectangle {
-
-        
-
-                                                color: root.currentBackgroundColor
-
-        
-
-                                            }
-
-        
-
-                    
-
-        
-
-                                            palette.buttonText: root.currentTextColor
-
-        
-
-                                            palette.button: root.currentBackgroundColor
-
-        
-
-                                            palette.window: root.currentBackgroundColor
-
-        
-
-                                            palette.text: root.currentTextColor
-
-        
-
-                    
-
-        
+                    MenuBar {
+                        id: menuBar
+                        Layout.preferredWidth: 300 // Give it some width
+                        background: Rectangle {
+                            color: root.currentBackgroundColor
+                        }
+                        palette.buttonText: root.currentTextColor
+                        palette.button: root.currentBackgroundColor
+                        palette.window: root.currentBackgroundColor
+                        palette.text: root.currentTextColor
 
                         Menu {
-
                             title: "&File"
-
                             Action { text: "&Open Folder..." }
-
                             Action {
-
                                 text: "&Settings..."
-
                                 onTriggered: {
-
                                     settingsDialog.heliconPath = uiState.get_helicon_path()
-
                                     settingsDialog.cacheSize = uiState.get_cache_size()
-
                                     settingsDialog.prefetchRadius = uiState.get_prefetch_radius()
-
                                     settingsDialog.theme = uiState.get_theme()
-
                                     settingsDialog.defaultDirectory = uiState.get_default_directory()
-
                                     settingsDialog.open()
-
                                 }
-
                             }
-
                             Action { text: "&Exit"; onTriggered: Qt.quit() }
-
                         }
-
                         Menu {
-
                             title: "&View"
-
                             Action { text: "Toggle Light/Dark Mode"; onTriggered: root.toggleTheme() }
-
                         }
-
                         Menu {
-
                             title: "&Actions"
-
                             Action { text: "Run Stacks"; onTriggered: uiState.launch_helicon() }
-
                             Action { text: "Clear Stacks"; onTriggered: uiState.clear_all_stacks() }
-
                             Action { text: "Show Stacks"; onTriggered: showStacksDialog.open() }
-
                             Action { text: "Preload All Images"; onTriggered: uiState.preloadAllImages() }
-
                         }
-
                         Menu {
-
                             title: "&Help"
-
                             Action { text: "&Key Bindings"; onTriggered: aboutDialog.open() }
-
                         }
-
                     }
 
         

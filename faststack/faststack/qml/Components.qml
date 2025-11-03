@@ -23,47 +23,79 @@ Item {
 
         onWidthChanged: {
             if (width > 0 && height > 0) {
-                uiState.onDisplaySizeChanged(width, height)
+                resizeDebounceTimer.restart()
             }
         }
 
         onHeightChanged: {
             if (width > 0 && height > 0) {
-                uiState.onDisplaySizeChanged(width, height)
+                resizeDebounceTimer.restart()
             }
         }
 
-        // Zoom and Pan logic would go here
-        // For example, using PinchArea or MouseArea
-        MouseArea {
-            anchors.fill: parent
-            acceptedButtons: Qt.LeftButton
-            
-            // Simple drag-to-pan placeholder
-            property real lastX: 0
-            property real lastY: 0
-
-            onPressed: {
-                lastX = mouseX
-                lastY = mouseY
+        onScaleChanged: {
+            if (scaleTransform.xScale > 1.1 && !uiState.isZoomed) {
+                uiState.setZoomed(true);
+            } else if (scaleTransform.xScale <= 1.0 && uiState.isZoomed) {
+                uiState.setZoomed(false);
             }
+        }
 
-            onPositionChanged: {
-                if (pressed) {
-                    mainImage.x += (mouseX - lastX)
-                    mainImage.y += (mouseY - lastY)
-                    lastX = mouseX
-                    lastY = mouseY
-                }
+        transform: [
+            Scale {
+                id: scaleTransform
+                origin.x: mainImage.width / 2
+                origin.y: mainImage.height / 2
+            },
+            Translate {
+                id: panTransform
             }
+        ]
+    }
 
-            // Wheel for zoom
-            onWheel: {
-                // A real implementation would be more complex, zooming
-                // into the cursor position.
-                var scaleFactor = wheel.angleDelta.y > 0 ? 1.2 : 1 / 1.2;
-                mainImage.scale *= scaleFactor;
+    // Zoom and Pan logic would go here
+    // For example, using PinchArea or MouseArea
+    Timer {
+        id: resizeDebounceTimer
+        interval: 100 // milliseconds
+        running: false
+        onTriggered: {
+            if (mainImage.width > 0 && mainImage.height > 0) {
+                uiState.onDisplaySizeChanged(mainImage.width, mainImage.height)
             }
+            running = false
+        }
+    }
+
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.LeftButton
+        
+        // Simple drag-to-pan placeholder
+        property real lastX: 0
+        property real lastY: 0
+
+        onPressed: function(mouse) {
+            lastX = mouse.x
+            lastY = mouse.y
+        }
+
+        onPositionChanged: function(mouse) {
+            if (pressed) {
+                panTransform.x += (mouse.x - lastX)
+                panTransform.y += (mouse.y - lastY)
+                lastX = mouse.x
+                lastY = mouse.y
+            }
+        }
+
+        // Wheel for zoom
+        onWheel: function(wheel) {
+            // A real implementation would be more complex, zooming
+            // into the cursor position.
+            var scaleFactor = wheel.angleDelta.y > 0 ? 1.2 : 1 / 1.2;
+            scaleTransform.xScale *= scaleFactor;
+            scaleTransform.yScale *= scaleFactor;
         }
     }
 
