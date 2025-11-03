@@ -79,8 +79,6 @@ class AppController(QObject):
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
 
-        theme = config.get('core', 'theme')
-        self.main_window.setProperty('isDarkTheme', theme == 'dark')
 
     def refresh_image_list(self):
         """Rescans the directory for images."""
@@ -359,11 +357,12 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
     setup_logging()
     log.info("Starting FastStack")
 
+    app = QApplication(sys.argv) # Moved here
+
     if image_dir is None:
         image_dir_str = config.get('core', 'default_directory')
         if not image_dir_str:
             log.warning("No image directory provided and no default directory set. Opening directory selection dialog.")
-            from PySide6.QtWidgets import QFileDialog
             selected_dir = QFileDialog.getExistingDirectory(None, "Select Image Directory")
             if not selected_dir:
                 log.error("No image directory selected. Exiting.")
@@ -374,8 +373,6 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
     if not image_dir.is_dir():
         log.error(f"Image directory not found: {image_dir}")
         sys.exit(1)
-
-    app = QApplication(sys.argv)
     app.setOrganizationName("FastStack")
     app.setOrganizationDomain("faststack.dev")
     app.setApplicationName("FastStack")
