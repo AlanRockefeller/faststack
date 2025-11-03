@@ -1,6 +1,38 @@
 # ChangeLog
 
+## [0.5.0] - 2025-11-03
+
+### Added
+-   Load full-resolution images when zooming in for maximum detail.
+-   Call Helicon Focus for each defined stack when multiple stacks are present.
+
+### Changed
+-   The filesystem watcher is now less sensitive to spurious modification events, reducing unnecessary refreshes.
+-   The preloading process now shares the same thread pool as the prefetcher for better resource utilization.
+-   Stacks are now cleared automatically after being sent to Helicon Focus.
+
+### Fixed
+-   Corrected a `ValueError` in `PyTurboJPEG` caused by unsupported scaling factors.
+-   Resolved an `AttributeError` in the JPEG scaling factor calculation.
+-   Fixed an issue where panning the image was not working correctly.
+-   Addressed a bug where panning speed was incorrect at high zoom levels.
+-   Ensured that stale prefetcher futures are cancelled when the display size changes.
+
+### Performance
+-   Improved image decoding performance by using `PyTurboJPEG` for resized decoding.
+-   Tuned the number of prefetcher thread pool workers based on system CPU cores.
+-   Replaced synchronous file reads with memory-mapped I/O for faster image loading.
+-   Optimized image resizing by using `BILINEAR` resampling for large downscales.
+-   Debounced display size change notifications to reduce redundant UI updates.
+
 ## Version 0.4
+
+### Todo
+
+Make it use the full res image when zooming in
+When multiple stacks are selected, call Helicon multiple times
+After Helicon is called, clear the stacks
+Fix S key - I guess it should remove an image from the stack?   Clarify what it does now.
 
 ### New Features
 - **Two-tier caching system:** Implemented a two-tier caching system to prefetch display-sized images, significantly improving performance and reducing GPU memory usage.

@@ -4,6 +4,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import List, Dict, Optional, Callable
+import mmap
 
 from faststack.models import ImageFile, DecodedImage
 from faststack.imaging.jpeg import decode_jpeg_rgb, decode_jpeg_resized
@@ -16,8 +17,12 @@ class Prefetcher:
         self.cache_put = cache_put
         self.prefetch_radius = prefetch_radius
         self.get_display_info = get_display_info
+        # Use CPU count for I/O-bound JPEG decoding
+        # Rule of thumb: 2x CPU cores for I/O bound, 1x for CPU bound
+        optimal_workers = min((os.cpu_count() or 1) * 2, 8)  # Cap at 8
+        
         self.executor = ThreadPoolExecutor(
-            max_workers=min(4, os.cpu_count() or 1),
+            max_workers=optimal_workers,
             thread_name_prefix="Prefetcher"
         )
         self.futures: Dict[int, Future] = {}
@@ -72,8 +77,10 @@ class Prefetcher:
             return None
 
         try:
+            # Memory-mapped file reading (faster than traditional read)
             with open(image_file.path, "rb") as f:
-                jpeg_bytes = f.read()
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                    jpeg_bytes = mmapped[:]
             
             buffer = decode_jpeg_resized(jpeg_bytes, display_width, display_height)
             if buffer is not None:

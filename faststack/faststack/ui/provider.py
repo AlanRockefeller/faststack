@@ -59,12 +59,21 @@ class UIState(QObject):
     themeChanged = Signal()
     preloadingStateChanged = Signal()
     preloadProgressChanged = Signal()
+    isZoomedChanged = Signal()
 
     def __init__(self, app_controller):
         super().__init__()
         self.app_controller = app_controller
         self._is_preloading = False
         self._preload_progress = 0
+
+    @Property(bool, notify=isZoomedChanged)
+    def isZoomed(self):
+        return self.app_controller.is_zoomed
+
+    @Slot(bool)
+    def setZoomed(self, zoomed: bool):
+        self.app_controller.set_zoomed(zoomed)
 
     @Property(bool, notify=preloadingStateChanged)
     def isPreloading(self):
