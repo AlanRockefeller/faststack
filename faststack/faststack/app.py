@@ -461,6 +461,13 @@ class AppController(QObject):
         config.set('helicon', 'exe', path)
         config.save()
 
+    def get_photoshop_path(self):
+        return config.get('photoshop', 'exe')
+
+    def set_photoshop_path(self, path):
+        config.set('photoshop', 'exe', path)
+        config.save()
+
     def open_file_dialog(self):
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)

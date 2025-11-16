@@ -163,6 +163,7 @@ ApplicationWindow {
                                 text: "&Settings..."
                                 onTriggered: {
                                     settingsDialog.heliconPath = uiState.get_helicon_path()
+                                    settingsDialog.photoshopPath = uiState.get_photoshop_path()
                                     settingsDialog.cacheSize = uiState.get_cache_size()
                                     settingsDialog.prefetchRadius = uiState.get_prefetch_radius()
                                     settingsDialog.theme = uiState.theme
@@ -246,27 +247,32 @@ ApplicationWindow {
             color: root.currentBackgroundColor
         }
 
-        contentItem: Text {
-            text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
-                  "<b>Navigation:</b><br>" +
-                  "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
-                  "&nbsp;&nbsp;K / Left Arrow: Previous Image<br><br>" +
-                  "<b>Viewing:</b><br>" +
-                  "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
-                  "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
-                  "&nbsp;&nbsp;G: Toggle Grid View (not implemented)<br><br>" +
-                  "<b>Rating & Stacking:</b><br>" +
-                  "&nbsp;&nbsp;Space: Toggle Flag<br>" +
-                  "&nbsp;&nbsp;X: Toggle Reject<br>" +
-                  "&nbsp;&nbsp;S: Add to selection for Helicon<br>" +
-                  "&nbsp;&nbsp;[: Begin new stack<br>" +
-                  "&nbsp;&nbsp;]: End current stack<br>" +
-                  "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
-                  "<b>Actions:</b><br>" +
-                  "&nbsp;&nbsp;Enter: Launch Helicon Focus"
-            padding: 10
-            wrapMode: Text.WordWrap
-            color: root.currentTextColor
+        contentItem: ScrollView {
+            clip: true
+            Text {
+                text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
+                      "<b>Navigation:</b><br>" +
+                      "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
+                      "&nbsp;&nbsp;K / Left Arrow: Previous Image<br><br>" +
+                      "<b>Viewing:</b><br>" +
+                      "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
+                      "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
+                      "&nbsp;&nbsp;G: Toggle Grid View (not implemented)<br><br>" +
+                      "<b>Rating & Stacking:</b><br>" +
+                      "&nbsp;&nbsp;Space: Toggle Flag<br>" +
+                      "&nbsp;&nbsp;X: Toggle Reject<br>" +
+                      "&nbsp;&nbsp;S: Add to selection for Helicon<br>" +
+                      "&nbsp;&nbsp;[: Begin new stack<br>" +
+                      "&nbsp;&nbsp;]: End current stack<br>" +
+                      "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
+                      "<b>Actions:</b><br>" +
+                      "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
+                      "&nbsp;&nbsp;E: Edit in Photoshop<br>" +
+                      "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
+                padding: 10
+                wrapMode: Text.WordWrap
+                color: root.currentTextColor
+            }
         }
     }
 

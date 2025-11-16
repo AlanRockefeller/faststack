@@ -198,6 +198,14 @@ class UIState(QObject):
         self.app_controller.set_helicon_path(path)
 
     @Slot(result=str)
+    def get_photoshop_path(self):
+        return self.app_controller.get_photoshop_path()
+
+    @Slot(str)
+    def set_photoshop_path(self, path):
+        self.app_controller.set_photoshop_path(path)
+
+    @Slot(result=str)
     def open_file_dialog(self):
         return self.app_controller.open_file_dialog()
 
