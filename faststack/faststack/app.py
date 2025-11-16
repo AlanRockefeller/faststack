@@ -619,8 +619,12 @@ class AppController(QObject):
         """
         Updates the UI status message and clears it after a timeout.
         """
+        def clear_message():
+            if self.ui_state.statusMessage == message:
+                self.ui_state.statusMessage = ""
+
         self.ui_state.statusMessage = message
-        QTimer.singleShot(timeout, lambda: self.ui_state.statusMessage = "")
+        QTimer.singleShot(timeout, clear_message)
 
 
 
