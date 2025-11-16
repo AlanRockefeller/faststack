@@ -1,45 +1,88 @@
-"""Maps Qt Key events to application actions."""
-
+# faststack/ui/keystrokes.py
 import logging
 from PySide6.QtCore import Qt
 
 log = logging.getLogger(__name__)
 
 class Keybinder:
-    def __init__(self, main_window):
-        self.main_window = main_window
+    def __init__(self, controller):
+        """
+        controller is your AppController.
+        We will call controller.<method>() by default,
+        but if controller.main_window has a QML method of the same name,
+        we'll call that instead so the footer/UI stays in sync.
+        """
+        self.controller = controller
+
+        # map keys → method names (not callables)
         self.key_map = {
             # Navigation
-            Qt.Key.Key_J: self.main_window.next_image,
-            Qt.Key.Key_Right: self.main_window.next_image,
-            Qt.Key.Key_K: self.main_window.prev_image,
-            Qt.Key.Key_Left: self.main_window.prev_image,
+            Qt.Key_J: "next_image",
+            Qt.Key_Right: "next_image",
+            Qt.Key_K: "prev_image",
+            Qt.Key_Left: "prev_image",
 
             # View Mode
-            Qt.Key.Key_G: self.main_window.toggle_grid_view,
+            Qt.Key_G: "toggle_grid_view",
 
             # Metadata
-            Qt.Key.Key_Space: self.main_window.toggle_current_flag,
-            Qt.Key.Key_X: self.main_window.toggle_current_reject,
+            Qt.Key_Space: "toggle_current_flag",
+            Qt.Key_X: "toggle_current_reject",
 
             # Stacking
-            Qt.Key.Key_BracketLeft: self.main_window.begin_new_stack,
-            Qt.Key.Key_BracketRight: self.main_window.end_current_stack,
+            Qt.Key_BracketLeft: "begin_new_stack",
+            Qt.Key_BracketRight: "end_current_stack",
 
             # Actions
-            Qt.Key.Key_S: self.main_window.toggle_selection,
-            Qt.Key.Key_Enter: self.main_window.launch_helicon,
-            Qt.Key.Key_Return: self.main_window.launch_helicon,
-
-            # Stack Management
-            Qt.Key.Key_C: self.main_window.clear_all_stacks,
+            Qt.Key_S: "toggle_selection",
+            Qt.Key_Enter: "launch_helicon",
+            Qt.Key_Return: "launch_helicon",
+            Qt.Key_E: "edit_in_photoshop",
+            Qt.Key_C: "clear_all_stacks", # Keep C for clear_all_stacks
         }
 
+        self.modifier_key_map = {
+            (Qt.Key_C, Qt.ControlModifier): "copy_path_to_clipboard",
+        }
+
+    def _call(self, method_name: str):
+        """
+        Try QML root first (to keep footer/UI happy), then controller.
+        """
+        mw = getattr(self.controller, "main_window", None)
+        if mw is not None and hasattr(mw, method_name):
+            getattr(mw, method_name)()
+            return
+
+        if hasattr(self.controller, method_name):
+            getattr(self.controller, method_name)()
+            return
+
+        log.warning(f"Keybinder: neither main_window nor controller has '{method_name}'")
+
     def handle_key_press(self, event):
-        """Handles a key press event from the main window."""
-        log.info(f"Key pressed: {event.key()}")
-        action = self.key_map.get(event.key())
-        if action:
-            action()
+        key = event.key()
+        text = event.text()
+        log.info(f"Key pressed: {key} ({text!r}) with modifiers {event.modifiers()}")
+
+        # Check for modifier + key combinations
+        for (mapped_key, mapped_modifier), method_name in self.modifier_key_map.items():
+            if key == mapped_key and event.modifiers() & mapped_modifier:
+                self._call(method_name)
+                return True
+
+        # Check for single key presses
+        method_name = self.key_map.get(key)
+        if method_name:
+            self._call(method_name)
             return True
+
+        # extra safety for layouts where bracket keycodes are odd
+        if text == "[":
+            self._call("begin_new_stack")
+            return True
+        if text == "]":
+            self._call("end_current_stack")
+            return True
+
         return False

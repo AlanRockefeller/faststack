@@ -15,22 +15,22 @@ ApplicationWindow {
     flags: Qt.FramelessWindowHint | Qt.Window
     title: "FastStack"
 
-    Material.theme: isDarkTheme ? Material.Dark : Material.Light
+    Material.theme: uiState.theme === 0 ? Material.Dark : Material.Light
 
-    property bool isDarkTheme: uiState.get_theme() === 0
+    property bool isDarkTheme: uiState.theme === 0
     property color currentBackgroundColor: isDarkTheme ? "#000000" : "white"
     property color currentTextColor: isDarkTheme ? "white" : "black"
 
     background: Rectangle { color: root.currentBackgroundColor }
 
     function toggleTheme() {
-        uiState.set_theme(isDarkTheme ? 1 : 0) // 0 for dark, 1 for light
+        uiState.theme = (uiState.theme === 0 ? 1 : 0) // 0 for dark, 1 for light
     }
 
     Connections {
         target: uiState
         function onThemeChanged() {
-            root.isDarkTheme = uiState.get_theme() === 0
+            root.isDarkTheme = uiState.theme === 0
         }
     }
 
@@ -109,6 +109,13 @@ ApplicationWindow {
                     font.pixelSize: 16
                 }
             }
+            Label {
+                id: statusMessageLabel
+                text: uiState.statusMessage
+                color: root.currentTextColor
+                visible: uiState.statusMessage !== ""
+                Layout.rightMargin: 10
+            }
         }
     }
 
@@ -158,7 +165,7 @@ ApplicationWindow {
                                     settingsDialog.heliconPath = uiState.get_helicon_path()
                                     settingsDialog.cacheSize = uiState.get_cache_size()
                                     settingsDialog.prefetchRadius = uiState.get_prefetch_radius()
-                                    settingsDialog.theme = uiState.get_theme()
+                                    settingsDialog.theme = uiState.theme
                                     settingsDialog.defaultDirectory = uiState.get_default_directory()
                                     settingsDialog.open()
                                 }
@@ -175,6 +182,8 @@ ApplicationWindow {
                             Action { text: "Clear Stacks"; onTriggered: uiState.clear_all_stacks() }
                             Action { text: "Show Stacks"; onTriggered: showStacksDialog.open() }
                             Action { text: "Preload All Images"; onTriggered: uiState.preloadAllImages() }
+                            Action { text: "Filter Images..."; onTriggered: filterDialog.open() }
+                            Action { text: "Clear Filename Filter"; onTriggered: controller.clear_filter() }
                         }
                         Menu {
                             title: "&Help"
@@ -274,7 +283,7 @@ ApplicationWindow {
         }
 
         contentItem: Text {
-            text: uiState.get_stack_summary // Access property directly
+            text: uiState.stackSummary || "No stacks defined."
             padding: 10
             wrapMode: Text.WordWrap
             color: root.currentTextColor
@@ -284,4 +293,13 @@ ApplicationWindow {
     SettingsDialog {
         id: settingsDialog
     }
+
+    FilterDialog {
+    id: filterDialog
+    onAccepted: {
+        controller.apply_filter(filterString)
+    }
+}
+
+
 }

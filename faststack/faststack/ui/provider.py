@@ -1,16 +1,14 @@
 """QML Image Provider and application state bridge."""
 
 import logging
-from typing import Optional
-
-import numpy as np
-from PySide6.QtCore import QObject, Signal, Property, QUrl, Slot, Qt
+from PySide6.QtCore import QObject, Signal, Property, Slot, Qt
 from PySide6.QtGui import QImage
 from PySide6.QtQuick import QQuickImageProvider
 
 from faststack.models import DecodedImage
 
 log = logging.getLogger(__name__)
+
 
 class ImageProvider(QQuickImageProvider):
     def __init__(self, app_controller):
@@ -24,14 +22,12 @@ class ImageProvider(QQuickImageProvider):
         if not id:
             return self.placeholder
 
-        # The ID is expected to be the image index
         try:
             image_index_str = id.split('/')[0]
             index = int(image_index_str)
             image_data = self.app_controller.get_decoded_image(index)
 
             if image_data:
-                # Zero-copy QImage from numpy buffer
                 qimg = QImage(
                     image_data.buffer,
                     image_data.width,
@@ -39,14 +35,15 @@ class ImageProvider(QQuickImageProvider):
                     image_data.bytes_per_line,
                     QImage.Format.Format_RGB888
                 )
-                # Keep a reference to the original buffer to prevent garbage collection
+                # keep buffer alive
                 qimg.original_buffer = image_data.buffer
                 return qimg
 
         except (ValueError, IndexError) as e:
             log.error(f"Invalid image ID requested from QML: {id}. Error: {e}")
-        
+
         return self.placeholder
+
 
 class UIState(QObject):
     """Manages the state exposed to the QML user interface."""
@@ -60,13 +57,31 @@ class UIState(QObject):
     preloadingStateChanged = Signal()
     preloadProgressChanged = Signal()
     isZoomedChanged = Signal()
+    statusMessageChanged = Signal() # New signal for status messages
 
     def __init__(self, app_controller):
         super().__init__()
         self.app_controller = app_controller
         self._is_preloading = False
         self._preload_progress = 0
+        # 1 = light, 0 = dark (controller will overwrite this on startup)
+        self._theme = 1
+        self._status_message = "" # New private variable for status message
 
+    # ---- THEME PROPERTY ----
+    @Property(int, notify=themeChanged)
+    def theme(self):
+        return self._theme
+
+    @theme.setter
+    def theme(self, value: int):
+        value = int(value)
+        if value == self._theme:
+            return
+        self._theme = value
+        self.themeChanged.emit()
+
+    # ---- ZOOM ----
     @Property(bool, notify=isZoomedChanged)
     def isZoomed(self):
         return self.app_controller.is_zoomed
@@ -75,6 +90,7 @@ class UIState(QObject):
     def setZoomed(self, zoomed: bool):
         self.app_controller.set_zoomed(zoomed)
 
+    # ---- PRELOADING ----
     @Property(bool, notify=preloadingStateChanged)
     def isPreloading(self):
         return self._is_preloading
@@ -95,6 +111,7 @@ class UIState(QObject):
             self._preload_progress = value
             self.preloadProgressChanged.emit()
 
+    # ---- IMAGE / METADATA ----
     @Property(int, notify=currentIndexChanged)
     def currentIndex(self):
         return self.app_controller.current_index
@@ -105,11 +122,8 @@ class UIState(QObject):
 
     @Property(str, notify=currentImageSourceChanged)
     def currentImageSource(self):
-        # The source is the provider ID, which we tie to the index and a generation counter
-        # to force QML to request a new image even if the index is the same.
         return f"image://provider/{self.app_controller.current_index}/{self.app_controller.ui_refresh_generation}"
 
-    # --- Metadata Properties ---
     @Property(str, notify=metadataChanged)
     def currentFilename(self):
         return self.app_controller.get_current_metadata().get("filename", "")
@@ -138,12 +152,21 @@ class UIState(QObject):
     def get_stack_summary(self):
         if not self.app_controller.stacks:
             return "No stacks defined."
-
         summary = f"Found {len(self.app_controller.stacks)} stacks:\n\n"
         for i, (start, end) in enumerate(self.app_controller.stacks):
             count = end - start + 1
             summary += f"Stack {i+1}: {count} photos (indices {start}-{end})\n"
         return summary
+
+    @Property(str, notify=statusMessageChanged)
+    def statusMessage(self):
+        return self._status_message
+
+    @statusMessage.setter
+    def statusMessage(self, value: str):
+        if self._status_message != value:
+            self._status_message = value
+            self.statusMessageChanged.emit()
 
     # --- Slots for QML to call ---
     @Slot()
@@ -200,10 +223,12 @@ class UIState(QObject):
 
     @Slot(result=int)
     def get_theme(self):
+        # this lets QML ask the controller, but the real binding is uiState.theme
         return self.app_controller.get_theme()
 
     @Slot(int)
     def set_theme(self, theme_index):
+        # delegate to controller so it can save to config
         self.app_controller.set_theme(theme_index)
 
     @Slot(result=str)
@@ -225,3 +250,4 @@ class UIState(QObject):
     @Slot(int, int)
     def onDisplaySizeChanged(self, width: int, height: int):
         self.app_controller.on_display_size_changed(width, height)
+
