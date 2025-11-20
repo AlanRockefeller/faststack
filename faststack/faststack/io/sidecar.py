@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -29,23 +30,31 @@ class SidecarManager:
             log.info(f"No sidecar file found at {self.path}. Creating new one.")
             return Sidecar()
         try:
+            t_start = time.perf_counter()
             with self.path.open("r") as f:
                 data = json.load(f)
-                if data.get("version") != 2:
-                    log.warning("Old sidecar format detected. Starting fresh.")
-                    return Sidecar()
+            json_load_time = time.perf_counter() - t_start
+            
+            # Import debug flag from app module
+            from faststack.app import _debug_mode
+            if _debug_mode:
+                log.info(f"SidecarManager.load: json.load() took {json_load_time:.3f}s")
+            
+            if data.get("version") != 2:
+                log.warning("Old sidecar format detected. Starting fresh.")
+                return Sidecar()
 
-                # Reconstruct nested objects
-                entries = { 
-                    stem: EntryMetadata(**meta) 
-                    for stem, meta in data.get("entries", {}).items()
-                }
-                return Sidecar(
-                    version=data.get("version", 2),
-                    last_index=data.get("last_index", 0),
-                    entries=entries,
-                    stacks=data.get("stacks", []),
-                )
+            # Reconstruct nested objects
+            entries = { 
+                stem: EntryMetadata(**meta) 
+                for stem, meta in data.get("entries", {}).items()
+            }
+            return Sidecar(
+                version=data.get("version", 2),
+                last_index=data.get("last_index", 0),
+                entries=entries,
+                stacks=data.get("stacks", []),
+            )
         except (json.JSONDecodeError, TypeError) as e:
             log.error(f"Failed to load or parse sidecar file {self.path}: {e}")
             # Consider backing up the corrupted file here

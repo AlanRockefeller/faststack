@@ -4,6 +4,7 @@ import logging
 import sys
 import struct
 import shlex
+import time
 from pathlib import Path
 from typing import Optional, List, Dict
 from datetime import date
@@ -60,6 +61,9 @@ def make_hdrop(paths):
 
 log = logging.getLogger(__name__)
 
+# Global flag for debug mode - set by main()
+_debug_mode = False
+
 class AppController(QObject):
     dataChanged = Signal() # New signal for general data changes
 
@@ -95,6 +99,7 @@ class AppController(QObject):
             prefetch_radius=config.getint('core', 'prefetch_radius', 4),
             get_display_info=self.get_display_info
         )
+        self.last_displayed_image: Optional[DecodedImage] = None  # Cache last image to avoid grey squares
 
         # -- UI State --
         self.ui_state = UIState(self)
@@ -239,7 +244,7 @@ class AppController(QObject):
         self.ui_state.imageCountChanged.emit()
 
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
-        """Retrieves a decoded image, from cache or by decoding."""
+        """Retrieves a decoded image, blocking until ready to ensure correct display."""
         if not self.image_files: # Handle empty image list
             log.warning("get_decoded_image called with empty image_files.")
             return None
@@ -247,26 +252,43 @@ class AppController(QObject):
         _, _, display_gen = self.get_display_info()
         cache_key = f"{index}_{display_gen}"
 
+        # Check cache first
         if cache_key in self.image_cache:
-            return self.image_cache[cache_key]
+            decoded = self.image_cache[cache_key]
+            self.last_displayed_image = decoded
+            return decoded
         
-        # If not in cache, this was likely a cache miss. 
-        # The prefetcher should have it, but we can do a blocking load if needed.
-        log.warning(f"Cache miss for index {index} (gen: {display_gen}). Forcing synchronous load.")
+        # Cache miss: need to decode synchronously to ensure correct image displays
+        if _debug_mode:
+            decode_start = time.perf_counter()
+            log.info(f"Cache miss for index {index} (gen: {display_gen}). Blocking decode.")
+        
         future = self.prefetcher.submit_task(index, self.prefetcher.generation)
         if future:
             try:
-                # Wait for the result and then retrieve from cache
-                result = future.result()
+                # Wait for decode to complete (blocking but fast for JPEGs)
+                result = future.result(timeout=5.0)  # 5 second timeout as safety
                 if result:
                     decoded_index, decoded_display_gen = result
                     cache_key = f"{decoded_index}_{decoded_display_gen}"
                     if cache_key in self.image_cache:
-                        return self.image_cache[cache_key]
+                        decoded = self.image_cache[cache_key]
+                        self.last_displayed_image = decoded
+                        if _debug_mode:
+                            elapsed = time.perf_counter() - decode_start
+                            log.info(f"Decoded image {index} in {elapsed:.3f}s")
+                        return decoded
+            except concurrent.futures.TimeoutError:
+                log.error(f"Timeout decoding image at index {index}")
+                return self.last_displayed_image
             except concurrent.futures.CancelledError:
-                log.warning(f"Prefetch task for index {index} was cancelled. Attempting synchronous load.")
-                return None
-        return None
+                log.warning(f"Decode cancelled for index {index}")
+                return self.last_displayed_image
+            except Exception as e:
+                log.error(f"Error decoding image at index {index}: {e}")
+                return self.last_displayed_image
+        
+        return self.last_displayed_image
 
     def sync_ui_state(self):
         """Forces the UI to update by emitting all state change signals."""
@@ -963,14 +985,25 @@ class AppController(QObject):
         meta = self.sidecar.get_metadata(stem)
         return meta.stacked
 
-def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of images to view")):
+def main(
+    image_dir: Optional[Path] = typer.Argument(None, help="Directory of images to view"),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging and timing information")
+):
     """FastStack Application Entry Point"""
-    setup_logging()
+    global _debug_mode
+    _debug_mode = debug
+    
+    t0 = time.perf_counter()
+    setup_logging(debug)
+    if debug:
+        log.info(f"Startup: after setup_logging: {time.perf_counter() - t0:.3f}s")
     log.info("Starting FastStack")
 
     os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
 
     app = QApplication(sys.argv) # Moved here
+    if debug:
+        log.info(f"Startup: after QApplication: {time.perf_counter() - t0:.3f}s")
 
     if image_dir is None:
         image_dir_str = config.get('core', 'default_directory')
@@ -992,6 +1025,8 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
 
     engine = QQmlApplicationEngine()
     controller = AppController(image_dir, engine)
+    if debug:
+        log.info(f"Startup: after AppController: {time.perf_counter() - t0:.3f}s")
     image_provider = ImageProvider(controller)
     engine.addImageProvider("provider", image_provider)
 
@@ -1002,6 +1037,8 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
 
     qml_file = Path(__file__).parent / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_file)))
+    if debug:
+        log.info(f"Startup: after engine.load(QML): {time.perf_counter() - t0:.3f}s")
 
     if not engine.rootObjects():
         log.error("Failed to load QML.")
@@ -1014,6 +1051,8 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
 
     # Load data and start services
     controller.load()
+    if debug:
+        log.info(f"Startup: after controller.load(): {time.perf_counter() - t0:.3f}s")
 
     # Graceful shutdown
     app.aboutToQuit.connect(controller.shutdown)

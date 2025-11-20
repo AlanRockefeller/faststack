@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import List, Dict, Tuple
 
@@ -18,6 +19,7 @@ JPG_EXTENSIONS = { ".JPG", ".JPEG", ".jpg", ".jpeg" }
 
 def find_images(directory: Path) -> List[ImageFile]:
     """Finds all JPGs in a directory and pairs them with RAW files."""
+    t_start = time.perf_counter()
     log.info(f"Scanning directory for images: {directory}")
     jpgs: List[Tuple[Path, os.stat_result]] = []
     raws: Dict[str, List[Tuple[Path, os.stat_result]]] = {}
@@ -50,6 +52,11 @@ def find_images(directory: Path) -> List[ImageFile]:
             timestamp=jpg_stat.st_mtime,
         ))
 
+    elapsed = time.perf_counter() - t_start
+    # Import debug flag from app module
+    from faststack.app import _debug_mode
+    if _debug_mode:
+        log.info(f"find_images: found {len(image_files)} images in {elapsed:.3f}s")
     log.info(f"Found {len(image_files)} JPG files and paired {sum(1 for im in image_files if im.raw_pair)} with RAWs.")
     return image_files
 
