@@ -64,21 +64,21 @@ ApplicationWindow {
                 color: root.currentTextColor
             }
             Label {
-                text: ` | File: ${uiState.currentFilename || 'N/A'}`
+                text: uiState.imageCount > 0 ? ` | File: ${uiState.currentFilename || 'N/A'}` : " | File: N/A"
                 color: root.currentTextColor
             }
             Label {
-                text: ` | Flag: ${uiState.isFlagged}`
-                color: uiState.isFlagged ? "lightgreen" : root.currentTextColor
+                text: uiState.imageCount > 0 ? ` | Flag: ${uiState.isFlagged}` : " | Flag: false"
+                color: (uiState.imageCount > 0 && uiState.isFlagged) ? "lightgreen" : root.currentTextColor
             }
             Label {
-                text: ` | Rejected: ${uiState.isRejected}`
-                color: uiState.isRejected ? "red" : root.currentTextColor
+                text: uiState.imageCount > 0 ? ` | Rejected: ${uiState.isRejected}` : " | Rejected: false"
+                color: (uiState.imageCount > 0 && uiState.isRejected) ? "red" : root.currentTextColor
             }
             Label {
                 text: ` | Stacked: ${uiState.stackedDate}`
                 color: "lightgreen"
-                visible: uiState.isStacked
+                visible: uiState.imageCount > 0 && uiState.isStacked
             }
             Label {
                 text: ` | Filter: "${uiState.filterString}"`
@@ -102,14 +102,14 @@ ApplicationWindow {
             }
             Rectangle {
                 Layout.fillWidth: true
-                color: uiState.stackInfoText ? "orange" : "transparent" // Brighter background
+                color: (uiState.imageCount > 0 && uiState.stackInfoText) ? "orange" : "transparent" // Brighter background
                 radius: 3
                 implicitWidth: stackInfoLabel.implicitWidth + 10
                 implicitHeight: stackInfoLabel.implicitHeight + 5
                 Label {
                     id: stackInfoLabel
                     anchors.centerIn: parent
-                    text: `Stack: ${uiState.stackInfoText || 'N/A'}`
+                    text: uiState.imageCount > 0 ? `Stack: ${uiState.stackInfoText || 'N/A'}` : "Stack: N/A"
                     color: "black" // Black text for contrast on orange
                     font.bold: true
                     font.pixelSize: 16

@@ -20,7 +20,7 @@ JPG_EXTENSIONS = { ".JPG", ".JPEG", ".jpg", ".jpeg" }
 def find_images(directory: Path) -> List[ImageFile]:
     """Finds all JPGs in a directory and pairs them with RAW files."""
     t_start = time.perf_counter()
-    log.info(f"Scanning directory for images: {directory}")
+    log.info("Scanning directory for images: %s", directory)
     jpgs: List[Tuple[Path, os.stat_result]] = []
     raws: Dict[str, List[Tuple[Path, os.stat_result]]] = {}
 
@@ -37,7 +37,7 @@ def find_images(directory: Path) -> List[ImageFile]:
                         raws[stem] = []
                     raws[stem].append((p, entry.stat()))
     except OSError as e:
-        log.error(f"Error scanning directory {directory}: {e}")
+        log.error("Error scanning directory %s: %s", directory, e)
         return []
 
     # Sort JPGs by filename
@@ -53,11 +53,12 @@ def find_images(directory: Path) -> List[ImageFile]:
         ))
 
     elapsed = time.perf_counter() - t_start
-    # Import debug flag from app module
-    from faststack.app import _debug_mode
-    if _debug_mode:
-        log.info(f"find_images: found {len(image_files)} images in {elapsed:.3f}s")
-    log.info(f"Found {len(image_files)} JPG files and paired {sum(1 for im in image_files if im.raw_pair)} with RAWs.")
+    paired_count = sum(1 for im in image_files if im.raw_pair)
+    
+    # Log timing info if DEBUG level is enabled
+    if log.isEnabledFor(logging.DEBUG):
+        log.info("find_images: found %d images in %.3fs", len(image_files), elapsed)
+    log.info("Found %d JPG files and paired %d with RAWs.", len(image_files), paired_count)
     return image_files
 
 def _find_raw_pair(
@@ -79,9 +80,5 @@ def _find_raw_pair(
             min_dt = dt
             best_match = raw_path
 
-    if best_match:
-        log.debug(f"Paired {jpg_path.name} with {best_match.name} (dt={min_dt:.3f}s)")
-    else:
-        log.debug(f"No close RAW match found for {jpg_path.name}")
-
+    # Removed per-pair debug logging to reduce noise - summary is logged at end of find_images()
     return best_match

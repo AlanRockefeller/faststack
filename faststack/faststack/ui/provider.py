@@ -152,26 +152,38 @@ class UIState(QObject):
 
     @Property(str, notify=metadataChanged)
     def currentFilename(self):
+        if not self.app_controller.image_files:
+            return ""
         return self.app_controller.get_current_metadata().get("filename", "")
 
     @Property(bool, notify=metadataChanged)
     def isFlagged(self):
+        if not self.app_controller.image_files:
+            return False
         return self.app_controller.get_current_metadata().get("flag", False)
 
     @Property(bool, notify=metadataChanged)
     def isRejected(self):
+        if not self.app_controller.image_files:
+            return False
         return self.app_controller.get_current_metadata().get("reject", False)
 
     @Property(bool, notify=metadataChanged)
     def isStacked(self):
+        if not self.app_controller.image_files:
+            return False
         return self.app_controller.get_current_metadata().get("stacked", False)
 
     @Property(str, notify=metadataChanged)
     def stackedDate(self):
+        if not self.app_controller.image_files:
+            return ""
         return self.app_controller.get_current_metadata().get("stacked_date", "")
 
     @Property(str, notify=metadataChanged)
     def stackInfoText(self):
+        if not self.app_controller.image_files:
+            return ""
         return self.app_controller.get_current_metadata().get("stack_info_text", "")
 
     @Property(str, notify=stackSummaryChanged)
