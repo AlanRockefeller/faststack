@@ -8,16 +8,18 @@ Dialog {
     standardButtons: Dialog.Ok | Dialog.Cancel
     modal: true
     width: 600
-    height: 400
+    height: 600
 
     property string heliconPath: ""
     property double cacheSize: 1.5
     property int prefetchRadius: 4
     property int theme: 0
     property string defaultDirectory: ""
+    property string photoshopPath: ""
 
     onAccepted: {
         uiState.set_helicon_path(heliconPath)
+        uiState.set_photoshop_path(photoshopPath)
         uiState.set_cache_size(cacheSize)
         uiState.set_prefetch_radius(prefetchRadius)
         uiState.set_theme(theme)
@@ -48,6 +50,30 @@ Dialog {
                 text: "✔"
                 color: "lightgreen"
                 visible: uiState.check_path_exists(heliconPathField.text)
+            }
+        }
+
+        // Photoshop Path
+        Label { text: "Photoshop Path:" }
+        TextField {
+            id: photoshopPathField
+            Layout.fillWidth: true
+            text: settingsDialog.photoshopPath
+            onTextChanged: settingsDialog.photoshopPath = text
+        }
+        RowLayout {
+            Button {
+                text: "Browse..."
+                onClicked: {
+                    var path = uiState.open_file_dialog()
+                    if (path) photoshopPathField.text = path
+                }
+            }
+            Label {
+                id: photoshopCheckMarkLabel
+                text: "✔"
+                color: "lightgreen"
+                visible: uiState.check_path_exists(photoshopPathField.text)
             }
         }
 

@@ -19,6 +19,10 @@ DEFAULT_CONFIG = {
         "exe": "C:\\Program Files\\Helicon Software\\Helicon Focus 8\\HeliconFocus.exe",
         "args": "",
     },
+    "photoshop": {
+        "exe": "C:\\Program Files\\Adobe\\Adobe Photoshop 2026\\Photoshop.exe",
+        "args": "",
+    },
 }
 
 class AppConfig:
