@@ -1,5 +1,41 @@
 # ChangeLog
 
+## [0.7.0] - 2025-11-20
+
+### Added
+- **High-DPI Display Support:** Images now render at full physical pixel resolution on 4K displays by accounting for `devicePixelRatio` in display size calculations.
+- **Ctrl+0 Zoom Reset:** Added keyboard shortcut to reset zoom and pan to fit window (like Photoshop), with visual feedback.
+- **Active Filter Indicator:** Footer now displays active filename filter in yellow bold text for better visibility.
+- **Directory Path Display:** Title bar now shows the current working directory path, centered between menu and window controls.
+- **WARP.md Documentation:** Created comprehensive development guide for Warp AI assistant with architecture, commands, and development patterns.
+
+### Security
+- **Executable Path Validation:** Added comprehensive validation for Photoshop and Helicon Focus executables:
+  - Validates executable exists and is in safe location (Program Files)
+  - Checks file type (.exe on Windows)
+  - Warns about executables outside known safe paths
+  - Detects directory traversal attempts
+- **Subprocess Security Hardening:**
+  - Replaced unsafe `.split()` with `shlex.split()` for proper argument parsing
+  - Explicitly set `shell=False` to prevent shell injection attacks
+  - Added file descriptor management (`stdin`, `stdout`, `stderr` redirection)
+  - Validates file paths before subprocess execution
+  - Uses `close_fds=True` to prevent information leakage
+- **Input Validation:** Added pre-execution validation for image file paths in both Photoshop and Helicon Focus launchers.
+
+### Fixed
+- **Property Name Mismatch:** Corrected `get_stack_summary` to `stackSummary` in UIState to match QML property naming conventions.
+- **FilterDialog Theme Support:** Enhanced FilterDialog with proper Material theme support and background styling for consistent dark/light mode appearance.
+- **Missing Signal Emissions:** Added `stackSummaryChanged` signal emission when stacks are created, cleared, or processed.
+
+### Changed
+- **Improved Error Handling:** Replaced broad `Exception` catches with specific exception types (`OSError`, `subprocess.SubprocessError`, `FileNotFoundError`, `IOError`, `PermissionError`).
+- **Better Logging:** Changed `log.error()` to `log.exception()` to include full tracebacks for debugging.
+- **Argument Parsing:** Now uses `shlex.split()` with platform-aware parsing (Windows vs POSIX) for proper handling of quoted paths and special characters.
+
+### Testing
+- **Executable Validator Tests:** Added comprehensive test suite for executable path validation with 8 test cases covering various security scenarios.
+
 ## [0.6.0] - 2025-11-03
 
 ### Fixed

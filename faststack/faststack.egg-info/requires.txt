@@ -1,0 +1,8 @@
+PySide6<7.0,>=6.0
+PyTurboJPEG<2.0,>=1.8
+numpy<3.0,>=2.0
+cachetools<6.0,>=5.0
+watchdog<5.0,>=4.0
+typer<1.0,>=0.12
+Pillow<11.0,>=10.0
+pytest<9.0,>=8.0

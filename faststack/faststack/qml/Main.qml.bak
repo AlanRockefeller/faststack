@@ -80,12 +80,6 @@ ApplicationWindow {
                 color: "lightgreen"
                 visible: uiState.isStacked
             }
-            Label {
-                text: ` | Filter: "${uiState.filterString}"`
-                color: "yellow"
-                font.bold: true
-                visible: uiState.filterString !== ""
-            }
             Rectangle {
                 visible: uiState.isPreloading
                 Layout.preferredWidth: 200
@@ -114,13 +108,6 @@ ApplicationWindow {
                     font.bold: true
                     font.pixelSize: 16
                 }
-            }
-            Label {
-                id: statusMessageLabel
-                text: uiState.statusMessage
-                color: root.currentTextColor
-                visible: uiState.statusMessage !== ""
-                Layout.rightMargin: 10
             }
         }
     }
@@ -169,7 +156,6 @@ ApplicationWindow {
                                 text: "&Settings..."
                                 onTriggered: {
                                     settingsDialog.heliconPath = uiState.get_helicon_path()
-                                    settingsDialog.photoshopPath = uiState.get_photoshop_path()
                                     settingsDialog.cacheSize = uiState.get_cache_size()
                                     settingsDialog.prefetchRadius = uiState.get_prefetch_radius()
                                     settingsDialog.theme = uiState.theme
@@ -190,7 +176,6 @@ ApplicationWindow {
                             Action { text: "Show Stacks"; onTriggered: showStacksDialog.open() }
                             Action { text: "Preload All Images"; onTriggered: uiState.preloadAllImages() }
                             Action { text: "Filter Images..."; onTriggered: filterDialog.open() }
-                            Action { text: "Clear Filename Filter"; onTriggered: controller.clear_filter() }
                         }
                         Menu {
                             title: "&Help"
@@ -200,19 +185,9 @@ ApplicationWindow {
 
         
 
-                    Item { Layout.fillWidth: true } // Left spacer
+                    Item { Layout.fillWidth: true } // Spacer
 
-                    Label {
-                        text: uiState.currentDirectory
-                        color: root.currentTextColor
-                        font.pixelSize: 12
-                        elide: Text.ElideMiddle
-                        Layout.maximumWidth: 600
-                        Layout.alignment: Qt.AlignVCenter
-                        horizontalAlignment: Text.AlignHCenter
-                    }
-
-                    Item { Layout.fillWidth: true } // Right spacer
+        
 
                     Row {
 
@@ -263,33 +238,27 @@ ApplicationWindow {
             color: root.currentBackgroundColor
         }
 
-        contentItem: ScrollView {
-            clip: true
-            Text {
-                text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
-                      "<b>Navigation:</b><br>" +
-                      "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
-                      "&nbsp;&nbsp;K / Left Arrow: Previous Image<br><br>" +
-                      "<b>Viewing:</b><br>" +
-                      "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
-                      "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
-                      "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br>" +
-                      "&nbsp;&nbsp;G: Toggle Grid View (not implemented)<br><br>" +
-                      "<b>Rating & Stacking:</b><br>" +
-                      "&nbsp;&nbsp;Space: Toggle Flag<br>" +
-                      "&nbsp;&nbsp;X: Toggle Reject<br>" +
-                      "&nbsp;&nbsp;S: Add to selection for Helicon<br>" +
-                      "&nbsp;&nbsp;[: Begin new stack<br>" +
-                      "&nbsp;&nbsp;]: End current stack<br>" +
-                      "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
-                      "<b>Actions:</b><br>" +
-                      "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
-                      "&nbsp;&nbsp;E: Edit in Photoshop<br>" +
-                      "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
-                padding: 10
-                wrapMode: Text.WordWrap
-                color: root.currentTextColor
-            }
+        contentItem: Text {
+            text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
+                  "<b>Navigation:</b><br>" +
+                  "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
+                  "&nbsp;&nbsp;K / Left Arrow: Previous Image<br><br>" +
+                  "<b>Viewing:</b><br>" +
+                  "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
+                  "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
+                  "&nbsp;&nbsp;G: Toggle Grid View (not implemented)<br><br>" +
+                  "<b>Rating & Stacking:</b><br>" +
+                  "&nbsp;&nbsp;Space: Toggle Flag<br>" +
+                  "&nbsp;&nbsp;X: Toggle Reject<br>" +
+                  "&nbsp;&nbsp;S: Add to selection for Helicon<br>" +
+                  "&nbsp;&nbsp;[: Begin new stack<br>" +
+                  "&nbsp;&nbsp;]: End current stack<br>" +
+                  "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
+                  "<b>Actions:</b><br>" +
+                  "&nbsp;&nbsp;Enter: Launch Helicon Focus"
+            padding: 10
+            wrapMode: Text.WordWrap
+            color: root.currentTextColor
         }
     }
 
@@ -318,11 +287,9 @@ ApplicationWindow {
     }
 
     FilterDialog {
-    id: filterDialog
-    onAccepted: {
-        controller.apply_filter(filterString)
+        id: filterDialog
+        onAccepted: {
+            uiState.applyFilter(filterString)
+        }
     }
-}
-
-
 }
