@@ -2,14 +2,73 @@
 
 import logging
 import os
+import io
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import List, Dict, Optional, Callable
 import mmap
 
+import numpy as np
+from PIL import Image as PILImage, ImageCms
+
 from faststack.models import ImageFile, DecodedImage
 from faststack.imaging.jpeg import decode_jpeg_rgb, decode_jpeg_resized
+from faststack.config import config
 
 log = logging.getLogger(__name__)
+
+# ---- Option C: ICC Color Management Setup ----
+SRGB_PROFILE = ImageCms.createProfile("sRGB")
+
+def get_monitor_profile():
+    """Dynamically load monitor ICC profile based on current config."""
+    try:
+        monitor_icc_path = config.get('color', 'monitor_icc_path', fallback="").strip()
+        if monitor_icc_path:
+            profile = ImageCms.ImageCmsProfile(monitor_icc_path)
+            log.debug(f"Loaded monitor ICC profile: {monitor_icc_path}")
+            return profile
+        else:
+            log.warning("ICC mode enabled but no monitor_icc_path configured")
+            return None
+    except Exception as e:
+        log.warning(f"Failed to load monitor ICC profile: {e}")
+        return None
+
+
+def apply_saturation_compensation(
+    arr: np.ndarray,
+    width: int,
+    height: int,
+    bytes_per_line: int,
+    factor: float,
+):
+    """
+    In-place saturation scale in RGB space (Option A).
+
+    arr: 1D uint8 array of length height * bytes_per_line
+    width, height, bytes_per_line: dimensions of the image stored in arr
+    factor: 1.0 = no change, <1.0 = less saturated, >1.0 = more saturated
+    """
+    if factor == 1.0:
+        return
+
+    # Treat the buffer as [height, bytes_per_line]
+    buf2d = arr.reshape((height, bytes_per_line))
+
+    # Only the first width*3 bytes per row are actual RGB pixels
+    rgb_region = buf2d[:, : width * 3]
+
+    # Interpret as H x W x 3
+    rgb = rgb_region.reshape((height, width, 3)).astype(np.float32)
+
+    # Simple saturation scaling: move each channel toward its per-pixel average
+    gray = rgb.mean(axis=2, keepdims=True)
+    rgb = gray + factor * (rgb - gray)
+
+    np.clip(rgb, 0, 255, out=rgb)
+
+    # Write back into the same memory
+    rgb_region[:] = rgb.reshape(height, width * 3).astype(np.uint8)
 
 class Prefetcher:
     def __init__(self, image_files: List[ImageFile], cache_put: Callable, prefetch_radius: int, get_display_info: Callable):
@@ -77,32 +136,102 @@ class Prefetcher:
             return None
 
         try:
-            # Memory-mapped file reading (faster than traditional read)
-            with open(image_file.path, "rb") as f:
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
-                    jpeg_bytes = mmapped[:]
-            
-            buffer = decode_jpeg_resized(jpeg_bytes, display_width, display_height)
-            if buffer is not None:
-                # Re-check generation before caching to prevent race conditions
-                if self.generation != local_generation:
-                    log.debug(f"Generation changed for index {index} before caching. Skipping cache_put.")
-                    return None
+            # Get current color management mode
+            color_mode = config.get('color', 'mode', fallback="none").lower()
 
+            # Option C: Full ICC pipeline with Pillow
+            if color_mode == "icc":
+                monitor_profile = get_monitor_profile()
+                
+                if monitor_profile is not None:
+                    img = PILImage.open(str(image_file.path))
+                    
+                    # Resize before color conversion for speed
+                    if display_width > 0 and display_height > 0:
+                        img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                    
+                    # Extract embedded ICC profile or assume sRGB
+                    icc_bytes = img.info.get("icc_profile")
+                    src_profile = None
+                    
+                    if icc_bytes:
+                        try:
+                            src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+                            log.debug(f"Using embedded ICC profile from {image_file.path}")
+                        except Exception as e:
+                            log.warning(f"Failed to parse ICC profile from {image_file.path}: {e}")
+                    
+                    if src_profile is None:
+                        src_profile = SRGB_PROFILE
+                        log.debug(f"No embedded profile, assuming sRGB for {image_file.path}")
+                    
+                    # Convert from source profile to monitor profile
+                    log.debug(f"Converting image from source to monitor profile")
+                    img = ImageCms.profileToProfile(
+                        img,
+                        src_profile,
+                        monitor_profile,
+                        outputMode="RGB",
+                    )
+                    
+                    rgb = np.array(img, dtype=np.uint8)
+                    h, w, _ = rgb.shape
+                    bytes_per_line = w * 3
+                    arr = rgb.reshape(-1).copy()
+                else:
+                    # Fall back to standard decode if ICC profile not available
+                    log.warning("ICC mode selected but no monitor profile available, using standard decode")
+                    with open(image_file.path, "rb") as f:
+                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                            jpeg_bytes = mmapped[:]
+                    
+                    buffer = decode_jpeg_resized(jpeg_bytes, display_width, display_height)
+                    if buffer is None:
+                        return None
+                    
+                    h, w, _ = buffer.shape
+                    bytes_per_line = w * 3
+                    arr = buffer.reshape(-1).copy()
+            
+            else:
+                # Standard decode path (Option A or no color management)
+                with open(image_file.path, "rb") as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                        jpeg_bytes = mmapped[:]
+                
+                buffer = decode_jpeg_resized(jpeg_bytes, display_width, display_height)
+                if buffer is None:
+                    return None
+                    
                 h, w, _ = buffer.shape
-                # In a real Qt app, we would create the QImage here in the main thread
-                # For now, we'll just store the raw buffer data.
-                decoded_image = DecodedImage(
-                    buffer=buffer.data,
-                    width=w,
-                    height=h,
-                    bytes_per_line=w * 3,
-                    format=None # Placeholder for QImage.Format.Format_RGB888
-                )
-                cache_key = f"{index}_{display_generation}"
-                self.cache_put(cache_key, decoded_image)
-                log.debug(f"Successfully decoded and cached image at index {index} for display gen {display_generation}")
-                return index, display_generation
+                bytes_per_line = w * 3
+                arr = buffer.reshape(-1).copy()
+                
+                # Option A: Saturation compensation
+                if color_mode == "saturation":
+                    try:
+                        factor = float(config.get('color', 'saturation_factor', fallback="1.0"))
+                        apply_saturation_compensation(arr, w, h, bytes_per_line, factor)
+                    except Exception as e:
+                        log.warning(f"Failed to apply saturation compensation: {e}")
+            
+            # Re-check generation before caching
+            if self.generation != local_generation:
+                log.debug(f"Generation changed for index {index} before caching. Skipping cache_put.")
+                return None
+            
+            decoded_image = DecodedImage(
+                buffer=arr.data,
+                width=w,
+                height=h,
+                bytes_per_line=bytes_per_line,
+                format=None # Placeholder for QImage.Format.Format_RGB888
+            )
+            cache_key = f"{index}_{display_generation}"
+            self.cache_put(cache_key, decoded_image)
+            log.debug(f"Successfully decoded and cached image at index {index} for display gen {display_generation}")
+            return index, display_generation
+            
         except Exception as e:
             log.error(f"Error decoding image {image_file.path} at index {index}: {e}")
         

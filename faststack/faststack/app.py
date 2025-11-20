@@ -25,7 +25,7 @@ from PySide6.QtCore import (
     Qt, 
     QPoint
 )
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from PySide6.QtQml import QQmlApplicationEngine
 
 # ⬇️ these are the ones that went missing
@@ -110,6 +110,10 @@ class AppController(QObject):
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
+        
+        # -- Delete/Undo State --
+        self.recycle_bin_dir = self.image_dir / "image recycle bin"
+        self.delete_history: List[tuple[Path, Optional[Path]]] = []  # [(jpg_path, raw_path), ...]
 
         self.resize_timer = QTimer()
         self.resize_timer.setSingleShot(True)
@@ -516,6 +520,63 @@ class AppController(QObject):
         # tell QML it changed (once is enough)
         self.ui_state.themeChanged.emit()
 
+    @Slot(result=str)
+    def get_color_mode(self):
+        """Returns current color management mode: 'none', 'saturation', or 'icc'."""
+        return config.get('color', 'mode', fallback='none')
+
+    @Slot(str)
+    def set_color_mode(self, mode: str):
+        """Sets color management mode and clears cache to force re-decode."""
+        if mode not in ['none', 'saturation', 'icc']:
+            log.error(f"Invalid color mode: {mode}")
+            return
+        
+        log.info(f"Setting color mode to: {mode}")
+        config.set('color', 'mode', mode)
+        config.save()
+        
+        # Clear cache and restart prefetcher to apply new color mode
+        self.image_cache.clear()
+        self.prefetcher.cancel_all()
+        self.display_generation += 1
+        self.prefetcher.update_prefetch(self.current_index)
+        self.sync_ui_state()
+        
+        # Notify QML that color mode changed
+        self.ui_state.colorModeChanged.emit()
+        
+        # Update status message
+        mode_names = {
+            'none': 'Original Colors',
+            'saturation': 'Saturation Compensation',
+            'icc': 'Full ICC Profile'
+        }
+        self.update_status_message(f"Color mode: {mode_names.get(mode, mode)}")
+
+    @Slot(result=float)
+    def get_saturation_factor(self):
+        """Returns current saturation factor (0.0-1.0)."""
+        return config.getfloat('color', 'saturation_factor', fallback=0.85)
+
+    @Slot(float)
+    def set_saturation_factor(self, factor: float):
+        """Sets saturation factor and refreshes images."""
+        factor = max(0.0, min(1.0, factor))  # Clamp to 0-1
+        log.info(f"Setting saturation factor to: {factor}")
+        config.set('color', 'saturation_factor', str(factor))
+        config.save()
+        
+        # Only refresh if in saturation mode
+        if self.get_color_mode() == 'saturation':
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self.display_generation += 1
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
+        
+        # Notify QML
+        self.ui_state.saturationFactorChanged.emit()
 
     def get_default_directory(self):
         return config.get('core', 'default_directory')
@@ -577,8 +638,133 @@ class AppController(QObject):
         self.ui_state.preloadProgress = 0
         log.info("Finished preloading all images.")
 
+    @Slot()
+    def delete_current_image(self):
+        """Moves current JPG and RAW to recycle bin."""
+        if not self.image_files:
+            self.update_status_message("No image to delete.")
+            return
+        
+        image_file = self.image_files[self.current_index]
+        jpg_path = image_file.path
+        raw_path = image_file.raw_pair
+        
+        # Create recycle bin if it doesn't exist
+        try:
+            self.recycle_bin_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.update_status_message(f"Failed to create recycle bin: {e}")
+            log.error(f"Failed to create recycle bin directory: {e}")
+            return
+        
+        # Move files to recycle bin
+        deleted_files = []
+        try:
+            if jpg_path.exists():
+                dest = self.recycle_bin_dir / jpg_path.name
+                jpg_path.rename(dest)
+                deleted_files.append(jpg_path.name)
+                log.info(f"Moved {jpg_path.name} to recycle bin")
+            
+            if raw_path and raw_path.exists():
+                dest = self.recycle_bin_dir / raw_path.name
+                raw_path.rename(dest)
+                deleted_files.append(raw_path.name)
+                log.info(f"Moved {raw_path.name} to recycle bin")
+            
+            # Add to delete history for undo
+            self.delete_history.append((jpg_path, raw_path))
+            
+            # Update status
+            files_str = ", ".join(deleted_files)
+            self.update_status_message(f"Deleted: {files_str}")
+            
+            # Refresh image list and move to next image
+            self.refresh_image_list()
+            if self.image_files:
+                # Stay at same index (which now shows the next image)
+                self.current_index = min(self.current_index, len(self.image_files) - 1)
+                # Clear cache and invalidate display generation to force image reload
+                self.display_generation += 1
+                self.image_cache.clear()
+                # update_prefetch will handle cancelling stale tasks and incrementing generation
+                self.prefetcher.update_prefetch(self.current_index)
+                self.sync_ui_state()
+            
+        except OSError as e:
+            self.update_status_message(f"Delete failed: {e}")
+            log.error(f"Failed to delete image: {e}")
+
+    @Slot()
+    def undo_delete(self):
+        """Restores the last deleted image from recycle bin."""
+        if not self.delete_history:
+            self.update_status_message("Nothing to undo.")
+            return
+        
+        jpg_path, raw_path = self.delete_history.pop()
+        
+        restored_files = []
+        try:
+            # Restore JPG
+            jpg_in_bin = self.recycle_bin_dir / jpg_path.name
+            if jpg_in_bin.exists():
+                jpg_in_bin.rename(jpg_path)
+                restored_files.append(jpg_path.name)
+                log.info(f"Restored {jpg_path.name} from recycle bin")
+            
+            # Restore RAW
+            if raw_path:
+                raw_in_bin = self.recycle_bin_dir / raw_path.name
+                if raw_in_bin.exists():
+                    raw_in_bin.rename(raw_path)
+                    restored_files.append(raw_path.name)
+                    log.info(f"Restored {raw_path.name} from recycle bin")
+            
+            # Update status
+            files_str = ", ".join(restored_files)
+            self.update_status_message(f"Restored: {files_str}")
+            
+            # Refresh image list
+            self.refresh_image_list()
+            
+            # Find and navigate to the restored image
+            for i, img_file in enumerate(self.image_files):
+                if img_file.path == jpg_path:
+                    self.current_index = i
+                    break
+            
+            # Clear cache and invalidate display generation to force image reload
+            self.display_generation += 1
+            self.image_cache.clear()
+            # update_prefetch will handle cancelling stale tasks and incrementing generation
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
+            
+        except OSError as e:
+            self.update_status_message(f"Undo failed: {e}")
+            log.error(f"Failed to restore image: {e}")
+            # Put it back in history if it failed
+            self.delete_history.append((jpg_path, raw_path))
+
     def shutdown(self):
         log.info("Application shutting down.")
+        
+        # Check if recycle bin has files and prompt to empty
+        if self.recycle_bin_dir.exists():
+            files_in_bin = list(self.recycle_bin_dir.glob("*"))
+            if files_in_bin:
+                reply = QMessageBox.question(
+                    None,
+                    "Empty Recycle Bin?",
+                    f"There are {len(files_in_bin)} files in the recycle bin. Do you want to permanently delete them?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    self.empty_recycle_bin()
+        
         # Clear QML context property to prevent TypeErrors during shutdown
         if self.engine:
             log.info("Clearing uiState context property in QML.")
@@ -589,13 +775,35 @@ class AppController(QObject):
         self.sidecar.set_last_index(self.current_index)
         self.sidecar.save()
 
+    def empty_recycle_bin(self):
+        """Permanently deletes all files in the recycle bin."""
+        if not self.recycle_bin_dir.exists():
+            return
+        
+        try:
+            import shutil
+            shutil.rmtree(self.recycle_bin_dir)
+            log.info("Emptied recycle bin")
+        except OSError as e:
+            log.error(f"Failed to empty recycle bin: {e}")
+
     @Slot()
     def edit_in_photoshop(self):
         if not self.image_files:
             self.update_status_message("No image to edit.")
             return
 
-        current_image_path = self.image_files[self.current_index].path
+        # Prefer RAW file if it exists, otherwise use JPG
+        image_file = self.image_files[self.current_index]
+        raw_path = image_file.raw_pair
+        
+        if raw_path and raw_path.exists():
+            current_image_path = raw_path
+            log.info(f"Using RAW file for Photoshop: {raw_path}")
+        else:
+            current_image_path = image_file.path
+            log.info(f"Using JPG file for Photoshop: {current_image_path}")
+        
         photoshop_exe = config.get('photoshop', 'exe')
         photoshop_args = config.get('photoshop', 'args')
 
