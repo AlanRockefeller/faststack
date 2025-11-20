@@ -7,6 +7,13 @@ from PySide6.QtQuick import QQuickImageProvider
 
 from faststack.models import DecodedImage
 
+# Try to import QColorSpace if available (Qt 6+)
+try:
+    from PySide6.QtGui import QColorSpace
+    HAS_COLOR_SPACE = True
+except ImportError:
+    HAS_COLOR_SPACE = False
+
 log = logging.getLogger(__name__)
 
 
@@ -35,6 +42,19 @@ class ImageProvider(QQuickImageProvider):
                     image_data.bytes_per_line,
                     QImage.Format.Format_RGB888
                 )
+                # Set sRGB color space for proper color management (if available)
+                # This tells Qt: "this decoded image data is in sRGB color space"
+                if HAS_COLOR_SPACE:
+                    try:
+                        cs = QColorSpace.fromNamedColorSpace(
+                            QColorSpace.NamedColorSpace.SRgb
+                        )
+                        qimg.setColorSpace(cs)
+                        log.debug("Applied sRGB color space to image")
+                    except Exception as e:
+                        log.warning(f"Failed to set color space: {e}")
+                else:
+                    log.debug("QColorSpace not available in this PySide6 version")
                 # keep buffer alive
                 qimg.original_buffer = image_data.buffer
                 return qimg

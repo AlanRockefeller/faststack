@@ -62,9 +62,10 @@ def test_suspicious_path_with_traversal():
         mock_path_instance.__str__ = lambda self: r"C:\Windows\System32\malware.exe"
         
         # The normalized path will differ from input, triggering warning
-        is_valid, error = validate_executable_path(suspicious_path)
-        # Should still pass but with a warning logged
-        # (in production, you might want to make this fail)
+        with patch('faststack.io.executable_validator._is_subpath', return_value=False):
+            is_valid, error = validate_executable_path(suspicious_path)
+            # Warning is logged for suspicious path, but doesn't fail with allow_custom_paths=True
+            assert is_valid  # Default allow_custom_paths=True means it passes with warning
 
 
 def test_non_exe_file():

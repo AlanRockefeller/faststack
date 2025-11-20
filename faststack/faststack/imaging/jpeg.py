@@ -10,7 +10,7 @@ log = logging.getLogger(__name__)
 
 # Attempt to import PyTurboJPEG
 try:
-    from turbojpeg import TurboJPEG, TJFLAG_FASTDCT, TJPF_RGB
+    from turbojpeg import TurboJPEG, TJPF_RGB
     jpeg_decoder = TurboJPEG()
     TURBO_AVAILABLE = True
     log.info("PyTurboJPEG is available. Using for JPEG decoding.")
@@ -23,8 +23,9 @@ def decode_jpeg_rgb(jpeg_bytes: bytes) -> Optional[np.ndarray]:
     """Decodes JPEG bytes into an RGB numpy array."""
     if TURBO_AVAILABLE and jpeg_decoder:
         try:
-            # The flags prevent upsampling of chroma channels, which is faster.
-            return jpeg_decoder.decode(jpeg_bytes, pixel_format=TJPF_RGB, flags=TJFLAG_FASTDCT)
+            # Decode with proper color space handling (no TJFLAG_FASTDCT)
+            # This ensures proper YCbCr->RGB conversion with correct gamma
+            return jpeg_decoder.decode(jpeg_bytes, pixel_format=TJPF_RGB, flags=0)
         except Exception as e:
             log.exception(f"PyTurboJPEG failed to decode image: {e}. Trying Pillow.")
             # Fall through to Pillow fallback
@@ -55,7 +56,7 @@ def decode_jpeg_thumb_rgb(
                 jpeg_bytes,
                 scaling_factor=scaling_factor,
                 pixel_format=TJPF_RGB,
-                flags=TJFLAG_FASTDCT,
+                flags=0,  # Proper color space handling
             )
             if decoded.shape[0] > max_dim or decoded.shape[1] > max_dim:
                 img = Image.fromarray(decoded)
@@ -115,7 +116,7 @@ def decode_jpeg_resized(
                     jpeg_bytes, 
                     scaling_factor=scale_factor,
                     pixel_format=TJPF_RGB, 
-                    flags=TJFLAG_FASTDCT
+                    flags=0  # Proper color space handling
                 )
                 
                 # Only use Pillow for final resize if needed

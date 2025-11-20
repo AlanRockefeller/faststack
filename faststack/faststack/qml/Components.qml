@@ -87,22 +87,52 @@ Item {
         anchors.fill: parent
         acceptedButtons: Qt.LeftButton
         
-        // Simple drag-to-pan placeholder
+        // Drag-to-pan with drag-and-drop when dragging outside window
         property real lastX: 0
         property real lastY: 0
+        property real startX: 0
+        property real startY: 0
+        property bool isDraggingOutside: false
+        property int dragThreshold: 10  // Minimum distance before checking for outside drag
 
         onPressed: function(mouse) {
             lastX = mouse.x
             lastY = mouse.y
+            startX = mouse.x
+            startY = mouse.y
+            isDraggingOutside = false
         }
 
         onPositionChanged: function(mouse) {
-            if (pressed) {
+            if (pressed && !isDraggingOutside) {
+                // Check if we've moved beyond the threshold
+                var dx = mouse.x - startX
+                var dy = mouse.y - startY
+                var distance = Math.sqrt(dx*dx + dy*dy)
+                
+                if (distance > dragThreshold) {
+                    // Check if mouse is outside the window bounds
+                    var globalPos = mapToItem(null, mouse.x, mouse.y)
+                    
+                    if (globalPos.x < 0 || globalPos.y < 0 || 
+                        globalPos.x > loupeView.width || globalPos.y > loupeView.height) {
+                        // Mouse is outside window - initiate drag-and-drop
+                        isDraggingOutside = true
+                        controller.start_drag_current_image()
+                        return
+                    }
+                }
+                
+                // Normal pan behavior
                 panTransform.x += (mouse.x - lastX)
                 panTransform.y += (mouse.y - lastY)
                 lastX = mouse.x
                 lastY = mouse.y
             }
+        }
+        
+        onReleased: function(mouse) {
+            isDraggingOutside = false
         }
 
         // Wheel for zoom
