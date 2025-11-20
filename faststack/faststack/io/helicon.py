@@ -66,7 +66,7 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
                 parsed_args = shlex.split(extra_args, posix=(os.name != 'nt'))
                 args.extend(parsed_args)
             except ValueError as e:
-                log.error(f"Invalid helicon args format: {e}")
+                log.exception(f"Invalid helicon args format: {e}")
                 return False, None
 
         log.info(f"Launching Helicon Focus with {len(raw_files)} files.")

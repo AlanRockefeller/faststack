@@ -44,7 +44,7 @@ def validate_executable_path(
     try:
         path = Path(exe_path).resolve()
     except (ValueError, OSError) as e:
-        log.error(f"Invalid path format: {exe_path}: {e}")
+        log.exception(f"Invalid path format: {exe_path}")
         return False, f"Invalid path format: {e}"
     
     # Check if file exists
@@ -88,8 +88,8 @@ def validate_executable_path(
         normalized = os.path.normpath(exe_path)
         if ".." in normalized or normalized != str(path):
             log.warning(f"Suspicious path detected: {exe_path}")
-    except Exception as e:
-        log.error(f"Error normalizing path: {e}")
+    except (ValueError, OSError) as e:
+        log.exception("Error normalizing path")
         return False, f"Path validation error: {e}"
     
     return True, None

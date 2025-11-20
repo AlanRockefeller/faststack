@@ -140,6 +140,7 @@ ApplicationWindow {
                 var delta = Qt.point(mouse.x - lastMousePos.x, mouse.y - lastMousePos.y)
                 root.x += delta.x
                 root.y += delta.y
+                lastMousePos = Qt.point(mouse.x, mouse.y)
             }
         }
 
@@ -208,7 +209,8 @@ ApplicationWindow {
                         font.pixelSize: 12
                         elide: Text.ElideMiddle
                         Layout.maximumWidth: 600
-                        Layout.alignment: Qt.AlignVCenter
+                        Layout.alignment: Qt.AlignTop | Qt.AlignHCenter
+                        Layout.topMargin: 5
                         horizontalAlignment: Text.AlignHCenter
                     }
 
