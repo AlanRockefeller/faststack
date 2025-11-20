@@ -3,22 +3,9 @@
 ## [0.8.0] - 2025-11-20
 
 ### Added
-- Backspace key now deletes images (in addition to Delete key)
-- Photoshop integration now automatically uses RAW files when available, falling back to JPG
-
-### Fixed
-- Fixed QML syntax error in Main.qml dialog structure (extra closing brace)
-- Fixed image display not updating immediately after delete operations
-- Fixed image display not updating correctly after undo/restore operations
-- Fixed grey box display issue when navigating after delete/restore operations
-- Fixed prefetcher generation mismatch causing cache failures after delete/undo
-- Restored images now display correctly at their original position in the list
-
-### Changed
-- Delete operations now immediately show the next image in the list
-- Undo operations now navigate to and display the restored image
-- Image cache is properly cleared and display generation incremented after delete/restore operations
-- Prefetcher properly handles generation counter to avoid cache mismatches
+- Backspace key now deletes images (in addition to Delete key).   Control-Z restores.
+- Photoshop integration now automatically uses RAW files when available, falling back to JPG.
+- We now have some new color modes in the view menu to make the images in your monitor reflect reality.   ICC profile mode works best on my system - try it if the images are over-saturated - or turn down the saturation in saturation mode.   Test it out by loading an image in Faststack and Photoshop or another image viewer and make sure the colors look the same.
 
 ## [0.7.0] - 2025-11-20
 
