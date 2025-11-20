@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Window
 
 // This file is intended to hold QML components like the main image view.
 // For simplicity, we'll start with just the main image view.
@@ -6,6 +7,17 @@ import QtQuick
 Item {
     id: loupeView
     anchors.fill: parent
+
+    // Connection to handle zoom/pan reset signal from Python
+    Connections {
+        target: uiState
+        function onResetZoomPanRequested() {
+            scaleTransform.xScale = 1.0
+            scaleTransform.yScale = 1.0
+            panTransform.x = 0
+            panTransform.y = 0
+        }
+    }
 
     // The main image display
     Image {
@@ -17,7 +29,8 @@ Item {
 
         Component.onCompleted: {
             if (width > 0 && height > 0) {
-                uiState.onDisplaySizeChanged(width, height)
+                var dpr = Screen.devicePixelRatio
+                uiState.onDisplaySizeChanged(Math.round(width * dpr), Math.round(height * dpr))
             }
         }
 
@@ -63,7 +76,8 @@ Item {
         running: false
         onTriggered: {
             if (mainImage.width > 0 && mainImage.height > 0) {
-                uiState.onDisplaySizeChanged(mainImage.width, mainImage.height)
+                var dpr = Screen.devicePixelRatio
+                uiState.onDisplaySizeChanged(Math.round(mainImage.width * dpr), Math.round(mainImage.height * dpr))
             }
             running = false
         }

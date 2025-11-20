@@ -1,3 +1,24 @@
+Metadata-Version: 2.4
+Name: faststack
+Version: 0.6
+Summary: Ultra-fast JPG Viewer for Focus Stacking Selection
+Author-email: Alan Rockefeller <alanrockefeller@gmail.com>
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: Microsoft :: Windows
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: PySide6<7.0,>=6.0
+Requires-Dist: PyTurboJPEG<2.0,>=1.8
+Requires-Dist: numpy<3.0,>=2.0
+Requires-Dist: cachetools<6.0,>=5.0
+Requires-Dist: watchdog<5.0,>=4.0
+Requires-Dist: typer<1.0,>=0.12
+Requires-Dist: Pillow<11.0,>=10.0
+Requires-Dist: pytest<9.0,>=8.0
+Dynamic: license-file
+
 # FastStack
 
 # Version 0.4 - November 2, 2025
@@ -17,11 +38,6 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
 - **Sidecar Metadata:** Saves flags, rejections, and stack groupings to a non-destructive `faststack.json` file.
 - **Configurable:** Adjust cache sizes, prefetch behavior, and Helicon Focus path via a settings dialog and a persistent `.ini` file.
-- **Photoshop Integration:** Edit current image in Photoshop (E key)
-- **Clipboard Support:** Copy image path to clipboard (Ctrl+C)
-- **Image Filtering:** Filter images by filename
-- **Drag & Drop:** Drag images to external applications
-- **Theme Support:** Toggle between light and dark themes
 
 ## Installation & Usage
 
@@ -46,6 +62,3 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - `Space`: Toggle Flag
 - `X`: Toggle Reject
 - `Enter`: Launch Helicon Focus with selected RAWs
-- `E`: Edit in Photoshop
-- `Ctrl+C`: Copy image path to clipboard
-- `C`: Clear all stacks

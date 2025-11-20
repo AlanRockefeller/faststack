@@ -43,6 +43,7 @@ class Keybinder:
 
         self.modifier_key_map = {
             (Qt.Key_C, Qt.ControlModifier): "copy_path_to_clipboard",
+            (Qt.Key_0, Qt.ControlModifier): "reset_zoom_pan",
         }
 
     def _call(self, method_name: str):
