@@ -14,7 +14,7 @@ Dialog {
     property int maxImageCount: 0
 
     // Inherit Material theme from parent
-    Material.theme: Material.Dark
+    Material.theme: uiState && uiState.theme === 0 ? Material.Dark : Material.Light
     Material.accent: "#4fb360"
 
     onOpened: {

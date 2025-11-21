@@ -23,44 +23,40 @@ Dialog {
         radius: 4
     }
 
-    contentItem: Item {
-        
-        Column {
-            spacing: 16
-            anchors.fill: parent
-            anchors.margins: 20
+    contentItem: Column {
+        spacing: 16
+        padding: 20
 
-            Label {
-                text: "Show only images whose filename contains:"
-                wrapMode: Text.WordWrap
-                width: parent.width
-            }
+        Label {
+            text: "Show only images whose filename contains:"
+            wrapMode: Text.WordWrap
+            width: parent.width - parent.padding * 2
+        }
 
-            TextField {
-                id: filterField
-                placeholderText: "Enter text to filter (e.g., 'stacked', 'IMG_001')..."
-                width: parent.width
-                height: 50
-                selectByMouse: true
-                focus: true
-                font.pixelSize: 16
-                verticalAlignment: TextInput.AlignVCenter
-                
-                onTextChanged: {
-                    filterDialog.filterString = text
-                }
-                
-                Keys.onReturnPressed: filterDialog.accept()
-                Keys.onEnterPressed: filterDialog.accept()
+        TextField {
+            id: filterField
+            placeholderText: "Enter text to filter (e.g., 'stacked', 'IMG_001')..."
+            width: parent.width - parent.padding * 2
+            height: 50
+            selectByMouse: true
+            focus: true
+            font.pixelSize: 16
+            verticalAlignment: TextInput.AlignVCenter
+            
+            onTextChanged: {
+                filterDialog.filterString = text
             }
+            
+            Keys.onReturnPressed: filterDialog.accept()
+            Keys.onEnterPressed: filterDialog.accept()
+        }
 
-            Label {
-                text: "Leave empty to show all images."
-                font.italic: true
-                opacity: 0.7
-                wrapMode: Text.WordWrap
-                width: parent.width
-            }
+        Label {
+            text: "Leave empty to show all images."
+            font.italic: true
+            opacity: 0.7
+            wrapMode: Text.WordWrap
+            width: parent.width - parent.padding * 2
         }
     }
 

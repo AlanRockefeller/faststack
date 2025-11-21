@@ -415,7 +415,7 @@ class AppController(QObject):
             self.update_status_message(f"Jumped to image {index + 1}")
         else:
             log.warning("Invalid image index: %d", index)
-            self.update_status_message(f"Invalid image number")
+            self.update_status_message("Invalid image number")
 
     def show_jump_to_image_dialog(self):
         """Shows the jump to image dialog (called from keybinder)."""
