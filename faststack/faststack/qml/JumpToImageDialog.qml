@@ -20,7 +20,6 @@ Dialog {
     onOpened: {
         imageNumberField.text = ""
         imageNumberField.forceActiveFocus()
-        imageNumberField.selectAll()
         // Notify Python that a dialog is open
         controller.dialog_opened()
     }
@@ -60,7 +59,7 @@ Dialog {
                 placeholderText: "Number"
                 font.pixelSize: 16
                 horizontalAlignment: TextInput.AlignHCenter
-                maximumLength: 4
+                maximumLength: Math.max(1, Math.ceil(Math.log10(jumpDialog.maxImageCount + 1)))
                 selectByMouse: true
                 focus: true
                 validator: IntValidator {

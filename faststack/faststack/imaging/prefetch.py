@@ -208,17 +208,20 @@ class Prefetcher:
         log.debug("Prefetch range: [%d, %d) for index %d (direction=%d, behind=%d, ahead=%d)", 
                   start, end, current_index, self._last_navigation_direction, behind, ahead)
 
-        # Cancel stale futures
+        # Get scheduled set for current generation
+        scheduled = self._scheduled.setdefault(self.generation, set())
+        
+        # Cancel stale futures and remove from scheduled
         stale_keys = []
-        for index, future in self.futures.items():
+        for index, future in list(self.futures.items()):
             if index < start or index >= end:
-                future.cancel()
-                stale_keys.append(index)
+                if future.cancel():
+                    stale_keys.append(index)
+                    scheduled.discard(index)  # Remove from scheduled set
         for key in stale_keys:
             del self.futures[key]
 
         # Submit new tasks - prioritize current image and direction of travel
-        scheduled = self._scheduled.setdefault(self.generation, set())
         
         # Build priority order: current first, then in direction of travel
         priority_order = [current_index]

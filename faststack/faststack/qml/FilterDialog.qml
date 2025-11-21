@@ -8,8 +8,8 @@ Dialog {
     modal: true
     standardButtons: Dialog.Ok | Dialog.Cancel
     closePolicy: Popup.CloseOnEscape
-    width: 400
-    height: 200
+    width: 500
+    height: 250
 
     property string filterString: ""
 
@@ -38,11 +38,13 @@ Dialog {
 
             TextField {
                 id: filterField
-                text: filterDialog.filterString
                 placeholderText: "Enter text to filter (e.g., 'stacked', 'IMG_001')..."
                 width: parent.width
+                height: 50
                 selectByMouse: true
                 focus: true
+                font.pixelSize: 16
+                verticalAlignment: TextInput.AlignVCenter
                 
                 onTextChanged: {
                     filterDialog.filterString = text

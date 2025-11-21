@@ -419,8 +419,10 @@ class AppController(QObject):
 
     def show_jump_to_image_dialog(self):
         """Shows the jump to image dialog (called from keybinder)."""
-        # This will be called by the main window QML function
-        pass
+        if self.main_window and hasattr(self.main_window, 'show_jump_to_image_dialog'):
+            self.main_window.show_jump_to_image_dialog()
+        else:
+            log.warning("Cannot open jump to image dialog: main_window or function not available")
     
     @Slot()
     def dialog_opened(self):
