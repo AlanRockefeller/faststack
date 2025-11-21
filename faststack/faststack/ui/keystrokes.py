@@ -21,9 +21,7 @@ class Keybinder:
             Qt.Key_Right: "next_image",
             Qt.Key_K: "prev_image",
             Qt.Key_Left: "prev_image",
-
-            # View Mode
-            Qt.Key_G: "toggle_grid_view",
+            Qt.Key_G: "show_jump_to_image_dialog",
 
             # Metadata
             Qt.Key_Space: "toggle_current_flag",

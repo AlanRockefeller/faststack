@@ -14,6 +14,7 @@
 ### Features
 - **JPG Fallback for Helicon:** Helicon Focus stacking now works with JPG-only workflows when RAW files absent.
 - **Comprehensive Timing Instrumentation:** Added detailed decode timing logs in debug mode for performance analysis.
+- **Added a Jump to Photo feature that can be activated by pressing the G key
 
 ## [0.8.0] - 2025-11-20
 

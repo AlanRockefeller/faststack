@@ -274,6 +274,10 @@ class UIState(QObject):
     @Slot(result=float)
     def get_cache_size(self):
         return self.app_controller.get_cache_size()
+    
+    @Slot(result=float)
+    def get_cache_usage_gb(self):
+        return self.app_controller.get_cache_usage_gb()
 
     @Slot(float)
     def set_cache_size(self, size):

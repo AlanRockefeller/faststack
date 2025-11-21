@@ -34,5 +34,12 @@ def get_decoded_image_size(item) -> int:
     # In the full app, this would also account for the QImage/QTexture.
     from faststack.models import DecodedImage
     if isinstance(item, DecodedImage):
-        return item.buffer.nbytes
+        # Handle both numpy arrays and memoryview buffers
+        if hasattr(item.buffer, 'nbytes'):
+            return item.buffer.nbytes
+        elif hasattr(item.buffer, '__len__'):
+            return len(item.buffer)
+        else:
+            # Fallback: compute from dimensions
+            return item.width * item.height * 3
     return 1 # Should not happen

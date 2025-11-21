@@ -131,6 +131,9 @@ class AppController(QObject):
         self.resize_timer.timeout.connect(self._handle_resize)
         self.pending_width = None
         self.pending_height = None
+        
+        # Track if any dialog is open to disable keybindings
+        self._dialog_open = False
 
 
     @Slot(str)
@@ -200,10 +203,6 @@ class AppController(QObject):
             self.display_ready = True
             log.info("Display size now stable, enabling prefetch")
         
-        # NOTE: We don't clear the cache or cancel prefetch work here.
-        # The generation increment is enough - cache keys include display_generation,
-        # so old resolutions become naturally unreachable and LRU will evict them.
-        # This lets us reuse cached images if user toggles zoom or resizes back.
         self.prefetcher.cancel_all()  # Cancel stale tasks to avoid wasted work
         
         # On first resize, execute deferred prefetch; on subsequent resizes, do normal prefetch
@@ -232,6 +231,10 @@ class AppController(QObject):
         self.ui_state.isZoomedChanged.emit()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        # Don't handle key events when a dialog is open
+        if self._dialog_open:
+            return False
+            
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
             handled = self.keybinder.handle_key_press(event)
             if handled:
@@ -309,8 +312,8 @@ class AppController(QObject):
         where users expect to see the correct image immediately. The prefetcher minimizes
         cache misses by decoding adjacent images in advance.
         """
-        if not self.image_files: # Handle empty image list
-            log.warning("get_decoded_image called with empty image_files.")
+        if not self.image_files or index < 0 or index >= len(self.image_files):
+            log.warning("get_decoded_image called with empty image_files or out of bounds index.")
             return None
 
         _, _, display_gen = self.get_display_info()
@@ -328,7 +331,8 @@ class AppController(QObject):
             decode_start = time.perf_counter()
             log.info("Cache miss for index %d (gen: %d). Blocking decode.", index, display_gen)
         
-        future = self.prefetcher.submit_task(index, self.prefetcher.generation)
+        # Submit with priority=True to cancel pending prefetch tasks and free up workers
+        future = self.prefetcher.submit_task(index, self.prefetcher.generation, priority=True)
         if future:
             try:
                 # Wait for decode to complete (blocking but fast for JPEGs)
@@ -399,6 +403,36 @@ class AppController(QObject):
             self.current_index -= 1
             self._do_prefetch(self.current_index, is_navigation=True, direction=-1)
             self.sync_ui_state()
+
+    @Slot(int)
+    def jump_to_image(self, index: int):
+        """Jump to a specific image by index (0-based)."""
+        if 0 <= index < len(self.image_files):
+            direction = 1 if index > self.current_index else -1
+            self.current_index = index
+            self._do_prefetch(self.current_index, is_navigation=True, direction=direction)
+            self.sync_ui_state()
+            self.update_status_message(f"Jumped to image {index + 1}")
+        else:
+            log.warning("Invalid image index: %d", index)
+            self.update_status_message(f"Invalid image number")
+
+    def show_jump_to_image_dialog(self):
+        """Shows the jump to image dialog (called from keybinder)."""
+        # This will be called by the main window QML function
+        pass
+    
+    @Slot()
+    def dialog_opened(self):
+        """Called when any dialog opens to disable global keybindings."""
+        self._dialog_open = True
+        log.debug("Dialog opened, disabling global keybindings")
+    
+    @Slot()
+    def dialog_closed(self):
+        """Called when any dialog closes to re-enable global keybindings."""
+        self._dialog_open = False
+        log.debug("Dialog closed, re-enabling global keybindings")
 
     def toggle_grid_view(self):
         log.warning("Grid view not implemented yet.")
@@ -611,6 +645,10 @@ class AppController(QObject):
 
     def get_cache_size(self):
         return config.getfloat('core', 'cache_size_gb')
+    
+    def get_cache_usage_gb(self):
+        """Returns current cache usage in GB."""
+        return self.image_cache.currsize / (1024**3)
 
     def set_cache_size(self, size):
         config.set('core', 'cache_size_gb', size)
@@ -885,16 +923,25 @@ class AppController(QObject):
         if self.recycle_bin_dir.exists():
             files_in_bin = list(self.recycle_bin_dir.glob("*"))
             if files_in_bin:
-                reply = QMessageBox.question(
-                    None,
-                    "Empty Recycle Bin?",
-                    f"There are {len(files_in_bin)} files in the recycle bin. Do you want to permanently delete them?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
-                )
+                file_count = len(files_in_bin)
+                msg_box = QMessageBox()
+                msg_box.setWindowTitle("Recycle Bin")
+                msg_box.setText(f"There are {file_count} files in the recycle bin.")
+                msg_box.setInformativeText("What would you like to do?")
                 
-                if reply == QMessageBox.Yes:
+                # Add custom buttons
+                delete_btn = msg_box.addButton("Delete Permanently", QMessageBox.YesRole)
+                restore_btn = msg_box.addButton(f"Restore {file_count} deleted files", QMessageBox.ActionRole)
+                keep_btn = msg_box.addButton("Keep in Recycle Bin", QMessageBox.NoRole)
+                
+                msg_box.setDefaultButton(keep_btn)
+                msg_box.exec()
+                
+                clicked_button = msg_box.clickedButton()
+                if clicked_button == delete_btn:
                     self.empty_recycle_bin()
+                elif clicked_button == restore_btn:
+                    self.restore_all_from_recycle_bin()
         
         # Clear QML context property to prevent TypeErrors during shutdown
         if self.engine:
@@ -916,8 +963,41 @@ class AppController(QObject):
             shutil.rmtree(self.recycle_bin_dir)
             self.delete_history.clear()
             log.info("Emptied recycle bin and cleared delete history")
-        except OSError as e:
+        except OSError:
             log.exception("Failed to empty recycle bin")
+    
+    def restore_all_from_recycle_bin(self):
+        """Restores all files from recycle bin to working directory."""
+        if not self.recycle_bin_dir.exists():
+            return
+        
+        try:
+            files_in_bin = list(self.recycle_bin_dir.glob("*"))
+            restored_count = 0
+            
+            for file_in_bin in files_in_bin:
+                # Restore to original location (working directory)
+                dest_path = self.image_dir / file_in_bin.name
+                
+                # If file already exists, skip (don't overwrite)
+                if dest_path.exists():
+                    log.warning("File already exists, skipping: %s", dest_path)
+                    continue
+                
+                try:
+                    file_in_bin.rename(dest_path)
+                    restored_count += 1
+                    log.info("Restored %s from recycle bin", file_in_bin.name)
+                except OSError as e:
+                    log.error("Failed to restore %s: %s", file_in_bin.name, e)
+            
+            # Clear delete history since we restored everything
+            self.delete_history.clear()
+            
+            log.info("Restored %d files from recycle bin", restored_count)
+            
+        except OSError:
+            log.exception("Failed to restore files from recycle bin")
 
     @Slot()
     def edit_in_photoshop(self):

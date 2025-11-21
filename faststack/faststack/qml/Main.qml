@@ -16,6 +16,7 @@ ApplicationWindow {
     title: "FastStack"
 
     Material.theme: uiState.theme === 0 ? Material.Dark : Material.Light
+    Material.accent: "#4fb360"
 
     property bool isDarkTheme: uiState.theme === 0
     property color currentBackgroundColor: isDarkTheme ? "#000000" : "white"
@@ -320,6 +321,8 @@ ApplicationWindow {
         title: "Key Bindings"
         standardButtons: Dialog.Ok
         modal: true
+        closePolicy: Popup.CloseOnEscape
+        focus: true
         width: 500
         height: 600
 
@@ -331,12 +334,12 @@ ApplicationWindow {
             text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
                   "<b>Navigation:</b><br>" +
                   "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
-                  "&nbsp;&nbsp;K / Left Arrow: Previous Image<br><br>" +
+                  "&nbsp;&nbsp;K / Left Arrow: Previous Image<br>" +
+                  "&nbsp;&nbsp;G: Jump to Image Number<br><br>" +
                   "<b>Viewing:</b><br>" +
                   "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
                   "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
-                  "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br>" +
-                  "&nbsp;&nbsp;G: Toggle Grid View (not implemented)<br><br>" +
+                  "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br><br>" +
                   "<b>Rating & Stacking:</b><br>" +
                   "&nbsp;&nbsp;Space: Toggle Flag<br>" +
                   "&nbsp;&nbsp;X: Toggle Reject<br>" +
@@ -362,6 +365,8 @@ ApplicationWindow {
         title: "Stack Information"
         standardButtons: Dialog.Ok
         modal: true
+        closePolicy: Popup.CloseOnEscape
+        focus: true
         width: 400
         height: 300
 
@@ -382,11 +387,18 @@ ApplicationWindow {
     }
 
     FilterDialog {
-    id: filterDialog
-    onAccepted: {
-        controller.apply_filter(filterString)
+        id: filterDialog
+        onAccepted: {
+            controller.apply_filter(filterString)
+        }
     }
-}
 
+    JumpToImageDialog {
+        id: jumpToImageDialog
+        maxImageCount: uiState.imageCount
+    }
 
+    function show_jump_to_image_dialog() {
+        jumpToImageDialog.open()
+    }
 }

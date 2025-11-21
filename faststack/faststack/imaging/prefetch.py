@@ -3,6 +3,7 @@
 import logging
 import os
 import io
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import List, Dict, Optional, Callable
 import mmap
@@ -26,17 +27,20 @@ _monitor_profile_warning_logged = False
 # Cache for ICC transforms to avoid rebuilding on every image
 _icc_transform_cache: Dict[tuple, ImageCms.ImageCmsTransform] = {}
 
-def get_icc_transform(src_profile: ImageCms.ImageCmsProfile, monitor_profile: ImageCms.ImageCmsProfile):
+def get_icc_transform(src_profile: ImageCms.ImageCmsProfile, monitor_profile: ImageCms.ImageCmsProfile, 
+                      src_profile_key: str, monitor_profile_path: str):
     """Get or create a cached ICC transform.
     
-    Building transforms is expensive, so we cache them by profile IDs.
+    Building transforms is expensive, so we cache them by stable keys:
+    - src_profile_key: SHA-256 digest of the embedded ICC bytes
+    - monitor_profile_path: file path to the monitor ICC profile
     """
-    key = (id(src_profile), id(monitor_profile))
+    key = (src_profile_key, monitor_profile_path)
     if key not in _icc_transform_cache:
         _icc_transform_cache[key] = ImageCms.buildTransform(
             src_profile, monitor_profile, "RGB", "RGB"
         )
-        log.debug("Built new ICC transform for profile pair (src=%d, monitor=%d)", id(src_profile), id(monitor_profile))
+        log.debug("Built new ICC transform for profile pair (src=%s, monitor=%s)", src_profile_key[:16], monitor_profile_path)
     return _icc_transform_cache[key]
 
 def clear_icc_caches():
@@ -232,17 +236,34 @@ class Prefetcher:
                 self.submit_task(i, self.generation)
                 scheduled.add(i)
 
-    def submit_task(self, index: int, generation: int) -> Optional[Future]:
-        """Submits a decoding task for a given index."""
+    def submit_task(self, index: int, generation: int, priority: bool = False) -> Optional[Future]:
+        """Submits a decoding task for a given index.
+        
+        Args:
+            index: Image index to decode
+            generation: Generation number for cache invalidation
+            priority: If True, cancels lower-priority pending tasks to free up workers
+        """
         if index in self.futures and not self.futures[index].done():
             return self.futures[index] # Already submitted
+
+        # For high-priority tasks (current image), cancel pending prefetch tasks
+        # to free up worker threads and reduce blocking time
+        if priority:
+            cancelled_count = 0
+            for task_index, future in list(self.futures.items()):
+                if task_index != index and not future.done() and future.cancel():
+                    cancelled_count += 1
+                    del self.futures[task_index]
+            if cancelled_count > 0:
+                log.debug("Cancelled %d pending prefetch tasks to prioritize index %d", cancelled_count, index)
 
         image_file = self.image_files[index]
         display_width, display_height, display_generation = self.get_display_info()
 
         future = self.executor.submit(self._decode_and_cache, image_file, index, generation, display_width, display_height, display_generation)
         self.futures[index] = future
-        log.debug("Submitted prefetch task for index %d", index)
+        log.debug("Submitted %s task for index %d", "priority" if priority else "prefetch", index)
         return future
 
     def _decode_and_cache(self, image_file: ImageFile, index: int, generation: int, display_width: int, display_height: int, display_generation: int) -> Optional[tuple[int, int]]:
@@ -259,11 +280,11 @@ class Prefetcher:
         try:
             # Get current color management mode
             color_mode = config.get('color', 'mode', fallback="none").lower()
-            t_after_init = time.perf_counter()
 
             # Option C: Full ICC pipeline - Use TurboJPEG for decode, Pillow only for ICC conversion
             if color_mode == "icc":
                 monitor_profile = get_monitor_profile()
+                monitor_icc_path = config.get('color', 'monitor_icc_path', fallback="").strip()
                 
                 if monitor_profile is not None:
                     # FAST: Use TurboJPEG for decode + resize
@@ -288,22 +309,27 @@ class Prefetcher:
                     t_after_profile_read = time.perf_counter()
                     
                     src_profile = None
+                    src_profile_key = None
                     if icc_bytes:
                         try:
                             src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+                            # Compute stable key: SHA-256 digest of ICC bytes
+                            src_profile_key = hashlib.sha256(icc_bytes).hexdigest()
                             log.debug("Using embedded ICC profile from %s", image_file.path)
                         except (OSError, ImageCms.PyCMSError, ValueError) as e:
                             log.warning("Failed to parse ICC profile from %s: %s", image_file.path, e)
                     
                     if src_profile is None:
                         src_profile = SRGB_PROFILE
+                        # Use a constant key for sRGB since it's always the same
+                        src_profile_key = "srgb_builtin"
                         log.debug("No embedded profile, assuming sRGB for %s", image_file.path)
                     
                     # Convert from source profile to monitor profile using cached transform
                     try:
                         log.debug("Converting image from source to monitor profile")
                         t_before_icc = time.perf_counter()
-                        transform = get_icc_transform(src_profile, monitor_profile)
+                        transform = get_icc_transform(src_profile, monitor_profile, src_profile_key, monitor_icc_path)
                         # Alan 11-20-25 - Add inPlace=True to speed up copy, shouldn't have many negative effects
                         ImageCms.applyTransform(img, transform, inPlace=True)
                         t_after_icc = time.perf_counter()
@@ -425,7 +451,7 @@ class Prefetcher:
             log.debug("Successfully decoded and cached image at index %d for display gen %d", index, display_generation)
             return index, display_generation
             
-        except Exception as e:
+        except Exception:
             log.exception("Error decoding image %s at index %d", image_file.path, index)
         
         return None
