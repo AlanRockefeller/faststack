@@ -37,7 +37,7 @@ def find_images(directory: Path) -> List[ImageFile]:
                         raws[stem] = []
                     raws[stem].append((p, entry.stat()))
     except OSError as e:
-        log.error("Error scanning directory %s: %s", directory, e)
+        log.exception("Error scanning directory %s", directory)
         return []
 
     # Sort JPGs by filename
@@ -55,10 +55,10 @@ def find_images(directory: Path) -> List[ImageFile]:
     elapsed = time.perf_counter() - t_start
     paired_count = sum(1 for im in image_files if im.raw_pair)
     
-    # Log timing info if DEBUG level is enabled
     if log.isEnabledFor(logging.DEBUG):
-        log.info("find_images: found %d images in %.3fs", len(image_files), elapsed)
-    log.info("Found %d JPG files and paired %d with RAWs.", len(image_files), paired_count)
+        log.info("Found %d JPG files and paired %d with RAWs in %.3fs", len(image_files), paired_count, elapsed)
+    else:
+        log.info("Found %d JPG files and paired %d with RAWs.", len(image_files), paired_count)
     return image_files
 
 def _find_raw_pair(
@@ -76,7 +76,7 @@ def _find_raw_pair(
 
     for raw_path, raw_stat in potential_raws:
         dt = abs(jpg_stat.st_mtime - raw_stat.st_mtime)
-        if dt < min_dt:
+        if dt <= min_dt:
             min_dt = dt
             best_match = raw_path
 

@@ -1,5 +1,21 @@
 # ChangeLog
 
+## [0.9.0] - 2025-11-20
+
+### Performance Improvements
+- **Zero-Copy JPEG Read:** Eliminated memory copy by passing mmap directly to decoders, reducing I/O time by 25-60% for large JPEGs.
+- **Filter Performance:** Cached image list in memory to eliminate disk scans on every filter keystroke (100-1000x faster for large directories).
+- **Smart Cache Management:** Removed unnecessary cache clearing on resize/zoom - LRU naturally evicts old entries while allowing instant reuse.
+- **Generation Thrashing Fix:** Navigation no longer increments generation counter, preventing cache invalidation on every keystroke.
+- **Directional Prefetching:** Asymmetric prefetch now biases 70% ahead and 30% behind in travel direction for faster sequential browsing.
+- **ICC Transform Caching:** Cached ICC color transforms to eliminate repeated transform builds during color-managed viewing.
+- **TurboJPEG for ICC:** ICC color path now uses TurboJPEG for decode+resize, then Pillow only for color conversion.
+
+### Features
+- **JPG Fallback for Helicon:** Helicon Focus stacking now works with JPG-only workflows when RAW files absent.
+- **Comprehensive Timing Instrumentation:** Added detailed decode timing logs in debug mode for performance analysis.
+- **Added a Jump to Photo feature that can be activated by pressing the G key
+
 ## [0.8.0] - 2025-11-20
 
 ### Added

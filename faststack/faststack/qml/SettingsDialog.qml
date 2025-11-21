@@ -7,8 +7,27 @@ Dialog {
     title: "Settings"
     standardButtons: Dialog.Ok | Dialog.Cancel
     modal: true
+    closePolicy: Popup.CloseOnEscape
+    focus: true
     width: 600
     height: 600
+
+    // Live cache usage value (updated by timer)
+    property real cacheUsage: 0.0
+
+    onVisibleChanged: {
+        cacheUsageTimer.running = visible
+        if (visible) {
+            controller.dialog_opened()
+        } else {
+            controller.dialog_closed()
+        }
+    }
+    
+    onOpened: {
+        // Refresh text field when dialog opens with current value
+        cacheSizeField.text = settingsDialog.cacheSize.toFixed(1)
+    }
 
     property string heliconPath: ""
     property double cacheSize: 1.5
@@ -82,17 +101,27 @@ Dialog {
         TextField {
             id: cacheSizeField
             Layout.fillWidth: true
-            text: settingsDialog.cacheSize.toFixed(1) // Display with one decimal place
-            onTextChanged: {
+            
+            Component.onCompleted: {
+                text = settingsDialog.cacheSize.toFixed(1)
+            }
+            
+            onEditingFinished: {
                 var value = parseFloat(text)
                 if (!isNaN(value) && value >= 0.5 && value <= 16) {
                     settingsDialog.cacheSize = value
-                } else if (text === "") { // Handle empty text
-                    settingsDialog.cacheSize = 1.5 // Default to 1.5 if empty
+                    text = value.toFixed(1)  // Format it
+                } else {
+                    // Invalid input, reset to current value
+                    text = settingsDialog.cacheSize.toFixed(1)
                 }
             }
         }
-        Label {} // Placeholder
+        Label {
+            id: cacheUsageLabel
+            text: "In use: " + settingsDialog.cacheUsage.toFixed(2) + " GB"
+            color: "#1013e6"
+        }
 
         // Prefetch Radius
         Label { text: "Prefetch Radius:" }
@@ -130,5 +159,14 @@ Dialog {
                 if (path) defaultDirectoryField.text = path
             }
         }
+    }
+
+    // Poll cache usage periodically while the dialog is open
+    Timer {
+        id: cacheUsageTimer
+        interval: 1000
+        repeat: true
+        running: false
+        onTriggered: settingsDialog.cacheUsage = uiState.get_cache_usage_gb()
     }
 }

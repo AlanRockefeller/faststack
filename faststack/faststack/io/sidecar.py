@@ -11,9 +11,10 @@ from faststack.models import Sidecar, EntryMetadata
 log = logging.getLogger(__name__)
 
 class SidecarManager:
-    def __init__(self, directory: Path, watcher):
+    def __init__(self, directory: Path, watcher, debug: bool = False):
         self.path = directory / "faststack.json"
         self.watcher = watcher
+        self.debug = debug
         self.data = self.load()
 
     def stop_watcher(self):
@@ -35,9 +36,7 @@ class SidecarManager:
                 data = json.load(f)
             json_load_time = time.perf_counter() - t_start
             
-            # Import debug flag from app module
-            from faststack.app import _debug_mode
-            if _debug_mode:
+            if self.debug:
                 log.info(f"SidecarManager.load: json.load() took {json_load_time:.3f}s")
             
             if data.get("version") != 2:
@@ -65,7 +64,7 @@ class SidecarManager:
         temp_path = self.path.with_suffix(".tmp")
         was_watcher_running = False
         try:
-            if self.watcher and self.watcher.is_alive():
+            if self.watcher and hasattr(self.watcher, 'is_alive') and self.watcher.is_alive():
                 self.stop_watcher()
                 was_watcher_running = True
             with temp_path.open("w") as f:

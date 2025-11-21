@@ -7,8 +7,9 @@ Dialog {
     title: "Filter Images"
     modal: true
     standardButtons: Dialog.Ok | Dialog.Cancel
-    width: 400
-    height: 200
+    closePolicy: Popup.CloseOnEscape
+    width: 500
+    height: 250
 
     property string filterString: ""
 
@@ -24,30 +25,30 @@ Dialog {
 
     contentItem: Column {
         spacing: 16
-        anchors.fill: parent
-        anchors.margins: 20
+        padding: 20
 
         Label {
             text: "Show only images whose filename contains:"
             wrapMode: Text.WordWrap
-            width: parent.width
+            width: parent.width - parent.padding * 2
         }
 
         TextField {
             id: filterField
-            text: filterDialog.filterString
             placeholderText: "Enter text to filter (e.g., 'stacked', 'IMG_001')..."
-            width: parent.width
+            width: parent.width - parent.padding * 2
+            height: 50
             selectByMouse: true
             focus: true
+            font.pixelSize: 16
+            verticalAlignment: TextInput.AlignVCenter
             
             onTextChanged: {
                 filterDialog.filterString = text
             }
             
-            Keys.onReturnPressed: {
-                filterDialog.accept()
-            }
+            Keys.onReturnPressed: filterDialog.accept()
+            Keys.onEnterPressed: filterDialog.accept()
         }
 
         Label {
@@ -55,7 +56,7 @@ Dialog {
             font.italic: true
             opacity: 0.7
             wrapMode: Text.WordWrap
-            width: parent.width
+            width: parent.width - parent.padding * 2
         }
     }
 
@@ -66,5 +67,12 @@ Dialog {
         filterField.text = filterDialog.filterString
         filterField.forceActiveFocus()
         filterField.selectAll()
+        // Notify Python that a dialog is open
+        controller.dialog_opened()
+    }
+    
+    onClosed: {
+        // Notify Python that dialog is closed
+        controller.dialog_closed()
     }
 }
