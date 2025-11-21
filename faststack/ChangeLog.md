@@ -1,5 +1,35 @@
 # ChangeLog
 
+## [1.0.0] - 2025-11-21
+
+### Major Features
+- **Batch Selection System:** New batch selection mode for drag-and-drop operations
+  - `{` to begin batch, `}` to end batch, `\` to clear all batches
+  - `X` or `S` keys remove individual images from batches/stacks (shrinks or splits ranges)
+  - Batches automatically cleared after successful drag operation
+  - Multiple files can now be dragged to browsers and external applications simultaneously
+- **Manual Flag Toggles:** Added keyboard shortcuts to manually control metadata flags
+  - `U` toggles uploaded flag
+  - `Ctrl+E` toggles edited flag  
+  - `Ctrl+S` toggles stacked flag
+- **Edited Flag Tracking:** New metadata flag for images edited in Photoshop
+  - Displays "Edited on [date]" in status bar (green)
+  - Can be manually toggled with `Ctrl+E`
+- **Jump to Image Dialog:** Press `G` to jump directly to any image by number
+  - Dynamic input field sizing based on image count
+  - Proper keyboard event capture while dialog is open
+
+### UI/UX Improvements
+- **Auto Zoom Reset:** Image view automatically resets to fit-window after drag operations
+- **Smooth Window Dragging:** Fixed flickering when dragging title bar by using global coordinates
+- **Status Bar Enhancements:** 
+  - Added batch info display (green badge showing position/count)
+  - Added uploaded status display
+  - Added edited status display
+
+### Bug Fixes
+- **Multi-file Drag:** Simplified drag implementation to work correctly with Chrome and other browsers
+
 ## [0.9.0] - 2025-11-20
 
 ### Performance Improvements
