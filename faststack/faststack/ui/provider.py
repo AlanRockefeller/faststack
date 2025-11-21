@@ -6,6 +6,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtQuick import QQuickImageProvider
 
 from faststack.models import DecodedImage
+from faststack.config import config
 
 # Try to import QColorSpace if available (Qt 6+)
 try:
@@ -43,18 +44,18 @@ class ImageProvider(QQuickImageProvider):
                     QImage.Format.Format_RGB888
                 )
                 # Set sRGB color space for proper color management (if available)
-                # This tells Qt: "this decoded image data is in sRGB color space"
-                if HAS_COLOR_SPACE:
+                # Skip this when using ICC mode - pixels are already in monitor space
+                color_mode = config.get('color', 'mode', fallback="none").lower()
+                if HAS_COLOR_SPACE and color_mode != "icc":
                     try:
-                        cs = QColorSpace.fromNamedColorSpace(
-                            QColorSpace.NamedColorSpace.SRgb
-                        )
+                        # Create sRGB color space using constructor with NamedColorSpace enum
+                        cs = QColorSpace(QColorSpace.NamedColorSpace.SRgb)
                         qimg.setColorSpace(cs)
                         log.debug("Applied sRGB color space to image")
-                    except Exception as e:
+                    except (RuntimeError, ValueError) as e:
                         log.warning(f"Failed to set color space: {e}")
-                else:
-                    log.debug("QColorSpace not available in this PySide6 version")
+                elif color_mode == "icc":
+                    log.debug("ICC mode: skipping Qt color space (pixels already in monitor space)")
                 # keep buffer alive
                 qimg.original_buffer = image_data.buffer
                 return qimg
@@ -81,6 +82,8 @@ class UIState(QObject):
     resetZoomPanRequested = Signal() # Signal to tell QML to reset zoom/pan
     stackSummaryChanged = Signal() # Signal for stack summary updates
     filterStringChanged = Signal() # Signal for filter string updates
+    colorModeChanged = Signal() # Signal for color mode updates
+    saturationFactorChanged = Signal() # Signal for saturation factor updates
 
     def __init__(self, app_controller):
         super().__init__()
@@ -149,26 +152,38 @@ class UIState(QObject):
 
     @Property(str, notify=metadataChanged)
     def currentFilename(self):
+        if not self.app_controller.image_files:
+            return ""
         return self.app_controller.get_current_metadata().get("filename", "")
 
     @Property(bool, notify=metadataChanged)
     def isFlagged(self):
+        if not self.app_controller.image_files:
+            return False
         return self.app_controller.get_current_metadata().get("flag", False)
 
     @Property(bool, notify=metadataChanged)
     def isRejected(self):
+        if not self.app_controller.image_files:
+            return False
         return self.app_controller.get_current_metadata().get("reject", False)
 
     @Property(bool, notify=metadataChanged)
     def isStacked(self):
+        if not self.app_controller.image_files:
+            return False
         return self.app_controller.get_current_metadata().get("stacked", False)
 
     @Property(str, notify=metadataChanged)
     def stackedDate(self):
+        if not self.app_controller.image_files:
+            return ""
         return self.app_controller.get_current_metadata().get("stacked_date", "")
 
     @Property(str, notify=metadataChanged)
     def stackInfoText(self):
+        if not self.app_controller.image_files:
+            return ""
         return self.app_controller.get_current_metadata().get("stack_info_text", "")
 
     @Property(str, notify=stackSummaryChanged)
@@ -195,6 +210,16 @@ class UIState(QObject):
     def filterString(self):
         """Returns the current filter string (empty if no filter active)."""
         return self.app_controller.get_filter_string()
+
+    @Property(str, notify=colorModeChanged)
+    def colorMode(self):
+        """Returns the current color mode."""
+        return self.app_controller.get_color_mode()
+
+    @Property(float, notify=saturationFactorChanged)
+    def saturationFactor(self):
+        """Returns the current saturation factor."""
+        return self.app_controller.get_saturation_factor()
 
     @Property(str, constant=True)
     def currentDirectory(self):

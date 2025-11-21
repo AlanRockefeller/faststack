@@ -23,6 +23,11 @@ DEFAULT_CONFIG = {
         "exe": "C:\\Program Files\\Adobe\\Adobe Photoshop 2026\\Photoshop.exe",
         "args": "",
     },
+    "color": {
+        "mode": "none",  # Options: "none", "saturation", "icc"
+        "saturation_factor": "0.85",  # Option A: 0.0-1.0, lower = less saturated
+        "monitor_icc_path": "",  # Option C: path to monitor ICC profile
+    },
 }
 
 class AppConfig:

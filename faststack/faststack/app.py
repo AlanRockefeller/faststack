@@ -4,11 +4,12 @@ import logging
 import sys
 import struct
 import shlex
+import time
+import argparse
 from pathlib import Path
 from typing import Optional, List, Dict
 from datetime import date
 import os
-import typer
 import concurrent.futures
 import threading
 import subprocess
@@ -25,7 +26,7 @@ from PySide6.QtCore import (
     Qt, 
     QPoint
 )
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from PySide6.QtQml import QQmlApplicationEngine
 
 # ⬇️ these are the ones that went missing
@@ -60,6 +61,9 @@ def make_hdrop(paths):
 
 log = logging.getLogger(__name__)
 
+# Global flag for debug mode - set by main()
+_debug_mode = False
+
 class AppController(QObject):
     dataChanged = Signal() # New signal for general data changes
 
@@ -80,6 +84,8 @@ class AppController(QObject):
         self.display_height = 0
         self.display_generation = 0
         self.is_zoomed = False
+        self.display_ready = False  # Track if display size has been reported
+        self.pending_prefetch_index: Optional[int] = None  # Deferred prefetch index
 
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self.refresh_image_list)
@@ -95,6 +101,7 @@ class AppController(QObject):
             prefetch_radius=config.getint('core', 'prefetch_radius', 4),
             get_display_info=self.get_display_info
         )
+        self.last_displayed_image: Optional[DecodedImage] = None  # Cache last image to avoid grey squares
 
         # -- UI State --
         self.ui_state = UIState(self)
@@ -110,6 +117,11 @@ class AppController(QObject):
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
+        self._logged_empty_metadata = False
+        
+        # -- Delete/Undo State --
+        self.recycle_bin_dir = self.image_dir / "image recycle bin"
+        self.delete_history: List[tuple[Path, Optional[Path]]] = []  # [(jpg_path, raw_path), ...]
 
         self.resize_timer = QTimer()
         self.resize_timer.setSingleShot(True)
@@ -135,7 +147,7 @@ class AppController(QObject):
         # reset to start of filtered list
         self.current_index = 0
         self.sync_ui_state()
-        self.prefetcher.update_prefetch(self.current_index)
+        self._do_prefetch(self.current_index)
 
     @Slot(result=str)
     def get_filter_string(self):
@@ -153,7 +165,7 @@ class AppController(QObject):
         self.ui_state.filterStringChanged.emit()  # Notify UI of filter change
         self.current_index = min(self.current_index, max(0, len(self.image_files) - 1))
         self.sync_ui_state()
-        self.prefetcher.update_prefetch(self.current_index)
+        self._do_prefetch(self.current_index)
 
 
 
@@ -174,20 +186,34 @@ class AppController(QObject):
 
     def _handle_resize(self):
         """Actual resize handler, called after debounce period."""
-        log.info(f"Display size changed to: {self.pending_width}x{self.pending_height} (physical pixels)")
+        log.info("Display size changed to: %dx%d (physical pixels)", self.pending_width, self.pending_height)
         self.display_width = self.pending_width
         self.display_height = self.pending_height
         self.display_generation += 1
+        
+        # Mark display as ready after first size report
+        is_first_resize = not self.display_ready
+        if is_first_resize:
+            self.display_ready = True
+            log.info("Display size now stable, enabling prefetch")
+        
         self.image_cache.clear()
         self.prefetcher.cancel_all()
-        self.prefetcher.update_prefetch(self.current_index)
+        
+        # On first resize, execute deferred prefetch; on subsequent resizes, do normal prefetch
+        if is_first_resize and self.pending_prefetch_index is not None:
+            self.prefetcher.update_prefetch(self.pending_prefetch_index)
+            self.pending_prefetch_index = None
+        else:
+            self.prefetcher.update_prefetch(self.current_index)
+        
         self.sync_ui_state() # To refresh the image
 
     def set_zoomed(self, zoomed: bool):
         if self.is_zoomed == zoomed:
             return
         self.is_zoomed = zoomed
-        log.info(f"Zoom state changed to: {zoomed}")
+        log.info("Zoom state changed to: %s", zoomed)
         self.display_generation += 1 # Invalidate cache
         self.image_cache.clear()
         self.prefetcher.cancel_all()
@@ -202,6 +228,19 @@ class AppController(QObject):
                 return True
         return super().eventFilter(watched, event)
 
+    def _do_prefetch(self, index: int, is_navigation: bool = False):
+        """Helper to defer prefetch until display size is stable.
+        
+        Args:
+            index: The index to prefetch around
+            is_navigation: True if called from user navigation (arrow keys, etc.)
+        """
+        if not self.display_ready:
+            log.debug("Display not ready, deferring prefetch for index %d", index)
+            self.pending_prefetch_index = index
+            return
+        self.prefetcher.update_prefetch(index, is_navigation=is_navigation)
+    
     def load(self):
         """Loads images, sidecar data, and starts services."""
         self.refresh_image_list()
@@ -212,7 +251,7 @@ class AppController(QObject):
         self.stacks = self.sidecar.data.stacks # Load stacks from sidecar
         self.dataChanged.emit() # Emit after stacks are loaded
         self.watcher.start()
-        self.prefetcher.update_prefetch(self.current_index)
+        self._do_prefetch(self.current_index)
         
         # Defer initial UI sync until after images are loaded
         self.sync_ui_state()
@@ -235,7 +274,7 @@ class AppController(QObject):
         self.ui_state.imageCountChanged.emit()
 
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
-        """Retrieves a decoded image, from cache or by decoding."""
+        """Retrieves a decoded image, blocking until ready to ensure correct display."""
         if not self.image_files: # Handle empty image list
             log.warning("get_decoded_image called with empty image_files.")
             return None
@@ -243,26 +282,43 @@ class AppController(QObject):
         _, _, display_gen = self.get_display_info()
         cache_key = f"{index}_{display_gen}"
 
+        # Check cache first
         if cache_key in self.image_cache:
-            return self.image_cache[cache_key]
+            decoded = self.image_cache[cache_key]
+            self.last_displayed_image = decoded
+            return decoded
         
-        # If not in cache, this was likely a cache miss. 
-        # The prefetcher should have it, but we can do a blocking load if needed.
-        log.warning(f"Cache miss for index {index} (gen: {display_gen}). Forcing synchronous load.")
+        # Cache miss: need to decode synchronously to ensure correct image displays
+        if _debug_mode:
+            decode_start = time.perf_counter()
+            log.info("Cache miss for index %d (gen: %d). Blocking decode.", index, display_gen)
+        
         future = self.prefetcher.submit_task(index, self.prefetcher.generation)
         if future:
             try:
-                # Wait for the result and then retrieve from cache
-                result = future.result()
+                # Wait for decode to complete (blocking but fast for JPEGs)
+                result = future.result(timeout=5.0)  # 5 second timeout as safety
                 if result:
                     decoded_index, decoded_display_gen = result
                     cache_key = f"{decoded_index}_{decoded_display_gen}"
                     if cache_key in self.image_cache:
-                        return self.image_cache[cache_key]
+                        decoded = self.image_cache[cache_key]
+                        self.last_displayed_image = decoded
+                        if _debug_mode:
+                            elapsed = time.perf_counter() - decode_start
+                            log.info("Decoded image %d in %.3fs", index, elapsed)
+                        return decoded
+            except concurrent.futures.TimeoutError:
+                log.error("Timeout decoding image at index %d", index)
+                return self.last_displayed_image
             except concurrent.futures.CancelledError:
-                log.warning(f"Prefetch task for index {index} was cancelled. Attempting synchronous load.")
-                return None
-        return None
+                log.warning("Decode cancelled for index %d", index)
+                return self.last_displayed_image
+            except Exception as e:
+                log.error("Error decoding image at index %d: %s", index, e)
+                return self.last_displayed_image
+        
+        return self.last_displayed_image
 
     def sync_ui_state(self):
         """Forces the UI to update by emitting all state change signals."""
@@ -277,13 +333,16 @@ class AppController(QObject):
         self.ui_state.metadataChanged.emit()
 
         log.debug(
-            f"UI State Synced: Index={self.ui_state.currentIndex}, "
-            f"Count={self.ui_state.imageCount}"
+            "UI State Synced: Index=%d, Count=%d",
+            self.ui_state.currentIndex,
+            self.ui_state.imageCount
         )
         log.debug(
-            f"Metadata Synced: Filename={self.ui_state.currentFilename}, "
-            f"Flagged={self.ui_state.isFlagged}, Rejected={self.ui_state.isRejected}, "
-            f"StackInfo='{self.ui_state.stackInfoText}'"
+            "Metadata Synced: Filename=%s, Flagged=%s, Rejected=%s, StackInfo='%s'",
+            self.ui_state.currentFilename,
+            self.ui_state.isFlagged,
+            self.ui_state.isRejected,
+            self.ui_state.stackInfoText
         )
 
 
@@ -292,13 +351,13 @@ class AppController(QObject):
     def next_image(self):
         if self.current_index < len(self.image_files) - 1:
             self.current_index += 1
-            self.prefetcher.update_prefetch(self.current_index)
+            self._do_prefetch(self.current_index, is_navigation=True)
             self.sync_ui_state()
 
     def prev_image(self):
         if self.current_index > 0:
             self.current_index -= 1
-            self.prefetcher.update_prefetch(self.current_index)
+            self._do_prefetch(self.current_index, is_navigation=True)
             self.sync_ui_state()
 
     def toggle_grid_view(self):
@@ -306,8 +365,11 @@ class AppController(QObject):
 
     def get_current_metadata(self) -> Dict:
         if not self.image_files:
-            log.debug("get_current_metadata: image_files is empty, returning {}.")
+            if not self._logged_empty_metadata:
+                log.debug("get_current_metadata: image_files is empty, returning {}.")
+                self._logged_empty_metadata = True
             return {}
+        self._logged_empty_metadata = False
         
         # Cache hit check
         cache_key = (self.current_index, self.ui_refresh_generation)
@@ -348,13 +410,13 @@ class AppController(QObject):
 
     def begin_new_stack(self):
         self.stack_start_index = self.current_index
-        log.info(f"Stack start marked at index {self.stack_start_index}")
+        log.info("Stack start marked at index %d", self.stack_start_index)
         self._metadata_cache_index = (-1, -1) # Invalidate cache
         self.dataChanged.emit() # Update UI to show start marker
         self.sync_ui_state()
 
     def end_current_stack(self):
-        log.info(f"end_current_stack called. stack_start_index: {self.stack_start_index}")
+        log.info("end_current_stack called. stack_start_index: %s", self.stack_start_index)
         if self.stack_start_index is not None:
             start = min(self.stack_start_index, self.current_index)
             end = max(self.stack_start_index, self.current_index)
@@ -362,7 +424,7 @@ class AppController(QObject):
             self.stacks.sort() # Keep stacks sorted by start index
             self.sidecar.data.stacks = self.stacks
             self.sidecar.save()
-            log.info(f"Defined new stack: [{start}, {end}]")
+            log.info("Defined new stack: [%d, %d]", start, end)
             self.stack_start_index = None
             self._metadata_cache_index = (-1, -1) # Invalidate cache
             self.dataChanged.emit() # Notify QML of data change
@@ -380,10 +442,10 @@ class AppController(QObject):
         if image_file.raw_pair:
             if image_file.raw_pair in self.selected_raws:
                 self.selected_raws.remove(image_file.raw_pair)
-                log.info(f"Removed {image_file.raw_pair.name} from selection.")
+                log.info("Removed %s from selection.", image_file.raw_pair.name)
             else:
                 self.selected_raws.add(image_file.raw_pair)
-                log.info(f"Added {image_file.raw_pair.name} to selection.")
+                log.info("Added %s to selection.", image_file.raw_pair.name)
             
             # In a real app, we'd update a selection indicator in the UI.
             # For now, we just log and can use it for batch operations.
@@ -393,12 +455,12 @@ class AppController(QObject):
     def launch_helicon(self):
         """Launches Helicon Focus with selected RAWs or all RAWs in defined stacks."""
         if self.selected_raws:
-            log.info(f"Launching Helicon with {len(self.selected_raws)} selected RAW files.")
+            log.info("Launching Helicon with %d selected RAW files.", len(self.selected_raws))
             self._launch_helicon_with_files(sorted(list(self.selected_raws)))
             self.selected_raws.clear()
 
         elif self.stacks:
-            log.info(f"Launching Helicon for {len(self.stacks)} defined stacks.")
+            log.info("Launching Helicon for %d defined stacks.", len(self.stacks))
             for start, end in self.stacks:
                 raw_files_to_process = []
                 for idx in range(start, end + 1):
@@ -408,7 +470,7 @@ class AppController(QObject):
                 if raw_files_to_process:
                     self._launch_helicon_with_files(raw_files_to_process)
                 else:
-                    log.warning(f"No valid RAW files found for stack [{start}, {end}].")
+                    log.warning("No valid RAW files found for stack [%d, %d].", start, end)
             
             # clear_all_stacks() already emits stackSummaryChanged
             self.clear_all_stacks()
@@ -421,7 +483,7 @@ class AppController(QObject):
 
     def _launch_helicon_with_files(self, raw_files: List[Path]):
         """Helper to launch Helicon with a specific list of files."""
-        log.info(f"Launching Helicon Focus with {len(raw_files)} RAW files.")
+        log.info("Launching Helicon Focus with %d RAW files.", len(raw_files))
         unique_raw_files = sorted(list(set(raw_files)))
         success, tmp_path = launch_helicon_focus(unique_raw_files)
         if success and tmp_path:
@@ -446,9 +508,9 @@ class AppController(QObject):
         if tmp_path.exists():
             try:
                 # os.remove(tmp_path)
-                log.info(f"Keeping temporary file: {tmp_path}")
+                log.info("Keeping temporary file: %s", tmp_path)
             except OSError as e:
-                log.error(f"Error deleting temporary file {tmp_path}: {e}")
+                log.error("Error deleting temporary file %s: %s", tmp_path, e)
 
     def clear_all_stacks(self):
         log.info("Clearing all defined stacks.")
@@ -516,6 +578,64 @@ class AppController(QObject):
         # tell QML it changed (once is enough)
         self.ui_state.themeChanged.emit()
 
+    @Slot(result=str)
+    def get_color_mode(self):
+        """Returns current color management mode: 'none', 'saturation', or 'icc'."""
+        return config.get('color', 'mode', fallback='none')
+
+    @Slot(str)
+    def set_color_mode(self, mode: str):
+        """Sets color management mode and clears cache to force re-decode."""
+        mode = mode.lower()
+        if mode not in ['none', 'saturation', 'icc']:
+            log.error("Invalid color mode: %s", mode)
+            return
+        
+        log.info("Setting color mode to: %s", mode)
+        config.set('color', 'mode', mode)
+        config.save()
+        
+        # Clear cache and restart prefetcher to apply new color mode
+        self.image_cache.clear()
+        self.prefetcher.cancel_all()
+        self.display_generation += 1
+        self.prefetcher.update_prefetch(self.current_index)
+        self.sync_ui_state()
+        
+        # Notify QML that color mode changed
+        self.ui_state.colorModeChanged.emit()
+        
+        # Update status message
+        mode_names = {
+            'none': 'Original Colors',
+            'saturation': 'Saturation Compensation',
+            'icc': 'Full ICC Profile'
+        }
+        self.update_status_message(f"Color mode: {mode_names.get(mode, mode)}")
+
+    @Slot(result=float)
+    def get_saturation_factor(self):
+        """Returns current saturation factor (0.0-1.0)."""
+        return config.getfloat('color', 'saturation_factor', fallback=0.85)
+
+    @Slot(float)
+    def set_saturation_factor(self, factor: float):
+        """Sets saturation factor and refreshes images."""
+        factor = max(0.0, min(1.0, factor))  # Clamp to 0-1
+        log.info("Setting saturation factor to: %.2f", factor)
+        config.set('color', 'saturation_factor', str(factor))
+        config.save()
+        
+        # Only refresh if in saturation mode
+        if self.get_color_mode() == 'saturation':
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self.display_generation += 1
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
+        
+        # Notify QML
+        self.ui_state.saturationFactorChanged.emit()
 
     def get_default_directory(self):
         return config.get('core', 'default_directory')
@@ -569,7 +689,7 @@ class AppController(QObject):
                 future.add_done_callback(_on_done)
 
     def _update_preload_progress(self, progress: int):
-        log.debug(f"Updating preload progress in UI: {progress}%")
+        log.debug("Updating preload progress in UI: %d%%", progress)
         self.ui_state.preloadProgress = progress
 
     def _finish_preloading(self):
@@ -577,8 +697,140 @@ class AppController(QObject):
         self.ui_state.preloadProgress = 0
         log.info("Finished preloading all images.")
 
+    @Slot()
+    def delete_current_image(self):
+        """Moves current JPG and RAW to recycle bin."""
+        if not self.image_files:
+            self.update_status_message("No image to delete.")
+            return
+        
+        image_file = self.image_files[self.current_index]
+        jpg_path = image_file.path
+        raw_path = image_file.raw_pair
+        
+        # Create recycle bin if it doesn't exist
+        try:
+            self.recycle_bin_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.update_status_message(f"Failed to create recycle bin: {e}")
+            log.error("Failed to create recycle bin directory: %s", e)
+            return
+        
+        # Move files to recycle bin
+        deleted_files = []
+        try:
+            if jpg_path.exists():
+                dest = self.recycle_bin_dir / jpg_path.name
+                jpg_path.rename(dest)
+                deleted_files.append(jpg_path.name)
+                log.info("Moved %s to recycle bin", jpg_path.name)
+            
+            if raw_path and raw_path.exists():
+                dest = self.recycle_bin_dir / raw_path.name
+                raw_path.rename(dest)
+                deleted_files.append(raw_path.name)
+                log.info("Moved %s to recycle bin", raw_path.name)
+            
+            # Add to delete history only if at least one file was moved
+            if deleted_files:
+                self.delete_history.append((jpg_path, raw_path))
+            
+            # Update status
+            if deleted_files:
+                files_str = ", ".join(deleted_files)
+                self.update_status_message(f"Deleted: {files_str}")
+            else:
+                self.update_status_message("No files to delete")
+            
+            # Refresh image list and move to next image
+            self.refresh_image_list()
+            if self.image_files:
+                # Stay at same index (which now shows the next image)
+                self.current_index = min(self.current_index, len(self.image_files) - 1)
+                # Clear cache and invalidate display generation to force image reload
+                self.display_generation += 1
+                self.image_cache.clear()
+                # update_prefetch will handle cancelling stale tasks and incrementing generation
+                self.prefetcher.update_prefetch(self.current_index)
+                self.sync_ui_state()
+            
+        except OSError as e:
+            self.update_status_message(f"Delete failed: {e}")
+            log.exception(f"Failed to delete image: {e}")
+
+    @Slot()
+    def undo_delete(self):
+        """Restores the last deleted image from recycle bin."""
+        if not self.delete_history:
+            self.update_status_message("Nothing to undo.")
+            return
+        
+        jpg_path, raw_path = self.delete_history.pop()
+        
+        restored_files = []
+        try:
+            # Restore JPG
+            jpg_in_bin = self.recycle_bin_dir / jpg_path.name
+            if jpg_in_bin.exists():
+                jpg_in_bin.rename(jpg_path)
+                restored_files.append(jpg_path.name)
+                log.info("Restored %s from recycle bin", jpg_path.name)
+            
+            # Restore RAW
+            if raw_path:
+                raw_in_bin = self.recycle_bin_dir / raw_path.name
+                if raw_in_bin.exists():
+                    raw_in_bin.rename(raw_path)
+                    restored_files.append(raw_path.name)
+                    log.info("Restored %s from recycle bin", raw_path.name)
+            
+            # Update status
+            if restored_files:
+                files_str = ", ".join(restored_files)
+                self.update_status_message(f"Restored: {files_str}")
+            else:
+                self.update_status_message("No files to restore")
+            
+            # Refresh image list
+            self.refresh_image_list()
+            
+            # Find and navigate to the restored image
+            for i, img_file in enumerate(self.image_files):
+                if img_file.path == jpg_path:
+                    self.current_index = i
+                    break
+            
+            # Clear cache and invalidate display generation to force image reload
+            self.display_generation += 1
+            self.image_cache.clear()
+            # update_prefetch will handle cancelling stale tasks and incrementing generation
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
+            
+        except OSError as e:
+            self.update_status_message(f"Undo failed: {e}")
+            log.exception(f"Failed to restore image: {e}")
+            # Put it back in history if it failed
+            self.delete_history.append((jpg_path, raw_path))
+
     def shutdown(self):
         log.info("Application shutting down.")
+        
+        # Check if recycle bin has files and prompt to empty
+        if self.recycle_bin_dir.exists():
+            files_in_bin = list(self.recycle_bin_dir.glob("*"))
+            if files_in_bin:
+                reply = QMessageBox.question(
+                    None,
+                    "Empty Recycle Bin?",
+                    f"There are {len(files_in_bin)} files in the recycle bin. Do you want to permanently delete them?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    self.empty_recycle_bin()
+        
         # Clear QML context property to prevent TypeErrors during shutdown
         if self.engine:
             log.info("Clearing uiState context property in QML.")
@@ -589,13 +841,36 @@ class AppController(QObject):
         self.sidecar.set_last_index(self.current_index)
         self.sidecar.save()
 
+    def empty_recycle_bin(self):
+        """Permanently deletes all files in the recycle bin."""
+        if not self.recycle_bin_dir.exists():
+            return
+        
+        try:
+            import shutil
+            shutil.rmtree(self.recycle_bin_dir)
+            self.delete_history.clear()
+            log.info("Emptied recycle bin and cleared delete history")
+        except OSError as e:
+            log.exception(f"Failed to empty recycle bin: {e}")
+
     @Slot()
     def edit_in_photoshop(self):
         if not self.image_files:
             self.update_status_message("No image to edit.")
             return
 
-        current_image_path = self.image_files[self.current_index].path
+        # Prefer RAW file if it exists, otherwise use JPG
+        image_file = self.image_files[self.current_index]
+        raw_path = image_file.raw_pair
+        
+        if raw_path and raw_path.exists():
+            current_image_path = raw_path
+            log.info("Using RAW file for Photoshop: %s", raw_path)
+        else:
+            current_image_path = image_file.path
+            log.info("Using JPG file for Photoshop: %s", current_image_path)
+        
         photoshop_exe = config.get('photoshop', 'exe')
         photoshop_args = config.get('photoshop', 'args')
 
@@ -608,13 +883,13 @@ class AppController(QObject):
         
         if not is_valid:
             self.update_status_message(f"Photoshop validation failed: {error_msg}")
-            log.error(f"Photoshop executable validation failed: {error_msg}")
+            log.error("Photoshop executable validation failed: %s", error_msg)
             return
         
         # Validate that the file path exists and is a file
         if not current_image_path.exists() or not current_image_path.is_file():
             self.update_status_message(f"Image file not found: {current_image_path.name}")
-            log.error(f"Image file not found or not a file: {current_image_path}")
+            log.error("Image file not found or not a file: %s", current_image_path)
             return
 
         try:
@@ -629,7 +904,7 @@ class AppController(QObject):
                     parsed_args = shlex.split(photoshop_args, posix=(os.name != 'nt'))
                     command.extend(parsed_args)
                 except ValueError as e:
-                    log.error(f"Invalid photoshop_args format: {e}")
+                    log.error("Invalid photoshop_args format: %s", e)
                     self.update_status_message("Invalid Photoshop arguments configured")
                     return
             
@@ -647,13 +922,13 @@ class AppController(QObject):
                 close_fds=True  # Close unused file descriptors
             )
             self.update_status_message(f"Opened {current_image_path.name} in Photoshop.")
-            log.info(f"Launched Photoshop with: {command}")
-        except (OSError, subprocess.SubprocessError) as e:
-            self.update_status_message(f"Failed to open in Photoshop: {e}")
-            log.exception(f"Error launching Photoshop: {e}")
+            log.info("Launched Photoshop with: %s", command)
         except FileNotFoundError as e:
             self.update_status_message(f"Photoshop executable not found: {e}")
             log.exception(f"Photoshop executable not found: {e}")
+        except (OSError, subprocess.SubprocessError) as e:
+            self.update_status_message(f"Failed to open in Photoshop: {e}")
+            log.exception(f"Error launching Photoshop: {e}")
 
     @Slot()
     def copy_path_to_clipboard(self):
@@ -664,7 +939,7 @@ class AppController(QObject):
         current_image_path = str(self.image_files[self.current_index].path)
         QApplication.clipboard().setText(current_image_path)
         self.update_status_message(f"Copied: {current_image_path}")
-        log.info(f"Copied path to clipboard: {current_image_path}")
+        log.info("Copied path to clipboard: %s", current_image_path)
 
     @Slot()
     def reset_zoom_pan(self):
@@ -693,7 +968,7 @@ class AppController(QObject):
 
         file_path = self.image_files[self.current_index].path
         if not file_path.exists():
-            log.error(f"File does not exist, cannot start drag: {file_path}")
+            log.error("File does not exist, cannot start drag: %s", file_path)
             return
 
         if self.main_window is None:
@@ -724,7 +999,7 @@ class AppController(QObject):
             # hotspot = center of image
             drag.setHotSpot(QPoint(scaled.width() // 2, scaled.height() // 2))
 
-        log.info(f"Starting drag for {file_path}")
+        log.info("Starting drag for %s", file_path)
         drag.exec(Qt.CopyAction)
 
     def _get_stack_info(self, index: int) -> str:
@@ -737,7 +1012,7 @@ class AppController(QObject):
                 break
         if not info and self.stack_start_index is not None and self.stack_start_index == index:
             info = "Stack Start Marked"
-        log.info(f"_get_stack_info for index {index}: {info}")
+        log.info("_get_stack_info for index %d: %s", index, info)
         return info
 
     def get_stack_summary(self) -> str:
@@ -755,16 +1030,24 @@ class AppController(QObject):
         meta = self.sidecar.get_metadata(stem)
         return meta.stacked
 
-def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of images to view")):
+def main(image_dir: str = "", debug: bool = False):
     """FastStack Application Entry Point"""
-    setup_logging()
+    global _debug_mode
+    _debug_mode = debug
+    
+    t0 = time.perf_counter()
+    setup_logging(debug)
+    if debug:
+        log.info("Startup: after setup_logging: %.3fs", time.perf_counter() - t0)
     log.info("Starting FastStack")
 
     os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
 
     app = QApplication(sys.argv) # Moved here
+    if debug:
+        log.info("Startup: after QApplication: %.3fs", time.perf_counter() - t0)
 
-    if image_dir is None:
+    if not image_dir:
         image_dir_str = config.get('core', 'default_directory')
         if not image_dir_str:
             log.warning("No image directory provided and no default directory set. Opening directory selection dialog.")
@@ -773,17 +1056,21 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
                 log.error("No image directory selected. Exiting.")
                 sys.exit(1)
             image_dir_str = selected_dir
-        image_dir = Path(image_dir_str)
+        image_dir_path = Path(image_dir_str)
+    else:
+        image_dir_path = Path(image_dir)
 
-    if not image_dir.is_dir():
-        log.error(f"Image directory not found: {image_dir}")
+    if not image_dir_path.is_dir():
+        log.error("Image directory not found: %s", image_dir_path)
         sys.exit(1)
     app.setOrganizationName("FastStack")
     app.setOrganizationDomain("faststack.dev")
     app.setApplicationName("FastStack")
 
     engine = QQmlApplicationEngine()
-    controller = AppController(image_dir, engine)
+    controller = AppController(image_dir_path, engine)
+    if debug:
+        log.info("Startup: after AppController: %.3fs", time.perf_counter() - t0)
     image_provider = ImageProvider(controller)
     engine.addImageProvider("provider", image_provider)
 
@@ -794,6 +1081,8 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
 
     qml_file = Path(__file__).parent / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_file)))
+    if debug:
+        log.info("Startup: after engine.load(QML): %.3fs", time.perf_counter() - t0)
 
     if not engine.rootObjects():
         log.error("Failed to load QML.")
@@ -806,11 +1095,21 @@ def main(image_dir: Optional[Path] = typer.Argument(None, help="Directory of ima
 
     # Load data and start services
     controller.load()
+    if debug:
+        log.info("Startup: after controller.load(): %.3fs", time.perf_counter() - t0)
 
     # Graceful shutdown
     app.aboutToQuit.connect(controller.shutdown)
 
     sys.exit(app.exec())
 
+def cli():
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(description="FastStack - Ultra-fast JPG Viewer for Focus Stacking Selection")
+    parser.add_argument("image_dir", nargs="?", default="", help="Directory of images to view")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging and timing information")
+    args = parser.parse_args()
+    main(image_dir=args.image_dir, debug=args.debug)
+
 if __name__ == "__main__":
-    typer.run(main)
+    cli()

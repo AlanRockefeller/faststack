@@ -39,11 +39,14 @@ class Keybinder:
             Qt.Key_Return: "launch_helicon",
             Qt.Key_E: "edit_in_photoshop",
             Qt.Key_C: "clear_all_stacks", # Keep C for clear_all_stacks
+            Qt.Key_Delete: "delete_current_image",
+            Qt.Key_Backspace: "delete_current_image",
         }
 
         self.modifier_key_map = {
             (Qt.Key_C, Qt.ControlModifier): "copy_path_to_clipboard",
             (Qt.Key_0, Qt.ControlModifier): "reset_zoom_pan",
+            (Qt.Key_Z, Qt.ControlModifier): "undo_delete",
         }
 
     def _call(self, method_name: str):

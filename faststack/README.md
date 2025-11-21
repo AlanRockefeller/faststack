@@ -1,6 +1,6 @@
 # FastStack
 
-# Version 0.7 - November 20, 2025
+# Version 0.8 - November 20, 2025
 # By Alan Rockefeller
 
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW files for focus stacking.
@@ -17,11 +17,12 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
 - **Sidecar Metadata:** Saves flags, rejections, and stack groupings to a non-destructive `faststack.json` file.
 - **Configurable:** Adjust cache sizes, prefetch behavior, and Helicon Focus path via a settings dialog and a persistent `.ini` file.
-- **Photoshop Integration:** Edit current image in Photoshop (E key)
+- **Photoshop Integration:** Edit current image in Photoshop (E key) - automatically uses RAW files when available
 - **Clipboard Support:** Copy image path to clipboard (Ctrl+C)
 - **Image Filtering:** Filter images by filename
 - **Drag & Drop:** Drag images to external applications
 - **Theme Support:** Toggle between light and dark themes
+- **Delete & Undo:** Move images to recycle bin (Delete/Backspace) with undo support (Ctrl+Z)
 
 ## Installation & Usage
 
@@ -46,6 +47,9 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - `Space`: Toggle Flag
 - `X`: Toggle Reject
 - `Enter`: Launch Helicon Focus with selected RAWs
-- `E`: Edit in Photoshop
+- `E`: Edit in Photoshop (uses RAW file if available)
+- `Delete` / `Backspace`: Move image to recycle bin
+- `Ctrl+Z`: Undo last delete
 - `Ctrl+C`: Copy image path to clipboard
+- `Ctrl+0`: Reset zoom and pan
 - `C`: Clear all stacks

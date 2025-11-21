@@ -12,8 +12,12 @@ def get_app_data_dir() -> Path:
         return Path(app_data) / "faststack"
     return Path.home() / ".faststack"
 
-def setup_logging():
-    """Sets up logging to a rotating file in the app data directory."""
+def setup_logging(debug: bool = False):
+    """Sets up logging to a rotating file in the app data directory.
+    
+    Args:
+        debug: If True, sets log level to DEBUG. Otherwise, sets to INFO to reduce noise.
+    """
     log_dir = get_app_data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "app.log"
@@ -27,10 +31,16 @@ def setup_logging():
     handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    # Set log level based on debug flag
+    root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
     root_logger.addHandler(handler)
 
     # Configure logging for key modules
-    logging.getLogger("faststack.imaging.cache").setLevel(logging.DEBUG)
-    logging.getLogger("faststack.imaging.prefetch").setLevel(logging.DEBUG)
+    if debug:
+        logging.getLogger("faststack.imaging.cache").setLevel(logging.DEBUG)
+        logging.getLogger("faststack.imaging.prefetch").setLevel(logging.DEBUG)
+    else:
+        # In non-debug mode, only log errors from these noisy modules
+        logging.getLogger("faststack.imaging.cache").setLevel(logging.ERROR)
+        logging.getLogger("faststack.imaging.prefetch").setLevel(logging.ERROR)
     logging.getLogger("PIL").setLevel(logging.INFO)

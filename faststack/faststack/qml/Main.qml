@@ -64,21 +64,21 @@ ApplicationWindow {
                 color: root.currentTextColor
             }
             Label {
-                text: ` | File: ${uiState.currentFilename || 'N/A'}`
+                text: uiState.imageCount > 0 ? ` | File: ${uiState.currentFilename || 'N/A'}` : " | File: N/A"
                 color: root.currentTextColor
             }
             Label {
-                text: ` | Flag: ${uiState.isFlagged}`
-                color: uiState.isFlagged ? "lightgreen" : root.currentTextColor
+                text: uiState.imageCount > 0 ? ` | Flag: ${uiState.isFlagged}` : " | Flag: false"
+                color: (uiState.imageCount > 0 && uiState.isFlagged) ? "lightgreen" : root.currentTextColor
             }
             Label {
-                text: ` | Rejected: ${uiState.isRejected}`
-                color: uiState.isRejected ? "red" : root.currentTextColor
+                text: uiState.imageCount > 0 ? ` | Rejected: ${uiState.isRejected}` : " | Rejected: false"
+                color: (uiState.imageCount > 0 && uiState.isRejected) ? "red" : root.currentTextColor
             }
             Label {
                 text: ` | Stacked: ${uiState.stackedDate}`
                 color: "lightgreen"
-                visible: uiState.isStacked
+                visible: uiState.imageCount > 0 && uiState.isStacked
             }
             Label {
                 text: ` | Filter: "${uiState.filterString}"`
@@ -102,19 +102,53 @@ ApplicationWindow {
             }
             Rectangle {
                 Layout.fillWidth: true
-                color: uiState.stackInfoText ? "orange" : "transparent" // Brighter background
+                color: (uiState.imageCount > 0 && uiState.stackInfoText) ? "orange" : "transparent" // Brighter background
                 radius: 3
                 implicitWidth: stackInfoLabel.implicitWidth + 10
                 implicitHeight: stackInfoLabel.implicitHeight + 5
                 Label {
                     id: stackInfoLabel
                     anchors.centerIn: parent
-                    text: `Stack: ${uiState.stackInfoText || 'N/A'}`
+                    text: uiState.imageCount > 0 ? `Stack: ${uiState.stackInfoText || 'N/A'}` : "Stack: N/A"
                     color: "black" // Black text for contrast on orange
                     font.bold: true
                     font.pixelSize: 16
                 }
             }
+            
+            // Saturation slider (only visible in saturation mode)
+            Row {
+                visible: uiState.colorMode === "saturation"
+                spacing: 5
+                Layout.rightMargin: 10
+                
+                Label {
+                    text: "Saturation:"
+                    color: root.currentTextColor
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                
+                Slider {
+                    id: saturationSlider
+                    from: 0.0
+                    to: 1.0
+                    value: uiState.saturationFactor
+                    stepSize: 0.01
+                    width: 150
+                    
+                    onMoved: {
+                        controller.set_saturation_factor(value)
+                    }
+                }
+                
+                Label {
+                    text: Math.round(saturationSlider.value * 100) + "%"
+                    color: root.currentTextColor
+                    anchors.verticalCenter: parent.verticalCenter
+                    Layout.preferredWidth: 40
+                }
+            }
+            
             Label {
                 id: statusMessageLabel
                 text: uiState.statusMessage
@@ -183,6 +217,34 @@ ApplicationWindow {
                         Menu {
                             title: "&View"
                             Action { text: "Toggle Light/Dark Mode"; onTriggered: root.toggleTheme() }
+                            MenuSeparator {}
+                            
+                            ActionGroup {
+                                id: colorModeGroup
+                                exclusive: true
+                            }
+                            
+                            Action {
+                                text: "Color: None (Original)"
+                                checkable: true
+                                checked: uiState.colorMode === "none"
+                                onTriggered: controller.set_color_mode("none")
+                                ActionGroup.group: colorModeGroup
+                            }
+                            Action {
+                                text: "Color: Saturation Compensation"
+                                checkable: true
+                                checked: uiState.colorMode === "saturation"
+                                onTriggered: controller.set_color_mode("saturation")
+                                ActionGroup.group: colorModeGroup
+                            }
+                            Action {
+                                text: "Color: Full ICC Profile"
+                                checkable: true
+                                checked: uiState.colorMode === "icc"
+                                onTriggered: controller.set_color_mode("icc")
+                                ActionGroup.group: colorModeGroup
+                            }
                         }
                         Menu {
                             title: "&Actions"
@@ -258,40 +320,40 @@ ApplicationWindow {
         title: "Key Bindings"
         standardButtons: Dialog.Ok
         modal: true
-        width: 400
-        height: 400
+        width: 500
+        height: 600
 
         background: Rectangle {
             color: root.currentBackgroundColor
         }
 
-        contentItem: ScrollView {
-            clip: true
-            Text {
-                text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
-                      "<b>Navigation:</b><br>" +
-                      "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
-                      "&nbsp;&nbsp;K / Left Arrow: Previous Image<br><br>" +
-                      "<b>Viewing:</b><br>" +
-                      "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
-                      "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
-                      "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br>" +
-                      "&nbsp;&nbsp;G: Toggle Grid View (not implemented)<br><br>" +
-                      "<b>Rating & Stacking:</b><br>" +
-                      "&nbsp;&nbsp;Space: Toggle Flag<br>" +
-                      "&nbsp;&nbsp;X: Toggle Reject<br>" +
-                      "&nbsp;&nbsp;S: Add to selection for Helicon<br>" +
-                      "&nbsp;&nbsp;[: Begin new stack<br>" +
-                      "&nbsp;&nbsp;]: End current stack<br>" +
-                      "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
-                      "<b>Actions:</b><br>" +
-                      "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
-                      "&nbsp;&nbsp;E: Edit in Photoshop<br>" +
-                      "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
-                padding: 10
+        contentItem: Text {
+            text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
+                  "<b>Navigation:</b><br>" +
+                  "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
+                  "&nbsp;&nbsp;K / Left Arrow: Previous Image<br><br>" +
+                  "<b>Viewing:</b><br>" +
+                  "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
+                  "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
+                  "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br>" +
+                  "&nbsp;&nbsp;G: Toggle Grid View (not implemented)<br><br>" +
+                  "<b>Rating & Stacking:</b><br>" +
+                  "&nbsp;&nbsp;Space: Toggle Flag<br>" +
+                  "&nbsp;&nbsp;X: Toggle Reject<br>" +
+                  "&nbsp;&nbsp;S: Add to selection for Helicon<br>" +
+                  "&nbsp;&nbsp;[: Begin new stack<br>" +
+                  "&nbsp;&nbsp;]: End current stack<br>" +
+                  "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
+                  "<b>File Management:</b><br>" +
+                  "&nbsp;&nbsp;Delete: Move current image to recycle bin<br>" +
+                  "&nbsp;&nbsp;Ctrl+Z: Undo last delete<br><br>" +
+                  "<b>Actions:</b><br>" +
+                  "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
+                  "&nbsp;&nbsp;E: Edit in Photoshop<br>" +
+                  "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
+            padding: 10
                 wrapMode: Text.WordWrap
                 color: root.currentTextColor
-            }
         }
     }
 
