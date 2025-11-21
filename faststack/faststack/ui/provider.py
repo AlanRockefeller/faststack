@@ -157,18 +157,6 @@ class UIState(QObject):
         return self.app_controller.get_current_metadata().get("filename", "")
 
     @Property(bool, notify=metadataChanged)
-    def isFlagged(self):
-        if not self.app_controller.image_files:
-            return False
-        return self.app_controller.get_current_metadata().get("flag", False)
-
-    @Property(bool, notify=metadataChanged)
-    def isRejected(self):
-        if not self.app_controller.image_files:
-            return False
-        return self.app_controller.get_current_metadata().get("reject", False)
-
-    @Property(bool, notify=metadataChanged)
     def isStacked(self):
         if not self.app_controller.image_files:
             return False
@@ -185,6 +173,36 @@ class UIState(QObject):
         if not self.app_controller.image_files:
             return ""
         return self.app_controller.get_current_metadata().get("stack_info_text", "")
+    
+    @Property(bool, notify=metadataChanged)
+    def isUploaded(self):
+        if not self.app_controller.image_files:
+            return False
+        return self.app_controller.get_current_metadata().get("uploaded", False)
+    
+    @Property(str, notify=metadataChanged)
+    def uploadedDate(self):
+        if not self.app_controller.image_files:
+            return ""
+        return self.app_controller.get_current_metadata().get("uploaded_date", "")
+    
+    @Property(str, notify=metadataChanged)
+    def batchInfoText(self):
+        if not self.app_controller.image_files:
+            return ""
+        return self.app_controller.get_current_metadata().get("batch_info_text", "")
+    
+    @Property(bool, notify=metadataChanged)
+    def isEdited(self):
+        if not self.app_controller.image_files:
+            return False
+        return self.app_controller.get_current_metadata().get("edited", False)
+    
+    @Property(str, notify=metadataChanged)
+    def editedDate(self):
+        if not self.app_controller.image_files:
+            return ""
+        return self.app_controller.get_current_metadata().get("edited_date", "")
 
     @Property(str, notify=stackSummaryChanged)
     def stackSummary(self):
@@ -235,9 +253,6 @@ class UIState(QObject):
     def prevImage(self):
         self.app_controller.prev_image()
 
-    @Slot()
-    def toggleFlag(self):
-        self.app_controller.toggle_current_flag()
 
     @Slot()
     def launch_helicon(self):

@@ -69,17 +69,19 @@ ApplicationWindow {
                 color: root.currentTextColor
             }
             Label {
-                text: uiState.imageCount > 0 ? ` | Flag: ${uiState.isFlagged}` : " | Flag: false"
-                color: (uiState.imageCount > 0 && uiState.isFlagged) ? "lightgreen" : root.currentTextColor
-            }
-            Label {
-                text: uiState.imageCount > 0 ? ` | Rejected: ${uiState.isRejected}` : " | Rejected: false"
-                color: (uiState.imageCount > 0 && uiState.isRejected) ? "red" : root.currentTextColor
-            }
-            Label {
                 text: ` | Stacked: ${uiState.stackedDate}`
                 color: "lightgreen"
                 visible: uiState.imageCount > 0 && uiState.isStacked
+            }
+            Label {
+                text: ` | Uploaded on ${uiState.uploadedDate}`
+                color: "lightgreen"
+                visible: uiState.imageCount > 0 && uiState.isUploaded
+            }
+            Label {
+                text: ` | Edited on ${uiState.editedDate}`
+                color: "lightgreen"
+                visible: uiState.imageCount > 0 && uiState.isEdited
             }
             Label {
                 text: ` | Filter: "${uiState.filterString}"`
@@ -102,19 +104,38 @@ ApplicationWindow {
                 }
             }
             Rectangle {
-                Layout.fillWidth: true
-                color: (uiState.imageCount > 0 && uiState.stackInfoText) ? "orange" : "transparent" // Brighter background
+                color: (uiState.imageCount > 0 && uiState.stackInfoText) ? "orange" : "transparent"
                 radius: 3
                 implicitWidth: stackInfoLabel.implicitWidth + 10
                 implicitHeight: stackInfoLabel.implicitHeight + 5
+                visible: uiState.imageCount > 0 && uiState.stackInfoText
                 Label {
                     id: stackInfoLabel
                     anchors.centerIn: parent
-                    text: uiState.imageCount > 0 ? `Stack: ${uiState.stackInfoText || 'N/A'}` : "Stack: N/A"
-                    color: "black" // Black text for contrast on orange
+                    text: `Stack: ${uiState.stackInfoText}`
+                    color: "black"
                     font.bold: true
                     font.pixelSize: 16
                 }
+            }
+            Rectangle {
+                color: (uiState.imageCount > 0 && uiState.batchInfoText) ? "#4fb360" : "transparent"
+                radius: 3
+                implicitWidth: batchInfoLabel.implicitWidth + 10
+                implicitHeight: batchInfoLabel.implicitHeight + 5
+                visible: uiState.imageCount > 0 && uiState.batchInfoText
+                Label {
+                    id: batchInfoLabel
+                    anchors.centerIn: parent
+                    text: `Batch: ${uiState.batchInfoText}`
+                    color: "white"
+                    font.bold: true
+                    font.pixelSize: 16
+                }
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                color: "transparent"
             }
             
             // Saturation slider (only visible in saturation mode)
@@ -167,15 +188,16 @@ ApplicationWindow {
 
         MouseArea {
             anchors.fill: parent
-            property point lastMousePos: Qt.point(0, 0)
+            property point lastGlobalPos: Qt.point(0, 0)
             onPressed: function(mouse) {
-                lastMousePos = Qt.point(mouse.x, mouse.y)
+                lastGlobalPos = Qt.point(root.x + mouse.x, root.y + mouse.y)
             }
             onPositionChanged: function(mouse) {
-                var delta = Qt.point(mouse.x - lastMousePos.x, mouse.y - lastMousePos.y)
+                var currentGlobalPos = Qt.point(root.x + mouse.x, root.y + mouse.y)
+                var delta = Qt.point(currentGlobalPos.x - lastGlobalPos.x, currentGlobalPos.y - lastGlobalPos.y)
                 root.x += delta.x
                 root.y += delta.y
-                lastMousePos = Qt.point(mouse.x, mouse.y)
+                lastGlobalPos = currentGlobalPos
             }
         }
 
@@ -323,40 +345,49 @@ ApplicationWindow {
         modal: true
         closePolicy: Popup.CloseOnEscape
         focus: true
-        width: 500
-        height: 600
+        width: 600
+        height: 750
 
         background: Rectangle {
             color: root.currentBackgroundColor
         }
 
-        contentItem: Text {
-            text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
-                  "<b>Navigation:</b><br>" +
-                  "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
-                  "&nbsp;&nbsp;K / Left Arrow: Previous Image<br>" +
-                  "&nbsp;&nbsp;G: Jump to Image Number<br><br>" +
-                  "<b>Viewing:</b><br>" +
-                  "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
-                  "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
-                  "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br><br>" +
-                  "<b>Rating & Stacking:</b><br>" +
-                  "&nbsp;&nbsp;Space: Toggle Flag<br>" +
-                  "&nbsp;&nbsp;X: Toggle Reject<br>" +
-                  "&nbsp;&nbsp;S: Add to selection for Helicon<br>" +
-                  "&nbsp;&nbsp;[: Begin new stack<br>" +
-                  "&nbsp;&nbsp;]: End current stack<br>" +
-                  "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
-                  "<b>File Management:</b><br>" +
-                  "&nbsp;&nbsp;Delete: Move current image to recycle bin<br>" +
-                  "&nbsp;&nbsp;Ctrl+Z: Undo last delete<br><br>" +
-                  "<b>Actions:</b><br>" +
-                  "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
-                  "&nbsp;&nbsp;E: Edit in Photoshop<br>" +
-                  "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
-            padding: 10
+        contentItem: ScrollView {
+            clip: true
+            Text {
+                text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
+                      "<b>Navigation:</b><br>" +
+                      "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
+                      "&nbsp;&nbsp;K / Left Arrow: Previous Image<br>" +
+                      "&nbsp;&nbsp;G: Jump to Image Number<br><br>" +
+                      "<b>Viewing:</b><br>" +
+                      "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
+                      "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
+                      "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br><br>" +
+                      "<b>Stacking:</b><br>" +
+                      "&nbsp;&nbsp;[: Begin new stack<br>" +
+                      "&nbsp;&nbsp;]: End current stack<br>" +
+                      "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
+                      "<b>Batch Selection (for drag-and-drop):</b><br>" +
+                      "&nbsp;&nbsp;{: Begin new batch<br>" +
+                      "&nbsp;&nbsp;}: End current batch<br>" +
+                      "&nbsp;&nbsp;\\: Clear all batches<br>" +
+                      "&nbsp;&nbsp;X or S: Remove current image from batch/stack<br><br>" +
+                      "<b>Flag Toggles:</b><br>" +
+                      "&nbsp;&nbsp;U: Toggle uploaded flag<br>" +
+                      "&nbsp;&nbsp;Ctrl+E: Toggle edited flag<br>" +
+                      "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
+                      "<b>File Management:</b><br>" +
+                      "&nbsp;&nbsp;Delete: Move current image to recycle bin<br>" +
+                      "&nbsp;&nbsp;Ctrl+Z: Undo last delete<br><br>" +
+                      "<b>Actions:</b><br>" +
+                      "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
+                      "&nbsp;&nbsp;E: Edit in Photoshop<br>" +
+                      "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
+                padding: 10
                 wrapMode: Text.WordWrap
                 color: root.currentTextColor
+            }
         }
     }
 

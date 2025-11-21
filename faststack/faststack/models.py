@@ -14,11 +14,13 @@ class ImageFile:
 @dataclasses.dataclass
 class EntryMetadata:
     """Sidecar metadata for a single image entry."""
-    flag: bool = False
-    reject: bool = False
     stack_id: Optional[int] = None
     stacked: bool = False
     stacked_date: Optional[str] = None
+    uploaded: bool = False
+    uploaded_date: Optional[str] = None
+    edited: bool = False
+    edited_date: Optional[str] = None
 
 
 @dataclasses.dataclass

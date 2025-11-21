@@ -115,6 +115,11 @@ class AppController(QObject):
         self.stack_start_index: Optional[int] = None
         self.stacks: List[List[int]] = []
         self.selected_raws: set[Path] = set()
+        
+        # -- Batch Selection State (for drag-and-drop) --
+        self.batch_start_index: Optional[int] = None
+        self.batches: List[List[int]] = []  # List of [start, end] ranges
+        
         self._filter_string: str = "" # Default filter
         self._filter_enabled: bool = False
 
@@ -382,11 +387,11 @@ class AppController(QObject):
             self.ui_state.imageCount
         )
         log.debug(
-            "Metadata Synced: Filename=%s, Flagged=%s, Rejected=%s, StackInfo='%s'",
+            "Metadata Synced: Filename=%s, Uploaded=%s, StackInfo='%s', BatchInfo='%s'",
             self.ui_state.currentFilename,
-            self.ui_state.isFlagged,
-            self.ui_state.isRejected,
-            self.ui_state.stackInfoText
+            self.ui_state.isUploaded,
+            self.ui_state.stackInfoText,
+            self.ui_state.batchInfoText
         )
 
 
@@ -438,6 +443,78 @@ class AppController(QObject):
 
     def toggle_grid_view(self):
         log.warning("Grid view not implemented yet.")
+    
+    def toggle_uploaded(self):
+        """Toggle uploaded flag for current image."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+        
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        stem = self.image_files[self.current_index].path.stem
+        meta = self.sidecar.get_metadata(stem)
+        
+        meta.uploaded = not meta.uploaded
+        if meta.uploaded:
+            meta.uploaded_date = today
+        else:
+            meta.uploaded_date = None
+        
+        self.sidecar.save()
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.sync_ui_state()
+        status = "uploaded" if meta.uploaded else "not uploaded"
+        self.update_status_message(f"Marked as {status}")
+        log.info("Toggled uploaded flag to %s for %s", meta.uploaded, stem)
+    
+    def toggle_edited(self):
+        """Toggle edited flag for current image."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+        
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        stem = self.image_files[self.current_index].path.stem
+        meta = self.sidecar.get_metadata(stem)
+        
+        meta.edited = not meta.edited
+        if meta.edited:
+            meta.edited_date = today
+        else:
+            meta.edited_date = None
+        
+        self.sidecar.save()
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.sync_ui_state()
+        status = "edited" if meta.edited else "not edited"
+        self.update_status_message(f"Marked as {status}")
+        log.info("Toggled edited flag to %s for %s", meta.edited, stem)
+    
+    def toggle_stacked(self):
+        """Toggle stacked flag for current image."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+        
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        stem = self.image_files[self.current_index].path.stem
+        meta = self.sidecar.get_metadata(stem)
+        
+        meta.stacked = not meta.stacked
+        if meta.stacked:
+            meta.stacked_date = today
+        else:
+            meta.stacked_date = None
+        
+        self.sidecar.save()
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.sync_ui_state()
+        status = "stacked" if meta.stacked else "not stacked"
+        self.update_status_message(f"Marked as {status}")
+        log.info("Toggled stacked flag to %s for %s", meta.stacked, stem)
 
     def get_current_metadata(self) -> Dict:
         if not self.image_files or self.current_index >= len(self.image_files):
@@ -456,37 +533,21 @@ class AppController(QObject):
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem)
         stack_info = self._get_stack_info(self.current_index)
+        batch_info = self._get_batch_info(self.current_index)
         
         self._metadata_cache = {
             "filename": self.image_files[self.current_index].path.name,
-            "flag": meta.flag,
-            "reject": meta.reject,
             "stacked": meta.stacked,
             "stacked_date": meta.stacked_date or "",
-            "stack_info_text": stack_info
+            "uploaded": meta.uploaded,
+            "uploaded_date": meta.uploaded_date or "",
+            "edited": meta.edited,
+            "edited_date": meta.edited_date or "",
+            "stack_info_text": stack_info,
+            "batch_info_text": batch_info
         }
         self._metadata_cache_index = cache_key
         return self._metadata_cache
-
-    def toggle_current_flag(self):
-        if not self.image_files or self.current_index >= len(self.image_files):
-            return
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
-        meta.flag = not meta.flag
-        self.sidecar.save()
-        self._metadata_cache_index = (-1, -1) # Invalidate cache
-        self.dataChanged.emit()
-
-    def toggle_current_reject(self):
-        if not self.image_files or self.current_index >= len(self.image_files):
-            return
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
-        meta.reject = not meta.reject
-        self.sidecar.save()
-        self._metadata_cache_index = (-1, -1) # Invalidate cache
-        self.dataChanged.emit()
 
     def begin_new_stack(self):
         self.stack_start_index = self.current_index
@@ -512,6 +573,118 @@ class AppController(QObject):
             self.sync_ui_state()
         else:
             log.warning("No stack start marked. Press '[' first.")
+    
+    def begin_new_batch(self):
+        """Mark the start of a new batch for drag-and-drop."""
+        self.batch_start_index = self.current_index
+        log.info("Batch start marked at index %d", self.batch_start_index)
+        self._metadata_cache_index = (-1, -1) # Invalidate cache
+        self.dataChanged.emit()
+        self.sync_ui_state()
+        self.update_status_message("Batch start marked")
+    
+    def end_current_batch(self):
+        """End the current batch and save the range."""
+        log.info("end_current_batch called. batch_start_index: %s", self.batch_start_index)
+        if self.batch_start_index is not None:
+            start = min(self.batch_start_index, self.current_index)
+            end = max(self.batch_start_index, self.current_index)
+            self.batches.append([start, end])
+            self.batches.sort() # Keep batches sorted by start index
+            log.info("Defined new batch: [%d, %d]", start, end)
+            self.batch_start_index = None
+            self._metadata_cache_index = (-1, -1) # Invalidate cache
+            self.dataChanged.emit()
+            self.sync_ui_state()
+            count = end - start + 1
+            self.update_status_message(f"Batch defined: {count} images")
+        else:
+            log.warning("No batch start marked. Press '{{' first.")
+            self.update_status_message("No batch start marked")
+    
+    def clear_all_batches(self):
+        """Clear all defined batches."""
+        log.info("Clearing all defined batches.")
+        self.batches = []
+        self.batch_start_index = None
+        self._metadata_cache_index = (-1, -1) # Invalidate cache
+        self.dataChanged.emit()
+        self.sync_ui_state()
+        self.update_status_message("All batches cleared")
+    
+    def remove_from_batch_or_stack(self):
+        """Remove current image from any batch or stack it's in."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+        
+        removed = False
+        
+        # Check and remove from batches
+        for i in range(len(self.batches)):
+            start, end = self.batches[i]
+            if start <= self.current_index <= end:
+                # Build new ranges excluding current_index
+                new_ranges = []
+                if start == end:
+                    # Single image batch - remove entirely (don't add anything)
+                    pass
+                elif self.current_index == start:
+                    # Remove from beginning - shift start forward
+                    new_ranges.append([start + 1, end])
+                elif self.current_index == end:
+                    # Remove from end - shift end backward
+                    new_ranges.append([start, end - 1])
+                else:
+                    # Remove from middle - split into two ranges
+                    new_ranges.append([start, self.current_index - 1])
+                    new_ranges.append([self.current_index + 1, end])
+                
+                # Replace the old range with new range(s)
+                self.batches[i:i+1] = new_ranges
+                
+                log.info("Removed index %d from batch [%d, %d]", self.current_index, start, end)
+                self.update_status_message(f"Removed from batch")
+                removed = True
+                break
+        
+        # Check and remove from stacks
+        if not removed:
+            for i in range(len(self.stacks)):
+                start, end = self.stacks[i]
+                if start <= self.current_index <= end:
+                    # Build new ranges excluding current_index
+                    new_ranges = []
+                    if start == end:
+                        # Single image stack - remove entirely (don't add anything)
+                        pass
+                    elif self.current_index == start:
+                        # Remove from beginning - shift start forward
+                        new_ranges.append([start + 1, end])
+                    elif self.current_index == end:
+                        # Remove from end - shift end backward
+                        new_ranges.append([start, end - 1])
+                    else:
+                        # Remove from middle - split into two ranges
+                        new_ranges.append([start, self.current_index - 1])
+                        new_ranges.append([self.current_index + 1, end])
+                    
+                    # Replace the old range with new range(s)
+                    self.stacks[i:i+1] = new_ranges
+                    
+                    self.sidecar.data.stacks = self.stacks
+                    self.sidecar.save()
+                    log.info("Removed index %d from stack [%d, %d]", self.current_index, start, end)
+                    self.update_status_message(f"Removed from stack")
+                    removed = True
+                    break
+        
+        if removed:
+            self._metadata_cache_index = (-1, -1)
+            self.dataChanged.emit()
+            self.ui_state.stackSummaryChanged.emit()
+            self.sync_ui_state()
+        else:
+            self.update_status_message("Not in any batch or stack")
 
     def toggle_selection(self):
         """Toggles the selection status of the current image's file (RAW if available, otherwise JPG)."""
@@ -611,8 +784,9 @@ class AppController(QObject):
                 log.error("Error deleting temporary file %s: %s", tmp_path, e)
 
     def clear_all_stacks(self):
-        log.info("Clearing all defined stacks.")
+        log.info("Clearing all defined stacks and stack start marker.")
         self.stacks = []
+        self.stack_start_index = None  # Clear the stack start marker too
         self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
         self._metadata_cache_index = (-1, -1) # Invalidate cache
@@ -1068,14 +1242,31 @@ class AppController(QObject):
                 stderr=subprocess.DEVNULL,
                 close_fds=True  # Close unused file descriptors
             )
+            
+            # Mark as edited on successful launch
+            from datetime import datetime
+            today = datetime.now().strftime("%Y-%m-%d")
+            stem = image_file.path.stem
+            meta = self.sidecar.get_metadata(stem)
+            meta.edited = True
+            meta.edited_date = today
+            self.sidecar.save()
+            self._metadata_cache_index = (-1, -1)
+            self.dataChanged.emit()
+            self.sync_ui_state()
+            
             self.update_status_message(f"Opened {current_image_path.name} in Photoshop.")
             log.info("Launched Photoshop with: %s", command)
         except FileNotFoundError as e:
             self.update_status_message(f"Photoshop executable not found: {e}")
             log.exception("Photoshop executable not found")
+            # Don't mark as edited if launch failed
+            return
         except (OSError, subprocess.SubprocessError) as e:
             self.update_status_message(f"Failed to open in Photoshop: {e}")
             log.exception("Error launching Photoshop")
+            # Don't mark as edited if launch failed
+            return
 
     @Slot()
     def copy_path_to_clipboard(self):
@@ -1113,9 +1304,22 @@ class AppController(QObject):
         if not self.image_files or self.current_index >= len(self.image_files):
             return
 
-        file_path = self.image_files[self.current_index].path
-        if not file_path.exists():
-            log.error("File does not exist, cannot start drag: %s", file_path)
+        # Collect all files: current + any in defined batches
+        files_to_drag = set()
+        files_to_drag.add(self.current_index)
+        
+        # Add all files from defined batches
+        for start, end in self.batches:
+            for idx in range(start, end + 1):
+                if 0 <= idx < len(self.image_files):
+                    files_to_drag.add(idx)
+        
+        # Convert to sorted list and get paths
+        file_indices = sorted(files_to_drag)
+        file_paths = [self.image_files[idx].path for idx in file_indices if self.image_files[idx].path.exists()]
+        
+        if not file_paths:
+            log.error("No valid files to drag")
             return
 
         if self.main_window is None:
@@ -1124,30 +1328,50 @@ class AppController(QObject):
         drag = QDrag(self.main_window)
         mime_data = QMimeData()
 
-        # --- Windows file drop payload ---
-        if sys.platform.startswith("win"):
-            hdrop = make_hdrop([str(file_path)])
-            mime_data.setData('application/x-qt-windows-mime;value="FileDrop"', hdrop)
-            mime_data.setData('application/x-qt-windows-mime;value="FileNameW"',
-                              (str(file_path) + "\0").encode("utf-16le"))
-            mime_data.setData('application/x-qt-windows-mime;value="FileName"',
-                              (str(file_path) + "\0").encode("mbcs", errors="replace"))
-        else:
-            mime_data.setUrls([QUrl.fromLocalFile(str(file_path))])
-
+        # Use Qt's standard setUrls - it handles both browser and native app compatibility
+        urls = [QUrl.fromLocalFile(str(p)) for p in file_paths]
+        mime_data.setUrls(urls)
+        
         drag.setMimeData(mime_data)
 
         # --- thumbnail / drag preview ---
-        pix = QPixmap(str(file_path))
+        pix = QPixmap(str(file_paths[0]))
         if not pix.isNull():
-            # scale it down so it’s not huge
+            # scale it down so it's not huge
             scaled = pix.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             drag.setPixmap(scaled)
             # hotspot = center of image
             drag.setHotSpot(QPoint(scaled.width() // 2, scaled.height() // 2))
 
-        log.info("Starting drag for %s", file_path)
-        drag.exec(Qt.CopyAction)
+        log.info("Starting drag for %d file(s): %s", len(file_paths), [str(p) for p in file_paths])
+        # Support both Copy and Move actions for browser compatibility
+        result = drag.exec(Qt.CopyAction | Qt.MoveAction)
+        log.info("Drag completed with result: %s", result)
+        
+        # Reset zoom/pan after drag completes (drag can cause unwanted panning)
+        self.ui_state.resetZoomPan()
+        
+        # Mark all dragged files as uploaded if drag was successful
+        if result in (Qt.CopyAction, Qt.MoveAction):
+            from datetime import datetime
+            today = datetime.now().strftime("%Y-%m-%d")
+            
+            for idx in file_indices:
+                stem = self.image_files[idx].path.stem
+                meta = self.sidecar.get_metadata(stem)
+                meta.uploaded = True
+                meta.uploaded_date = today
+            
+            self.sidecar.save()
+            
+            # Clear all batches after successful drag (like pressing \)
+            self.batches = []
+            self.batch_start_index = None
+            
+            self._metadata_cache_index = (-1, -1)
+            self.dataChanged.emit()
+            self.sync_ui_state()
+            log.info("Marked %d file(s) as uploaded on %s. Cleared all batches.", len(file_indices), today)
 
     def _get_stack_info(self, index: int) -> str:
         info = ""
@@ -1160,6 +1384,20 @@ class AppController(QObject):
         if not info and self.stack_start_index is not None and self.stack_start_index == index:
             info = "Stack Start Marked"
         log.debug("_get_stack_info for index %d: %s", index, info)
+        return info
+    
+    def _get_batch_info(self, index: int) -> str:
+        """Get batch info for the given index."""
+        info = ""
+        for i, (start, end) in enumerate(self.batches):
+            if start <= index <= end:
+                count_in_batch = end - start + 1
+                pos_in_batch = index - start + 1
+                info = f"Batch {i+1} ({pos_in_batch}/{count_in_batch})"
+                break
+        if not info and self.batch_start_index is not None and self.batch_start_index == index:
+            info = "Batch Start Marked"
+        log.debug("_get_batch_info for index %d: %s", index, info)
         return info
 
     def get_stack_summary(self) -> str:

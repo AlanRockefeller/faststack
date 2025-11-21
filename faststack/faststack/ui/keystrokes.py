@@ -23,20 +23,27 @@ class Keybinder:
             Qt.Key_Left: "prev_image",
             Qt.Key_G: "show_jump_to_image_dialog",
 
-            # Metadata
-            Qt.Key_Space: "toggle_current_flag",
-            Qt.Key_X: "toggle_current_reject",
-
             # Stacking
             Qt.Key_BracketLeft: "begin_new_stack",
             Qt.Key_BracketRight: "end_current_stack",
+            
+            # Batching
+            Qt.Key_BraceLeft: "begin_new_batch",
+            Qt.Key_BraceRight: "end_current_batch",
+            Qt.Key_Backslash: "clear_all_batches",
+
+            # Remove from batch/stack
+            Qt.Key_X: "remove_from_batch_or_stack",
+            Qt.Key_S: "remove_from_batch_or_stack",
+            
+            # Toggle flags
+            Qt.Key_U: "toggle_uploaded",
 
             # Actions
-            Qt.Key_S: "toggle_selection",
             Qt.Key_Enter: "launch_helicon",
             Qt.Key_Return: "launch_helicon",
             Qt.Key_E: "edit_in_photoshop",
-            Qt.Key_C: "clear_all_stacks", # Keep C for clear_all_stacks
+            Qt.Key_C: "clear_all_stacks",
             Qt.Key_Delete: "delete_current_image",
             Qt.Key_Backspace: "delete_current_image",
         }
@@ -45,6 +52,8 @@ class Keybinder:
             (Qt.Key_C, Qt.ControlModifier): "copy_path_to_clipboard",
             (Qt.Key_0, Qt.ControlModifier): "reset_zoom_pan",
             (Qt.Key_Z, Qt.ControlModifier): "undo_delete",
+            (Qt.Key_E, Qt.ControlModifier): "toggle_edited",
+            (Qt.Key_S, Qt.ControlModifier): "toggle_stacked",
         }
 
     def _call(self, method_name: str):
@@ -85,6 +94,15 @@ class Keybinder:
             return True
         if text == "]":
             self._call("end_current_stack")
+            return True
+        if text == "{":
+            self._call("begin_new_batch")
+            return True
+        if text == "}":
+            self._call("end_current_batch")
+            return True
+        if text == "\\":
+            self._call("clear_all_batches")
             return True
 
         return False
