@@ -67,7 +67,7 @@ class Keybinder:
     def handle_key_press(self, event):
         key = event.key()
         text = event.text()
-        log.info(f"Key pressed: {key} ({text!r}) with modifiers {event.modifiers()}")
+        log.debug(f"Key pressed: {key} ({text!r}) with modifiers {event.modifiers()}")
 
         # Check for modifier + key combinations
         for (mapped_key, mapped_modifier), method_name in self.modifier_key_map.items():

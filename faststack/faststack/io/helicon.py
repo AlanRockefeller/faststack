@@ -53,6 +53,7 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
             tmp_path = Path(tmp.name)
 
         log.info(f"Temporary file for Helicon Focus: {tmp_path}")
+        log.info(f"Input files: {[str(f) for f in raw_files]}")
 
         # Build command list safely
         args = [helicon_exe, "-i", str(tmp_path.resolve())]
@@ -69,8 +70,8 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
                 log.exception(f"Invalid helicon args format: {e}")
                 return False, None
 
-        log.info(f"Launching Helicon Focus with {len(raw_files)} files.")
-        log.info(f"Helicon Focus command: {args}") # Log the full command
+        log.info(f"Launching Helicon Focus with {len(raw_files)} files")
+        log.info(f"Command: {' '.join(args)}")
         
         # SECURITY: Explicitly disable shell execution
         subprocess.Popen(

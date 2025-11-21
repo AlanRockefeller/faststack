@@ -39,7 +39,7 @@ from faststack.io.watcher import Watcher
 from faststack.io.helicon import launch_helicon_focus
 from faststack.io.executable_validator import validate_executable_path
 from faststack.imaging.cache import ByteLRUCache, get_decoded_image_size
-from faststack.imaging.prefetch import Prefetcher
+from faststack.imaging.prefetch import Prefetcher, clear_icc_caches
 from faststack.ui.provider import ImageProvider
 from faststack.ui.keystrokes import Keybinder
 
@@ -74,7 +74,8 @@ class AppController(QObject):
     def __init__(self, image_dir: Path, engine: QQmlApplicationEngine):
         super().__init__()
         self.image_dir = image_dir
-        self.image_files: List[ImageFile] = []
+        self.image_files: List[ImageFile] = []  # Filtered list for display
+        self._all_images: List[ImageFile] = []  # Cached full list from disk
         self.current_index: int = 0
         self.ui_refresh_generation = 0
         self.main_window: Optional[QObject] = None
@@ -89,7 +90,7 @@ class AppController(QObject):
 
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self.refresh_image_list)
-        self.sidecar = SidecarManager(self.image_dir, self.watcher)
+        self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
         
         # -- Caching & Prefetching --
         cache_size_gb = config.getfloat('core', 'cache_size_gb', 1.5)
@@ -99,9 +100,11 @@ class AppController(QObject):
             image_files=self.image_files,
             cache_put=self.image_cache.__setitem__,
             prefetch_radius=config.getint('core', 'prefetch_radius', 4),
-            get_display_info=self.get_display_info
+            get_display_info=self.get_display_info,
+            debug=_debug_mode
         )
         self.last_displayed_image: Optional[DecodedImage] = None  # Cache last image to avoid grey squares
+        self._last_image_lock = threading.Lock()  # Protect last_displayed_image from race conditions
 
         # -- UI State --
         self.ui_state = UIState(self)
@@ -140,7 +143,7 @@ class AppController(QObject):
 
         self._filter_string = filter_string
         self._filter_enabled = True
-        self.refresh_image_list()
+        self._apply_filter_to_cached_list()  # Fast in-memory filtering
         self.dataChanged.emit()
         self.ui_state.filterStringChanged.emit()  # Notify UI of filter change
 
@@ -160,7 +163,7 @@ class AppController(QObject):
             return
         self._filter_enabled = False
         self._filter_string = ""
-        self.refresh_image_list()
+        self._apply_filter_to_cached_list()  # Fast in-memory filtering
         self.dataChanged.emit()
         self.ui_state.filterStringChanged.emit()  # Notify UI of filter change
         self.current_index = min(self.current_index, max(0, len(self.image_files) - 1))
@@ -189,7 +192,7 @@ class AppController(QObject):
         log.info("Display size changed to: %dx%d (physical pixels)", self.pending_width, self.pending_height)
         self.display_width = self.pending_width
         self.display_height = self.pending_height
-        self.display_generation += 1
+        self.display_generation += 1  # Invalidates old entries via cache key
         
         # Mark display as ready after first size report
         is_first_resize = not self.display_ready
@@ -197,8 +200,11 @@ class AppController(QObject):
             self.display_ready = True
             log.info("Display size now stable, enabling prefetch")
         
-        self.image_cache.clear()
-        self.prefetcher.cancel_all()
+        # NOTE: We don't clear the cache or cancel prefetch work here.
+        # The generation increment is enough - cache keys include display_generation,
+        # so old resolutions become naturally unreachable and LRU will evict them.
+        # This lets us reuse cached images if user toggles zoom or resizes back.
+        self.prefetcher.cancel_all()  # Cancel stale tasks to avoid wasted work
         
         # On first resize, execute deferred prefetch; on subsequent resizes, do normal prefetch
         if is_first_resize and self.pending_prefetch_index is not None:
@@ -214,9 +220,13 @@ class AppController(QObject):
             return
         self.is_zoomed = zoomed
         log.info("Zoom state changed to: %s", zoomed)
-        self.display_generation += 1 # Invalidate cache
-        self.image_cache.clear()
-        self.prefetcher.cancel_all()
+        self.display_generation += 1  # Invalidates old entries via cache key
+        
+        # NOTE: We don't clear the cache here. The generation increment is enough.
+        # Cache keys include display_generation, so zoomed/unzoomed images become
+        # naturally unreachable and LRU will evict them. This lets us instantly
+        # reuse cached images if user toggles zoom on/off repeatedly.
+        self.prefetcher.cancel_all()  # Cancel stale tasks to avoid wasted work
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
         self.ui_state.isZoomedChanged.emit()
@@ -228,22 +238,29 @@ class AppController(QObject):
                 return True
         return super().eventFilter(watched, event)
 
-    def _do_prefetch(self, index: int, is_navigation: bool = False):
+    def _do_prefetch(self, index: int, is_navigation: bool = False, direction: Optional[int] = None):
         """Helper to defer prefetch until display size is stable.
         
         Args:
             index: The index to prefetch around
             is_navigation: True if called from user navigation (arrow keys, etc.)
+            direction: 1 for forward, -1 for backward, None to use last direction
         """
+        # If navigation occurs during resize debounce, cancel timer and apply resize immediately
+        # to ensure prefetch uses correct dimensions
+        if is_navigation and self.resize_timer.isActive():
+            self.resize_timer.stop()
+            self._handle_resize()
+        
         if not self.display_ready:
             log.debug("Display not ready, deferring prefetch for index %d", index)
             self.pending_prefetch_index = index
             return
-        self.prefetcher.update_prefetch(index, is_navigation=is_navigation)
+        self.prefetcher.update_prefetch(index, is_navigation=is_navigation, direction=direction)
     
     def load(self):
         """Loads images, sidecar data, and starts services."""
-        self.refresh_image_list()
+        self.refresh_image_list()  # Initial scan from disk
         if not self.image_files:
             self.current_index = 0
         else:
@@ -258,23 +275,40 @@ class AppController(QObject):
 
 
     def refresh_image_list(self):
-        """Rescans the directory for images and applies the current filter."""
-        all_images = find_images(self.image_dir)
+        """Rescans the directory for images from disk and updates cache.
+        
+        This does a full disk scan and should only be called when:
+        - Application starts (load())
+        - Directory watcher detects file changes
+        - User explicitly refreshes
+        
+        For filtering, use _apply_filter_to_cached_list() instead.
+        """
+        self._all_images = find_images(self.image_dir)
+        self._apply_filter_to_cached_list()
+    
+    def _apply_filter_to_cached_list(self):
+        """Applies current filter to cached image list without disk I/O."""
         if self._filter_enabled and self._filter_string:
             needle = self._filter_string.lower()
             self.image_files = [
-                img for img in all_images
+                img for img in self._all_images
                 if needle in img.path.stem.lower()
             ]
         else:
-            self.image_files = all_images
+            self.image_files = self._all_images
 
         self.prefetcher.set_image_files(self.image_files)
         self._metadata_cache_index = (-1, -1) # Invalidate cache
         self.ui_state.imageCountChanged.emit()
 
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
-        """Retrieves a decoded image, blocking until ready to ensure correct display."""
+        """Retrieves a decoded image, blocking until ready to ensure correct display.
+        
+        This blocks the UI thread on cache miss, but that's acceptable for an image viewer
+        where users expect to see the correct image immediately. The prefetcher minimizes
+        cache misses by decoding adjacent images in advance.
+        """
         if not self.image_files: # Handle empty image list
             log.warning("get_decoded_image called with empty image_files.")
             return None
@@ -285,7 +319,8 @@ class AppController(QObject):
         # Check cache first
         if cache_key in self.image_cache:
             decoded = self.image_cache[cache_key]
-            self.last_displayed_image = decoded
+            with self._last_image_lock:
+                self.last_displayed_image = decoded
             return decoded
         
         # Cache miss: need to decode synchronously to ensure correct image displays
@@ -303,22 +338,27 @@ class AppController(QObject):
                     cache_key = f"{decoded_index}_{decoded_display_gen}"
                     if cache_key in self.image_cache:
                         decoded = self.image_cache[cache_key]
-                        self.last_displayed_image = decoded
+                        with self._last_image_lock:
+                            self.last_displayed_image = decoded
                         if _debug_mode:
                             elapsed = time.perf_counter() - decode_start
                             log.info("Decoded image %d in %.3fs", index, elapsed)
                         return decoded
             except concurrent.futures.TimeoutError:
-                log.error("Timeout decoding image at index %d", index)
-                return self.last_displayed_image
+                log.exception("Timeout decoding image at index %d", index)
+                with self._last_image_lock:
+                    return self.last_displayed_image
             except concurrent.futures.CancelledError:
                 log.warning("Decode cancelled for index %d", index)
-                return self.last_displayed_image
+                with self._last_image_lock:
+                    return self.last_displayed_image
             except Exception as e:
-                log.error("Error decoding image at index %d: %s", index, e)
-                return self.last_displayed_image
+                log.exception("Error decoding image at index %d", index)
+                with self._last_image_lock:
+                    return self.last_displayed_image
         
-        return self.last_displayed_image
+        with self._last_image_lock:
+            return self.last_displayed_image
 
     def sync_ui_state(self):
         """Forces the UI to update by emitting all state change signals."""
@@ -351,22 +391,22 @@ class AppController(QObject):
     def next_image(self):
         if self.current_index < len(self.image_files) - 1:
             self.current_index += 1
-            self._do_prefetch(self.current_index, is_navigation=True)
+            self._do_prefetch(self.current_index, is_navigation=True, direction=1)
             self.sync_ui_state()
 
     def prev_image(self):
         if self.current_index > 0:
             self.current_index -= 1
-            self._do_prefetch(self.current_index, is_navigation=True)
+            self._do_prefetch(self.current_index, is_navigation=True, direction=-1)
             self.sync_ui_state()
 
     def toggle_grid_view(self):
         log.warning("Grid view not implemented yet.")
 
     def get_current_metadata(self) -> Dict:
-        if not self.image_files:
+        if not self.image_files or self.current_index >= len(self.image_files):
             if not self._logged_empty_metadata:
-                log.debug("get_current_metadata: image_files is empty, returning {}.")
+                log.debug("get_current_metadata: image_files is empty or index out of bounds, returning {}.")
                 self._logged_empty_metadata = True
             return {}
         self._logged_empty_metadata = False
@@ -393,6 +433,8 @@ class AppController(QObject):
         return self._metadata_cache
 
     def toggle_current_flag(self):
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem)
         meta.flag = not meta.flag
@@ -401,6 +443,8 @@ class AppController(QObject):
         self.dataChanged.emit()
 
     def toggle_current_reject(self):
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem)
         meta.reject = not meta.reject
@@ -434,46 +478,56 @@ class AppController(QObject):
             log.warning("No stack start marked. Press '[' first.")
 
     def toggle_selection(self):
-        """Toggles the selection status of the current image's RAW file."""
-        if not self.image_files:
+        """Toggles the selection status of the current image's file (RAW if available, otherwise JPG)."""
+        if not self.image_files or self.current_index >= len(self.image_files):
             return
 
         image_file = self.image_files[self.current_index]
-        if image_file.raw_pair:
-            if image_file.raw_pair in self.selected_raws:
-                self.selected_raws.remove(image_file.raw_pair)
-                log.info("Removed %s from selection.", image_file.raw_pair.name)
-            else:
-                self.selected_raws.add(image_file.raw_pair)
-                log.info("Added %s to selection.", image_file.raw_pair.name)
-            
-            # In a real app, we'd update a selection indicator in the UI.
-            # For now, we just log and can use it for batch operations.
-            self.sync_ui_state() # This will trigger a UI refresh
+        # Use RAW if available, otherwise use JPG
+        file_to_select = image_file.raw_pair if image_file.raw_pair else image_file.path
+        
+        if file_to_select in self.selected_raws:
+            self.selected_raws.remove(file_to_select)
+            log.info("Removed %s from selection.", file_to_select.name)
+        else:
+            self.selected_raws.add(file_to_select)
+            log.info("Added %s to selection.", file_to_select.name)
+        
+        # In a real app, we'd update a selection indicator in the UI.
+        # For now, we just log and can use it for batch operations.
+        self.sync_ui_state() # This will trigger a UI refresh
 
 
     def launch_helicon(self):
-        """Launches Helicon Focus with selected RAWs or all RAWs in defined stacks."""
+        """Launches Helicon Focus with selected files (RAW preferred, JPG fallback) or stacks."""
         if self.selected_raws:
-            log.info("Launching Helicon with %d selected RAW files.", len(self.selected_raws))
-            self._launch_helicon_with_files(sorted(list(self.selected_raws)))
-            self.selected_raws.clear()
+            log.info("Launching Helicon with %d selected files.", len(self.selected_raws))
+            success = self._launch_helicon_with_files(sorted(list(self.selected_raws)))
+            if success:
+                self.selected_raws.clear()
 
         elif self.stacks:
             log.info("Launching Helicon for %d defined stacks.", len(self.stacks))
+            any_success = False
             for start, end in self.stacks:
-                raw_files_to_process = []
+                files_to_process = []
                 for idx in range(start, end + 1):
-                    if idx < len(self.image_files) and self.image_files[idx].raw_pair:
-                        raw_files_to_process.append(self.image_files[idx].raw_pair)
+                    if idx < len(self.image_files):
+                        img_file = self.image_files[idx]
+                        # Use RAW if available, otherwise use JPG
+                        file_to_use = img_file.raw_pair if img_file.raw_pair else img_file.path
+                        files_to_process.append(file_to_use)
                 
-                if raw_files_to_process:
-                    self._launch_helicon_with_files(raw_files_to_process)
+                if files_to_process:
+                    success = self._launch_helicon_with_files(files_to_process)
+                    if success:
+                        any_success = True
                 else:
-                    log.warning("No valid RAW files found for stack [%d, %d].", start, end)
+                    log.warning("No valid files found for stack [%d, %d].", start, end)
             
-            # clear_all_stacks() already emits stackSummaryChanged
-            self.clear_all_stacks()
+            # Only clear stacks if at least one launch succeeded
+            if any_success:
+                self.clear_all_stacks()
 
         else:
             log.warning("No selection or stacks defined to launch Helicon Focus.")
@@ -481,21 +535,26 @@ class AppController(QObject):
 
         self.sync_ui_state()
 
-    def _launch_helicon_with_files(self, raw_files: List[Path]):
-        """Helper to launch Helicon with a specific list of files."""
-        log.info("Launching Helicon Focus with %d RAW files.", len(raw_files))
-        unique_raw_files = sorted(list(set(raw_files)))
-        success, tmp_path = launch_helicon_focus(unique_raw_files)
+    def _launch_helicon_with_files(self, files: List[Path]) -> bool:
+        """Helper to launch Helicon with a specific list of files (RAW or JPG).
+        
+        Returns:
+            True if Helicon was successfully launched, False otherwise.
+        """
+        log.info("Launching Helicon Focus with %d files.", len(files))
+        unique_files = sorted(list(set(files)))
+        success, tmp_path = launch_helicon_focus(unique_files)
         if success and tmp_path:
             # Schedule delayed deletion of the temporary file
             QTimer.singleShot(5000, lambda: self._delete_temp_file(tmp_path))
 
             # Record stacking metadata
             today = date.today().isoformat()
-            for raw_path in unique_raw_files:
+            for file_path in unique_files:
                 # Find the corresponding image file to get the stem
                 for img_file in self.image_files:
-                    if img_file.raw_pair == raw_path:
+                    # Match by either RAW pair or JPG path
+                    if img_file.raw_pair == file_path or img_file.path == file_path:
                         stem = img_file.path.stem
                         meta = self.sidecar.get_metadata(stem)
                         meta.stacked = True
@@ -503,12 +562,15 @@ class AppController(QObject):
                         break
             self.sidecar.save()
             self._metadata_cache_index = (-1, -1) # Invalidate cache
+        
+        return success
 
     def _delete_temp_file(self, tmp_path: Path):
+        """Deletes the temporary file list passed to Helicon Focus."""
         if tmp_path.exists():
             try:
-                # os.remove(tmp_path)
-                log.info("Keeping temporary file: %s", tmp_path)
+                os.remove(tmp_path)
+                log.info("Deleted temporary file: %s", tmp_path)
             except OSError as e:
                 log.error("Error deleting temporary file %s: %s", tmp_path, e)
 
@@ -594,6 +656,9 @@ class AppController(QObject):
         log.info("Setting color mode to: %s", mode)
         config.set('color', 'mode', mode)
         config.save()
+        
+        # Clear ICC caches when color mode changes
+        clear_icc_caches()
         
         # Clear cache and restart prefetcher to apply new color mode
         self.image_cache.clear()
@@ -750,13 +815,13 @@ class AppController(QObject):
                 # Clear cache and invalidate display generation to force image reload
                 self.display_generation += 1
                 self.image_cache.clear()
-                # update_prefetch will handle cancelling stale tasks and incrementing generation
+                self.prefetcher.cancel_all()  # Cancel stale tasks since image list changed
                 self.prefetcher.update_prefetch(self.current_index)
                 self.sync_ui_state()
             
         except OSError as e:
             self.update_status_message(f"Delete failed: {e}")
-            log.exception(f"Failed to delete image: {e}")
+            log.exception("Failed to delete image")
 
     @Slot()
     def undo_delete(self):
@@ -803,13 +868,13 @@ class AppController(QObject):
             # Clear cache and invalidate display generation to force image reload
             self.display_generation += 1
             self.image_cache.clear()
-            # update_prefetch will handle cancelling stale tasks and incrementing generation
+            self.prefetcher.cancel_all()  # Cancel stale tasks since image list changed
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
             
         except OSError as e:
             self.update_status_message(f"Undo failed: {e}")
-            log.exception(f"Failed to restore image: {e}")
+            log.exception("Failed to restore image")
             # Put it back in history if it failed
             self.delete_history.append((jpg_path, raw_path))
 
@@ -852,7 +917,7 @@ class AppController(QObject):
             self.delete_history.clear()
             log.info("Emptied recycle bin and cleared delete history")
         except OSError as e:
-            log.exception(f"Failed to empty recycle bin: {e}")
+            log.exception("Failed to empty recycle bin")
 
     @Slot()
     def edit_in_photoshop(self):
@@ -925,10 +990,10 @@ class AppController(QObject):
             log.info("Launched Photoshop with: %s", command)
         except FileNotFoundError as e:
             self.update_status_message(f"Photoshop executable not found: {e}")
-            log.exception(f"Photoshop executable not found: {e}")
+            log.exception("Photoshop executable not found")
         except (OSError, subprocess.SubprocessError) as e:
             self.update_status_message(f"Failed to open in Photoshop: {e}")
-            log.exception(f"Error launching Photoshop: {e}")
+            log.exception("Error launching Photoshop")
 
     @Slot()
     def copy_path_to_clipboard(self):
@@ -1012,7 +1077,7 @@ class AppController(QObject):
                 break
         if not info and self.stack_start_index is not None and self.stack_start_index == index:
             info = "Stack Start Marked"
-        log.info("_get_stack_info for index %d: %s", index, info)
+        log.debug("_get_stack_info for index %d: %s", index, info)
         return info
 
     def get_stack_summary(self) -> str:
@@ -1024,7 +1089,7 @@ class AppController(QObject):
         return "; ".join(summary)
 
     def is_stacked(self) -> bool:
-        if not self.image_files:
+        if not self.image_files or self.current_index >= len(self.image_files):
             return False
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem)
