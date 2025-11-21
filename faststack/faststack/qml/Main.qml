@@ -382,7 +382,7 @@ ApplicationWindow {
                       "&nbsp;&nbsp;Ctrl+Z: Undo last delete<br><br>" +
                       "<b>Actions:</b><br>" +
                       "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
-                      "&nbsp;&nbsp;E: Edit in Photoshop<br>" +
+                      "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
                       "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
                 padding: 10
                 wrapMode: Text.WordWrap

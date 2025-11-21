@@ -114,7 +114,7 @@ class AppController(QObject):
         # -- Stacking State --
         self.stack_start_index: Optional[int] = None
         self.stacks: List[List[int]] = []
-        self.selected_raws: set[Path] = set()
+
         
         # -- Batch Selection State (for drag-and-drop) --
         self.batch_start_index: Optional[int] = None
@@ -599,7 +599,7 @@ class AppController(QObject):
             count = end - start + 1
             self.update_status_message(f"Batch defined: {count} images")
         else:
-            log.warning("No batch start marked. Press '{{' first.")
+            log.warning("No batch start marked. Press '{' first.")
             self.update_status_message("No batch start marked")
     
     def clear_all_batches(self):
@@ -620,64 +620,72 @@ class AppController(QObject):
         removed = False
         
         # Check and remove from batches
-        for i in range(len(self.batches)):
-            start, end = self.batches[i]
-            if start <= self.current_index <= end:
-                # Build new ranges excluding current_index
-                new_ranges = []
-                if start == end:
-                    # Single image batch - remove entirely (don't add anything)
-                    pass
-                elif self.current_index == start:
-                    # Remove from beginning - shift start forward
-                    new_ranges.append([start + 1, end])
-                elif self.current_index == end:
-                    # Remove from end - shift end backward
-                    new_ranges.append([start, end - 1])
-                else:
-                    # Remove from middle - split into two ranges
-                    new_ranges.append([start, self.current_index - 1])
-                    new_ranges.append([self.current_index + 1, end])
+        new_batches = []
+        batch_modified = False
+        for start, end in self.batches:
+            if not batch_modified and start <= self.current_index <= end:
+                # This is the batch to modify.
                 
-                # Replace the old range with new range(s)
-                self.batches[i:i+1] = new_ranges
+                # Single image batch - remove entirely by not adding anything.
+                if start == end:
+                    pass
+                # Remove from beginning - shift start forward
+                elif self.current_index == start:
+                    new_batches.append([start + 1, end])
+                # Remove from end - shift end backward
+                elif self.current_index == end:
+                    new_batches.append([start, end - 1])
+                # Remove from middle - split into two ranges
+                else:
+                    new_batches.append([start, self.current_index - 1])
+                    new_batches.append([self.current_index + 1, end])
                 
                 log.info("Removed index %d from batch [%d, %d]", self.current_index, start, end)
                 self.update_status_message(f"Removed from batch")
                 removed = True
-                break
+                batch_modified = True
+            else:
+                new_batches.append([start, end])
+        
+        if batch_modified:
+            self.batches = new_batches
         
         # Check and remove from stacks
         if not removed:
-            for i in range(len(self.stacks)):
-                start, end = self.stacks[i]
-                if start <= self.current_index <= end:
-                    # Build new ranges excluding current_index
-                    new_ranges = []
+            new_stacks = []
+            stack_modified = False
+            for start, end in self.stacks:
+                if not stack_modified and start <= self.current_index <= end:
+                    # This is the stack to modify.
+                    
+                    # Single image stack - remove entirely.
                     if start == end:
-                        # Single image stack - remove entirely (don't add anything)
                         pass
+                    # Remove from beginning
                     elif self.current_index == start:
-                        # Remove from beginning - shift start forward
-                        new_ranges.append([start + 1, end])
+                        new_stacks.append([start + 1, end])
+                    # Remove from end
                     elif self.current_index == end:
-                        # Remove from end - shift end backward
-                        new_ranges.append([start, end - 1])
+                        new_stacks.append([start, end - 1])
+                    # Remove from middle
                     else:
-                        # Remove from middle - split into two ranges
-                        new_ranges.append([start, self.current_index - 1])
-                        new_ranges.append([self.current_index + 1, end])
+                        new_stacks.append([start, self.current_index - 1])
+                        new_stacks.append([self.current_index + 1, end])
                     
-                    # Replace the old range with new range(s)
-                    self.stacks[i:i+1] = new_ranges
-                    
-                    self.sidecar.data.stacks = self.stacks
+                    self.sidecar.data.stacks = self.stacks # Update sidecar BEFORE self.stacks is replaced
                     self.sidecar.save()
                     log.info("Removed index %d from stack [%d, %d]", self.current_index, start, end)
                     self.update_status_message(f"Removed from stack")
                     removed = True
-                    break
-        
+                    stack_modified = True
+                else:
+                    new_stacks.append([start, end])
+            
+            if stack_modified:
+                self.stacks = new_stacks
+                self.sidecar.data.stacks = self.stacks
+                self.sidecar.save()
+
         if removed:
             self._metadata_cache_index = (-1, -1)
             self.dataChanged.emit()
@@ -686,36 +694,157 @@ class AppController(QObject):
         else:
             self.update_status_message("Not in any batch or stack")
 
-    def toggle_selection(self):
-        """Toggles the selection status of the current image's file (RAW if available, otherwise JPG)."""
+    def toggle_batch_membership(self):
+        """Toggles the current image's inclusion in a batch."""
         if not self.image_files or self.current_index >= len(self.image_files):
             return
 
-        image_file = self.image_files[self.current_index]
-        # Use RAW if available, otherwise use JPG
-        file_to_select = image_file.raw_pair if image_file.raw_pair else image_file.path
+        index_to_toggle = self.current_index
         
-        if file_to_select in self.selected_raws:
-            self.selected_raws.remove(file_to_select)
-            log.info("Removed %s from selection.", file_to_select.name)
+        # Check if the image is already in a batch
+        in_batch = False
+        for start, end in self.batches:
+            if start <= index_to_toggle <= end:
+                in_batch = True
+                break
+        
+        new_batches = []
+        if in_batch:
+            # Remove from batch
+            item_removed = False
+            for start, end in self.batches:
+                if not item_removed and start <= index_to_toggle <= end:
+                    if start < index_to_toggle:
+                        new_batches.append([start, index_to_toggle - 1])
+                    if index_to_toggle < end:
+                        new_batches.append([index_to_toggle + 1, end])
+                    item_removed = True
+                else:
+                    new_batches.append([start, end])
+            self.batches = new_batches
+            self.update_status_message("Removed image from batch")
+            log.info("Removed index %d from a batch.", index_to_toggle)
         else:
-            self.selected_raws.add(file_to_select)
-            log.info("Added %s to selection.", file_to_select.name)
+            # Add to a new batch
+            self.batches.append([index_to_toggle, index_to_toggle])
+            self.batches.sort()
+            self.update_status_message("Added image to batch")
+            log.info("Added index %d to a new batch.", index_to_toggle)
         
-        # In a real app, we'd update a selection indicator in the UI.
-        # For now, we just log and can use it for batch operations.
-        self.sync_ui_state() # This will trigger a UI refresh
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.sync_ui_state()
+
+    def toggle_stack_membership(self):
+        """Toggles the current image's inclusion in a stack."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+
+        index_to_toggle = self.current_index
+        
+        # Check if the image is already in a stack
+        stack_to_modify_idx = -1
+        for i, (start, end) in enumerate(self.stacks):
+            if start <= index_to_toggle <= end:
+                stack_to_modify_idx = i
+                break
+        
+        if stack_to_modify_idx != -1:
+            # --- Remove from existing stack ---
+            new_stacks = []
+            item_removed = False
+            for i, (start, end) in enumerate(self.stacks):
+                if not item_removed and i == stack_to_modify_idx:
+                    if start < index_to_toggle:
+                        new_stacks.append([start, index_to_toggle - 1])
+                    if index_to_toggle < end:
+                        new_stacks.append([index_to_toggle + 1, end])
+                    item_removed = True
+                else:
+                    new_stacks.append([start, end])
+            self.stacks = new_stacks
+            self.update_status_message("Removed image from stack")
+            log.info("Removed index %d from stack #%d.", index_to_toggle, stack_to_modify_idx + 1)
+
+        else:
+            # --- Add to nearest stack ---
+            if not self.stacks:
+                self.stacks.append([index_to_toggle, index_to_toggle])
+                self.update_status_message("Created new stack with current image.")
+                log.info("No existing stacks. Created new stack for index %d.", index_to_toggle)
+            else:
+                # Find closest stack
+                dist_backward = float('inf')
+                stack_idx_backward = -1
+                for i in range(index_to_toggle - 1, -1, -1):
+                    for j, (start, end) in enumerate(self.stacks):
+                        if start <= i <= end:
+                            dist_backward = index_to_toggle - i
+                            stack_idx_backward = j
+                            break
+                    if stack_idx_backward != -1:
+                        break
+
+                dist_forward = float('inf')
+                stack_idx_forward = -1
+                for i in range(index_to_toggle + 1, len(self.image_files)):
+                    for j, (start, end) in enumerate(self.stacks):
+                        if start <= i <= end:
+                            dist_forward = i - index_to_toggle
+                            stack_idx_forward = j
+                            break
+                    if stack_idx_forward != -1:
+                        break
+                
+                if stack_idx_backward == -1 and stack_idx_forward == -1:
+                    # This case should be covered by `if not self.stacks`, but as a fallback.
+                    self.stacks.append([index_to_toggle, index_to_toggle])
+                    self.update_status_message("Created new stack with current image.")
+                    log.info("No stacks found nearby. Created new stack for index %d.", index_to_toggle)
+                else:
+                    if dist_backward <= dist_forward:
+                        stack_to_join_idx = stack_idx_backward
+                    else:
+                        stack_to_join_idx = stack_idx_forward
+
+                    start, end = self.stacks[stack_to_join_idx]
+                    self.stacks[stack_to_join_idx] = [min(start, index_to_toggle), max(end, index_to_toggle)]
+                    
+                    # Merge overlapping stacks
+                    self.stacks.sort()
+                    merged_stacks = [self.stacks[0]] if self.stacks else []
+                    for i in range(1, len(self.stacks)):
+                        last_start, last_end = merged_stacks[-1]
+                        current_start, current_end = self.stacks[i]
+                        if current_start <= last_end + 1:
+                            merged_stacks[-1] = [last_start, max(last_end, current_end)]
+                        else:
+                            merged_stacks.append([current_start, current_end])
+                    self.stacks = merged_stacks
+
+                    # Find the new stack index for the status message
+                    new_stack_idx = -1
+                    for i, (start, end) in enumerate(self.stacks):
+                        if start <= index_to_toggle <= end:
+                            new_stack_idx = i
+                            break
+
+                    self.update_status_message(f"Added image to Stack #{new_stack_idx + 1}")
+                    log.info("Added index %d to stack #%d.", index_to_toggle, new_stack_idx + 1)
+
+        self.sidecar.data.stacks = self.stacks
+        self.sidecar.save()
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.ui_state.stackSummaryChanged.emit()
+        self.sync_ui_state()
+
+
 
 
     def launch_helicon(self):
         """Launches Helicon Focus with selected files (RAW preferred, JPG fallback) or stacks."""
-        if self.selected_raws:
-            log.info("Launching Helicon with %d selected files.", len(self.selected_raws))
-            success = self._launch_helicon_with_files(sorted(list(self.selected_raws)))
-            if success:
-                self.selected_raws.clear()
-
-        elif self.stacks:
+        if self.stacks:
             log.info("Launching Helicon for %d defined stacks.", len(self.stacks))
             any_success = False
             for start, end in self.stacks:
@@ -1314,9 +1443,10 @@ class AppController(QObject):
                 if 0 <= idx < len(self.image_files):
                     files_to_drag.add(idx)
         
-        # Convert to sorted list and get paths
+        # Convert to sorted list and get only existing paths
         file_indices = sorted(files_to_drag)
-        file_paths = [self.image_files[idx].path for idx in file_indices if self.image_files[idx].path.exists()]
+        existing_indices = [idx for idx in file_indices if self.image_files[idx].path.exists()]
+        file_paths = [self.image_files[idx].path for idx in existing_indices]
         
         if not file_paths:
             log.error("No valid files to drag")
@@ -1355,8 +1485,8 @@ class AppController(QObject):
         if result in (Qt.CopyAction, Qt.MoveAction):
             from datetime import datetime
             today = datetime.now().strftime("%Y-%m-%d")
-            
-            for idx in file_indices:
+
+            for idx in existing_indices:
                 stem = self.image_files[idx].path.stem
                 meta = self.sidecar.get_metadata(stem)
                 meta.uploaded = True
@@ -1371,7 +1501,7 @@ class AppController(QObject):
             self._metadata_cache_index = (-1, -1)
             self.dataChanged.emit()
             self.sync_ui_state()
-            log.info("Marked %d file(s) as uploaded on %s. Cleared all batches.", len(file_indices), today)
+            log.info("Marked %d file(s) as uploaded on %s. Cleared all batches.", len(existing_indices), today)
 
     def _get_stack_info(self, index: int) -> str:
         info = ""
@@ -1393,7 +1523,7 @@ class AppController(QObject):
             if start <= index <= end:
                 count_in_batch = end - start + 1
                 pos_in_batch = index - start + 1
-                info = f"Batch {i+1} ({pos_in_batch}/{count_in_batch})"
+                info = "In Batch"
                 break
         if not info and self.batch_start_index is not None and self.batch_start_index == index:
             info = "Batch Start Marked"

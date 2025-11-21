@@ -26,15 +26,16 @@ class Keybinder:
             # Stacking
             Qt.Key_BracketLeft: "begin_new_stack",
             Qt.Key_BracketRight: "end_current_stack",
-            
+            Qt.Key_S: "toggle_stack_membership",
+
             # Batching
             Qt.Key_BraceLeft: "begin_new_batch",
             Qt.Key_BraceRight: "end_current_batch",
             Qt.Key_Backslash: "clear_all_batches",
+            Qt.Key_B: "toggle_batch_membership",
 
             # Remove from batch/stack
             Qt.Key_X: "remove_from_batch_or_stack",
-            Qt.Key_S: "remove_from_batch_or_stack",
             
             # Toggle flags
             Qt.Key_U: "toggle_uploaded",
@@ -42,7 +43,7 @@ class Keybinder:
             # Actions
             Qt.Key_Enter: "launch_helicon",
             Qt.Key_Return: "launch_helicon",
-            Qt.Key_E: "edit_in_photoshop",
+            Qt.Key_P: "edit_in_photoshop",
             Qt.Key_C: "clear_all_stacks",
             Qt.Key_Delete: "delete_current_image",
             Qt.Key_Backspace: "delete_current_image",

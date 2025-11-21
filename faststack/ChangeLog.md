@@ -1,5 +1,7 @@
 # ChangeLog
 
+Todo:   Add image brightness control / cropping.   Make batches a bit more intuitive.   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.
+
 ## [1.0.0] - 2025-11-21
 
 ### Major Features
