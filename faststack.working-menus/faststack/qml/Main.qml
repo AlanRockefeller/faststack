@@ -44,25 +44,6 @@ ApplicationWindow {
         anchors.fill: parent
         anchors.topMargin: titleBar.height
         source: "Components.qml"
-        z: -1
-        focus: true
-        Keys.onPressed: (event) => {
-            // Toggle Image Editor with 'E' key
-            if (event.key === Qt.Key_E && !event.isAutoRepeat) {
-                uiState.isEditorOpen = !uiState.isEditorOpen
-                if (uiState.isEditorOpen) {
-                    controller.load_image_for_editing()
-                }
-                event.accepted = true
-            }
-            // Global Key for saving edited image (Ctrl+S)
-            else if (event.key === Qt.Key_S && event.modifiers & Qt.ControlModifier) {
-                if (uiState.isEditorOpen) {
-                    controller.save_edited_image()
-                    event.accepted = true
-                }
-            }
-        }
     }
 
     // Keyboard focus and event handling
@@ -207,7 +188,6 @@ ApplicationWindow {
 
         MouseArea {
             anchors.fill: parent
-            z: -1
             property point lastGlobalPos: Qt.point(0, 0)
             onPressed: function(mouse) {
                 lastGlobalPos = Qt.point(root.x + mouse.x, root.y + mouse.y)
@@ -229,18 +209,19 @@ ApplicationWindow {
 
         
 
-                    Row {
-                        spacing: 5
-                        z: 10
-                        Layout.alignment: Qt.AlignLeft | Qt.AlignVCenter
-                        
-                        Button {
-                            text: "File"
-                            onClicked: fileMenu.popup()
-                            Menu {
-                                id: fileMenu
-                                x: 0
-                                y: parent.height
+                    MenuBar {
+                        id: menuBar
+                        Layout.preferredWidth: 300 // Give it some width
+                        background: Rectangle {
+                            color: root.currentBackgroundColor
+                        }
+                        palette.buttonText: root.currentTextColor
+                        palette.button: root.currentBackgroundColor
+                        palette.window: root.currentBackgroundColor
+                        palette.text: root.currentTextColor
+
+                        Menu {
+                            title: "&File"
                             Action { text: "&Open Folder..." }
                             Action {
                                 text: "&Settings..."
@@ -255,16 +236,9 @@ ApplicationWindow {
                                 }
                             }
                             Action { text: "&Exit"; onTriggered: Qt.quit() }
-                            }
                         }
-                        
-                        Button {
-                            text: "View"
-                            onClicked: viewMenu.popup()
-                            Menu {
-                                id: viewMenu
-                                x: 0
-                                y: parent.height
+                        Menu {
+                            title: "&View"
                             Action { text: "Toggle Light/Dark Mode"; onTriggered: root.toggleTheme() }
                             MenuSeparator {}
                             
@@ -294,42 +268,19 @@ ApplicationWindow {
                                 onTriggered: controller.set_color_mode("icc")
                                 ActionGroup.group: colorModeGroup
                             }
-                            }
                         }
-                        
-                        Button {
-                            text: "Actions"
-                            onClicked: actionsMenu.popup()
-                            Menu {
-                                id: actionsMenu
-                                x: 0
-                                y: parent.height
-                            Action {
-                                text: "Edit Image"
-                                onTriggered: {
-                                    uiState.isEditorOpen = !uiState.isEditorOpen
-                                    if (uiState.isEditorOpen)
-                                        controller.load_image_for_editing()
-                                }
-                            }
+                        Menu {
+                            title: "&Actions"
                             Action { text: "Run Stacks"; onTriggered: uiState.launch_helicon() }
                             Action { text: "Clear Stacks"; onTriggered: uiState.clear_all_stacks() }
                             Action { text: "Show Stacks"; onTriggered: showStacksDialog.open() }
                             Action { text: "Preload All Images"; onTriggered: uiState.preloadAllImages() }
                             Action { text: "Filter Images..."; onTriggered: filterDialog.open() }
                             Action { text: "Clear Filename Filter"; onTriggered: controller.clear_filter() }
-                            }
                         }
-                        
-                        Button {
-                            text: "Help"
-                            onClicked: helpMenu.popup()
-                            Menu {
-                                id: helpMenu
-                                x: 0
-                                y: parent.height
-                                Action { text: "&Key Bindings"; onTriggered: aboutDialog.open() }
-                            }
+                        Menu {
+                            title: "&Help"
+                            Action { text: "&Key Bindings"; onTriggered: aboutDialog.open() }
                         }
                     }
 
@@ -428,12 +379,10 @@ ApplicationWindow {
                       "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
                       "<b>File Management:</b><br>" +
                       "&nbsp;&nbsp;Delete: Move current image to recycle bin<br>" +
-                      "&nbsp;&nbsp;Ctrl+Z: Undo last action (delete or auto white balance)<br><br>" +
+                      "&nbsp;&nbsp;Ctrl+Z: Undo last delete<br><br>" +
                       "<b>Actions:</b><br>" +
                       "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
                       "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
-                      "&nbsp;&nbsp;A: Quick auto white balance (saves automatically)<br>" +
-                      "&nbsp;&nbsp;E: Toggle Image Editor<br>" +
                       "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
                 padding: 10
                 wrapMode: Text.WordWrap
@@ -478,15 +427,6 @@ ApplicationWindow {
     JumpToImageDialog {
         id: jumpToImageDialog
         maxImageCount: uiState.imageCount
-    }
-
-    ImageEditorDialog {
-        id: imageEditorDialog
-        onVisibleChanged: {
-            if (!visible) {
-                mainViewLoader.forceActiveFocus()
-            }
-        }
     }
 
     function show_jump_to_image_dialog() {

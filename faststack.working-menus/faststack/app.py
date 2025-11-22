@@ -7,14 +7,13 @@ import shlex
 import time
 import argparse
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 from datetime import date
 import os
 import concurrent.futures
 import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
-import PySide6
 from PySide6.QtGui import QDrag, QPixmap
 from PySide6.QtCore import (
     QUrl,
@@ -43,7 +42,6 @@ from faststack.imaging.cache import ByteLRUCache, get_decoded_image_size
 from faststack.imaging.prefetch import Prefetcher, clear_icc_caches
 from faststack.ui.provider import ImageProvider
 from faststack.ui.keystrokes import Keybinder
-from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS
 
 def make_hdrop(paths):
     """
@@ -93,7 +91,6 @@ class AppController(QObject):
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self.refresh_image_list)
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
-        self.image_editor = ImageEditor() # Initialize the editor
         
         # -- Caching & Prefetching --
         cache_size_gb = config.getfloat('core', 'cache_size_gb', 1.5)
@@ -133,8 +130,6 @@ class AppController(QObject):
         # -- Delete/Undo State --
         self.recycle_bin_dir = self.image_dir / "image recycle bin"
         self.delete_history: List[tuple[Path, Optional[Path]]] = []  # [(jpg_path, raw_path), ...]
-        # Track all undoable actions with timestamps
-        self.undo_history: List[Tuple[str, Any, float]] = []  # (action_type, action_data, timestamp)
 
         self.resize_timer = QTimer()
         self.resize_timer.setSingleShot(True)
@@ -325,12 +320,6 @@ class AppController(QObject):
         if not self.image_files or index < 0 or index >= len(self.image_files):
             log.warning("get_decoded_image called with empty image_files or out of bounds index.")
             return None
-
-        # If editor is open for this image, return the live preview
-        if self.ui_state.isEditorOpen and self.image_editor.original_image and str(self.image_editor.current_filepath) == str(self.image_files[index].path):
-            preview_data = self.image_editor.get_preview_data()
-            if preview_data:
-                return preview_data
 
         _, _, display_gen = self.get_display_info()
         cache_key = f"{index}_{display_gen}"
@@ -736,44 +725,11 @@ class AppController(QObject):
             self.update_status_message("Removed image from batch")
             log.info("Removed index %d from a batch.", index_to_toggle)
         else:
-            # Add to batch - merge with adjacent batches if possible
-            if not self.batches:
-                self.batches.append([index_to_toggle, index_to_toggle])
-                self.update_status_message("Created new batch with current image.")
-                log.info("No existing batches. Created new batch for index %d.", index_to_toggle)
-            else:
-                # Check if adjacent to any existing batch
-                merged = False
-                for i, (start, end) in enumerate(self.batches):
-                    # Adjacent to start of batch
-                    if index_to_toggle == start - 1:
-                        self.batches[i] = [index_to_toggle, end]
-                        merged = True
-                        break
-                    # Adjacent to end of batch
-                    elif index_to_toggle == end + 1:
-                        self.batches[i] = [start, index_to_toggle]
-                        merged = True
-                        break
-                
-                if not merged:
-                    # Not adjacent to any batch, create new one
-                    self.batches.append([index_to_toggle, index_to_toggle])
-                
-                # Sort and merge any overlapping batches
-                self.batches.sort()
-                merged_batches = [self.batches[0]] if self.batches else []
-                for i in range(1, len(self.batches)):
-                    last_start, last_end = merged_batches[-1]
-                    current_start, current_end = self.batches[i]
-                    if current_start <= last_end + 1:
-                        merged_batches[-1] = [last_start, max(last_end, current_end)]
-                    else:
-                        merged_batches.append([current_start, current_end])
-                self.batches = merged_batches
-                
-                self.update_status_message("Added image to batch")
-                log.info("Added index %d to batch.", index_to_toggle)
+            # Add to a new batch
+            self.batches.append([index_to_toggle, index_to_toggle])
+            self.batches.sort()
+            self.update_status_message("Added image to batch")
+            log.info("Added index %d to a new batch.", index_to_toggle)
         
         self._metadata_cache_index = (-1, -1)
         self.dataChanged.emit()
@@ -1185,10 +1141,7 @@ class AppController(QObject):
             
             # Add to delete history only if at least one file was moved
             if deleted_files:
-                import time
-                timestamp = time.time()
                 self.delete_history.append((jpg_path, raw_path))
-                self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
             
             # Update status
             if deleted_files:
@@ -1215,97 +1168,58 @@ class AppController(QObject):
 
     @Slot()
     def undo_delete(self):
-        """Unified undo that handles both delete and auto white balance operations."""
-        if not self.undo_history:
+        """Restores the last deleted image from recycle bin."""
+        if not self.delete_history:
             self.update_status_message("Nothing to undo.")
             return
         
-        # Get the most recent action
-        action_type, action_data, timestamp = self.undo_history.pop()
+        jpg_path, raw_path = self.delete_history.pop()
         
-        if action_type == "delete":
-            jpg_path, raw_path = action_data
-            # Also remove from delete_history
-            if self.delete_history and self.delete_history[-1] == (jpg_path, raw_path):
-                self.delete_history.pop()
+        restored_files = []
+        try:
+            # Restore JPG
+            jpg_in_bin = self.recycle_bin_dir / jpg_path.name
+            if jpg_in_bin.exists():
+                jpg_in_bin.rename(jpg_path)
+                restored_files.append(jpg_path.name)
+                log.info("Restored %s from recycle bin", jpg_path.name)
             
-            restored_files = []
-            try:
-                # Restore JPG
-                jpg_in_bin = self.recycle_bin_dir / jpg_path.name
-                if jpg_in_bin.exists():
-                    jpg_in_bin.rename(jpg_path)
-                    restored_files.append(jpg_path.name)
-                    log.info("Restored %s from recycle bin", jpg_path.name)
-                
-                # Restore RAW
-                if raw_path:
-                    raw_in_bin = self.recycle_bin_dir / raw_path.name
-                    if raw_in_bin.exists():
-                        raw_in_bin.rename(raw_path)
-                        restored_files.append(raw_path.name)
-                        log.info("Restored %s from recycle bin", raw_path.name)
-                
-                # Update status
-                if restored_files:
-                    files_str = ", ".join(restored_files)
-                    self.update_status_message(f"Restored: {files_str}")
-                else:
-                    self.update_status_message("No files to restore")
-                
-                # Refresh image list
-                self.refresh_image_list()
-                
-                # Find and navigate to the restored image
-                for i, img_file in enumerate(self.image_files):
-                    if img_file.path == jpg_path:
-                        self.current_index = i
-                        break
-                
-                # Clear cache and invalidate display generation to force image reload
-                self.display_generation += 1
-                self.image_cache.clear()
-                self.prefetcher.cancel_all()  # Cancel stale tasks since image list changed
-                self.prefetcher.update_prefetch(self.current_index)
-                self.sync_ui_state()
-                
-            except OSError as e:
-                self.update_status_message(f"Undo failed: {e}")
-                log.exception("Failed to restore image")
-                # Put it back in history if it failed
-                self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
-                self.delete_history.append((jpg_path, raw_path))
-        
-        elif action_type == "auto_white_balance":
-            filepath, saved_path = action_data
-            filepath_obj = Path(filepath)
-            backup_path = filepath_obj.parent / f"{filepath_obj.stem}_backup{filepath_obj.suffix}"
+            # Restore RAW
+            if raw_path:
+                raw_in_bin = self.recycle_bin_dir / raw_path.name
+                if raw_in_bin.exists():
+                    raw_in_bin.rename(raw_path)
+                    restored_files.append(raw_path.name)
+                    log.info("Restored %s from recycle bin", raw_path.name)
             
-            try:
-                if backup_path.exists():
-                    # Restore the backup
-                    filepath_obj.unlink()  # Remove the edited version
-                    backup_path.rename(filepath_obj)  # Restore backup
-                    log.info("Restored backup for %s", filepath)
-                    
-                    # Refresh the view
-                    self.display_generation += 1
-                    self.image_cache.clear()
-                    self.prefetcher.cancel_all()
-                    self.prefetcher.update_prefetch(self.current_index)
-                    self.sync_ui_state()
-                    
-                    self.update_status_message("Undid auto white balance")
-                else:
-                    self.update_status_message("Backup not found")
-                    log.warning("Backup not found at %s", backup_path)
-                    # Put it back in history if backup not found
-                    self.undo_history.append(("auto_white_balance", (filepath, saved_path), timestamp))
-            except OSError as e:
-                self.update_status_message(f"Undo failed: {e}")
-                log.exception("Failed to undo auto white balance")
-                # Put it back in history if it failed
-                self.undo_history.append(("auto_white_balance", (filepath, saved_path), timestamp))
+            # Update status
+            if restored_files:
+                files_str = ", ".join(restored_files)
+                self.update_status_message(f"Restored: {files_str}")
+            else:
+                self.update_status_message("No files to restore")
+            
+            # Refresh image list
+            self.refresh_image_list()
+            
+            # Find and navigate to the restored image
+            for i, img_file in enumerate(self.image_files):
+                if img_file.path == jpg_path:
+                    self.current_index = i
+                    break
+            
+            # Clear cache and invalidate display generation to force image reload
+            self.display_generation += 1
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()  # Cancel stale tasks since image list changed
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
+            
+        except OSError as e:
+            self.update_status_message(f"Undo failed: {e}")
+            log.exception("Failed to restore image")
+            # Put it back in history if it failed
+            self.delete_history.append((jpg_path, raw_path))
 
     def shutdown(self):
         log.info("Application shutting down.")
@@ -1398,34 +1312,14 @@ class AppController(QObject):
 
         # Prefer RAW file if it exists, otherwise use JPG
         image_file = self.image_files[self.current_index]
-        jpg_path = image_file.path
-        
-        # Handle backup images: strip -backup, -backup2, -backup-1, etc. to find original RAW
-        import re
-        original_stem = jpg_path.stem
-        # Remove -backup with optional digits or -backup-digits (handles both formats)
-        original_stem = re.sub(r'-backup(-?\d+)?$', '', original_stem)
-        
-        # Look for RAW file with the original stem
-        raw_path = None
-        if image_file.raw_pair and image_file.raw_pair.exists():
-            # Use the paired RAW if it exists
-            raw_path = image_file.raw_pair
-        else:
-            # Search for RAW file manually by original stem
-            from faststack.io.indexer import RAW_EXTENSIONS
-            for ext in RAW_EXTENSIONS:
-                potential_raw = jpg_path.parent / f"{original_stem}{ext}"
-                if potential_raw.exists():
-                    raw_path = potential_raw
-                    break
+        raw_path = image_file.raw_pair
         
         if raw_path and raw_path.exists():
             current_image_path = raw_path
             log.info("Using RAW file for Photoshop: %s", raw_path)
         else:
-            current_image_path = jpg_path
-            log.info("Using JPG file for Photoshop (no RAW found): %s", current_image_path)
+            current_image_path = image_file.path
+            log.info("Using JPG file for Photoshop: %s", current_image_path)
         
         photoshop_exe = config.get('photoshop', 'exe')
         photoshop_args = config.get('photoshop', 'args')
@@ -1609,257 +1503,6 @@ class AppController(QObject):
             self.sync_ui_state()
             log.info("Marked %d file(s) as uploaded on %s. Cleared all batches.", len(existing_indices), today)
 
-    # --- Image Editor Logic ---
-
-    @Slot(result=bool)
-    def load_image_for_editing(self):
-        """Loads the currently viewed image into the editor."""
-        if self.image_files and self.current_index < len(self.image_files):
-            filepath = str(self.image_files[self.current_index].path)
-            # Only load if the editor is not already open for this file
-            if str(self.image_editor.current_filepath) == filepath and self.image_editor.original_image is not None:
-                 # Already loaded, just reset UI state for a fresh start
-                 self.reset_edit_parameters()
-                 return True
-
-            # Get the cached, display-sized image to use for fast previews
-            cached_preview = self.get_decoded_image(self.current_index)
-
-            if self.image_editor.load_image(filepath, cached_preview=cached_preview):
-                # Pass initial edits to uiState
-                initial_edits = self.image_editor._initial_edits()
-                for key, value in initial_edits.items():
-                    if hasattr(self.ui_state, key):
-                        setattr(self.ui_state, key, value)
-
-                # Set aspect ratios for QML dropdown
-                self.ui_state.aspectRatioNames = [r['name'] for r in ASPECT_RATIOS]
-                self.ui_state.currentAspectRatioIndex = 0
-                self.ui_state.currentCropBox = (0, 0, 1000, 1000) # Reset crop box visually
-                return True
-        return False
-
-    @Slot(result=bytes)
-    def get_preview_data(self) -> Optional[bytes]:
-        """Gets the PNG bytes of the currently edited image."""
-        data = self.image_editor.get_preview_data()
-        if data is None:
-            return b''
-        return data
-
-    @Slot(str, "QVariant")
-    def set_edit_parameter(self, key: str, value: Any):
-        """Sets an edit parameter and updates the UIState for the slider visual."""
-        if self.image_editor.set_edit_param(key, value):
-            # Update the corresponding UIState property to reflect the new value in QML
-            if hasattr(self.ui_state, key):
-                setattr(self.ui_state, key, value)
-
-            # Trigger a refresh of the image to show the edit
-            self.ui_refresh_generation += 1
-            self.ui_state.currentImageSourceChanged.emit()
-
-    @Slot(int, int, int, int)
-    def set_crop_box(self, left: int, top: int, right: int, bottom: int):
-        """Sets the normalized crop box (0-1000) in the editor."""
-        from typing import Tuple
-        crop_box: Tuple[int, int, int, int] = (left, top, right, bottom)
-        self.image_editor.set_crop_box(crop_box)
-        self.ui_state.currentCropBox = crop_box # Update QML visual (if implemented)
-
-    @Slot()
-    def reset_edit_parameters(self):
-        """Resets all editing parameters in the editor."""
-        self.image_editor.current_edits = self.image_editor._initial_edits()
-        if hasattr(self.ui_state, 'reset_editor_state'):
-            self.ui_state.reset_editor_state()
-
-        # Trigger a refresh to show the reset image
-        self.ui_refresh_generation += 1
-        self.ui_state.currentImageSourceChanged.emit()
-
-    @Slot()
-    def save_edited_image(self):
-        """Saves the edited image."""
-        saved_path = self.image_editor.save_image()
-        if saved_path:
-            # Clear the image editor state so it will reload fresh next time
-            self.image_editor.original_image = None
-            self.image_editor.current_filepath = None
-            self.image_editor._preview_image = None
-            
-            # Reset all edit parameters in the controller/UI
-            self.reset_edit_parameters()
-
-            # Refresh the view - need to refresh image list since backup file was created
-            original_path = saved_path
-            self.refresh_image_list()
-            
-            # Find the edited image (not the backup) in the refreshed list
-            for i, img_file in enumerate(self.image_files):
-                if img_file.path == original_path:
-                    self.current_index = i
-                    break
-            
-            # Invalidate cache and refresh display
-            self.display_generation += 1
-            self.image_cache.clear()
-            self.prefetcher.cancel_all()
-            self.prefetcher.update_prefetch(self.current_index)
-            self.sync_ui_state()
-
-            QMessageBox.information(
-                None,
-                "Save Successful",
-                f"Image saved to: {saved_path}. Original backed up.",
-                QMessageBox.Ok
-            )
-    
-    @Slot()
-    def rotate_image_cw(self):
-        """Rotate the edited image 90 degrees clockwise."""
-        current = self.image_editor.current_edits.get('rotation', 0)
-        new_rotation = (current + 90) % 360
-        self.set_edit_parameter('rotation', new_rotation)
-
-    @Slot()
-    def rotate_image_ccw(self):
-        """Rotate the edited image 90 degrees counter-clockwise."""
-        current = self.image_editor.current_edits.get('rotation', 0)
-        new_rotation = (current - 90) % 360
-        if new_rotation < 0:
-            new_rotation += 360
-        self.set_edit_parameter('rotation', new_rotation)
-    
-    @Slot()
-    def quick_auto_white_balance(self):
-        """Quickly apply auto white balance, save the image, and track for undo."""
-        if not self.image_files:
-            self.update_status_message("No image to adjust")
-            return
-        
-        import time
-        image_file = self.image_files[self.current_index]
-        filepath = str(image_file.path)
-        
-        # Load the image into the editor if not already loaded
-        cached_preview = self.get_decoded_image(self.current_index)
-        if not self.image_editor.load_image(filepath, cached_preview=cached_preview):
-            self.update_status_message("Failed to load image")
-            return
-        
-        # Calculate and apply auto white balance
-        self.auto_white_balance()
-        
-        # Save the edited image (this creates a backup automatically)
-        saved_path = self.image_editor.save_image()
-        if saved_path:
-            # Track this action for undo
-            timestamp = time.time()
-            self.undo_history.append(("auto_white_balance", (filepath, saved_path), timestamp))
-            
-            # Force the image editor to clear its current state so it reloads fresh
-            self.image_editor.original_image = None
-            self.image_editor.current_filepath = None
-            self.image_editor._preview_image = None
-            
-            # Refresh the view - need to refresh image list since backup file was created
-            original_path = Path(filepath)
-            self.refresh_image_list()
-            
-            # Find the edited image (not the backup) in the refreshed list
-            for i, img_file in enumerate(self.image_files):
-                if img_file.path == original_path:
-                    self.current_index = i
-                    break
-            
-            # Invalidate cache for the edited image so it's reloaded from disk
-            # This ensures the Image Editor will see the updated version
-            self.display_generation += 1
-            self.image_cache.clear()
-            self.prefetcher.cancel_all()
-            self.prefetcher.update_prefetch(self.current_index)
-            self.sync_ui_state()
-            
-            self.update_status_message("Auto white balance applied and saved")
-            log.info("Quick auto white balance applied to %s", filepath)
-        else:
-            self.update_status_message("Failed to save image")
-    
-    @Slot()
-    def auto_white_balance(self):
-        """Calculates and applies auto white balance using grey world assumption."""
-        if not self.image_editor.original_image:
-            log.warning("No image loaded in editor for auto white balance")
-            return
-        
-        import numpy as np
-        
-        # Work with the original image for accurate calculation
-        img = self.image_editor.original_image
-        
-        # Convert to numpy array
-        arr = np.array(img, dtype=np.float32)
-        
-        # Calculate mean values for each channel
-        r_mean = arr[:, :, 0].mean()
-        g_mean = arr[:, :, 1].mean()
-        b_mean = arr[:, :, 2].mean()
-        
-        # Grey world assumption: average should be neutral grey
-        grey_target = (r_mean + g_mean + b_mean) / 3.0
-        
-        log.info("Auto white balance - means: R=%.1f G=%.1f B=%.1f, target=%.1f", 
-                 r_mean, g_mean, b_mean, grey_target)
-        
-        # Calculate how much each channel differs from grey (positive = too high)
-        r_diff = r_mean - grey_target
-        g_diff = g_mean - grey_target
-        b_diff = b_mean - grey_target
-        
-        # From editor.py, the white balance equations are:
-        # R' = R + by_shift + mg_shift
-        # G' = G + by_shift - mg_shift  
-        # B' = B - by_shift + mg_shift
-        #
-        # To neutralize:
-        # We want R' = G' = B' = grey_target
-        # So: R + by_shift + mg_shift = grey_target  => by_shift + mg_shift = -r_diff
-        #     G + by_shift - mg_shift = grey_target  => by_shift - mg_shift = -g_diff
-        #     B - by_shift + mg_shift = grey_target  => -by_shift + mg_shift = -b_diff
-        #
-        # From first two equations:
-        # by_shift = -(r_diff + g_diff) / 2
-        # mg_shift = -(r_diff - g_diff) / 2
-        
-        by_shift = -(r_diff + g_diff) / 2.0
-        mg_shift = -(r_diff - g_diff) / 2.0
-        
-        # Convert to the -1 to 1 range expected by the editor (editor multiplies by 0.5 then 127.5)
-        # So our value goes through: value * 0.5 * 127.5 = value * 63.75
-        # We want: by_shift, so value = by_shift / 63.75
-        by_value = by_shift / 63.75
-        mg_value = mg_shift / 63.75
-        
-        # Clamp to -1.0 to 1.0 range
-        by_value = float(np.clip(by_value, -1.0, 1.0))
-        mg_value = float(np.clip(mg_value, -1.0, 1.0))
-        
-        log.info("Auto white balance: by_shift=%.1f mg_shift=%.1f", by_shift, mg_shift)
-        log.info("Auto white balance values: B/Y=%.3f, M/G=%.3f", by_value, mg_value)
-        
-        # Apply the adjustments
-        self.image_editor.set_edit_param('white_balance_by', by_value)
-        self.image_editor.set_edit_param('white_balance_mg', mg_value)
-        
-        # Update UIState properties directly to force slider refresh
-        self.ui_state.white_balance_by = by_value
-        self.ui_state.white_balance_mg = mg_value
-        
-        # Trigger image refresh
-        self.ui_refresh_generation += 1
-        self.ui_state.currentImageSourceChanged.emit()
-
     def _get_stack_info(self, index: int) -> str:
         info = ""
         for i, (start, end) in enumerate(self.stacks):
@@ -1876,20 +1519,14 @@ class AppController(QObject):
     def _get_batch_info(self, index: int) -> str:
         """Get batch info for the given index."""
         info = ""
-        # Check if current image is in any batch
-        in_batch = False
         for i, (start, end) in enumerate(self.batches):
             if start <= index <= end:
-                in_batch = True
+                count_in_batch = end - start + 1
+                pos_in_batch = index - start + 1
+                info = "In Batch"
                 break
-        
-        if in_batch:
-            # Calculate total count across all batches
-            total_count = sum(end - start + 1 for start, end in self.batches)
-            info = f"{total_count} in Batch"
-        elif self.batch_start_index is not None and self.batch_start_index == index:
+        if not info and self.batch_start_index is not None and self.batch_start_index == index:
             info = "Batch Start Marked"
-        
         log.debug("_get_batch_info for index %d: %s", index, info)
         return info
 
@@ -1920,7 +1557,6 @@ def main(image_dir: str = "", debug: bool = False):
     log.info("Starting FastStack")
 
     os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
-    os.environ["QML2_IMPORT_PATH"] = os.path.join(os.path.dirname(__file__), "qml")
 
     app = QApplication(sys.argv) # Moved here
     if debug:
@@ -1947,12 +1583,6 @@ def main(image_dir: str = "", debug: bool = False):
     app.setApplicationName("FastStack")
 
     engine = QQmlApplicationEngine()
-    engine.addImportPath(os.path.join(os.path.dirname(PySide6.__file__), "qml"))
-    engine.addImportPath("qrc:/qt-project.org/imports")
-    engine.addImportPath(os.path.join(os.path.dirname(__file__), "qml"))
-    # Add the path to Qt5Compat.GraphicalEffects to QML import paths
-    engine.addImportPath(os.path.join(os.path.dirname(PySide6.__file__), "qml", "Qt5Compat"))
-
     controller = AppController(image_dir_path, engine)
     if debug:
         log.info("Startup: after AppController: %.3fs", time.perf_counter() - t0)

@@ -1,33 +1,6 @@
 # ChangeLog
 
-Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   Add the ability to pull in images from a stack if they are taken with a camera with in-camera stacking.
-
-## [1.1.0] - 2025-11-22
-
-### Major Features
-- **Built-in Image Editor:** Full-featured image editor with draggable window
-  - Exposure, highlights, shadows, whites, blacks, brightness, contrast
-  - White balance (Blue/Yellow and Magenta/Green axes)
-  - Auto White Balance button using grey world assumption
-  - Saturation, vibrance, clarity, sharpness
-  - Vignette effect
-  - Rotation (90°, 180°, 270°)
-  - EXIF metadata preservation (GPS, camera settings, timestamps)
-  - Press `E` to open editor, `Ctrl+S` to save
-  - Sequential backup naming (filename-backup.jpg, filename-backup2.jpg, etc.)
-
-- **Quick Auto White Balance:** Press `A` key for instant auto white balance
-  - Uses grey world assumption algorithm
-  - Automatically saves with backup
-  - Full undo support with Ctrl+Z
-
-- **Enhanced Batch Display:** Batch counter shows total selected images
-  - `B` key toggles images in/out of batch selection
-
-### UI/UX Improvements
-- **Updated Key Bindings Dialog:** Added documentation for new features
-  - Auto white balance (A key)
-  - Image editor toggle (E key)  
+Todo:   Add image brightness control / cropping.   Make batches a bit more intuitive.   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.
 
 ## [1.0.0] - 2025-11-21
 

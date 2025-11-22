@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faststack"
-version = "1.1"
+version = "1.0"
 authors = [
     { name="Alan Rockefeller", email="alanrockefeller@gmail.com" },
 ]
