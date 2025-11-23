@@ -242,8 +242,12 @@ class ImageEditor:
         """Set the normalized crop box (left, top, right, bottom) from 0-1000."""
         self.current_edits['crop_box'] = crop_box
 
-    def save_image(self) -> Optional[Path]:
-        """Saves the edited image, backing up the original."""
+    def save_image(self) -> Optional[Tuple[Path, Path]]:
+        """Saves the edited image, backing up the original.
+        
+        Returns:
+            A tuple of (saved_path, backup_path) on success, otherwise None.
+        """
         if self.original_image is None or self.current_filepath is None:
             return None
 
@@ -271,23 +275,28 @@ class ImageEditor:
             # Perform the backup and overwrite
             shutil.copy2(original_path, backup_path)
             
-            # Preserve EXIF data from original image
-            try:
-                # Load the original image again to extract EXIF
-                original_img = Image.open(original_path)
+            # Re-open original to correctly detect format and get EXIF
+            with Image.open(original_path) as original_img:
+                original_format = original_img.format or original_path.suffix.lstrip('.').upper()
                 exif_data = original_img.info.get('exif')
-                
-                # Save with EXIF data preserved
+
+            save_kwargs = {}
+            if original_format == 'JPEG':
+                save_kwargs['format'] = 'JPEG'
+                save_kwargs['quality'] = 95
                 if exif_data:
-                    final_img.save(original_path, format='JPEG', quality=95, exif=exif_data)
-                else:
-                    final_img.save(original_path, format='JPEG', quality=95)
+                    save_kwargs['exif'] = exif_data
+            else:
+                save_kwargs['format'] = original_format
+
+            try:
+                final_img.save(original_path, **save_kwargs)
             except Exception as e:
-                print(f"Warning: Could not preserve EXIF data: {e}")
-                # Fall back to saving without EXIF if there's an issue
-                final_img.save(original_path, format='JPEG', quality=95)
-            
-            return original_path
+                print(f"Warning: Could not save with original format settings: {e}")
+                # Fallback to saving based on suffix
+                final_img.save(original_path)
+
+            return original_path, backup_path
         except Exception as e:
             print(f"Failed to save edited image or backup: {e}")
             return None

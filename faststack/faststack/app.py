@@ -7,7 +7,7 @@ import shlex
 import time
 import argparse
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import date
 import os
 import concurrent.futures
@@ -29,6 +29,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from PySide6.QtQml import QQmlApplicationEngine
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
 
 # ⬇️ these are the ones that went missing
 from faststack.config import config
@@ -615,13 +617,7 @@ class AppController(QObject):
     
     def clear_all_batches(self):
         """Clear all defined batches."""
-        log.info("Clearing all defined batches.")
-        self.batches = []
-        self.batch_start_index = None
-        self._metadata_cache_index = (-1, -1) # Invalidate cache
-        self.dataChanged.emit()
-        self.sync_ui_state()
-        self.update_status_message("All batches cleared")
+        self.clear_all_stacks()
     
     def remove_from_batch_or_stack(self):
         """Remove current image from any batch or stack it's in."""
@@ -957,15 +953,20 @@ class AppController(QObject):
                 log.error("Error deleting temporary file %s: %s", tmp_path, e)
 
     def clear_all_stacks(self):
-        log.info("Clearing all defined stacks and stack start marker.")
+        log.info("Clearing all defined stacks, batches, and markers.")
         self.stacks = []
-        self.stack_start_index = None  # Clear the stack start marker too
+        self.stack_start_index = None
+        self.batches = []
+        self.batch_start_index = None
+        
         self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
-        self._metadata_cache_index = (-1, -1) # Invalidate cache
-        self.dataChanged.emit() # Notify QML of data change
-        self.ui_state.stackSummaryChanged.emit() # Update stack summary in dialog
+        
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
+        self.update_status_message("All stacks and batches cleared")
 
     def get_helicon_path(self):
         return config.get('helicon', 'exe')
@@ -1092,16 +1093,91 @@ class AppController(QObject):
     def get_default_directory(self):
         return config.get('core', 'default_directory')
 
+    @Slot(result=str)
+    def get_awb_mode(self):
+        return config.get("awb", "mode")
+
+    @Slot(str)
+    def set_awb_mode(self, mode):
+        config.set("awb", "mode", mode)
+        config.save()
+
+    @Slot(result=float)
+    def get_awb_strength(self):
+        return config.getfloat("awb", "strength")
+
+    @Slot(float)
+    def set_awb_strength(self, value):
+        config.set("awb", "strength", value)
+        config.save()
+
+    @Slot(result=int)
+    def get_awb_warm_bias(self):
+        return config.getint("awb", "warm_bias")
+
+    @Slot(int)
+    def set_awb_warm_bias(self, value):
+        config.set("awb", "warm_bias", value)
+        config.save()
+
+    @Slot(result=int)
+    def get_awb_luma_lower_bound(self):
+        return config.getint("awb", "luma_lower_bound")
+
+    @Slot(int)
+    def set_awb_luma_lower_bound(self, value):
+        config.set("awb", "luma_lower_bound", value)
+        config.save()
+
+    @Slot(result=int)
+    def get_awb_luma_upper_bound(self):
+        return config.getint("awb", "luma_upper_bound")
+
+    @Slot(int)
+    def set_awb_luma_upper_bound(self, value):
+        config.set("awb", "luma_upper_bound", value)
+        config.save()
+
+    @Slot(result=int)
+    def get_awb_rgb_lower_bound(self):
+        return config.getint("awb", "rgb_lower_bound")
+
+    @Slot(int)
+    def set_awb_rgb_lower_bound(self, value):
+        config.set("awb", "rgb_lower_bound", value)
+        config.save()
+
+    @Slot(result=int)
+    def get_awb_rgb_upper_bound(self):
+        return config.getint("awb", "rgb_upper_bound")
+
+    @Slot(int)
+    def set_awb_rgb_upper_bound(self, value):
+        config.set("awb", "rgb_upper_bound", value)
+        config.save()
+        
+    def get_default_directory(self):
+        return config.get('core', 'default_directory')
+
     def set_default_directory(self, path):
         config.set('core', 'default_directory', path)
         config.save()
-
+        
     def open_directory_dialog(self):
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.FileMode.Directory)
         if dialog.exec():
             return dialog.selectedFiles()[0]
         return ""
+
+    @Slot()
+    def open_folder(self):
+        """Opens a directory dialog and reloads the application with the selected folder."""
+        path = self.open_directory_dialog()
+        if path:
+            self.image_dir = Path(path)
+            self.load()
+
 
     def preload_all_images(self):
         if self.ui_state.isPreloading:
@@ -1277,16 +1353,15 @@ class AppController(QObject):
                 self.delete_history.append((jpg_path, raw_path))
         
         elif action_type == "auto_white_balance":
-            filepath, saved_path = action_data
-            filepath_obj = Path(filepath)
-            backup_path = filepath_obj.parent / f"{filepath_obj.stem}_backup{filepath_obj.suffix}"
-            
+            saved_path, backup_path = action_data
+            filepath_obj = Path(saved_path)
+
             try:
                 if backup_path.exists():
                     # Restore the backup
                     filepath_obj.unlink()  # Remove the edited version
                     backup_path.rename(filepath_obj)  # Restore backup
-                    log.info("Restored backup for %s", filepath)
+                    log.info("Restored backup %s for %s", backup_path.name, saved_path)
                     
                     # Refresh the view
                     self.display_generation += 1
@@ -1297,15 +1372,15 @@ class AppController(QObject):
                     
                     self.update_status_message("Undid auto white balance")
                 else:
+                    # This case should not be reached if glob finds files
                     self.update_status_message("Backup not found")
-                    log.warning("Backup not found at %s", backup_path)
-                    # Put it back in history if backup not found
-                    self.undo_history.append(("auto_white_balance", (filepath, saved_path), timestamp))
+                    log.warning("Backup %s disappeared before it could be restored.", backup_path)
+                    self.undo_history.append(("auto_white_balance", (saved_path, backup_path), timestamp))
             except OSError as e:
                 self.update_status_message(f"Undo failed: {e}")
                 log.exception("Failed to undo auto white balance")
                 # Put it back in history if it failed
-                self.undo_history.append(("auto_white_balance", (filepath, saved_path), timestamp))
+                self.undo_history.append(("auto_white_balance", (saved_path, backup_path), timestamp))
 
     def shutdown(self):
         log.info("Application shutting down.")
@@ -1749,11 +1824,12 @@ class AppController(QObject):
         self.auto_white_balance()
         
         # Save the edited image (this creates a backup automatically)
-        saved_path = self.image_editor.save_image()
-        if saved_path:
+        save_result = self.image_editor.save_image()
+        if save_result:
+            saved_path, backup_path = save_result
             # Track this action for undo
             timestamp = time.time()
-            self.undo_history.append(("auto_white_balance", (filepath, saved_path), timestamp))
+            self.undo_history.append(("auto_white_balance", (saved_path, backup_path), timestamp))
             
             # Force the image editor to clear its current state so it reloads fresh
             self.image_editor.original_image = None
@@ -1785,77 +1861,157 @@ class AppController(QObject):
     
     @Slot()
     def auto_white_balance(self):
-        """Calculates and applies auto white balance using grey world assumption."""
+        """
+        Dispatcher for auto white balance. Calls the appropriate method based on
+        the mode set in the config ('lab' or 'rgb').
+        """
+        mode = config.get('awb', 'mode', fallback='lab')
+        if mode == 'lab':
+            self.auto_white_balance_lab()
+        elif mode == 'rgb':
+            self.auto_white_balance_legacy()
+        else:
+            log.error(f"Unknown AWB mode: {mode}")
+            self.update_status_message(f"Error: Unknown AWB mode '{mode}'")
+
+    def auto_white_balance_legacy(self):
+        """
+        Calculates and applies auto white balance using the legacy grey world
+        assumption on the entire RGB image.
+        """
         if not self.image_editor.original_image:
             log.warning("No image loaded in editor for auto white balance")
             return
         
-        import numpy as np
+        try:
+            import numpy as np
+        except ImportError:
+            log.error("NumPy not found. Please install with: pip install numpy")
+            self.update_status_message("Error: NumPy not installed")
+            return
+            
+        log.info("Applying legacy (RGB Grey World) Auto White Balance")
         
-        # Work with the original image for accurate calculation
         img = self.image_editor.original_image
-        
-        # Convert to numpy array
         arr = np.array(img, dtype=np.float32)
         
-        # Calculate mean values for each channel
         r_mean = arr[:, :, 0].mean()
         g_mean = arr[:, :, 1].mean()
         b_mean = arr[:, :, 2].mean()
         
-        # Grey world assumption: average should be neutral grey
         grey_target = (r_mean + g_mean + b_mean) / 3.0
         
-        log.info("Auto white balance - means: R=%.1f G=%.1f B=%.1f, target=%.1f", 
-                 r_mean, g_mean, b_mean, grey_target)
-        
-        # Calculate how much each channel differs from grey (positive = too high)
         r_diff = r_mean - grey_target
         g_diff = g_mean - grey_target
-        b_diff = b_mean - grey_target
-        
-        # From editor.py, the white balance equations are:
-        # R' = R + by_shift + mg_shift
-        # G' = G + by_shift - mg_shift  
-        # B' = B - by_shift + mg_shift
-        #
-        # To neutralize:
-        # We want R' = G' = B' = grey_target
-        # So: R + by_shift + mg_shift = grey_target  => by_shift + mg_shift = -r_diff
-        #     G + by_shift - mg_shift = grey_target  => by_shift - mg_shift = -g_diff
-        #     B - by_shift + mg_shift = grey_target  => -by_shift + mg_shift = -b_diff
-        #
-        # From first two equations:
-        # by_shift = -(r_diff + g_diff) / 2
-        # mg_shift = -(r_diff - g_diff) / 2
         
         by_shift = -(r_diff + g_diff) / 2.0
         mg_shift = -(r_diff - g_diff) / 2.0
         
-        # Convert to the -1 to 1 range expected by the editor (editor multiplies by 0.5 then 127.5)
-        # So our value goes through: value * 0.5 * 127.5 = value * 63.75
-        # We want: by_shift, so value = by_shift / 63.75
         by_value = by_shift / 63.75
         mg_value = mg_shift / 63.75
         
-        # Clamp to -1.0 to 1.0 range
         by_value = float(np.clip(by_value, -1.0, 1.0))
         mg_value = float(np.clip(mg_value, -1.0, 1.0))
         
-        log.info("Auto white balance: by_shift=%.1f mg_shift=%.1f", by_shift, mg_shift)
-        log.info("Auto white balance values: B/Y=%.3f, M/G=%.3f", by_value, mg_value)
-        
-        # Apply the adjustments
         self.image_editor.set_edit_param('white_balance_by', by_value)
         self.image_editor.set_edit_param('white_balance_mg', mg_value)
         
-        # Update UIState properties directly to force slider refresh
         self.ui_state.white_balance_by = by_value
         self.ui_state.white_balance_mg = mg_value
         
-        # Trigger image refresh
         self.ui_refresh_generation += 1
         self.ui_state.currentImageSourceChanged.emit()
+        self.update_status_message("Auto white balance applied (Legacy)")
+
+
+    def auto_white_balance_lab(self):
+        """
+        Calculates and applies auto white balance using the Lab color space,
+        filtering out clipped and saturated pixels for a more robust result.
+        """
+        if not self.image_editor.original_image:
+            log.warning("No image loaded in editor for auto white balance")
+            return
+        
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            log.error("OpenCV or NumPy not found. Please install with: pip install opencv-python numpy")
+            self.update_status_message("Error: OpenCV or NumPy not installed")
+            return
+
+        img = self.image_editor.original_image
+        # Ensure image is RGB before processing
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+            
+        arr = np.array(img, dtype=np.uint8)
+
+        # --- Tunable Constants for Auto White Balance (from config) ---
+        _LOWER_BOUND_RGB = config.getint('awb', 'rgb_lower_bound', 5)
+        _UPPER_BOUND_RGB = config.getint('awb', 'rgb_upper_bound', 250)
+        _LUMA_LOWER_BOUND = config.getint('awb', 'luma_lower_bound', 30)
+        _LUMA_UPPER_BOUND = config.getint('awb', 'luma_upper_bound', 220)
+        warm_bias = config.getint('awb', 'warm_bias', 6)
+        _TARGET_A_LAB = 128.0
+        _TARGET_B_LAB = 128.0 + warm_bias
+        _SCALING_FACTOR_LAB_TO_SLIDER = 128.0 
+        _CORRECTION_STRENGTH = config.getfloat('awb', 'strength', 0.7)
+
+        # --- 1. Reject clipped channels and use a luma midtone mask ---
+        mask = (
+            (arr[:, :, 0] > _LOWER_BOUND_RGB) & (arr[:, :, 0] < _UPPER_BOUND_RGB) &
+            (arr[:, :, 1] > _LOWER_BOUND_RGB) & (arr[:, :, 1] < _UPPER_BOUND_RGB) &
+            (arr[:, :, 2] > _LOWER_BOUND_RGB) & (arr[:, :, 2] < _UPPER_BOUND_RGB)
+        )
+        
+        luma = (0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2])
+        mask &= (luma > _LUMA_LOWER_BOUND) & (luma < _LUMA_UPPER_BOUND)
+        
+        if not np.any(mask):
+            log.warning("Auto white balance: No pixels found after clipping and luma filter. Aborting.")
+            self.update_status_message("AWB failed: no valid pixels found")
+            return
+
+        # --- 2. Work in Lab color space ---
+        lab_image = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+        
+        a_channel = lab_image[:, :, 1]
+        b_channel = lab_image[:, :, 2]
+
+        masked_a = a_channel[mask]
+        masked_b = b_channel[mask]
+        
+        a_mean = masked_a.mean()
+        b_mean = masked_b.mean()
+
+        a_shift = _TARGET_A_LAB - a_mean
+        b_shift = _TARGET_B_LAB - b_mean
+        
+        log.info(
+            "Auto WB (Lab) - means: a*=%.1f, b*=%.1f; targets: a*=%.1f, b*=%.1f; shifts: a*=%.1f, b*=%.1f",
+            a_mean, b_mean, _TARGET_A_LAB, _TARGET_B_LAB, a_shift, b_shift
+        )
+
+        # --- 3. Convert Lab shift to our slider values with strength factor ---
+        by_value = (b_shift / _SCALING_FACTOR_LAB_TO_SLIDER) * _CORRECTION_STRENGTH
+        mg_value = (a_shift / _SCALING_FACTOR_LAB_TO_SLIDER) * _CORRECTION_STRENGTH
+        
+        by_value = float(np.clip(by_value, -1.0, 1.0))
+        mg_value = float(np.clip(mg_value, -1.0, 1.0))
+        
+        log.info(f"Auto white balance values: B/Y={by_value:.3f}, M/G={mg_value:.3f}")
+        
+        self.image_editor.set_edit_param('white_balance_by', by_value)
+        self.image_editor.set_edit_param('white_balance_mg', mg_value)
+        
+        self.ui_state.white_balance_by = by_value
+        self.ui_state.white_balance_mg = mg_value
+        
+        self.ui_refresh_generation += 1
+        self.ui_state.currentImageSourceChanged.emit()
+        self.update_status_message("Auto white balance applied")
 
     def _get_stack_info(self, index: int) -> str:
         info = ""

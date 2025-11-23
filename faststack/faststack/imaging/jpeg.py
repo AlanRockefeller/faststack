@@ -118,10 +118,17 @@ def decode_jpeg_resized(
         try:
             # Get image header to determine dimensions
             img_width, img_height, _, _ = jpeg_decoder.decode_header(jpeg_bytes)
-            
-            # Calculate best scaling factor for TurboJPEG (supports 1/8, 1/4, 1/2, etc.)
-            scale_factor = _get_turbojpeg_scaling_factor(img_width, img_height, max(width, height))
-            
+
+            # Determine which dimension is the limiting factor
+            if img_width * height > img_height * width:
+                # Image is wider relative to target box; width is the constraint
+                max_dim = width
+            else:
+                # Image is taller relative to target box; height is the constraint
+                max_dim = height
+
+            scale_factor = _get_turbojpeg_scaling_factor(img_width, img_height, max_dim)
+         
             if scale_factor:
                 decoded = jpeg_decoder.decode(
                     jpeg_bytes, 

@@ -5,6 +5,7 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 # [1.2.0] - 2025-11-22
 
 - Fixed menus, they now work well and look cool.
+- Updated auto white balance to make it better, and put some controls for it in the settings
 
 ## [1.1.0] - 2025-11-22
 
