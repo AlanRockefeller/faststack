@@ -22,8 +22,10 @@ ApplicationWindow {
     Material.accent: "#4fb360"
 
     property bool isDarkTheme: uiState ? uiState.theme === 0 : true
-    property color currentBackgroundColor: isDarkTheme ? "#000000" : "white"
+    property color currentBackgroundColor: isDarkTheme ? "#2b2b2b" : "#ffffff"
     property color currentTextColor: isDarkTheme ? "white" : "black"
+    property color hoverColor: isDarkTheme ? Qt.lighter(currentBackgroundColor, 1.5) : Qt.darker(currentBackgroundColor, 1.1)
+
 
     background: Rectangle { color: root.currentBackgroundColor }
 
@@ -99,7 +101,7 @@ ApplicationWindow {
                 id: fileBtn
                 width: fileLabel.width + 20
                 height: 30
-                color: fileMouseArea.containsMouse ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                color: fileMouseArea.containsMouse ? hoverColor : "transparent"
                 radius: 4
 
                 Text {
@@ -126,7 +128,7 @@ ApplicationWindow {
                 id: viewBtn
                 width: viewLabel.width + 20
                 height: 30
-                color: viewMouseArea.containsMouse ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                color: viewMouseArea.containsMouse ? hoverColor : "transparent"
                 radius: 4
 
                 Text {
@@ -153,7 +155,7 @@ ApplicationWindow {
                 id: actionsBtn
                 width: actionsLabel.width + 20
                 height: 30
-                color: actionsMouseArea.containsMouse ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                color: actionsMouseArea.containsMouse ? hoverColor : "transparent"
                 radius: 4
 
                 Text {
@@ -180,7 +182,7 @@ ApplicationWindow {
                 id: helpBtn
                 width: helpLabel.width + 20
                 height: 30
-                color: helpMouseArea.containsMouse ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                color: helpMouseArea.containsMouse ? hoverColor : "transparent"
                 radius: 4
 
                 Text {
@@ -213,7 +215,7 @@ ApplicationWindow {
         background: Rectangle {
             implicitWidth: 200
             implicitHeight: fileMenuColumn.implicitHeight
-            color: root.isDarkTheme ? "#424242" : "#ffffff"
+            color: root.currentBackgroundColor
             border.color: root.isDarkTheme ? "#666666" : "#cccccc"
             radius: 4
         }
@@ -226,11 +228,13 @@ ApplicationWindow {
                 height: 36
                 text: "Open Folder..."
                 onClicked: {
-                    console.log("Open folder triggered")
+                    if (uiState) {
+                        uiState.open_folder()
+                    }
                     fileMenu.close()
                 }
                 background: Rectangle {
-                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                    color: parent.hovered ? hoverColor : "transparent"
                 }
                 contentItem: Text {
                     text: parent.text
@@ -251,6 +255,13 @@ ApplicationWindow {
                         settingsDialog.prefetchRadius   = uiState.get_prefetch_radius()
                         settingsDialog.theme            = uiState.theme
                         settingsDialog.defaultDirectory = uiState.get_default_directory()
+                        settingsDialog.awbMode          = uiState.awbMode
+                        settingsDialog.awbStrength      = uiState.awbStrength
+                        settingsDialog.awbWarmBias      = uiState.awbWarmBias
+                        settingsDialog.awbLumaLowerBound = uiState.awbLumaLowerBound
+                        settingsDialog.awbLumaUpperBound = uiState.awbLumaUpperBound
+                        settingsDialog.awbRgbLowerBound = uiState.awbRgbLowerBound
+                        settingsDialog.awbRgbUpperBound = uiState.awbRgbUpperBound
                     }
                     settingsDialog.open()
                     fileMenu.close()
@@ -296,7 +307,7 @@ ApplicationWindow {
         background: Rectangle {
             implicitWidth: 220
             implicitHeight: viewMenuColumn.implicitHeight
-            color: root.isDarkTheme ? "#424242" : "#ffffff"
+            color: root.currentBackgroundColor
             border.color: root.isDarkTheme ? "#666666" : "#cccccc"
             radius: 4
         }
@@ -338,7 +349,6 @@ ApplicationWindow {
                 text: "Color: None (Original)"
                 onClicked: {
                     if (controller) controller.set_color_mode("none")
-                    if (uiState) uiState.colorMode = "none"
                     viewMenu.close()
                 }
                 background: Rectangle {
@@ -363,7 +373,6 @@ ApplicationWindow {
                 text: "Color: Saturation Compensation"
                 onClicked: {
                     if (controller) controller.set_color_mode("saturation")
-                    if (uiState) uiState.colorMode = "saturation"
                     viewMenu.close()
                 }
                 background: Rectangle {
@@ -388,7 +397,6 @@ ApplicationWindow {
                 text: "Color: Full ICC Profile"
                 onClicked: {
                     if (controller) controller.set_color_mode("icc")
-                    if (uiState) uiState.colorMode = "icc"
                     viewMenu.close()
                 }
                 background: Rectangle {
@@ -416,7 +424,7 @@ ApplicationWindow {
         background: Rectangle {
             implicitWidth: 220
             implicitHeight: actionsMenuColumn.implicitHeight
-            color: root.isDarkTheme ? "#424242" : "#ffffff"
+            color: root.currentBackgroundColor
             border.color: root.isDarkTheme ? "#666666" : "#cccccc"
             radius: 4
         }
@@ -555,7 +563,7 @@ ApplicationWindow {
         background: Rectangle {
             implicitWidth: 200
             implicitHeight: helpMenuColumn.implicitHeight
-            color: root.isDarkTheme ? "#424242" : "#ffffff"
+            color: root.currentBackgroundColor
             border.color: root.isDarkTheme ? "#666666" : "#cccccc"
             radius: 4
         }
@@ -623,7 +631,7 @@ ApplicationWindow {
         implicitHeight: footerRow.implicitHeight + 10 // Add some padding
         anchors.left: parent.left
         anchors.right: parent.right
-        color: "#80000000" // Semi-transparent black
+        color: Qt.rgba(root.currentBackgroundColor.r, root.currentBackgroundColor.g, root.currentBackgroundColor.b, 0.8)
 
         RowLayout {
             id: footerRow
@@ -841,6 +849,8 @@ ApplicationWindow {
 
     FilterDialog {
         id: filterDialog
+        backgroundColor: root.currentBackgroundColor
+        textColor: root.currentTextColor
         onAccepted: {
             if (uiState) uiState.applyFilter(filterString)
         }
@@ -848,11 +858,15 @@ ApplicationWindow {
 
     JumpToImageDialog {
         id: jumpToImageDialog
+        backgroundColor: root.currentBackgroundColor
+        textColor: root.currentTextColor
         maxImageCount: uiState ? uiState.imageCount : 0
     }
 
     ImageEditorDialog {
         id: imageEditorDialog
+        backgroundColor: root.currentBackgroundColor
+        textColor: root.currentTextColor
         onVisibleChanged: {
             if (!visible) {
                 mainViewLoader.forceActiveFocus()

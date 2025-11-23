@@ -28,6 +28,15 @@ DEFAULT_CONFIG = {
         "saturation_factor": "0.85",  # Option A: 0.0-1.0, lower = less saturated
         "monitor_icc_path": "",  # Option C: path to monitor ICC profile
     },
+    "awb": {
+        "mode": "lab", # "lab" or "rgb"
+        "strength": "0.7",
+        "warm_bias": "6",
+        "luma_lower_bound": "30",
+        "luma_upper_bound": "220",
+        "rgb_lower_bound": "5",
+        "rgb_upper_bound": "250",
+    },
 }
 
 class AppConfig:

@@ -12,12 +12,15 @@ Dialog {
     height: 250
 
     property string filterString: ""
+    property color backgroundColor: "#1e1e1e"
+    property color textColor: "white"
+
 
     // Match the app's theme dynamically
-    Material.theme: uiState && uiState.theme === 0 ? Material.Dark : Material.Light
+    // Material.theme: uiState && uiState.theme === 0 ? Material.Dark : Material.Light
 
     background: Rectangle {
-        color: Material.theme === Material.Dark ? "#1e1e1e" : "white"
+        color: filterDialog.backgroundColor
         border.color: Material.theme === Material.Dark ? "#404040" : "#c0c0c0"
         border.width: 1
         radius: 4
@@ -31,6 +34,7 @@ Dialog {
             text: "Show only images whose filename contains:"
             wrapMode: Text.WordWrap
             width: parent.width - parent.padding * 2
+            color: filterDialog.textColor
         }
 
         TextField {
@@ -42,6 +46,10 @@ Dialog {
             focus: true
             font.pixelSize: 16
             verticalAlignment: TextInput.AlignVCenter
+            color: filterDialog.textColor
+            background: Rectangle {
+                color: filterDialog.backgroundColor
+            }
             
             onTextChanged: {
                 filterDialog.filterString = text
@@ -57,6 +65,7 @@ Dialog {
             opacity: 0.7
             wrapMode: Text.WordWrap
             width: parent.width - parent.padding * 2
+            color: filterDialog.textColor
         }
     }
 

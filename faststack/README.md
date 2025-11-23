@@ -9,7 +9,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 
 ## Features
 
-- **Instant Navigation:** Sub-10ms next/previous image switching, high-peformance decoding via `PyTurboJPEG`.
+- **Instant Navigation:** Sub-10ms next/previous image switching, high performance decoding via `PyTurboJPEG`.
 - **Zoom & Pan:** Smooth zooming and panning.
 - **Stack Selection:** Group images into stacks (`[`, `]`) and select them for processing (`S`).
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).

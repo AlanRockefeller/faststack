@@ -12,10 +12,16 @@ Dialog {
     width: 400
 
     property int maxImageCount: 0
+    property color backgroundColor: "red" // Placeholder, will be set from Main.qml
+    property color textColor: "white" // Placeholder, will be set from Main.qml
+
 
     // Inherit Material theme from parent
-    Material.theme: uiState && uiState.theme === 0 ? Material.Dark : Material.Light
-    Material.accent: "#4fb360"
+    // Material.theme: uiState && uiState.theme === 0 ? Material.Dark : Material.Light
+    // Material.accent: "#4fb360"
+    background: Rectangle {
+        color: jumpDialog.backgroundColor
+    }
 
     onOpened: {
         imageNumberField.text = ""
@@ -49,6 +55,7 @@ Dialog {
                 text: "Enter image number (1-" + jumpDialog.maxImageCount + "):"
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
+                color: jumpDialog.textColor
             }
 
             TextField {
@@ -65,6 +72,10 @@ Dialog {
                 validator: IntValidator {
                     bottom: 1
                     top: jumpDialog.maxImageCount
+                }
+                color: jumpDialog.textColor
+                background: Rectangle {
+                    color: jumpDialog.backgroundColor
                 }
                 
                 Keys.onReturnPressed: jumpDialog.accept()

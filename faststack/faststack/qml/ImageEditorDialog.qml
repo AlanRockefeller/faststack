@@ -12,6 +12,9 @@ Window {
     visible: uiState.isEditorOpen
     flags: Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
     property int updatePulse: 0
+    property color backgroundColor: "red" // Placeholder, will be set from Main.qml
+    property color textColor: "white" // Placeholder, will be set from Main.qml
+
 
     Material.theme: uiState.theme === 0 ? Material.Dark : Material.Light
     Material.accent: "#4fb360"
@@ -35,7 +38,7 @@ Window {
     }
 
     // Background
-    color: "#2b2b2b"
+    color: imageEditorDialog.backgroundColor
 
     ScrollView {
         anchors.fill: parent
@@ -54,7 +57,7 @@ Window {
                 spacing: 2
 
                 // --- Light Group ---
-                Label { text: "Light"; font.bold: true; color: uiState.theme === 0 ? "white" : "black" }
+                Label { text: "Light"; font.bold: true; color: imageEditorDialog.textColor }
                 ListModel {
                     id: lightModel
                     ListElement { name: "Exposure"; key: "exposure" }
@@ -68,7 +71,7 @@ Window {
                 Repeater { model: lightModel; delegate: editSlider }
 
                 // --- Detail Group ---
-                Label { text: "Detail"; font.bold: true; color: uiState.theme === 0 ? "white" : "black"; Layout.topMargin: 10 }
+                Label { text: "Detail"; font.bold: true; color: imageEditorDialog.textColor; Layout.topMargin: 10 }
                 ListModel {
                     id: detailModel
                     ListElement { name: "Clarity"; key: "clarity" }
@@ -84,7 +87,7 @@ Window {
                 spacing: 2
 
                 // --- Color Group ---
-                Label { text: "Color"; font.bold: true; color: uiState.theme === 0 ? "white" : "black" }
+                Label { text: "Color"; font.bold: true; color: imageEditorDialog.textColor }
                 ListModel {
                     id: colorModel
                     ListElement { name: "Saturation"; key: "saturation"; reverse: false }
@@ -105,7 +108,7 @@ Window {
                 }
 
                 // --- Effects Group ---
-                Label { text: "Effects"; font.bold: true; color: uiState.theme === 0 ? "white" : "black"; Layout.topMargin: 10 }
+                Label { text: "Effects"; font.bold: true; color: imageEditorDialog.textColor; Layout.topMargin: 10 }
                 ListModel {
                     id: effectsModel
                     ListElement { name: "Vignette"; key: "vignette"; min: 0; max: 100 }
@@ -113,10 +116,10 @@ Window {
                 Repeater { model: effectsModel; delegate: editSlider }
 
                 // --- Transform Group ---
-                Label { text: "Transform"; font.bold: true; color: uiState.theme === 0 ? "white" : "black"; Layout.topMargin: 10 }
+                Label { text: "Transform"; font.bold: true; color: imageEditorDialog.textColor; Layout.topMargin: 10 }
                 RowLayout {
                     Layout.fillWidth: true
-                    Label { text: "Rotation"; color: uiState.theme === 0 ? "white" : "black" }
+                    Label { text: "Rotation"; color: imageEditorDialog.textColor }
                     Button { text: "↶"; onClicked: controller.rotate_image_ccw() }
                     Button { text: "↷"; onClicked: controller.rotate_image_cw() }
                 }
@@ -158,7 +161,7 @@ Window {
             
             Text {
                 text: model.name + ": " + displayValue.toFixed(0)
-                color: uiState.theme === 0 ? "white" : "black"
+                color: imageEditorDialog.textColor
                 font.pixelSize: 14
                 wrapMode: Text.WordWrap
                 Layout.fillWidth: true
@@ -212,7 +215,7 @@ Window {
                     width: slider.availableWidth
                     height: 4
                     radius: 2
-                    color: "#404040"
+                    color: imageEditorDialog.backgroundColor === "#2b2b2b" ? Qt.lighter(imageEditorDialog.backgroundColor, 1.2) : Qt.darker(imageEditorDialog.backgroundColor, 1.2)
                 }
 
                 handle: Rectangle {
@@ -222,7 +225,7 @@ Window {
                     height: 16
                     radius: 8
                     color: slider.pressed ? "#4fb360" : "#6fcf7c"
-                    border.color: "#3d8a4a"
+                    border.color: uiState.theme === 0 ? Qt.darker(Material.accent, 1.2) : Qt.lighter(Material.accent, 1.2)
                 }
             }
         }

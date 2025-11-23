@@ -84,6 +84,13 @@ class UIState(QObject):
     filterStringChanged = Signal() # Signal for filter string updates
     colorModeChanged = Signal() # Signal for color mode updates
     saturationFactorChanged = Signal() # Signal for saturation factor updates
+    awbModeChanged = Signal()
+    awbStrengthChanged = Signal()
+    awbWarmBiasChanged = Signal()
+    awbLumaLowerBoundChanged = Signal()
+    awbLumaUpperBoundChanged = Signal()
+    awbRgbLowerBoundChanged = Signal()
+    awbRgbUpperBoundChanged = Signal()
     default_directory_changed = Signal(str)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
@@ -284,6 +291,69 @@ class UIState(QObject):
         """Returns the current saturation factor."""
         return self.app_controller.get_saturation_factor()
 
+    @Property(str, notify=awbModeChanged)
+    def awbMode(self):
+        return self.app_controller.get_awb_mode()
+
+    @awbMode.setter
+    def awbMode(self, mode: str):
+        self.app_controller.set_awb_mode(mode)
+        self.awbModeChanged.emit()
+
+    @Property(float, notify=awbStrengthChanged)
+    def awbStrength(self):
+        return self.app_controller.get_awb_strength()
+
+    @awbStrength.setter
+    def awbStrength(self, value: float):
+        self.app_controller.set_awb_strength(value)
+        self.awbStrengthChanged.emit()
+
+    @Property(int, notify=awbWarmBiasChanged)
+    def awbWarmBias(self):
+        return self.app_controller.get_awb_warm_bias()
+
+    @awbWarmBias.setter
+    def awbWarmBias(self, value: int):
+        self.app_controller.set_awb_warm_bias(value)
+        self.awbWarmBiasChanged.emit()
+
+    @Property(int, notify=awbLumaLowerBoundChanged)
+    def awbLumaLowerBound(self):
+        return self.app_controller.get_awb_luma_lower_bound()
+
+    @awbLumaLowerBound.setter
+    def awbLumaLowerBound(self, value: int):
+        self.app_controller.set_awb_luma_lower_bound(value)
+        self.awbLumaLowerBoundChanged.emit()
+
+    @Property(int, notify=awbLumaUpperBoundChanged)
+    def awbLumaUpperBound(self):
+        return self.app_controller.get_awb_luma_upper_bound()
+
+    @awbLumaUpperBound.setter
+    def awbLumaUpperBound(self, value: int):
+        self.app_controller.set_awb_luma_upper_bound(value)
+        self.awbLumaUpperBoundChanged.emit()
+
+    @Property(int, notify=awbRgbLowerBoundChanged)
+    def awbRgbLowerBound(self):
+        return self.app_controller.get_awb_rgb_lower_bound()
+
+    @awbRgbLowerBound.setter
+    def awbRgbLowerBound(self, value: int):
+        self.app_controller.set_awb_rgb_lower_bound(value)
+        self.awbRgbLowerBoundChanged.emit()
+
+    @Property(int, notify=awbRgbUpperBoundChanged)
+    def awbRgbUpperBound(self):
+        return self.app_controller.get_awb_rgb_upper_bound()
+
+    @awbRgbUpperBound.setter
+    def awbRgbUpperBound(self, value: int):
+        self.app_controller.set_awb_rgb_upper_bound(value)
+        self.awbRgbUpperBoundChanged.emit()
+
     @Property(str, constant=True)
     def currentDirectory(self):
         """Returns the path of the current working directory."""
@@ -372,6 +442,11 @@ class UIState(QObject):
     @Slot(result=str)
     def open_directory_dialog(self):
         return self.app_controller.open_directory_dialog()
+
+    @Slot()
+    def open_folder(self):
+        self.app_controller.open_folder()
+
 
     @Slot()
     def preloadAllImages(self):
