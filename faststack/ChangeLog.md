@@ -2,6 +2,10 @@
 
 Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   Add the ability to pull in images from a stack if they are taken with a camera with in-camera stacking.
 
+# [1.2.0] - 2025-11-22
+
+- Fixed menus, they now work well and look cool.
+
 ## [1.1.0] - 2025-11-22
 
 ### Major Features

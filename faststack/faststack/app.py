@@ -1639,13 +1639,10 @@ class AppController(QObject):
                 return True
         return False
 
-    @Slot(result=bytes)
-    def get_preview_data(self) -> Optional[bytes]:
-        """Gets the PNG bytes of the currently edited image."""
-        data = self.image_editor.get_preview_data()
-        if data is None:
-            return b''
-        return data
+    @Slot(result=DecodedImage)
+    def get_preview_data(self) -> Optional[DecodedImage]:
+        """Gets the preview data of the currently edited image as a DecodedImage."""
+        return self.image_editor.get_preview_data()
 
     @Slot(str, "QVariant")
     def set_edit_parameter(self, key: str, value: Any):
@@ -1878,7 +1875,7 @@ class AppController(QObject):
         info = ""
         # Check if current image is in any batch
         in_batch = False
-        for i, (start, end) in enumerate(self.batches):
+        for start, end in self.batches:
             if start <= index <= end:
                 in_batch = True
                 break

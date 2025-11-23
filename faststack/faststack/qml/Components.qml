@@ -8,6 +8,7 @@ Item {
     id: loupeView
     anchors.fill: parent
 
+
     // Connection to handle zoom/pan reset signal from Python
     Connections {
         target: uiState
@@ -26,8 +27,8 @@ Item {
         source: uiState && uiState.imageCount > 0 ? uiState.currentImageSource : ""
         fillMode: Image.PreserveAspectFit
         cache: false // We do our own caching in Python
-        smooth: !uiState.anySliderPressed
-        mipmap: !uiState.anySliderPressed
+	smooth: uiState && !uiState.anySliderPressed
+	mipmap: uiState && !uiState.anySliderPressed
 
         Component.onCompleted: {
             if (width > 0 && height > 0) {

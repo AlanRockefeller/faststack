@@ -1,6 +1,6 @@
 # FastStack
 
-# Version 1.1 - November 22, 2025
+# Version 1.2 - November 22, 2025
 # By Alan Rockefeller
 
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW or JPG files for focus stacking and website upload.
@@ -9,7 +9,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 
 ## Features
 
-- **Instant Navigation:** Sub-10ms next/previous image switching, high peformance decoding via `PyTurboJPEG`.
+- **Instant Navigation:** Sub-10ms next/previous image switching, high-peformance decoding via `PyTurboJPEG`.
 - **Zoom & Pan:** Smooth zooming and panning.
 - **Stack Selection:** Group images into stacks (`[`, `]`) and select them for processing (`S`).
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
