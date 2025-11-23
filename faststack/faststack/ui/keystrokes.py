@@ -46,6 +46,7 @@ class Keybinder:
             Qt.Key_P: "edit_in_photoshop",
             Qt.Key_C: "clear_all_stacks",
             Qt.Key_A: "quick_auto_white_balance",
+            Qt.Key_O: "toggle_crop_mode",
             Qt.Key_Delete: "delete_current_image",
             Qt.Key_Backspace: "delete_current_image",
         }

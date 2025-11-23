@@ -45,7 +45,7 @@ from faststack.imaging.cache import ByteLRUCache, get_decoded_image_size
 from faststack.imaging.prefetch import Prefetcher, clear_icc_caches
 from faststack.ui.provider import ImageProvider
 from faststack.ui.keystrokes import Keybinder
-from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS
+from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, create_backup_file
 
 def make_hdrop(paths):
     """
@@ -251,6 +251,16 @@ class AppController(QObject):
             return False
             
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
+            # Handle Enter key in crop mode
+            if self.ui_state.isCropping and (event.key() == Qt.Key_Enter or event.key() == Qt.Key_Return):
+                self.execute_crop()
+                return True
+            
+            # Handle ESC key to exit crop mode
+            if self.ui_state.isCropping and event.key() == Qt.Key_Escape:
+                self.cancel_crop_mode()
+                return True
+            
             handled = self.keybinder.handle_key_press(event)
             if handled:
                 return True
@@ -1386,13 +1396,22 @@ class AppController(QObject):
             filepath_obj = Path(saved_path)
 
             try:
-                if backup_path.exists():
+                backup_path_obj = Path(backup_path)
+                if backup_path_obj.exists():
                     # Restore the backup
                     filepath_obj.unlink()  # Remove the edited version
-                    backup_path.rename(filepath_obj)  # Restore backup
-                    log.info("Restored backup %s for %s", backup_path.name, saved_path)
+                    backup_path_obj.rename(filepath_obj)  # Restore backup
+                    log.info("Restored backup %s for %s", backup_path_obj.name, saved_path)
                     
                     # Refresh the view
+                    self.refresh_image_list()
+                    
+                    # Find the restored image
+                    for i, img_file in enumerate(self.image_files):
+                        if img_file.path == filepath_obj:
+                            self.current_index = i
+                            break
+                    
                     self.display_generation += 1
                     self.image_cache.clear()
                     self.prefetcher.cancel_all()
@@ -1410,6 +1429,44 @@ class AppController(QObject):
                 log.exception("Failed to undo auto white balance")
                 # Put it back in history if it failed
                 self.undo_history.append(("auto_white_balance", (saved_path, backup_path), timestamp))
+        
+        elif action_type == "crop":
+            saved_path, backup_path = action_data
+            filepath_obj = Path(saved_path)
+
+            try:
+                backup_path_obj = Path(backup_path)
+                if backup_path_obj.exists():
+                    # Restore the backup
+                    filepath_obj.unlink()  # Remove the cropped version
+                    backup_path_obj.rename(filepath_obj)  # Restore backup
+                    log.info("Restored backup %s for %s", backup_path_obj.name, saved_path)
+                    
+                    # Refresh the view
+                    self.refresh_image_list()
+                    
+                    # Find the restored image
+                    for i, img_file in enumerate(self.image_files):
+                        if img_file.path == filepath_obj:
+                            self.current_index = i
+                            break
+                    
+                    self.display_generation += 1
+                    self.image_cache.clear()
+                    self.prefetcher.cancel_all()
+                    self.prefetcher.update_prefetch(self.current_index)
+                    self.sync_ui_state()
+                    
+                    self.update_status_message("Undid crop")
+                else:
+                    self.update_status_message("Backup not found")
+                    log.warning("Backup %s disappeared before it could be restored.", backup_path)
+                    self.undo_history.append(("crop", (saved_path, backup_path), timestamp))
+            except OSError as e:
+                self.update_status_message(f"Undo failed: {e}")
+                log.exception("Failed to undo crop")
+                # Put it back in history if it failed
+                self.undo_history.append(("crop", (saved_path, backup_path), timestamp))
 
     def shutdown(self):
         log.info("Application shutting down.")
@@ -1832,6 +1889,157 @@ class AppController(QObject):
         if new_rotation < 0:
             new_rotation += 360
         self.set_edit_parameter('rotation', new_rotation)
+    
+    @Slot()
+    def toggle_crop_mode(self):
+        """Toggle crop mode on/off."""
+        self.ui_state.isCropping = not self.ui_state.isCropping
+        if self.ui_state.isCropping:
+            # Reset crop box when entering crop mode
+            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            # Set aspect ratios for QML dropdown
+            self.ui_state.aspectRatioNames = [r['name'] for r in ASPECT_RATIOS]
+            self.ui_state.currentAspectRatioIndex = 0
+            self.update_status_message("Crop mode: Drag to select area, Enter to crop")
+            log.info("Crop mode enabled")
+        else:
+            self.update_status_message("Crop mode disabled")
+            log.info("Crop mode disabled")
+    
+    @Slot()
+    def cancel_crop_mode(self):
+        """Cancel crop mode without applying changes."""
+        if self.ui_state.isCropping:
+            self.ui_state.isCropping = False
+            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            self.update_status_message("Crop cancelled")
+            log.info("Crop mode cancelled")
+    
+    @Slot()
+    def execute_crop(self):
+        """Execute the crop operation: crop image, save, backup, and refresh."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            self.update_status_message("No image to crop")
+            return
+        
+        if not self.ui_state.isCropping:
+            return
+        
+        # Convert QJSValue to Python list if needed
+        crop_box_raw = self.ui_state.currentCropBox
+        try:
+            # Try to convert QJSValue to list
+            if hasattr(crop_box_raw, 'toVariant'):
+                # It's a QJSValue, convert to list
+                variant = crop_box_raw.toVariant()
+                if isinstance(variant, (list, tuple)):
+                    crop_box = list(variant)
+                else:
+                    # Try to iterate if it's iterable
+                    crop_box = [variant[0], variant[1], variant[2], variant[3]]
+            elif isinstance(crop_box_raw, (list, tuple)):
+                crop_box = list(crop_box_raw)
+            else:
+                # Try direct access (might work for some QJSValue types)
+                crop_box = [crop_box_raw[0], crop_box_raw[1], crop_box_raw[2], crop_box_raw[3]]
+        except (TypeError, IndexError, AttributeError) as e:
+            self.update_status_message("Invalid crop box")
+            log.error("Failed to parse crop box (type: %s): %s", type(crop_box_raw), e)
+            return
+        
+        if len(crop_box) != 4:
+            self.update_status_message("Invalid crop box")
+            return
+        
+        if crop_box == [0, 0, 1000, 1000] or crop_box == (0, 0, 1000, 1000):
+            self.update_status_message("No crop area selected")
+            return
+        
+        image_file = self.image_files[self.current_index]
+        filepath = str(image_file.path)
+        
+        try:
+            # Load the image
+            img = Image.open(filepath).convert("RGB")
+            width, height = img.size
+            
+            # Convert normalized crop box (0-1000) to pixel coordinates
+            left = int(crop_box[0] * width / 1000)
+            top = int(crop_box[1] * height / 1000)
+            right = int(crop_box[2] * width / 1000)
+            bottom = int(crop_box[3] * height / 1000)
+            
+            # Ensure valid crop box
+            left = max(0, min(left, width - 1))
+            top = max(0, min(top, height - 1))
+            right = max(left + 1, min(right, width))
+            bottom = max(top + 1, min(bottom, height))
+            
+            # Crop the image
+            cropped_img = img.crop((left, top, right, bottom))
+            
+            # Create backup
+            original_path = Path(filepath)
+            backup_path = create_backup_file(original_path)
+            if backup_path is None:
+                self.update_status_message("Failed to create backup")
+                log.error("Failed to create backup for crop operation")
+                return
+            
+            # Save the cropped image
+            with Image.open(original_path) as original_img:
+                original_format = original_img.format or original_path.suffix.lstrip('.').upper()
+                exif_data = original_img.info.get('exif')
+            
+            save_kwargs = {}
+            if original_format == 'JPEG':
+                save_kwargs['format'] = 'JPEG'
+                save_kwargs['quality'] = 95
+                if exif_data:
+                    save_kwargs['exif'] = exif_data
+            else:
+                save_kwargs['format'] = original_format
+            
+            try:
+                cropped_img.save(original_path, **save_kwargs)
+            except Exception as e:
+                log.warning(f"Could not save with original format settings: {e}")
+                cropped_img.save(original_path)
+            
+            # Track for undo
+            import time
+            timestamp = time.time()
+            self.undo_history.append(("crop", (str(original_path), str(backup_path)), timestamp))
+            
+            # Exit crop mode
+            self.ui_state.isCropping = False
+            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            
+            # Refresh the view
+            self.refresh_image_list()
+            
+            # Find the edited image in the refreshed list
+            for i, img_file in enumerate(self.image_files):
+                if img_file.path == original_path:
+                    self.current_index = i
+                    break
+            
+            # Invalidate cache and refresh display
+            self.display_generation += 1
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
+            
+            # Reset zoom/pan to fit the new cropped image
+            self.ui_state.resetZoomPan()
+            
+            self.update_status_message("Image cropped and saved")
+            log.info("Crop operation completed for %s", filepath)
+            
+        except Exception as e:
+            self.update_status_message(f"Crop failed: {e}")
+            log.exception("Failed to crop image")
     
     @Slot()
     def quick_auto_white_balance(self):

@@ -1,6 +1,7 @@
 import os
 import shutil
 import glob
+import re
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import numpy as np
@@ -18,6 +19,39 @@ INSTAGRAM_RATIOS = {
     "1.91:1 (Landscape)": (191, 100),
     "9:16 (Story)": (9, 16),
 }
+
+def create_backup_file(original_path: Path) -> Optional[Path]:
+    """
+    Creates a backup of the original file with naming pattern:
+    filename-backup.jpg, filename-backup2.jpg, etc.
+    
+    Returns:
+        Path to the backup file on success, None on failure.
+    """
+    if not original_path.exists():
+        return None
+    
+    # Extract base name without any existing -backup suffix
+    stem = original_path.stem
+    # Remove any existing -backup, -backup2, -backup-1, etc. (handles both old and new formats)
+    base_stem = re.sub(r'-backup(-?\d+)?$', '', stem)
+    
+    # Try filename-backup.jpg first
+    backup_path = original_path.parent / f"{base_stem}-backup{original_path.suffix}"
+    
+    # If that exists, try filename-backup2.jpg, filename-backup3.jpg, etc.
+    i = 2
+    while backup_path.exists():
+        backup_path = original_path.parent / f"{base_stem}-backup{i}{original_path.suffix}"
+        i += 1
+    
+    try:
+        # Perform the backup
+        shutil.copy2(original_path, backup_path)
+        return backup_path
+    except Exception as e:
+        print(f"Failed to create backup: {e}")
+        return None
 
 class ImageEditor:
     """Handles core image manipulation using PIL."""
@@ -256,24 +290,12 @@ class ImageEditor:
 
         original_path = self.current_filepath
         
-        # Extract base name without any existing -backup suffix
-        stem = original_path.stem
-        # Remove any existing -backup, -backup2, -backup-1, etc. (handles both old and new formats)
-        import re
-        base_stem = re.sub(r'-backup(-?\d+)?$', '', stem)
-        
-        # Try filename-backup.jpg first
-        backup_path = original_path.parent / f"{base_stem}-backup{original_path.suffix}"
-        
-        # If that exists, try filename-backup2.jpg, filename-backup3.jpg, etc.
-        i = 2
-        while backup_path.exists():
-            backup_path = original_path.parent / f"{base_stem}-backup{i}{original_path.suffix}"
-            i += 1
+        # Use the reusable backup function
+        backup_path = create_backup_file(original_path)
+        if backup_path is None:
+            return None
         
         try:
-            # Perform the backup and overwrite
-            shutil.copy2(original_path, backup_path)
             
             # Re-open original to correctly detect format and get EXIF
             with Image.open(original_path) as original_img:

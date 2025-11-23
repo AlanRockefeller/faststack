@@ -590,7 +590,26 @@ class UIState(QObject):
         return self._current_crop_box
 
     @currentCropBox.setter
-    def currentCropBox(self, new_value: tuple):
+    def currentCropBox(self, new_value):
+        # Convert QJSValue or list to tuple if needed
+        try:
+            if hasattr(new_value, 'toVariant'):
+                # It's a QJSValue, convert to tuple
+                variant = new_value.toVariant()
+                if isinstance(variant, (list, tuple)):
+                    new_value = tuple(variant)
+                else:
+                    # Try to access elements directly
+                    new_value = (variant[0], variant[1], variant[2], variant[3])
+            elif isinstance(new_value, list):
+                new_value = tuple(new_value)
+            elif not isinstance(new_value, tuple):
+                # Try to convert to tuple
+                new_value = tuple(new_value)
+        except (TypeError, IndexError, AttributeError):
+            # If conversion fails, try to use as-is or log error
+            pass
+        
         if self._current_crop_box != new_value:
             self._current_crop_box = new_value
             self.current_crop_box_changed.emit(new_value)

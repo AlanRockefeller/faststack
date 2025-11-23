@@ -807,11 +807,12 @@ ApplicationWindow {
                       "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
                       "<b>File Management:</b><br>" +
                       "&nbsp;&nbsp;Delete: Move current image to recycle bin<br>" +
-                      "&nbsp;&nbsp;Ctrl+Z: Undo last action (delete or auto white balance)<br><br>" +
+                      "&nbsp;&nbsp;Ctrl+Z: Undo last action (delete, auto white balance, or crop)<br><br>" +
                       "<b>Actions:</b><br>" +
                       "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
                       "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
                       "&nbsp;&nbsp;A: Quick auto white balance (saves automatically)<br>" +
+                      "&nbsp;&nbsp;O: Toggle crop mode (Enter to execute crop, ESC to cancel)<br>" +
                       "&nbsp;&nbsp;E: Toggle Image Editor<br>" +
                       "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
                 padding: 10
