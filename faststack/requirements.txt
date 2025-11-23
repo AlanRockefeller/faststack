@@ -3,7 +3,6 @@ PyTurboJPEG==1.*
 numpy==2.*
 cachetools==5.*
 watchdog==4.*
-typer==0.12.*
 Pillow==10.*      # fallback decode; keep it
 pyinstaller==6.*
 pytest==8.*

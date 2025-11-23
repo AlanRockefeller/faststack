@@ -9,15 +9,24 @@ from PIL import Image
 log = logging.getLogger(__name__)
 
 # Attempt to import PyTurboJPEG
+
 try:
     from turbojpeg import TurboJPEG, TJPF_RGB
-    jpeg_decoder = TurboJPEG()
-    TURBO_AVAILABLE = True
-    log.info("PyTurboJPEG is available. Using for JPEG decoding.")
 except ImportError:
     jpeg_decoder = None
     TURBO_AVAILABLE = False
     log.warning("PyTurboJPEG not found. Falling back to Pillow for JPEG decoding.")
+else:
+    try:
+        jpeg_decoder = TurboJPEG()
+    except Exception:
+        jpeg_decoder = None
+        TURBO_AVAILABLE = False
+        log.exception("PyTurboJPEG initialization failed. Falling back to Pillow.")
+    else:
+        TURBO_AVAILABLE = True
+        log.info("PyTurboJPEG is available. Using it for JPEG decoding.")
+
 
 def decode_jpeg_rgb(jpeg_bytes: bytes) -> Optional[np.ndarray]:
     """Decodes JPEG bytes into an RGB numpy array."""
@@ -29,7 +38,7 @@ def decode_jpeg_rgb(jpeg_bytes: bytes) -> Optional[np.ndarray]:
         except Exception as e:
             log.exception(f"PyTurboJPEG failed to decode image: {e}. Trying Pillow.")
             # Fall through to Pillow fallback
-    
+
     # Fallback to Pillow
     try:
         from io import BytesIO
@@ -39,8 +48,9 @@ def decode_jpeg_rgb(jpeg_bytes: bytes) -> Optional[np.ndarray]:
         log.exception(f"Pillow also failed to decode image: {e}")
         return None
 
+
 def decode_jpeg_thumb_rgb(
-    jpeg_bytes: bytes, 
+    jpeg_bytes: bytes,
     max_dim: int = 256
 ) -> Optional[np.ndarray]:
     """Decodes a JPEG into a thumbnail-sized RGB numpy array."""
@@ -48,10 +58,10 @@ def decode_jpeg_thumb_rgb(
         try:
             # Get image header to determine dimensions
             width, height, _, _ = jpeg_decoder.decode_header(jpeg_bytes)
-            
+
             # Find the best scaling factor
             scaling_factor = _get_turbojpeg_scaling_factor(width, height, max_dim)
-            
+
             decoded = jpeg_decoder.decode(
                 jpeg_bytes,
                 scaling_factor=scaling_factor,
@@ -75,6 +85,7 @@ def decode_jpeg_thumb_rgb(
     except Exception as e:
         log.exception(f"Pillow also failed to decode thumbnail: {e}")
         return None
+
 
 def _get_turbojpeg_scaling_factor(width: int, height: int, max_dim: int) -> Optional[Tuple[int, int]]:
     """Finds the best libjpeg-turbo scaling factor to get a thumbnail <= max_dim."""

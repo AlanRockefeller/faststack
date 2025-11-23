@@ -20,7 +20,8 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
         raw_files: A list of absolute paths to RAW files.
 
     Returns:
-        True if the process was launched successfully, False otherwise.
+        Tuple of (success: bool, tmp_path: Optional[Path]).
+        Returns (True, tmp_path) if launched successfully, (False, None) otherwise.
     """
     helicon_exe = config.get("helicon", "exe")
     if not helicon_exe or not isinstance(helicon_exe, str):
