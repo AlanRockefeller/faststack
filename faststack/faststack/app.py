@@ -1175,7 +1175,33 @@ class AppController(QObject):
         """Opens a directory dialog and reloads the application with the selected folder."""
         path = self.open_directory_dialog()
         if path:
+            # Stop the old watcher
+            if self.watcher:
+                self.watcher.stop()
+            
+            # Update the directory path
             self.image_dir = Path(path)
+            
+            # Reinitialize directory-bound components
+            self.watcher = Watcher(self.image_dir, self.refresh_image_list)
+            self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
+            self.recycle_bin_dir = self.image_dir / "image recycle bin"
+            
+            # Clear directory-specific state
+            self.delete_history = []
+            self.undo_history = []
+            self.stacks = []
+            self.batches = []
+            self.batch_start_index = None
+            self.stack_start_index = None
+            
+            # Clear caches since they reference old directory's images
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self._metadata_cache = {}
+            self._metadata_cache_index = (-1, -1)
+            
+            # Load images from new directory
             self.load()
 
 
