@@ -30,8 +30,7 @@ from PySide6.QtCore import (
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from PySide6.QtQml import QQmlApplicationEngine
 from PIL import Image
-Image.MAX_IMAGE_PIXELS = None
-
+Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 # ⬇️ these are the ones that went missing
 from faststack.config import config
 from faststack.logging_setup import setup_logging
@@ -136,7 +135,7 @@ class AppController(QObject):
         
         # -- Delete/Undo State --
         self.recycle_bin_dir = self.image_dir / "image recycle bin"
-        self.delete_history: List[tuple[Path, Optional[Path]]] = []  # [(jpg_path, raw_path), ...]
+        self.delete_history: List[Tuple[Path, Optional[Path]]] = []  # [(jpg_path, raw_path), ...]
         # Track all undoable actions with timestamps
         self.undo_history: List[Tuple[str, Any, float]] = []  # (action_type, action_data, timestamp)
 
@@ -145,7 +144,7 @@ class AppController(QObject):
         self.resize_timer.timeout.connect(self._handle_resize)
         self.pending_width = None
         self.pending_height = None
-        
+
         # Track if any dialog is open to disable keybindings
         self._dialog_open = False
 
@@ -679,6 +678,7 @@ class AppController(QObject):
             self.batches = new_batches
         
         # Check and remove from stacks
+        # Check and remove from stacks
         if not removed:
             new_stacks = []
             stack_modified = False
@@ -700,8 +700,6 @@ class AppController(QObject):
                         new_stacks.append([start, self.current_index - 1])
                         new_stacks.append([self.current_index + 1, end])
                     
-                    self.sidecar.data.stacks = self.stacks # Update sidecar BEFORE self.stacks is replaced
-                    self.sidecar.save()
                     log.info("Removed index %d from stack [%d, %d]", self.current_index, start, end)
                     self.update_status_message(f"Removed from stack")
                     removed = True
@@ -712,8 +710,7 @@ class AppController(QObject):
             if stack_modified:
                 self.stacks = new_stacks
                 self.sidecar.data.stacks = self.stacks
-                self.sidecar.save()
-
+                self.sidecar.save()        
         if removed:
             self._metadata_cache_index = (-1, -1)
             self.dataChanged.emit()
@@ -1111,9 +1108,6 @@ class AppController(QObject):
         # Notify QML
         self.ui_state.saturationFactorChanged.emit()
 
-    def get_default_directory(self):
-        return config.get('core', 'default_directory')
-
     @Slot(result=str)
     def get_awb_mode(self):
         return config.get("awb", "mode")
@@ -1323,13 +1317,11 @@ class AppController(QObject):
                 self.delete_history.append((jpg_path, raw_path))
                 self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
             
-            # Update status
+            # Add to delete history only if at least one file was moved
             if deleted_files:
-                files_str = ", ".join(deleted_files)
-                self.update_status_message(f"Deleted: {files_str}")
-            else:
-                self.update_status_message("No files to delete")
-            
+                timestamp = time.time()
+                self.delete_history.append((jpg_path, raw_path))
+                self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))            
             # Refresh image list and move to next image
             self.refresh_image_list()
             if self.image_files:
@@ -1862,42 +1854,50 @@ class AppController(QObject):
     def save_edited_image(self):
         """Saves the edited image."""
         save_result = self.image_editor.save_image()
-        if save_result:
-            saved_path, _ = save_result
-            # Clear the image editor state so it will reload fresh next time
-            self.image_editor.original_image = None
-            self.image_editor.current_filepath = None
-            self.image_editor._preview_image = None
-            
-            # Reset all edit parameters in the controller/UI
-            self.reset_edit_parameters()
-
-            # Refresh the view - need to refresh image list since backup file was created
-            original_path = saved_path
-            self.refresh_image_list()
-            
-            # Find the edited image (not the backup) in the refreshed list
-            for i, img_file in enumerate(self.image_files):
-                if img_file.path == original_path:
-                    self.current_index = i
-                    break
-            
-            # Invalidate cache and refresh display
-            self.display_generation += 1
-            self.image_cache.clear()
-            self.prefetcher.cancel_all()
-            self.prefetcher.update_prefetch(self.current_index)
-            self.sync_ui_state()
-
-            QMessageBox.information(
+        if not save_result:
+            QMessageBox.warning(
                 None,
-                "Save Successful",
-                f"Image saved to: {saved_path}. Original backed up.",
-                QMessageBox.Ok
+                "Save Failed",
+                "Failed to save edited image. Please check the log for details.",
+                QMessageBox.Ok,
             )
-        else:
             self.update_status_message("Failed to save image")
             log.error("Failed to save edited image")
+            return
+
+        saved_path, _ = save_result
+        # Clear the image editor state so it will reload fresh next time
+        self.image_editor.original_image = None
+        self.image_editor.current_filepath = None
+        self.image_editor._preview_image = None
+            
+        # Reset all edit parameters in the controller/UI
+        self.reset_edit_parameters()
+
+        # Refresh the view - need to refresh image list since backup file was created
+        original_path = saved_path
+        self.refresh_image_list()
+        
+        # Find the edited image (not the backup) in the refreshed list
+        for i, img_file in enumerate(self.image_files):
+            if img_file.path == original_path:
+                self.current_index = i
+                break
+        
+        # Invalidate cache and refresh display
+        self.display_generation += 1
+        self.image_cache.clear()
+        self.prefetcher.cancel_all()
+        self.prefetcher.update_prefetch(self.current_index)
+        self.sync_ui_state()
+
+        QMessageBox.information(
+            None,
+            "Save Successful",
+            f"Image saved to: {saved_path}. Original backed up.",
+            QMessageBox.Ok
+        )
+
     
     @Slot()
     def rotate_image_cw(self):

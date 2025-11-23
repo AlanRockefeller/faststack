@@ -213,8 +213,8 @@ Dialog {
                 ComboBox {
                     id: awbModeComboBox
                     model: ["lab", "rgb"]
-                    currentIndex: model.indexOf(settingsDialog.awbMode)
-                    onCurrentIndexChanged: settingsDialog.awbMode = model[currentIndex]
+                    currentIndex: Math.max(0, model.indexOf(settingsDialog.awbMode))
+                    onCurrentIndexChanged: settingsDialog.awbMode = model[currentIndex]                    
                     Layout.topMargin: 10
                 }
                 Label {

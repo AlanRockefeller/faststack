@@ -2,12 +2,12 @@
 
 Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   Add the ability to pull in images from a stack if they are taken with a camera with in-camera stacking
 
-# [1.3.0] - 2025-11-23
+## [1.3.0] - 2025-11-23
 
 - Added the ability to crop images, via the cr(O)p hotkey.   It can be a freeform crop, or constrained to several popular aspect ratios.   
 
 
-# [1.2.0] - 2025-11-22
+## [1.2.0] - 2025-11-22
 
 - Fixed menus, they now work well and look cool.
 - Updated auto white balance to make it better, and put some controls for it in the settings
@@ -82,9 +82,7 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 
 ### Features
 - **JPG Fallback for Helicon:** Helicon Focus stacking now works with JPG-only workflows when RAW files absent.
-- **Comprehensive Timing Instrumentation:** Added detailed decode timing logs in debug mode for performance analysis.
-- **Added a Jump to Photo feature that can be activated by pressing the G key
-
+- **Comprehensive Timing Instrumentation:** Added detailed decode timing logs in debug mode for performance analysis.- **Jump to Photo:** Press `G` to jump directly to any image (feature documented more fully in [1.0.0]).
 ## [0.8.0] - 2025-11-20
 
 ### Added

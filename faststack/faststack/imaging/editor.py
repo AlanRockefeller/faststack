@@ -149,13 +149,15 @@ class ImageEditor:
             arr = (arr * 255).clip(0, 255).astype(np.uint8)
             img = Image.fromarray(arr)
 
-        # 4. Blacks/Whites (Levels)
         blacks = self.current_edits['blacks']
         whites = self.current_edits['whites']
         if abs(blacks) > 0.001 or abs(whites) > 0.001:
             arr = np.array(img, dtype=np.float32)
             black_point = -blacks * 40
             white_point = 255 + whites * 40
+            # Prevent division by zero
+            if abs(white_point - black_point) < 0.001:
+                white_point = black_point + 0.001
             arr = (arr - black_point) * (255.0 / (white_point - black_point))
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
@@ -218,9 +220,12 @@ class ImageEditor:
             arr = np.array(img, dtype=np.float32)
             by_shift = by_val * 127.5
             mg_shift = mg_val * 127.5
-            arr[:, :, 0] += by_shift + mg_shift
-            arr[:, :, 1] += by_shift - mg_shift
-            arr[:, :, 2] -= by_shift - mg_shift
+            # Apply temperature (by_shift) primarily between R and B, and
+            # tint (mg_shift) primarily to G relative to R/B. We apply half
+            # of the tint opposite to R/B so that tint shifts G against R/B.
+            arr[:, :, 0] += (by_shift - 0.5 * mg_shift)  # R
+            arr[:, :, 1] += (1.0 * mg_shift)              # G
+            arr[:, :, 2] -= (by_shift - 0.5 * mg_shift)  # B
             np.clip(arr, 0, 255, out=arr)
             img = Image.fromarray(arr.astype(np.uint8))
 
@@ -312,16 +317,46 @@ class ImageEditor:
                 save_kwargs['format'] = original_format
 
             try:
+                # First attempt: preserve EXIF (if any) and original format settings
                 final_img.save(original_path, **save_kwargs)
             except Exception as e:
-                print(f"Warning: Could not save with original format settings: {e}")
-                # Fallback to saving based on suffix
-                final_img.save(original_path)
+                exif_was_requested = 'exif' in save_kwargs
+                print(
+                    f"Warning: Could not save with original format settings"
+                    f"{' (with EXIF)' if exif_was_requested else ''}: {e}"
+                )
+
+                # If EXIF was requested, try again without EXIF but keep format/quality
+                if exif_was_requested:
+                    retry_kwargs = dict(save_kwargs)
+                    retry_kwargs.pop('exif', None)
+                    try:
+                        final_img.save(original_path, **retry_kwargs)
+                        print(
+                            "Note: Image saved without EXIF metadata; "
+                            "EXIF may be corrupted or incompatible with the edited image."
+                        )
+                    except Exception as e2:
+                        print(f"Warning: Could not save even without EXIF metadata: {e2}")
+                        # Fall through to the final fallback below
+
+                # Final fallback: let Pillow infer format from suffix / image mode
+                try:
+                    final_img.save(original_path)
+                    print(
+                        "Warning: Used final fallback save; image may not use the original "
+                        "format settings and EXIF metadata is likely lost."
+                    )
+                except Exception as e3:
+                    print(f"Failed to save edited image even with fallback: {e3}")
+                    # Reraise so the outer except logs and returns None
+                    raise
 
             return original_path, backup_path
         except Exception as e:
             print(f"Failed to save edited image or backup: {e}")
             return None
+
 
 # Dictionary of ratios for QML dropdown
 ASPECT_RATIOS = [{"name": name, "ratio": ratio} for name, ratio in INSTAGRAM_RATIOS.items()]

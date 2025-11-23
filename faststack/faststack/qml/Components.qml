@@ -148,6 +148,7 @@ Item {
                     
                     // Store initial crop box
                     var box = uiState.currentCropBox
+                    if (!box || box.length !== 4) return
                     cropBoxStartLeft = box[0]
                     cropBoxStartTop = box[1]
                     cropBoxStartRight = box[2]
@@ -160,10 +161,9 @@ Item {
                 }
                 isCropDragging = true
             }
-        }
-        
+        }        
         function getCropRect() {
-            if (!mainImage.source || !uiState || !uiState.currentCropBox) {
+            if (!mainImage.source || !uiState || !uiState.currentCropBox || uiState.currentCropBox.length !== 4) {
                 return {x: 0, y: 0, width: 0, height: 0}
             }
             var imgWidth = mainImage.paintedWidth
@@ -178,7 +178,6 @@ Item {
                 height: (box[3] - box[1]) / 1000 * imgHeight
             }
         }
-
         onPositionChanged: function(mouse) {
             if (uiState && uiState.isCropping && isCropDragging) {
                 if (cropDragMode === "new") {
@@ -235,29 +234,13 @@ Item {
                         bottom = Math.max(top + 10, Math.min(1000, mouseY))
                     }
                     
-                    // Apply aspect ratio if needed
-                    if (uiState.currentAspectRatioIndex > 0 && uiState.aspectRatioNames && uiState.aspectRatioNames.length > uiState.currentAspectRatioIndex) {
-                        var ratioName = uiState.aspectRatioNames[uiState.currentAspectRatioIndex]
-                        var ratio = getAspectRatio(ratioName)
-                        if (ratio) {
-                            var targetAspect = ratio[0] / ratio[1]
-                            var currentWidth = right - left
-                            var currentHeight = bottom - top
-                            var currentAspect = currentWidth / currentHeight
-                            
-                            if (currentAspect > targetAspect) {
-                                var newHeight = currentWidth / targetAspect
-                                var centerY = (top + bottom) / 2
-                                top = Math.max(0, centerY - newHeight / 2)
-                                bottom = Math.min(1000, top + newHeight)
-                            } else {
-                                var newWidth = currentHeight * targetAspect
-                                var centerX = (left + right) / 2
-                                left = Math.max(0, centerX - newWidth / 2)
-                                right = Math.min(1000, left + newWidth)
-                            }
-                        }
-                    }
+                    
+                    var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom)
+                    left = constrainedBox[0]
+                    top = constrainedBox[1]
+                    right = constrainedBox[2]
+                    bottom = constrainedBox[3]
+
                     
                     uiState.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
                 }
@@ -337,7 +320,27 @@ Item {
             var top = Math.min(imgCoordY1, imgCoordY2) * 1000
             var bottom = Math.max(imgCoordY1, imgCoordY2) * 1000
             
-            // Apply aspect ratio constraint if selected (index 0 is Freeform, so skip it)
+            
+            var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom)
+            left = constrainedBox[0]
+            top = constrainedBox[1]
+            right = constrainedBox[2]
+            bottom = constrainedBox[3]
+
+            
+            uiState.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
+        }
+        
+        function getAspectRatio(name) {
+            // Map aspect ratio names to ratios
+            if (name === "1:1 (Square)") return [1, 1]
+            if (name === "4:5 (Portrait)") return [4, 5]
+            if (name === "1.91:1 (Landscape)") return [191, 100]
+            if (name === "9:16 (Story)") return [9, 16]
+            return null
+        }
+        
+        function applyAspectRatioConstraint(left, top, right, bottom) {
             if (uiState.currentAspectRatioIndex > 0 && uiState.aspectRatioNames && uiState.aspectRatioNames.length > uiState.currentAspectRatioIndex) {
                 var ratioName = uiState.aspectRatioNames[uiState.currentAspectRatioIndex]
                 var ratio = getAspectRatio(ratioName)
@@ -380,17 +383,7 @@ Item {
                     }
                 }
             }
-            
-            uiState.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
-        }
-        
-        function getAspectRatio(name) {
-            // Map aspect ratio names to ratios
-            if (name === "1:1 (Square)") return [1, 1]
-            if (name === "4:5 (Portrait)") return [4, 5]
-            if (name === "1.91:1 (Landscape)") return [191, 100]
-            if (name === "9:16 (Story)") return [9, 16]
-            return null
+            return [left, top, right, bottom]
         }
         
         function updateCropBoxFromAspectRatio() {
@@ -511,15 +504,13 @@ Item {
         z: 1000
         
         // Try to get root from parent hierarchy
-        property bool isDark: root.isDarkTheme
+        property bool isDark: typeof root !== "undefined" && root ? root.isDarkTheme : true
         
         Component.onCompleted: {
             // Update colors based on theme
             color = isDark ? "#333333" : "#f0f0f0"
             border.color = isDark ? "#666666" : "#cccccc"
-        }
-        
-        Column {
+        }        Column {
             id: aspectRatioColumn
             anchors.fill: parent
             anchors.margins: 10

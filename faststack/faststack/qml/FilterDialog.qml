@@ -21,7 +21,7 @@ Dialog {
 
     background: Rectangle {
         color: filterDialog.backgroundColor
-        border.color: Material.theme === Material.Dark ? "#404040" : "#c0c0c0"
+        border.color: "#404040"
         border.width: 1
         radius: 4
     }

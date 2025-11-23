@@ -37,9 +37,11 @@ def get_decoded_image_size(item) -> int:
         # Handle both numpy arrays and memoryview buffers
         if hasattr(item.buffer, 'nbytes'):
             return item.buffer.nbytes
-        elif hasattr(item.buffer, '__len__'):
+        elif isinstance(item.buffer, (bytes, bytearray)):
             return len(item.buffer)
         else:
-            # Fallback: compute from dimensions
-            return item.width * item.height * 3
+            # Fallback: estimate using sys.getsizeof or compute from dimensions
+            # Assuming 4 bytes/pixel for RGBA or 3 for RGB - check item.channels if available
+            import sys
+            return sys.getsizeof(item.buffer) if hasattr(item.buffer, '__sizeof__') else item.width * item.height * 4
     return 1 # Should not happen
