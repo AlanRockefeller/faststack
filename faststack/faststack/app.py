@@ -130,6 +130,9 @@ class AppController(QObject):
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
+        # Clear last displayed image since it references old directory
+        with self._last_image_lock:
+            self.last_displayed_image = None
         self._logged_empty_metadata = False
         
         # -- Delete/Undo State --
@@ -1781,7 +1784,7 @@ class AppController(QObject):
         """Saves the edited image."""
         save_result = self.image_editor.save_image()
         if save_result:
-            saved_path, backup_path = save_result
+            saved_path, _ = save_result
             # Clear the image editor state so it will reload fresh next time
             self.image_editor.original_image = None
             self.image_editor.current_filepath = None
