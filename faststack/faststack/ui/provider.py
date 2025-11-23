@@ -594,7 +594,7 @@ class UIState(QObject):
         # Convert QJSValue or list to tuple if needed
         original_value = new_value
         try:
-            if hasattr(new_value, 'toVariant')
+            if hasattr(new_value, 'toVariant'):
                 # It's a QJSValue, convert to tuple
                 variant = new_value.toVariant()
                 if isinstance(variant, (list, tuple)):
