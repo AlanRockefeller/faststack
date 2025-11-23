@@ -125,7 +125,7 @@ Item {
             if (uiState && uiState.isCropping) {
                 // Check if clicking on existing crop box
                 var cropRect = getCropRect()
-                var edgeThreshold = 10
+                var edgeThreshold = 10 * Screen.devicePixelRatio
                 var inside = mouse.x >= cropRect.x && mouse.x <= cropRect.x + cropRect.width &&
                              mouse.y >= cropRect.y && mouse.y <= cropRect.y + cropRect.height
                 
@@ -511,16 +511,7 @@ Item {
         z: 1000
         
         // Try to get root from parent hierarchy
-        property bool isDark: {
-            var p = parent
-            while (p) {
-                if (p.hasOwnProperty("isDarkTheme")) {
-                    return p.isDarkTheme
-                }
-                p = p.parent
-            }
-            return true
-        }
+        property bool isDark: root.isDarkTheme
         
         Component.onCompleted: {
             // Update colors based on theme

@@ -592,8 +592,9 @@ class UIState(QObject):
     @currentCropBox.setter
     def currentCropBox(self, new_value):
         # Convert QJSValue or list to tuple if needed
+        original_value = new_value
         try:
-            if hasattr(new_value, 'toVariant'):
+            if hasattr(new_value, 'toVariant')
                 # It's a QJSValue, convert to tuple
                 variant = new_value.toVariant()
                 if isinstance(variant, (list, tuple)):
@@ -606,10 +607,18 @@ class UIState(QObject):
             elif not isinstance(new_value, tuple):
                 # Try to convert to tuple
                 new_value = tuple(new_value)
-        except (TypeError, IndexError, AttributeError):
-            # If conversion fails, try to use as-is or log error
-            pass
-        
+        except (TypeError, IndexError, AttributeError) as e:
+            log.warning(
+                "UIState.currentCropBox: failed to normalize value %r (type %s): %s",
+                original_value,
+                type(original_value),
+                e,
+            )
+
+        # only accept 4‑element tuples
+        if not isinstance(new_value, tuple) or len(new_value) != 4:
+            log.warning("UIState.currentCropBox: ignoring invalid crop box %r", new_value)
+            return 
         if self._current_crop_box != new_value:
             self._current_crop_box = new_value
             self.current_crop_box_changed.emit(new_value)

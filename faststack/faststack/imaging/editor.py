@@ -49,7 +49,7 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
         # Perform the backup
         shutil.copy2(original_path, backup_path)
         return backup_path
-    except Exception as e:
+    except OSError as e:
         print(f"Failed to create backup: {e}")
         return None
 

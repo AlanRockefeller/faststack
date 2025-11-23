@@ -9,7 +9,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 
 ## Features
 
-- **Crop:** Added the ability to crop images, via the cr(O)p hotkey.   It can be a freeform crop, or constrained to several popular aspect ratios.
+- **Crop:** Added the ability to crop images via the cr(O)p hotkey.   It can be a freeform crop, or constrained to several popular aspect ratios.
 - **Zoom & Pan:** Smooth zooming and panning.
 - **Stack Selection:** Group images into stacks (`[`, `]`) and select them for processing (`S`).
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
@@ -60,6 +60,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - `Ctrl+Z`: Undo last action (delete or auto white balance)
 - `A`: Quick auto white balance (saves automatically)
 - `E`: Toggle Image Editor
+- 'O': Crop image
 - `Ctrl+C`: Copy image path to clipboard
 - `Ctrl+0`: Reset zoom and pan
 - `C`: Clear all stacks

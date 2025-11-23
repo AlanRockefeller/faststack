@@ -130,7 +130,6 @@ class AppController(QObject):
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
-        # Clear last displayed image since it references old directory
         with self._last_image_lock:
             self.last_displayed_image = None
         self._logged_empty_metadata = False
@@ -1209,10 +1208,20 @@ class AppController(QObject):
             self.stack_start_index = None
             
             # Clear caches since they reference old directory's images
+            with self._last_image_lock:
+                self.last_displayed_image = None
             self.image_cache.clear()
             self.prefetcher.cancel_all()
+            self.display_generation += 1
             self._metadata_cache = {}
             self._metadata_cache_index = (-1, -1)
+            # Clear last displayed image since it references the old directory
+            with self._last_image_lock:
+                self.last_displayed_image = None
+            # Clear editor state if open
+            self.image_editor.original_image = None
+            self.image_editor.current_filepath = None
+            self.image_editor._preview_image = None
             
             # Load images from new directory
             self.load()
@@ -1873,6 +1882,9 @@ class AppController(QObject):
                 f"Image saved to: {saved_path}. Original backed up.",
                 QMessageBox.Ok
             )
+        else:
+            self.update_status_message("Failed to save image")
+            log.error("Failed to save edited image")
     
     @Slot()
     def rotate_image_cw(self):

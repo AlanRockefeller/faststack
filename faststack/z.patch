@@ -1,0 +1,11 @@
+--- a/faststack/faststack/imaging/editor.py
++++ b/faststack/faststack/imaging/editor.py
+@@ -47,7 +47,7 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
+     try:
+         # Perform the backup
+         shutil.copy2(original_path, backup_path)
+         return backup_path
+-    except Exception as e:
++    except OSError as e:
+         print(f"Failed to create backup: {e}")
+         return None
