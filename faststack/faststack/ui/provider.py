@@ -95,6 +95,8 @@ class UIState(QObject):
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_cropping_changed = Signal(bool)
+    is_histogram_visible_changed = Signal(bool)
+    histogram_data_changed = Signal()
     brightness_changed = Signal(float)
     contrast_changed = Signal(float)
     saturation_changed = Signal(float)
@@ -126,6 +128,8 @@ class UIState(QObject):
         # Image Editor State
         self._is_editor_open = False
         self._is_cropping = False
+        self._is_histogram_visible = False
+        self._histogram_data = None  # Will be a dict with 'r', 'g', 'b' arrays
         self._brightness = 0.0
         self._contrast = 0.0
         self._saturation = 0.0
@@ -496,6 +500,30 @@ class UIState(QObject):
         if self._is_cropping != new_value:
             self._is_cropping = new_value
             self.is_cropping_changed.emit(new_value)
+    
+    @Property(bool, notify=is_histogram_visible_changed)
+    def isHistogramVisible(self) -> bool:
+        return self._is_histogram_visible
+    
+    @isHistogramVisible.setter
+    def isHistogramVisible(self, new_value: bool):
+        if self._is_histogram_visible != new_value:
+            self._is_histogram_visible = new_value
+            self.is_histogram_visible_changed.emit(new_value)
+            if new_value:
+                # Update histogram when opened
+                self.app_controller.update_histogram()
+    
+    @Property('QVariant', notify=histogram_data_changed)
+    def histogramData(self):
+        """Returns histogram data as a dict with 'r', 'g', 'b' keys, each containing a list of 256 values."""
+        return self._histogram_data
+    
+    @histogramData.setter
+    def histogramData(self, new_value):
+        if self._histogram_data != new_value:
+            self._histogram_data = new_value
+            self.histogram_data_changed.emit()
 
     @Property(float, notify=brightness_changed)
     def brightness(self) -> float:

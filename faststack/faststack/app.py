@@ -427,12 +427,18 @@ class AppController(QObject):
             self.current_index += 1
             self._do_prefetch(self.current_index, is_navigation=True, direction=1)
             self.sync_ui_state()
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
 
     def prev_image(self):
         if self.current_index > 0:
             self.current_index -= 1
             self._do_prefetch(self.current_index, is_navigation=True, direction=-1)
             self.sync_ui_state()
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
 
     @Slot(int)
     def jump_to_image(self, index: int):
@@ -442,6 +448,9 @@ class AppController(QObject):
             self.current_index = index
             self._do_prefetch(self.current_index, is_navigation=True, direction=direction)
             self.sync_ui_state()
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
             self.update_status_message(f"Jumped to image {index + 1}")
         else:
             log.warning("Invalid image index: %d", index)
@@ -1825,6 +1834,10 @@ class AppController(QObject):
             # Trigger a refresh of the image to show the edit
             self.ui_refresh_generation += 1
             self.ui_state.currentImageSourceChanged.emit()
+            
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
 
     @Slot(int, int, int, int)
     def set_crop_box(self, left: int, top: int, right: int, bottom: int):
@@ -1901,6 +1914,63 @@ class AppController(QObject):
         if new_rotation < 0:
             new_rotation += 360
         self.set_edit_parameter('rotation', new_rotation)
+    
+    @Slot()
+    def toggle_histogram(self):
+        """Toggle histogram window visibility."""
+        self.ui_state.isHistogramVisible = not self.ui_state.isHistogramVisible
+        if self.ui_state.isHistogramVisible:
+            self.update_histogram()
+            log.info("Histogram window opened")
+        else:
+            log.info("Histogram window closed")
+    
+    @Slot()
+    def update_histogram(self):
+        """Update histogram data from current image."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+        
+        try:
+            import numpy as np
+            
+            # Get the current image data
+            decoded = self.get_decoded_image(self.current_index)
+            if not decoded:
+                return
+            
+            # If editor is open and has a preview, use that instead
+            if self.ui_state.isEditorOpen and self.image_editor.original_image:
+                # Use the preview from editor (includes edits)
+                preview_data = self.image_editor.get_preview_data()
+                if preview_data:
+                    decoded = preview_data
+            
+            # Convert buffer to numpy array
+            arr = np.frombuffer(decoded.buffer, dtype=np.uint8)
+            arr = arr.reshape((decoded.height, decoded.width, 3))
+            
+            # Compute histograms for each channel
+            r_hist = np.histogram(arr[:, :, 0], bins=256, range=(0, 256))[0]
+            g_hist = np.histogram(arr[:, :, 1], bins=256, range=(0, 256))[0]
+            b_hist = np.histogram(arr[:, :, 2], bins=256, range=(0, 256))[0]
+            
+            # Convert to Python lists
+            histogram_data = {
+                'r': r_hist.tolist(),
+                'g': g_hist.tolist(),
+                'b': b_hist.tolist()
+            }
+            
+            self.ui_state.histogramData = histogram_data
+            log.debug("Histogram updated")
+            
+        except ImportError:
+            log.error("NumPy not available for histogram computation")
+            self.update_status_message("Histogram requires NumPy")
+        except Exception as e:
+            log.exception("Failed to compute histogram: %s", e)
+            self.update_status_message(f"Histogram error: {e}")
     
     @Slot()
     def toggle_crop_mode(self):
@@ -2046,6 +2116,10 @@ class AppController(QObject):
             # Reset zoom/pan to fit the new cropped image
             self.ui_state.resetZoomPan()
             
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
+            
             self.update_status_message("Image cropped and saved")
             log.info("Crop operation completed for %s", filepath)
             
@@ -2103,6 +2177,10 @@ class AppController(QObject):
             self.prefetcher.cancel_all()
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
+            
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
             
             self.update_status_message("Auto white balance applied and saved")
             log.info("Quick auto white balance applied to %s", filepath)
