@@ -130,6 +130,9 @@ class AppController(QObject):
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
+        # Clear last displayed image since it references old directory
+        with self._last_image_lock:
+            self.last_displayed_image = None
         self._logged_empty_metadata = False
         
         # -- Delete/Undo State --
@@ -616,7 +619,7 @@ class AppController(QObject):
             self.update_status_message("No batch start marked")
     
     def clear_all_batches(self):
-        """Clear all defined batches."""
+        """Clear all defined batches and stacks."""
         self.clear_all_stacks()
     
     def remove_from_batch_or_stack(self):
@@ -1175,7 +1178,33 @@ class AppController(QObject):
         """Opens a directory dialog and reloads the application with the selected folder."""
         path = self.open_directory_dialog()
         if path:
+            # Stop the old watcher
+            if self.watcher:
+                self.watcher.stop()
+            
+            # Update the directory path
             self.image_dir = Path(path)
+            
+            # Reinitialize directory-bound components
+            self.watcher = Watcher(self.image_dir, self.refresh_image_list)
+            self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
+            self.recycle_bin_dir = self.image_dir / "image recycle bin"
+            
+            # Clear directory-specific state
+            self.delete_history = []
+            self.undo_history = []
+            self.stacks = []
+            self.batches = []
+            self.batch_start_index = None
+            self.stack_start_index = None
+            
+            # Clear caches since they reference old directory's images
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self._metadata_cache = {}
+            self._metadata_cache_index = (-1, -1)
+            
+            # Load images from new directory
             self.load()
 
 
@@ -1753,8 +1782,9 @@ class AppController(QObject):
     @Slot()
     def save_edited_image(self):
         """Saves the edited image."""
-        saved_path = self.image_editor.save_image()
-        if saved_path:
+        save_result = self.image_editor.save_image()
+        if save_result:
+            saved_path, _ = save_result
             # Clear the image editor state so it will reload fresh next time
             self.image_editor.original_image = None
             self.image_editor.current_filepath = None
