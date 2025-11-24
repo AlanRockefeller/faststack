@@ -33,8 +33,8 @@ def setup_logging(debug: bool = False):
     root_logger = logging.getLogger()
     # Set log level based on debug flag
     root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    root_logger.handlers.clear()
     root_logger.addHandler(handler)
-
     # Configure logging for key modules
     if debug:
         logging.getLogger("faststack.imaging.cache").setLevel(logging.DEBUG)

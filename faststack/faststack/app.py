@@ -443,6 +443,9 @@ class AppController(QObject):
     def jump_to_image(self, index: int):
         """Jump to a specific image by index (0-based)."""
         if 0 <= index < len(self.image_files):
+            if index == self.current_index:
+                self.update_status_message(f"Already at image {index + 1}")
+                return
             direction = 1 if index > self.current_index else -1
             self.current_index = index
             self._do_prefetch(self.current_index, is_navigation=True, direction=direction)
@@ -1125,6 +1128,14 @@ class AppController(QObject):
     def set_awb_strength(self, value):
         config.set("awb", "strength", value)
         config.save()
+        
+    # Refresh if AWB was recently applied
+    if self.get_color_mode() in ['saturation', 'icc']:
+        self.image_cache.clear()
+        self.prefetcher.cancel_all()
+        self.display_generation += 1
+        self.prefetcher.update_prefetch(self.current_index)
+        self.sync_ui_state()
 
     @Slot(result=int)
     def get_awb_warm_bias(self):
@@ -1315,11 +1326,7 @@ class AppController(QObject):
                 self.delete_history.append((jpg_path, raw_path))
                 self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
             
-            # Add to delete history only if at least one file was moved
-            if deleted_files:
-                timestamp = time.time()
-                self.delete_history.append((jpg_path, raw_path))
-                self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))            
+    
             # Refresh image list and move to next image
             self.refresh_image_list()
             if self.image_files:

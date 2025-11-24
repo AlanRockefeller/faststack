@@ -40,8 +40,8 @@ def get_decoded_image_size(item) -> int:
         elif isinstance(item.buffer, (bytes, bytearray)):
             return len(item.buffer)
         else:
-            # Fallback: estimate using sys.getsizeof or compute from dimensions
-            # Assuming 4 bytes/pixel for RGBA or 3 for RGB - check item.channels if available
-            import sys
-            return sys.getsizeof(item.buffer) if hasattr(item.buffer, '__sizeof__') else item.width * item.height * 4
+            # Fallback: estimate from dimensions (more accurate for image buffers than sys.getsizeof)
+            bytes_per_pixel = getattr(item, 'channels', 4)  # Default to RGBA
+            return item.width * item.height * bytes_per_pixel
+        
     return 1 # Should not happen
