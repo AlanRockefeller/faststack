@@ -63,6 +63,14 @@ class ImageEditor:
         # Stores the currently applied edits (used for preview)
         self.current_edits: Dict[str, Any] = self._initial_edits()
         self.current_filepath: Optional[Path] = None
+        
+    def clear(self):
+        """Clear all editor state so the next edit starts from a clean slate."""
+        self.original_image = None
+        self.current_filepath = None
+        self._preview_image = None
+        # Optionally also reset edits if that matches your mental model:
+        # self.current_edits = self._initial_edits()
 
     def _initial_edits(self) -> Dict[str, Any]:
         return {

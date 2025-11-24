@@ -1222,9 +1222,7 @@ class AppController(QObject):
             with self._last_image_lock:
                 self.last_displayed_image = None
             # Clear editor state if open
-            self.image_editor.original_image = None
-            self.image_editor.current_filepath = None
-            self.image_editor._preview_image = None
+            self.image_editor.clear()
             
             # Load images from new directory
             self.load()
@@ -1867,9 +1865,7 @@ class AppController(QObject):
 
         saved_path, _ = save_result
         # Clear the image editor state so it will reload fresh next time
-        self.image_editor.original_image = None
-        self.image_editor.current_filepath = None
-        self.image_editor._preview_image = None
+        self.image_editor.clear()
             
         # Reset all edit parameters in the controller/UI
         self.reset_edit_parameters()
@@ -2156,9 +2152,7 @@ class AppController(QObject):
             self.undo_history.append(("auto_white_balance", (saved_path, backup_path), timestamp))
             
             # Force the image editor to clear its current state so it reloads fresh
-            self.image_editor.original_image = None
-            self.image_editor.current_filepath = None
-            self.image_editor._preview_image = None
+            self.image_editor.clear()
             
             # Refresh the view - need to refresh image list since backup file was created
             original_path = Path(filepath)
