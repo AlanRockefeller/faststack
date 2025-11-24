@@ -45,6 +45,8 @@ from faststack.imaging.prefetch import Prefetcher, clear_icc_caches
 from faststack.ui.provider import ImageProvider
 from faststack.ui.keystrokes import Keybinder
 from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, create_backup_file
+import re
+from faststack.io.indexer import RAW_EXTENSIONS
 
 def make_hdrop(paths):
     """
@@ -1987,9 +1989,135 @@ class AppController(QObject):
             self.ui_state.currentAspectRatioIndex = 0
             self.update_status_message("Crop mode: Drag to select area, Enter to crop")
             log.info("Crop mode enabled")
-        else:
-            self.update_status_message("Crop mode disabled")
+        else: # Exiting crop mode
+            self.ui_state.isCropping = False
+            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            self.update_status_message("Crop cancelled")
             log.info("Crop mode disabled")
+
+    @Slot()
+    def stack_source_raws(self):
+        """
+        Finds the source RAW files for the current stacked JPG and launches Helicon Focus.
+        """
+        if not self.image_files or self.current_index >= len(self.image_files):
+            self.update_status_message("No image selected.")
+            return
+
+        current_image_path = self.image_files[self.current_index].path
+        filename = current_image_path.name
+
+        # Ensure it's a stacked JPG
+        if not filename.lower().endswith(" stacked.jpg"):
+            self.update_status_message("Current image is not a stacked JPG.")
+            return
+
+        # Extract base name and number, e.g., "PB210633" from "20251121-PB210633 stacked.JPG"
+        match = re.search(r'([A-Z]+)(\d+)\s+stacked\.JPG', filename, re.IGNORECASE)
+        if not match:
+            self.update_status_message("Could not parse stacked JPG filename format.")
+            log.error("Could not parse stacked JPG filename: %s", filename)
+            return
+
+        base_prefix = match.group(1) # e.g., "PB"
+        base_number_str = match.group(2) # e.g., "210633"
+        base_number = int(base_number_str)
+
+        # Determine the RAW source directory
+        raw_source_dir_str = config.get('raw', 'source_dir')
+        if not raw_source_dir_str:
+            self.update_status_message("RAW source directory not configured in settings.")
+            log.warning("RAW source directory (raw.source_dir) is not set in config.")
+            return
+        
+        raw_base_dir = Path(raw_source_dir_str)
+        if not raw_base_dir.is_dir():
+            self.update_status_message(f"RAW source directory not found: {raw_base_dir}")
+            log.warning("Configured RAW source directory does not exist: %s", raw_base_dir)
+            return
+
+        # Get the mirror base from config
+        mirror_base_str = config.get('raw', 'mirror_base')
+        if not mirror_base_str:
+            self.update_status_message("RAW mirror base directory not configured in settings.")
+            log.warning("RAW mirror base (raw.mirror_base) is not set in config.")
+            return
+        
+        mirror_base_dir = Path(mirror_base_str)
+        if not mirror_base_dir.is_dir():
+            self.update_status_message(f"RAW mirror base directory not found: {mirror_base_dir}")
+            log.warning("Configured RAW mirror base directory does not exist: %s", mirror_base_dir)
+            return
+
+        # The date structure in the RAW directory mirrors the structure relative to the mirror_base
+        try:
+            relative_part = current_image_path.parent.relative_to(mirror_base_dir)
+        except ValueError:
+            self.update_status_message("Current image is not in the configured mirror base directory.")
+            log.error(
+                "Could not find relative path for '%s' from base '%s'. Check 'mirror_base' config.",
+                current_image_path.parent,
+                mirror_base_dir
+            )
+            return
+
+        raw_search_dir = raw_base_dir / relative_part
+        
+        if not raw_search_dir.is_dir():
+            self.update_status_message(f"RAW directory for this date not found: {raw_search_dir}")
+            log.warning("RAW search directory does not exist: %s", raw_search_dir)
+            return
+
+        # Find RAW files by decrementing the number
+        found_raw_files: List[Path] = []
+        # Start one number less than the stacked image number
+        current_raw_number = base_number - 1 
+        
+        # Limit to reasonable number of RAWs to avoid infinite loop or too many files
+        max_raw_search = 15 # As per user request, typically between 3 and 15
+        search_count = 0
+
+        while current_raw_number >= 0 and search_count < max_raw_search:
+            raw_filename_stem = f"{base_prefix}{current_raw_number:06d}" # e.g., PB210632
+            
+            # Look for any of the common RAW extensions
+            potential_raw_paths = []
+            for ext in RAW_EXTENSIONS:
+                potential_raw_paths.append(raw_search_dir / f"{raw_filename_stem}{ext}")
+            
+            found_this_number = False
+            for p in potential_raw_paths:
+                if p.is_file():
+                    found_raw_files.append(p)
+                    found_this_number = True
+                    break
+            
+            if not found_this_number:
+                # User specified "continue until there is a gap in the numbers"
+                # If we don't find any RAW for a number, assume it's a gap and stop
+                if found_raw_files: # Only break if we've found at least one file before this gap
+                    break
+            
+            current_raw_number -= 1
+            search_count += 1
+        
+        if not found_raw_files:
+            self.update_status_message(f"No source RAW files found in {raw_search_dir} for {filename}.")
+            log.info("No source RAWs found for %s in %s", filename, raw_search_dir)
+            return
+
+        # Sort the files by name to ensure Helicon Focus receives them in sequence
+        found_raw_files.sort()
+
+        self.update_status_message(f"Launching Helicon Focus with {len(found_raw_files)} RAWs...")
+        log.info("Launching Helicon Focus for %s with RAWs: %s", filename, [str(p) for p in found_raw_files])
+        success = self._launch_helicon_with_files(found_raw_files)
+
+        if success:
+            self.update_status_message("Helicon Focus launched successfully.")
+        else:
+            self.update_status_message("Failed to launch Helicon Focus.")
+            
     
     @Slot()
     def cancel_crop_mode(self):

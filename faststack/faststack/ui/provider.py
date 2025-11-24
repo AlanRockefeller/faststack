@@ -92,6 +92,7 @@ class UIState(QObject):
     awbRgbLowerBoundChanged = Signal()
     awbRgbUpperBoundChanged = Signal()
     default_directory_changed = Signal(str)
+    isStackedJpgChanged = Signal() # New signal for isStackedJpg
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_cropping_changed = Signal(bool)
@@ -363,6 +364,11 @@ class UIState(QObject):
         """Returns the path of the current working directory."""
         return str(self.app_controller.image_dir)
 
+    @Property(bool, notify=metadataChanged)
+    def isStackedJpg(self):
+        """Returns True if the current image is a stacked JPG."""
+        return self.currentFilename.endswith(" stacked.JPG")
+
     # --- Slots for QML to call ---
     @Slot()
     def nextImage(self):
@@ -455,6 +461,10 @@ class UIState(QObject):
     @Slot()
     def preloadAllImages(self):
         self.app_controller.preload_all_images()
+
+    @Slot()
+    def stack_source_raws(self):
+        self.app_controller.stack_source_raws()
 
     @Slot(int, int)
     def onDisplaySizeChanged(self, width: int, height: int):

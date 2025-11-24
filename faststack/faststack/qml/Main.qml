@@ -572,6 +572,25 @@ ApplicationWindow {
                     leftPadding: 10
                 }
             }
+            ItemDelegate {
+                width: 220
+                height: 36
+                text: "Stack Source RAWs"
+                enabled: uiState ? uiState.isStackedJpg : false
+                onClicked: {
+                    if (uiState) uiState.stack_source_raws();
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
         }
     }
 

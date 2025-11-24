@@ -36,6 +36,10 @@ DEFAULT_CONFIG = {
         "rgb_lower_bound": "5",
         "rgb_upper_bound": "250",
     },
+    "raw": {
+        "source_dir": "C:\\Users\\alanr\\pictures\\olympus.stack.input.photos",
+        "mirror_base": "C:\\Users\\alanr\\Pictures\\Lightroom",
+    }
 }
 
 class AppConfig:
