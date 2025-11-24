@@ -1129,13 +1129,13 @@ class AppController(QObject):
         config.set("awb", "strength", value)
         config.save()
         
-    # Refresh if AWB was recently applied
-    if self.get_color_mode() in ['saturation', 'icc']:
-        self.image_cache.clear()
-        self.prefetcher.cancel_all()
-        self.display_generation += 1
-        self.prefetcher.update_prefetch(self.current_index)
-        self.sync_ui_state()
+        # Refresh if AWB was recently applied
+        if self.get_color_mode() in ['saturation', 'icc']:
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self.display_generation += 1
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
 
     @Slot(result=int)
     def get_awb_warm_bias(self):
