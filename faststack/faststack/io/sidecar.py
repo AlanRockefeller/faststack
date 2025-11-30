@@ -37,8 +37,7 @@ class SidecarManager:
             json_load_time = time.perf_counter() - t_start
             
             if self.debug:
-                log.info(f"SidecarManager.load: json.load() took {json_load_time:.3f}s")
-            
+                log.info(f"SidecarManager.load: loading sidecar took {json_load_time:.3f}s")            
             if data.get("version") != 2:
                 log.warning("Old sidecar format detected. Starting fresh.")
                 return Sidecar()

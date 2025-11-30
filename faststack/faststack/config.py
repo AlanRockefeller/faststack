@@ -25,18 +25,21 @@ DEFAULT_CONFIG = {
     },
     "color": {
         "mode": "none",  # Options: "none", "saturation", "icc"
-        "saturation_factor": "0.85",  # Option A: 0.0-1.0, lower = less saturated
-        "monitor_icc_path": "",  # Option C: path to monitor ICC profile
+        "saturation_factor": "0.85",  # For 'saturation' mode: 0.0-1.0, lower = less saturated
+        "monitor_icc_path": "",  # For 'icc' mode: path to monitor ICC profile
     },
     "awb": {
-        "mode": "lab", # "lab" or "rgb"
-        "strength": "0.7",
+        "mode": "lab",  # "lab" or "rgb"        "strength": "0.7",
         "warm_bias": "6",
         "luma_lower_bound": "30",
         "luma_upper_bound": "220",
         "rgb_lower_bound": "5",
         "rgb_upper_bound": "250",
     },
+    "raw": {
+        "source_dir": "C:\\Users\\alanr\\pictures\\olympus.stack.input.photos",
+        "mirror_base": "C:\\Users\\alanr\\Pictures\\Lightroom",
+    }
 }
 
 class AppConfig:

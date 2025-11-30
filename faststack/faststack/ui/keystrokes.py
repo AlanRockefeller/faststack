@@ -46,6 +46,8 @@ class Keybinder:
             Qt.Key_P: "edit_in_photoshop",
             Qt.Key_C: "clear_all_stacks",
             Qt.Key_A: "quick_auto_white_balance",
+            Qt.Key_O: "toggle_crop_mode",
+            Qt.Key_H: "toggle_histogram",
             Qt.Key_Delete: "delete_current_image",
             Qt.Key_Backspace: "delete_current_image",
         }
@@ -56,6 +58,7 @@ class Keybinder:
             (Qt.Key_Z, Qt.ControlModifier): "undo_delete",
             (Qt.Key_E, Qt.ControlModifier): "toggle_edited",
             (Qt.Key_S, Qt.ControlModifier): "toggle_stacked",
+            (Qt.Key_B, Qt.ControlModifier | Qt.ShiftModifier): "quick_auto_white_balance",
         }
 
     def _call(self, method_name: str):

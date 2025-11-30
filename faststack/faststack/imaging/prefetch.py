@@ -17,6 +17,8 @@ from faststack.config import config
 
 log = logging.getLogger(__name__)
 
+import threading
+
 # ---- Option C: ICC Color Management Setup ----
 SRGB_PROFILE = ImageCms.createProfile("sRGB")
 
@@ -27,6 +29,9 @@ _monitor_profile_warning_logged = False
 # Cache for ICC transforms to avoid rebuilding on every image
 _icc_transform_cache: Dict[tuple, ImageCms.ImageCmsTransform] = {}
 
+# Thread lock for all ICC caches
+_icc_cache_lock = threading.Lock()
+
 def get_icc_transform(src_profile: ImageCms.ImageCmsProfile, monitor_profile: ImageCms.ImageCmsProfile, 
                       src_profile_key: str, monitor_profile_path: str):
     """Get or create a cached ICC transform.
@@ -36,20 +41,22 @@ def get_icc_transform(src_profile: ImageCms.ImageCmsProfile, monitor_profile: Im
     - monitor_profile_path: file path to the monitor ICC profile
     """
     key = (src_profile_key, monitor_profile_path)
-    if key not in _icc_transform_cache:
-        _icc_transform_cache[key] = ImageCms.buildTransform(
-            src_profile, monitor_profile, "RGB", "RGB"
-        )
-        log.debug("Built new ICC transform for profile pair (src=%s, monitor=%s)", src_profile_key[:16], monitor_profile_path)
-    return _icc_transform_cache[key]
+    with _icc_cache_lock:
+        if key not in _icc_transform_cache:
+            _icc_transform_cache[key] = ImageCms.buildTransform(
+                src_profile, monitor_profile, "RGB", "RGB"
+            )
+            log.debug("Built new ICC transform for profile pair (src=%s, monitor=%s)", src_profile_key[:16], monitor_profile_path)
+        return _icc_transform_cache[key]
 
 def clear_icc_caches():
     """Clear all ICC-related caches (profiles and transforms)."""
     global _monitor_profile_cache, _icc_transform_cache, _monitor_profile_warning_logged
-    _monitor_profile_cache.clear()
-    _icc_transform_cache.clear()
-    _monitor_profile_warning_logged = False
-    log.info("Cleared ICC profile and transform caches")
+    with _icc_cache_lock:
+        _monitor_profile_cache.clear()
+        _icc_transform_cache.clear()
+        _monitor_profile_warning_logged = False
+        log.info("Cleared ICC profile and transform caches")
 
 def get_monitor_profile():
     """Dynamically load monitor ICC profile based on current config.
@@ -60,29 +67,29 @@ def get_monitor_profile():
     
     monitor_icc_path = config.get('color', 'monitor_icc_path', fallback="").strip()
     
-    # Check cache first
-    if monitor_icc_path in _monitor_profile_cache:
+    with _icc_cache_lock:
+        # Check cache first
+        if monitor_icc_path in _monitor_profile_cache:
+            return _monitor_profile_cache[monitor_icc_path]
+        
+        # Handle empty path case
+        if not monitor_icc_path:
+            if not _monitor_profile_warning_logged:
+                log.warning("ICC mode enabled but no monitor_icc_path configured")
+                _monitor_profile_warning_logged = True
+            _monitor_profile_cache[monitor_icc_path] = None
+            return None
+        
+        # Load and cache the profile
+        try:
+            profile = ImageCms.ImageCmsProfile(monitor_icc_path)
+            log.debug("Loaded monitor ICC profile: %s", monitor_icc_path)
+            _monitor_profile_cache[monitor_icc_path] = profile
+        except (OSError, ImageCms.PyCMSError) as e:
+            log.warning("Failed to load monitor ICC profile from %s: %s", monitor_icc_path, e)
+            _monitor_profile_cache[monitor_icc_path] = None
+        
         return _monitor_profile_cache[monitor_icc_path]
-    
-    # Handle empty path case
-    if not monitor_icc_path:
-        if not _monitor_profile_warning_logged:
-            log.warning("ICC mode enabled but no monitor_icc_path configured")
-            _monitor_profile_warning_logged = True
-        _monitor_profile_cache[monitor_icc_path] = None
-        return None
-    
-    # Load and cache the profile
-    try:
-        profile = ImageCms.ImageCmsProfile(monitor_icc_path)
-        log.debug("Loaded monitor ICC profile: %s", monitor_icc_path)
-        _monitor_profile_cache[monitor_icc_path] = profile
-    except (OSError, ImageCms.PyCMSError) as e:
-        log.warning("Failed to load monitor ICC profile from %s: %s", monitor_icc_path, e)
-        _monitor_profile_cache[monitor_icc_path] = None
-    
-    return _monitor_profile_cache[monitor_icc_path]
-
 
 def apply_saturation_compensation(
     arr: np.ndarray,

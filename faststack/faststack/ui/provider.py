@@ -92,9 +92,12 @@ class UIState(QObject):
     awbRgbLowerBoundChanged = Signal()
     awbRgbUpperBoundChanged = Signal()
     default_directory_changed = Signal(str)
+    isStackedJpgChanged = Signal() # New signal for isStackedJpg
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_cropping_changed = Signal(bool)
+    is_histogram_visible_changed = Signal(bool)
+    histogram_data_changed = Signal()
     brightness_changed = Signal(float)
     contrast_changed = Signal(float)
     saturation_changed = Signal(float)
@@ -126,6 +129,8 @@ class UIState(QObject):
         # Image Editor State
         self._is_editor_open = False
         self._is_cropping = False
+        self._is_histogram_visible = False
+        self._histogram_data = None  # Will be a dict with 'r', 'g', 'b' arrays
         self._brightness = 0.0
         self._contrast = 0.0
         self._saturation = 0.0
@@ -359,6 +364,11 @@ class UIState(QObject):
         """Returns the path of the current working directory."""
         return str(self.app_controller.image_dir)
 
+    @Property(bool, notify=metadataChanged)
+    def isStackedJpg(self):
+        """Returns True if the current image is a stacked JPG."""
+        return self.currentFilename.endswith(" stacked.JPG")
+
     # --- Slots for QML to call ---
     @Slot()
     def nextImage(self):
@@ -376,6 +386,10 @@ class UIState(QObject):
     @Slot()
     def clear_all_stacks(self):
         self.app_controller.clear_all_stacks()
+
+    @Slot()
+    def clear_all_batches(self):
+        self.app_controller.clear_all_batches()
 
     @Slot(result=str)
     def get_helicon_path(self):
@@ -452,6 +466,15 @@ class UIState(QObject):
     def preloadAllImages(self):
         self.app_controller.preload_all_images()
 
+    @Slot()
+    def stack_source_raws(self):
+        self.app_controller.stack_source_raws()
+
+    @Slot(str)
+    def applyFilter(self, filter_string: str):
+        """Applies a filter string to the image list."""
+        self.app_controller.apply_filter(filter_string)
+
     @Slot(int, int)
     def onDisplaySizeChanged(self, width: int, height: int):
         self.app_controller.on_display_size_changed(width, height)
@@ -496,6 +519,30 @@ class UIState(QObject):
         if self._is_cropping != new_value:
             self._is_cropping = new_value
             self.is_cropping_changed.emit(new_value)
+    
+    @Property(bool, notify=is_histogram_visible_changed)
+    def isHistogramVisible(self) -> bool:
+        return self._is_histogram_visible
+    
+    @isHistogramVisible.setter
+    def isHistogramVisible(self, new_value: bool):
+        if self._is_histogram_visible != new_value:
+            self._is_histogram_visible = new_value
+            self.is_histogram_visible_changed.emit(new_value)
+            if new_value:
+                # Update histogram when opened
+                self.app_controller.update_histogram()
+    
+    @Property('QVariant', notify=histogram_data_changed)
+    def histogramData(self):
+        """Returns histogram data as a dict with 'r', 'g', 'b' keys, each containing a list of 256 values."""
+        return self._histogram_data
+    
+    @histogramData.setter
+    def histogramData(self, new_value):
+        if self._histogram_data != new_value:
+            self._histogram_data = new_value
+            self.histogram_data_changed.emit()
 
     @Property(float, notify=brightness_changed)
     def brightness(self) -> float:
@@ -590,7 +637,35 @@ class UIState(QObject):
         return self._current_crop_box
 
     @currentCropBox.setter
-    def currentCropBox(self, new_value: tuple):
+    def currentCropBox(self, new_value):
+        # Convert QJSValue or list to tuple if needed
+        original_value = new_value
+        try:
+            if hasattr(new_value, 'toVariant'):
+                # It's a QJSValue, convert to tuple
+                variant = new_value.toVariant()
+                if isinstance(variant, (list, tuple)):
+                    new_value = tuple(variant)
+                else:
+                    # Try to access elements directly
+                    new_value = (variant[0], variant[1], variant[2], variant[3])
+            elif isinstance(new_value, list):
+                new_value = tuple(new_value)
+            elif not isinstance(new_value, tuple):
+                # Try to convert to tuple
+                new_value = tuple(new_value)
+        except (TypeError, IndexError, AttributeError) as e:
+            log.warning(
+                "UIState.currentCropBox: failed to normalize value %r (type %s): %s",
+                original_value,
+                type(original_value),
+                e,
+            )
+
+        # only accept 4‑element tuples
+        if not isinstance(new_value, tuple) or len(new_value) != 4:
+            log.warning("UIState.currentCropBox: ignoring invalid crop box %r", new_value)
+            return 
         if self._current_crop_box != new_value:
             self._current_crop_box = new_value
             self.current_crop_box_changed.emit(new_value)

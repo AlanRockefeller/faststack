@@ -9,8 +9,9 @@ log = logging.getLogger(__name__)
 
 class ByteLRUCache(LRUCache):
     """An LRU Cache that respects the size of its items in bytes."""
-    def __init__(self, max_bytes: int, size_of: Callable[[Any], int] = len):
+    def __init__(self, max_bytes: int, size_of: Callable[[Any], int] = len, on_evict: Callable[[], None] = None):
         super().__init__(maxsize=max_bytes, getsizeof=size_of)
+        self.on_evict = on_evict
         log.info(f"Initialized byte-aware LRU cache with {max_bytes / 1024**2:.2f} MB capacity.")
 
     def __setitem__(self, key, value):
@@ -23,6 +24,10 @@ class ByteLRUCache(LRUCache):
         """Extend popitem to log eviction."""
         key, value = super().popitem()
         log.debug(f"Evicted item '{key}' to free up space. Cache size: {self.currsize / 1024**2:.2f} MB")
+        
+        if self.on_evict:
+            self.on_evict()
+            
         # In a real Qt app, `value` would be a tuple like (numpy_buffer, qtexture_id)
         # and we would explicitly free the GPU texture here.
         return key, value
@@ -37,9 +42,11 @@ def get_decoded_image_size(item) -> int:
         # Handle both numpy arrays and memoryview buffers
         if hasattr(item.buffer, 'nbytes'):
             return item.buffer.nbytes
-        elif hasattr(item.buffer, '__len__'):
+        elif isinstance(item.buffer, (bytes, bytearray)):
             return len(item.buffer)
         else:
-            # Fallback: compute from dimensions
-            return item.width * item.height * 3
+            # Fallback: estimate from dimensions (more accurate for image buffers than sys.getsizeof)
+            bytes_per_pixel = getattr(item, 'channels', 4)  # Default to RGBA
+            return item.width * item.height * bytes_per_pixel
+        
     return 1 # Should not happen

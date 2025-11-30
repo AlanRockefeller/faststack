@@ -40,8 +40,8 @@ def find_images(directory: Path) -> List[ImageFile]:
         log.exception("Error scanning directory %s", directory)
         return []
 
-    # Sort JPGs by filename
-    jpgs.sort(key=lambda x: x[0].name)
+    # Sort JPGs by modification time (oldest first), then filename
+    jpgs.sort(key=lambda x: (x[1].st_mtime, x[0].name))
 
     image_files: List[ImageFile] = []
     for jpg_path, jpg_stat in jpgs:

@@ -30,8 +30,7 @@ from PySide6.QtCore import (
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from PySide6.QtQml import QQmlApplicationEngine
 from PIL import Image
-Image.MAX_IMAGE_PIXELS = None
-
+Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 # ⬇️ these are the ones that went missing
 from faststack.config import config
 from faststack.logging_setup import setup_logging
@@ -45,7 +44,9 @@ from faststack.imaging.cache import ByteLRUCache, get_decoded_image_size
 from faststack.imaging.prefetch import Prefetcher, clear_icc_caches
 from faststack.ui.provider import ImageProvider
 from faststack.ui.keystrokes import Keybinder
-from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS
+from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, create_backup_file
+import re
+from faststack.io.indexer import RAW_EXTENSIONS
 
 def make_hdrop(paths):
     """
@@ -100,7 +101,12 @@ class AppController(QObject):
         # -- Caching & Prefetching --
         cache_size_gb = config.getfloat('core', 'cache_size_gb', 1.5)
         cache_size_bytes = int(cache_size_gb * 1024**3)
-        self.image_cache = ByteLRUCache(max_bytes=cache_size_bytes, size_of=get_decoded_image_size)
+        self._has_warned_cache_full = False
+        self.image_cache = ByteLRUCache(
+            max_bytes=cache_size_bytes, 
+            size_of=get_decoded_image_size,
+            on_evict=self._on_cache_evict
+        )
         self.prefetcher = Prefetcher(
             image_files=self.image_files,
             cache_put=self.image_cache.__setitem__,
@@ -130,11 +136,13 @@ class AppController(QObject):
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
+        with self._last_image_lock:
+            self.last_displayed_image = None
         self._logged_empty_metadata = False
         
         # -- Delete/Undo State --
         self.recycle_bin_dir = self.image_dir / "image recycle bin"
-        self.delete_history: List[tuple[Path, Optional[Path]]] = []  # [(jpg_path, raw_path), ...]
+        self.delete_history: List[Tuple[Path, Optional[Path]]] = []  # [(jpg_path, raw_path), ...]
         # Track all undoable actions with timestamps
         self.undo_history: List[Tuple[str, Any, float]] = []  # (action_type, action_data, timestamp)
 
@@ -143,7 +151,7 @@ class AppController(QObject):
         self.resize_timer.timeout.connect(self._handle_resize)
         self.pending_width = None
         self.pending_height = None
-        
+
         # Track if any dialog is open to disable keybindings
         self._dialog_open = False
 
@@ -194,9 +202,11 @@ class AppController(QObject):
 
     def on_display_size_changed(self, width: int, height: int):
         """Debounces display size change events to prevent spamming resizes."""
-        if self.display_width == width and self.display_height == height:
+        log.debug(f"on_display_size_changed called with {width}x{height}. Current: {self.display_width}x{self.display_height}")
+        if width <= 0 or height <= 0:
+            log.debug("Ignoring invalid resize event")
             return
-        
+
         # Debounce resize events
         self.pending_width = width
         self.pending_height = height
@@ -248,6 +258,16 @@ class AppController(QObject):
             return False
             
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
+            # Handle Enter key in crop mode
+            if self.ui_state.isCropping and (event.key() == Qt.Key_Enter or event.key() == Qt.Key_Return):
+                self.execute_crop()
+                return True
+            
+            # Handle ESC key to exit crop mode
+            if self.ui_state.isCropping and event.key() == Qt.Key_Escape:
+                self.cancel_crop_mode()
+                return True
+            
             handled = self.keybinder.handle_key_press(event)
             if handled:
                 return True
@@ -415,21 +435,33 @@ class AppController(QObject):
             self.current_index += 1
             self._do_prefetch(self.current_index, is_navigation=True, direction=1)
             self.sync_ui_state()
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
 
     def prev_image(self):
         if self.current_index > 0:
             self.current_index -= 1
             self._do_prefetch(self.current_index, is_navigation=True, direction=-1)
             self.sync_ui_state()
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
 
     @Slot(int)
     def jump_to_image(self, index: int):
         """Jump to a specific image by index (0-based)."""
         if 0 <= index < len(self.image_files):
+            if index == self.current_index:
+                self.update_status_message(f"Already at image {index + 1}")
+                return
             direction = 1 if index > self.current_index else -1
             self.current_index = index
             self._do_prefetch(self.current_index, is_navigation=True, direction=direction)
             self.sync_ui_state()
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
             self.update_status_message(f"Jumped to image {index + 1}")
         else:
             log.warning("Invalid image index: %d", index)
@@ -615,9 +647,6 @@ class AppController(QObject):
             log.warning("No batch start marked. Press '{' first.")
             self.update_status_message("No batch start marked")
     
-    def clear_all_batches(self):
-        """Clear all defined batches."""
-        self.clear_all_stacks()
     
     def remove_from_batch_or_stack(self):
         """Remove current image from any batch or stack it's in."""
@@ -658,6 +687,7 @@ class AppController(QObject):
             self.batches = new_batches
         
         # Check and remove from stacks
+        # Check and remove from stacks
         if not removed:
             new_stacks = []
             stack_modified = False
@@ -679,8 +709,6 @@ class AppController(QObject):
                         new_stacks.append([start, self.current_index - 1])
                         new_stacks.append([self.current_index + 1, end])
                     
-                    self.sidecar.data.stacks = self.stacks # Update sidecar BEFORE self.stacks is replaced
-                    self.sidecar.save()
                     log.info("Removed index %d from stack [%d, %d]", self.current_index, start, end)
                     self.update_status_message(f"Removed from stack")
                     removed = True
@@ -691,8 +719,7 @@ class AppController(QObject):
             if stack_modified:
                 self.stacks = new_stacks
                 self.sidecar.data.stacks = self.stacks
-                self.sidecar.save()
-
+                self.sidecar.save()        
         if removed:
             self._metadata_cache_index = (-1, -1)
             self.dataChanged.emit()
@@ -953,11 +980,10 @@ class AppController(QObject):
                 log.error("Error deleting temporary file %s: %s", tmp_path, e)
 
     def clear_all_stacks(self):
-        log.info("Clearing all defined stacks, batches, and markers.")
+        log.info("Clearing all defined stacks.")
         self.stacks = []
         self.stack_start_index = None
-        self.batches = []
-        self.batch_start_index = None
+        # Do NOT clear batches here
         
         self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
@@ -966,7 +992,18 @@ class AppController(QObject):
         self.dataChanged.emit()
         self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
-        self.update_status_message("All stacks and batches cleared")
+        self.update_status_message("All stacks cleared")
+
+    def clear_all_batches(self):
+        """Clear all defined batches."""
+        log.info("Clearing all defined batches.")
+        self.batches = []
+        self.batch_start_index = None
+        
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.sync_ui_state()
+        self.update_status_message("All batches cleared")
 
     def get_helicon_path(self):
         return config.get('helicon', 'exe')
@@ -1090,9 +1127,6 @@ class AppController(QObject):
         # Notify QML
         self.ui_state.saturationFactorChanged.emit()
 
-    def get_default_directory(self):
-        return config.get('core', 'default_directory')
-
     @Slot(result=str)
     def get_awb_mode(self):
         return config.get("awb", "mode")
@@ -1110,6 +1144,14 @@ class AppController(QObject):
     def set_awb_strength(self, value):
         config.set("awb", "strength", value)
         config.save()
+        
+        # Refresh if AWB was recently applied
+        if self.get_color_mode() in ['saturation', 'icc']:
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self.display_generation += 1
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
 
     @Slot(result=int)
     def get_awb_warm_bias(self):
@@ -1175,7 +1217,41 @@ class AppController(QObject):
         """Opens a directory dialog and reloads the application with the selected folder."""
         path = self.open_directory_dialog()
         if path:
+            # Stop the old watcher
+            if self.watcher:
+                self.watcher.stop()
+            
+            # Update the directory path
             self.image_dir = Path(path)
+            
+            # Reinitialize directory-bound components
+            self.watcher = Watcher(self.image_dir, self.refresh_image_list)
+            self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
+            self.recycle_bin_dir = self.image_dir / "image recycle bin"
+            
+            # Clear directory-specific state
+            self.delete_history = []
+            self.undo_history = []
+            self.stacks = []
+            self.batches = []
+            self.batch_start_index = None
+            self.stack_start_index = None
+            
+            # Clear caches since they reference old directory's images
+            with self._last_image_lock:
+                self.last_displayed_image = None
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self.display_generation += 1
+            self._metadata_cache = {}
+            self._metadata_cache_index = (-1, -1)
+            # Clear last displayed image since it references the old directory
+            with self._last_image_lock:
+                self.last_displayed_image = None
+            # Clear editor state if open
+            self.image_editor.clear()
+            
+            # Load images from new directory
             self.load()
 
 
@@ -1184,7 +1260,7 @@ class AppController(QObject):
             log.info("Preloading is already in progress.")
             return
 
-        log.info("Starting to preload all images.")
+        log.info("Starting to preload all images, skipping cached.")
         self.ui_state.isPreloading = True
         self.ui_state.preloadProgress = 0
 
@@ -1192,26 +1268,83 @@ class AppController(QObject):
         self.reporter.progress_updated.connect(self._update_preload_progress)
         self.reporter.finished.connect(self._finish_preloading)
 
-        # Use existing prefetch executor (better resource utilization)
-        total = len(self.image_files)
-        
-        if total == 0:
+        total_images = len(self.image_files)
+        if total_images == 0:
             log.info("No images to preload.")
-            self.reporter.progress_updated.emit(100) # Or 0, depending on desired UX
-            self.reporter.finished.emit()
+            self.ui_state.isPreloading = False
+            self.ui_state.preloadProgress = 0
             return
 
-        completed = 0
+        # --- Check for cached images ---
+        images_to_preload = []
+        already_cached_count = 0
+        _, _, display_gen = self.get_display_info()
         
+        # We want to load images furthest from the current index FIRST,
+        # and images closest to the current index LAST.
+        # This ensures that the images the user is currently looking at (and their neighbors)
+        # are the most recently added to the LRU cache, so they won't be evicted.
+        
+        # Calculate distance for all images
+        # (index, distance_from_current)
+        all_images_with_dist = []
+        for i in range(total_images):
+            dist = abs(i - self.current_index)
+            all_images_with_dist.append((i, dist))
+            
+        # Sort by distance descending (furthest first)
+        all_images_with_dist.sort(key=lambda x: x[1], reverse=True)
+        
+        # Determine which images are "nearby" (e.g. within prefetch radius * 2)
+        # We will FORCE these to be re-cached even if they are already in cache,
+        # to ensure they are moved to the front of the LRU queue.
+        nearby_radius = self.prefetcher.prefetch_radius * 2
+        
+        for i, dist in all_images_with_dist:
+            cache_key = f"{i}_{display_gen}"
+            is_cached = cache_key in self.image_cache
+            is_nearby = dist <= nearby_radius
+            
+            if is_cached and not is_nearby:
+                already_cached_count += 1
+            else:
+                # Add to preload list if it's not cached OR if it's nearby (to refresh LRU)
+                images_to_preload.append(i)
+        
+        log.info(f"Found {already_cached_count} cached images (skipping). Preloading {len(images_to_preload)} images (including nearby refreshes).")
+
+        if not images_to_preload:
+            log.info("All images are already cached.")
+            self._update_preload_progress(100)
+            self._finish_preloading()
+            return
+            
+        # --- Setup progress tracking ---
+        # `completed` starts at the number of images already cached (that we are skipping).
+        completed = already_cached_count
+        
+        # Update initial progress
+        initial_progress = int((completed / total_images) * 100)
+        self._update_preload_progress(initial_progress)
+
         def _on_done(_future):
             nonlocal completed
             completed += 1
-            progress = int((completed / total) * 100)
+            progress = int((completed / total_images) * 100)
             self.reporter.progress_updated.emit(progress)
-            if completed == total:
+            # Check if all images (including cached ones) are accounted for
+            if completed == total_images:
                 self.reporter.finished.emit()
         
-        for i in range(total):
+        # --- Submit tasks ---
+        # images_to_preload is already sorted furthest -> nearest
+        for i in images_to_preload:
+            # For nearby images that we are forcing to re-cache, we might need to remove them first
+            # to ensure the cache actually updates the LRU position (depending on cache implementation).
+            # ByteLRUCache (cachetools) updates LRU on access (get/set), so just overwriting is fine.
+            # But we need to make sure we don't skip the task in prefetcher if it thinks it's already done.
+            # The prefetcher checks self.futures, but we are submitting new ones.
+            
             future = self.prefetcher.submit_task(i, self.prefetcher.generation)
             if future:
                 future.add_done_callback(_on_done)
@@ -1266,13 +1399,7 @@ class AppController(QObject):
                 self.delete_history.append((jpg_path, raw_path))
                 self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
             
-            # Update status
-            if deleted_files:
-                files_str = ", ".join(deleted_files)
-                self.update_status_message(f"Deleted: {files_str}")
-            else:
-                self.update_status_message("No files to delete")
-            
+    
             # Refresh image list and move to next image
             self.refresh_image_list()
             if self.image_files:
@@ -1357,13 +1484,22 @@ class AppController(QObject):
             filepath_obj = Path(saved_path)
 
             try:
-                if backup_path.exists():
+                backup_path_obj = Path(backup_path)
+                if backup_path_obj.exists():
                     # Restore the backup
                     filepath_obj.unlink()  # Remove the edited version
-                    backup_path.rename(filepath_obj)  # Restore backup
-                    log.info("Restored backup %s for %s", backup_path.name, saved_path)
+                    backup_path_obj.rename(filepath_obj)  # Restore backup
+                    log.info("Restored backup %s for %s", backup_path_obj.name, saved_path)
                     
                     # Refresh the view
+                    self.refresh_image_list()
+                    
+                    # Find the restored image
+                    for i, img_file in enumerate(self.image_files):
+                        if img_file.path == filepath_obj:
+                            self.current_index = i
+                            break
+                    
                     self.display_generation += 1
                     self.image_cache.clear()
                     self.prefetcher.cancel_all()
@@ -1381,6 +1517,44 @@ class AppController(QObject):
                 log.exception("Failed to undo auto white balance")
                 # Put it back in history if it failed
                 self.undo_history.append(("auto_white_balance", (saved_path, backup_path), timestamp))
+        
+        elif action_type == "crop":
+            saved_path, backup_path = action_data
+            filepath_obj = Path(saved_path)
+
+            try:
+                backup_path_obj = Path(backup_path)
+                if backup_path_obj.exists():
+                    # Restore the backup
+                    filepath_obj.unlink()  # Remove the cropped version
+                    backup_path_obj.rename(filepath_obj)  # Restore backup
+                    log.info("Restored backup %s for %s", backup_path_obj.name, saved_path)
+                    
+                    # Refresh the view
+                    self.refresh_image_list()
+                    
+                    # Find the restored image
+                    for i, img_file in enumerate(self.image_files):
+                        if img_file.path == filepath_obj:
+                            self.current_index = i
+                            break
+                    
+                    self.display_generation += 1
+                    self.image_cache.clear()
+                    self.prefetcher.cancel_all()
+                    self.prefetcher.update_prefetch(self.current_index)
+                    self.sync_ui_state()
+                    
+                    self.update_status_message("Undid crop")
+                else:
+                    self.update_status_message("Backup not found")
+                    log.warning("Backup %s disappeared before it could be restored.", backup_path)
+                    self.undo_history.append(("crop", (saved_path, backup_path), timestamp))
+            except OSError as e:
+                self.update_status_message(f"Undo failed: {e}")
+                log.exception("Failed to undo crop")
+                # Put it back in history if it failed
+                self.undo_history.append(("crop", (saved_path, backup_path), timestamp))
 
     def shutdown(self):
         log.info("Application shutting down.")
@@ -1432,6 +1606,14 @@ class AppController(QObject):
         except OSError:
             log.exception("Failed to empty recycle bin")
     
+    def _on_cache_evict(self):
+        """Callback for when the image cache evicts an item."""
+        if not self._has_warned_cache_full:
+            self._has_warned_cache_full = True
+            # Use QTimer.singleShot to ensure this runs on the main thread if called from a background thread
+            QTimer.singleShot(0, lambda: self.update_status_message("Cache full! Consider increasing cache size in settings."))
+            log.warning("Cache full, eviction started. User warned.")
+
     def restore_all_from_recycle_bin(self):
         """Restores all files from recycle bin to working directory."""
         if not self.recycle_bin_dir.exists():
@@ -1730,6 +1912,10 @@ class AppController(QObject):
             # Trigger a refresh of the image to show the edit
             self.ui_refresh_generation += 1
             self.ui_state.currentImageSourceChanged.emit()
+            
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
 
     @Slot(int, int, int, int)
     def set_crop_box(self, left: int, top: int, right: int, bottom: int):
@@ -1753,39 +1939,49 @@ class AppController(QObject):
     @Slot()
     def save_edited_image(self):
         """Saves the edited image."""
-        saved_path = self.image_editor.save_image()
-        if saved_path:
-            # Clear the image editor state so it will reload fresh next time
-            self.image_editor.original_image = None
-            self.image_editor.current_filepath = None
-            self.image_editor._preview_image = None
-            
-            # Reset all edit parameters in the controller/UI
-            self.reset_edit_parameters()
-
-            # Refresh the view - need to refresh image list since backup file was created
-            original_path = saved_path
-            self.refresh_image_list()
-            
-            # Find the edited image (not the backup) in the refreshed list
-            for i, img_file in enumerate(self.image_files):
-                if img_file.path == original_path:
-                    self.current_index = i
-                    break
-            
-            # Invalidate cache and refresh display
-            self.display_generation += 1
-            self.image_cache.clear()
-            self.prefetcher.cancel_all()
-            self.prefetcher.update_prefetch(self.current_index)
-            self.sync_ui_state()
-
-            QMessageBox.information(
+        save_result = self.image_editor.save_image()
+        if not save_result:
+            QMessageBox.warning(
                 None,
-                "Save Successful",
-                f"Image saved to: {saved_path}. Original backed up.",
-                QMessageBox.Ok
+                "Save Failed",
+                "Failed to save edited image. Please check the log for details.",
+                QMessageBox.Ok,
             )
+            self.update_status_message("Failed to save image")
+            log.error("Failed to save edited image")
+            return
+
+        saved_path, _ = save_result
+        # Clear the image editor state so it will reload fresh next time
+        self.image_editor.clear()
+            
+        # Reset all edit parameters in the controller/UI
+        self.reset_edit_parameters()
+
+        # Refresh the view - need to refresh image list since backup file was created
+        original_path = saved_path
+        self.refresh_image_list()
+        
+        # Find the edited image (not the backup) in the refreshed list
+        for i, img_file in enumerate(self.image_files):
+            if img_file.path == original_path:
+                self.current_index = i
+                break
+        
+        # Invalidate cache and refresh display
+        self.display_generation += 1
+        self.image_cache.clear()
+        self.prefetcher.cancel_all()
+        self.prefetcher.update_prefetch(self.current_index)
+        self.sync_ui_state()
+
+        QMessageBox.information(
+            None,
+            "Save Successful",
+            f"Image saved to: {saved_path}. Original backed up.",
+            QMessageBox.Ok
+        )
+
     
     @Slot()
     def rotate_image_cw(self):
@@ -1802,6 +1998,367 @@ class AppController(QObject):
         if new_rotation < 0:
             new_rotation += 360
         self.set_edit_parameter('rotation', new_rotation)
+    
+    @Slot()
+    def toggle_histogram(self):
+        """Toggle histogram window visibility."""
+        self.ui_state.isHistogramVisible = not self.ui_state.isHistogramVisible
+        if self.ui_state.isHistogramVisible:
+            self.update_histogram()
+            log.info("Histogram window opened")
+        else:
+            log.info("Histogram window closed")
+    
+    @Slot()
+    def update_histogram(self):
+        """Update histogram data from current image."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+        
+        try:
+            import numpy as np
+            
+            # Get the current image data
+            decoded = self.get_decoded_image(self.current_index)
+            if not decoded:
+                return
+            
+            # If editor is open and has a preview, use that instead
+            if self.ui_state.isEditorOpen and self.image_editor.original_image:
+                preview_data = self.image_editor.get_preview_data()
+                if preview_data:
+                    decoded = preview_data
+            
+            # Convert buffer to numpy array
+            arr = np.frombuffer(decoded.buffer, dtype=np.uint8)
+            arr = arr.reshape((decoded.height, decoded.width, 3))
+            
+            # --- New Histogram Logic ---
+            bins = 256
+            value_range = (0, 256)
+            
+            # Compute histograms for each channel
+            r_hist = np.histogram(arr[:, :, 0], bins=bins, range=value_range)[0]
+            g_hist = np.histogram(arr[:, :, 1], bins=bins, range=value_range)[0]
+            b_hist = np.histogram(arr[:, :, 2], bins=bins, range=value_range)[0]
+            
+            # Calculate clip and pre-clip counts *before* log scaling
+            r_clip_count = int(r_hist[255])
+            g_clip_count = int(g_hist[255])
+            b_clip_count = int(b_hist[255])
+            
+            r_preclip_count = int(np.sum(r_hist[250:255]))
+            g_preclip_count = int(np.sum(g_hist[250:255]))
+            b_preclip_count = int(np.sum(b_hist[250:255]))
+            
+            # Apply log scaling for better visualization
+            log_r_hist = np.log1p(r_hist).tolist()
+            log_g_hist = np.log1p(g_hist).tolist()
+            log_b_hist = np.log1p(b_hist).tolist()
+
+            # Create the structured data for QML
+            histogram_data = {
+                'r_hist': log_r_hist,
+                'g_hist': log_g_hist,
+                'b_hist': log_b_hist,
+                'r_clip': r_clip_count,
+                'g_clip': g_clip_count,
+                'b_clip': b_clip_count,
+                'r_preclip': r_preclip_count,
+                'g_preclip': g_preclip_count,
+                'b_preclip': b_preclip_count,
+            }
+            
+            self.ui_state.histogramData = histogram_data
+            log.debug("Histogram updated with log scale and clip counts")
+            
+        except ImportError:
+            log.error("NumPy not available for histogram computation")
+            self.update_status_message("Histogram requires NumPy")
+        except Exception as e:
+            log.exception("Failed to compute histogram: %s", e)
+            self.update_status_message(f"Histogram error: {e}")
+    
+    @Slot()
+    def toggle_crop_mode(self):
+        """Toggle crop mode on/off."""
+        self.ui_state.isCropping = not self.ui_state.isCropping
+        if self.ui_state.isCropping:
+            # Reset crop box when entering crop mode
+            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            # Set aspect ratios for QML dropdown
+            self.ui_state.aspectRatioNames = [r['name'] for r in ASPECT_RATIOS]
+            self.ui_state.currentAspectRatioIndex = 0
+            self.update_status_message("Crop mode: Drag to select area, Enter to crop")
+            log.info("Crop mode enabled")
+        else: # Exiting crop mode
+            self.ui_state.isCropping = False
+            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            self.update_status_message("Crop cancelled")
+            log.info("Crop mode disabled")
+
+    @Slot()
+    def stack_source_raws(self):
+        """
+        Finds the source RAW files for the current stacked JPG and launches Helicon Focus.
+        """
+        if not self.image_files or self.current_index >= len(self.image_files):
+            self.update_status_message("No image selected.")
+            return
+
+        current_image_path = self.image_files[self.current_index].path
+        filename = current_image_path.name
+
+        # Ensure it's a stacked JPG
+        if not filename.lower().endswith(" stacked.jpg"):
+            self.update_status_message("Current image is not a stacked JPG.")
+            return
+
+        # Extract base name and number, e.g., "PB210633" from "20251121-PB210633 stacked.JPG"
+        match = re.search(r'([A-Z]+)(\d+)\s+stacked\.JPG', filename, re.IGNORECASE)
+        if not match:
+            self.update_status_message("Could not parse stacked JPG filename format.")
+            log.error("Could not parse stacked JPG filename: %s", filename)
+            return
+
+        base_prefix = match.group(1) # e.g., "PB"
+        base_number_str = match.group(2) # e.g., "210633"
+        base_number = int(base_number_str)
+
+        # Determine the RAW source directory
+        raw_source_dir_str = config.get('raw', 'source_dir')
+        if not raw_source_dir_str:
+            self.update_status_message("RAW source directory not configured in settings.")
+            log.warning("RAW source directory (raw.source_dir) is not set in config.")
+            return
+        
+        raw_base_dir = Path(raw_source_dir_str)
+        if not raw_base_dir.is_dir():
+            self.update_status_message(f"RAW source directory not found: {raw_base_dir}")
+            log.warning("Configured RAW source directory does not exist: %s", raw_base_dir)
+            return
+
+        # Get the mirror base from config
+        mirror_base_str = config.get('raw', 'mirror_base')
+        if not mirror_base_str:
+            self.update_status_message("RAW mirror base directory not configured in settings.")
+            log.warning("RAW mirror base (raw.mirror_base) is not set in config.")
+            return
+        
+        mirror_base_dir = Path(mirror_base_str)
+        if not mirror_base_dir.is_dir():
+            self.update_status_message(f"RAW mirror base directory not found: {mirror_base_dir}")
+            log.warning("Configured RAW mirror base directory does not exist: %s", mirror_base_dir)
+            return
+
+        # The date structure in the RAW directory mirrors the structure relative to the mirror_base
+        try:
+            relative_part = current_image_path.parent.relative_to(mirror_base_dir)
+        except ValueError:
+            self.update_status_message("Current image is not in the configured mirror base directory.")
+            log.error(
+                "Could not find relative path for '%s' from base '%s'. Check 'mirror_base' config.",
+                current_image_path.parent,
+                mirror_base_dir
+            )
+            return
+
+        raw_search_dir = raw_base_dir / relative_part
+        
+        if not raw_search_dir.is_dir():
+            self.update_status_message(f"RAW directory for this date not found: {raw_search_dir}")
+            log.warning("RAW search directory does not exist: %s", raw_search_dir)
+            return
+
+        # Find RAW files by decrementing the number
+        found_raw_files: List[Path] = []
+        # Start one number less than the stacked image number
+        current_raw_number = base_number - 1 
+        
+        # Limit to reasonable number of RAWs to avoid infinite loop or too many files
+        max_raw_search = 15 # As per user request, typically between 3 and 15
+        search_count = 0
+
+        while current_raw_number >= 0 and search_count < max_raw_search:
+            raw_filename_stem = f"{base_prefix}{current_raw_number:06d}" # e.g., PB210632
+            
+            # Look for any of the common RAW extensions
+            potential_raw_paths = []
+            for ext in RAW_EXTENSIONS:
+                potential_raw_paths.append(raw_search_dir / f"{raw_filename_stem}{ext}")
+            
+            found_this_number = False
+            for p in potential_raw_paths:
+                if p.is_file():
+                    found_raw_files.append(p)
+                    found_this_number = True
+                    break
+            
+            if not found_this_number:
+                # User specified "continue until there is a gap in the numbers"
+                # If we don't find any RAW for a number, assume it's a gap and stop
+                if found_raw_files: # Only break if we've found at least one file before this gap
+                    break
+            
+            current_raw_number -= 1
+            search_count += 1
+        
+        if not found_raw_files:
+            self.update_status_message(f"No source RAW files found in {raw_search_dir} for {filename}.")
+            log.info("No source RAWs found for %s in %s", filename, raw_search_dir)
+            return
+
+        # Sort the files by name to ensure Helicon Focus receives them in sequence
+        found_raw_files.sort()
+
+        self.update_status_message(f"Launching Helicon Focus with {len(found_raw_files)} RAWs...")
+        log.info("Launching Helicon Focus for %s with RAWs: %s", filename, [str(p) for p in found_raw_files])
+        success = self._launch_helicon_with_files(found_raw_files)
+
+        if success:
+            self.update_status_message("Helicon Focus launched successfully.")
+        else:
+            self.update_status_message("Failed to launch Helicon Focus.")
+            
+    
+    @Slot()
+    def cancel_crop_mode(self):
+        """Cancel crop mode without applying changes."""
+        if self.ui_state.isCropping:
+            self.ui_state.isCropping = False
+            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            self.update_status_message("Crop cancelled")
+            log.info("Crop mode cancelled")
+    
+    @Slot()
+    def execute_crop(self):
+        """Execute the crop operation: crop image, save, backup, and refresh."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            self.update_status_message("No image to crop")
+            return
+        
+        if not self.ui_state.isCropping:
+            return
+        
+        # Convert QJSValue to Python list if needed
+        crop_box_raw = self.ui_state.currentCropBox
+        try:
+            # Try to convert QJSValue to list
+            if hasattr(crop_box_raw, 'toVariant'):
+                # It's a QJSValue, convert to list
+                variant = crop_box_raw.toVariant()
+                if isinstance(variant, (list, tuple)):
+                    crop_box = list(variant)
+                else:
+                    # Try to iterate if it's iterable
+                    crop_box = [variant[0], variant[1], variant[2], variant[3]]
+            elif isinstance(crop_box_raw, (list, tuple)):
+                crop_box = list(crop_box_raw)
+            else:
+                # Try direct access (might work for some QJSValue types)
+                crop_box = [crop_box_raw[0], crop_box_raw[1], crop_box_raw[2], crop_box_raw[3]]
+        except (TypeError, IndexError, AttributeError) as e:
+            self.update_status_message("Invalid crop box")
+            log.error("Failed to parse crop box (type: %s): %s", type(crop_box_raw), e)
+            return
+        
+        if len(crop_box) != 4:
+            self.update_status_message("Invalid crop box")
+            return
+        
+        if crop_box == [0, 0, 1000, 1000] or crop_box == (0, 0, 1000, 1000):
+            self.update_status_message("No crop area selected")
+            return
+        
+        image_file = self.image_files[self.current_index]
+        filepath = str(image_file.path)
+        
+        try:
+            # Load the image
+            img = Image.open(filepath).convert("RGB")
+            width, height = img.size
+            
+            # Convert normalized crop box (0-1000) to pixel coordinates
+            left = int(crop_box[0] * width / 1000)
+            top = int(crop_box[1] * height / 1000)
+            right = int(crop_box[2] * width / 1000)
+            bottom = int(crop_box[3] * height / 1000)
+            
+            # Ensure valid crop box
+            left = max(0, min(left, width - 1))
+            top = max(0, min(top, height - 1))
+            right = max(left + 1, min(right, width))
+            bottom = max(top + 1, min(bottom, height))
+            
+            # Crop the image
+            cropped_img = img.crop((left, top, right, bottom))
+            
+            # Create backup
+            original_path = Path(filepath)
+            backup_path = create_backup_file(original_path)
+            if backup_path is None:
+                self.update_status_message("Failed to create backup")
+                log.error("Failed to create backup for crop operation")
+                return
+            
+            # Save the cropped image
+            with Image.open(original_path) as original_img:
+                original_format = original_img.format or original_path.suffix.lstrip('.').upper()
+                exif_data = original_img.info.get('exif')
+            
+            save_kwargs = {}
+            if original_format == 'JPEG':
+                save_kwargs['format'] = 'JPEG'
+                save_kwargs['quality'] = 95
+                if exif_data:
+                    save_kwargs['exif'] = exif_data
+            else:
+                save_kwargs['format'] = original_format
+            
+            try:
+                cropped_img.save(original_path, **save_kwargs)
+            except Exception as e:
+                log.warning(f"Could not save with original format settings: {e}")
+                cropped_img.save(original_path)
+            
+            # Track for undo
+            import time
+            timestamp = time.time()
+            self.undo_history.append(("crop", (str(original_path), str(backup_path)), timestamp))
+            
+            # Exit crop mode
+            self.ui_state.isCropping = False
+            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            
+            # Refresh the view
+            self.refresh_image_list()
+            
+            # Find the edited image in the refreshed list
+            for i, img_file in enumerate(self.image_files):
+                if img_file.path == original_path:
+                    self.current_index = i
+                    break
+            
+            # Invalidate cache and refresh display
+            self.display_generation += 1
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
+            
+            # Reset zoom/pan to fit the new cropped image
+            self.ui_state.resetZoomPan()
+            
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
+            
+            self.update_status_message("Image cropped and saved")
+            log.info("Crop operation completed for %s", filepath)
+            
+        except Exception as e:
+            self.update_status_message(f"Crop failed: {e}")
+            log.exception("Failed to crop image")
     
     @Slot()
     def quick_auto_white_balance(self):
@@ -1832,9 +2389,7 @@ class AppController(QObject):
             self.undo_history.append(("auto_white_balance", (saved_path, backup_path), timestamp))
             
             # Force the image editor to clear its current state so it reloads fresh
-            self.image_editor.original_image = None
-            self.image_editor.current_filepath = None
-            self.image_editor._preview_image = None
+            self.image_editor.clear()
             
             # Refresh the view - need to refresh image list since backup file was created
             original_path = Path(filepath)
@@ -1853,6 +2408,10 @@ class AppController(QObject):
             self.prefetcher.cancel_all()
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
+            
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
             
             self.update_status_message("Auto white balance applied and saved")
             log.info("Quick auto white balance applied to %s", filepath)

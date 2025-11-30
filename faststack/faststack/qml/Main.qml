@@ -12,7 +12,7 @@ ApplicationWindow {
     height: 800
     minimumWidth: 800
     minimumHeight: 500
-    title: "FastStack"
+    title: "FastStack - " + (uiState ? uiState.currentDirectory : "Loading...")
 
     Component.onCompleted: {
         // Initialization complete
@@ -456,6 +456,26 @@ ApplicationWindow {
                     leftPadding: 10
                 }
             }
+            ItemDelegate {
+                width: 220
+                height: 36
+                text: "Crop Image"
+                onClicked: {
+                    if (controller) {
+                        controller.toggle_crop_mode()
+                    }
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
 
             ItemDelegate {
                 width: 220
@@ -552,6 +572,25 @@ ApplicationWindow {
                     leftPadding: 10
                 }
             }
+            ItemDelegate {
+                width: 220
+                height: 36
+                text: "Stack Source RAWs"
+                enabled: uiState ? uiState.isStackedJpg : false
+                onClicked: {
+                    if (uiState) uiState.stack_source_raws();
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
         }
     }
 
@@ -607,10 +646,17 @@ ApplicationWindow {
                 }
 
                 // Toggle Image Editor with 'E' key
+                // If editor is open, close it without saving. Otherwise open it.
                 if (event.key === Qt.Key_E && !event.isAutoRepeat) {
-                    uiState.isEditorOpen = !uiState.isEditorOpen
                     if (uiState.isEditorOpen) {
-                        controller.load_image_for_editing()
+                        // Close editor without saving
+                        uiState.isEditorOpen = false
+                    } else {
+                        // Open editor
+                        uiState.isEditorOpen = true
+                        if (controller) {
+                            controller.load_image_for_editing()
+                        }
                     }
                     event.accepted = true
                 }
@@ -807,12 +853,15 @@ ApplicationWindow {
                       "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
                       "<b>File Management:</b><br>" +
                       "&nbsp;&nbsp;Delete: Move current image to recycle bin<br>" +
-                      "&nbsp;&nbsp;Ctrl+Z: Undo last action (delete or auto white balance)<br><br>" +
+                      "&nbsp;&nbsp;Ctrl+Z: Undo last action (delete, auto white balance, or crop)<br><br>" +
                       "<b>Actions:</b><br>" +
                       "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
                       "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
                       "&nbsp;&nbsp;A: Quick auto white balance (saves automatically)<br>" +
-                      "&nbsp;&nbsp;E: Toggle Image Editor<br>" +
+                      "&nbsp;&nbsp;Ctrl+Shift+B: Quick auto white balance (saves automatically)<br>" +
+                      "&nbsp;&nbsp;O: Toggle crop mode (Enter to execute crop, ESC to cancel)<br>" +
+                      "&nbsp;&nbsp;H: Toggle histogram window<br>" +
+                      "&nbsp;&nbsp;E: Toggle Image Editor (closes without saving if open)<br>" +
                       "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
                 padding: 10
                 wrapMode: Text.WordWrap
@@ -861,6 +910,13 @@ ApplicationWindow {
         backgroundColor: root.currentBackgroundColor
         textColor: root.currentTextColor
         maxImageCount: uiState ? uiState.imageCount : 0
+    }
+    
+    HistogramWindow {
+        id: histogramWindow
+        windowBackgroundColor: root.currentBackgroundColor
+        primaryTextColor: root.currentTextColor
+        gridLineColor: root.isDarkTheme ? "#454545" : "#dcdcdc"
     }
 
     ImageEditorDialog {

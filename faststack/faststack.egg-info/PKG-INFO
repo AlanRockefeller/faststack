@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: faststack
-Version: 1.1
-Summary: Ultra-fast JPG Viewer for Focus Stacking Selection and website upload
+Version: 1.3
+Summary: Ultra-fast JPG Viewer for Focus Stacking Selection and website upload via drag and drop
 Author-email: Alan Rockefeller <alanrockefeller@gmail.com>
 Classifier: Programming Language :: Python :: 3
 Classifier: License :: OSI Approved :: MIT License
@@ -20,7 +20,7 @@ Dynamic: license-file
 
 # FastStack
 
-# Version 1.1 - November 22, 2025
+# Version 1.3 - November 23, 2025
 # By Alan Rockefeller
 
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW or JPG files for focus stacking.
