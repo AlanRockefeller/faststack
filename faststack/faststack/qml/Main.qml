@@ -12,7 +12,7 @@ ApplicationWindow {
     height: 800
     minimumWidth: 800
     minimumHeight: 500
-    title: "FastStack"
+    title: "FastStack - " + (uiState ? uiState.currentDirectory : "Loading...")
 
     Component.onCompleted: {
         // Initialization complete
@@ -914,6 +914,9 @@ ApplicationWindow {
     
     HistogramWindow {
         id: histogramWindow
+        windowBackgroundColor: root.currentBackgroundColor
+        primaryTextColor: root.currentTextColor
+        gridLineColor: root.isDarkTheme ? "#454545" : "#dcdcdc"
     }
 
     ImageEditorDialog {

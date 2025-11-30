@@ -1,33 +1,26 @@
 import QtQuick
+import QtQuick.Window
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 
 Window {
     id: histogramWindow
     title: "RGB Histogram"
-    width: 600
-    height: 400
-    minimumWidth: 400
-    minimumHeight: 300
-    visible: uiState && uiState.isHistogramVisible
+    width: 750
+    height: 450
+    minimumWidth: 500
+    minimumHeight: 350
+    visible: uiState ? uiState.isHistogramVisible : false
     
-    property bool isDarkTheme: uiState ? uiState.theme === 0 : true
-    property color backgroundColor: isDarkTheme ? "#2b2b2b" : "#ffffff"
-    property color textColor: isDarkTheme ? "white" : "black"
-    
-    color: backgroundColor
-    
-    onVisibleChanged: {
-        if (visible && controller) {
-            controller.update_histogram()
-        }
-    }
-    
+    // Connections need to be outside the visibility check
     Connections {
         target: uiState
+        function onIsHistogramVisibleChanged() {
+            histogramWindow.visible = uiState.isHistogramVisible
+        }
         function onHistogramDataChanged() {
             if (histogramWindow.visible) {
-                histogramCanvas.requestPaint()
+                // Since data is bound, the components will update automatically
             }
         }
         function onCurrentImageSourceChanged() {
@@ -36,170 +29,200 @@ Window {
             }
         }
     }
-    
-    ColumnLayout {
-        anchors.fill: parent
-        anchors.margins: 10
-        spacing: 10
-        
-        Text {
-            text: "RGB Histogram"
-            font.bold: true
-            font.pixelSize: 14
-            color: histogramWindow.textColor
-            Layout.alignment: Qt.AlignHCenter
+
+    onVisibleChanged: {
+        if (visible && controller) {
+            controller.update_histogram()
         }
-        
-        Canvas {
-            id: histogramCanvas
+    }
+
+    // --- Injected Properties ---
+    // These are set by Main.qml to decouple the component from global state
+    property color windowBackgroundColor: "#f4f4f4"
+    property color primaryTextColor: "#222222"
+    property color gridLineColor: "#dcdcdc"
+    property color dangerColor: Qt.rgba(1, 0, 0, 0.25)
+
+    color: windowBackgroundColor
+
+
+    Component {
+        id: singleChannelHistogram
+
+        Item {
+            property string channelName: "Channel"
+            property color channelColor: "white"
+            property var histogramData: []
+            property int clipCount: 0
+            property int preClipCount: 0
+
+            ColumnLayout {
+                anchors.fill: parent
+                
+                Text {
+                    text: channelName
+                    color: channelColor
+                    font.bold: true
+                    font.pixelSize: 14
+                    Layout.alignment: Qt.AlignHCenter
+                }
+
+                Canvas {
+                    id: canvas
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, canvas.width, canvas.height)
+                        
+                        if (!histogramData || histogramData.length === 0) return
+
+                        // --- Draw Grid ---
+                        ctx.strokeStyle = gridLineColor
+                        ctx.lineWidth = 1
+                        for (var i = 1; i < 4; i++) {
+                            var y = i * canvas.height / 4
+                            ctx.beginPath()
+                            ctx.moveTo(0, y)
+                            ctx.lineTo(canvas.width, y)
+                            ctx.stroke()
+                        }
+                        
+                        // --- Draw Danger Zone ---
+                        var dangerZoneStart = (250 / 255) * canvas.width
+                        ctx.fillStyle = dangerColor
+                        ctx.fillRect(dangerZoneStart, 0, canvas.width - dangerZoneStart, canvas.height)
+
+                        // --- Prepare data for drawing ---
+                        var maxVal = 0
+                        for (i = 0; i < histogramData.length; i++) {
+                            maxVal = Math.max(maxVal, histogramData[i])
+                        }
+                        if (maxVal === 0) return
+                        
+                        // --- Draw Histogram Path ---
+                        ctx.beginPath()
+                        ctx.moveTo(0, canvas.height)
+                        
+                        for (i = 0; i < histogramData.length; i++) {
+                            var x = (i / (histogramData.length - 1)) * canvas.width
+                            var y = canvas.height - (histogramData[i] / maxVal) * canvas.height
+                            ctx.lineTo(x, y)
+                        }
+                        
+                        ctx.lineTo(canvas.width, canvas.height)
+                        ctx.closePath()
+
+                        // Create gradient fill
+                        var gradient = ctx.createLinearGradient(0, 0, 0, canvas.height)
+                        var transparentColor = Qt.color(channelColor)
+                        transparentColor.a = 0.0
+                        var semiTransparentColor = Qt.color(channelColor)
+                        semiTransparentColor.a = 0.4
+                        
+                        gradient.addColorStop(0, semiTransparentColor)
+                        gradient.addColorStop(1, transparentColor)
+                        
+                        ctx.fillStyle = gradient
+                        ctx.fill()
+                        
+                        // Draw outline
+                        ctx.strokeStyle = channelColor
+                        ctx.lineWidth = 1.5
+                        ctx.stroke()
+                    }
+                }
+
+                RowLayout {
+                    Layout.alignment: Qt.AlignHCenter
+                    spacing: 15
+
+                    Text {
+                        text: "Pre-clip: " + preClipCount
+                        color: primaryTextColor
+                        font.pixelSize: 11
+                    }
+                    Text {
+                        text: "Clipped: " + clipCount
+                        color: clipCount > 0 ? "red" : primaryTextColor
+                        font.bold: clipCount > 0
+                        font.pixelSize: 11
+                    }
+                }
+            }
+        }
+    }
+
+    RowLayout {
+        anchors.fill: parent
+        anchors.margins: 15
+        spacing: 15
+
+        Loader {
+            id: redLoader
             Layout.fillWidth: true
             Layout.fillHeight: true
-            
-            onPaint: {
-                var ctx = getContext("2d")
-                var width = histogramCanvas.width
-                var height = histogramCanvas.height
-                
-                // Clear canvas
-                ctx.fillStyle = histogramWindow.backgroundColor
-                ctx.fillRect(0, 0, width, height)
-                
-                if (!uiState || !uiState.histogramData) {
-                    return
+            sourceComponent: singleChannelHistogram
+            onLoaded: {
+                item.channelName = "Red"
+                item.channelColor = "#e15050"
+            }
+            Connections {
+                target: uiState
+                function onHistogramDataChanged() {
+                    if (redLoader.item && uiState.histogramData) {
+                        redLoader.item.histogramData = uiState.histogramData.r_hist
+                        redLoader.item.clipCount = uiState.histogramData.r_clip
+                        redLoader.item.preClipCount = uiState.histogramData.r_preclip
+                        // Access canvas through item: item.children[0].children[1] is fragile
+                        redLoader.item.children[0].children[1].requestPaint()
+                    }
                 }
-                
-                var data = uiState.histogramData
-                var rData = data.r || []
-                var gData = data.g || []
-                var bData = data.b || []
-                
-                if (rData.length === 0) {
-                    return
-                }
-                
-                // Find max value for normalization
-                var maxValue = 0
-                for (var i = 0; i < 256; i++) {
-                    maxValue = Math.max(maxValue, rData[i] || 0)
-                    maxValue = Math.max(maxValue, gData[i] || 0)
-                    maxValue = Math.max(maxValue, bData[i] || 0)
-                }
-                
-                if (maxValue === 0) {
-                    return
-                }
-                
-                // Draw grid lines
-                ctx.strokeStyle = histogramWindow.isDarkTheme ? "#555555" : "#cccccc"
-                ctx.lineWidth = 1
-                for (var gridY = 0; gridY <= 4; gridY++) {
-                    var y = (height - 40) * (gridY / 4) + 20
-                    ctx.beginPath()
-                    ctx.moveTo(20, y)
-                    ctx.lineTo(width - 20, y)
-                    ctx.stroke()
-                }
-                
-                // Draw histogram bars
-                var barWidth = (width - 40) / 256
-                
-                // Draw Red channel
-                ctx.fillStyle = "rgba(255, 0, 0, 0.6)"
-                for (var i = 0; i < 256; i++) {
-                    var value = (rData[i] || 0) / maxValue
-                    var barHeight = (height - 40) * value
-                    var x = 20 + i * barWidth
-                    var y = height - 20 - barHeight
-                    ctx.fillRect(x, y, barWidth - 1, barHeight)
-                }
-                
-                // Draw Green channel
-                ctx.fillStyle = "rgba(0, 255, 0, 0.6)"
-                for (var i = 0; i < 256; i++) {
-                    var value = (gData[i] || 0) / maxValue
-                    var barHeight = (height - 40) * value
-                    var x = 20 + i * barWidth
-                    var y = height - 20 - barHeight
-                    ctx.fillRect(x, y, barWidth - 1, barHeight)
-                }
-                
-                // Draw Blue channel
-                ctx.fillStyle = "rgba(0, 0, 255, 0.6)"
-                for (var i = 0; i < 256; i++) {
-                    var value = (bData[i] || 0) / maxValue
-                    var barHeight = (height - 40) * value
-                    var x = 20 + i * barWidth
-                    var y = height - 20 - barHeight
-                    ctx.fillRect(x, y, barWidth - 1, barHeight)
-                }
-                
-                // Draw axis labels
-                ctx.fillStyle = histogramWindow.textColor
-                ctx.font = "10px sans-serif"
-                ctx.textAlign = "center"
-                
-                // X-axis labels (0, 64, 128, 192, 255)
-                for (var labelX = 0; labelX <= 4; labelX++) {
-                    var value = labelX * 64
-                    if (labelX === 4) value = 255
-                    var x = 20 + (value / 255) * (width - 40)
-                    ctx.fillText(value.toString(), x, height - 5)
-                }
-                
-                // Y-axis label
-                ctx.save()
-                ctx.translate(10, height / 2)
-                ctx.rotate(-Math.PI / 2)
-                ctx.textAlign = "center"
-                ctx.fillText("Pixel Count", 0, 0)
-                ctx.restore()
             }
         }
         
-        RowLayout {
-            Layout.alignment: Qt.AlignHCenter
-            spacing: 20
-            
-            Rectangle {
-                width: 20
-                height: 20
-                color: "red"
-                opacity: 0.6
-                border.color: histogramWindow.textColor
-                border.width: 1
+        Loader {
+            id: greenLoader
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            sourceComponent: singleChannelHistogram
+            onLoaded: {
+                item.channelName = "Green"
+                item.channelColor = "#50e150"
             }
-            Text {
-                text: "Red"
-                color: histogramWindow.textColor
-                font.pixelSize: 12
+            Connections {
+                target: uiState
+                function onHistogramDataChanged() {
+                    if (greenLoader.item && uiState.histogramData) {
+                        greenLoader.item.histogramData = uiState.histogramData.g_hist
+                        greenLoader.item.clipCount = uiState.histogramData.g_clip
+                        greenLoader.item.preClipCount = uiState.histogramData.g_preclip
+                        greenLoader.item.children[0].children[1].requestPaint()
+                    }
+                }
             }
-            
-            Rectangle {
-                width: 20
-                height: 20
-                color: "green"
-                opacity: 0.6
-                border.color: histogramWindow.textColor
-                border.width: 1
+        }
+
+        Loader {
+            id: blueLoader
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            sourceComponent: singleChannelHistogram
+            onLoaded: {
+                item.channelName = "Blue"
+                item.channelColor = "#5050e1"
             }
-            Text {
-                text: "Green"
-                color: histogramWindow.textColor
-                font.pixelSize: 12
-            }
-            
-            Rectangle {
-                width: 20
-                height: 20
-                color: "blue"
-                opacity: 0.6
-                border.color: histogramWindow.textColor
-                border.width: 1
-            }
-            Text {
-                text: "Blue"
-                color: histogramWindow.textColor
-                font.pixelSize: 12
+            Connections {
+                target: uiState
+                function onHistogramDataChanged() {
+                    if (blueLoader.item && uiState.histogramData) {
+                        blueLoader.item.histogramData = uiState.histogramData.b_hist
+                        blueLoader.item.clipCount = uiState.histogramData.b_clip
+                        blueLoader.item.preClipCount = uiState.histogramData.b_preclip
+                        blueLoader.item.children[0].children[1].requestPaint()
+                    }
+                }
             }
         }
     }

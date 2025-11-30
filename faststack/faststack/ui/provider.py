@@ -466,6 +466,11 @@ class UIState(QObject):
     def stack_source_raws(self):
         self.app_controller.stack_source_raws()
 
+    @Slot(str)
+    def applyFilter(self, filter_string: str):
+        """Applies a filter string to the image list."""
+        self.app_controller.apply_filter(filter_string)
+
     @Slot(int, int)
     def onDisplaySizeChanged(self, width: int, height: int):
         self.app_controller.on_display_size_changed(width, height)

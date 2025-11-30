@@ -1246,7 +1246,7 @@ class AppController(QObject):
             log.info("Preloading is already in progress.")
             return
 
-        log.info("Starting to preload all images.")
+        log.info("Starting to preload all images, skipping cached.")
         self.ui_state.isPreloading = True
         self.ui_state.preloadProgress = 0
 
@@ -1254,26 +1254,52 @@ class AppController(QObject):
         self.reporter.progress_updated.connect(self._update_preload_progress)
         self.reporter.finished.connect(self._finish_preloading)
 
-        # Use existing prefetch executor (better resource utilization)
-        total = len(self.image_files)
-        
-        if total == 0:
+        total_images = len(self.image_files)
+        if total_images == 0:
             log.info("No images to preload.")
-            self.reporter.progress_updated.emit(100) # Or 0, depending on desired UX
-            self.reporter.finished.emit()
+            self.ui_state.isPreloading = False
+            self.ui_state.preloadProgress = 0
             return
 
-        completed = 0
+        # --- Check for cached images ---
+        images_to_preload = []
+        already_cached_count = 0
+        _, _, display_gen = self.get_display_info()
+
+        for i in range(total_images):
+            cache_key = f"{i}_{display_gen}"
+            if cache_key in self.image_cache:
+                already_cached_count += 1
+            else:
+                images_to_preload.append(i)
         
+        log.info(f"Found {already_cached_count} cached images. Preloading {len(images_to_preload)} images.")
+
+        if not images_to_preload:
+            log.info("All images are already cached.")
+            self._update_preload_progress(100)
+            self._finish_preloading()
+            return
+            
+        # --- Setup progress tracking ---
+        # `completed` starts at the number of images already cached.
+        completed = already_cached_count
+        
+        # Update initial progress
+        initial_progress = int((completed / total_images) * 100)
+        self._update_preload_progress(initial_progress)
+
         def _on_done(_future):
             nonlocal completed
             completed += 1
-            progress = int((completed / total) * 100)
+            progress = int((completed / total_images) * 100)
             self.reporter.progress_updated.emit(progress)
-            if completed == total:
+            # Check if all images (including cached ones) are accounted for
+            if completed == total_images:
                 self.reporter.finished.emit()
         
-        for i in range(total):
+        # --- Submit tasks ---
+        for i in images_to_preload:
             future = self.prefetcher.submit_task(i, self.prefetcher.generation)
             if future:
                 future.add_done_callback(_on_done)
@@ -1946,7 +1972,6 @@ class AppController(QObject):
             
             # If editor is open and has a preview, use that instead
             if self.ui_state.isEditorOpen and self.image_editor.original_image:
-                # Use the preview from editor (includes edits)
                 preview_data = self.image_editor.get_preview_data()
                 if preview_data:
                     decoded = preview_data
@@ -1955,20 +1980,44 @@ class AppController(QObject):
             arr = np.frombuffer(decoded.buffer, dtype=np.uint8)
             arr = arr.reshape((decoded.height, decoded.width, 3))
             
-            # Compute histograms for each channel
-            r_hist = np.histogram(arr[:, :, 0], bins=256, range=(0, 256))[0]
-            g_hist = np.histogram(arr[:, :, 1], bins=256, range=(0, 256))[0]
-            b_hist = np.histogram(arr[:, :, 2], bins=256, range=(0, 256))[0]
+            # --- New Histogram Logic ---
+            bins = 256
+            value_range = (0, 256)
             
-            # Convert to Python lists
+            # Compute histograms for each channel
+            r_hist = np.histogram(arr[:, :, 0], bins=bins, range=value_range)[0]
+            g_hist = np.histogram(arr[:, :, 1], bins=bins, range=value_range)[0]
+            b_hist = np.histogram(arr[:, :, 2], bins=bins, range=value_range)[0]
+            
+            # Calculate clip and pre-clip counts *before* log scaling
+            r_clip_count = int(r_hist[255])
+            g_clip_count = int(g_hist[255])
+            b_clip_count = int(b_hist[255])
+            
+            r_preclip_count = int(np.sum(r_hist[250:255]))
+            g_preclip_count = int(np.sum(g_hist[250:255]))
+            b_preclip_count = int(np.sum(b_hist[250:255]))
+            
+            # Apply log scaling for better visualization
+            log_r_hist = np.log1p(r_hist).tolist()
+            log_g_hist = np.log1p(g_hist).tolist()
+            log_b_hist = np.log1p(b_hist).tolist()
+
+            # Create the structured data for QML
             histogram_data = {
-                'r': r_hist.tolist(),
-                'g': g_hist.tolist(),
-                'b': b_hist.tolist()
+                'r_hist': log_r_hist,
+                'g_hist': log_g_hist,
+                'b_hist': log_b_hist,
+                'r_clip': r_clip_count,
+                'g_clip': g_clip_count,
+                'b_clip': b_clip_count,
+                'r_preclip': r_preclip_count,
+                'g_preclip': g_preclip_count,
+                'b_preclip': b_preclip_count,
             }
             
             self.ui_state.histogramData = histogram_data
-            log.debug("Histogram updated")
+            log.debug("Histogram updated with log scale and clip counts")
             
         except ImportError:
             log.error("NumPy not available for histogram computation")
