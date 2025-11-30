@@ -387,6 +387,10 @@ class UIState(QObject):
     def clear_all_stacks(self):
         self.app_controller.clear_all_stacks()
 
+    @Slot()
+    def clear_all_batches(self):
+        self.app_controller.clear_all_batches()
+
     @Slot(result=str)
     def get_helicon_path(self):
         return self.app_controller.get_helicon_path()

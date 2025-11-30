@@ -101,7 +101,12 @@ class AppController(QObject):
         # -- Caching & Prefetching --
         cache_size_gb = config.getfloat('core', 'cache_size_gb', 1.5)
         cache_size_bytes = int(cache_size_gb * 1024**3)
-        self.image_cache = ByteLRUCache(max_bytes=cache_size_bytes, size_of=get_decoded_image_size)
+        self._has_warned_cache_full = False
+        self.image_cache = ByteLRUCache(
+            max_bytes=cache_size_bytes, 
+            size_of=get_decoded_image_size,
+            on_evict=self._on_cache_evict
+        )
         self.prefetcher = Prefetcher(
             image_files=self.image_files,
             cache_put=self.image_cache.__setitem__,
@@ -197,9 +202,11 @@ class AppController(QObject):
 
     def on_display_size_changed(self, width: int, height: int):
         """Debounces display size change events to prevent spamming resizes."""
-        if self.display_width == width and self.display_height == height:
+        log.debug(f"on_display_size_changed called with {width}x{height}. Current: {self.display_width}x{self.display_height}")
+        if width <= 0 or height <= 0:
+            log.debug("Ignoring invalid resize event")
             return
-        
+
         # Debounce resize events
         self.pending_width = width
         self.pending_height = height
@@ -640,9 +647,6 @@ class AppController(QObject):
             log.warning("No batch start marked. Press '{' first.")
             self.update_status_message("No batch start marked")
     
-    def clear_all_batches(self):
-        """Clear all defined batches and stacks."""
-        self.clear_all_stacks()
     
     def remove_from_batch_or_stack(self):
         """Remove current image from any batch or stack it's in."""
@@ -976,11 +980,10 @@ class AppController(QObject):
                 log.error("Error deleting temporary file %s: %s", tmp_path, e)
 
     def clear_all_stacks(self):
-        log.info("Clearing all defined stacks, batches, and markers.")
+        log.info("Clearing all defined stacks.")
         self.stacks = []
         self.stack_start_index = None
-        self.batches = []
-        self.batch_start_index = None
+        # Do NOT clear batches here
         
         self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
@@ -989,7 +992,18 @@ class AppController(QObject):
         self.dataChanged.emit()
         self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
-        self.update_status_message("All stacks and batches cleared")
+        self.update_status_message("All stacks cleared")
+
+    def clear_all_batches(self):
+        """Clear all defined batches."""
+        log.info("Clearing all defined batches.")
+        self.batches = []
+        self.batch_start_index = None
+        
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.sync_ui_state()
+        self.update_status_message("All batches cleared")
 
     def get_helicon_path(self):
         return config.get('helicon', 'exe')
@@ -1265,15 +1279,39 @@ class AppController(QObject):
         images_to_preload = []
         already_cached_count = 0
         _, _, display_gen = self.get_display_info()
-
+        
+        # We want to load images furthest from the current index FIRST,
+        # and images closest to the current index LAST.
+        # This ensures that the images the user is currently looking at (and their neighbors)
+        # are the most recently added to the LRU cache, so they won't be evicted.
+        
+        # Calculate distance for all images
+        # (index, distance_from_current)
+        all_images_with_dist = []
         for i in range(total_images):
+            dist = abs(i - self.current_index)
+            all_images_with_dist.append((i, dist))
+            
+        # Sort by distance descending (furthest first)
+        all_images_with_dist.sort(key=lambda x: x[1], reverse=True)
+        
+        # Determine which images are "nearby" (e.g. within prefetch radius * 2)
+        # We will FORCE these to be re-cached even if they are already in cache,
+        # to ensure they are moved to the front of the LRU queue.
+        nearby_radius = self.prefetcher.prefetch_radius * 2
+        
+        for i, dist in all_images_with_dist:
             cache_key = f"{i}_{display_gen}"
-            if cache_key in self.image_cache:
+            is_cached = cache_key in self.image_cache
+            is_nearby = dist <= nearby_radius
+            
+            if is_cached and not is_nearby:
                 already_cached_count += 1
             else:
+                # Add to preload list if it's not cached OR if it's nearby (to refresh LRU)
                 images_to_preload.append(i)
         
-        log.info(f"Found {already_cached_count} cached images. Preloading {len(images_to_preload)} images.")
+        log.info(f"Found {already_cached_count} cached images (skipping). Preloading {len(images_to_preload)} images (including nearby refreshes).")
 
         if not images_to_preload:
             log.info("All images are already cached.")
@@ -1282,7 +1320,7 @@ class AppController(QObject):
             return
             
         # --- Setup progress tracking ---
-        # `completed` starts at the number of images already cached.
+        # `completed` starts at the number of images already cached (that we are skipping).
         completed = already_cached_count
         
         # Update initial progress
@@ -1299,7 +1337,14 @@ class AppController(QObject):
                 self.reporter.finished.emit()
         
         # --- Submit tasks ---
+        # images_to_preload is already sorted furthest -> nearest
         for i in images_to_preload:
+            # For nearby images that we are forcing to re-cache, we might need to remove them first
+            # to ensure the cache actually updates the LRU position (depending on cache implementation).
+            # ByteLRUCache (cachetools) updates LRU on access (get/set), so just overwriting is fine.
+            # But we need to make sure we don't skip the task in prefetcher if it thinks it's already done.
+            # The prefetcher checks self.futures, but we are submitting new ones.
+            
             future = self.prefetcher.submit_task(i, self.prefetcher.generation)
             if future:
                 future.add_done_callback(_on_done)
@@ -1561,6 +1606,14 @@ class AppController(QObject):
         except OSError:
             log.exception("Failed to empty recycle bin")
     
+    def _on_cache_evict(self):
+        """Callback for when the image cache evicts an item."""
+        if not self._has_warned_cache_full:
+            self._has_warned_cache_full = True
+            # Use QTimer.singleShot to ensure this runs on the main thread if called from a background thread
+            QTimer.singleShot(0, lambda: self.update_status_message("Cache full! Consider increasing cache size in settings."))
+            log.warning("Cache full, eviction started. User warned.")
+
     def restore_all_from_recycle_bin(self):
         """Restores all files from recycle bin to working directory."""
         if not self.recycle_bin_dir.exists():

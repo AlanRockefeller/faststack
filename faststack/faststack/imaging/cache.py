@@ -9,8 +9,9 @@ log = logging.getLogger(__name__)
 
 class ByteLRUCache(LRUCache):
     """An LRU Cache that respects the size of its items in bytes."""
-    def __init__(self, max_bytes: int, size_of: Callable[[Any], int] = len):
+    def __init__(self, max_bytes: int, size_of: Callable[[Any], int] = len, on_evict: Callable[[], None] = None):
         super().__init__(maxsize=max_bytes, getsizeof=size_of)
+        self.on_evict = on_evict
         log.info(f"Initialized byte-aware LRU cache with {max_bytes / 1024**2:.2f} MB capacity.")
 
     def __setitem__(self, key, value):
@@ -23,6 +24,10 @@ class ByteLRUCache(LRUCache):
         """Extend popitem to log eviction."""
         key, value = super().popitem()
         log.debug(f"Evicted item '{key}' to free up space. Cache size: {self.currsize / 1024**2:.2f} MB")
+        
+        if self.on_evict:
+            self.on_evict()
+            
         # In a real Qt app, `value` would be a tuple like (numpy_buffer, qtexture_id)
         # and we would explicitly free the GPU texture here.
         return key, value
