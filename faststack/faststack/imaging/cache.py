@@ -12,6 +12,8 @@ class ByteLRUCache(LRUCache):
     def __init__(self, max_bytes: int, size_of: Callable[[Any], int] = len, on_evict: Callable[[], None] = None):
         super().__init__(maxsize=max_bytes, getsizeof=size_of)
         self.on_evict = on_evict
+        self.hits = 0
+        self.misses = 0
         log.info(f"Initialized byte-aware LRU cache with {max_bytes / 1024**2:.2f} MB capacity.")
 
     def __setitem__(self, key, value):

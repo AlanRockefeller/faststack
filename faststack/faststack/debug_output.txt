@@ -1,0 +1,13 @@
+Starting debug test...
+Calling get_exif_data...
+Result Summary: {
+  "Date Taken": "2023:01:01 12:00:00",
+  "Camera": "Canon EOS R5",
+  "Lens": "RF 24-70mm F2.8L IS USM",
+  "ISO": "100",
+  "Aperture": "f/2.8",
+  "Shutter Speed": "1/200s",
+  "Focal Length": "50mm"
+}
+Result Full Keys: ['DateTimeOriginal', 'Make', 'Model', 'LensModel', 'ISOSpeedRatings', 'FNumber', 'ExposureTime', 'FocalLength']
+Test PASSED

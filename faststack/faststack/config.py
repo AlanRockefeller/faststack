@@ -29,7 +29,8 @@ DEFAULT_CONFIG = {
         "monitor_icc_path": "",  # For 'icc' mode: path to monitor ICC profile
     },
     "awb": {
-        "mode": "lab",  # "lab" or "rgb"        "strength": "0.7",
+        "mode": "lab",  # "lab" or "rgb"        
+        "strength": "0.7",
         "warm_bias": "6",
         "luma_lower_bound": "30",
         "luma_upper_bound": "220",

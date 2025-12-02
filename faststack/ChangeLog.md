@@ -2,6 +2,12 @@
 
 Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   
 
+## [1.4.0] - 2025-12-01
+
+- Changed how image caching works for even faster display.   
+- Pressing H brings up a RGB histogram which is designed to show even a little bit of highlight clipping and updates as you zoom in.
+- Added batch delete with confirmation dialog.
+
 ## [1.3.0] - 2025-11-23
 
 - Added the ability to crop images, via the cr(O)p hotkey.   It can be a freeform crop, or constrained to several popular aspect ratios.   

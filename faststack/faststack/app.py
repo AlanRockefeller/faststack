@@ -25,7 +25,8 @@ from PySide6.QtCore import (
     Slot,
     QMimeData,
     Qt, 
-    QPoint
+    QPoint,
+    QCoreApplication
 )
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from PySide6.QtQml import QQmlApplicationEngine
@@ -45,6 +46,7 @@ from faststack.imaging.prefetch import Prefetcher, clear_icc_caches
 from faststack.ui.provider import ImageProvider
 from faststack.ui.keystrokes import Keybinder
 from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, create_backup_file
+from faststack.imaging.metadata import get_exif_data
 import re
 from faststack.io.indexer import RAW_EXTENSIONS
 
@@ -76,7 +78,7 @@ class AppController(QObject):
         progress_updated = Signal(int)
         finished = Signal()
 
-    def __init__(self, image_dir: Path, engine: QQmlApplicationEngine):
+    def __init__(self, image_dir: Path, engine: QQmlApplicationEngine, debug_cache: bool = False):
         super().__init__()
         self.image_dir = image_dir
         self.image_files: List[ImageFile] = []  # Filtered list for display
@@ -85,6 +87,7 @@ class AppController(QObject):
         self.ui_refresh_generation = 0
         self.main_window: Optional[QObject] = None
         self.engine = engine
+        self.debug_cache = debug_cache # New debug_cache flag
 
         self.display_width = 0
         self.display_height = 0
@@ -107,6 +110,8 @@ class AppController(QObject):
             size_of=get_decoded_image_size,
             on_evict=self._on_cache_evict
         )
+        self.image_cache.hits = 0 # Initialize cache hit counter
+        self.image_cache.misses = 0 # Initialize cache miss counter
         self.prefetcher = Prefetcher(
             image_files=self.image_files,
             cache_put=self.image_cache.__setitem__,
@@ -120,7 +125,10 @@ class AppController(QObject):
         # -- UI State --
         self.ui_state = UIState(self)
         self.ui_state.theme = self.get_theme()
+        self.ui_state.debugCache = self.debug_cache
         self.keybinder = Keybinder(self)
+        self.ui_state.debugCache = self.debug_cache # Pass debug_cache state to UI
+        self.ui_state.isDecoding = False # Initialize decoding indicator
 
         # -- Stacking State --
         self.stack_start_index: Optional[int] = None
@@ -357,47 +365,63 @@ class AppController(QObject):
         _, _, display_gen = self.get_display_info()
         cache_key = f"{index}_{display_gen}"
 
-        # Check cache first
+        # Check cache
         if cache_key in self.image_cache:
+            self.image_cache.hits += 1 # Increment hit counter
+            self._update_cache_stats() # Update UI with new stats
             decoded = self.image_cache[cache_key]
             with self._last_image_lock:
                 self.last_displayed_image = decoded
             return decoded
         
+        self.image_cache.misses += 1 # Increment miss counter
+        self._update_cache_stats() # Update UI with new stats
+
         # Cache miss: need to decode synchronously to ensure correct image displays
         if _debug_mode:
             decode_start = time.perf_counter()
             log.info("Cache miss for index %d (gen: %d). Blocking decode.", index, display_gen)
         
-        # Submit with priority=True to cancel pending prefetch tasks and free up workers
-        future = self.prefetcher.submit_task(index, self.prefetcher.generation, priority=True)
-        if future:
-            try:
-                # Wait for decode to complete (blocking but fast for JPEGs)
-                result = future.result(timeout=5.0)  # 5 second timeout as safety
-                if result:
-                    decoded_index, decoded_display_gen = result
-                    cache_key = f"{decoded_index}_{decoded_display_gen}"
-                    if cache_key in self.image_cache:
-                        decoded = self.image_cache[cache_key]
-                        with self._last_image_lock:
-                            self.last_displayed_image = decoded
-                        if _debug_mode:
-                            elapsed = time.perf_counter() - decode_start
-                            log.info("Decoded image %d in %.3fs", index, elapsed)
-                        return decoded
-            except concurrent.futures.TimeoutError:
-                log.exception("Timeout decoding image at index %d", index)
-                with self._last_image_lock:
-                    return self.last_displayed_image
-            except concurrent.futures.CancelledError:
-                log.warning("Decode cancelled for index %d", index)
-                with self._last_image_lock:
-                    return self.last_displayed_image
-            except Exception as e:
-                log.exception("Error decoding image at index %d", index)
-                with self._last_image_lock:
-                    return self.last_displayed_image
+        # Show decoding indicator if debug cache is enabled
+        if self.debug_cache:
+            self.ui_state.isDecoding = True
+            # Note: processEvents() caused crashes, so the indicator might not update immediately
+            # QCoreApplication.processEvents()
+        
+        try:
+            # Submit with priority=True to cancel pending prefetch tasks and free up workers
+            future = self.prefetcher.submit_task(index, self.prefetcher.generation, priority=True)
+            if future:
+                try:
+                    # Wait for decode to complete (blocking but fast for JPEGs)
+                    result = future.result(timeout=5.0)  # 5 second timeout as safety
+                    if result:
+                        decoded_index, decoded_display_gen = result
+                        cache_key = f"{decoded_index}_{decoded_display_gen}"
+                        if cache_key in self.image_cache:
+                            decoded = self.image_cache[cache_key]
+                            with self._last_image_lock:
+                                self.last_displayed_image = decoded
+                            if _debug_mode:
+                                elapsed = time.perf_counter() - decode_start
+                                log.info("Decoded image %d in %.3fs", index, elapsed)
+                            return decoded
+                except concurrent.futures.TimeoutError:
+                    log.exception("Timeout decoding image at index %d", index)
+                    with self._last_image_lock:
+                        return self.last_displayed_image
+                except concurrent.futures.CancelledError:
+                    log.warning("Decode cancelled for index %d", index)
+                    with self._last_image_lock:
+                        return self.last_displayed_image
+                except Exception as e:
+                    log.exception("Error decoding image at index %d", index)
+                    with self._last_image_lock:
+                        return self.last_displayed_image
+        finally:
+            # Hide decoding indicator
+            if self.debug_cache:
+                self.ui_state.isDecoding = False
         
         with self._last_image_lock:
             return self.last_displayed_image
@@ -473,6 +497,20 @@ class AppController(QObject):
             self.main_window.show_jump_to_image_dialog()
         else:
             log.warning("Cannot open jump to image dialog: main_window or function not available")
+
+    def show_exif_dialog(self):
+        """Shows the EXIF data dialog."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+
+        path = self.image_files[self.current_index].path
+        data = get_exif_data(path)
+        
+        if self.main_window and hasattr(self.main_window, 'openExifDialog'):
+            # Pass data as QVariantMap (dict)
+            self.main_window.openExifDialog(data)
+        else:
+            log.warning("Cannot open EXIF dialog: main_window or openExifDialog not available")
     
     @Slot()
     def dialog_opened(self):
@@ -864,7 +902,7 @@ class AppController(QObject):
                         break
                 
                 if stack_idx_backward == -1 and stack_idx_forward == -1:
-                    # This case should be covered by `if not self.stacks`, but as a fallback.
+                    # This case should not be reached if `if not self.stacks` handles it.
                     self.stacks.append([index_to_toggle, index_to_toggle])
                     self.update_status_message("Created new stack with current image.")
                     log.info("No stacks found nearby. Created new stack for index %d.", index_to_toggle)
@@ -910,7 +948,7 @@ class AppController(QObject):
 
 
     def launch_helicon(self):
-        """Launches Helicon Focus with selected files (RAW preferred, JPG fallback) or stacks."""
+        """Launches Helicon with selected files (RAW preferred, JPG fallback) or stacks."""
         if self.stacks:
             log.info("Launching Helicon for %d defined stacks.", len(self.stacks))
             any_success = False
@@ -1358,14 +1396,48 @@ class AppController(QObject):
         self.ui_state.preloadProgress = 0
         log.info("Finished preloading all images.")
 
+    @Slot(result=int)
+    def get_batch_count_for_current_image(self) -> int:
+        """Get the count of images in the batch that contains the current image."""
+        if not self.image_files:
+            return 0
+        
+        # Check if current image is in any batch
+        for start, end in self.batches:
+            if start <= self.current_index <= end:
+                # Calculate total count across all batches
+                total_count = sum(end - start + 1 for start, end in self.batches)
+                return total_count
+        
+        return 0
+
     @Slot()
     def delete_current_image(self):
-        """Moves current JPG and RAW to recycle bin."""
+        """Moves current JPG and RAW to recycle bin. Shows dialog if multiple images in batch."""
         if not self.image_files:
             self.update_status_message("No image to delete.")
             return
         
-        image_file = self.image_files[self.current_index]
+        # Check if current image is in a batch with multiple images
+        batch_count = self.get_batch_count_for_current_image()
+        
+        if batch_count > 1:
+            # Show dialog asking what to delete
+            if hasattr(self, 'main_window') and self.main_window:
+                # Set batch count in dialog and open it
+                self.main_window.show_delete_batch_dialog(batch_count)
+            return
+        
+        # Single image deletion - proceed normally
+        self._delete_single_image(self.current_index)
+
+    def _delete_single_image(self, index: int):
+        """Internal method to delete a single image by index."""
+        if not self.image_files or index < 0 or index >= len(self.image_files):
+            self.update_status_message("No image to delete.")
+            return
+        
+        image_file = self.image_files[index]
         jpg_path = image_file.path
         raw_path = image_file.raw_pair
         
@@ -1399,8 +1471,99 @@ class AppController(QObject):
                 self.delete_history.append((jpg_path, raw_path))
                 self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
             
-    
-            # Refresh image list and move to next image
+        except OSError as e:
+            self.update_status_message(f"Delete failed: {e}")
+            log.exception("Failed to delete image")
+            return
+        
+        # Refresh image list and move to next image
+        self.refresh_image_list()
+        if self.image_files:
+            # Stay at same index (which now shows the next image)
+            self.current_index = min(self.current_index, len(self.image_files) - 1)
+            # Clear cache and invalidate display generation to force image reload
+            self.display_generation += 1
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()  # Cancel stale tasks since image list changed
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
+
+    @Slot()
+    def delete_current_image_only(self):
+        """Delete only the current image, ignoring batch selection."""
+        if not self.image_files:
+            self.update_status_message("No image to delete.")
+            return
+        self._delete_single_image(self.current_index)
+
+    @Slot()
+    def delete_batch_images(self):
+        """Delete all images in the current batch."""
+        if not self.image_files:
+            self.update_status_message("No images to delete.")
+            return
+        
+        # Collect all indices in batches
+        indices_to_delete = set()
+        for start, end in self.batches:
+            for i in range(start, end + 1):
+                if 0 <= i < len(self.image_files):
+                    indices_to_delete.add(i)
+        
+        if not indices_to_delete:
+            self.update_status_message("No images in batch to delete.")
+            return
+        
+        # Sort indices in reverse order so we delete from end to start
+        # This way indices don't shift as we delete
+        sorted_indices = sorted(indices_to_delete, reverse=True)
+        
+        # Create recycle bin if it doesn't exist
+        try:
+            self.recycle_bin_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.update_status_message(f"Failed to create recycle bin: {e}")
+            log.error("Failed to create recycle bin directory: %s", e)
+            return
+        
+        deleted_count = 0
+        import time
+        timestamp = time.time()
+        
+        # Delete all images in the batch
+        for index in sorted_indices:
+            if index >= len(self.image_files):
+                continue
+            
+            image_file = self.image_files[index]
+            jpg_path = image_file.path
+            raw_path = image_file.raw_pair
+            
+            try:
+                if jpg_path.exists():
+                    dest = self.recycle_bin_dir / jpg_path.name
+                    jpg_path.rename(dest)
+                    log.info("Moved %s to recycle bin", jpg_path.name)
+                
+                if raw_path and raw_path.exists():
+                    dest = self.recycle_bin_dir / raw_path.name
+                    raw_path.rename(dest)
+                    log.info("Moved %s to recycle bin", raw_path.name)
+                
+                # Add to delete history
+                self.delete_history.append((jpg_path, raw_path))
+                self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
+                deleted_count += 1
+                
+            except OSError as e:
+                log.exception("Failed to delete image at index %d: %s", index, e)
+        
+        if deleted_count > 0:
+            # Clear all batches after deletion
+            self.batches = []
+            self.batch_start_index = None
+            
+            # Refresh image list
             self.refresh_image_list()
             if self.image_files:
                 # Stay at same index (which now shows the next image)
@@ -1412,9 +1575,10 @@ class AppController(QObject):
                 self.prefetcher.update_prefetch(self.current_index)
                 self.sync_ui_state()
             
-        except OSError as e:
-            self.update_status_message(f"Delete failed: {e}")
-            log.exception("Failed to delete image")
+            self.update_status_message(f"Deleted {deleted_count} image(s)")
+            log.info("Deleted %d image(s) from batch", deleted_count)
+        else:
+            self.update_status_message("No images were deleted.")
 
     @Slot()
     def undo_delete(self):
@@ -2620,7 +2784,16 @@ class AppController(QObject):
         meta = self.sidecar.get_metadata(stem)
         return meta.stacked
 
-def main(image_dir: str = "", debug: bool = False):
+    def _update_cache_stats(self):
+        if self.debug_cache:
+            hits = self.image_cache.hits
+            misses = self.image_cache.misses
+            total = hits + misses
+            hit_rate = (hits / total * 100) if total > 0 else 0
+            size_mb = self.image_cache.currsize / (1024 * 1024)
+            self.ui_state.cacheStats = f"Cache: {hits} hits, {misses} misses ({hit_rate:.1f}%), {size_mb:.1f} MB"
+
+def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False):
     """FastStack Application Entry Point"""
     global _debug_mode
     _debug_mode = debug
@@ -2634,7 +2807,7 @@ def main(image_dir: str = "", debug: bool = False):
     os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
     os.environ["QML2_IMPORT_PATH"] = os.path.join(os.path.dirname(__file__), "qml")
 
-    app = QApplication(sys.argv) # Moved here
+    app = QApplication(sys.argv) # QApplication is correct for desktop apps with widgets
     if debug:
         log.info("Startup: after QApplication: %.3fs", time.perf_counter() - t0)
 
@@ -2665,7 +2838,7 @@ def main(image_dir: str = "", debug: bool = False):
     # Add the path to Qt5Compat.GraphicalEffects to QML import paths
     engine.addImportPath(os.path.join(os.path.dirname(PySide6.__file__), "qml", "Qt5Compat"))
 
-    controller = AppController(image_dir_path, engine)
+    controller = AppController(image_dir_path, engine, debug_cache=debug_cache)
     if debug:
         log.info("Startup: after AppController: %.3fs", time.perf_counter() - t0)
     image_provider = ImageProvider(controller)
@@ -2705,8 +2878,9 @@ def cli():
     parser = argparse.ArgumentParser(description="FastStack - Ultra-fast JPG Viewer for Focus Stacking Selection")
     parser.add_argument("image_dir", nargs="?", default="", help="Directory of images to view")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging and timing information")
+    parser.add_argument("--debugcache", action="store_true", help="Enable debug cache features")
     args = parser.parse_args()
-    main(image_dir=args.image_dir, debug=args.debug)
+    main(image_dir=args.image_dir, debug=args.debug, debug_cache=args.debugcache)
 
 if __name__ == "__main__":
     cli()

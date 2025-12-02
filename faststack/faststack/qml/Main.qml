@@ -35,6 +35,12 @@ ApplicationWindow {
         }
     }
 
+    function openExifDialog(data) {
+        exifDialog.summaryData = data.summary
+        exifDialog.fullData = data.full
+        exifDialog.open()
+    }
+
     Connections {
         target: uiState
         function onThemeChanged() {
@@ -766,6 +772,22 @@ ApplicationWindow {
                 color: "transparent"
             }
 
+            Label {
+                text: uiState ? uiState.cacheStats : ""
+                color: "#00FFFF" // Cyan
+                font.family: "Monospace"
+                visible: uiState ? uiState.debugCache : false
+                Layout.rightMargin: 10
+            }
+
+            Label {
+                text: uiState ? uiState.cacheStats : ""
+                color: "#00FFFF" // Cyan
+                font.family: "Monospace"
+                visible: uiState ? uiState.debugCache : false
+                Layout.rightMargin: 10
+            }
+
             // Saturation slider (only visible in saturation mode)
             Row {
                 visible: uiState && uiState.colorMode === "saturation"
@@ -833,7 +855,8 @@ ApplicationWindow {
                       "<b>Navigation:</b><br>" +
                       "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
                       "&nbsp;&nbsp;K / Left Arrow: Previous Image<br>" +
-                      "&nbsp;&nbsp;G: Jump to Image Number<br><br>" +
+                      "&nbsp;&nbsp;G: Jump to Image Number<br>" +
+                      "&nbsp;&nbsp;I: Show EXIF Data<br><br>" +
                       "<b>Viewing:</b><br>" +
                       "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
                       "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
@@ -911,6 +934,12 @@ ApplicationWindow {
         textColor: root.currentTextColor
         maxImageCount: uiState ? uiState.imageCount : 0
     }
+
+    DeleteBatchDialog {
+        id: deleteBatchDialog
+        backgroundColor: root.currentBackgroundColor
+        textColor: root.currentTextColor
+    }
     
     HistogramWindow {
         id: histogramWindow
@@ -932,5 +961,36 @@ ApplicationWindow {
 
     function show_jump_to_image_dialog() {
         jumpToImageDialog.open()
+    }
+
+    function show_delete_batch_dialog(count) {
+        deleteBatchDialog.batchCount = count
+        deleteBatchDialog.open()
+    }
+
+    ExifDialog {
+        id: exifDialog
+        backgroundColor: root.currentBackgroundColor
+        textColor: root.currentTextColor
+    }
+
+    // Debug Cache Indicator (Yellow Square)
+    Rectangle {
+        id: debugIndicator
+        width: 30
+        height: 30
+        color: "yellow"
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.margins: 20
+        z: 9999 // Ensure it is on top of everything, including footer
+        visible: uiState ? (uiState.debugCache && uiState.isDecoding) : false
+        
+        Text {
+            anchors.centerIn: parent
+            text: "D"
+            font.bold: true
+            color: "black"
+        }
     }
 }

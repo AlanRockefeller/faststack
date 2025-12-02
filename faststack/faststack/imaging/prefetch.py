@@ -259,10 +259,24 @@ class Prefetcher:
 
         # For high-priority tasks (current image), cancel pending prefetch tasks
         # to free up worker threads and reduce blocking time
+        # For high-priority tasks (current image), cancel pending prefetch tasks
+        # to free up worker threads and reduce blocking time
         if priority:
             cancelled_count = 0
+            # Don't cancel tasks that are very close to the requested index (e.g. +/- 2)
+            # This prevents thrashing when the user is navigating quickly
+            safe_radius = 2
+            
             for task_index, future in list(self.futures.items()):
-                if task_index != index and not future.done() and future.cancel():
+                # Skip the current task
+                if task_index == index:
+                    continue
+                
+                # Skip tasks within safe radius
+                if abs(task_index - index) <= safe_radius:
+                    continue
+
+                if not future.done() and future.cancel():
                     cancelled_count += 1
                     del self.futures[task_index]
             if cancelled_count > 0:
@@ -302,7 +316,8 @@ class Prefetcher:
                     with open(image_file.path, "rb") as f:
                         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                             # Pass mmap directly - no copy! Decoders accept bytes-like objects
-                            buffer = decode_jpeg_resized(mmapped, display_width, display_height)
+                            # Use fast_dct=True for speed
+                            buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=True)
                     t_after_read = time.perf_counter()
                     if buffer is None:
                         return None
@@ -364,7 +379,8 @@ class Prefetcher:
                         with open(image_file.path, "rb") as f:
                             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                                 # Pass mmap directly - no copy!
-                                buffer = decode_jpeg_resized(mmapped, display_width, display_height)
+                                # Use fast_dct=True for speed
+                                buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=True)
                         t_after_fallback_read = time.perf_counter()
                         if buffer is None:
                             return None
@@ -387,7 +403,8 @@ class Prefetcher:
                     with open(image_file.path, "rb") as f:
                         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                             # Pass mmap directly - no copy!
-                            buffer = decode_jpeg_resized(mmapped, display_width, display_height)
+                            # Use fast_dct=True for speed
+                            buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=True)
                     t_after_read = time.perf_counter()
                     if buffer is None:
                         return None
@@ -409,7 +426,8 @@ class Prefetcher:
                 with open(image_file.path, "rb") as f:
                     with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                         # Pass mmap directly - no copy! Decoders accept bytes-like objects
-                        buffer = decode_jpeg_resized(mmapped, display_width, display_height)
+                        # Use fast_dct=True for speed
+                        buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=True)
                 t_after_read = time.perf_counter()
                 if buffer is None:
                     return None

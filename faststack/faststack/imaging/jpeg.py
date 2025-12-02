@@ -28,13 +28,17 @@ else:
         log.info("PyTurboJPEG is available. Using it for JPEG decoding.")
 
 
-def decode_jpeg_rgb(jpeg_bytes: bytes) -> Optional[np.ndarray]:
+def decode_jpeg_rgb(jpeg_bytes: bytes, fast_dct: bool = False) -> Optional[np.ndarray]:
     """Decodes JPEG bytes into an RGB numpy array."""
     if TURBO_AVAILABLE and jpeg_decoder:
         try:
             # Decode with proper color space handling (no TJFLAG_FASTDCT)
             # This ensures proper YCbCr->RGB conversion with correct gamma
-            return jpeg_decoder.decode(jpeg_bytes, pixel_format=TJPF_RGB, flags=0)
+            flags = 0
+            if fast_dct:
+                # TJFLAG_FASTDCT = 2048
+                flags |= 2048
+            return jpeg_decoder.decode(jpeg_bytes, pixel_format=TJPF_RGB, flags=flags)
         except Exception as e:
             log.exception(f"PyTurboJPEG failed to decode image: {e}. Trying Pillow.")
             # Fall through to Pillow fallback
@@ -108,11 +112,11 @@ def _get_turbojpeg_scaling_factor(width: int, height: int, max_dim: int) -> Opti
 
 
 def decode_jpeg_resized(
-    jpeg_bytes: bytes, width: int, height: int
+    jpeg_bytes: bytes, width: int, height: int, fast_dct: bool = False
 ) -> Optional[np.ndarray]:
     """Decodes and resizes a JPEG to fit within the given dimensions."""
     if width == 0 or height == 0:
-        return decode_jpeg_rgb(jpeg_bytes)
+        return decode_jpeg_rgb(jpeg_bytes, fast_dct=fast_dct)
 
     if TURBO_AVAILABLE and jpeg_decoder:
         try:
@@ -130,18 +134,24 @@ def decode_jpeg_resized(
             scale_factor = _get_turbojpeg_scaling_factor(img_width, img_height, max_dim)
          
             if scale_factor:
+                flags = 0
+                if fast_dct:
+                    # TJFLAG_FASTDCT = 2048
+                    flags |= 2048
+
                 decoded = jpeg_decoder.decode(
                     jpeg_bytes, 
                     scaling_factor=scale_factor,
                     pixel_format=TJPF_RGB, 
-                    flags=0  # Proper color space handling
+                    flags=flags  # Proper color space handling
                 )
                 
                 # Only use Pillow for final resize if needed
                 if decoded.shape[0] > height or decoded.shape[1] > width:
                     from io import BytesIO
                     img = Image.fromarray(decoded)
-                    img.thumbnail((width, height), Image.Resampling.LANCZOS)
+                    # Use BILINEAR for speed
+                    img.thumbnail((width, height), Image.Resampling.BILINEAR)
                     return np.array(img)
                 return decoded
         except Exception as e:
@@ -158,7 +168,7 @@ def decode_jpeg_resized(
         if scale_factor_ratio > 4:
             resampling = Image.Resampling.BILINEAR  # Much faster
         else:
-            resampling = Image.Resampling.LANCZOS  # Higher quality
+            resampling = Image.Resampling.BILINEAR  # Changed from LANCZOS to BILINEAR for speed
 
         img.thumbnail((width, height), resampling)
         return np.array(img.convert("RGB"))

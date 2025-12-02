@@ -117,6 +117,11 @@ class UIState(QObject):
     blacks_changed = Signal(float)
     whites_changed = Signal(float)
     clarity_changed = Signal(float)
+    
+    # Debug Cache Signals
+    debugCacheChanged = Signal(bool)
+    cacheStatsChanged = Signal(str)
+    isDecodingChanged = Signal(bool)
 
     def __init__(self, app_controller):
         super().__init__()
@@ -150,6 +155,11 @@ class UIState(QObject):
         self._blacks = 0.0
         self._whites = 0.0
         self._clarity = 0.0
+        
+        # Debug Cache State
+        self._debug_cache = False
+        self._cache_stats = ""
+        self._is_decoding = False
 
     # ---- THEME PROPERTY ----
     @Property(int, notify=themeChanged)
@@ -367,7 +377,7 @@ class UIState(QObject):
     @Property(bool, notify=metadataChanged)
     def isStackedJpg(self):
         """Returns True if the current image is a stacked JPG."""
-        return self.currentFilename.endswith(" stacked.JPG")
+        return self.currentFilename.lower().endswith(" stacked.jpg")
 
     # --- Slots for QML to call ---
     @Slot()
@@ -771,22 +781,34 @@ class UIState(QObject):
             self._clarity = new_value
             self.clarity_changed.emit(new_value)
 
-    def reset_editor_state(self):
-        """Resets all UI state variables for the editor."""
-        self.brightness = 0.0
-        self.contrast = 0.0
-        self.saturation = 0.0
-        self.whiteBalanceBY = 0.0
-        self.whiteBalanceMG = 0.0
-        self.currentCropBox = (0, 0, 1000, 1000)
-        self.isCropping = False
-        self.sharpness = 0.0
-        self.rotation = 0
-        self.exposure = 0.0
-        self.highlights = 0.0
-        self.shadows = 0.0
-        self.vibrance = 0.0
-        self.vignette = 0.0
-        self.blacks = 0.0
-        self.whites = 0.0
-        self.clarity = 0.0
+    # --- Debug Cache Properties ---
+
+    @Property(bool, notify=debugCacheChanged)
+    def debugCache(self) -> bool:
+        return self._debug_cache
+
+    @debugCache.setter
+    def debugCache(self, value: bool):
+        if self._debug_cache != value:
+            self._debug_cache = value
+            self.debugCacheChanged.emit(value)
+
+    @Property(str, notify=cacheStatsChanged)
+    def cacheStats(self) -> str:
+        return self._cache_stats
+
+    @cacheStats.setter
+    def cacheStats(self, value: str):
+        if self._cache_stats != value:
+            self._cache_stats = value
+            self.cacheStatsChanged.emit(value)
+
+    @Property(bool, notify=isDecodingChanged)
+    def isDecoding(self) -> bool:
+        return self._is_decoding
+
+    @isDecoding.setter
+    def isDecoding(self, value: bool):
+        if self._is_decoding != value:
+            self._is_decoding = value
+            self.isDecodingChanged.emit(value)

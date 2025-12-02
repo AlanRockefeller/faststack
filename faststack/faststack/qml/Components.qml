@@ -519,7 +519,7 @@ Item {
             Text {
                 text: "Aspect Ratio"
                 font.bold: true
-                color: "white"
+                color: aspectRatioWindow.isDark ? "white" : "black"
                 font.pixelSize: 12
             }
             
