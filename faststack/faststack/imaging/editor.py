@@ -302,6 +302,11 @@ class ImageEditor:
         final_img = self._apply_edits(final_img)
 
         original_path = self.current_filepath
+        try:
+            original_stat = original_path.stat()
+        except OSError as e:
+            print(f"Warning: Unable to read timestamps for {original_path}: {e}")
+            original_stat = None
         
         # Use the reusable backup function
         backup_path = create_backup_file(original_path)
@@ -360,10 +365,20 @@ class ImageEditor:
                     # Reraise so the outer except logs and returns None
                     raise
 
+            if original_stat is not None:
+                self._restore_file_times(original_path, original_stat)
+
             return original_path, backup_path
         except Exception as e:
             print(f"Failed to save edited image or backup: {e}")
             return None
+
+    def _restore_file_times(self, path: Path, original_stat: os.stat_result) -> None:
+        """Best-effort restoration of access/modify timestamps after saving."""
+        try:
+            os.utime(path, (original_stat.st_atime, original_stat.st_mtime))
+        except OSError as e:
+            print(f"Warning: Unable to restore timestamps for {path}: {e}")
 
 
 # Dictionary of ratios for QML dropdown

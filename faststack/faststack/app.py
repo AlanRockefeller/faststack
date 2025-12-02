@@ -1453,6 +1453,7 @@ class AppController(QObject):
             self.update_status_message("No image to delete.")
             return
         
+        previous_index = self.current_index
         image_file = self.image_files[index]
         jpg_path = image_file.path
         raw_path = image_file.raw_pair
@@ -1495,14 +1496,27 @@ class AppController(QObject):
         # Refresh image list and move to next image
         self.refresh_image_list()
         if self.image_files:
-            # Stay at same index (which now shows the next image)
-            self.current_index = min(self.current_index, len(self.image_files) - 1)
+            self._reposition_after_delete(None, previous_index)
             # Clear cache and invalidate display generation to force image reload
             self.display_generation += 1
             self.image_cache.clear()
             self.prefetcher.cancel_all()  # Cancel stale tasks since image list changed
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
+
+    def _reposition_after_delete(self, preserved_path: Optional[Path], previous_index: int):
+        """Reposition current_index after the image list refreshed post-deletion."""
+        if not self.image_files:
+            self.current_index = 0
+            return
+
+        if preserved_path:
+            for i, img_file in enumerate(self.image_files):
+                if img_file.path == preserved_path:
+                    self.current_index = i
+                    return
+
+        self.current_index = min(previous_index, len(self.image_files) - 1)
 
     @Slot()
     def delete_current_image_only(self):
@@ -1533,7 +1547,12 @@ class AppController(QObject):
         # Sort indices in reverse order so we delete from end to start
         # This way indices don't shift as we delete
         sorted_indices = sorted(indices_to_delete, reverse=True)
-        
+
+        previous_index = self.current_index
+        preserved_path = None
+        if self.image_files and self.current_index not in indices_to_delete:
+            preserved_path = self.image_files[self.current_index].path
+
         # Create recycle bin if it doesn't exist
         try:
             self.recycle_bin_dir.mkdir(parents=True, exist_ok=True)
@@ -1582,8 +1601,7 @@ class AppController(QObject):
             # Refresh image list
             self.refresh_image_list()
             if self.image_files:
-                # Stay at same index (which now shows the next image)
-                self.current_index = min(self.current_index, len(self.image_files) - 1)
+                self._reposition_after_delete(preserved_path, previous_index)
                 # Clear cache and invalidate display generation to force image reload
                 self.display_generation += 1
                 self.image_cache.clear()
@@ -2521,6 +2539,11 @@ class AppController(QObject):
             
             # Create backup
             original_path = Path(filepath)
+            
+            # Preserve original file modification time
+            original_mtime = original_path.stat().st_mtime
+            original_atime = original_path.stat().st_atime
+            
             backup_path = create_backup_file(original_path)
             if backup_path is None:
                 self.update_status_message("Failed to create backup")
@@ -2546,6 +2569,10 @@ class AppController(QObject):
             except Exception as e:
                 log.warning(f"Could not save with original format settings: {e}")
                 cropped_img.save(original_path)
+            
+            # Restore original modification and access times to preserve file position in sorted list
+            import os
+            os.utime(original_path, (original_atime, original_mtime))
             
             # Track for undo
             import time

@@ -11,6 +11,19 @@ Window {
     minimumWidth: 500
     minimumHeight: 350
     visible: uiState ? uiState.isHistogramVisible : false
+
+    FocusScope {
+        id: histogramKeyScope
+        anchors.fill: parent
+        focus: histogramWindow.visible
+
+        Keys.onPressed: function(event) {
+            if (event.key === Qt.Key_H && controller) {
+                event.accepted = true
+                controller.toggle_histogram()
+            }
+        }
+    }
     
     // Connections need to be outside the visibility check
     Connections {
@@ -40,6 +53,7 @@ Window {
 
     onVisibleChanged: {
         if (visible && controller) {
+            histogramKeyScope.forceActiveFocus()
             controller.update_histogram()
         }
     }

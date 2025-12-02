@@ -79,6 +79,9 @@ Item {
             }
         }
 
+        property alias scaleTransform: scaleTransform
+        property alias panTransform: panTransform
+        
         transform: [
             Scale {
                 id: scaleTransform
@@ -87,16 +90,24 @@ Item {
                 onXScaleChanged: {
                     mainImage.updateZoomState()
                     mainImage.updateHistogramWithZoom()
+                    if (cropOverlay.visible) cropOverlay.updateCropRect()
                 }
                 onYScaleChanged: {
                     mainImage.updateZoomState()
                     mainImage.updateHistogramWithZoom()
+                    if (cropOverlay.visible) cropOverlay.updateCropRect()
                 }
             },
             Translate {
                 id: panTransform
-                onXChanged: mainImage.updateHistogramWithZoom()
-                onYChanged: mainImage.updateHistogramWithZoom()
+                onXChanged: {
+                    mainImage.updateHistogramWithZoom()
+                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+                }
+                onYChanged: {
+                    mainImage.updateHistogramWithZoom()
+                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+                }
             }
         ]
     }
@@ -155,11 +166,19 @@ Item {
             if (uiState && uiState.isCropping) {
                 // Check if clicking on existing crop box
                 var cropRect = getCropRect()
+                var box = uiState.currentCropBox
+                var isFullImage = box && box.length === 4 && box[0] === 0 && box[1] === 0 && box[2] === 1000 && box[3] === 1000
+                
                 var edgeThreshold = 10 * Screen.devicePixelRatio
                 var inside = mouse.x >= cropRect.x && mouse.x <= cropRect.x + cropRect.width &&
                              mouse.y >= cropRect.y && mouse.y <= cropRect.y + cropRect.height
                 
-                if (inside && cropRect.width > 0 && cropRect.height > 0) {
+                // If crop box is full image, always start a new crop
+                if (isFullImage) {
+                    cropDragMode = "new"
+                    cropStartX = mouse.x
+                    cropStartY = mouse.y
+                } else if (inside && cropRect.width > 0 && cropRect.height > 0) {
                     // Determine which edge/corner is being dragged
                     var nearLeft = Math.abs(mouse.x - cropRect.x) < edgeThreshold
                     var nearRight = Math.abs(mouse.x - (cropRect.x + cropRect.width)) < edgeThreshold
@@ -201,11 +220,24 @@ Item {
             var imgX = (mainImage.width - imgWidth) / 2
             var imgY = (mainImage.height - imgHeight) / 2
             var box = uiState.currentCropBox
+            
+            // Account for zoom and pan transforms when displaying crop box
+            var scale = scaleTransform.xScale
+            var panX = panTransform.x
+            var panY = panTransform.y
+            
+            // Convert normalized crop box (0-1000) to image-local coordinates
+            var localX = (box[0] / 1000) * imgWidth
+            var localY = (box[1] / 1000) * imgHeight
+            var localWidth = (box[2] - box[0]) / 1000 * imgWidth
+            var localHeight = (box[3] - box[1]) / 1000 * imgHeight
+            
+            // Apply zoom and pan transforms to get screen coordinates
             return {
-                x: imgX + (box[0] / 1000) * imgWidth,
-                y: imgY + (box[1] / 1000) * imgHeight,
-                width: (box[2] - box[0]) / 1000 * imgWidth,
-                height: (box[3] - box[1]) / 1000 * imgHeight
+                x: imgX + (localX * scale) + panX,
+                y: imgY + (localY * scale) + panY,
+                width: localWidth * scale,
+                height: localHeight * scale
             }
         }
         onPositionChanged: function(mouse) {
@@ -221,9 +253,20 @@ Item {
                     var imgX = (mainImage.width - imgWidth) / 2
                     var imgY = (mainImage.height - imgHeight) / 2
                     
-                    // Convert mouse position to normalized coordinates
-                    var mouseX = (mouse.x - imgX) / imgWidth
-                    var mouseY = (mouse.y - imgY) / imgHeight
+                    // Account for zoom and pan transforms when converting mouse position
+                    var scale = scaleTransform.xScale
+                    var panX = panTransform.x
+                    var panY = panTransform.y
+                    
+                    // Convert screen coordinates to image-local coordinates (accounting for pan)
+                    var localX = (mouse.x - imgX - panX) / scale
+                    var localY = (mouse.y - imgY - panY) / scale
+                    
+                    // Convert to normalized image coordinates (0-1 range)
+                    var mouseX = localX / imgWidth
+                    var mouseY = localY / imgHeight
+                    
+                    // Clamp to image bounds and convert to 0-1000 range
                     mouseX = Math.max(0, Math.min(1, mouseX)) * 1000
                     mouseY = Math.max(0, Math.min(1, mouseY)) * 1000
                     
@@ -430,11 +473,24 @@ Item {
             var imgX = (mainImage.width - imgWidth) / 2
             var imgY = (mainImage.height - imgHeight) / 2
             
-            // Convert mouse coordinates to image coordinates
-            var imgCoordX1 = (x1 - imgX) / imgWidth
-            var imgCoordY1 = (y1 - imgY) / imgHeight
-            var imgCoordX2 = (x2 - imgX) / imgWidth
-            var imgCoordY2 = (y2 - imgY) / imgHeight
+            // Account for zoom and pan transforms
+            // The transforms are applied in order: Scale then Translate
+            // To reverse: subtract pan, then divide by scale
+            var scale = scaleTransform.xScale
+            var panX = panTransform.x
+            var panY = panTransform.y
+            
+            // Convert screen coordinates to image-local coordinates (accounting for pan)
+            var localX1 = (x1 - imgX - panX) / scale
+            var localY1 = (y1 - imgY - panY) / scale
+            var localX2 = (x2 - imgX - panX) / scale
+            var localY2 = (y2 - imgY - panY) / scale
+            
+            // Convert to normalized image coordinates (0-1 range)
+            var imgCoordX1 = localX1 / imgWidth
+            var imgCoordY1 = localY1 / imgHeight
+            var imgCoordX2 = localX2 / imgWidth
+            var imgCoordY2 = localY2 / imgHeight
             
             // Clamp to image bounds
             imgCoordX1 = Math.max(0, Math.min(1, imgCoordX1))
@@ -448,6 +504,15 @@ Item {
             var top = Math.min(imgCoordY1, imgCoordY2) * 1000
             var bottom = Math.max(imgCoordY1, imgCoordY2) * 1000
             
+            // Ensure minimum size
+            if (right - left < 10) {
+                if (right < 1000) right = left + 10
+                else left = right - 10
+            }
+            if (bottom - top < 10) {
+                if (bottom < 1000) bottom = top + 10
+                else top = bottom - 10
+            }
             
             var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom)
             left = constrainedBox[0]
@@ -529,11 +594,16 @@ Item {
     // Crop rectangle overlay
     Item {
         id: cropOverlay
-        visible: uiState && uiState.isCropping && uiState.currentCropBox
+        property var cropBox: uiState ? uiState.currentCropBox : [0, 0, 1000, 1000]
+        property bool hasActiveCrop: cropBox
+                                     && cropBox.length === 4
+                                     && !(cropBox[0] === 0
+                                          && cropBox[1] === 0
+                                          && cropBox[2] === 1000
+                                          && cropBox[3] === 1000)
+        visible: uiState && uiState.isCropping && hasActiveCrop
         anchors.fill: parent
         z: 100
-        
-        property var cropBox: uiState ? uiState.currentCropBox : [0, 0, 1000, 1000]
         
         onCropBoxChanged: {
             if (!mainImage.source) return
@@ -550,6 +620,16 @@ Item {
             function onPaintedHeightChanged() { if (cropOverlay.visible) cropOverlay.updateCropRect() }
         }
         
+        Connections {
+            target: uiState
+            function onCurrentCropBoxChanged() {
+                cropOverlay.cropBox = uiState.currentCropBox
+                if (cropOverlay.visible && mainImage.source) {
+                    cropOverlay.updateCropRect()
+                }
+            }
+        }
+        
         function updateCropRect() {
             if (!mainImage.source) return
             
@@ -558,10 +638,22 @@ Item {
             var imgX = (mainImage.width - imgWidth) / 2
             var imgY = (mainImage.height - imgHeight) / 2
             
-            var left = imgX + (cropBox[0] / 1000) * imgWidth
-            var top = imgY + (cropBox[1] / 1000) * imgHeight
-            var right = imgX + (cropBox[2] / 1000) * imgWidth
-            var bottom = imgY + (cropBox[3] / 1000) * imgHeight
+            // Account for zoom and pan transforms when displaying crop box
+            var scale = mainImage.scaleTransform ? mainImage.scaleTransform.xScale : 1.0
+            var panX = mainImage.panTransform ? mainImage.panTransform.x : 0
+            var panY = mainImage.panTransform ? mainImage.panTransform.y : 0
+            
+            // Convert normalized crop box (0-1000) to image-local coordinates
+            var localLeft = (cropBox[0] / 1000) * imgWidth
+            var localTop = (cropBox[1] / 1000) * imgHeight
+            var localRight = (cropBox[2] / 1000) * imgWidth
+            var localBottom = (cropBox[3] / 1000) * imgHeight
+            
+            // Apply zoom and pan transforms to get screen coordinates
+            var left = imgX + (localLeft * scale) + panX
+            var top = imgY + (localTop * scale) + panY
+            var right = imgX + (localRight * scale) + panX
+            var bottom = imgY + (localBottom * scale) + panY
             
             cropRect.x = left
             cropRect.y = top
