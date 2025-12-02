@@ -7,6 +7,8 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 - Changed how image caching works for even faster display.   
 - Pressing H brings up a RGB histogram which is designed to show even a little bit of highlight clipping and updates as you zoom in.
 - Added batch delete with confirmation dialog.
+- Added the --cachedebug command line argument which gives info on the image cache in the status bar.   Doesn't seem to slow down the program at all, just takes up room in the status bar.A
+- Added a setting that switches between image display optimized for speed or quality.
 
 ## [1.3.0] - 2025-11-23
 

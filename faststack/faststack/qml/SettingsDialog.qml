@@ -29,6 +29,7 @@ Dialog {
         cacheSizeField.text = settingsDialog.cacheSize.toFixed(1)
         heliconPathField.text = settingsDialog.heliconPath
         photoshopPathField.text = settingsDialog.photoshopPath
+        optimizeForComboBox.currentIndex = optimizeForComboBox.model.indexOf(settingsDialog.optimizeFor)
     }
 
     property string heliconPath: ""
@@ -37,6 +38,7 @@ Dialog {
     property int theme: 0
     property string defaultDirectory: ""
     property string photoshopPath: ""
+    property string optimizeFor: "speed"
 
     property string awbMode: "lab"
     property double awbStrength: 0.7
@@ -54,6 +56,7 @@ Dialog {
         uiState.set_prefetch_radius(prefetchRadius)
         uiState.set_theme(theme)
         uiState.set_default_directory(defaultDirectory)
+        uiState.set_optimize_for(optimizeFor)
         
         uiState.awbMode = awbMode
         uiState.awbStrength = awbStrength
@@ -200,6 +203,17 @@ Dialog {
                         if (path) defaultDirectoryField.text = path
                     }
                 }
+
+                // Optimize For
+                Label { text: "Optimize For:" }
+                ComboBox {
+                    id: optimizeForComboBox
+                    model: ["speed", "quality"]
+                    currentIndex: model.indexOf(settingsDialog.optimizeFor)
+                    onCurrentIndexChanged: settingsDialog.optimizeFor = model[currentIndex]
+                    Layout.fillWidth: true
+                }
+                Label {} // Placeholder
             }
 
             GridLayout {

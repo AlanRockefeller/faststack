@@ -261,6 +261,7 @@ ApplicationWindow {
                         settingsDialog.prefetchRadius   = uiState.get_prefetch_radius()
                         settingsDialog.theme            = uiState.theme
                         settingsDialog.defaultDirectory = uiState.get_default_directory()
+                        settingsDialog.optimizeFor       = uiState.get_optimize_for()
                         settingsDialog.awbMode          = uiState.awbMode
                         settingsDialog.awbStrength      = uiState.awbStrength
                         settingsDialog.awbWarmBias      = uiState.awbWarmBias
@@ -781,11 +782,42 @@ ApplicationWindow {
             }
 
             Label {
-                text: uiState ? uiState.cacheStats : ""
+                id: cacheUsageLabel
+                text: uiState ? `Cache: ${cacheUsageValue.toFixed(2)} GB` : ""
                 color: "#00FFFF" // Cyan
                 font.family: "Monospace"
                 visible: uiState ? uiState.debugCache : false
                 Layout.rightMargin: 10
+                property real cacheUsageValue: 0.0
+                
+                Connections {
+                    target: uiState
+                    function onDebugCacheChanged() {
+                        if (uiState && uiState.debugCache) {
+                            cacheUsageTimer.running = true
+                        } else {
+                            cacheUsageTimer.running = false
+                        }
+                    }
+                }
+                
+                Component.onCompleted: {
+                    if (uiState && uiState.debugCache) {
+                        cacheUsageTimer.running = true
+                    }
+                }
+                
+                Timer {
+                    id: cacheUsageTimer
+                    interval: 1000
+                    repeat: true
+                    running: false
+                    onTriggered: {
+                        if (uiState) {
+                            cacheUsageLabel.cacheUsageValue = uiState.get_cache_usage_gb()
+                        }
+                    }
+                }
             }
 
             // Saturation slider (only visible in saturation mode)

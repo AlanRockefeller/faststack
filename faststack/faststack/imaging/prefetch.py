@@ -302,8 +302,11 @@ class Prefetcher:
             return None
 
         try:
-            # Get current color management mode
+            # Get current color management mode and optimization setting
             color_mode = config.get('color', 'mode', fallback="none").lower()
+            optimize_for = config.get('core', 'optimize_for', fallback='speed').lower()
+            fast_dct = (optimize_for == 'speed')
+            use_resized = (optimize_for == 'speed')  # Use decode_jpeg_resized for speed, decode_jpeg_rgb for quality
 
             # Option C: Full ICC pipeline - Use TurboJPEG for decode, Pillow only for ICC conversion
             if color_mode == "icc":
@@ -316,8 +319,15 @@ class Prefetcher:
                     with open(image_file.path, "rb") as f:
                         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                             # Pass mmap directly - no copy! Decoders accept bytes-like objects
-                            # Use fast_dct=True for speed
-                            buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=True)
+                            if use_resized:
+                                buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                            else:
+                                # Quality mode: decode full image then resize with high quality
+                                buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                                if buffer is not None:
+                                    img = PILImage.fromarray(buffer)
+                                    img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                    buffer = np.array(img)
                     t_after_read = time.perf_counter()
                     if buffer is None:
                         return None
@@ -379,8 +389,15 @@ class Prefetcher:
                         with open(image_file.path, "rb") as f:
                             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                                 # Pass mmap directly - no copy!
-                                # Use fast_dct=True for speed
-                                buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=True)
+                                if use_resized:
+                                    buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                                else:
+                                    # Quality mode: decode full image then resize with high quality
+                                    buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                                    if buffer is not None:
+                                        img = PILImage.fromarray(buffer)
+                                        img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                        buffer = np.array(img)
                         t_after_fallback_read = time.perf_counter()
                         if buffer is None:
                             return None
@@ -403,8 +420,15 @@ class Prefetcher:
                     with open(image_file.path, "rb") as f:
                         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                             # Pass mmap directly - no copy!
-                            # Use fast_dct=True for speed
-                            buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=True)
+                            if use_resized:
+                                buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                            else:
+                                # Quality mode: decode full image then resize with high quality
+                                buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                                if buffer is not None:
+                                    img = PILImage.fromarray(buffer)
+                                    img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                    buffer = np.array(img)
                     t_after_read = time.perf_counter()
                     if buffer is None:
                         return None
@@ -426,8 +450,15 @@ class Prefetcher:
                 with open(image_file.path, "rb") as f:
                     with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                         # Pass mmap directly - no copy! Decoders accept bytes-like objects
-                        # Use fast_dct=True for speed
-                        buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=True)
+                        if use_resized:
+                            buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                        else:
+                            # Quality mode: decode full image then resize with high quality
+                            buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                            if buffer is not None:
+                                img = PILImage.fromarray(buffer)
+                                img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                buffer = np.array(img)
                 t_after_read = time.perf_counter()
                 if buffer is None:
                     return None

@@ -14,6 +14,7 @@ DEFAULT_CONFIG = {
         "prefetch_radius": "4",
         "theme": "dark",
         "default_directory": "",
+        "optimize_for": "speed",  # "speed" or "quality"
     },
     "helicon": {
         "exe": "C:\\Program Files\\Helicon Software\\Helicon Focus 8\\HeliconFocus.exe",

@@ -27,8 +27,10 @@ Item {
         source: uiState && uiState.imageCount > 0 ? uiState.currentImageSource : ""
         fillMode: Image.PreserveAspectFit
         cache: false // We do our own caching in Python
-	smooth: uiState && !uiState.anySliderPressed
-	mipmap: uiState && !uiState.anySliderPressed
+	smooth: uiState && !uiState.anySliderPressed && !isZooming
+	mipmap: uiState && !uiState.anySliderPressed && !isZooming
+        
+        property bool isZooming: false
 
         Component.onCompleted: {
             if (width > 0 && height > 0) {
@@ -55,6 +57,26 @@ Item {
             } else if (scaleTransform.xScale <= 1.0 && uiState.isZoomed) {
                 uiState.setZoomed(false);
             }
+            
+            // Update histogram with zoom/pan info if histogram is visible
+            if (uiState && uiState.isHistogramVisible && controller) {
+                var zoom = scaleTransform.xScale
+                var panX = panTransform.x
+                var panY = panTransform.y
+                // Calculate image scale (painted size vs actual size)
+                var imageScale = mainImage.paintedWidth > 0 ? (mainImage.paintedWidth / mainImage.sourceSize.width) : 1.0
+                controller.update_histogram(zoom, panX, panY, imageScale)
+            }
+        }
+        
+        function updateHistogramWithZoom() {
+            if (uiState && uiState.isHistogramVisible && controller) {
+                var zoom = scaleTransform.xScale
+                var panX = panTransform.x
+                var panY = panTransform.y
+                var imageScale = mainImage.paintedWidth > 0 ? (mainImage.paintedWidth / mainImage.sourceSize.width) : 1.0
+                controller.update_histogram(zoom, panX, panY, imageScale)
+            }
         }
 
         transform: [
@@ -62,11 +84,19 @@ Item {
                 id: scaleTransform
                 origin.x: mainImage.width / 2
                 origin.y: mainImage.height / 2
-                onXScaleChanged: mainImage.updateZoomState()
-                onYScaleChanged: mainImage.updateZoomState()
+                onXScaleChanged: {
+                    mainImage.updateZoomState()
+                    mainImage.updateHistogramWithZoom()
+                }
+                onYScaleChanged: {
+                    mainImage.updateZoomState()
+                    mainImage.updateHistogramWithZoom()
+                }
             },
             Translate {
                 id: panTransform
+                onXChanged: mainImage.updateHistogramWithZoom()
+                onYChanged: mainImage.updateHistogramWithZoom()
             }
         ]
     }
@@ -284,13 +314,111 @@ Item {
             }
         }
 
-        // Wheel for zoom
+        // Wheel for zoom - zooms in towards cursor, zooms out towards center
         onWheel: function(wheel) {
-            // A real implementation would be more complex, zooming
-            // into the cursor position.
-            var scaleFactor = wheel.angleDelta.y > 0 ? 1.2 : 1 / 1.2;
-            scaleTransform.xScale *= scaleFactor;
-            scaleTransform.yScale *= scaleFactor;
+            // Disable smooth rendering during zoom for better performance
+            mainImage.isZooming = true
+            
+            // Use a smaller scale factor for smoother, more responsive zoom
+            var isZoomingIn = wheel.angleDelta.y > 0
+            var scaleFactor = isZoomingIn ? 1.1 : 1 / 1.1;
+            
+            // Calculate old and new scale
+            var oldScale = scaleTransform.xScale
+            var newScale = oldScale * scaleFactor
+            newScale = Math.max(0.1, Math.min(20.0, newScale))
+            
+            // Get the image's painted (displayed) bounds
+            var imgWidth = mainImage.paintedWidth
+            var imgHeight = mainImage.paintedHeight
+            var centerX = mainImage.width / 2
+            var centerY = mainImage.height / 2
+            
+            if (isZoomingIn) {
+                // Zoom in: zoom towards cursor position
+                var mouseX = wheel.x
+                var mouseY = wheel.y
+                var imgX = (mainImage.width - imgWidth) / 2
+                var imgY = (mainImage.height - imgHeight) / 2
+                
+                // Calculate the point in the image that's under the cursor
+                var pointInImageX = mouseX - imgX
+                var pointInImageY = mouseY - imgY
+                
+                // Only zoom towards cursor if cursor is over the image
+                if (pointInImageX >= 0 && pointInImageX <= imgWidth && 
+                    pointInImageY >= 0 && pointInImageY <= imgHeight) {
+                    
+                    // Calculate offset from image center in screen coordinates
+                    var centerOffsetX = pointInImageX - imgWidth / 2
+                    var centerOffsetY = pointInImageY - imgHeight / 2
+                    
+                    // The current screen position of a point is: (imgPoint * oldScale) + oldPan + center
+                    // We want to find what's currently under the cursor and keep it there
+                    // Instead of dividing by oldScale (which loses precision), work with scaled values
+                    
+                    // Calculate what the scaled image point currently is (before zoom)
+                    // This is: (centerOffset - pan) which represents (imgPoint * oldScale)
+                    var scaledImagePointX = centerOffsetX - panTransform.x
+                    var scaledImagePointY = centerOffsetY - panTransform.y
+                    
+                    // Adjust the scale origin to the cursor position
+                    scaleTransform.origin.x = mouseX
+                    scaleTransform.origin.y = mouseY
+                    
+                    // Apply the new scale first
+                    scaleTransform.xScale = newScale
+                    scaleTransform.yScale = newScale
+                    
+                    // After zoom, the scaled image point becomes: scaledImagePoint * (newScale / oldScale)
+                    // We want it to stay at the same screen position, so:
+                    // newPan = centerOffset - (scaledImagePoint * newScale / oldScale)
+                    // Use scaleRatio to avoid precision loss from repeated division
+                    var scaleRatio = newScale / oldScale
+                    var newPanX = centerOffsetX - (scaledImagePointX * scaleRatio)
+                    var newPanY = centerOffsetY - (scaledImagePointY * scaleRatio)
+                    
+                    // Apply the adjusted pan
+                    panTransform.x = newPanX
+                    panTransform.y = newPanY
+                } else {
+                    // If cursor is outside image, zoom from center
+                    scaleTransform.origin.x = centerX
+                    scaleTransform.origin.y = centerY
+                    scaleTransform.xScale = newScale
+                    scaleTransform.yScale = newScale
+                }
+            } else {
+                // Zoom out: always zoom towards center of screen
+                scaleTransform.origin.x = centerX
+                scaleTransform.origin.y = centerY
+                
+                // When zooming out, we need to adjust pan to keep the center visible
+                // The pan values are in screen coordinates, but they represent image-space offsets
+                // When scale changes, we need to scale the pan proportionally to maintain
+                // the same visual position relative to the center
+                var scaleRatio = newScale / oldScale
+                
+                // Adjust pan to keep the center point fixed
+                // If we're zooming out (scaleRatio < 1), pan should be reduced proportionally
+                panTransform.x = panTransform.x * scaleRatio
+                panTransform.y = panTransform.y * scaleRatio
+                
+                // Apply the new scale
+                scaleTransform.xScale = newScale
+                scaleTransform.yScale = newScale
+            }
+            
+            // Re-enable smooth rendering after a short delay
+            zoomSmoothTimer.restart()
+        }
+        
+        Timer {
+            id: zoomSmoothTimer
+            interval: 150  // Re-enable smooth rendering 150ms after last zoom
+            onTriggered: {
+                mainImage.isZooming = false
+            }
         }
         
         function updateCropBox(x1, y1, x2, y2) {

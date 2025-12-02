@@ -1242,6 +1242,22 @@ class AppController(QObject):
     def set_default_directory(self, path):
         config.set('core', 'default_directory', path)
         config.save()
+
+    def get_optimize_for(self):
+        return config.get('core', 'optimize_for', fallback='speed')
+    
+    def set_optimize_for(self, optimize_for):
+        old_value = config.get('core', 'optimize_for', fallback='speed')
+        config.set('core', 'optimize_for', optimize_for)
+        config.save()
+        
+        # If the setting changed, clear cache and redraw current image
+        if old_value != optimize_for:
+            log.info(f"Optimize for changed from {old_value} to {optimize_for}, clearing cache and redrawing")
+            self.image_cache.clear()
+            # Force redraw of current image
+            if self.current_index >= 0 and self.current_index < len(self.image_files):
+                self.ui_state.currentImageSourceChanged.emit()
         
     def open_directory_dialog(self):
         dialog = QFileDialog()
@@ -2174,8 +2190,16 @@ class AppController(QObject):
             log.info("Histogram window closed")
     
     @Slot()
-    def update_histogram(self):
-        """Update histogram data from current image."""
+    @Slot(float, float, float, float)  # zoom, panX, panY, imageScale
+    def update_histogram(self, zoom: float = 1.0, pan_x: float = 0.0, pan_y: float = 0.0, image_scale: float = 1.0):
+        """Update histogram data from current image.
+        
+        Args:
+            zoom: Zoom scale factor (1.0 = no zoom)
+            pan_x: Pan offset in X direction (in image coordinates)
+            pan_y: Pan offset in Y direction (in image coordinates)
+            image_scale: Scale factor of displayed image vs original
+        """
         if not self.image_files or self.current_index >= len(self.image_files):
             return
         
@@ -2196,6 +2220,44 @@ class AppController(QObject):
             # Convert buffer to numpy array
             arr = np.frombuffer(decoded.buffer, dtype=np.uint8)
             arr = arr.reshape((decoded.height, decoded.width, 3))
+            
+            # If zoomed in, calculate visible region and only use that portion
+            if zoom > 1.1 and self.ui_state.isZoomed:
+                # Calculate visible region in image coordinates
+                # When zoomed, the visible area is the original image size divided by zoom
+                # The pan_x/pan_y are in screen coordinates relative to transform origin (center)
+                # image_scale is the scale factor of displayed image vs original
+                
+                # Visible size in original image coordinates
+                visible_width = decoded.width / zoom
+                visible_height = decoded.height / zoom
+                
+                # Center of visible region in image coordinates
+                # pan_x/pan_y are screen pixel offsets, convert to image pixels
+                # Account for image_scale: if image is scaled down for display, pan needs scaling too
+                center_x = decoded.width / 2
+                center_y = decoded.height / 2
+                
+                # Convert pan from screen pixels to image pixels
+                # If image_scale < 1, the image is displayed smaller, so pan needs to be scaled up
+                pan_x_image = pan_x / image_scale if image_scale > 0 else 0
+                pan_y_image = pan_y / image_scale if image_scale > 0 else 0
+                
+                # The visible center in image coordinates (accounting for pan)
+                visible_center_x = center_x - (pan_x_image / zoom)
+                visible_center_y = center_y - (pan_y_image / zoom)
+                
+                # Calculate bounds
+                visible_x_start = max(0, int(visible_center_x - visible_width / 2))
+                visible_y_start = max(0, int(visible_center_y - visible_height / 2))
+                visible_x_end = min(decoded.width, int(visible_center_x + visible_width / 2))
+                visible_y_end = min(decoded.height, int(visible_center_y + visible_height / 2))
+                
+                # Ensure we have valid bounds
+                if visible_x_end > visible_x_start and visible_y_end > visible_y_start:
+                    # Extract only the visible portion
+                    arr = arr[visible_y_start:visible_y_end, visible_x_start:visible_x_end, :]
+                    log.debug(f"Histogram: Using zoomed region {visible_x_start},{visible_y_start} to {visible_x_end},{visible_y_end} (zoom={zoom:.2f}, pan=({pan_x:.1f},{pan_y:.1f}))")
             
             # --- New Histogram Logic ---
             bins = 256

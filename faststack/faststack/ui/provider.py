@@ -458,10 +458,18 @@ class UIState(QObject):
     @Slot(result=str)
     def get_default_directory(self):
         return self.app_controller.get_default_directory()
-
+    
     @Slot(str)
     def set_default_directory(self, path):
         self.app_controller.set_default_directory(path)
+
+    @Slot(result=str)
+    def get_optimize_for(self):
+        return self.app_controller.get_optimize_for()
+    
+    @Slot(str)
+    def set_optimize_for(self, optimize_for):
+        self.app_controller.set_optimize_for(optimize_for)
 
     @Slot(result=str)
     def open_directory_dialog(self):

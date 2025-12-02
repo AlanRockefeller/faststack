@@ -25,6 +25,14 @@ Window {
         }
         function onCurrentImageSourceChanged() {
             if (histogramWindow.visible && controller) {
+                // Get zoom/pan info from main image view
+                var zoom = 1.0
+                var panX = 0.0
+                var panY = 0.0
+                var imageScale = 1.0
+                
+                // Try to get zoom/pan from Components (if accessible)
+                // For now, just call without params - Components will handle it
                 controller.update_histogram()
             }
         }
