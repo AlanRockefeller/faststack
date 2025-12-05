@@ -226,14 +226,24 @@ class ImageEditor:
         mg_val = self.current_edits['white_balance_mg'] * 0.5
         if abs(by_val) > 0.001 or abs(mg_val) > 0.001:
             arr = np.array(img, dtype=np.float32)
-            by_shift = by_val * 127.5
-            mg_shift = mg_val * 127.5
-            # Apply temperature (by_shift) primarily between R and B, and
-            # tint (mg_shift) primarily to G relative to R/B. We apply half
-            # of the tint opposite to R/B so that tint shifts G against R/B.
-            arr[:, :, 0] += (by_shift - 0.5 * mg_shift)  # R
-            arr[:, :, 1] += (1.0 * mg_shift)              # G
-            arr[:, :, 2] -= (by_shift - 0.5 * mg_shift)  # B
+            # Multiplicative White Balance (Gain-based)
+            # This preserves black levels (0 * gain = 0) while adjusting the color balance of brighter pixels.
+            
+            # Temperature (Blue-Yellow):
+            # Positive = Warm (Yellow/Red), Negative = Cool (Blue)
+            r_gain = 1.0 + by_val
+            b_gain = 1.0 - by_val
+            
+            # Tint (Magenta-Green):
+            # Positive = Magenta (Red+Blue boost or Green cut), Negative = Green (Green boost)
+            # Standard approach: Adjust Green channel opposite to the tint value.
+            g_gain = 1.0 - mg_val
+
+            # Apply gains
+            arr[:, :, 0] = arr[:, :, 0] * r_gain
+            arr[:, :, 1] = arr[:, :, 1] * g_gain
+            arr[:, :, 2] = arr[:, :, 2] * b_gain
+            
             np.clip(arr, 0, 255, out=arr)
             img = Image.fromarray(arr.astype(np.uint8))
 

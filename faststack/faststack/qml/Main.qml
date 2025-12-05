@@ -681,14 +681,20 @@ ApplicationWindow {
     // -------- FOOTER / STATUS BAR (old version) --------
     footer: Rectangle {
         id: footerRect
-        implicitHeight: footerRow.implicitHeight + 10 // Add some padding
+        // Keep footer height fixed so the main image area doesn't change size when
+        // stack/batch labels appear or disappear (prevents cache invalidations).
+        property int fixedHeight: 60
+        height: fixedHeight
+        implicitHeight: fixedHeight
         anchors.left: parent.left
         anchors.right: parent.right
         color: Qt.rgba(root.currentBackgroundColor.r, root.currentBackgroundColor.g, root.currentBackgroundColor.b, 0.8)
+        clip: true
 
         RowLayout {
             id: footerRow
             spacing: 10
+            anchors.verticalCenter: parent.verticalCenter
 
             Label {
                 Layout.leftMargin: 10

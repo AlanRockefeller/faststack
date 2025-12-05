@@ -41,7 +41,7 @@ from faststack.io.sidecar import SidecarManager
 from faststack.io.watcher import Watcher
 from faststack.io.helicon import launch_helicon_focus
 from faststack.io.executable_validator import validate_executable_path
-from faststack.imaging.cache import ByteLRUCache, get_decoded_image_size
+from faststack.imaging.cache import ByteLRUCache, get_decoded_image_size, build_cache_key
 from faststack.imaging.prefetch import Prefetcher, clear_icc_caches
 from faststack.ui.provider import ImageProvider
 from faststack.ui.keystrokes import Keybinder
@@ -363,7 +363,9 @@ class AppController(QObject):
                 return preview_data
 
         _, _, display_gen = self.get_display_info()
-        cache_key = f"{index}_{display_gen}"
+        image_path = self.image_files[index].path
+        path_str = image_path.as_posix()
+        cache_key = build_cache_key(image_path, display_gen)
 
         # Check cache
         if cache_key in self.image_cache:
@@ -376,6 +378,23 @@ class AppController(QObject):
         
         self.image_cache.misses += 1 # Increment miss counter
         self._update_cache_stats() # Update UI with new stats
+        if self.debug_cache:
+            prefix = f"{path_str}::"
+            cached_gens = [
+                key.split("::", 1)[1]
+                for key in self.image_cache.keys()
+                if key.startswith(prefix)
+            ]
+            cache_usage_gb = self.image_cache.currsize / (1024**3)
+            log.info(
+                "Cache miss for %s (index=%d gen=%d). Cached gens: %s. Cache usage=%.2fGB entries=%d",
+                image_path.name,
+                index,
+                display_gen,
+                cached_gens or "none",
+                cache_usage_gb,
+                len(self.image_cache),
+            )
 
         # Cache miss: need to decode synchronously to ensure correct image displays
         if _debug_mode:
@@ -396,8 +415,8 @@ class AppController(QObject):
                     # Wait for decode to complete (blocking but fast for JPEGs)
                     result = future.result(timeout=5.0)  # 5 second timeout as safety
                     if result:
-                        decoded_index, decoded_display_gen = result
-                        cache_key = f"{decoded_index}_{decoded_display_gen}"
+                        decoded_path, decoded_display_gen = result
+                        cache_key = build_cache_key(decoded_path, decoded_display_gen)
                         if cache_key in self.image_cache:
                             decoded = self.image_cache[cache_key]
                             with self._last_image_lock:
@@ -1076,8 +1095,30 @@ class AppController(QObject):
         return self.image_cache.currsize / (1024**3)
 
     def set_cache_size(self, size):
+        """Update cache size at runtime and persist to config."""
+        size = max(0.5, min(size, 16.0))  # enforce sane bounds
         config.set('core', 'cache_size_gb', size)
         config.save()
+        
+        old_max_bytes = self.image_cache.maxsize
+        new_max_bytes = int(size * 1024**3)
+        if old_max_bytes == new_max_bytes:
+            return
+        
+        log.info("Resizing decoded image cache from %.2f GB to %.2f GB",
+                 old_max_bytes / (1024**3), size)
+        self.image_cache.maxsize = new_max_bytes
+        
+        # If the new size is smaller than current usage, evict until under limit
+        while self.image_cache.currsize > new_max_bytes and len(self.image_cache) > 0:
+            try:
+                self.image_cache.popitem()
+            except KeyError:
+                break
+        
+        # Allow future warnings after expanding the cache
+        if new_max_bytes > old_max_bytes:
+            self._has_warned_cache_full = False
 
     def get_prefetch_radius(self):
         return config.getint('core', 'prefetch_radius')
@@ -1355,7 +1396,10 @@ class AppController(QObject):
         nearby_radius = self.prefetcher.prefetch_radius * 2
         
         for i, dist in all_images_with_dist:
-            cache_key = f"{i}_{display_gen}"
+            if i >= len(self.image_files):
+                continue
+            image_path = self.image_files[i].path
+            cache_key = build_cache_key(image_path, display_gen)
             is_cached = cache_key in self.image_cache
             is_nearby = dist <= nearby_radius
             

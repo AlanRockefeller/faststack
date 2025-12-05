@@ -4,6 +4,7 @@ import logging
 import os
 import io
 import hashlib
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import List, Dict, Optional, Callable
 import mmap
@@ -13,6 +14,7 @@ from PIL import Image as PILImage, ImageCms
 
 from faststack.models import ImageFile, DecodedImage
 from faststack.imaging.jpeg import decode_jpeg_rgb, decode_jpeg_resized, TURBO_AVAILABLE
+from faststack.imaging.cache import build_cache_key
 from faststack.config import config
 
 log = logging.getLogger(__name__)
@@ -290,7 +292,7 @@ class Prefetcher:
         log.debug("Submitted %s task for index %d", "priority" if priority else "prefetch", index)
         return future
 
-    def _decode_and_cache(self, image_file: ImageFile, index: int, generation: int, display_width: int, display_height: int, display_generation: int) -> Optional[tuple[int, int]]:
+    def _decode_and_cache(self, image_file: ImageFile, index: int, generation: int, display_width: int, display_height: int, display_generation: int) -> Optional[tuple[Path, int]]:
         """The actual work done by the thread pool."""
         import time
         
@@ -505,10 +507,10 @@ class Prefetcher:
                 bytes_per_line=bytes_per_line,
                 format=None # Placeholder for QImage.Format.Format_RGB888
             )
-            cache_key = f"{index}_{display_generation}"
+            cache_key = build_cache_key(image_file.path, display_generation)
             self.cache_put(cache_key, decoded_image)
             log.debug("Successfully decoded and cached image at index %d for display gen %d", index, display_generation)
-            return index, display_generation
+            return image_file.path, display_generation
             
         except Exception:
             log.exception("Error decoding image %s at index %d", image_file.path, index)
