@@ -90,6 +90,7 @@ class ImageEditor:
             'blacks': 0.0,
             'whites': 0.0,
             'clarity': 0.0,
+            'texture': 0.0,
         }
 
     def load_image(self, filepath: str, cached_preview: Optional[DecodedImage] = None):
@@ -265,6 +266,23 @@ class ImageEditor:
             vignette_mask = 1.0 - (dist ** 2) * vignette
             vignette_mask = vignette_mask[:, :, np.newaxis]
             arr = arr * vignette_mask
+            img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
+
+        # 14. Texture (Fine Detail Local Contrast)
+        # Similar to Clarity but with a smaller radius to target texture/fine details
+        texture = self.current_edits.get('texture', 0.0)
+        if abs(texture) > 0.001:
+            arr = np.array(img, dtype=np.float32)
+            luminance = 0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2]
+            lum_img = Image.fromarray(luminance.astype(np.uint8))
+            # Smaller radius for texture compared to clarity (20)
+            blurred = lum_img.filter(ImageFilter.GaussianBlur(radius=2.0))
+            blurred_arr = np.array(blurred, dtype=np.float32)
+            # Apply texture enhancement primarily to midtones
+            midtone_mask = 1.0 - np.abs(luminance - 128) / 128.0
+            local_details = (luminance - blurred_arr) * texture * midtone_mask
+            for c in range(3):
+                arr[:,:,c] += local_details
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
         return img

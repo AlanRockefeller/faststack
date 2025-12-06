@@ -260,7 +260,7 @@ class AppController(QObject):
         self.sync_ui_state()
         self.ui_state.isZoomedChanged.emit()
 
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+    def eventFilter(self, watched, event) -> bool:
         # Don't handle key events when a dialog is open
         if self._dialog_open:
             return False
