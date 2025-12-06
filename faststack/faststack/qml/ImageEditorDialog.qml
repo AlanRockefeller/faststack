@@ -61,11 +61,11 @@ Window {
                 ListModel {
                     id: lightModel
                     ListElement { name: "Exposure"; key: "exposure" }
+                    ListElement { name: "Brightness"; key: "brightness" }
                     ListElement { name: "Highlights"; key: "highlights" }
                     ListElement { name: "Shadows"; key: "shadows" }
-                    ListElement { name: "Whites"; key: "whites" }
+                    ListElement { name: "Whites"; key: "whites"; reverse: true }
                     ListElement { name: "Blacks"; key: "blacks" }
-                    ListElement { name: "Brightness"; key: "brightness" }
                     ListElement { name: "Contrast"; key: "contrast" }
                 }
                 Repeater { model: lightModel; delegate: editSlider }
@@ -75,6 +75,7 @@ Window {
                 ListModel {
                     id: detailModel
                     ListElement { name: "Clarity"; key: "clarity" }
+                    ListElement { name: "Texture"; key: "texture" }
                     ListElement { name: "Sharpness"; key: "sharpness" }
                 }
                 Repeater { model: detailModel; delegate: editSlider }
@@ -92,8 +93,8 @@ Window {
                     id: colorModel
                     ListElement { name: "Saturation"; key: "saturation"; reverse: false }
                     ListElement { name: "Vibrance"; key: "vibrance"; reverse: false }
-                    ListElement { name: "White Balance (B/Y)"; key: "white_balance_by"; reverse: false }
-                    ListElement { name: "White Balance (G/M)"; key: "white_balance_mg"; reverse: false }
+                    ListElement { name: "White Balance (Blue/Yellow)"; key: "white_balance_by"; reverse: false }
+                    ListElement { name: "White Balance (Green/Magenta)"; key: "white_balance_mg"; reverse: false }
                 }
                 Repeater { model: colorModel; delegate: editSlider }
                 
@@ -135,12 +136,15 @@ Window {
                     }
                 }
                 Button { 
-                    text: "Save Edited Image (Ctrl+S)"
+                    text: "Save and Close Editor (Ctrl+S)"
                     Layout.fillWidth: true
-                    onClicked: controller.save_edited_image()
+                    onClicked: {
+                        controller.save_edited_image()
+                        uiState.isEditorOpen = false
+                    }
                 }
                 Button { 
-                    text: "Close Editor (E)"
+                    text: "Close Without Saving (E)"
                     Layout.fillWidth: true
                     onClicked: { 
                         uiState.isEditorOpen = false
@@ -159,12 +163,41 @@ Window {
             property bool isReversed: model.reverse !== undefined ? model.reverse : false
             property real displayValue: isReversed ? -slider.value : slider.value
             
-            Text {
-                text: model.name + ": " + displayValue.toFixed(0)
-                color: imageEditorDialog.textColor
-                font.pixelSize: 14
-                wrapMode: Text.WordWrap
+            RowLayout {
                 Layout.fillWidth: true
+                spacing: 5
+
+                Text {
+                    text: model.name + ":"
+                    color: imageEditorDialog.textColor
+                    font.pixelSize: 14
+                }
+                
+                Item { Layout.fillWidth: true } // Spacer
+
+                TextInput {
+                    id: valueInput
+                    text: displayValue.toFixed(0)
+                    color: imageEditorDialog.textColor
+                    font.pixelSize: 14
+                    selectByMouse: true
+                    validator: IntValidator { bottom: model.min === undefined ? -100 : model.min; top: model.max === undefined ? 100 : model.max }
+                    
+                    onEditingFinished: {
+                        var val = parseInt(text)
+                        if (isNaN(val)) return
+                        
+                        // Clamp value
+                        var min = model.min === undefined ? -100 : model.min
+                        var max = model.max === undefined ? 100 : model.max
+                        if (val < min) val = min
+                        if (val > max) val = max
+                        
+                        var sendValue = isReversed ? -val : val
+                        controller.set_edit_parameter(model.key, sendValue / (model.max === undefined ? 100.0 : model.max))
+                        editDialog.updatePulse++ // Force slider update
+                    }
+                }
             }
             Slider {
                 id: slider
@@ -195,6 +228,20 @@ Window {
                 onMoved: {
                     var sendValue = isReversed ? -value : value
                     controller.set_edit_parameter(model.key, sendValue / (model.max === undefined ? 100.0 : model.max))
+                }
+
+                // Double click to reset
+                MouseArea {
+                    anchors.fill: parent
+                    acceptedButtons: Qt.LeftButton
+                    propagateComposedEvents: true
+                    onDoubleClicked: (mouse) => {
+                         controller.set_edit_parameter(model.key, 0.0)
+                         editDialog.updatePulse++
+                    }
+                    onPressed: (mouse) => {
+                         mouse.accepted = false // Let slider handle drag
+                    }
                 }
 
                 onPressedChanged: {

@@ -240,35 +240,42 @@ Item {
                 height: localHeight * scale
             }
         }
+        function mapToImageCoordinates(screenPoint) {
+            var imgWidth = mainImage.paintedWidth
+            var imgHeight = mainImage.paintedHeight
+            var imgX = (mainImage.width - imgWidth) / 2
+            var imgY = (mainImage.height - imgHeight) / 2
+            
+            var scale = scaleTransform.xScale
+            var panX = panTransform.x
+            var panY = panTransform.y
+
+            var originX = scaleTransform.origin.x
+            var originY = scaleTransform.origin.y
+
+            var x_no_pan = screenPoint.x - panX
+            var y_no_pan = screenPoint.y - panY
+
+            var x_no_scale = originX + (x_no_pan - originX) / scale
+            var y_no_scale = originY + (y_no_pan - originY) / scale
+
+            var localX = x_no_scale - imgX
+            var localY = y_no_scale - imgY
+
+            return {x: localX / imgWidth, y: localY / imgHeight}
+        }
         onPositionChanged: function(mouse) {
             if (uiState && uiState.isCropping && isCropDragging) {
                 if (cropDragMode === "new") {
                     // Update crop rectangle while dragging
-                    updateCropBox(cropStartX, cropStartY, mouse.x, mouse.y)
+                    updateCropBox(cropStartX, cropStartY, mouse.x, mouse.y, true)
                 } else if (cropDragMode !== "none") {
-                    // Refine existing crop box
-                    var cropRect = getCropRect()
-                    var imgWidth = mainImage.paintedWidth
-                    var imgHeight = mainImage.paintedHeight
-                    var imgX = (mainImage.width - imgWidth) / 2
-                    var imgY = (mainImage.height - imgHeight) / 2
                     
-                    // Account for zoom and pan transforms when converting mouse position
-                    var scale = scaleTransform.xScale
-                    var panX = panTransform.x
-                    var panY = panTransform.y
-                    
-                    // Convert screen coordinates to image-local coordinates (accounting for pan)
-                    var localX = (mouse.x - imgX - panX) / scale
-                    var localY = (mouse.y - imgY - panY) / scale
-                    
-                    // Convert to normalized image coordinates (0-1 range)
-                    var mouseX = localX / imgWidth
-                    var mouseY = localY / imgHeight
-                    
+                    var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+
                     // Clamp to image bounds and convert to 0-1000 range
-                    mouseX = Math.max(0, Math.min(1, mouseX)) * 1000
-                    mouseY = Math.max(0, Math.min(1, mouseY)) * 1000
+                    var mouseX = Math.max(0, Math.min(1, coords.x)) * 1000
+                    var mouseY = Math.max(0, Math.min(1, coords.y)) * 1000
                     
                     var left = cropBoxStartLeft
                     var top = cropBoxStartTop
@@ -277,43 +284,31 @@ Item {
                     
                     // Adjust based on drag mode
                     if (cropDragMode === "move") {
-                        var dx = mouseX - (cropBoxStartLeft + cropBoxStartRight) / 2
-                        var dy = mouseY - (cropBoxStartTop + cropBoxStartBottom) / 2
+                        var startCenterX = (cropBoxStartLeft + cropBoxStartRight) / 2
+                        var startCenterY = (cropBoxStartTop + cropBoxStartBottom) / 2
+                        
+                        var dx = mouseX - startCenterX
+                        var dy = mouseY - startCenterY
+
                         var width = cropBoxStartRight - cropBoxStartLeft
                         var height = cropBoxStartBottom - cropBoxStartTop
+
                         left = Math.max(0, Math.min(1000 - width, cropBoxStartLeft + dx))
                         top = Math.max(0, Math.min(1000 - height, cropBoxStartTop + dy))
                         right = left + width
                         bottom = top + height
-                    } else if (cropDragMode === "left") {
-                        left = Math.max(0, Math.min(right - 10, mouseX))
-                    } else if (cropDragMode === "right") {
-                        right = Math.max(left + 10, Math.min(1000, mouseX))
-                    } else if (cropDragMode === "top") {
-                        top = Math.max(0, Math.min(bottom - 10, mouseY))
-                    } else if (cropDragMode === "bottom") {
-                        bottom = Math.max(top + 10, Math.min(1000, mouseY))
-                    } else if (cropDragMode === "topleft") {
-                        left = Math.max(0, Math.min(right - 10, mouseX))
-                        top = Math.max(0, Math.min(bottom - 10, mouseY))
-                    } else if (cropDragMode === "topright") {
-                        right = Math.max(left + 10, Math.min(1000, mouseX))
-                        top = Math.max(0, Math.min(bottom - 10, mouseY))
-                    } else if (cropDragMode === "bottomleft") {
-                        left = Math.max(0, Math.min(right - 10, mouseX))
-                        bottom = Math.max(top + 10, Math.min(1000, mouseY))
-                    } else if (cropDragMode === "bottomright") {
-                        right = Math.max(left + 10, Math.min(1000, mouseX))
-                        bottom = Math.max(top + 10, Math.min(1000, mouseY))
-                    }
-                    
-                    
-                    var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom)
-                    left = constrainedBox[0]
-                    top = constrainedBox[1]
-                    right = constrainedBox[2]
-                    bottom = constrainedBox[3]
+                    } else {
+                        if (cropDragMode.includes("left")) left = mouseX;
+                        if (cropDragMode.includes("right")) right = mouseX;
+                        if (cropDragMode.includes("top")) top = mouseY;
+                        if (cropDragMode.includes("bottom")) bottom = mouseY;
 
+                        var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom, cropDragMode)
+                        left = constrainedBox[0]
+                        top = constrainedBox[1]
+                        right = constrainedBox[2]
+                        bottom = constrainedBox[3]
+                    }
                     
                     uiState.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
                 }
@@ -464,39 +459,17 @@ Item {
             }
         }
         
-        function updateCropBox(x1, y1, x2, y2) {
+        function updateCropBox(x1, y1, x2, y2, applyAspectRatio = false) {
             if (!uiState || !mainImage.source) return
-            
-            // Get image display bounds (accounting for PreserveAspectFit)
-            var imgWidth = mainImage.paintedWidth
-            var imgHeight = mainImage.paintedHeight
-            var imgX = (mainImage.width - imgWidth) / 2
-            var imgY = (mainImage.height - imgHeight) / 2
-            
-            // Account for zoom and pan transforms
-            // The transforms are applied in order: Scale then Translate
-            // To reverse: subtract pan, then divide by scale
-            var scale = scaleTransform.xScale
-            var panX = panTransform.x
-            var panY = panTransform.y
-            
-            // Convert screen coordinates to image-local coordinates (accounting for pan)
-            var localX1 = (x1 - imgX - panX) / scale
-            var localY1 = (y1 - imgY - panY) / scale
-            var localX2 = (x2 - imgX - panX) / scale
-            var localY2 = (y2 - imgY - panY) / scale
-            
-            // Convert to normalized image coordinates (0-1 range)
-            var imgCoordX1 = localX1 / imgWidth
-            var imgCoordY1 = localY1 / imgHeight
-            var imgCoordX2 = localX2 / imgWidth
-            var imgCoordY2 = localY2 / imgHeight
+
+            var imgCoord1 = mapToImageCoordinates(Qt.point(x1, y1))
+            var imgCoord2 = mapToImageCoordinates(Qt.point(x2, y2))
             
             // Clamp to image bounds
-            imgCoordX1 = Math.max(0, Math.min(1, imgCoordX1))
-            imgCoordY1 = Math.max(0, Math.min(1, imgCoordY1))
-            imgCoordX2 = Math.max(0, Math.min(1, imgCoordX2))
-            imgCoordY2 = Math.max(0, Math.min(1, imgCoordY2))
+            var imgCoordX1 = Math.max(0, Math.min(1, imgCoord1.x))
+            var imgCoordY1 = Math.max(0, Math.min(1, imgCoord1.y))
+            var imgCoordX2 = Math.max(0, Math.min(1, imgCoord2.x))
+            var imgCoordY2 = Math.max(0, Math.min(1, imgCoord2.y))
             
             // Ensure left < right and top < bottom
             var left = Math.min(imgCoordX1, imgCoordX2) * 1000
@@ -513,13 +486,14 @@ Item {
                 if (bottom < 1000) bottom = top + 10
                 else top = bottom - 10
             }
-            
-            var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom)
-            left = constrainedBox[0]
-            top = constrainedBox[1]
-            right = constrainedBox[2]
-            bottom = constrainedBox[3]
 
+            if (applyAspectRatio) {
+                var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom, "new")
+                left = constrainedBox[0]
+                top = constrainedBox[1]
+                right = constrainedBox[2]
+                bottom = constrainedBox[3]
+            }
             
             uiState.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
         }
@@ -530,53 +504,95 @@ Item {
             if (name === "4:5 (Portrait)") return [4, 5]
             if (name === "1.91:1 (Landscape)") return [191, 100]
             if (name === "9:16 (Story)") return [9, 16]
+            if (name === "16:9 (Wide)") return [16, 9]
             return null
         }
         
-        function applyAspectRatioConstraint(left, top, right, bottom) {
-            if (uiState.currentAspectRatioIndex > 0 && uiState.aspectRatioNames && uiState.aspectRatioNames.length > uiState.currentAspectRatioIndex) {
-                var ratioName = uiState.aspectRatioNames[uiState.currentAspectRatioIndex]
-                var ratio = getAspectRatio(ratioName)
-                if (ratio) {
-                    var currentWidth = right - left
-                    var currentHeight = bottom - top
-                    var targetAspect = ratio[0] / ratio[1]
-                    var currentAspect = currentWidth / currentHeight
-                    
-                    if (currentAspect > targetAspect) {
-                        // Too wide, adjust height
-                        var newHeight = currentWidth / targetAspect
-                        var centerY = (top + bottom) / 2
-                        top = centerY - newHeight / 2
-                        bottom = centerY + newHeight / 2
-                        // Clamp to image bounds
-                        if (top < 0) {
-                            bottom += -top
-                            top = 0
-                        }
-                        if (bottom > 1000) {
-                            top -= (bottom - 1000)
-                            bottom = 1000
-                        }
+        function applyAspectRatioConstraint(left, top, right, bottom, dragMode) {
+            if (uiState.currentAspectRatioIndex <= 0 || !uiState.aspectRatioNames || uiState.aspectRatioNames.length <= uiState.currentAspectRatioIndex) {
+                return [left, top, right, bottom];
+            }
+
+            var ratioName = uiState.aspectRatioNames[uiState.currentAspectRatioIndex];
+            var ratio = getAspectRatio(ratioName);
+            if (!ratio) {
+                return [left, top, right, bottom];
+            }
+
+            var targetAspect = ratio[0] / ratio[1];
+            var width = right - left;
+            var height = bottom - top;
+
+            // Adjust dimensions based on which edge/corner is being dragged
+            if (dragMode.includes("left") || dragMode.includes("right")) {
+                height = width / targetAspect;
+            } else if (dragMode.includes("top") || dragMode.includes("bottom")) {
+                width = height * targetAspect;
+            } else if (dragMode === "new") {
+                if(width / height > targetAspect) {
+                    width = height * targetAspect;
+                } else {
+                    height = width / targetAspect;
+                }
+            }
+
+
+            // Anchor the box to the correct edge/corner
+            if (dragMode.includes("top")) {
+                top = bottom - height;
+            } else {
+                bottom = top + height;
+            }
+            
+            if (dragMode.includes("left")) {
+                left = right - width;
+            } else {
+                right = left + width;
+            }
+
+
+            // Clamp to image bounds and readjust
+            if (left < 0) {
+                left = 0;
+                right = width;
+            }
+            if (right > 1000) {
+                right = 1000;
+                left = 1000 - width;
+            }
+            if (top < 0) {
+                top = 0;
+                bottom = height;
+            }
+            if (bottom > 1000) {
+                bottom = 1000;
+                top = 1000 - height;
+            }
+            
+            // Final check to ensure aspect ratio is maintained after clamping
+            var finalWidth = right - left;
+            var finalHeight = bottom - top;
+            
+            if(Math.abs(finalWidth / finalHeight - targetAspect) > 0.01) {
+                if (dragMode.includes("left") || dragMode.includes("right")) {
+                    finalWidth = finalHeight * targetAspect;
+                    if(dragMode.includes("left")) {
+                        left = right - finalWidth;
                     } else {
-                        // Too tall, adjust width
-                        var newWidth = currentHeight * targetAspect
-                        var centerX = (left + right) / 2
-                        left = centerX - newWidth / 2
-                        right = centerX + newWidth / 2
-                        // Clamp to image bounds
-                        if (left < 0) {
-                            right += -left
-                            left = 0
-                        }
-                        if (right > 1000) {
-                            left -= (right - 1000)
-                            right = 1000
-                        }
+                        right = left + finalWidth;
+                    }
+                } else {
+                    finalHeight = finalWidth / targetAspect;
+                    if(dragMode.includes("top")) {
+                        top = bottom - finalHeight;
+                    } else {
+                        bottom = top + finalHeight;
                     }
                 }
             }
-            return [left, top, right, bottom]
+
+
+            return [left, top, right, bottom];
         }
         
         function updateCropBoxFromAspectRatio() {
@@ -586,7 +602,8 @@ Item {
                 box[0] / 1000 * mainImage.paintedWidth + (mainImage.width - mainImage.paintedWidth) / 2,
                 box[1] / 1000 * mainImage.paintedHeight + (mainImage.height - mainImage.paintedHeight) / 2,
                 box[2] / 1000 * mainImage.paintedWidth + (mainImage.width - mainImage.paintedWidth) / 2,
-                box[3] / 1000 * mainImage.paintedHeight + (mainImage.height - mainImage.paintedHeight) / 2
+                box[3] / 1000 * mainImage.paintedHeight + (mainImage.height - mainImage.paintedHeight) / 2,
+                true
             )
         }
     }
