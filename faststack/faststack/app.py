@@ -162,6 +162,8 @@ class AppController(QObject):
 
         # Track if any dialog is open to disable keybindings
         self._dialog_open = False
+        
+        self.auto_level_threshold = config.getfloat('core', 'auto_level_threshold', 0.1)
 
 
     @Slot(str)
@@ -2657,6 +2659,74 @@ class AppController(QObject):
             self.update_status_message(f"Crop failed: {e}")
             log.exception("Failed to crop image")
     
+    @Slot()
+    def auto_levels(self):
+        """Quickly apply auto levels, save the image, and track for undo."""
+        if not self.image_files:
+            self.update_status_message("No image to adjust")
+            return
+        
+        import time
+        image_file = self.image_files[self.current_index]
+        filepath = str(image_file.path)
+        
+        # Load the image into the editor if not already loaded
+        cached_preview = self.get_decoded_image(self.current_index)
+        if not self.image_editor.load_image(filepath, cached_preview=cached_preview):
+            self.update_status_message("Failed to load image")
+            return
+        
+        # Calculate and apply auto levels
+        blacks, whites = self.image_editor.auto_levels(self.auto_level_threshold)
+        
+        # Save the edited image (this creates a backup automatically)
+        save_result = self.image_editor.save_image()
+        if save_result:
+            saved_path, backup_path = save_result
+            # Track this action for undo
+            timestamp = time.time()
+            self.undo_history.append(("auto_levels", (saved_path, backup_path), timestamp))
+            
+            # Force the image editor to clear its current state so it reloads fresh
+            self.image_editor.clear()
+            
+            # Refresh the view - need to refresh image list since backup file was created
+            original_path = Path(filepath)
+            self.refresh_image_list()
+            
+            # Find the edited image (not the backup) in the refreshed list
+            for i, img_file in enumerate(self.image_files):
+                if img_file.path == original_path:
+                    self.current_index = i
+                    break
+            
+            # Invalidate cache
+            self.display_generation += 1
+            self.image_cache.clear()
+            self.prefetcher.cancel_all()
+            self.prefetcher.update_prefetch(self.current_index)
+            self.sync_ui_state()
+            
+            # Update histogram if visible
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
+            
+            self.update_status_message(f"Auto levels applied (clip {self.auto_level_threshold}%)")
+            log.info("Auto levels applied to %s with threshold %.2f%%", filepath, self.auto_level_threshold)
+        else:
+            self.update_status_message("Failed to save image")
+
+    @Slot(result=float)
+    def get_auto_level_clipping_threshold(self):
+        return self.auto_level_threshold
+
+    @Slot(float)
+    def set_auto_level_clipping_threshold(self, value):
+        if self.auto_level_threshold != value:
+            self.auto_level_threshold = value
+            config.set('core', 'auto_level_threshold', value)
+            config.save()
+
     @Slot()
     def quick_auto_white_balance(self):
         """Quickly apply auto white balance, save the image, and track for undo."""

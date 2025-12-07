@@ -155,6 +155,11 @@ Item {
         property real cropBoxStartTop: 0
         property real cropBoxStartRight: 0
         property real cropBoxStartBottom: 0
+        property real cropRotation: 0
+        property bool isRotating: false
+        property real cropStartAngle: 0
+        property real cropStartRotation: 0
+        onCropRotationChanged: uiState.cropRotation = cropRotation
         
         onPressed: function(mouse) {
             lastX = mouse.x
@@ -173,8 +178,15 @@ Item {
                 var inside = mouse.x >= cropRect.x && mouse.x <= cropRect.x + cropRect.width &&
                              mouse.y >= cropRect.y && mouse.y <= cropRect.y + cropRect.height
                 
+                if (mainMouseArea.isRotating) {
+                    cropDragMode = "rotate"
+                    var cropCenterX = cropRect.x + cropRect.width / 2
+                    var cropCenterY = cropRect.y + cropRect.height / 2
+                    cropStartAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
+                    cropStartRotation = cropRotation
+                }
                 // If crop box is full image, always start a new crop
-                if (isFullImage) {
+                else if (isFullImage) {
                     cropDragMode = "new"
                     cropStartX = mouse.x
                     cropStartY = mouse.y
@@ -269,6 +281,11 @@ Item {
                 if (cropDragMode === "new") {
                     // Update crop rectangle while dragging
                     updateCropBox(cropStartX, cropStartY, mouse.x, mouse.y, true)
+                } else if (cropDragMode === "rotate") {
+                    var cropCenterX = getCropRect().x + getCropRect().width / 2
+                    var cropCenterY = getCropRect().y + getCropRect().height / 2
+                    var currentAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
+                    cropRotation = cropStartRotation + (currentAngle - cropStartAngle)
                 } else if (cropDragMode !== "none") {
                     
                     var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
@@ -722,6 +739,8 @@ Item {
             color: "transparent"
             border.color: "white"
             border.width: 3
+            rotation: mainMouseArea.cropRotation
+            transformOrigin: Item.Center
         }
     }
     
@@ -732,7 +751,7 @@ Item {
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.margins: 10
-        width: 200
+        width: 120
         height: Math.max(150, aspectRatioColumn.implicitHeight + 20)
         color: "#333333"
         border.color: "#666666"
@@ -788,6 +807,34 @@ Item {
                                     mainMouseArea.updateCropBoxFromAspectRatio()
                                 }
                             }
+                        }
+                    }
+                }
+            }
+            
+            Rectangle {
+                width: parent.width
+                height: 30
+                color: "transparent"
+                radius: 3
+                
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Rotate"
+                    color: "white"
+                    font.pixelSize: 11
+                }
+                
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        mainMouseArea.isRotating = !mainMouseArea.isRotating
+                        if(mainMouseArea.isRotating) {
+                            mainMouseArea.cropDragMode = "rotate"
+                        } else {
+                            mainMouseArea.cropDragMode = "none"
                         }
                     }
                 }

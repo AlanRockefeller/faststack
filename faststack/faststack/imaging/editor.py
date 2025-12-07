@@ -287,6 +287,50 @@ class ImageEditor:
 
         return img
 
+    def auto_levels(self, threshold_percent: float = 0.1) -> Tuple[float, float]:
+        """
+        Automatically adjusts blacks and whites based on image histogram.
+        
+        Args:
+            threshold_percent: value 0.0-10.0, percentage of pixels to clip at each end.
+        
+        Returns:
+            Tuple of (blacks, whites) parameter values.
+        """
+        if self.original_image is None:
+            return 0.0, 0.0
+            
+        # Use preview image for speed if available, otherwise original
+        img = self._preview_image if self._preview_image else self.original_image
+        
+        # Convert to numpy array for histogram analysis
+        arr = np.array(img.convert('L')) # Use luminance for levels
+        
+        # Calculate percentiles
+        low_p = threshold_percent
+        high_p = 100.0 - threshold_percent
+        
+        p_low, p_high = np.percentile(arr, [low_p, high_p])
+        
+        # Calculate parameters to map p_low->0 and p_high->255
+        # Logic matches _apply_edits:
+        # black_point = -blacks * 40
+        # white_point = 255 + whites * 40
+        
+        # We want black_point to be p_low
+        # p_low = -blacks * 40 => blacks = -p_low / 40.0
+        blacks = -float(p_low) / 40.0
+        
+        # We want white_point to be p_high
+        # p_high = 255 + whites * 40 => whites = (p_high - 255) / 40.0
+        whites = (float(p_high) - 255.0) / 40.0
+        
+        # Update state
+        self.current_edits['blacks'] = blacks
+        self.current_edits['whites'] = whites
+        
+        return blacks, whites
+
     def get_preview_data(self) -> Optional[DecodedImage]:
         """Apply current edits and return the data as a DecodedImage."""
         if self._preview_image is None:

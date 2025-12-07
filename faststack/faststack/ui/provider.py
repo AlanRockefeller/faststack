@@ -93,6 +93,7 @@ class UIState(QObject):
     awbRgbUpperBoundChanged = Signal()
     default_directory_changed = Signal(str)
     isStackedJpgChanged = Signal() # New signal for isStackedJpg
+    autoLevelClippingThresholdChanged = Signal(float)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_cropping_changed = Signal(bool)
@@ -106,6 +107,7 @@ class UIState(QObject):
     aspect_ratio_names_changed = Signal(list)
     current_aspect_ratio_index_changed = Signal(int)
     current_crop_box_changed = Signal(tuple) # (left, top, right, bottom) normalized to 0-1000
+    crop_rotation_changed = Signal(float)
     anySliderPressedChanged = Signal(bool)
     sharpness_changed = Signal(float)
     rotation_changed = Signal(int)
@@ -142,6 +144,7 @@ class UIState(QObject):
         self._white_balance_by = 0.0
         self._white_balance_mg = 0.0
         self._current_crop_box = (0, 0, 1000, 1000)
+        self._crop_rotation = 0.0
         self._aspect_ratio_names = []
         self._current_aspect_ratio_index = 0
         self._any_slider_pressed = False
@@ -475,6 +478,15 @@ class UIState(QObject):
     def open_directory_dialog(self):
         return self.app_controller.open_directory_dialog()
 
+    @Property(float, notify=autoLevelClippingThresholdChanged)
+    def autoLevelClippingThreshold(self):
+        return self.app_controller.get_auto_level_clipping_threshold()
+
+    @autoLevelClippingThreshold.setter
+    def autoLevelClippingThreshold(self, value):
+        self.app_controller.set_auto_level_clipping_threshold(value)
+        self.autoLevelClippingThresholdChanged.emit(value)
+
     @Slot()
     def open_folder(self):
         self.app_controller.open_folder()
@@ -687,6 +699,16 @@ class UIState(QObject):
         if self._current_crop_box != new_value:
             self._current_crop_box = new_value
             self.current_crop_box_changed.emit(new_value)
+
+    @Property(float, notify=crop_rotation_changed)
+    def cropRotation(self) -> float:
+        return self._crop_rotation
+
+    @cropRotation.setter
+    def cropRotation(self, new_value: float):
+        if self._crop_rotation != new_value:
+            self._crop_rotation = new_value
+            self.crop_rotation_changed.emit(new_value)
     
     # --- New Properties ---
     @Property(float, notify=sharpness_changed)

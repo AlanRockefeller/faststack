@@ -15,6 +15,7 @@ DEFAULT_CONFIG = {
         "theme": "dark",
         "default_directory": "",
         "optimize_for": "speed",  # "speed" or "quality"
+        "auto_level_threshold": "0.1",
     },
     "helicon": {
         "exe": "C:\\Program Files\\Helicon Software\\Helicon Focus 8\\HeliconFocus.exe",

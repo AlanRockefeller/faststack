@@ -10,7 +10,7 @@ Dialog {
     closePolicy: Popup.CloseOnEscape
     focus: true
     width: 600
-    height: 600
+    height: 700
 
     // Live cache usage value (updated by timer)
     property real cacheUsage: 0.0
@@ -30,10 +30,12 @@ Dialog {
         heliconPathField.text = settingsDialog.heliconPath
         photoshopPathField.text = settingsDialog.photoshopPath
         optimizeForComboBox.currentIndex = optimizeForComboBox.model.indexOf(settingsDialog.optimizeFor)
+        autoLevelThresholdField.text = settingsDialog.autoLevelClippingThreshold.toFixed(4)
     }
 
     property string heliconPath: ""
     property double cacheSize: 1.5
+    property double autoLevelClippingThreshold: 0.1
     property int prefetchRadius: 4
     property int theme: 0
     property string defaultDirectory: ""
@@ -57,6 +59,7 @@ Dialog {
         uiState.set_theme(theme)
         uiState.set_default_directory(defaultDirectory)
         uiState.set_optimize_for(optimizeFor)
+        uiState.autoLevelClippingThreshold = autoLevelClippingThreshold
         
         uiState.awbMode = awbMode
         uiState.awbStrength = awbStrength
@@ -212,6 +215,24 @@ Dialog {
                     currentIndex: model.indexOf(settingsDialog.optimizeFor)
                     onCurrentIndexChanged: settingsDialog.optimizeFor = model[currentIndex]
                     Layout.fillWidth: true
+                }
+                Label {} // Placeholder
+
+                // Auto Levels Clip Threshold
+                Label { text: "Auto Levels Clip %:" }
+                TextField {
+                    id: autoLevelThresholdField
+                    Layout.fillWidth: true
+                    
+                    onEditingFinished: {
+                        var value = parseFloat(text)
+                        if (!isNaN(value) && value >= 0.0 && value <= 10.0) {
+                            settingsDialog.autoLevelClippingThreshold = value
+                            text = value.toFixed(4)
+                        } else {
+                            text = settingsDialog.autoLevelClippingThreshold.toFixed(4)
+                        }
+                    }
                 }
                 Label {} // Placeholder
             }
