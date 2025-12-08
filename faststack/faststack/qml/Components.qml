@@ -832,7 +832,7 @@ Item {
                         anchors.leftMargin: 10
                         anchors.verticalCenter: parent.verticalCenter
                         text: uiState && uiState.aspectRatioNames ? uiState.aspectRatioNames[index] : ""
-                        color: "white"
+                        color: aspectRatioWindow.isDark ? "white" : "black"
                         font.pixelSize: 11
                     }
                     
@@ -862,7 +862,7 @@ Item {
                     anchors.leftMargin: 10
                     anchors.verticalCenter: parent.verticalCenter
                     text: "Rotate"
-                    color: "white"
+                    color: aspectRatioWindow.isDark ? "white" : "black"
                     font.pixelSize: 11
                 }
                 

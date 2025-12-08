@@ -20,7 +20,7 @@ def mock_sidecar_dir(tmp_path: Path):
 def test_sidecar_load_non_existent(mock_sidecar_dir):
     """Tests loading when no sidecar file exists."""
     d = mock_sidecar_dir()
-    sm = SidecarManager(d)
+    sm = SidecarManager(d, None)
     assert sm.data.version == 2
     assert sm.data.last_index == 0
     assert not sm.data.entries
@@ -28,7 +28,7 @@ def test_sidecar_load_non_existent(mock_sidecar_dir):
 def test_sidecar_load_existing(mock_sidecar_dir):
     """Tests loading a valid, existing sidecar file."""
     content = {
-        "version": 1,
+        "version": 2,
         "last_index": 42,
         "entries": {
             "IMG_0001": { "flag": True, "reject": False, "stack_id": 1 },
@@ -36,7 +36,7 @@ def test_sidecar_load_existing(mock_sidecar_dir):
         }
     }
     d = mock_sidecar_dir(content)
-    sm = SidecarManager(d)
+    sm = SidecarManager(d, None)
 
     assert sm.data.last_index == 42
     assert len(sm.data.entries) == 2
@@ -47,7 +47,7 @@ def test_sidecar_load_existing(mock_sidecar_dir):
 def test_sidecar_save(mock_sidecar_dir):
     """Tests saving data back to the JSON file."""
     d = mock_sidecar_dir()
-    sm = SidecarManager(d)
+    sm = SidecarManager(d, None)
 
     # Modify data
     sm.set_last_index(10)
@@ -67,7 +67,7 @@ def test_sidecar_save(mock_sidecar_dir):
 def test_sidecar_get_metadata_creates_new(mock_sidecar_dir):
     """Tests that get_metadata creates a new entry if one doesn't exist."""
     d = mock_sidecar_dir()
-    sm = SidecarManager(d)
+    sm = SidecarManager(d, None)
     assert "NEW_IMG" not in sm.data.entries
     meta = sm.get_metadata("NEW_IMG")
     assert isinstance(meta, EntryMetadata)
