@@ -261,8 +261,6 @@ class Prefetcher:
 
         # For high-priority tasks (current image), cancel pending prefetch tasks
         # to free up worker threads and reduce blocking time
-        # For high-priority tasks (current image), cancel pending prefetch tasks
-        # to free up worker threads and reduce blocking time
         if priority:
             cancelled_count = 0
             # Don't cancel tasks that are very close to the requested index (e.g. +/- 2)

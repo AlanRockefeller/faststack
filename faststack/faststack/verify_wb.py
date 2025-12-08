@@ -56,11 +56,11 @@ def test_white_balance():
         print("FAIL: Grey did not shift as expected.")
 
     # Cleanup
-    try:
-        os.remove(black_path)
-        os.remove(grey_path)
-    except:
-        pass
+    for path in [black_path, grey_path]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass  # File may not exist or be locked
 
 if __name__ == "__main__":
     test_white_balance()

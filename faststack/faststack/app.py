@@ -1763,6 +1763,47 @@ class AppController(QObject):
                 log.exception("Failed to undo auto white balance")
                 # Put it back in history if it failed
                 self.undo_history.append(("auto_white_balance", (saved_path, backup_path), timestamp))
+
+        elif action_type == "auto_levels":
+            saved_path, backup_path = action_data
+            filepath_obj = Path(saved_path)
+
+            try:
+                backup_path_obj = Path(backup_path)
+                if backup_path_obj.exists():
+                    # Restore the backup
+                    filepath_obj.unlink()  # Remove the edited version
+                    backup_path_obj.rename(filepath_obj)  # Restore backup
+                    log.info("Restored backup %s for %s", backup_path_obj.name, saved_path)
+                    
+                    # Refresh the view
+                    self.refresh_image_list()
+                    
+                    # Find the restored image
+                    for i, img_file in enumerate(self.image_files):
+                        if img_file.path == filepath_obj:
+                            self.current_index = i
+                            break
+                    
+                    self.display_generation += 1
+                    self.image_cache.clear()
+                    self.prefetcher.cancel_all()
+                    self.prefetcher.update_prefetch(self.current_index)
+                    self.sync_ui_state()
+                    
+                    if self.ui_state.isHistogramVisible:
+                        self.update_histogram()
+                        
+                    self.update_status_message("Undid auto levels")
+                else:
+                    self.update_status_message("Backup not found")
+                    log.warning("Backup %s disappeared before it could be restored.", backup_path)
+                    self.undo_history.append(("auto_levels", (saved_path, backup_path), timestamp))
+            except OSError as e:
+                self.update_status_message(f"Undo failed: {e}")
+                log.exception("Failed to undo auto levels")
+                # Put it back in history if it failed
+                self.undo_history.append(("auto_levels", (saved_path, backup_path), timestamp))
         
         elif action_type == "crop":
             saved_path, backup_path = action_data
@@ -2233,16 +2274,14 @@ class AppController(QObject):
     def rotate_image_cw(self):
         """Rotate the edited image 90 degrees clockwise."""
         current = self.image_editor.current_edits.get('rotation', 0)
-        new_rotation = (current + 90) % 360
+        new_rotation = (current - 90) % 360
         self.set_edit_parameter('rotation', new_rotation)
 
     @Slot()
     def rotate_image_ccw(self):
         """Rotate the edited image 90 degrees counter-clockwise."""
         current = self.image_editor.current_edits.get('rotation', 0)
-        new_rotation = (current - 90) % 360
-        if new_rotation < 0:
-            new_rotation += 360
+        new_rotation = (current + 90) % 360
         self.set_edit_parameter('rotation', new_rotation)
     
     @Slot()

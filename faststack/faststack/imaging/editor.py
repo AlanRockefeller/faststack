@@ -465,14 +465,12 @@ class ImageEditor:
             print(f"Warning: Unable to restore timestamps for {path}: {e}")
 
     def rotate_image_cw(self):
-        """Decreases the rotation edit parameter by 90° modulo 360."""
+        """Decreases the rotation edit parameter by 90° modulo 360 (clockwise)."""
         current = self.current_edits.get('rotation', 0)
         self.current_edits['rotation'] = (current - 90) % 360
-        if self.current_edits['rotation'] < 0:
-            self.current_edits['rotation'] += 360
 
     def rotate_image_ccw(self):
-        """Increases the rotation edit parameter by 90° modulo 360."""
+        """Increases the rotation edit parameter by 90° modulo 360 (counter-clockwise)."""
         current = self.current_edits.get('rotation', 0)
         self.current_edits['rotation'] = (current + 90) % 360
 

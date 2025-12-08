@@ -29,11 +29,15 @@ Dialog {
         // Reset to summary view when opened
         showFull = false
         // Notify Python that a dialog is open
-        controller.dialog_opened()
+        if (controller) {
+            controller.dialog_opened()
+        }
     }
     
     onClosed: {
-        controller.dialog_closed()
+        if (controller) {
+            controller.dialog_closed()
+        }
     }
 
     contentItem: ColumnLayout {

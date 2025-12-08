@@ -168,7 +168,7 @@ def decode_jpeg_resized(
         if scale_factor_ratio > 4:
             resampling = Image.Resampling.BILINEAR  # Much faster
         else:
-            resampling = Image.Resampling.BILINEAR  # Changed from LANCZOS to BILINEAR for speed
+            resampling = Image.Resampling.LANCZOS  # Higher quality for smaller downscales
 
         img.thumbnail((width, height), resampling)
         return np.array(img.convert("RGB"))

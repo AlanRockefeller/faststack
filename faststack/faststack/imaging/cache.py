@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Union
+from typing import Any, Callable, Optional, Union
 
 from cachetools import LRUCache
 
@@ -16,7 +16,7 @@ class ByteLRUCache(LRUCache):
         self,
         max_bytes: int,
         size_of: Callable[[Any], int] = len,
-        on_evict: Callable[[], None] = None,
+        on_evict: Optional[Callable[[], None]] = None,
     ):
         super().__init__(maxsize=max_bytes, getsizeof=size_of)
         self.on_evict = on_evict
@@ -66,6 +66,7 @@ def get_decoded_image_size(item) -> int:
             bytes_per_pixel = getattr(item, "channels", 4)  # Default to RGBA
             return item.width * item.height * bytes_per_pixel
 
+    log.warning(f"Unexpected item type in cache: {type(item)}. Returning estimated size of 1.")
     return 1  # Should not happen
 
 
