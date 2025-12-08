@@ -19,9 +19,10 @@ Window {
 
         Keys.onPressed: function(event) {
             if (event.key === Qt.Key_H && controller) {
-                event.accepted = true
                 controller.toggle_histogram()
+                event.accepted = true // Only accept if H is pressed
             }
+            // For other keys, event.accepted remains false, allowing propagation
         }
     }
     

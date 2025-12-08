@@ -143,17 +143,107 @@ class ImageEditor:
         # 2. Free Rotation (Straighten)
         straighten_angle = self.current_edits['straighten_angle']
         if abs(straighten_angle) > 0.001:
-            img = img.rotate(straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
+            # PIL rotate is CCW, but our UI rotation is CW. Use negative angle.
+            img = img.rotate(-straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
 
         # 3. Cropping
         crop_box = self.current_edits.get('crop_box')
         if crop_box:
-            width, height = img.size
-            left = int(crop_box[0] * width / 1000)
-            top = int(crop_box[1] * height / 1000)
-            right = int(crop_box[2] * width / 1000)
-            bottom = int(crop_box[3] * height / 1000)
+            # crop_box is normalized (0-1000) relative to the *un-rotated* image (or rather, the image as seen in the UI).
+            # Since we rotated the image, we need to map this box into the rotated coordinate space.
+            
+            # Original dimensions (after discrete rotation but before free rotation)
+            # We don't have them stored directly, but we can infer.
+            # The 'img' here is already rotated and expanded.
+            # We need the dimensions *before* step 2.
+            
+            # Let's reconstruct dimensions. 
+            # If we rotate back by -angle, we get original rect? 
+            # Easier: Calculate the transformation of the crop box center.
+            
+            # 1. Get expanded dimensions
+            new_w, new_h = img.size
+            
+            # 2. Calculate original dimensions (approximate or exact?)
+            # Since we don't have the original object here easily without reloading or passing it,
+            # we can use the crop box normalization to work backward? No.
+            # Better approach: Store original dims before rotation.
+            # But we are inside _apply_edits where 'img' is mutated step-by-step.
+            # We need to know what 'img.size' was *before* the rotate(-straighten_angle) call.
+            # Since we overwrote 'img', we can't get it from 'img'. 
+            
+            # Strategy: Create a temporary dummy image of the same size as the pre-rotated image to calculate bounds?
+            # Or just mathematically invert the rotation bounding box expansion?
+            # Simpler: Modify this method to track previous size.
+            pass 
+            
+            # We need to refactor _apply_edits slightly to capture size before free rotation.
+            # Since I can't easily see the lines above "2. Free Rotation" in this REPLACE block without re-reading,
+            # I will assume I need to insert the size capture before the rotation.
+            
+            # The replace block spans from the rotation section.
+            # I will capture size before rotation.
+            
+            # BUT wait, I am replacing the existing block.
+            # I need to grab the size of 'img' *before* calling img.rotate().
+            
+            w_prev, h_prev = img.size
+            
+            # Now rotate
+            img = img.rotate(-straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
+            new_w, new_h = img.size
+            
+            # Now map crop box
+            # De-normalize crop box using ORIGINAL (pre-rotation) dimensions
+            cx_norm = (crop_box[0] + crop_box[2]) / 2000
+            cy_norm = (crop_box[1] + crop_box[3]) / 2000
+            cw_norm = (crop_box[2] - crop_box[0]) / 1000
+            ch_norm = (crop_box[3] - crop_box[1]) / 1000
+            
+            cx = cx_norm * w_prev
+            cy = cy_norm * h_prev
+            cw = cw_norm * w_prev
+            ch = ch_norm * h_prev
+            
+            # Transform center from old coordinate system to new coordinate system
+            # Old center of image: (w_prev/2, h_prev/2)
+            # New center of image: (new_w/2, new_h/2)
+            # Point relative to old center:
+            dx = cx - w_prev / 2
+            dy = cy - h_prev / 2
+            
+            # Rotate this vector by -straighten_angle (CCW if angle is positive CW? No.)
+            # straighten_angle is CW degrees.
+            # We rotated image by -straighten_angle (CCW degrees).
+            # So the vector should be rotated by -straighten_angle?
+            # Yes, the image content rotated CCW. A point fixed on the image content also rotates CCW relative to center.
+            
+            import math
+            rad = math.radians(-straighten_angle) # CCW rotation in math
+            
+            # Standard rotation matrix for CCW angle 'rad':
+            # x' = x cos - y sin
+            # y' = x sin + y cos
+            dx_rot = dx * math.cos(rad) - dy * math.sin(rad)
+            dy_rot = dx * math.sin(rad) + dy * math.cos(rad)
+            
+            # New absolute center
+            cx_rot = new_w / 2 + dx_rot
+            cy_rot = new_h / 2 + dy_rot
+            
+            # Define crop rect centered at cx_rot, cy_rot with same dimensions (cw, ch)
+            # because we rotate the image to align with the box, so the box becomes axis-aligned
+            # and retains its dimensions relative to the image content.
+            
+            left = int(cx_rot - cw / 2)
+            top = int(cy_rot - ch / 2)
+            right = int(cx_rot + cw / 2)
+            bottom = int(cy_rot + ch / 2)
+            
             img = img.crop((left, top, right, bottom))
+        elif abs(straighten_angle) > 0.001:
+             # No crop box but rotation? Just keep the rotated expanded image.
+             pass
         
         # 3. Exposure (gamma-based)
         exposure = self.current_edits['exposure']
@@ -402,14 +492,38 @@ class ImageEditor:
             # Re-open original to correctly detect format and get EXIF
             with Image.open(original_path) as original_img:
                 original_format = original_img.format or original_path.suffix.lstrip('.').upper()
-                exif_data = original_img.info.get('exif')
+                
+                # Handle EXIF
+                exif_bytes = original_img.info.get('exif')
+                
+                # Try to reset orientation to Normal (1) if EXIF exists
+                if exif_bytes:
+                    try:
+                        # Load exif data as an object
+                        exif = original_img.getexif()
+                        # Tag 274 is Orientation. Set to 1 (Normal)
+                        if 274 in exif:
+                            exif[274] = 1
+                            # Serialize back to bytes - Pillow >= 8.2.0 required for tobytes()
+                            # If tobytes() is missing, we might skip writing modified EXIF or write original
+                            if hasattr(exif, 'tobytes'):
+                                exif_bytes = exif.tobytes()
+                            else:
+                                # Fallback for older Pillow: skip writing EXIF if we can't sanitize it
+                                # to avoid double-rotation bug.
+                                print("Warning: Pillow too old to sanitize EXIF bytes. Skipping EXIF write to prevent double-rotation.")
+                                exif_bytes = None
+                    except Exception as e:
+                        print(f"Warning: Failed to sanitize EXIF orientation: {e}")
+                        # Fallback: safer to skip EXIF than write bad orientation
+                        exif_bytes = None
 
             save_kwargs = {}
             if original_format == 'JPEG':
                 save_kwargs['format'] = 'JPEG'
                 save_kwargs['quality'] = 95
-                if exif_data:
-                    save_kwargs['exif'] = exif_data
+                if exif_bytes:
+                    save_kwargs['exif'] = exif_bytes
             else:
                 save_kwargs['format'] = original_format
 
