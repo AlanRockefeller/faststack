@@ -94,6 +94,7 @@ class UIState(QObject):
     default_directory_changed = Signal(str)
     isStackedJpgChanged = Signal() # New signal for isStackedJpg
     autoLevelClippingThresholdChanged = Signal(float)
+    autoLevelStrengthChanged = Signal(float)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_cropping_changed = Signal(bool)
@@ -486,6 +487,15 @@ class UIState(QObject):
     def autoLevelClippingThreshold(self, value):
         self.app_controller.set_auto_level_clipping_threshold(value)
         self.autoLevelClippingThresholdChanged.emit(value)
+
+    @Property(float, notify=autoLevelStrengthChanged)
+    def autoLevelStrength(self):
+        return self.app_controller.get_auto_level_strength()
+
+    @autoLevelStrength.setter
+    def autoLevelStrength(self, value):
+        self.app_controller.set_auto_level_strength(value)
+        self.autoLevelStrengthChanged.emit(value)
 
     @Slot()
     def open_folder(self):

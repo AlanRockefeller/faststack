@@ -31,11 +31,13 @@ Dialog {
         photoshopPathField.text = settingsDialog.photoshopPath
         optimizeForComboBox.currentIndex = optimizeForComboBox.model.indexOf(settingsDialog.optimizeFor)
         autoLevelThresholdField.text = settingsDialog.autoLevelClippingThreshold.toFixed(4)
+        settingsDialog.autoLevelStrength = uiState.autoLevelStrength
     }
 
     property string heliconPath: ""
     property double cacheSize: 1.5
     property double autoLevelClippingThreshold: 0.1
+    property double autoLevelStrength: 1.0
     property int prefetchRadius: 4
     property int theme: 0
     property string defaultDirectory: ""
@@ -60,6 +62,7 @@ Dialog {
         uiState.set_default_directory(defaultDirectory)
         uiState.set_optimize_for(optimizeFor)
         uiState.autoLevelClippingThreshold = autoLevelClippingThreshold
+        uiState.autoLevelStrength = autoLevelStrength
         
         uiState.awbMode = awbMode
         uiState.awbStrength = awbStrength
@@ -235,6 +238,19 @@ Dialog {
                     }
                 }
                 Label {} // Placeholder
+
+                // Auto Levels Strength
+                Label { text: "Auto Levels Strength:" }
+                Slider {
+                    id: autoLevelStrengthSlider
+                    from: 0.0
+                    to: 1.0
+                    stepSize: 0.05
+                    value: settingsDialog.autoLevelStrength
+                    onValueChanged: settingsDialog.autoLevelStrength = value
+                    Layout.fillWidth: true
+                }
+                Label { text: Math.round(settingsDialog.autoLevelStrength * 100) + "%" }
             }
 
             GridLayout {

@@ -91,6 +91,7 @@ class ImageEditor:
             'whites': 0.0,
             'clarity': 0.0,
             'texture': 0.0,
+            'straighten_angle': 0.0,
         }
 
     def load_image(self, filepath: str, cached_preview: Optional[DecodedImage] = None):
@@ -139,7 +140,12 @@ class ImageEditor:
         elif rotation == 270:
             img = img.transpose(Image.Transpose.ROTATE_270)
 
-        # 2. Cropping
+        # 2. Free Rotation (Straighten)
+        straighten_angle = self.current_edits['straighten_angle']
+        if abs(straighten_angle) > 0.001:
+            img = img.rotate(straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
+
+        # 3. Cropping
         crop_box = self.current_edits.get('crop_box')
         if crop_box:
             width, height = img.size
@@ -178,7 +184,13 @@ class ImageEditor:
             if abs(shadows) > 0.001:
                 shadow_mask = 1.0 - np.clip(arr / 128.0, 0, 1)
                 arr += shadows * 60 * shadow_mask
-            if abs(highlights) > 0.001:
+            
+            if highlights < -0.001: # Negative highlights (recovery)
+                mask = np.clip((arr - 128) / 127.0, 0, 1) # targets bright pixels
+                # highlights is negative here, so 1.0 + (negative * positive) = something less than 1.0
+                factor = 1.0 + (highlights * 0.75 * mask) 
+                arr = arr * factor
+            elif highlights > 0.001: # Positive highlights (keep existing)
                 highlight_mask = np.clip((arr - 128) / 127.0, 0, 1)
                 arr += highlights * 60 * highlight_mask
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
@@ -452,6 +464,17 @@ class ImageEditor:
         except OSError as e:
             print(f"Warning: Unable to restore timestamps for {path}: {e}")
 
+    def rotate_image_cw(self):
+        """Decreases the rotation edit parameter by 90° modulo 360."""
+        current = self.current_edits.get('rotation', 0)
+        self.current_edits['rotation'] = (current - 90) % 360
+        if self.current_edits['rotation'] < 0:
+            self.current_edits['rotation'] += 360
+
+    def rotate_image_ccw(self):
+        """Increases the rotation edit parameter by 90° modulo 360."""
+        current = self.current_edits.get('rotation', 0)
+        self.current_edits['rotation'] = (current + 90) % 360
 
 # Dictionary of ratios for QML dropdown
 ASPECT_RATIOS = [{"name": name, "ratio": ratio} for name, ratio in INSTAGRAM_RATIOS.items()]

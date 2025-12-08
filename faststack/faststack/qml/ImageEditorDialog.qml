@@ -40,6 +40,18 @@ Window {
     // Background
     color: imageEditorDialog.backgroundColor
 
+    // Keyboard Shortcuts
+    Item {
+        anchors.fill: parent
+        focus: true
+        Keys.onPressed: (event) => {
+            if (event.key === Qt.Key_E || event.key === Qt.Key_Escape) {
+                uiState.isEditorOpen = false
+                event.accepted = true
+            }
+        }
+    }
+
     ScrollView {
         anchors.fill: parent
         anchors.margins: 10
@@ -104,6 +116,16 @@ Window {
                     Layout.topMargin: 5
                     onClicked: {
                         controller.auto_white_balance()
+                        editDialog.updatePulse++
+                    }
+                }
+                
+                Button {
+                    text: "Auto Levels"
+                    Layout.fillWidth: true
+                    Layout.topMargin: 5
+                    onClicked: {
+                        controller.auto_levels()
                         editDialog.updatePulse++
                     }
                 }
@@ -230,17 +252,13 @@ Window {
                     controller.set_edit_parameter(model.key, sendValue / (model.max === undefined ? 100.0 : model.max))
                 }
 
-                // Double click to reset
-                MouseArea {
-                    anchors.fill: parent
+                // Double click/tap to reset
+                TapHandler {
                     acceptedButtons: Qt.LeftButton
-                    propagateComposedEvents: true
-                    onDoubleClicked: (mouse) => {
+                    onDoubleTapped: {
                          controller.set_edit_parameter(model.key, 0.0)
+                         slider.value = 0.0
                          editDialog.updatePulse++
-                    }
-                    onPressed: (mouse) => {
-                         mouse.accepted = false // Let slider handle drag
                     }
                 }
 

@@ -178,7 +178,24 @@ Item {
                 var inside = mouse.x >= cropRect.x && mouse.x <= cropRect.x + cropRect.width &&
                              mouse.y >= cropRect.y && mouse.y <= cropRect.y + cropRect.height
                 
-                if (mainMouseArea.isRotating) {
+                // Hit test for rotation handle
+                var cropCenterX = cropRect.x + cropRect.width / 2
+                var cropCenterY = cropRect.y + cropRect.height / 2
+                var theta = mainMouseArea.cropRotation * Math.PI / 180
+                // Handle is at bottom center + 25px
+                var handleOffset = cropRect.height / 2 + 25
+                // Rotated offset: x = -offset * sin(theta), y = offset * cos(theta)
+                var handleX = cropCenterX - handleOffset * Math.sin(theta)
+                var handleY = cropCenterY + handleOffset * Math.cos(theta)
+                
+                var dist = Math.sqrt(Math.pow(mouse.x - handleX, 2) + Math.pow(mouse.y - handleY, 2))
+
+                if (dist < 20) {
+                    cropDragMode = "rotate"
+                    cropStartAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
+                    cropStartRotation = cropRotation
+                }
+                else if (mainMouseArea.isRotating) {
                     cropDragMode = "rotate"
                     var cropCenterX = cropRect.x + cropRect.width / 2
                     var cropCenterY = cropRect.y + cropRect.height / 2
@@ -741,6 +758,28 @@ Item {
             border.width: 3
             rotation: mainMouseArea.cropRotation
             transformOrigin: Item.Center
+
+            // Rotation Handle Line
+            Rectangle {
+                id: handleLine
+                width: 2
+                height: 25
+                color: "white"
+                anchors.top: parent.bottom
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+
+            // Rotation Handle Knob
+            Rectangle {
+                width: 12
+                height: 12
+                radius: 6
+                color: "white"
+                border.color: "black"
+                border.width: 1
+                anchors.verticalCenter: handleLine.bottom
+                anchors.horizontalCenter: handleLine.horizontalCenter
+            }
         }
     }
     

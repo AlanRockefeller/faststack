@@ -38,6 +38,19 @@ Dialog {
 
     contentItem: ColumnLayout {
         spacing: 10
+        
+        // Keyboard Handling
+        Item {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 0
+            focus: true
+            Keys.onPressed: (event) => {
+                if (event.key === Qt.Key_I) {
+                    exifDialog.close()
+                    event.accepted = true
+                }
+            }
+        }
 
         ScrollView {
             Layout.fillWidth: true

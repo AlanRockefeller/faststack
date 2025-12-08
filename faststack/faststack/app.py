@@ -48,6 +48,7 @@ from faststack.ui.keystrokes import Keybinder
 from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, create_backup_file
 from faststack.imaging.metadata import get_exif_data
 import re
+import numpy as np
 from faststack.io.indexer import RAW_EXTENSIONS
 
 def make_hdrop(paths):
@@ -164,6 +165,7 @@ class AppController(QObject):
         self._dialog_open = False
         
         self.auto_level_threshold = config.getfloat('core', 'auto_level_threshold', 0.1)
+        self.auto_level_strength = config.getfloat('core', 'auto_level_strength', 1.0)
 
 
     @Slot(str)
@@ -2264,22 +2266,29 @@ class AppController(QObject):
             pan_y: Pan offset in Y direction (in image coordinates)
             image_scale: Scale factor of displayed image vs original
         """
+        # Return immediately if histogram is not visible
+        if not self.ui_state.isHistogramVisible:
+            return
+
         if not self.image_files or self.current_index >= len(self.image_files):
             return
         
         try:
-            import numpy as np
-            
             # Get the current image data
-            decoded = self.get_decoded_image(self.current_index)
-            if not decoded:
-                return
+            decoded = None
             
             # If editor is open and has a preview, use that instead
             if self.ui_state.isEditorOpen and self.image_editor.original_image:
                 preview_data = self.image_editor.get_preview_data()
                 if preview_data:
                     decoded = preview_data
+            
+            # Fallback to cached image
+            if not decoded:
+                decoded = self.get_decoded_image(self.current_index)
+            
+            if not decoded:
+                return
             
             # Convert buffer to numpy array
             arr = np.frombuffer(decoded.buffer, dtype=np.uint8)
@@ -2341,16 +2350,17 @@ class AppController(QObject):
             g_preclip_count = int(np.sum(g_hist[250:255]))
             b_preclip_count = int(np.sum(b_hist[250:255]))
             
-            # Apply log scaling for better visualization
-            log_r_hist = np.log1p(r_hist).tolist()
-            log_g_hist = np.log1p(g_hist).tolist()
-            log_b_hist = np.log1p(b_hist).tolist()
+            # Apply log scaling for better visualization - keeping this per existing code style
+            # but converting to float as requested
+            log_r_hist = [float(x) for x in np.log1p(r_hist)]
+            log_g_hist = [float(x) for x in np.log1p(g_hist)]
+            log_b_hist = [float(x) for x in np.log1p(b_hist)]
 
-            # Create the structured data for QML
+            # Create the structured data for QML with keys 'r', 'g', 'b'
             histogram_data = {
-                'r_hist': log_r_hist,
-                'g_hist': log_g_hist,
-                'b_hist': log_b_hist,
+                'r': log_r_hist,
+                'g': log_g_hist,
+                'b': log_b_hist,
                 'r_clip': r_clip_count,
                 'g_clip': g_clip_count,
                 'b_clip': b_clip_count,
@@ -2661,58 +2671,90 @@ class AppController(QObject):
     
     @Slot()
     def auto_levels(self):
-        """Quickly apply auto levels, save the image, and track for undo."""
+        """Calculates and applies auto levels (preview only)."""
         if not self.image_files:
             self.update_status_message("No image to adjust")
             return
         
-        import time
         image_file = self.image_files[self.current_index]
         filepath = str(image_file.path)
         
-        # Load the image into the editor if not already loaded
-        cached_preview = self.get_decoded_image(self.current_index)
-        if not self.image_editor.load_image(filepath, cached_preview=cached_preview):
-            self.update_status_message("Failed to load image")
-            return
-        
-        # Calculate and apply auto levels
+        # Ensure image is loaded in editor
+        # Only load if not already loaded to avoid resetting other edits
+        if not self.image_editor.current_filepath or str(self.image_editor.current_filepath) != filepath:
+            cached_preview = self.get_decoded_image(self.current_index)
+            if not self.image_editor.load_image(filepath, cached_preview=cached_preview):
+                self.update_status_message("Failed to load image")
+                return
+
+        # Calculate auto levels
         blacks, whites = self.image_editor.auto_levels(self.auto_level_threshold)
         
-        # Save the edited image (this creates a backup automatically)
+        # Scale by strength
+        blacks *= self.auto_level_strength
+        whites *= self.auto_level_strength
+        
+        # Apply scaled values
+        self.image_editor.set_edit_param('blacks', blacks)
+        self.image_editor.set_edit_param('whites', whites)
+        
+        # Update UI state
+        self.ui_state.blacks = blacks
+        self.ui_state.whites = whites
+        
+        # Trigger preview update
+        self.ui_state.currentImageSourceChanged.emit()
+        
+        if self.ui_state.isHistogramVisible:
+            self.update_histogram()
+            
+        self.update_status_message(f"Auto levels applied (preview only)")
+        log.info("Auto levels preview applied to %s (clip %.2f%%, str %.2f)", 
+                 filepath, self.auto_level_threshold, self.auto_level_strength)
+
+    @Slot()
+    def quick_auto_levels(self):
+        """Applies auto levels and immediately saves (with undo)."""
+        if not self.image_files:
+            self.update_status_message("No image to adjust")
+            return
+
+        # Apply the preview first (loads image + sets params)
+        self.auto_levels()
+        
+        # Save
+        import time
         save_result = self.image_editor.save_image()
         if save_result:
             saved_path, backup_path = save_result
-            # Track this action for undo
             timestamp = time.time()
             self.undo_history.append(("auto_levels", (saved_path, backup_path), timestamp))
             
-            # Force the image editor to clear its current state so it reloads fresh
+            # Force reload to ensure disk consistency
             self.image_editor.clear()
             
-            # Refresh the view - need to refresh image list since backup file was created
-            original_path = Path(filepath)
+            # Refresh list/cache/UI (standard save pattern)
+            image_file = self.image_files[self.current_index]
+            original_path = image_file.path
             self.refresh_image_list()
             
-            # Find the edited image (not the backup) in the refreshed list
+            # Find image again
             for i, img_file in enumerate(self.image_files):
                 if img_file.path == original_path:
                     self.current_index = i
                     break
             
-            # Invalidate cache
             self.display_generation += 1
             self.image_cache.clear()
             self.prefetcher.cancel_all()
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
             
-            # Update histogram if visible
             if self.ui_state.isHistogramVisible:
                 self.update_histogram()
             
-            self.update_status_message(f"Auto levels applied (clip {self.auto_level_threshold}%)")
-            log.info("Auto levels applied to %s with threshold %.2f%%", filepath, self.auto_level_threshold)
+            self.update_status_message("Auto levels applied and saved")
+            log.info("Quick auto levels saved for %s", original_path)
         else:
             self.update_status_message("Failed to save image")
 
@@ -2725,6 +2767,18 @@ class AppController(QObject):
         if self.auto_level_threshold != value:
             self.auto_level_threshold = value
             config.set('core', 'auto_level_threshold', value)
+            config.save()
+
+    @Slot(result=float)
+    def get_auto_level_strength(self):
+        return self.auto_level_strength
+
+    @Slot(float)
+    def set_auto_level_strength(self, value: float):
+        value = max(0.0, min(1.0, value))
+        if self.auto_level_strength != value:
+            self.auto_level_strength = value
+            config.set('core', 'auto_level_strength', str(value))
             config.save()
 
     @Slot()

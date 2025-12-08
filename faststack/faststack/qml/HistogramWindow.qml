@@ -194,7 +194,7 @@ Window {
                 target: uiState
                 function onHistogramDataChanged() {
                     if (redLoader.item && uiState.histogramData) {
-                        redLoader.item.histogramData = uiState.histogramData.r_hist
+                        redLoader.item.histogramData = uiState.histogramData.r
                         redLoader.item.clipCount = uiState.histogramData.r_clip
                         redLoader.item.preClipCount = uiState.histogramData.r_preclip
                         // Access canvas through item: item.children[0].children[1] is fragile
@@ -217,7 +217,7 @@ Window {
                 target: uiState
                 function onHistogramDataChanged() {
                     if (greenLoader.item && uiState.histogramData) {
-                        greenLoader.item.histogramData = uiState.histogramData.g_hist
+                        greenLoader.item.histogramData = uiState.histogramData.g
                         greenLoader.item.clipCount = uiState.histogramData.g_clip
                         greenLoader.item.preClipCount = uiState.histogramData.g_preclip
                         greenLoader.item.children[0].children[1].requestPaint()
@@ -239,7 +239,7 @@ Window {
                 target: uiState
                 function onHistogramDataChanged() {
                     if (blueLoader.item && uiState.histogramData) {
-                        blueLoader.item.histogramData = uiState.histogramData.b_hist
+                        blueLoader.item.histogramData = uiState.histogramData.b
                         blueLoader.item.clipCount = uiState.histogramData.b_clip
                         blueLoader.item.preClipCount = uiState.histogramData.b_preclip
                         blueLoader.item.children[0].children[1].requestPaint()
