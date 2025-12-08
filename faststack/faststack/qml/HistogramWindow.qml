@@ -11,6 +11,19 @@ Window {
     minimumWidth: 500
     minimumHeight: 350
     visible: uiState ? uiState.isHistogramVisible : false
+
+    FocusScope {
+        id: histogramKeyScope
+        anchors.fill: parent
+        focus: histogramWindow.visible
+
+        Keys.onPressed: function(event) {
+            if (event.key === Qt.Key_H && controller) {
+                event.accepted = true
+                controller.toggle_histogram()
+            }
+        }
+    }
     
     // Connections need to be outside the visibility check
     Connections {
@@ -25,6 +38,14 @@ Window {
         }
         function onCurrentImageSourceChanged() {
             if (histogramWindow.visible && controller) {
+                // Get zoom/pan info from main image view
+                var zoom = 1.0
+                var panX = 0.0
+                var panY = 0.0
+                var imageScale = 1.0
+                
+                // Try to get zoom/pan from Components (if accessible)
+                // For now, just call without params - Components will handle it
                 controller.update_histogram()
             }
         }
@@ -32,6 +53,7 @@ Window {
 
     onVisibleChanged: {
         if (visible && controller) {
+            histogramKeyScope.forceActiveFocus()
             controller.update_histogram()
         }
     }
@@ -172,7 +194,7 @@ Window {
                 target: uiState
                 function onHistogramDataChanged() {
                     if (redLoader.item && uiState.histogramData) {
-                        redLoader.item.histogramData = uiState.histogramData.r_hist
+                        redLoader.item.histogramData = uiState.histogramData.r
                         redLoader.item.clipCount = uiState.histogramData.r_clip
                         redLoader.item.preClipCount = uiState.histogramData.r_preclip
                         // Access canvas through item: item.children[0].children[1] is fragile
@@ -195,7 +217,7 @@ Window {
                 target: uiState
                 function onHistogramDataChanged() {
                     if (greenLoader.item && uiState.histogramData) {
-                        greenLoader.item.histogramData = uiState.histogramData.g_hist
+                        greenLoader.item.histogramData = uiState.histogramData.g
                         greenLoader.item.clipCount = uiState.histogramData.g_clip
                         greenLoader.item.preClipCount = uiState.histogramData.g_preclip
                         greenLoader.item.children[0].children[1].requestPaint()
@@ -217,7 +239,7 @@ Window {
                 target: uiState
                 function onHistogramDataChanged() {
                     if (blueLoader.item && uiState.histogramData) {
-                        blueLoader.item.histogramData = uiState.histogramData.b_hist
+                        blueLoader.item.histogramData = uiState.histogramData.b
                         blueLoader.item.clipCount = uiState.histogramData.b_clip
                         blueLoader.item.preClipCount = uiState.histogramData.b_preclip
                         blueLoader.item.children[0].children[1].requestPaint()

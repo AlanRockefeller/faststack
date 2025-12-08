@@ -4,6 +4,7 @@ import logging
 import os
 import io
 import hashlib
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import List, Dict, Optional, Callable
 import mmap
@@ -13,6 +14,7 @@ from PIL import Image as PILImage, ImageCms
 
 from faststack.models import ImageFile, DecodedImage
 from faststack.imaging.jpeg import decode_jpeg_rgb, decode_jpeg_resized, TURBO_AVAILABLE
+from faststack.imaging.cache import build_cache_key
 from faststack.config import config
 
 log = logging.getLogger(__name__)
@@ -259,10 +261,24 @@ class Prefetcher:
 
         # For high-priority tasks (current image), cancel pending prefetch tasks
         # to free up worker threads and reduce blocking time
+        # For high-priority tasks (current image), cancel pending prefetch tasks
+        # to free up worker threads and reduce blocking time
         if priority:
             cancelled_count = 0
+            # Don't cancel tasks that are very close to the requested index (e.g. +/- 2)
+            # This prevents thrashing when the user is navigating quickly
+            safe_radius = 2
+            
             for task_index, future in list(self.futures.items()):
-                if task_index != index and not future.done() and future.cancel():
+                # Skip the current task
+                if task_index == index:
+                    continue
+                
+                # Skip tasks within safe radius
+                if abs(task_index - index) <= safe_radius:
+                    continue
+
+                if not future.done() and future.cancel():
                     cancelled_count += 1
                     del self.futures[task_index]
             if cancelled_count > 0:
@@ -276,7 +292,7 @@ class Prefetcher:
         log.debug("Submitted %s task for index %d", "priority" if priority else "prefetch", index)
         return future
 
-    def _decode_and_cache(self, image_file: ImageFile, index: int, generation: int, display_width: int, display_height: int, display_generation: int) -> Optional[tuple[int, int]]:
+    def _decode_and_cache(self, image_file: ImageFile, index: int, generation: int, display_width: int, display_height: int, display_generation: int) -> Optional[tuple[Path, int]]:
         """The actual work done by the thread pool."""
         import time
         
@@ -288,8 +304,11 @@ class Prefetcher:
             return None
 
         try:
-            # Get current color management mode
+            # Get current color management mode and optimization setting
             color_mode = config.get('color', 'mode', fallback="none").lower()
+            optimize_for = config.get('core', 'optimize_for', fallback='speed').lower()
+            fast_dct = (optimize_for == 'speed')
+            use_resized = (optimize_for == 'speed')  # Use decode_jpeg_resized for speed, decode_jpeg_rgb for quality
 
             # Option C: Full ICC pipeline - Use TurboJPEG for decode, Pillow only for ICC conversion
             if color_mode == "icc":
@@ -302,7 +321,15 @@ class Prefetcher:
                     with open(image_file.path, "rb") as f:
                         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                             # Pass mmap directly - no copy! Decoders accept bytes-like objects
-                            buffer = decode_jpeg_resized(mmapped, display_width, display_height)
+                            if use_resized:
+                                buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                            else:
+                                # Quality mode: decode full image then resize with high quality
+                                buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                                if buffer is not None:
+                                    img = PILImage.fromarray(buffer)
+                                    img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                    buffer = np.array(img)
                     t_after_read = time.perf_counter()
                     if buffer is None:
                         return None
@@ -364,7 +391,15 @@ class Prefetcher:
                         with open(image_file.path, "rb") as f:
                             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                                 # Pass mmap directly - no copy!
-                                buffer = decode_jpeg_resized(mmapped, display_width, display_height)
+                                if use_resized:
+                                    buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                                else:
+                                    # Quality mode: decode full image then resize with high quality
+                                    buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                                    if buffer is not None:
+                                        img = PILImage.fromarray(buffer)
+                                        img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                        buffer = np.array(img)
                         t_after_fallback_read = time.perf_counter()
                         if buffer is None:
                             return None
@@ -387,7 +422,15 @@ class Prefetcher:
                     with open(image_file.path, "rb") as f:
                         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                             # Pass mmap directly - no copy!
-                            buffer = decode_jpeg_resized(mmapped, display_width, display_height)
+                            if use_resized:
+                                buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                            else:
+                                # Quality mode: decode full image then resize with high quality
+                                buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                                if buffer is not None:
+                                    img = PILImage.fromarray(buffer)
+                                    img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                    buffer = np.array(img)
                     t_after_read = time.perf_counter()
                     if buffer is None:
                         return None
@@ -409,7 +452,15 @@ class Prefetcher:
                 with open(image_file.path, "rb") as f:
                     with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                         # Pass mmap directly - no copy! Decoders accept bytes-like objects
-                        buffer = decode_jpeg_resized(mmapped, display_width, display_height)
+                        if use_resized:
+                            buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                        else:
+                            # Quality mode: decode full image then resize with high quality
+                            buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                            if buffer is not None:
+                                img = PILImage.fromarray(buffer)
+                                img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                buffer = np.array(img)
                 t_after_read = time.perf_counter()
                 if buffer is None:
                     return None
@@ -456,10 +507,10 @@ class Prefetcher:
                 bytes_per_line=bytes_per_line,
                 format=None # Placeholder for QImage.Format.Format_RGB888
             )
-            cache_key = f"{index}_{display_generation}"
+            cache_key = build_cache_key(image_file.path, display_generation)
             self.cache_put(cache_key, decoded_image)
             log.debug("Successfully decoded and cached image at index %d for display gen %d", index, display_generation)
-            return index, display_generation
+            return image_file.path, display_generation
             
         except Exception:
             log.exception("Error decoding image %s at index %d", image_file.path, index)

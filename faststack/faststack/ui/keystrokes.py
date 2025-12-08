@@ -39,6 +39,7 @@ class Keybinder:
             
             # Toggle flags
             Qt.Key_U: "toggle_uploaded",
+            Qt.Key_I: "show_exif_dialog",
 
             # Actions
             Qt.Key_Enter: "launch_helicon",
@@ -46,6 +47,7 @@ class Keybinder:
             Qt.Key_P: "edit_in_photoshop",
             Qt.Key_C: "clear_all_stacks",
             Qt.Key_A: "quick_auto_white_balance",
+            Qt.Key_L: "quick_auto_levels",
             Qt.Key_O: "toggle_crop_mode",
             Qt.Key_H: "toggle_histogram",
             Qt.Key_Delete: "delete_current_image",

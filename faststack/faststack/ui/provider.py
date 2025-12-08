@@ -93,6 +93,8 @@ class UIState(QObject):
     awbRgbUpperBoundChanged = Signal()
     default_directory_changed = Signal(str)
     isStackedJpgChanged = Signal() # New signal for isStackedJpg
+    autoLevelClippingThresholdChanged = Signal(float)
+    autoLevelStrengthChanged = Signal(float)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_cropping_changed = Signal(bool)
@@ -106,6 +108,7 @@ class UIState(QObject):
     aspect_ratio_names_changed = Signal(list)
     current_aspect_ratio_index_changed = Signal(int)
     current_crop_box_changed = Signal(tuple) # (left, top, right, bottom) normalized to 0-1000
+    crop_rotation_changed = Signal(float)
     anySliderPressedChanged = Signal(bool)
     sharpness_changed = Signal(float)
     rotation_changed = Signal(int)
@@ -117,6 +120,11 @@ class UIState(QObject):
     blacks_changed = Signal(float)
     whites_changed = Signal(float)
     clarity_changed = Signal(float)
+    
+    # Debug Cache Signals
+    debugCacheChanged = Signal(bool)
+    cacheStatsChanged = Signal(str)
+    isDecodingChanged = Signal(bool)
 
     def __init__(self, app_controller):
         super().__init__()
@@ -137,6 +145,7 @@ class UIState(QObject):
         self._white_balance_by = 0.0
         self._white_balance_mg = 0.0
         self._current_crop_box = (0, 0, 1000, 1000)
+        self._crop_rotation = 0.0
         self._aspect_ratio_names = []
         self._current_aspect_ratio_index = 0
         self._any_slider_pressed = False
@@ -150,6 +159,11 @@ class UIState(QObject):
         self._blacks = 0.0
         self._whites = 0.0
         self._clarity = 0.0
+        
+        # Debug Cache State
+        self._debug_cache = False
+        self._cache_stats = ""
+        self._is_decoding = False
 
     # ---- THEME PROPERTY ----
     @Property(int, notify=themeChanged)
@@ -367,7 +381,7 @@ class UIState(QObject):
     @Property(bool, notify=metadataChanged)
     def isStackedJpg(self):
         """Returns True if the current image is a stacked JPG."""
-        return self.currentFilename.endswith(" stacked.JPG")
+        return self.currentFilename.lower().endswith(" stacked.jpg")
 
     # --- Slots for QML to call ---
     @Slot()
@@ -448,14 +462,40 @@ class UIState(QObject):
     @Slot(result=str)
     def get_default_directory(self):
         return self.app_controller.get_default_directory()
-
+    
     @Slot(str)
     def set_default_directory(self, path):
         self.app_controller.set_default_directory(path)
 
     @Slot(result=str)
+    def get_optimize_for(self):
+        return self.app_controller.get_optimize_for()
+    
+    @Slot(str)
+    def set_optimize_for(self, optimize_for):
+        self.app_controller.set_optimize_for(optimize_for)
+
+    @Slot(result=str)
     def open_directory_dialog(self):
         return self.app_controller.open_directory_dialog()
+
+    @Property(float, notify=autoLevelClippingThresholdChanged)
+    def autoLevelClippingThreshold(self):
+        return self.app_controller.get_auto_level_clipping_threshold()
+
+    @autoLevelClippingThreshold.setter
+    def autoLevelClippingThreshold(self, value):
+        self.app_controller.set_auto_level_clipping_threshold(value)
+        self.autoLevelClippingThresholdChanged.emit(value)
+
+    @Property(float, notify=autoLevelStrengthChanged)
+    def autoLevelStrength(self):
+        return self.app_controller.get_auto_level_strength()
+
+    @autoLevelStrength.setter
+    def autoLevelStrength(self, value):
+        self.app_controller.set_auto_level_strength(value)
+        self.autoLevelStrengthChanged.emit(value)
 
     @Slot()
     def open_folder(self):
@@ -669,6 +709,16 @@ class UIState(QObject):
         if self._current_crop_box != new_value:
             self._current_crop_box = new_value
             self.current_crop_box_changed.emit(new_value)
+
+    @Property(float, notify=crop_rotation_changed)
+    def cropRotation(self) -> float:
+        return self._crop_rotation
+
+    @cropRotation.setter
+    def cropRotation(self, new_value: float):
+        if self._crop_rotation != new_value:
+            self._crop_rotation = new_value
+            self.crop_rotation_changed.emit(new_value)
     
     # --- New Properties ---
     @Property(float, notify=sharpness_changed)
@@ -771,22 +821,34 @@ class UIState(QObject):
             self._clarity = new_value
             self.clarity_changed.emit(new_value)
 
-    def reset_editor_state(self):
-        """Resets all UI state variables for the editor."""
-        self.brightness = 0.0
-        self.contrast = 0.0
-        self.saturation = 0.0
-        self.whiteBalanceBY = 0.0
-        self.whiteBalanceMG = 0.0
-        self.currentCropBox = (0, 0, 1000, 1000)
-        self.isCropping = False
-        self.sharpness = 0.0
-        self.rotation = 0
-        self.exposure = 0.0
-        self.highlights = 0.0
-        self.shadows = 0.0
-        self.vibrance = 0.0
-        self.vignette = 0.0
-        self.blacks = 0.0
-        self.whites = 0.0
-        self.clarity = 0.0
+    # --- Debug Cache Properties ---
+
+    @Property(bool, notify=debugCacheChanged)
+    def debugCache(self) -> bool:
+        return self._debug_cache
+
+    @debugCache.setter
+    def debugCache(self, value: bool):
+        if self._debug_cache != value:
+            self._debug_cache = value
+            self.debugCacheChanged.emit(value)
+
+    @Property(str, notify=cacheStatsChanged)
+    def cacheStats(self) -> str:
+        return self._cache_stats
+
+    @cacheStats.setter
+    def cacheStats(self, value: str):
+        if self._cache_stats != value:
+            self._cache_stats = value
+            self.cacheStatsChanged.emit(value)
+
+    @Property(bool, notify=isDecodingChanged)
+    def isDecoding(self) -> bool:
+        return self._is_decoding
+
+    @isDecoding.setter
+    def isDecoding(self, value: bool):
+        if self._is_decoding != value:
+            self._is_decoding = value
+            self.isDecodingChanged.emit(value)

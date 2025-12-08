@@ -10,7 +10,7 @@ Dialog {
     closePolicy: Popup.CloseOnEscape
     focus: true
     width: 600
-    height: 600
+    height: 700
 
     // Live cache usage value (updated by timer)
     property real cacheUsage: 0.0
@@ -29,14 +29,20 @@ Dialog {
         cacheSizeField.text = settingsDialog.cacheSize.toFixed(1)
         heliconPathField.text = settingsDialog.heliconPath
         photoshopPathField.text = settingsDialog.photoshopPath
+        optimizeForComboBox.currentIndex = optimizeForComboBox.model.indexOf(settingsDialog.optimizeFor)
+        autoLevelThresholdField.text = settingsDialog.autoLevelClippingThreshold.toFixed(4)
+        settingsDialog.autoLevelStrength = uiState.autoLevelStrength
     }
 
     property string heliconPath: ""
     property double cacheSize: 1.5
+    property double autoLevelClippingThreshold: 0.1
+    property double autoLevelStrength: 1.0
     property int prefetchRadius: 4
     property int theme: 0
     property string defaultDirectory: ""
     property string photoshopPath: ""
+    property string optimizeFor: "speed"
 
     property string awbMode: "lab"
     property double awbStrength: 0.7
@@ -54,6 +60,9 @@ Dialog {
         uiState.set_prefetch_radius(prefetchRadius)
         uiState.set_theme(theme)
         uiState.set_default_directory(defaultDirectory)
+        uiState.set_optimize_for(optimizeFor)
+        uiState.autoLevelClippingThreshold = autoLevelClippingThreshold
+        uiState.autoLevelStrength = autoLevelStrength
         
         uiState.awbMode = awbMode
         uiState.awbStrength = awbStrength
@@ -200,6 +209,48 @@ Dialog {
                         if (path) defaultDirectoryField.text = path
                     }
                 }
+
+                // Optimize For
+                Label { text: "Optimize For:" }
+                ComboBox {
+                    id: optimizeForComboBox
+                    model: ["speed", "quality"]
+                    currentIndex: model.indexOf(settingsDialog.optimizeFor)
+                    onCurrentIndexChanged: settingsDialog.optimizeFor = model[currentIndex]
+                    Layout.fillWidth: true
+                }
+                Label {} // Placeholder
+
+                // Auto Levels Clip Threshold
+                Label { text: "Auto Levels Clip %:" }
+                TextField {
+                    id: autoLevelThresholdField
+                    Layout.fillWidth: true
+                    
+                    onEditingFinished: {
+                        var value = parseFloat(text)
+                        if (!isNaN(value) && value >= 0.0 && value <= 10.0) {
+                            settingsDialog.autoLevelClippingThreshold = value
+                            text = value.toFixed(4)
+                        } else {
+                            text = settingsDialog.autoLevelClippingThreshold.toFixed(4)
+                        }
+                    }
+                }
+                Label {} // Placeholder
+
+                // Auto Levels Strength
+                Label { text: "Auto Levels Strength:" }
+                Slider {
+                    id: autoLevelStrengthSlider
+                    from: 0.0
+                    to: 1.0
+                    stepSize: 0.05
+                    value: settingsDialog.autoLevelStrength
+                    onValueChanged: settingsDialog.autoLevelStrength = value
+                    Layout.fillWidth: true
+                }
+                Label { text: Math.round(settingsDialog.autoLevelStrength * 100) + "%" }
             }
 
             GridLayout {

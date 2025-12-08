@@ -90,6 +90,8 @@ class ImageEditor:
             'blacks': 0.0,
             'whites': 0.0,
             'clarity': 0.0,
+            'texture': 0.0,
+            'straighten_angle': 0.0,
         }
 
     def load_image(self, filepath: str, cached_preview: Optional[DecodedImage] = None):
@@ -138,7 +140,12 @@ class ImageEditor:
         elif rotation == 270:
             img = img.transpose(Image.Transpose.ROTATE_270)
 
-        # 2. Cropping
+        # 2. Free Rotation (Straighten)
+        straighten_angle = self.current_edits['straighten_angle']
+        if abs(straighten_angle) > 0.001:
+            img = img.rotate(straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
+
+        # 3. Cropping
         crop_box = self.current_edits.get('crop_box')
         if crop_box:
             width, height = img.size
@@ -177,7 +184,13 @@ class ImageEditor:
             if abs(shadows) > 0.001:
                 shadow_mask = 1.0 - np.clip(arr / 128.0, 0, 1)
                 arr += shadows * 60 * shadow_mask
-            if abs(highlights) > 0.001:
+            
+            if highlights < -0.001: # Negative highlights (recovery)
+                mask = np.clip((arr - 128) / 127.0, 0, 1) # targets bright pixels
+                # highlights is negative here, so 1.0 + (negative * positive) = something less than 1.0
+                factor = 1.0 + (highlights * 0.75 * mask) 
+                arr = arr * factor
+            elif highlights > 0.001: # Positive highlights (keep existing)
                 highlight_mask = np.clip((arr - 128) / 127.0, 0, 1)
                 arr += highlights * 60 * highlight_mask
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
@@ -226,14 +239,24 @@ class ImageEditor:
         mg_val = self.current_edits['white_balance_mg'] * 0.5
         if abs(by_val) > 0.001 or abs(mg_val) > 0.001:
             arr = np.array(img, dtype=np.float32)
-            by_shift = by_val * 127.5
-            mg_shift = mg_val * 127.5
-            # Apply temperature (by_shift) primarily between R and B, and
-            # tint (mg_shift) primarily to G relative to R/B. We apply half
-            # of the tint opposite to R/B so that tint shifts G against R/B.
-            arr[:, :, 0] += (by_shift - 0.5 * mg_shift)  # R
-            arr[:, :, 1] += (1.0 * mg_shift)              # G
-            arr[:, :, 2] -= (by_shift - 0.5 * mg_shift)  # B
+            # Multiplicative White Balance (Gain-based)
+            # This preserves black levels (0 * gain = 0) while adjusting the color balance of brighter pixels.
+            
+            # Temperature (Blue-Yellow):
+            # Positive = Warm (Yellow/Red), Negative = Cool (Blue)
+            r_gain = 1.0 + by_val
+            b_gain = 1.0 - by_val
+            
+            # Tint (Magenta-Green):
+            # Positive = Magenta (Red+Blue boost or Green cut), Negative = Green (Green boost)
+            # Standard approach: Adjust Green channel opposite to the tint value.
+            g_gain = 1.0 - mg_val
+
+            # Apply gains
+            arr[:, :, 0] = arr[:, :, 0] * r_gain
+            arr[:, :, 1] = arr[:, :, 1] * g_gain
+            arr[:, :, 2] = arr[:, :, 2] * b_gain
+            
             np.clip(arr, 0, 255, out=arr)
             img = Image.fromarray(arr.astype(np.uint8))
 
@@ -257,7 +280,68 @@ class ImageEditor:
             arr = arr * vignette_mask
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
+        # 14. Texture (Fine Detail Local Contrast)
+        # Similar to Clarity but with a smaller radius to target texture/fine details
+        texture = self.current_edits.get('texture', 0.0)
+        if abs(texture) > 0.001:
+            arr = np.array(img, dtype=np.float32)
+            luminance = 0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2]
+            lum_img = Image.fromarray(luminance.astype(np.uint8))
+            # Smaller radius for texture compared to clarity (20)
+            blurred = lum_img.filter(ImageFilter.GaussianBlur(radius=2.0))
+            blurred_arr = np.array(blurred, dtype=np.float32)
+            # Apply texture enhancement primarily to midtones
+            midtone_mask = 1.0 - np.abs(luminance - 128) / 128.0
+            local_details = (luminance - blurred_arr) * texture * midtone_mask
+            for c in range(3):
+                arr[:,:,c] += local_details
+            img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
+
         return img
+
+    def auto_levels(self, threshold_percent: float = 0.1) -> Tuple[float, float]:
+        """
+        Automatically adjusts blacks and whites based on image histogram.
+        
+        Args:
+            threshold_percent: value 0.0-10.0, percentage of pixels to clip at each end.
+        
+        Returns:
+            Tuple of (blacks, whites) parameter values.
+        """
+        if self.original_image is None:
+            return 0.0, 0.0
+            
+        # Use preview image for speed if available, otherwise original
+        img = self._preview_image if self._preview_image else self.original_image
+        
+        # Convert to numpy array for histogram analysis
+        arr = np.array(img.convert('L')) # Use luminance for levels
+        
+        # Calculate percentiles
+        low_p = threshold_percent
+        high_p = 100.0 - threshold_percent
+        
+        p_low, p_high = np.percentile(arr, [low_p, high_p])
+        
+        # Calculate parameters to map p_low->0 and p_high->255
+        # Logic matches _apply_edits:
+        # black_point = -blacks * 40
+        # white_point = 255 + whites * 40
+        
+        # We want black_point to be p_low
+        # p_low = -blacks * 40 => blacks = -p_low / 40.0
+        blacks = -float(p_low) / 40.0
+        
+        # We want white_point to be p_high
+        # p_high = 255 + whites * 40 => whites = (p_high - 255) / 40.0
+        whites = (float(p_high) - 255.0) / 40.0
+        
+        # Update state
+        self.current_edits['blacks'] = blacks
+        self.current_edits['whites'] = whites
+        
+        return blacks, whites
 
     def get_preview_data(self) -> Optional[DecodedImage]:
         """Apply current edits and return the data as a DecodedImage."""
@@ -302,6 +386,11 @@ class ImageEditor:
         final_img = self._apply_edits(final_img)
 
         original_path = self.current_filepath
+        try:
+            original_stat = original_path.stat()
+        except OSError as e:
+            print(f"Warning: Unable to read timestamps for {original_path}: {e}")
+            original_stat = None
         
         # Use the reusable backup function
         backup_path = create_backup_file(original_path)
@@ -360,11 +449,32 @@ class ImageEditor:
                     # Reraise so the outer except logs and returns None
                     raise
 
+            if original_stat is not None:
+                self._restore_file_times(original_path, original_stat)
+
             return original_path, backup_path
         except Exception as e:
             print(f"Failed to save edited image or backup: {e}")
             return None
 
+    def _restore_file_times(self, path: Path, original_stat: os.stat_result) -> None:
+        """Best-effort restoration of access/modify timestamps after saving."""
+        try:
+            os.utime(path, (original_stat.st_atime, original_stat.st_mtime))
+        except OSError as e:
+            print(f"Warning: Unable to restore timestamps for {path}: {e}")
+
+    def rotate_image_cw(self):
+        """Decreases the rotation edit parameter by 90° modulo 360."""
+        current = self.current_edits.get('rotation', 0)
+        self.current_edits['rotation'] = (current - 90) % 360
+        if self.current_edits['rotation'] < 0:
+            self.current_edits['rotation'] += 360
+
+    def rotate_image_ccw(self):
+        """Increases the rotation edit parameter by 90° modulo 360."""
+        current = self.current_edits.get('rotation', 0)
+        self.current_edits['rotation'] = (current + 90) % 360
 
 # Dictionary of ratios for QML dropdown
 ASPECT_RATIOS = [{"name": name, "ratio": ratio} for name, ratio in INSTAGRAM_RATIOS.items()]

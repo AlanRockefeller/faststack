@@ -27,8 +27,10 @@ Item {
         source: uiState && uiState.imageCount > 0 ? uiState.currentImageSource : ""
         fillMode: Image.PreserveAspectFit
         cache: false // We do our own caching in Python
-	smooth: uiState && !uiState.anySliderPressed
-	mipmap: uiState && !uiState.anySliderPressed
+	smooth: uiState && !uiState.anySliderPressed && !isZooming
+	mipmap: uiState && !uiState.anySliderPressed && !isZooming
+        
+        property bool isZooming: false
 
         Component.onCompleted: {
             if (width > 0 && height > 0) {
@@ -55,18 +57,57 @@ Item {
             } else if (scaleTransform.xScale <= 1.0 && uiState.isZoomed) {
                 uiState.setZoomed(false);
             }
+            
+            // Update histogram with zoom/pan info if histogram is visible
+            if (uiState && uiState.isHistogramVisible && controller) {
+                var zoom = scaleTransform.xScale
+                var panX = panTransform.x
+                var panY = panTransform.y
+                // Calculate image scale (painted size vs actual size)
+                var imageScale = mainImage.paintedWidth > 0 ? (mainImage.paintedWidth / mainImage.sourceSize.width) : 1.0
+                controller.update_histogram(zoom, panX, panY, imageScale)
+            }
+        }
+        
+        function updateHistogramWithZoom() {
+            if (uiState && uiState.isHistogramVisible && controller) {
+                var zoom = scaleTransform.xScale
+                var panX = panTransform.x
+                var panY = panTransform.y
+                var imageScale = mainImage.paintedWidth > 0 ? (mainImage.paintedWidth / mainImage.sourceSize.width) : 1.0
+                controller.update_histogram(zoom, panX, panY, imageScale)
+            }
         }
 
+        property alias scaleTransform: scaleTransform
+        property alias panTransform: panTransform
+        
         transform: [
             Scale {
                 id: scaleTransform
                 origin.x: mainImage.width / 2
                 origin.y: mainImage.height / 2
-                onXScaleChanged: mainImage.updateZoomState()
-                onYScaleChanged: mainImage.updateZoomState()
+                onXScaleChanged: {
+                    mainImage.updateZoomState()
+                    mainImage.updateHistogramWithZoom()
+                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+                }
+                onYScaleChanged: {
+                    mainImage.updateZoomState()
+                    mainImage.updateHistogramWithZoom()
+                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+                }
             },
             Translate {
                 id: panTransform
+                onXChanged: {
+                    mainImage.updateHistogramWithZoom()
+                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+                }
+                onYChanged: {
+                    mainImage.updateHistogramWithZoom()
+                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+                }
             }
         ]
     }
@@ -114,6 +155,11 @@ Item {
         property real cropBoxStartTop: 0
         property real cropBoxStartRight: 0
         property real cropBoxStartBottom: 0
+        property real cropRotation: 0
+        property bool isRotating: false
+        property real cropStartAngle: 0
+        property real cropStartRotation: 0
+        onCropRotationChanged: uiState.cropRotation = cropRotation
         
         onPressed: function(mouse) {
             lastX = mouse.x
@@ -125,11 +171,43 @@ Item {
             if (uiState && uiState.isCropping) {
                 // Check if clicking on existing crop box
                 var cropRect = getCropRect()
+                var box = uiState.currentCropBox
+                var isFullImage = box && box.length === 4 && box[0] === 0 && box[1] === 0 && box[2] === 1000 && box[3] === 1000
+                
                 var edgeThreshold = 10 * Screen.devicePixelRatio
                 var inside = mouse.x >= cropRect.x && mouse.x <= cropRect.x + cropRect.width &&
                              mouse.y >= cropRect.y && mouse.y <= cropRect.y + cropRect.height
                 
-                if (inside && cropRect.width > 0 && cropRect.height > 0) {
+                // Hit test for rotation handle
+                var cropCenterX = cropRect.x + cropRect.width / 2
+                var cropCenterY = cropRect.y + cropRect.height / 2
+                var theta = mainMouseArea.cropRotation * Math.PI / 180
+                // Handle is at bottom center + 25px
+                var handleOffset = cropRect.height / 2 + 25
+                // Rotated offset: x = -offset * sin(theta), y = offset * cos(theta)
+                var handleX = cropCenterX - handleOffset * Math.sin(theta)
+                var handleY = cropCenterY + handleOffset * Math.cos(theta)
+                
+                var dist = Math.sqrt(Math.pow(mouse.x - handleX, 2) + Math.pow(mouse.y - handleY, 2))
+
+                if (dist < 20) {
+                    cropDragMode = "rotate"
+                    cropStartAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
+                    cropStartRotation = cropRotation
+                }
+                else if (mainMouseArea.isRotating) {
+                    cropDragMode = "rotate"
+                    var cropCenterX = cropRect.x + cropRect.width / 2
+                    var cropCenterY = cropRect.y + cropRect.height / 2
+                    cropStartAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
+                    cropStartRotation = cropRotation
+                }
+                // If crop box is full image, always start a new crop
+                else if (isFullImage) {
+                    cropDragMode = "new"
+                    cropStartX = mouse.x
+                    cropStartY = mouse.y
+                } else if (inside && cropRect.width > 0 && cropRect.height > 0) {
                     // Determine which edge/corner is being dragged
                     var nearLeft = Math.abs(mouse.x - cropRect.x) < edgeThreshold
                     var nearRight = Math.abs(mouse.x - (cropRect.x + cropRect.width)) < edgeThreshold
@@ -171,31 +249,67 @@ Item {
             var imgX = (mainImage.width - imgWidth) / 2
             var imgY = (mainImage.height - imgHeight) / 2
             var box = uiState.currentCropBox
+            
+            // Account for zoom and pan transforms when displaying crop box
+            var scale = scaleTransform.xScale
+            var panX = panTransform.x
+            var panY = panTransform.y
+            
+            // Convert normalized crop box (0-1000) to image-local coordinates
+            var localX = (box[0] / 1000) * imgWidth
+            var localY = (box[1] / 1000) * imgHeight
+            var localWidth = (box[2] - box[0]) / 1000 * imgWidth
+            var localHeight = (box[3] - box[1]) / 1000 * imgHeight
+            
+            // Apply zoom and pan transforms to get screen coordinates
             return {
-                x: imgX + (box[0] / 1000) * imgWidth,
-                y: imgY + (box[1] / 1000) * imgHeight,
-                width: (box[2] - box[0]) / 1000 * imgWidth,
-                height: (box[3] - box[1]) / 1000 * imgHeight
+                x: imgX + (localX * scale) + panX,
+                y: imgY + (localY * scale) + panY,
+                width: localWidth * scale,
+                height: localHeight * scale
             }
+        }
+        function mapToImageCoordinates(screenPoint) {
+            var imgWidth = mainImage.paintedWidth
+            var imgHeight = mainImage.paintedHeight
+            var imgX = (mainImage.width - imgWidth) / 2
+            var imgY = (mainImage.height - imgHeight) / 2
+            
+            var scale = scaleTransform.xScale
+            var panX = panTransform.x
+            var panY = panTransform.y
+
+            var originX = scaleTransform.origin.x
+            var originY = scaleTransform.origin.y
+
+            var x_no_pan = screenPoint.x - panX
+            var y_no_pan = screenPoint.y - panY
+
+            var x_no_scale = originX + (x_no_pan - originX) / scale
+            var y_no_scale = originY + (y_no_pan - originY) / scale
+
+            var localX = x_no_scale - imgX
+            var localY = y_no_scale - imgY
+
+            return {x: localX / imgWidth, y: localY / imgHeight}
         }
         onPositionChanged: function(mouse) {
             if (uiState && uiState.isCropping && isCropDragging) {
                 if (cropDragMode === "new") {
                     // Update crop rectangle while dragging
-                    updateCropBox(cropStartX, cropStartY, mouse.x, mouse.y)
+                    updateCropBox(cropStartX, cropStartY, mouse.x, mouse.y, true)
+                } else if (cropDragMode === "rotate") {
+                    var cropCenterX = getCropRect().x + getCropRect().width / 2
+                    var cropCenterY = getCropRect().y + getCropRect().height / 2
+                    var currentAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
+                    cropRotation = cropStartRotation + (currentAngle - cropStartAngle)
                 } else if (cropDragMode !== "none") {
-                    // Refine existing crop box
-                    var cropRect = getCropRect()
-                    var imgWidth = mainImage.paintedWidth
-                    var imgHeight = mainImage.paintedHeight
-                    var imgX = (mainImage.width - imgWidth) / 2
-                    var imgY = (mainImage.height - imgHeight) / 2
                     
-                    // Convert mouse position to normalized coordinates
-                    var mouseX = (mouse.x - imgX) / imgWidth
-                    var mouseY = (mouse.y - imgY) / imgHeight
-                    mouseX = Math.max(0, Math.min(1, mouseX)) * 1000
-                    mouseY = Math.max(0, Math.min(1, mouseY)) * 1000
+                    var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+
+                    // Clamp to image bounds and convert to 0-1000 range
+                    var mouseX = Math.max(0, Math.min(1, coords.x)) * 1000
+                    var mouseY = Math.max(0, Math.min(1, coords.y)) * 1000
                     
                     var left = cropBoxStartLeft
                     var top = cropBoxStartTop
@@ -204,43 +318,31 @@ Item {
                     
                     // Adjust based on drag mode
                     if (cropDragMode === "move") {
-                        var dx = mouseX - (cropBoxStartLeft + cropBoxStartRight) / 2
-                        var dy = mouseY - (cropBoxStartTop + cropBoxStartBottom) / 2
+                        var startCenterX = (cropBoxStartLeft + cropBoxStartRight) / 2
+                        var startCenterY = (cropBoxStartTop + cropBoxStartBottom) / 2
+                        
+                        var dx = mouseX - startCenterX
+                        var dy = mouseY - startCenterY
+
                         var width = cropBoxStartRight - cropBoxStartLeft
                         var height = cropBoxStartBottom - cropBoxStartTop
+
                         left = Math.max(0, Math.min(1000 - width, cropBoxStartLeft + dx))
                         top = Math.max(0, Math.min(1000 - height, cropBoxStartTop + dy))
                         right = left + width
                         bottom = top + height
-                    } else if (cropDragMode === "left") {
-                        left = Math.max(0, Math.min(right - 10, mouseX))
-                    } else if (cropDragMode === "right") {
-                        right = Math.max(left + 10, Math.min(1000, mouseX))
-                    } else if (cropDragMode === "top") {
-                        top = Math.max(0, Math.min(bottom - 10, mouseY))
-                    } else if (cropDragMode === "bottom") {
-                        bottom = Math.max(top + 10, Math.min(1000, mouseY))
-                    } else if (cropDragMode === "topleft") {
-                        left = Math.max(0, Math.min(right - 10, mouseX))
-                        top = Math.max(0, Math.min(bottom - 10, mouseY))
-                    } else if (cropDragMode === "topright") {
-                        right = Math.max(left + 10, Math.min(1000, mouseX))
-                        top = Math.max(0, Math.min(bottom - 10, mouseY))
-                    } else if (cropDragMode === "bottomleft") {
-                        left = Math.max(0, Math.min(right - 10, mouseX))
-                        bottom = Math.max(top + 10, Math.min(1000, mouseY))
-                    } else if (cropDragMode === "bottomright") {
-                        right = Math.max(left + 10, Math.min(1000, mouseX))
-                        bottom = Math.max(top + 10, Math.min(1000, mouseY))
-                    }
-                    
-                    
-                    var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom)
-                    left = constrainedBox[0]
-                    top = constrainedBox[1]
-                    right = constrainedBox[2]
-                    bottom = constrainedBox[3]
+                    } else {
+                        if (cropDragMode.includes("left")) left = mouseX;
+                        if (cropDragMode.includes("right")) right = mouseX;
+                        if (cropDragMode.includes("top")) top = mouseY;
+                        if (cropDragMode.includes("bottom")) bottom = mouseY;
 
+                        var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom, cropDragMode)
+                        left = constrainedBox[0]
+                        top = constrainedBox[1]
+                        right = constrainedBox[2]
+                        bottom = constrainedBox[3]
+                    }
                     
                     uiState.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
                 }
@@ -284,35 +386,124 @@ Item {
             }
         }
 
-        // Wheel for zoom
+        // Wheel for zoom - zooms in towards cursor, zooms out towards center
         onWheel: function(wheel) {
-            // A real implementation would be more complex, zooming
-            // into the cursor position.
-            var scaleFactor = wheel.angleDelta.y > 0 ? 1.2 : 1 / 1.2;
-            scaleTransform.xScale *= scaleFactor;
-            scaleTransform.yScale *= scaleFactor;
-        }
-        
-        function updateCropBox(x1, y1, x2, y2) {
-            if (!uiState || !mainImage.source) return
+            // Disable smooth rendering during zoom for better performance
+            mainImage.isZooming = true
             
-            // Get image display bounds (accounting for PreserveAspectFit)
+            // Use a smaller scale factor for smoother, more responsive zoom
+            var isZoomingIn = wheel.angleDelta.y > 0
+            var scaleFactor = isZoomingIn ? 1.1 : 1 / 1.1;
+            
+            // Calculate old and new scale
+            var oldScale = scaleTransform.xScale
+            var newScale = oldScale * scaleFactor
+            newScale = Math.max(0.1, Math.min(20.0, newScale))
+            
+            // Get the image's painted (displayed) bounds
             var imgWidth = mainImage.paintedWidth
             var imgHeight = mainImage.paintedHeight
-            var imgX = (mainImage.width - imgWidth) / 2
-            var imgY = (mainImage.height - imgHeight) / 2
+            var centerX = mainImage.width / 2
+            var centerY = mainImage.height / 2
             
-            // Convert mouse coordinates to image coordinates
-            var imgCoordX1 = (x1 - imgX) / imgWidth
-            var imgCoordY1 = (y1 - imgY) / imgHeight
-            var imgCoordX2 = (x2 - imgX) / imgWidth
-            var imgCoordY2 = (y2 - imgY) / imgHeight
+            if (isZoomingIn) {
+                // Zoom in: zoom towards cursor position
+                var mouseX = wheel.x
+                var mouseY = wheel.y
+                var imgX = (mainImage.width - imgWidth) / 2
+                var imgY = (mainImage.height - imgHeight) / 2
+                
+                // Calculate the point in the image that's under the cursor
+                var pointInImageX = mouseX - imgX
+                var pointInImageY = mouseY - imgY
+                
+                // Only zoom towards cursor if cursor is over the image
+                if (pointInImageX >= 0 && pointInImageX <= imgWidth && 
+                    pointInImageY >= 0 && pointInImageY <= imgHeight) {
+                    
+                    // Calculate offset from image center in screen coordinates
+                    var centerOffsetX = pointInImageX - imgWidth / 2
+                    var centerOffsetY = pointInImageY - imgHeight / 2
+                    
+                    // The current screen position of a point is: (imgPoint * oldScale) + oldPan + center
+                    // We want to find what's currently under the cursor and keep it there
+                    // Instead of dividing by oldScale (which loses precision), work with scaled values
+                    
+                    // Calculate what the scaled image point currently is (before zoom)
+                    // This is: (centerOffset - pan) which represents (imgPoint * oldScale)
+                    var scaledImagePointX = centerOffsetX - panTransform.x
+                    var scaledImagePointY = centerOffsetY - panTransform.y
+                    
+                    // Adjust the scale origin to the cursor position
+                    scaleTransform.origin.x = mouseX
+                    scaleTransform.origin.y = mouseY
+                    
+                    // Apply the new scale first
+                    scaleTransform.xScale = newScale
+                    scaleTransform.yScale = newScale
+                    
+                    // After zoom, the scaled image point becomes: scaledImagePoint * (newScale / oldScale)
+                    // We want it to stay at the same screen position, so:
+                    // newPan = centerOffset - (scaledImagePoint * newScale / oldScale)
+                    // Use scaleRatio to avoid precision loss from repeated division
+                    var scaleRatio = newScale / oldScale
+                    var newPanX = centerOffsetX - (scaledImagePointX * scaleRatio)
+                    var newPanY = centerOffsetY - (scaledImagePointY * scaleRatio)
+                    
+                    // Apply the adjusted pan
+                    panTransform.x = newPanX
+                    panTransform.y = newPanY
+                } else {
+                    // If cursor is outside image, zoom from center
+                    scaleTransform.origin.x = centerX
+                    scaleTransform.origin.y = centerY
+                    scaleTransform.xScale = newScale
+                    scaleTransform.yScale = newScale
+                }
+            } else {
+                // Zoom out: always zoom towards center of screen
+                scaleTransform.origin.x = centerX
+                scaleTransform.origin.y = centerY
+                
+                // When zooming out, we need to adjust pan to keep the center visible
+                // The pan values are in screen coordinates, but they represent image-space offsets
+                // When scale changes, we need to scale the pan proportionally to maintain
+                // the same visual position relative to the center
+                var scaleRatio = newScale / oldScale
+                
+                // Adjust pan to keep the center point fixed
+                // If we're zooming out (scaleRatio < 1), pan should be reduced proportionally
+                panTransform.x = panTransform.x * scaleRatio
+                panTransform.y = panTransform.y * scaleRatio
+                
+                // Apply the new scale
+                scaleTransform.xScale = newScale
+                scaleTransform.yScale = newScale
+            }
+            
+            // Re-enable smooth rendering after a short delay
+            zoomSmoothTimer.restart()
+        }
+        
+        Timer {
+            id: zoomSmoothTimer
+            interval: 150  // Re-enable smooth rendering 150ms after last zoom
+            onTriggered: {
+                mainImage.isZooming = false
+            }
+        }
+        
+        function updateCropBox(x1, y1, x2, y2, applyAspectRatio = false) {
+            if (!uiState || !mainImage.source) return
+
+            var imgCoord1 = mapToImageCoordinates(Qt.point(x1, y1))
+            var imgCoord2 = mapToImageCoordinates(Qt.point(x2, y2))
             
             // Clamp to image bounds
-            imgCoordX1 = Math.max(0, Math.min(1, imgCoordX1))
-            imgCoordY1 = Math.max(0, Math.min(1, imgCoordY1))
-            imgCoordX2 = Math.max(0, Math.min(1, imgCoordX2))
-            imgCoordY2 = Math.max(0, Math.min(1, imgCoordY2))
+            var imgCoordX1 = Math.max(0, Math.min(1, imgCoord1.x))
+            var imgCoordY1 = Math.max(0, Math.min(1, imgCoord1.y))
+            var imgCoordX2 = Math.max(0, Math.min(1, imgCoord2.x))
+            var imgCoordY2 = Math.max(0, Math.min(1, imgCoord2.y))
             
             // Ensure left < right and top < bottom
             var left = Math.min(imgCoordX1, imgCoordX2) * 1000
@@ -320,13 +511,23 @@ Item {
             var top = Math.min(imgCoordY1, imgCoordY2) * 1000
             var bottom = Math.max(imgCoordY1, imgCoordY2) * 1000
             
-            
-            var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom)
-            left = constrainedBox[0]
-            top = constrainedBox[1]
-            right = constrainedBox[2]
-            bottom = constrainedBox[3]
+            // Ensure minimum size
+            if (right - left < 10) {
+                if (right < 1000) right = left + 10
+                else left = right - 10
+            }
+            if (bottom - top < 10) {
+                if (bottom < 1000) bottom = top + 10
+                else top = bottom - 10
+            }
 
+            if (applyAspectRatio) {
+                var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom, "new")
+                left = constrainedBox[0]
+                top = constrainedBox[1]
+                right = constrainedBox[2]
+                bottom = constrainedBox[3]
+            }
             
             uiState.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
         }
@@ -337,53 +538,95 @@ Item {
             if (name === "4:5 (Portrait)") return [4, 5]
             if (name === "1.91:1 (Landscape)") return [191, 100]
             if (name === "9:16 (Story)") return [9, 16]
+            if (name === "16:9 (Wide)") return [16, 9]
             return null
         }
         
-        function applyAspectRatioConstraint(left, top, right, bottom) {
-            if (uiState.currentAspectRatioIndex > 0 && uiState.aspectRatioNames && uiState.aspectRatioNames.length > uiState.currentAspectRatioIndex) {
-                var ratioName = uiState.aspectRatioNames[uiState.currentAspectRatioIndex]
-                var ratio = getAspectRatio(ratioName)
-                if (ratio) {
-                    var currentWidth = right - left
-                    var currentHeight = bottom - top
-                    var targetAspect = ratio[0] / ratio[1]
-                    var currentAspect = currentWidth / currentHeight
-                    
-                    if (currentAspect > targetAspect) {
-                        // Too wide, adjust height
-                        var newHeight = currentWidth / targetAspect
-                        var centerY = (top + bottom) / 2
-                        top = centerY - newHeight / 2
-                        bottom = centerY + newHeight / 2
-                        // Clamp to image bounds
-                        if (top < 0) {
-                            bottom += -top
-                            top = 0
-                        }
-                        if (bottom > 1000) {
-                            top -= (bottom - 1000)
-                            bottom = 1000
-                        }
+        function applyAspectRatioConstraint(left, top, right, bottom, dragMode) {
+            if (uiState.currentAspectRatioIndex <= 0 || !uiState.aspectRatioNames || uiState.aspectRatioNames.length <= uiState.currentAspectRatioIndex) {
+                return [left, top, right, bottom];
+            }
+
+            var ratioName = uiState.aspectRatioNames[uiState.currentAspectRatioIndex];
+            var ratio = getAspectRatio(ratioName);
+            if (!ratio) {
+                return [left, top, right, bottom];
+            }
+
+            var targetAspect = ratio[0] / ratio[1];
+            var width = right - left;
+            var height = bottom - top;
+
+            // Adjust dimensions based on which edge/corner is being dragged
+            if (dragMode.includes("left") || dragMode.includes("right")) {
+                height = width / targetAspect;
+            } else if (dragMode.includes("top") || dragMode.includes("bottom")) {
+                width = height * targetAspect;
+            } else if (dragMode === "new") {
+                if(width / height > targetAspect) {
+                    width = height * targetAspect;
+                } else {
+                    height = width / targetAspect;
+                }
+            }
+
+
+            // Anchor the box to the correct edge/corner
+            if (dragMode.includes("top")) {
+                top = bottom - height;
+            } else {
+                bottom = top + height;
+            }
+            
+            if (dragMode.includes("left")) {
+                left = right - width;
+            } else {
+                right = left + width;
+            }
+
+
+            // Clamp to image bounds and readjust
+            if (left < 0) {
+                left = 0;
+                right = width;
+            }
+            if (right > 1000) {
+                right = 1000;
+                left = 1000 - width;
+            }
+            if (top < 0) {
+                top = 0;
+                bottom = height;
+            }
+            if (bottom > 1000) {
+                bottom = 1000;
+                top = 1000 - height;
+            }
+            
+            // Final check to ensure aspect ratio is maintained after clamping
+            var finalWidth = right - left;
+            var finalHeight = bottom - top;
+            
+            if(Math.abs(finalWidth / finalHeight - targetAspect) > 0.01) {
+                if (dragMode.includes("left") || dragMode.includes("right")) {
+                    finalWidth = finalHeight * targetAspect;
+                    if(dragMode.includes("left")) {
+                        left = right - finalWidth;
                     } else {
-                        // Too tall, adjust width
-                        var newWidth = currentHeight * targetAspect
-                        var centerX = (left + right) / 2
-                        left = centerX - newWidth / 2
-                        right = centerX + newWidth / 2
-                        // Clamp to image bounds
-                        if (left < 0) {
-                            right += -left
-                            left = 0
-                        }
-                        if (right > 1000) {
-                            left -= (right - 1000)
-                            right = 1000
-                        }
+                        right = left + finalWidth;
+                    }
+                } else {
+                    finalHeight = finalWidth / targetAspect;
+                    if(dragMode.includes("top")) {
+                        top = bottom - finalHeight;
+                    } else {
+                        bottom = top + finalHeight;
                     }
                 }
             }
-            return [left, top, right, bottom]
+
+
+            return [left, top, right, bottom];
         }
         
         function updateCropBoxFromAspectRatio() {
@@ -393,7 +636,8 @@ Item {
                 box[0] / 1000 * mainImage.paintedWidth + (mainImage.width - mainImage.paintedWidth) / 2,
                 box[1] / 1000 * mainImage.paintedHeight + (mainImage.height - mainImage.paintedHeight) / 2,
                 box[2] / 1000 * mainImage.paintedWidth + (mainImage.width - mainImage.paintedWidth) / 2,
-                box[3] / 1000 * mainImage.paintedHeight + (mainImage.height - mainImage.paintedHeight) / 2
+                box[3] / 1000 * mainImage.paintedHeight + (mainImage.height - mainImage.paintedHeight) / 2,
+                true
             )
         }
     }
@@ -401,11 +645,16 @@ Item {
     // Crop rectangle overlay
     Item {
         id: cropOverlay
-        visible: uiState && uiState.isCropping && uiState.currentCropBox
+        property var cropBox: uiState ? uiState.currentCropBox : [0, 0, 1000, 1000]
+        property bool hasActiveCrop: cropBox
+                                     && cropBox.length === 4
+                                     && !(cropBox[0] === 0
+                                          && cropBox[1] === 0
+                                          && cropBox[2] === 1000
+                                          && cropBox[3] === 1000)
+        visible: uiState && uiState.isCropping && hasActiveCrop
         anchors.fill: parent
         z: 100
-        
-        property var cropBox: uiState ? uiState.currentCropBox : [0, 0, 1000, 1000]
         
         onCropBoxChanged: {
             if (!mainImage.source) return
@@ -422,6 +671,16 @@ Item {
             function onPaintedHeightChanged() { if (cropOverlay.visible) cropOverlay.updateCropRect() }
         }
         
+        Connections {
+            target: uiState
+            function onCurrentCropBoxChanged() {
+                cropOverlay.cropBox = uiState.currentCropBox
+                if (cropOverlay.visible && mainImage.source) {
+                    cropOverlay.updateCropRect()
+                }
+            }
+        }
+        
         function updateCropRect() {
             if (!mainImage.source) return
             
@@ -430,10 +689,22 @@ Item {
             var imgX = (mainImage.width - imgWidth) / 2
             var imgY = (mainImage.height - imgHeight) / 2
             
-            var left = imgX + (cropBox[0] / 1000) * imgWidth
-            var top = imgY + (cropBox[1] / 1000) * imgHeight
-            var right = imgX + (cropBox[2] / 1000) * imgWidth
-            var bottom = imgY + (cropBox[3] / 1000) * imgHeight
+            // Account for zoom and pan transforms when displaying crop box
+            var scale = mainImage.scaleTransform ? mainImage.scaleTransform.xScale : 1.0
+            var panX = mainImage.panTransform ? mainImage.panTransform.x : 0
+            var panY = mainImage.panTransform ? mainImage.panTransform.y : 0
+            
+            // Convert normalized crop box (0-1000) to image-local coordinates
+            var localLeft = (cropBox[0] / 1000) * imgWidth
+            var localTop = (cropBox[1] / 1000) * imgHeight
+            var localRight = (cropBox[2] / 1000) * imgWidth
+            var localBottom = (cropBox[3] / 1000) * imgHeight
+            
+            // Apply zoom and pan transforms to get screen coordinates
+            var left = imgX + (localLeft * scale) + panX
+            var top = imgY + (localTop * scale) + panY
+            var right = imgX + (localRight * scale) + panX
+            var bottom = imgY + (localBottom * scale) + panY
             
             cropRect.x = left
             cropRect.y = top
@@ -485,6 +756,30 @@ Item {
             color: "transparent"
             border.color: "white"
             border.width: 3
+            rotation: mainMouseArea.cropRotation
+            transformOrigin: Item.Center
+
+            // Rotation Handle Line
+            Rectangle {
+                id: handleLine
+                width: 2
+                height: 25
+                color: "white"
+                anchors.top: parent.bottom
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+
+            // Rotation Handle Knob
+            Rectangle {
+                width: 12
+                height: 12
+                radius: 6
+                color: "white"
+                border.color: "black"
+                border.width: 1
+                anchors.verticalCenter: handleLine.bottom
+                anchors.horizontalCenter: handleLine.horizontalCenter
+            }
         }
     }
     
@@ -495,7 +790,7 @@ Item {
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.margins: 10
-        width: 200
+        width: 120
         height: Math.max(150, aspectRatioColumn.implicitHeight + 20)
         color: "#333333"
         border.color: "#666666"
@@ -519,7 +814,7 @@ Item {
             Text {
                 text: "Aspect Ratio"
                 font.bold: true
-                color: "white"
+                color: aspectRatioWindow.isDark ? "white" : "black"
                 font.pixelSize: 12
             }
             
@@ -551,6 +846,34 @@ Item {
                                     mainMouseArea.updateCropBoxFromAspectRatio()
                                 }
                             }
+                        }
+                    }
+                }
+            }
+            
+            Rectangle {
+                width: parent.width
+                height: 30
+                color: "transparent"
+                radius: 3
+                
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Rotate"
+                    color: "white"
+                    font.pixelSize: 11
+                }
+                
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        mainMouseArea.isRotating = !mainMouseArea.isRotating
+                        if(mainMouseArea.isRotating) {
+                            mainMouseArea.cropDragMode = "rotate"
+                        } else {
+                            mainMouseArea.cropDragMode = "none"
                         }
                     }
                 }

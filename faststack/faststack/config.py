@@ -14,6 +14,9 @@ DEFAULT_CONFIG = {
         "prefetch_radius": "4",
         "theme": "dark",
         "default_directory": "",
+        "optimize_for": "speed",  # "speed" or "quality"
+        "auto_level_threshold": "0.1",
+        "auto_level_strength": "1.0",
     },
     "helicon": {
         "exe": "C:\\Program Files\\Helicon Software\\Helicon Focus 8\\HeliconFocus.exe",
@@ -29,7 +32,8 @@ DEFAULT_CONFIG = {
         "monitor_icc_path": "",  # For 'icc' mode: path to monitor ICC profile
     },
     "awb": {
-        "mode": "lab",  # "lab" or "rgb"        "strength": "0.7",
+        "mode": "lab",  # "lab" or "rgb"        
+        "strength": "0.7",
         "warm_bias": "6",
         "luma_lower_bound": "30",
         "luma_upper_bound": "220",
