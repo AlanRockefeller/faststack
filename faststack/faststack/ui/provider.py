@@ -703,7 +703,11 @@ class UIState(QObject):
             )
 
         # only accept 4-element tuples
-        if not isinstance(new_value, tuple) or len(new_value) != 4:
+        if (
+            not isinstance(new_value, tuple)
+            or len(new_value) != 4
+            or not all(isinstance(v, (int, float)) for v in new_value)
+        ):
             log.warning("UIState.currentCropBox: ignoring invalid crop box %r", new_value)
             return 
         if self._current_crop_box != new_value:

@@ -2274,16 +2274,14 @@ class AppController(QObject):
     def rotate_image_cw(self):
         """Rotate the edited image 90 degrees clockwise."""
         current = self.image_editor.current_edits.get('rotation', 0)
-        new_rotation = (current + 90) % 360
+        new_rotation = (current - 90) % 360
         self.set_edit_parameter('rotation', new_rotation)
 
     @Slot()
     def rotate_image_ccw(self):
         """Rotate the edited image 90 degrees counter-clockwise."""
         current = self.image_editor.current_edits.get('rotation', 0)
-        new_rotation = (current - 90) % 360
-        if new_rotation < 0:
-            new_rotation += 360
+        new_rotation = (current + 90) % 360
         self.set_edit_parameter('rotation', new_rotation)
     
     @Slot()
