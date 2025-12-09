@@ -130,7 +130,7 @@ Item {
         MouseArea {
             id: mainMouseArea
             anchors.fill: parent
-            acceptedButtons: Qt.LeftButton
+            acceptedButtons: Qt.LeftButton | Qt.RightButton
             hoverEnabled: true
             cursorShape: {
                 if (!uiState || !uiState.isCropping) return Qt.ArrowCursor
@@ -168,6 +168,35 @@ Item {
             startY = mouse.y
             isDraggingOutside = false
             
+            if (mouse.button === Qt.RightButton) {
+                if (uiState && uiState.isCropping) {
+                    // Cancel crop mode if already active
+                    if (controller) controller.cancel_crop_mode()
+                } else if (uiState) {
+                    // Enter crop mode and start new crop
+                    uiState.isCropping = true
+                    
+                    // Set up new crop state
+                    cropDragMode = "new"
+                    cropStartX = mouse.x
+                    cropStartY = mouse.y
+                    
+                    // Initialize anchors
+                    var startCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+                    // Clamp to [0, 1] and convert to [0, 1000]
+                    var startNormX = Math.max(0, Math.min(1, startCoords.x)) * 1000
+                    var startNormY = Math.max(0, Math.min(1, startCoords.y)) * 1000
+                    
+                    cropBoxStartLeft = startNormX
+                    cropBoxStartRight = startNormX
+                    cropBoxStartTop = startNormY
+                    cropBoxStartBottom = startNormY
+                    
+                    isCropDragging = true
+                }
+                return
+            }
+            
             if (uiState && uiState.isCropping) {
                 // Check if clicking on existing crop box
                 var cropRect = getCropRect()
@@ -184,9 +213,9 @@ Item {
                 var theta = mainMouseArea.cropRotation * Math.PI / 180
                 // Handle is at bottom center + 25px
                 var handleOffset = cropRect.height / 2 + 25
-                // Rotated offset: x = -offset * sin(theta), y = offset * cos(theta)
-                var handleX = cropCenterX - handleOffset * Math.sin(theta)
-                var handleY = cropCenterY + handleOffset * Math.cos(theta)
+                // Correct rotation handle placement (CW-positive UI)
+                var handleX = cropCenterX + handleOffset * Math.sin(theta)
+                var handleY = cropCenterY - handleOffset * Math.cos(theta)
                 
                 var dist = Math.sqrt(Math.pow(mouse.x - handleX, 2) + Math.pow(mouse.y - handleY, 2))
 
@@ -236,6 +265,17 @@ Item {
                     cropDragMode = "new"
                     cropStartX = mouse.x
                     cropStartY = mouse.y
+                    
+                    // Initialize anchors for aspect ratio constraint using normalized coordinates
+                    var startCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+                    // Clamp to [0, 1] and convert to [0, 1000]
+                    var startNormX = Math.max(0, Math.min(1, startCoords.x)) * 1000
+                    var startNormY = Math.max(0, Math.min(1, startCoords.y)) * 1000
+                    
+                    cropBoxStartLeft = startNormX
+                    cropBoxStartRight = startNormX
+                    cropBoxStartTop = startNormY
+                    cropBoxStartBottom = startNormY
                 }
                 isCropDragging = true
             }
@@ -279,17 +319,12 @@ Item {
             var panX = panTransform.x
             var panY = panTransform.y
 
-            var originX = scaleTransform.origin.x
-            var originY = scaleTransform.origin.y
-
-            var x_no_pan = screenPoint.x - panX
-            var y_no_pan = screenPoint.y - panY
-
-            var x_no_scale = originX + (x_no_pan - originX) / scale
-            var y_no_scale = originY + (y_no_pan - originY) / scale
-
-            var localX = x_no_scale - imgX
-            var localY = y_no_scale - imgY
+            // Inverse of getCropRect transform:
+            // Screen = imgX + (Local * Scale) + Pan
+            // Local = (Screen - Pan - imgX) / Scale
+            
+            var localX = (screenPoint.x - panX - imgX) / scale
+            var localY = (screenPoint.y - panY - imgY) / scale
 
             return {x: localX / imgWidth, y: localY / imgHeight}
         }
@@ -302,7 +337,7 @@ Item {
                     var cropCenterX = getCropRect().x + getCropRect().width / 2
                     var cropCenterY = getCropRect().y + getCropRect().height / 2
                     var currentAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
-                    cropRotation = cropStartRotation + (currentAngle - cropStartAngle)
+                    cropRotation = cropStartRotation - (currentAngle - cropStartAngle)
                 } else if (cropDragMode !== "none") {
                     
                     var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
