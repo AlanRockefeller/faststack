@@ -87,6 +87,7 @@ class UIState(QObject):
     awbModeChanged = Signal()
     awbStrengthChanged = Signal()
     awbWarmBiasChanged = Signal()
+    awbTintBiasChanged = Signal()
     awbLumaLowerBoundChanged = Signal()
     awbLumaUpperBoundChanged = Signal()
     awbRgbLowerBoundChanged = Signal()
@@ -95,6 +96,7 @@ class UIState(QObject):
     isStackedJpgChanged = Signal() # New signal for isStackedJpg
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
+    autoLevelStrengthAutoChanged = Signal(bool)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_cropping_changed = Signal(bool)
@@ -337,6 +339,15 @@ class UIState(QObject):
         self.app_controller.set_awb_warm_bias(value)
         self.awbWarmBiasChanged.emit()
 
+    @Property(int, notify=awbTintBiasChanged)
+    def awbTintBias(self):
+        return self.app_controller.get_awb_tint_bias()
+
+    @awbTintBias.setter
+    def awbTintBias(self, value: int):
+        self.app_controller.set_awb_tint_bias(value)
+        self.awbTintBiasChanged.emit()
+
     @Property(int, notify=awbLumaLowerBoundChanged)
     def awbLumaLowerBound(self):
         return self.app_controller.get_awb_luma_lower_bound()
@@ -496,6 +507,15 @@ class UIState(QObject):
     def autoLevelStrength(self, value):
         self.app_controller.set_auto_level_strength(value)
         self.autoLevelStrengthChanged.emit(value)
+
+    @Property(bool, notify=autoLevelStrengthAutoChanged)
+    def autoLevelStrengthAuto(self):
+        return self.app_controller.get_auto_level_strength_auto()
+
+    @autoLevelStrengthAuto.setter
+    def autoLevelStrengthAuto(self, value):
+        self.app_controller.set_auto_level_strength_auto(value)
+        self.autoLevelStrengthAutoChanged.emit(value)
 
     @Slot()
     def open_folder(self):
@@ -713,6 +733,8 @@ class UIState(QObject):
         if self._current_crop_box != new_value:
             self._current_crop_box = new_value
             self.current_crop_box_changed.emit(new_value)
+            # Sync with ImageEditor
+            self.app_controller.image_editor.set_crop_box(new_value)
 
     @Property(float, notify=crop_rotation_changed)
     def cropRotation(self) -> float:

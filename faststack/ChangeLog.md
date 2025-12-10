@@ -9,13 +9,17 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 - Added batch delete with confirmation dialog.
 - Added the --cachedebug command line argument which gives info on the image cache in the status bar.   Doesn't seem to slow down the program at all, just takes up room in the status bar.A
 - Added a setting that switches between image display optimized for speed or quality.
+- **Auto-Levels:** Automatic image enhancement with configurable threshold and strength
+- **Image Metadata:** Extract and display EXIF metadata (I key)
+- **Image Processing:** Auto white balance, texture enhancement, and straightening
+- **Crop Operations:** Fixed crop functionality with rotation support
 
 ## [1.3.0] - 2025-11-23
 
 - Added the ability to crop images, via the cr(O)p hotkey.   It can be a freeform crop, or constrained to several popular aspect ratios.   
 - Sorts images by time.
 - Added the Stack Source Raws feature in the Action menu - if you import your images with stackcopy.py --lightroomimport (https://github.com/AlanRockefeller/faststack) and you are viewing a photo stacked in-camera, this feature will open the raw images that made this stack in Helicon Focus.
-- Some fixes to the image cache - it doesn't expire when it shouldn't, does expire when it should, and warns you when the cache is full so you can consider increassing the cache size in settings.
+- Some fixes to the image cache - it doesn't expire when it shouldn't, does expire when it should, and warns you when the cache is full so you can consider increasing the cache size in settings.
 
 
 ## [1.2.0] - 2025-11-22

@@ -129,30 +129,40 @@ class ImageEditor:
             self._preview_image = None
             return False
 
-    def _apply_edits(self, img: Image.Image) -> Image.Image:
+    def _apply_edits(self, img: Image.Image, is_export: bool = False) -> Image.Image:
         """Applies all current edits to the provided PIL Image."""
         # 1. Rotation
         rotation = self.current_edits['rotation']
         if rotation == 90:
-            img = img.transpose(Image.Transpose.ROTATE_90)
+            img = img.transpose(Image.Transpose.ROTATE_270) # 90 CW = 270 CCW
         elif rotation == 180:
             img = img.transpose(Image.Transpose.ROTATE_180)
         elif rotation == 270:
-            img = img.transpose(Image.Transpose.ROTATE_270)
+            img = img.transpose(Image.Transpose.ROTATE_90) # 270 CW = 90 CCW
 
         # 2. Free Rotation (Straighten)
         straighten_angle = self.current_edits['straighten_angle']
         if abs(straighten_angle) > 0.001:
-            img = img.rotate(straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
+            # PIL rotate is CCW. We want UI CW. Use negative.
+            # expand=True changes dimensions.
+            img = img.rotate(-straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
 
         # 3. Cropping
         crop_box = self.current_edits.get('crop_box')
-        if crop_box:
+        if crop_box and len(crop_box) == 4:
             width, height = img.size
+            # Normalized 0-1000 to pixels
             left = int(crop_box[0] * width / 1000)
             top = int(crop_box[1] * height / 1000)
             right = int(crop_box[2] * width / 1000)
             bottom = int(crop_box[3] * height / 1000)
+            
+            # Bounds check
+            left = max(0, min(width - 1, left))
+            top = max(0, min(height - 1, top))
+            right = max(left + 1, min(width, right))
+            bottom = max(top + 1, min(height, bottom))
+            
             img = img.crop((left, top, right, bottom))
         
         # 3. Exposure (gamma-based)
@@ -350,7 +360,7 @@ class ImageEditor:
 
         # Always start from a fresh copy of the small preview image
         img = self._preview_image.copy()
-        img = self._apply_edits(img)
+        img = self._apply_edits(img, is_export=False)
 
         # The image is in RGB mode after _apply_edits
         buffer = img.tobytes()
@@ -383,7 +393,7 @@ class ImageEditor:
             return None
 
         final_img = self.original_image.copy()
-        final_img = self._apply_edits(final_img)
+        final_img = self._apply_edits(final_img, is_export=True)
 
         original_path = self.current_filepath
         try:
@@ -402,14 +412,38 @@ class ImageEditor:
             # Re-open original to correctly detect format and get EXIF
             with Image.open(original_path) as original_img:
                 original_format = original_img.format or original_path.suffix.lstrip('.').upper()
-                exif_data = original_img.info.get('exif')
+                
+                # Handle EXIF
+                exif_bytes = original_img.info.get('exif')
+                
+                # Try to reset orientation to Normal (1) if EXIF exists
+                if exif_bytes:
+                    try:
+                        # Load exif data as an object
+                        exif = original_img.getexif()
+                        # Tag 274 is Orientation. Set to 1 (Normal)
+                        if 274 in exif:
+                            exif[274] = 1
+                            # Serialize back to bytes - Pillow >= 8.2.0 required for tobytes()
+                            # If tobytes() is missing, we might skip writing modified EXIF or write original
+                            if hasattr(exif, 'tobytes'):
+                                exif_bytes = exif.tobytes()
+                            else:
+                                # Fallback for older Pillow: skip writing EXIF if we can't sanitize it
+                                # to avoid double-rotation bug.
+                                print("Warning: Pillow too old to sanitize EXIF bytes. Skipping EXIF write to prevent double-rotation.")
+                                exif_bytes = None
+                    except Exception as e:
+                        print(f"Warning: Failed to sanitize EXIF orientation: {e}")
+                        # Fallback: safer to skip EXIF than write bad orientation
+                        exif_bytes = None
 
             save_kwargs = {}
             if original_format == 'JPEG':
                 save_kwargs['format'] = 'JPEG'
                 save_kwargs['quality'] = 95
-                if exif_data:
-                    save_kwargs['exif'] = exif_data
+                if exif_bytes:
+                    save_kwargs['exif'] = exif_bytes
             else:
                 save_kwargs['format'] = original_format
 
