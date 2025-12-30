@@ -127,6 +127,7 @@ class AppController(QObject):
         self.ui_state = UIState(self)
         self.ui_state.theme = self.get_theme()
         self.ui_state.debugCache = self.debug_cache
+        self.ui_state.debugMode = _debug_mode # Set debug mode from global
         self.keybinder = Keybinder(self)
         self.ui_state.debugCache = self.debug_cache # Pass debug_cache state to UI
         self.ui_state.isDecoding = False # Initialize decoding indicator
@@ -271,16 +272,15 @@ class AppController(QObject):
             return False
             
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
-            # Handle Enter key in crop mode
-            if self.ui_state.isCropping and (event.key() == Qt.Key_Enter or event.key() == Qt.Key_Return):
-                self.execute_crop()
-                return True
+            # QML handles Crop Enter/Esc keys now.
+            # We defer to QML to avoid double-triggering or focus conflicts.
+            # handled = self.keybinder.handle_key_press(event) ...
             
-            # Handle ESC key to exit crop mode
-            if self.ui_state.isCropping and event.key() == Qt.Key_Escape:
-                self.cancel_crop_mode()
-                return True
-            
+            # When cropping (or editing), let QML handle Enter/Esc and related keys.
+            # Otherwise keybinder can swallow them before QML sees them.
+            if getattr(self.ui_state, "isCropping", False) or getattr(self.ui_state, "isEditorOpen", False):
+                return False
+
             handled = self.keybinder.handle_key_press(event)
             if handled:
                 return True
@@ -1276,35 +1276,86 @@ class AppController(QObject):
             self.sync_ui_state()
 
     @Slot(float)
-    def set_straighten_angle(self, angle: float):
-        """Sets the straighten angle for the image editor and updates current view."""
+    @Slot(float, float)
+    def set_straighten_angle(self, angle: float, target_aspect_ratio: float = -1.0):
         """Sets the straighten angle for the image editor and updates current view."""
         if not (self.ui_state.isEditorOpen or self.ui_state.isCropping):
             return
         
-        # Ensure editor is loaded with current image so preview can update in crop mode
-        # self.get_decoded_image relies on this being loaded to return the preview
-        image_file = self.image_files[self.current_index]
-        filepath = image_file.path
-        editor_path = self.image_editor.current_filepath
-        
-        match = False
-        if editor_path:
-            try:
-                match = Path(editor_path).resolve() == Path(filepath).resolve()
-            except Exception:
-                match = str(editor_path) == str(filepath)
+        # Optimization: Assume image is loaded by toggle_crop_mode or open_editor.
+        # Avoid disk I/O here to prevent stutter during drag.
+        if not self.image_editor.original_image:
+             return
 
-        if not match or not self.image_editor.original_image:
-            # We don't want to trigger a full recursive loop if get_decoded_image calls back here, 
-            # but usually get_decoded_image calls get_preview_data only if loaded.
-            # Passing cached_preview=None forces a load from disk which is safer here.
-            # Or better, fetch the raw decoded image from cache if available (but get_decoded_image might recurse).
-            # We can peek into self.image_cache directly to avoid recursion risk.
+        # log.info(f"AppController.set_straighten_angle: {angle}, AR: {target_aspect_ratio}")
+        
+        # Update Aspect Ratio Compensation for Crop Box
+        # If we have a target aspect ratio, we need to adjust the normalized crop box 
+        # because the underlying canvas aspect ratio changes with rotation (expand=True).
+        if target_aspect_ratio > 0 and self.ui_state.currentCropBox:
+            l, t, r, b = self.ui_state.currentCropBox
+            w_norm = r - l
+            h_norm = b - t
             
-            # Simple approach: just load it.
-            if not self.image_editor.load_image(str(filepath)):
-                 return
+            if w_norm > 0 and h_norm > 0:
+                # Calculate new canvas dimensions
+                # PIL expand=True logic:
+                im_w, im_h = self.image_editor.original_image.size
+                import math
+                rad = math.radians(abs(angle))
+                # New dimensions
+                new_w = abs(im_w * math.cos(rad)) + abs(im_h * math.sin(rad))
+                new_h = abs(im_w * math.sin(rad)) + abs(im_h * math.cos(rad))
+                
+                if new_w > 0 and new_h > 0:
+                    canvas_aspect = new_w / new_h
+                    
+                    # We want PixelAspect = (w_norm * new_w/1000) / (h_norm * new_h/1000) = target_aspect
+                    # (w_norm / h_norm) * (new_w / new_h) = target_aspect
+                    # w_norm / h_norm = target_aspect / canvas_aspect
+                    
+                    target_norm_ratio = target_aspect_ratio / canvas_aspect
+                    
+                    # Adjust dimensions to match target_norm_ratio
+                    # Simple: Preserve Width, adjust Height.
+                    
+                    new_h_norm = w_norm / target_norm_ratio
+                    
+                    # If new height exceeds bounds (1000), constrain and adjust width instead
+                    if new_h_norm > 1000:
+                         new_h_norm = 1000
+                         w_norm = new_h_norm * target_norm_ratio
+                    # Recenter height
+                    cy = (t + b) / 2
+                    t = cy - new_h_norm / 2
+                    b = cy + new_h_norm / 2
+                    
+                    # Clamp vertical
+                    if t < 0: 
+                        b -= t # shift down
+                        t = 0
+                    if b > 1000:
+                        t -= (b - 1000) # shift up
+                        b = 1000
+                        if t < 0: t = 0 # double clamp
+                    
+                    # Recenter width (if changed)
+                    cx = (l + r) / 2
+                    l = cx - w_norm / 2
+                    r = cx + w_norm / 2
+                     
+                    # Clamp horizontal
+                    if l < 0:
+                        r -= l
+                        l = 0
+                    if r > 1000:
+                        l -= (r - 1000)
+                        r = 1000
+                        if l < 0: l = 0
+
+                    # IMPORTANT: Don't mutate currentCropBox here.
+                    # Doing so during rotation causes the crop box to walk and jitter.
+                    # self.ui_state.currentCropBox = [l, t, r, b]
 
         log.info(f"AppController.set_straighten_angle: {angle}")
         # Invert angle because QML rotation is CW but PIL rotation (used in editor) handles direction logic internally 
@@ -1316,8 +1367,8 @@ class AppController(QObject):
         # Trigger refresh. Since we are editing, we are viewing the preview.
         # Incrementing display generation invalidates cache, but for preview it just ensures freshness if logic depends on it.
         # Crucially, sync_ui_state emits currentImageSourceChanged, forcing QML to reload.
-        self.display_generation += 1 
-        self.sync_ui_state()
+        # self.display_generation += 1 
+        # self.sync_ui_state() # DISABLE TO PREVENT FLASHING - QML handles preview live
 
     @Slot(result=int)
     def get_awb_warm_bias(self):
@@ -2502,6 +2553,20 @@ class AppController(QObject):
             self.update_status_message(f"Histogram error: {e}")
     
     @Slot()
+    def cancel_crop_mode(self):
+         """Cancel crop mode without applying changes."""
+         if self.ui_state.isCropping:
+             self.ui_state.isCropping = False
+             self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+             # Ensure preview rotation is cleared
+             self.image_editor.set_edit_param("straighten_angle", 0.0)
+             # Force QML to refresh if it's showing provider preview frames
+             self.ui_refresh_generation += 1
+             self.ui_state.currentImageSourceChanged.emit()
+             self.update_status_message("Crop cancelled")
+             log.info("Crop mode cancelled")
+
+    @Slot()
     def toggle_crop_mode(self):
         """Toggle crop mode on/off."""
         self.ui_state.isCropping = not self.ui_state.isCropping
@@ -2511,6 +2576,31 @@ class AppController(QObject):
             # Set aspect ratios for QML dropdown
             self.ui_state.aspectRatioNames = [r['name'] for r in ASPECT_RATIOS]
             self.ui_state.currentAspectRatioIndex = 0
+            
+            # Pre-load image into editor to ensure smooth rotation
+            if self.image_files and self.current_index < len(self.image_files):
+                 image_file = self.image_files[self.current_index]
+                 filepath = image_file.path
+                 editor_path = self.image_editor.current_filepath
+                 
+                 # Robust comparison
+                 match = False
+                 if editor_path:
+                     try:
+                         match = Path(editor_path).resolve() == Path(filepath).resolve()
+                     except Exception:
+                         match = str(editor_path) == str(filepath)
+                 
+                 if not match:
+                     log.debug(f"toggle_crop_mode: Loading {filepath} into editor")
+                     # Use cached preview if available to speed up using get_decoded_image(self.current_index)
+                     # note: get_decoded_image verifies index bounds
+                     cached_preview = self.get_decoded_image(self.current_index)
+                     self.image_editor.load_image(str(filepath), cached_preview=cached_preview)
+            
+            # Reset rotation to 0 when starting fresh crop mode
+            self.image_editor.set_edit_param("straighten_angle", 0.0)
+
             self.update_status_message("Crop mode: Drag to select area, Enter to crop")
             log.info("Crop mode enabled")
         else: # Exiting crop mode
@@ -2699,7 +2789,7 @@ class AppController(QObject):
                 paths_match = str(editor_path) == str(filepath)
 
         if not paths_match:
-            log.info(f"execute_crop reloading image due to path mismatch. Editor: {editor_path}, File: {filepath}")
+            log.debug(f"execute_crop reloading image due to path mismatch. Editor: {editor_path}, File: {filepath}")
             cached_preview = self.get_decoded_image(self.current_index)
             if not self.image_editor.load_image(str(filepath), cached_preview=cached_preview):
                 self.update_status_message("Failed to load image for cropping")

@@ -676,10 +676,11 @@ ApplicationWindow {
                 }
             }
         }
-    }
 
-    // -------- FOOTER / STATUS BAR (old version) --------
-    footer: Rectangle {
+    // -------- STATUS BAR OVERLAY --------
+    Rectangle {
+        z: 100
+        anchors.bottom: parent.bottom
         id: footerRect
         // Keep footer height fixed so the main image area doesn't change size when
         // stack/batch labels appear or disappear (prevents cache invalidations).
@@ -829,6 +830,7 @@ ApplicationWindow {
                 Layout.rightMargin: 10
             }
         }
+    }
     }
 
     // -------- DIALOGS --------

@@ -143,27 +143,103 @@ class ImageEditor:
         # 2. Free Rotation (Straighten)
         straighten_angle = self.current_edits['straighten_angle']
         if abs(straighten_angle) > 0.001:
-            # PIL rotate is CCW. We want UI CW. Use negative.
-            # expand=True changes dimensions.
-            img = img.rotate(-straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
-
-        # 3. Cropping
-        crop_box = self.current_edits.get('crop_box')
-        if crop_box and len(crop_box) == 4:
-            width, height = img.size
-            # Normalized 0-1000 to pixels
-            left = int(crop_box[0] * width / 1000)
-            top = int(crop_box[1] * height / 1000)
-            right = int(crop_box[2] * width / 1000)
-            bottom = int(crop_box[3] * height / 1000)
-            
-            # Bounds check
-            left = max(0, min(width - 1, left))
-            top = max(0, min(height - 1, top))
-            right = max(left + 1, min(width, right))
-            bottom = max(top + 1, min(height, bottom))
-            
-            img = img.crop((left, top, right, bottom))
+            # Current crop_box is in SOURCE SPACE (0-1000 relative to un-rotated image)
+            # We must convert it to ROTATED SPACE (relative to the expanded rotated image)
+            crop_box = self.current_edits.get('crop_box')
+            if crop_box and len(crop_box) == 4:
+                w, h = img.size
+                
+                # 1. Get Source Pixels
+                l = int(crop_box[0] * w / 1000)
+                t = int(crop_box[1] * h / 1000)
+                r = int(crop_box[2] * w / 1000)
+                b = int(crop_box[3] * h / 1000)
+                
+                # 4 Corners relative to center
+                cx, cy = w / 2, h / 2
+                corners = [
+                    (l - cx, t - cy), # TL
+                    (r - cx, t - cy), # TR
+                    (r - cx, b - cy), # BR
+                    (l - cx, b - cy)  # BL
+                ]
+                
+                # 2. Rotate Corners
+                rad = -np.deg2rad(straighten_angle) # UI is CW? rotate uses CCW?
+                # PIL rotate(-angle) means CW if angle is positive?
+                # Actually PIL rotate(theta) rotates CCW by theta.
+                # If UI sends positive for CW, we use -angle.
+                # To map coordinates, we use standard rotation matrix for CCW theta:
+                # x' = x cos - y sin
+                # y' = x sin + y cos
+                # Here theta is -straighten_angle (to match PIL rotate(-straighten_angle))
+                
+                theta = np.deg2rad(-straighten_angle)
+                cos_t = np.cos(theta)
+                sin_t = np.sin(theta)
+                
+                rot_corners = []
+                for x, y in corners:
+                    rx = x * cos_t - y * sin_t
+                    ry = x * sin_t + y * cos_t
+                    rot_corners.append((rx, ry))
+                
+                # 3. Calculate AABB of rotated corners
+                # This corresponds to the bounding box in the NEW rotated image space (relative to its center)
+                min_x = min(c[0] for c in rot_corners)
+                max_x = max(c[0] for c in rot_corners)
+                min_y = min(c[1] for c in rot_corners)
+                max_y = max(c[1] for c in rot_corners)
+                
+                # 4. Map to new image coordinates
+                # New image size (expand=True)
+                new_w = int(abs(w * np.cos(theta)) + abs(h * np.sin(theta)))
+                new_h = int(abs(w * np.sin(theta)) + abs(h * np.cos(theta)))
+                # Actually PIL calculation is slightly different/more precise, but we can just use the rotated image size
+                
+                # Perform the rotation on the image
+                img = img.rotate(-straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
+                real_new_w, real_new_h = img.size
+                
+                # Center offset
+                new_cx, new_cy = real_new_w / 2, real_new_h / 2
+                
+                final_left = int(new_cx + min_x)
+                final_top = int(new_cy + min_y)
+                final_right = int(new_cx + max_x)
+                final_bottom = int(new_cy + max_y)
+                
+                # Clamp
+                final_left = max(0, min(real_new_w, final_left))
+                final_top = max(0, min(real_new_h, final_top))
+                final_right = max(final_left, min(real_new_w, final_right))
+                final_bottom = max(final_top, min(real_new_h, final_bottom))
+                
+                # Apply Crop
+                img = img.crop((final_left, final_top, final_right, final_bottom))
+                
+            else:
+                # No crop, just rotate
+                 img = img.rotate(-straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
+        
+        # 3. Cropping (Standard axis-aligned crop if NO straighten angle, or if crop applied separately?)
+        # If straighten angle was present, we already handled the crop above as a "Rotated Crop".
+        # If we didn't handle it above (e.g. angle=0), we handle it here.
+        elif 'crop_box' in self.current_edits and self.current_edits['crop_box']:
+             crop_box = self.current_edits['crop_box']
+             if crop_box and len(crop_box) == 4:
+                width, height = img.size
+                left = int(crop_box[0] * width / 1000)
+                top = int(crop_box[1] * height / 1000)
+                right = int(crop_box[2] * width / 1000)
+                bottom = int(crop_box[3] * height / 1000)
+                
+                left = max(0, min(width - 1, left))
+                top = max(0, min(height - 1, top))
+                right = max(left + 1, min(width, right))
+                bottom = max(top + 1, min(height, bottom))
+                
+                img = img.crop((left, top, right, bottom))
         
         # 3. Exposure (gamma-based)
         exposure = self.current_edits['exposure']
