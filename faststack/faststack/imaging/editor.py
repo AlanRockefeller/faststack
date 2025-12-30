@@ -374,6 +374,24 @@ class ImageEditor:
 
     def set_edit_param(self, key: str, value: Any) -> bool:
         """Update a single edit parameter."""
+        if key == 'rotation':
+            # Guard against arbitrary angles in 'rotation'. It expects 90-degree steps.
+            # For arbitrary rotation (drag to rotate), use 'straighten_angle'.
+            try:
+                # Round to nearest 90 degrees
+                val_deg = float(value)
+                rounded_deg = round(val_deg / 90.0) * 90
+                final_val = int(rounded_deg) % 360
+                
+                if abs(val_deg - rounded_deg) > 1.0:
+                     print(f"Warning: 'rotation' received {value}. Rounding to {final_val}. Use 'straighten_angle' for free rotation.")
+                
+                self.current_edits[key] = final_val
+                return True
+            except (ValueError, TypeError):
+                print(f"Error: Invalid value for rotation: {value}")
+                return False
+
         if key in self.current_edits and key != 'crop_box':
             self.current_edits[key] = value
             return True

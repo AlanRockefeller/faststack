@@ -7,6 +7,29 @@ import QtQuick.Window
 Item {
     id: loupeView
     anchors.fill: parent
+    focus: true
+    
+    Keys.onEscapePressed: {
+        if (uiState && uiState.isCropping && mainMouseArea.isRotating) {
+            mainMouseArea.isRotating = false
+            mainMouseArea.cropDragMode = "none"
+            mainMouseArea.isCropDragging = false
+            event.accepted = true
+        }
+    }
+
+    Keys.onReturnPressed: {
+        if (uiState && uiState.isCropping && controller) {
+            controller.execute_crop()
+            event.accepted = true
+        }
+    }
+    Keys.onEnterPressed: {
+        if (uiState && uiState.isCropping && controller) {
+            controller.execute_crop()
+            event.accepted = true
+        }
+    }
 
 
     // Connection to handle zoom/pan reset signal from Python
@@ -160,6 +183,27 @@ Item {
         property real cropStartAngle: 0
         property real cropStartRotation: 0
         onCropRotationChanged: uiState.cropRotation = cropRotation
+
+        Connections {
+            target: uiState
+            function onCropRotationChanged() {
+                if (mainMouseArea.cropRotation !== uiState.cropRotation) {
+                    mainMouseArea.cropRotation = uiState.cropRotation
+                }
+            }
+        }
+
+        onIsRotatingChanged: {
+            if (uiState) {
+                if (isRotating) {
+                    uiState.statusMessage = "Press ESC to exit rotate mode"
+                } else {
+                    if (uiState.statusMessage === "Press ESC to exit rotate mode") {
+                        uiState.statusMessage = ""
+                    }
+                }
+            }
+        }
         
         onPressed: function(mouse) {
             lastX = mouse.x
@@ -199,49 +243,45 @@ Item {
             
             if (uiState && uiState.isCropping) {
                 // Check if clicking on existing crop box
-                var cropRect = getCropRect()
+                var cropGeo = getCropRect()
                 var box = uiState.currentCropBox
                 var isFullImage = box && box.length === 4 && box[0] === 0 && box[1] === 0 && box[2] === 1000 && box[3] === 1000
                 
                 var edgeThreshold = 10 * Screen.devicePixelRatio
-                var inside = mouse.x >= cropRect.x && mouse.x <= cropRect.x + cropRect.width &&
-                             mouse.y >= cropRect.y && mouse.y <= cropRect.y + cropRect.height
+                var inside = mouse.x >= cropGeo.x && mouse.x <= cropGeo.x + cropGeo.width &&
+                             mouse.y >= cropGeo.y && mouse.y <= cropGeo.y + cropGeo.height
                 
-                // Hit test for rotation handle
-                var cropCenterX = cropRect.x + cropRect.width / 2
-                var cropCenterY = cropRect.y + cropRect.height / 2
-                var theta = mainMouseArea.cropRotation * Math.PI / 180
-                // Handle is at bottom center + 25px
-                var handleOffset = cropRect.height / 2 + 25
-                // Correct rotation handle placement (CW-positive UI)
-                var handleX = cropCenterX + handleOffset * Math.sin(theta)
-                var handleY = cropCenterY - handleOffset * Math.cos(theta)
-                
-                var dist = Math.sqrt(Math.pow(mouse.x - handleX, 2) + Math.pow(mouse.y - handleY, 2))
+                // --- Hit test for rotation handle (robust: uses actual knob transform) ---
+                if (mainMouseArea.isRotating && cropOverlay.visible && rotateKnob.visible) {
+                    // knob center in mainMouseArea coords (includes cropRect rotation)
+                    var k = mainMouseArea.mapFromItem(rotateKnob, rotateKnob.width/2, rotateKnob.height/2)
+                    var dxk = mouse.x - k.x
+                    var dyk = mouse.y - k.y
+                    var distk = Math.sqrt(dxk*dxk + dyk*dyk)
 
-                if (dist < 20) {
-                    cropDragMode = "rotate"
-                    cropStartAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
-                    cropStartRotation = cropRotation
-                }
-                else if (mainMouseArea.isRotating) {
-                    cropDragMode = "rotate"
-                    var cropCenterX = cropRect.x + cropRect.width / 2
-                    var cropCenterY = cropRect.y + cropRect.height / 2
-                    cropStartAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
-                    cropStartRotation = cropRotation
+                    if (distk < 22) { // a little forgiving
+                        cropDragMode = "rotate"
+
+                        // crop center in mainMouseArea coords (includes rotation)
+                        var c = mainMouseArea.mapFromItem(cropRect, cropRect.width/2, cropRect.height/2)
+                        cropStartAngle = Math.atan2(mouse.y - c.y, mouse.x - c.x) * 180 / Math.PI
+                        cropStartRotation = cropRotation
+
+                        isCropDragging = true
+                        return
+                    }
                 }
                 // If crop box is full image, always start a new crop
                 else if (isFullImage) {
                     cropDragMode = "new"
                     cropStartX = mouse.x
                     cropStartY = mouse.y
-                } else if (inside && cropRect.width > 0 && cropRect.height > 0) {
+                } else if (inside && cropGeo.width > 0 && cropGeo.height > 0) {
                     // Determine which edge/corner is being dragged
-                    var nearLeft = Math.abs(mouse.x - cropRect.x) < edgeThreshold
-                    var nearRight = Math.abs(mouse.x - (cropRect.x + cropRect.width)) < edgeThreshold
-                    var nearTop = Math.abs(mouse.y - cropRect.y) < edgeThreshold
-                    var nearBottom = Math.abs(mouse.y - (cropRect.y + cropRect.height)) < edgeThreshold
+                    var nearLeft = Math.abs(mouse.x - cropGeo.x) < edgeThreshold
+                    var nearRight = Math.abs(mouse.x - (cropGeo.x + cropGeo.width)) < edgeThreshold
+                    var nearTop = Math.abs(mouse.y - cropGeo.y) < edgeThreshold
+                    var nearBottom = Math.abs(mouse.y - (cropGeo.y + cropGeo.height)) < edgeThreshold
                     
                     if (nearLeft && nearTop) cropDragMode = "topleft"
                     else if (nearRight && nearTop) cropDragMode = "topright"
@@ -334,10 +374,15 @@ Item {
                     // Update crop rectangle while dragging
                     updateCropBox(cropStartX, cropStartY, mouse.x, mouse.y, true)
                 } else if (cropDragMode === "rotate") {
-                    var cropCenterX = getCropRect().x + getCropRect().width / 2
-                    var cropCenterY = getCropRect().y + getCropRect().height / 2
-                    var currentAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
-                    cropRotation = cropStartRotation - (currentAngle - cropStartAngle)
+                    var c = mainMouseArea.mapFromItem(cropRect, cropRect.width/2, cropRect.height/2)
+                    var currentAngle = Math.atan2(mouse.y - c.y, mouse.x - c.x) * 180 / Math.PI
+                    cropRotation = cropStartRotation + (currentAngle - cropStartAngle)
+                    
+                    // Update rotation in backend live
+                    if (controller) {
+                        console.log("Rotating: " + cropRotation)
+                        controller.set_straighten_angle(cropRotation)
+                    }
                 } else if (cropDragMode !== "none") {
                     
                     var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
@@ -873,7 +918,7 @@ Item {
                                           && cropBox[1] === 0
                                           && cropBox[2] === 1000
                                           && cropBox[3] === 1000)
-        visible: uiState && uiState.isCropping && hasActiveCrop
+        visible: uiState && uiState.isCropping && (hasActiveCrop || mainMouseArea.isRotating)
         anchors.fill: parent
         z: 100
         
@@ -983,6 +1028,7 @@ Item {
             // Rotation Handle Line
             Rectangle {
                 id: handleLine
+                visible: mainMouseArea.isRotating
                 width: 2
                 height: 25
                 color: "white"
@@ -992,6 +1038,8 @@ Item {
 
             // Rotation Handle Knob
             Rectangle {
+                id: rotateKnob
+                visible: mainMouseArea.isRotating
                 width: 12
                 height: 12
                 radius: 6
@@ -1072,33 +1120,30 @@ Item {
                 }
             }
             
-            Rectangle {
-                width: parent.width
-                height: 30
-                color: "transparent"
-                radius: 3
-                
-                Text {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 10
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "Rotate"
-                    color: aspectRatioWindow.isDark ? "white" : "black"
-                    font.pixelSize: 11
-                }
-                
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        mainMouseArea.isRotating = !mainMouseArea.isRotating
-                        if(mainMouseArea.isRotating) {
-                            mainMouseArea.cropDragMode = "rotate"
-                        } else {
+                Rectangle {
+                    width: parent.width
+                    height: 30
+                    color: mainMouseArea.isRotating ? "#555555" : "transparent"
+                    radius: 3
+                    
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Rotate"
+                        color: aspectRatioWindow.isDark ? "white" : "black"
+                        font.pixelSize: 11
+                        font.bold: mainMouseArea.isRotating
+                    }
+                    
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            mainMouseArea.isRotating = !mainMouseArea.isRotating
                             mainMouseArea.cropDragMode = "none"
                         }
                     }
                 }
-            }
         }
     }
 

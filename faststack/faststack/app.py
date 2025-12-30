@@ -361,11 +361,28 @@ class AppController(QObject):
             log.warning("get_decoded_image called with empty image_files or out of bounds index.")
             return None
 
-        # If editor is open for this image, return the live preview
-        if self.ui_state.isEditorOpen and self.image_editor.original_image and str(self.image_editor.current_filepath) == str(self.image_files[index].path):
-            preview_data = self.image_editor.get_preview_data()
-            if preview_data:
-                return preview_data
+        # Debug preview condition
+        if self.ui_state.isEditorOpen or self.ui_state.isCropping:
+             # Robust path comparison
+             editor_path = self.image_editor.current_filepath
+             file_path = self.image_files[index].path
+             
+             match = False
+             if editor_path and file_path:
+                 try:
+                     match = Path(editor_path).resolve() == Path(file_path).resolve()
+                 except Exception:
+                     match = str(editor_path) == str(file_path)
+             
+             if not match:
+                 # Debug log if mismatch
+                 log.debug(f"Path mismatch in preview. Editor: {editor_path}, File: {file_path}")
+             
+             # Return preview if Editor is open OR Cropping is active (for live rotation)
+             if (self.ui_state.isEditorOpen or self.ui_state.isCropping) and match and self.image_editor.original_image:
+                 preview_data = self.image_editor.get_preview_data()
+                 if preview_data:
+                     return preview_data
 
         _, _, display_gen = self.get_display_info()
         image_path = self.image_files[index].path
@@ -1257,6 +1274,50 @@ class AppController(QObject):
             self.display_generation += 1
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
+
+    @Slot(float)
+    def set_straighten_angle(self, angle: float):
+        """Sets the straighten angle for the image editor and updates current view."""
+        """Sets the straighten angle for the image editor and updates current view."""
+        if not (self.ui_state.isEditorOpen or self.ui_state.isCropping):
+            return
+        
+        # Ensure editor is loaded with current image so preview can update in crop mode
+        # self.get_decoded_image relies on this being loaded to return the preview
+        image_file = self.image_files[self.current_index]
+        filepath = image_file.path
+        editor_path = self.image_editor.current_filepath
+        
+        match = False
+        if editor_path:
+            try:
+                match = Path(editor_path).resolve() == Path(filepath).resolve()
+            except Exception:
+                match = str(editor_path) == str(filepath)
+
+        if not match or not self.image_editor.original_image:
+            # We don't want to trigger a full recursive loop if get_decoded_image calls back here, 
+            # but usually get_decoded_image calls get_preview_data only if loaded.
+            # Passing cached_preview=None forces a load from disk which is safer here.
+            # Or better, fetch the raw decoded image from cache if available (but get_decoded_image might recurse).
+            # We can peek into self.image_cache directly to avoid recursion risk.
+            
+            # Simple approach: just load it.
+            if not self.image_editor.load_image(str(filepath)):
+                 return
+
+        log.info(f"AppController.set_straighten_angle: {angle}")
+        # Invert angle because QML rotation is CW but PIL rotation (used in editor) handles direction logic internally 
+        # (ImageEditor._apply_edits uses negative angle for PIL).
+        # We pass the raw angle from QML (degrees CW for UI rotation) to the editor.
+        # Editor takes care of sign.
+        self.image_editor.set_edit_param("straighten_angle", angle)
+        
+        # Trigger refresh. Since we are editing, we are viewing the preview.
+        # Incrementing display generation invalidates cache, but for preview it just ensures freshness if logic depends on it.
+        # Crucially, sync_ui_state emits currentImageSourceChanged, forcing QML to reload.
+        self.display_generation += 1 
+        self.sync_ui_state()
 
     @Slot(result=int)
     def get_awb_warm_bias(self):
@@ -2601,6 +2662,10 @@ class AppController(QObject):
         if not self.ui_state.isCropping:
             return
         
+        # Capture current rotation (straighten_angle) from editor state BEFORE any reload
+        # This is the single source of truth since set_straighten_angle updates it live.
+        current_rotation = float(self.image_editor.current_edits.get("straighten_angle", 0.0))
+
         # Ensure ImageEditor has the latest crop box (it should be synced via UIState, but good to be safe)
         crop_box_raw = self.ui_state.currentCropBox
         # ... (validation code remains similar or can be simplified since UIState validates) ...
@@ -2620,21 +2685,31 @@ class AppController(QObject):
             self.update_status_message("No crop area selected")
             return
 
-        # Ensure image is loaded in editor (crop mode might be active without editor open)
+        # Ensure image is loaded in editor
         image_file = self.image_files[self.current_index]
-        filepath = str(image_file.path)
-        if not self.image_editor.current_filepath or str(self.image_editor.current_filepath) != filepath:
-            # Load without preview if needed, but we likely have one cached
+        filepath = image_file.path
+        
+        # Robust path comparison
+        editor_path = self.image_editor.current_filepath
+        paths_match = False
+        if editor_path:
+            try:
+                paths_match = Path(editor_path).resolve() == Path(filepath).resolve()
+            except Exception:
+                paths_match = str(editor_path) == str(filepath)
+
+        if not paths_match:
+            log.info(f"execute_crop reloading image due to path mismatch. Editor: {editor_path}, File: {filepath}")
             cached_preview = self.get_decoded_image(self.current_index)
-            if not self.image_editor.load_image(filepath, cached_preview=cached_preview):
+            if not self.image_editor.load_image(str(filepath), cached_preview=cached_preview):
                 self.update_status_message("Failed to load image for cropping")
                 return
 
         self.image_editor.set_crop_box(crop_box_raw)
         
-        # Sync straighten_angle (crop rotation) from UI to ImageEditor before saving
-        if hasattr(self.ui_state, 'cropRotation'):
-             self.image_editor.set_edit_param('straighten_angle', self.ui_state.cropRotation)
+        # Re-apply the captured rotation.
+        # This handles cases where we reloaded the image (resetting edits) or where UI state sync was flaky.
+        self.image_editor.set_edit_param('straighten_angle', current_rotation)
         
         # Save via ImageEditor (handles rotation + crop correctly)
         save_result = self.image_editor.save_image()
