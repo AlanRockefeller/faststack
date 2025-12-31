@@ -10,7 +10,7 @@ Dialog {
     closePolicy: Popup.CloseOnEscape
     focus: true
     width: 600
-    height: 700
+    height: 770
 
     // Live cache usage value (updated by timer)
     property real cacheUsage: 0.0
@@ -32,12 +32,14 @@ Dialog {
         optimizeForComboBox.currentIndex = optimizeForComboBox.model.indexOf(settingsDialog.optimizeFor)
         autoLevelThresholdField.text = settingsDialog.autoLevelClippingThreshold.toFixed(4)
         settingsDialog.autoLevelStrength = uiState.autoLevelStrength
+        settingsDialog.autoLevelStrengthAuto = uiState.autoLevelStrengthAuto
     }
 
     property string heliconPath: ""
     property double cacheSize: 1.5
     property double autoLevelClippingThreshold: 0.1
     property double autoLevelStrength: 1.0
+    property bool autoLevelStrengthAuto: false
     property int prefetchRadius: 4
     property int theme: 0
     property string defaultDirectory: ""
@@ -47,6 +49,7 @@ Dialog {
     property string awbMode: "lab"
     property double awbStrength: 0.7
     property int awbWarmBias: 6
+    property int awbTintBias: 0
 
     property int awbLumaLowerBound: 30
     property int awbLumaUpperBound: 220
@@ -63,10 +66,12 @@ Dialog {
         uiState.set_optimize_for(optimizeFor)
         uiState.autoLevelClippingThreshold = autoLevelClippingThreshold
         uiState.autoLevelStrength = autoLevelStrength
+        uiState.autoLevelStrengthAuto = autoLevelStrengthAuto
         
         uiState.awbMode = awbMode
         uiState.awbStrength = awbStrength
         uiState.awbWarmBias = awbWarmBias
+        uiState.awbTintBias = awbTintBias
         
         uiState.awbLumaLowerBound = awbLumaLowerBound
         uiState.awbLumaUpperBound = awbLumaUpperBound
@@ -241,14 +246,25 @@ Dialog {
 
                 // Auto Levels Strength
                 Label { text: "Auto Levels Strength:" }
-                Slider {
-                    id: autoLevelStrengthSlider
-                    from: 0.0
-                    to: 1.0
-                    stepSize: 0.05
-                    value: settingsDialog.autoLevelStrength
-                    onValueChanged: settingsDialog.autoLevelStrength = value
+                RowLayout {
                     Layout.fillWidth: true
+                    Slider {
+                        id: autoLevelStrengthSlider
+                        from: 0.0
+                        to: 1.0
+                        stepSize: 0.05
+                        value: settingsDialog.autoLevelStrength
+                        onValueChanged: settingsDialog.autoLevelStrength = value
+                        enabled: !autoLevelStrengthAutoCheckBox.checked
+                        Layout.fillWidth: true
+                        opacity: enabled ? 1.0 : 0.5
+                    }
+                    CheckBox {
+                        id: autoLevelStrengthAutoCheckBox
+                        text: "Auto"
+                        checked: settingsDialog.autoLevelStrengthAuto
+                        onCheckedChanged: settingsDialog.autoLevelStrengthAuto = checked
+                    }
                 }
                 Label { text: Math.round(settingsDialog.autoLevelStrength * 100) + "%" }
             }
@@ -257,9 +273,17 @@ Dialog {
                 columns: 3
 
                 // --- Auto White Balance ---
-                Label { 
-                    text: "Auto WB Mode:"
+                MouseArea {
+                    width: awbModeLabel.implicitWidth
+                    height: awbModeLabel.implicitHeight
+                    hoverEnabled: true
                     Layout.topMargin: 10
+                    Label { 
+                        id: awbModeLabel
+                        text: "Auto WB Mode:"
+                    }
+                    ToolTip.visible: containsMouse
+                    ToolTip.text: "Choose the algorithm for Auto White Balance.\n'lab': Uses Lab color space (recommended).\n'rgb': Uses simple Grey World assumption."
                 }
                 ComboBox {
                     id: awbModeComboBox
@@ -272,7 +296,17 @@ Dialog {
                      Layout.topMargin: 10
                 }
 
-                Label { text: "Auto WB Strength:" }
+                MouseArea {
+                    width: awbStrengthLabel.implicitWidth
+                    height: awbStrengthLabel.implicitHeight
+                    hoverEnabled: true
+                    Label { 
+                        id: awbStrengthLabel
+                        text: "Auto WB Strength:"
+                    }
+                    ToolTip.visible: containsMouse
+                    ToolTip.text: "How strongly to apply the calculated white balance correction (0.0 - 1.0)."
+                }
                 Slider {
                     id: awbStrengthSlider
                     from: 0.3
@@ -282,13 +316,45 @@ Dialog {
                 }
                 Label { text: (awbStrengthSlider.value * 100).toFixed(0) + "%" }
 
-                Label { text: "Auto WB Warm Bias:" }
+                MouseArea {
+                    width: awbWarmBiasLabel.implicitWidth
+                    height: awbWarmBiasLabel.implicitHeight
+                    hoverEnabled: true
+                    Label { 
+                        id: awbWarmBiasLabel
+                        text: "Auto WB Warm Bias:"
+                    }
+                    ToolTip.visible: containsMouse
+                    ToolTip.text: "Adjusts the target Yellow/Blue balance.\nPositive values make the result warmer (more yellow).\nNegative values make it cooler (more blue)."
+                }
                 SpinBox {
                     id: awbWarmBiasSpinBox
-                    from: -10
-                    to: 20
+                    from: -50
+                    to: 50
                     value: settingsDialog.awbWarmBias
+                    editable: true
                     onValueChanged: settingsDialog.awbWarmBias = value
+                }
+                Label {} // Placeholder
+
+                MouseArea {
+                    width: awbTintBiasLabel.implicitWidth
+                    height: awbTintBiasLabel.implicitHeight
+                    hoverEnabled: true
+                    Label { 
+                        id: awbTintBiasLabel
+                        text: "Auto WB Tint Bias:"
+                    }
+                    ToolTip.visible: containsMouse
+                    ToolTip.text: "Adjusts the target Magenta/Green balance.\nPositive values add magenta tint.\nNegative values add green tint."
+                }
+                SpinBox {
+                    id: awbTintBiasSpinBox
+                    from: -50
+                    to: 50
+                    value: settingsDialog.awbTintBias
+                    editable: true
+                    onValueChanged: settingsDialog.awbTintBias = value
                 }
                 Label {} // Placeholder
 
@@ -298,6 +364,9 @@ Dialog {
                     text: "Advanced Settings"
                     checked: false
                     Layout.columnSpan: 3
+                    hoverEnabled: true
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Configure thresholds for pixel selection in AWB calculation."
                 }
 
                 GridLayout {
@@ -306,38 +375,82 @@ Dialog {
                     Layout.columnSpan: 3
                     Layout.fillWidth: true
                     
-                    Label { text: "Luma Lower Bound:" }
+                    MouseArea {
+                        width: lumaLowerLabel.implicitWidth
+                        height: lumaLowerLabel.implicitHeight
+                        hoverEnabled: true
+                        Label { 
+                            id: lumaLowerLabel
+                            text: "Luma Lower Bound:" 
+                        }
+                        ToolTip.visible: containsMouse
+                        ToolTip.text: "Ignore pixels darker than this brightness (0-255) when calculating AWB."
+                    }
                     SpinBox {
                         from: 0
                         to: 255
                         value: settingsDialog.awbLumaLowerBound
+                        editable: true
                         onValueChanged: settingsDialog.awbLumaLowerBound = value
                     }
                     Label {}
 
-                    Label { text: "Luma Upper Bound:" }
+                    MouseArea {
+                        width: lumaUpperLabel.implicitWidth
+                        height: lumaUpperLabel.implicitHeight
+                        hoverEnabled: true
+                        Label { 
+                            id: lumaUpperLabel
+                            text: "Luma Upper Bound:" 
+                        }
+                        ToolTip.visible: containsMouse
+                        ToolTip.text: "Ignore pixels brighter than this brightness (0-255) when calculating AWB."
+                    }
                     SpinBox {
                         from: 0
                         to: 255
                         value: settingsDialog.awbLumaUpperBound
+                        editable: true
                         onValueChanged: settingsDialog.awbLumaUpperBound = value
                     }
                     Label {}
 
-                    Label { text: "RGB Lower Bound:" }
+                    MouseArea {
+                        width: rgbLowerLabel.implicitWidth
+                        height: rgbLowerLabel.implicitHeight
+                        hoverEnabled: true
+                        Label { 
+                            id: rgbLowerLabel
+                            text: "RGB Lower Bound:" 
+                        }
+                        ToolTip.visible: containsMouse
+                        ToolTip.text: "Ignore pixels where any channel is below this value (0-255)."
+                    }
                     SpinBox {
                         from: 0
                         to: 255
                         value: settingsDialog.awbRgbLowerBound
+                        editable: true
                         onValueChanged: settingsDialog.awbRgbLowerBound = value
                     }
                     Label {}
 
-                    Label { text: "RGB Upper Bound:" }
+                    MouseArea {
+                        width: rgbUpperLabel.implicitWidth
+                        height: rgbUpperLabel.implicitHeight
+                        hoverEnabled: true
+                        Label { 
+                            id: rgbUpperLabel
+                            text: "RGB Upper Bound:" 
+                        }
+                        ToolTip.visible: containsMouse
+                        ToolTip.text: "Ignore pixels where any channel is above this value (0-255)."
+                    }
                     SpinBox {
                         from: 0
                         to: 255
                         value: settingsDialog.awbRgbUpperBound
+                        editable: true
                         onValueChanged: settingsDialog.awbRgbUpperBound = value
                     }
                     Label {}

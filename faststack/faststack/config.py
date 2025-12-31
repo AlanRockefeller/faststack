@@ -17,6 +17,7 @@ DEFAULT_CONFIG = {
         "optimize_for": "speed",  # "speed" or "quality"
         "auto_level_threshold": "0.1",
         "auto_level_strength": "1.0",
+        "auto_level_strength_auto": "False",
     },
     "helicon": {
         "exe": "C:\\Program Files\\Helicon Software\\Helicon Focus 8\\HeliconFocus.exe",
@@ -35,6 +36,7 @@ DEFAULT_CONFIG = {
         "mode": "lab",  # "lab" or "rgb"        
         "strength": "0.7",
         "warm_bias": "6",
+        "tint_bias": "0",
         "luma_lower_bound": "30",
         "luma_upper_bound": "220",
         "rgb_lower_bound": "5",

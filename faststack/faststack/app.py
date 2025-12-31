@@ -166,6 +166,7 @@ class AppController(QObject):
         
         self.auto_level_threshold = config.getfloat('core', 'auto_level_threshold', 0.1)
         self.auto_level_strength = config.getfloat('core', 'auto_level_strength', 1.0)
+        self.auto_level_strength_auto = config.getboolean('core', 'auto_level_strength_auto', False)
 
 
     @Slot(str)
@@ -480,6 +481,7 @@ class AppController(QObject):
     def next_image(self):
         if self.current_index < len(self.image_files) - 1:
             self.current_index += 1
+            self._reset_crop_settings()
             self._do_prefetch(self.current_index, is_navigation=True, direction=1)
             self.sync_ui_state()
             # Update histogram if visible
@@ -489,6 +491,7 @@ class AppController(QObject):
     def prev_image(self):
         if self.current_index > 0:
             self.current_index -= 1
+            self._reset_crop_settings()
             self._do_prefetch(self.current_index, is_navigation=True, direction=-1)
             self.sync_ui_state()
             # Update histogram if visible
@@ -504,6 +507,7 @@ class AppController(QObject):
                 return
             direction = 1 if index > self.current_index else -1
             self.current_index = index
+            self._reset_crop_settings()
             self._do_prefetch(self.current_index, is_navigation=True, direction=direction)
             self.sync_ui_state()
             # Update histogram if visible
@@ -967,8 +971,26 @@ class AppController(QObject):
         self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
 
-
-
+    def _reset_crop_settings(self):
+        """Resets crop settings to default (full image) and exits crop mode, and resets rotation."""
+        if self.ui_state.isCropping:
+            self.ui_state.isCropping = False
+            self.update_status_message("Crop mode exited")
+        self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+        # Also clear any editor-side crop box in case it's not fully synced yet
+        self.image_editor.set_crop_box((0, 0, 1000, 1000))
+        # Reset rotation and straighten angle
+        self.image_editor.set_edit_param('rotation', 0)
+        self.image_editor.set_edit_param('straighten_angle', 0.0)
+        # Also update UI state for rotation values if they are exposed
+        if hasattr(self.ui_state, 'rotation'):
+            self.ui_state.rotation = 0
+        if hasattr(self.ui_state, 'cropRotation'): # This is used by Components.qml for the overlay
+            self.ui_state.cropRotation = 0.0
+        
+        # Also reset the straighten angle in current_edits since it affects rotation logic
+        if 'straighten_angle' in self.image_editor.current_edits:
+             self.image_editor.current_edits['straighten_angle'] = 0.0
 
     def launch_helicon(self):
         """Launches Helicon with selected files (RAW preferred, JPG fallback) or stacks."""
@@ -1243,6 +1265,15 @@ class AppController(QObject):
     @Slot(int)
     def set_awb_warm_bias(self, value):
         config.set("awb", "warm_bias", value)
+        config.save()
+
+    @Slot(result=int)
+    def get_awb_tint_bias(self):
+        return config.getint("awb", "tint_bias", fallback=0)
+
+    @Slot(int)
+    def set_awb_tint_bias(self, value):
+        config.set("awb", "tint_bias", value)
         config.save()
 
     @Slot(result=int)
@@ -1752,6 +1783,9 @@ class AppController(QObject):
                     self.prefetcher.update_prefetch(self.current_index)
                     self.sync_ui_state()
                     
+                    if self.ui_state.isHistogramVisible:
+                        self.update_histogram()
+                    
                     self.update_status_message("Undid auto white balance")
                 else:
                     # This case should not be reached if glob finds files
@@ -2228,17 +2262,12 @@ class AppController(QObject):
         """Saves the edited image."""
         save_result = self.image_editor.save_image()
         if not save_result:
-            QMessageBox.warning(
-                None,
-                "Save Failed",
-                "Failed to save edited image. Please check the log for details.",
-                QMessageBox.Ok,
-            )
             self.update_status_message("Failed to save image")
             log.error("Failed to save edited image")
             return
 
         saved_path, _ = save_result
+        self.update_status_message(f"Edits saved to {saved_path.name}")
         # Clear the image editor state so it will reload fresh next time
         self.image_editor.clear()
             
@@ -2261,13 +2290,6 @@ class AppController(QObject):
         self.prefetcher.cancel_all()
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
-
-        QMessageBox.information(
-            None,
-            "Save Successful",
-            f"Image saved to: {saved_path}. Original backed up.",
-            QMessageBox.Ok
-        )
 
     
     @Slot()
@@ -2579,100 +2601,51 @@ class AppController(QObject):
         if not self.ui_state.isCropping:
             return
         
-        # Convert QJSValue to Python list if needed
+        # Ensure ImageEditor has the latest crop box (it should be synced via UIState, but good to be safe)
         crop_box_raw = self.ui_state.currentCropBox
-        try:
-            # Try to convert QJSValue to list
-            if hasattr(crop_box_raw, 'toVariant'):
-                # It's a QJSValue, convert to list
-                variant = crop_box_raw.toVariant()
-                if isinstance(variant, (list, tuple)):
-                    crop_box = list(variant)
-                else:
-                    # Try to iterate if it's iterable
-                    crop_box = [variant[0], variant[1], variant[2], variant[3]]
-            elif isinstance(crop_box_raw, (list, tuple)):
-                crop_box = list(crop_box_raw)
-            else:
-                # Try direct access (might work for some QJSValue types)
-                crop_box = [crop_box_raw[0], crop_box_raw[1], crop_box_raw[2], crop_box_raw[3]]
-        except (TypeError, IndexError, AttributeError) as e:
-            self.update_status_message("Invalid crop box")
-            log.error("Failed to parse crop box (type: %s): %s", type(crop_box_raw), e)
-            return
+        # ... (validation code remains similar or can be simplified since UIState validates) ...
+        # For robustness, we'll trust UIState's validation or do a quick check
+        if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:
+             # Try to convert if it came as list
+             try:
+                 crop_box_raw = tuple(crop_box_raw) if isinstance(crop_box_raw, list) else tuple(crop_box_raw.toVariant())
+             except:
+                 pass
         
-        if len(crop_box) != 4:
-            self.update_status_message("Invalid crop box")
-            return
-        
-        if crop_box == [0, 0, 1000, 1000] or crop_box == (0, 0, 1000, 1000):
+        if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:
+             self.update_status_message("Invalid crop box")
+             return
+
+        if crop_box_raw == (0, 0, 1000, 1000):
             self.update_status_message("No crop area selected")
             return
-        
+
+        # Ensure image is loaded in editor (crop mode might be active without editor open)
         image_file = self.image_files[self.current_index]
         filepath = str(image_file.path)
-        
-        try:
-            # Load the image
-            img = Image.open(filepath).convert("RGB")
-            width, height = img.size
-            
-            # Convert normalized crop box (0-1000) to pixel coordinates
-            left = int(crop_box[0] * width / 1000)
-            top = int(crop_box[1] * height / 1000)
-            right = int(crop_box[2] * width / 1000)
-            bottom = int(crop_box[3] * height / 1000)
-            
-            # Ensure valid crop box
-            left = max(0, min(left, width - 1))
-            top = max(0, min(top, height - 1))
-            right = max(left + 1, min(right, width))
-            bottom = max(top + 1, min(bottom, height))
-            
-            # Crop the image
-            cropped_img = img.crop((left, top, right, bottom))
-            
-            # Create backup
-            original_path = Path(filepath)
-            
-            # Preserve original file modification time
-            original_mtime = original_path.stat().st_mtime
-            original_atime = original_path.stat().st_atime
-            
-            backup_path = create_backup_file(original_path)
-            if backup_path is None:
-                self.update_status_message("Failed to create backup")
-                log.error("Failed to create backup for crop operation")
+        if not self.image_editor.current_filepath or str(self.image_editor.current_filepath) != filepath:
+            # Load without preview if needed, but we likely have one cached
+            cached_preview = self.get_decoded_image(self.current_index)
+            if not self.image_editor.load_image(filepath, cached_preview=cached_preview):
+                self.update_status_message("Failed to load image for cropping")
                 return
-            
-            # Save the cropped image
-            with Image.open(original_path) as original_img:
-                original_format = original_img.format or original_path.suffix.lstrip('.').upper()
-                exif_data = original_img.info.get('exif')
-            
-            save_kwargs = {}
-            if original_format == 'JPEG':
-                save_kwargs['format'] = 'JPEG'
-                save_kwargs['quality'] = 95
-                if exif_data:
-                    save_kwargs['exif'] = exif_data
-            else:
-                save_kwargs['format'] = original_format
-            
-            try:
-                cropped_img.save(original_path, **save_kwargs)
-            except Exception as e:
-                log.warning(f"Could not save with original format settings: {e}")
-                cropped_img.save(original_path)
-            
-            # Restore original modification and access times to preserve file position in sorted list
-            import os
-            os.utime(original_path, (original_atime, original_mtime))
+
+        self.image_editor.set_crop_box(crop_box_raw)
+        
+        # Sync straighten_angle (crop rotation) from UI to ImageEditor before saving
+        if hasattr(self.ui_state, 'cropRotation'):
+             self.image_editor.set_edit_param('straighten_angle', self.ui_state.cropRotation)
+        
+        # Save via ImageEditor (handles rotation + crop correctly)
+        save_result = self.image_editor.save_image()
+        
+        if save_result:
+            saved_path, backup_path = save_result
             
             # Track for undo
             import time
             timestamp = time.time()
-            self.undo_history.append(("crop", (str(original_path), str(backup_path)), timestamp))
+            self.undo_history.append(("crop", (str(saved_path), str(backup_path)), timestamp))
             
             # Exit crop mode
             self.ui_state.isCropping = False
@@ -2681,9 +2654,9 @@ class AppController(QObject):
             # Refresh the view
             self.refresh_image_list()
             
-            # Find the edited image in the refreshed list
+            # Find the edited image
             for i, img_file in enumerate(self.image_files):
-                if img_file.path == original_path:
+                if img_file.path == saved_path:
                     self.current_index = i
                     break
             
@@ -2694,44 +2667,83 @@ class AppController(QObject):
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
             
-            # Reset zoom/pan to fit the new cropped image
+            # Reset zoom/pan
             self.ui_state.resetZoomPan()
             
-            # Update histogram if visible
             if self.ui_state.isHistogramVisible:
                 self.update_histogram()
             
             self.update_status_message("Image cropped and saved")
-            log.info("Crop operation completed for %s", filepath)
+            log.info("Crop operation completed for %s", saved_path)
             
-        except Exception as e:
-            self.update_status_message(f"Crop failed: {e}")
-            log.exception("Failed to crop image")
+            # Force reload of editor to ensure subsequent edits operate on the cropped image
+            self.image_editor.clear()
+            self.reset_edit_parameters()
+            
+        else:
+            self.update_status_message("Failed to save cropped image")
     
     @Slot()
     def auto_levels(self):
-        """Calculates and applies auto levels (preview only)."""
+        """Calculates and applies auto levels (preview only). Returns False if skipped."""
         if not self.image_files:
             self.update_status_message("No image to adjust")
-            return
+            return False
         
         image_file = self.image_files[self.current_index]
         filepath = str(image_file.path)
         
         # Ensure image is loaded in editor
-        # Only load if not already loaded to avoid resetting other edits
         if not self.image_editor.current_filepath or str(self.image_editor.current_filepath) != filepath:
             cached_preview = self.get_decoded_image(self.current_index)
             if not self.image_editor.load_image(filepath, cached_preview=cached_preview):
                 self.update_status_message("Failed to load image")
-                return
+                return False
 
         # Calculate auto levels
         blacks, whites = self.image_editor.auto_levels(self.auto_level_threshold)
         
         # Scale by strength
-        blacks *= self.auto_level_strength
-        whites *= self.auto_level_strength
+        skipped_due_to_clipping = False
+        if self.auto_level_strength_auto:
+            # Calculate optimal strength to prevent pre-clipping
+            try:
+                # Use preview image if available to ignore single hot-pixel outliers
+                img = self.image_editor._preview_image if self.image_editor._preview_image else self.image_editor.original_image
+                if img:
+                    # Get max value across all channels
+                    extrema = img.getextrema()
+                    if isinstance(extrema[0], tuple):
+                        max_val = max(ch[1] for ch in extrema)
+                    else:
+                        max_val = extrema[1]
+                    
+                    log.debug(f"Auto levels auto-strength: max_val={max_val}")
+                    
+                    if max_val < 250:
+                        denom = 40 * (250 * whites - 5 * blacks)
+                        if abs(denom) > 0.001:
+                            strength = (255 * (max_val - 250)) / denom
+                            strength = max(0.0, min(1.0, strength))
+                        else:
+                            strength = 0.0
+                    else:
+                        strength = 0.0
+                        skipped_due_to_clipping = True
+                else:
+                    strength = self.auto_level_strength
+            except Exception as e:
+                log.warning(f"Failed to calculate auto strength: {e}")
+                strength = self.auto_level_strength
+        else:
+            strength = self.auto_level_strength
+
+        if skipped_due_to_clipping:
+            self.update_status_message("No changes made to color levels to avoid clipping")
+            return False
+
+        blacks *= strength
+        whites *= strength
         
         # Apply scaled values
         self.image_editor.set_edit_param('blacks', blacks)
@@ -2749,7 +2761,8 @@ class AppController(QObject):
             
         self.update_status_message(f"Auto levels applied (preview only)")
         log.info("Auto levels preview applied to %s (clip %.2f%%, str %.2f)", 
-                 filepath, self.auto_level_threshold, self.auto_level_strength)
+                 filepath, self.auto_level_threshold, strength)
+        return True
 
     @Slot()
     def quick_auto_levels(self):
@@ -2759,8 +2772,13 @@ class AppController(QObject):
             return
 
         # Apply the preview first (loads image + sets params)
-        self.auto_levels()
+        applied = self.auto_levels()
         
+        # If in auto mode and no changes were made (skipped), don't save
+        if self.auto_level_strength_auto and not applied:
+            # Status message already set by auto_levels ("No changes made...")
+            return
+
         # Save
         import time
         save_result = self.image_editor.save_image()
@@ -2818,6 +2836,17 @@ class AppController(QObject):
         if self.auto_level_strength != value:
             self.auto_level_strength = value
             config.set('core', 'auto_level_strength', str(value))
+            config.save()
+
+    @Slot(result=bool)
+    def get_auto_level_strength_auto(self):
+        return self.auto_level_strength_auto
+
+    @Slot(bool)
+    def set_auto_level_strength_auto(self, value: bool):
+        if self.auto_level_strength_auto != value:
+            self.auto_level_strength_auto = value
+            config.set('core', 'auto_level_strength_auto', str(value))
             config.save()
 
     @Slot()
@@ -2973,7 +3002,8 @@ class AppController(QObject):
         _LUMA_LOWER_BOUND = config.getint('awb', 'luma_lower_bound', 30)
         _LUMA_UPPER_BOUND = config.getint('awb', 'luma_upper_bound', 220)
         warm_bias = config.getint('awb', 'warm_bias', 6)
-        _TARGET_A_LAB = 128.0
+        tint_bias = config.getint('awb', 'tint_bias', 0)
+        _TARGET_A_LAB = 128.0 + tint_bias
         _TARGET_B_LAB = 128.0 + warm_bias
         _SCALING_FACTOR_LAB_TO_SLIDER = 128.0 
         _CORRECTION_STRENGTH = config.getfloat('awb', 'strength', 0.7)
