@@ -80,6 +80,7 @@ class UIState(QObject):
     isZoomedChanged = Signal()
     statusMessageChanged = Signal() # New signal for status messages
     resetZoomPanRequested = Signal() # Signal to tell QML to reset zoom/pan
+    absoluteZoomRequested = Signal(float)  # New: Request absolute zoom level (1.0, 2.0, etc.)
     stackSummaryChanged = Signal() # Signal for stack summary updates
     filterStringChanged = Signal() # Signal for filter string updates
     colorModeChanged = Signal() # Signal for color mode updates
@@ -147,7 +148,7 @@ class UIState(QObject):
         self._saturation = 0.0
         self._white_balance_by = 0.0
         self._white_balance_mg = 0.0
-        self._current_crop_box = (0, 0, 1000, 1000)
+        self._current_crop_box = [0, 0, 1000, 1000]
         self._crop_rotation = 0.0
         self._debug_mode = False
         self._aspect_ratio_names = []
@@ -190,6 +191,11 @@ class UIState(QObject):
     @Slot(bool)
     def setZoomed(self, zoomed: bool):
         self.app_controller.set_zoomed(zoomed)
+
+    @Slot(float)
+    def request_absolute_zoom(self, scale):
+        """Request the UI to set zoom to an absolute scale (1.0 = 100%)."""
+        self.absoluteZoomRequested.emit(scale)
 
     # ---- PRELOADING ----
     @Property(bool, notify=preloadingStateChanged)

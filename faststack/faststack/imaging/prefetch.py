@@ -307,6 +307,9 @@ class Prefetcher:
             optimize_for = config.get('core', 'optimize_for', fallback='speed').lower()
             fast_dct = (optimize_for == 'speed')
             use_resized = (optimize_for == 'speed')  # Use decode_jpeg_resized for speed, decode_jpeg_rgb for quality
+            
+            # Determine if we should resize
+            should_resize = (display_width > 0 and display_height > 0)
 
             # Option C: Full ICC pipeline - Use TurboJPEG for decode, Pillow only for ICC conversion
             if color_mode == "icc":
@@ -319,12 +322,12 @@ class Prefetcher:
                     with open(image_file.path, "rb") as f:
                         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                             # Pass mmap directly - no copy! Decoders accept bytes-like objects
-                            if use_resized:
+                            if use_resized and should_resize:
                                 buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
                             else:
-                                # Quality mode: decode full image then resize with high quality
+                                # Quality mode or Full Res: decode full image then resize with high quality
                                 buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
-                                if buffer is not None:
+                                if buffer is not None and should_resize:
                                     img = PILImage.fromarray(buffer)
                                     img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
                                     buffer = np.array(img)
@@ -389,12 +392,12 @@ class Prefetcher:
                         with open(image_file.path, "rb") as f:
                             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                                 # Pass mmap directly - no copy!
-                                if use_resized:
+                                if use_resized and should_resize:
                                     buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
                                 else:
-                                    # Quality mode: decode full image then resize with high quality
+                                    # Quality mode or Full Res: decode full image then resize with high quality
                                     buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
-                                    if buffer is not None:
+                                    if buffer is not None and should_resize:
                                         img = PILImage.fromarray(buffer)
                                         img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
                                         buffer = np.array(img)
@@ -420,12 +423,12 @@ class Prefetcher:
                     with open(image_file.path, "rb") as f:
                         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                             # Pass mmap directly - no copy!
-                            if use_resized:
+                            if use_resized and should_resize:
                                 buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
                             else:
-                                # Quality mode: decode full image then resize with high quality
+                                # Quality mode or Full Res: decode full image then resize with high quality
                                 buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
-                                if buffer is not None:
+                                if buffer is not None and should_resize:
                                     img = PILImage.fromarray(buffer)
                                     img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
                                     buffer = np.array(img)
@@ -450,12 +453,12 @@ class Prefetcher:
                 with open(image_file.path, "rb") as f:
                     with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                         # Pass mmap directly - no copy! Decoders accept bytes-like objects
-                        if use_resized:
+                        if use_resized and should_resize:
                             buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
                         else:
-                            # Quality mode: decode full image then resize with high quality
+                            # Quality mode or Full Res: decode full image then resize with high quality
                             buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
-                            if buffer is not None:
+                            if buffer is not None and should_resize:
                                 img = PILImage.fromarray(buffer)
                                 img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
                                 buffer = np.array(img)
@@ -468,30 +471,29 @@ class Prefetcher:
                 bytes_per_line = w * 3
                 arr = buffer.reshape(-1).copy()
                 t_after_copy = time.perf_counter()
-                
-                # Option A: Saturation compensation
-                if color_mode == "saturation":
-                    try:
-                        t_before_saturation = time.perf_counter()
-                        factor = float(config.get('color', 'saturation_factor', fallback="1.0"))
-                        apply_saturation_compensation(arr, w, h, bytes_per_line, factor)
-                        t_after_saturation = time.perf_counter()
-                        
-                        if self.debug:
-                            decoder = "TurboJPEG" if TURBO_AVAILABLE else "Pillow"
-                            log.info("Saturation decode timing for index %d (%s): read=%.3fs, decode=%.3fs, copy=%.3fs, saturation=%.3fs, total=%.3fs, size=%dx%d",
-                                     index, decoder, t_after_read - t_before_read, t_after_decode - t_after_read,
-                                     t_after_copy - t_after_decode, t_after_saturation - t_before_saturation,
-                                     t_after_saturation - t_start, w, h)
-                    except (ValueError, AssertionError) as e:
-                        log.warning("Failed to apply saturation compensation: %s", e)
-                else:
-                    # No color management - log standard timing
+
+            # Apply saturation compensation if enabled
+            if color_mode == "saturation":
+                try:
+                    factor = float(config.get('color', 'saturation_factor', fallback="1.0"))
+                    apply_saturation_compensation(arr, w, h, bytes_per_line, factor)
+                    t_after_saturation = time.perf_counter()
+                    
                     if self.debug:
                         decoder = "TurboJPEG" if TURBO_AVAILABLE else "Pillow"
-                        log.info("Standard decode timing for index %d (%s): read=%.3fs, decode=%.3fs, copy=%.3fs, total=%.3fs, size=%dx%d",
+                        log.info("Saturation decode timing for index %d (%s): read=%.3fs, decode=%.3fs, copy=%.3fs, saturation=%.3fs, total=%.3fs, size=%dx%d",
                                  index, decoder, t_after_read - t_before_read, t_after_decode - t_after_read,
-                                 t_after_copy - t_after_decode, t_after_copy - t_start, w, h)
+                                 t_after_copy - t_after_decode, t_after_saturation - t_after_copy,
+                                 t_after_saturation - t_start, w, h)
+                except (ValueError, AssertionError) as e:
+                    log.warning("Failed to apply saturation compensation: %s", e)
+            else:
+                # No color management - log standard timing
+                if self.debug:
+                    decoder = "TurboJPEG" if TURBO_AVAILABLE else "Pillow"
+                    log.info("Standard decode timing for index %d (%s): read=%.3fs, decode=%.3fs, copy=%.3fs, total=%.3fs, size=%dx%d",
+                             index, decoder, t_after_read - t_before_read, t_after_decode - t_after_read,
+                             t_after_copy - t_after_decode, t_after_copy - t_start, w, h)
             
             # Re-check generation before caching (in case it changed during decode)
             if self.generation != generation:

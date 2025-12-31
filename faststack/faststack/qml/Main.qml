@@ -635,6 +635,8 @@ ApplicationWindow {
         }
     }
 
+    property int footerHeight: 60
+
     // -------- MAIN VIEW --------
     Item {
         id: contentArea
@@ -645,6 +647,7 @@ ApplicationWindow {
             anchors.fill: parent
             source: "Components.qml"
             focus: true
+            onLoaded: item.footerHeight = Qt.binding(function() { return root.footerHeight })
 
             // Key bindings implemented in old Main.qml
             Keys.onPressed: function(event) {
@@ -684,9 +687,8 @@ ApplicationWindow {
         id: footerRect
         // Keep footer height fixed so the main image area doesn't change size when
         // stack/batch labels appear or disappear (prevents cache invalidations).
-        property int fixedHeight: 60
-        height: fixedHeight
-        implicitHeight: fixedHeight
+        height: root.footerHeight
+        implicitHeight: root.footerHeight
         anchors.left: parent.left
         anchors.right: parent.right
         color: Qt.rgba(root.currentBackgroundColor.r, root.currentBackgroundColor.g, root.currentBackgroundColor.b, 0.8)

@@ -74,6 +74,7 @@ _debug_mode = False
 
 class AppController(QObject):
     dataChanged = Signal() # New signal for general data changes
+    is_zoomed_changed = Signal(bool) # Signal for zoom state changes
 
     class ProgressReporter(QObject):
         progress_updated = Signal(int)
@@ -93,7 +94,11 @@ class AppController(QObject):
         self.display_width = 0
         self.display_height = 0
         self.display_generation = 0
-        self.is_zoomed = False
+        self._is_decoding = False
+        
+        # Cache Warning State
+        self._last_cache_warning_time = 0
+        self._eviction_timestamps = [] # List of eviction timestamps for rate detection
         self.display_ready = False  # Track if display size has been reported
         self.pending_prefetch_index: Optional[int] = None  # Deferred prefetch index
 
@@ -131,6 +136,7 @@ class AppController(QObject):
         self.keybinder = Keybinder(self)
         self.ui_state.debugCache = self.debug_cache # Pass debug_cache state to UI
         self.ui_state.isDecoding = False # Initialize decoding indicator
+        self.is_zoomed = False # Track zoom state for high-res loading logic
 
         # -- Stacking State --
         self.stack_start_index: Optional[int] = None
@@ -250,13 +256,44 @@ class AppController(QObject):
         
         self.sync_ui_state() # To refresh the image
 
+    @Slot(bool)
     def set_zoomed(self, zoomed: bool):
-        if self.is_zoomed == zoomed:
-            return
-        self.is_zoomed = zoomed
+        if self.is_zoomed != zoomed:
+            if _debug_mode:
+                 log.info(f"AppController.set_zoomed: {self.is_zoomed} -> {zoomed}")
+            self.is_zoomed = zoomed
+            self.is_zoomed_changed.emit(zoomed)
         log.info("Zoom state changed to: %s", zoomed)
         self.display_generation += 1  # Invalidates old entries via cache key
         
+        # Invalidate current image to force reload with new resolution logic
+        if self.image_files and self.main_window:
+            # Force QML to reload the image by updating the URL generation
+            self.ui_refresh_generation += 1
+            self.ui_state.currentImageSourceChanged.emit()
+            self.main_window.update() # Force repaint
+            
+    # -- Zoom Shortcuts --
+    # -- Zoom Shortcuts --
+    def zoom_100(self):
+        log.info("Zoom 100% requested")
+        self.ui_state.request_absolute_zoom(1.0)
+        # self.set_zoomed(True) - Handled by QML smart zoom logic
+
+    def zoom_200(self):
+        log.info("Zoom 200% requested")
+        self.ui_state.request_absolute_zoom(2.0)
+        # self.set_zoomed(True) - Handled by QML smart zoom logic
+
+    def zoom_300(self):
+        log.info("Zoom 300% requested")
+        self.ui_state.request_absolute_zoom(3.0)
+        # self.set_zoomed(True) - Handled by QML smart zoom logic
+
+    def zoom_400(self):
+        log.info("Zoom 400% requested")
+        self.ui_state.request_absolute_zoom(4.0)
+        # self.set_zoomed(True) - Handled by QML smart zoom logic
         # NOTE: We don't clear the cache here. The generation increment is enough.
         # Cache keys include display_generation, so zoomed/unzoomed images become
         # naturally unreachable and LRU will evict them. This lets us instantly
@@ -1357,7 +1394,7 @@ class AppController(QObject):
                     # Doing so during rotation causes the crop box to walk and jitter.
                     # self.ui_state.currentCropBox = [l, t, r, b]
 
-        log.info(f"AppController.set_straighten_angle: {angle}")
+        log.debug(f"AppController.set_straighten_angle: {angle}")
         # Invert angle because QML rotation is CW but PIL rotation (used in editor) handles direction logic internally 
         # (ImageEditor._apply_edits uses negative angle for PIL).
         # We pass the raw angle from QML (degrees CW for UI rotation) to the editor.
@@ -2041,11 +2078,32 @@ class AppController(QObject):
     
     def _on_cache_evict(self):
         """Callback for when the image cache evicts an item."""
-        if not self._has_warned_cache_full:
-            self._has_warned_cache_full = True
-            # Use QTimer.singleShot to ensure this runs on the main thread if called from a background thread
-            QTimer.singleShot(0, lambda: self.update_status_message("Cache full! Consider increasing cache size in settings."))
-            log.warning("Cache full, eviction started. User warned.")
+        now = time.time()
+        
+        # 1. Record eviction timestamp
+        self._eviction_timestamps.append(now)
+        
+        # 2. Prune timestamps older than 2 seconds
+        # Keep list short
+        cutoff = now - 2.0
+        self._eviction_timestamps = [t for t in self._eviction_timestamps if t > cutoff]
+        
+        # 3. Check for thrashing (e.g., > 5 evictions in 2 seconds)
+        if len(self._eviction_timestamps) > 5:
+            # 4. Rate limit the warning (once every 5 minutes = 300 seconds)
+            if now - self._last_cache_warning_time > 300:
+                self._last_cache_warning_time = now
+                self._has_warned_cache_full = True
+                
+                # Format usage info
+                used_gb = self.image_cache.currsize / (1024**3)
+                max_gb = self.image_cache.maxsize / (1024**3)
+                
+                msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in 2s. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
+                
+                # Use QTimer.singleShot to ensure this runs on the main thread
+                QTimer.singleShot(0, lambda: self.update_status_message(msg))
+                log.warning(msg)
 
     def restore_all_from_recycle_bin(self):
         """Restores all files from recycle bin to working directory."""
@@ -2557,7 +2615,7 @@ class AppController(QObject):
          """Cancel crop mode without applying changes."""
          if self.ui_state.isCropping:
              self.ui_state.isCropping = False
-             self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+             self.ui_state.currentCropBox = [0, 0, 1000, 1000]
              # Ensure preview rotation is cleared
              self.image_editor.set_edit_param("straighten_angle", 0.0)
              # Force QML to refresh if it's showing provider preview frames
@@ -2733,14 +2791,7 @@ class AppController(QObject):
             self.update_status_message("Failed to launch Helicon Focus.")
             
     
-    @Slot()
-    def cancel_crop_mode(self):
-        """Cancel crop mode without applying changes."""
-        if self.ui_state.isCropping:
-            self.ui_state.isCropping = False
-            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
-            self.update_status_message("Crop cancelled")
-            log.info("Crop mode cancelled")
+
     
     @Slot()
     def execute_crop(self):

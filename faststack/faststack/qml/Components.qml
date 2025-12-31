@@ -10,7 +10,26 @@ Item {
     focus: true
     
     // Height of the status bar footer in Main.qml
+    // Height of the status bar footer in Main.qml
     property int footerHeight: 60
+    
+    Connections {
+        target: uiState
+        function onCurrentIndexChanged() {
+            // Smart High-Res Logic:
+            // Before the new image loads, decide if we should keep high-res mode.
+            // Rule: Only keep high-res if we are currently "meaningfully zoomed" (> 1.1x fit).
+            // This prevents "sticky" high-res where zooming in once keeps it forever.
+            
+            if (imageRotator.zoomScale > imageRotator.fitScale * 1.1) {
+                // Keep high-res (setZoomed true if not already)
+                if (!uiState.isZoomed) uiState.setZoomed(true)
+            } else {
+                // Drop to low-res for the next image
+                if (uiState.isZoomed) uiState.setZoomed(false)
+            }
+        }
+    }
     
     Keys.onEscapePressed: (event) => {
         if (uiState && uiState.isCropping) {
@@ -38,13 +57,43 @@ Item {
             event.accepted = true
         }
     }
-    Keys.onEnterPressed: (event) => {
-        if (uiState && uiState.isCropping && controller) {
+    Keys.onPressed: (event) => {
+        // Zoom Shortcuts (Ctrl+1..4)
+        // Zoom Shortcuts (Ctrl+1..4)
+        if (event.modifiers & Qt.ControlModifier) {
+             if (event.key === Qt.Key_1) {
+                 uiState.request_absolute_zoom(1.0)
+                 event.accepted = true
+                 return
+             } else if (event.key === Qt.Key_2) {
+                 uiState.request_absolute_zoom(2.0)
+                 event.accepted = true
+                 return
+             } else if (event.key === Qt.Key_3) {
+                 uiState.request_absolute_zoom(3.0)
+                 event.accepted = true
+                 return
+             } else if (event.key === Qt.Key_4) {
+                 // 400% zoom
+                 uiState.request_absolute_zoom(4.0)
+                 event.accepted = true
+                 return
+             }
+        }
+        
+        // Handle Enter for Crop Execution (formerly Keys.onEnterPressed)
+        // We only accept the event if we actually act on it.
+        if ((event.key === Qt.Key_Enter || event.key === Qt.Key_Return) && uiState && uiState.isCropping && controller) {
             uiState.setZoomed(false) // Force unzoom
             controller.execute_crop()
             event.accepted = true
+            return
         }
+
+        // IMPORTANT: Allow unhandled keys to propagate to Python eventFilter logic
+        event.accepted = false
     }
+
 
 
     // Connection to handle zoom/pan reset signal from Python
@@ -54,6 +103,18 @@ Item {
             imageRotator.zoomScale = imageRotator.fitScale
             panTransform.x = 0
             panTransform.y = 0
+        }
+        function onAbsoluteZoomRequested(scale) {
+             console.log("QML: Absolute zoom requested: " + scale)
+             
+             imageRotator.zoomScale = scale
+             
+             // If we need to switch to high-res, flag this scale as the target 
+             // for the incoming source change so recomputeFitScale doesn't clobber it.
+             if (uiState && !uiState.isZoomed) {
+                 imageRotator.targetAbsoluteZoom = scale
+                 uiState.setZoomed(true)
+             }
         }
     }
 
@@ -82,6 +143,9 @@ Item {
             
             // Fix A: Atomic Zoom Scale
             property real zoomScale: 1.0
+            
+            // Fix C: Persist requested absolute zoom across source changes
+            property real targetAbsoluteZoom: -1.0
             
             onZoomScaleChanged: {
                 mainImage.updateZoomState()
@@ -126,12 +190,15 @@ Item {
             // NEW: fit-to-window scale (minimum zoom)
             property real fitScale: 1.0
 
-            function recomputeFitScale() {
+            function recomputeFitScale(force) {
+                if (typeof force === 'undefined') force = false;
+
                 if (width <= 0 || height <= 0 || imageViewport.width <= 0 || imageViewport.height <= 0)
                     return;
                 
-                // Prevent jitter: Don't recompute fit scale while rotating or dragging
-                if (mainMouseArea.isRotating || mainMouseArea.isCropDragging) return;
+                // Prevent jitter: Don't recompute fit scale while dragging (resize, move, or rotate)
+                // Unless forced (e.g. on release)
+                if (!force && mainMouseArea.isCropDragging) return;
 
                 // Capture current relative zoom to preserve it during resize/reload
                 var oldFit = fitScale
@@ -150,13 +217,21 @@ Item {
 
                 fitScale = s;
 
-                // Restore zoom level relative to new fit (breaks cycle and preserves zoom)
-                imageRotator.zoomScale = fitScale * ratio;
+                // Restore zoom level
+                if (targetAbsoluteZoom > 0) {
+                     // Check if we have a pending absolute zoom request (e.g. from Ctrl+1)
+                     // If so, use it directly (1.0 = 1:1 pixels) and consume the flag.
+                     imageRotator.zoomScale = targetAbsoluteZoom;
+                     targetAbsoluteZoom = -1.0;
+                } else {
+                     // Otherwise, preserve relative visual size (fit ratio)
+                     imageRotator.zoomScale = fitScale * ratio;
+                }
                 // Preserve Pan (don't reset to 0) as pan is in screen pixels (mostly)
             }
 
-            onWidthChanged: if (!isUpdatingGeometry && !mainMouseArea.isRotating) recomputeFitScale()
-            onHeightChanged: if (!isUpdatingGeometry && !mainMouseArea.isRotating) recomputeFitScale()
+            onWidthChanged: if (!isUpdatingGeometry) recomputeFitScale()
+            onHeightChanged: if (!isUpdatingGeometry) recomputeFitScale()
             Component.onCompleted: {
                 updateRotatorGeometry()
                 recomputeFitScale()
@@ -281,25 +356,52 @@ Item {
                 }
                 
                 source: uiState && uiState.imageCount > 0 ? uiState.currentImageSource : ""
+                
+                function _currentDpr() {
+                    // Per-window DPR is the safest (multi-monitor setups)
+                    if (mainImage.window && mainImage.window.devicePixelRatio)
+                        return mainImage.window.devicePixelRatio
+                    return Screen.devicePixelRatio
+                }
+
                 onSourceSizeChanged: {
-                    // Only set base size the first time, or when NOT zoomed
-                    // (prevents hi-res swap from changing logical geometry)
-                    if (!imageRotator.baseW || !imageRotator.baseH || (uiState && !uiState.isZoomed)) {
-                        imageRotator.baseW = sourceSize.width
-                        imageRotator.baseH = sourceSize.height
-                    }
+                    if (sourceSize.width <= 0 || sourceSize.height <= 0) return
+
+                    const dpr = _currentDpr()
+
+                    // Treat baseW/baseH as *device-independent pixels* that correspond to 1:1 physical pixels at zoomScale=1
+                    imageRotator.baseW = sourceSize.width / dpr
+                    imageRotator.baseH = sourceSize.height / dpr
+
+                    // Rebuild rotator + mainImage geometry based on the NEW resolution
                     imageRotator.updateRotatorGeometry()
+
+                    // Force fit recompute so fitScale / zoom logic stabilizes immediately
+                    imageRotator.recomputeFitScale(true)
+
+                    console.log("sourceSize changed:", sourceSize.width, sourceSize.height,
+                                "dpr:", dpr,
+                                "base:", imageRotator.baseW, imageRotator.baseH,
+                                "zoomScale:", imageRotator.zoomScale)
                 }
+
                 onStatusChanged: {
-                    if (status === Image.Ready) imageRotator.updateRotatorGeometry()
+                   if (status === Image.Ready) {
+                       // Some backends update sourceSize right as status flips
+                       mainImage.onSourceSizeChanged()
+                       imageRotator.updateRotatorGeometry()
+                   }
                 }
+
+                // Force reset when source changes (existing logic)
                 onSourceChanged: {
                     // Reset base size for new image so we pick up the new sourceSize
                     imageRotator.baseW = 0
                     imageRotator.baseH = 0
                     
-                    // Reset zoom/pan only when switching images (not zoomed), 
-                    // or if explicitly unzoomed. If zoomed (high-res load), preserve.
+                    // Smart Zoom Reset:
+                    // If we intended to keep high-res (isZoomed is true), preserve capabilities.
+                    // If not (isZoomed is false), reset to "fit" state for speed and consistency.
                     if (uiState && !uiState.isZoomed) {
                         mainMouseArea.cropRotation = 0
                         mainMouseArea.isRotating = false
@@ -312,8 +414,8 @@ Item {
                 }
                 fillMode: Image.PreserveAspectFit
                 cache: false // We do our own caching in Python
-                smooth: uiState && !uiState.anySliderPressed 
-                mipmap: uiState && !uiState.anySliderPressed
+                smooth: false // Crisp rendering for technical accuracy
+                mipmap: false // Crisp rendering
                 
                 property bool isZooming: false
         
@@ -338,15 +440,42 @@ Item {
                 // Removed direct onWidth/HeightChanged handlers for resizeDebounceTimer 
                 // because we now drive size reporting via viewport changes.
 
+                Timer {
+                    id: lowResDebounceTimer
+                    interval: 200 // 200ms debounce to prevent thrashing
+                    repeat: false
+                    onTriggered: {
+                        if (uiState && uiState.isZoomed) {
+                            uiState.setZoomed(false)
+                        }
+                    }
+                }
+
                 function updateZoomState() {
                     if (!uiState) return;
-                    if (imageRotator.zoomScale > imageRotator.fitScale * 1.1) {
-                         // Check isZoomed first to break binding loop (Source -> Width -> Scale -> Zoomed -> Source)
+                    
+                    // Thresholds for hysteresis
+                    var highResThreshold = imageRotator.fitScale * 1.1
+                    var lowResThreshold = imageRotator.fitScale * 1.02
+                    
+                    // Enable High-Res if zoomed in significantly
+                    if (imageRotator.zoomScale > highResThreshold) {
+                         lowResDebounceTimer.stop()
                          if (!uiState.isZoomed) {
                              uiState.setZoomed(true);
                          }
+                    } 
+                    // Disable High-Res (return to low-res) if zoomed out to near-fit
+                    // formatting note: added hysteresis check AND debounce
+                    else if (imageRotator.zoomScale <= lowResThreshold) {
+                        if (uiState.isZoomed) {
+                            // Only drop to low-res after delay to handle wheel overshoot/jitter
+                            if (!lowResDebounceTimer.running) lowResDebounceTimer.start()
+                        }
+                    } else {
+                        // In hysteresis band: cancel any pending low-res switch
+                        lowResDebounceTimer.stop()
                     }
-                    // Remove auto-unzoom to prevent flashing. Once high-res, stay high-res.
                     
                     updateHistogramWithZoom()
                 }
@@ -370,18 +499,7 @@ Item {
 
     // Zoom and Pan logic would go here
     // For example, using PinchArea or MouseArea
-    Timer {
-        id: resizeDebounceTimer
-        interval: 100 // milliseconds
-        running: false
-        onTriggered: {
-            if (mainImage.width > 0 && mainImage.height > 0) {
-                var dpr = Screen.devicePixelRatio
-                uiState.onDisplaySizeChanged(Math.round(mainImage.width * dpr), Math.round(mainImage.height * dpr))
-            }
-            running = false
-        }
-    }
+
 
         MouseArea {
             id: mainMouseArea
@@ -498,17 +616,12 @@ Item {
                 var my = coords.y * 1000
                 
                 // Calculate threshold in normalized units (approx 10 screen pixels)
-                // 10 px / (scale * size) * 1000
                 var threshX = (10 / (scaleTransform.xScale * mainImage.width)) * 1000
                 var threshY = (10 / (scaleTransform.yScale * mainImage.height)) * 1000
-                var edgeThreshold = Math.max(10, Math.min(threshX, threshY)) // Fallback/Clamp
-                if (imageRotator.width > 0) {
-                     // cleaner approx: just use mapToImage for a 10px delta?
-                     // Let's stick to the mapped coords.
-                     threshX = (10 / (scaleTransform.xScale * mainImage.width)) * 1000
-                     threshY = (10 / (scaleTransform.yScale * mainImage.height)) * 1000
-                     edgeThreshold = Math.max(threshX, threshY)
-                }
+                
+                // Clamp threshold: min 5 normalized units (prevent too small), max 40 (prevent too large)
+                // This ensures handles remain usable at all zoom levels
+                var edgeThreshold = Math.max(5, Math.min(40, Math.max(threshX, threshY)))
 
                 var inside = mx >= box[0] && mx <= box[2] && my >= box[1] && my <= box[3]
                 
@@ -635,18 +748,7 @@ Item {
                             rotationThrottleTimer.start()
                         }
                     }
-                } else if (cropDragMode !== "none") {
 
-                    // Update rotation in backend live (throttled)
-                    if (controller) {
-                        pendingRotation = cropRotation
-                        pendingAspect = cropStartAspect
-                        
-                        if (!rotationThrottleTimer.running) {
-                            rotationThrottleTimer.start()
-                        }
-                    }
-                } else if (cropDragMode !== "none") {
                     
                     var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
 
@@ -726,8 +828,8 @@ Item {
             if (uiState && uiState.isCropping && isCropDragging) {
                 isCropDragging = false
                 cropDragMode = "none"
-                // Settle zoom/pan after rotation ends
-                if (mainMouseArea.isRotating) imageRotator.recomputeFitScale()
+                // Settle zoom/pan after rotation ends (Force recompute)
+                if (mainMouseArea.isRotating) imageRotator.recomputeFitScale(true)
             }
         }
 
