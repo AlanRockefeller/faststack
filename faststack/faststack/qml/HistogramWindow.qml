@@ -8,8 +8,8 @@ Window {
     title: "RGB Histogram"
     width: 750
     height: 450
-    minimumWidth: 250
-    minimumHeight: 150
+    minimumWidth: 100
+    minimumHeight: 50
     visible: uiState ? uiState.isHistogramVisible : false
 
     FocusScope {
@@ -82,13 +82,15 @@ Window {
 
             ColumnLayout {
                 anchors.fill: parent
+                spacing: 2
                 
                 Text {
                     text: channelName
                     color: channelColor
                     font.bold: true
-                    font.pixelSize: 14
+                    font.pixelSize: Math.max(10, Math.min(14, histogramWindow.height / 30))
                     Layout.alignment: Qt.AlignHCenter
+                    visible: histogramWindow.height > 100
                 }
 
                 Canvas {
@@ -106,8 +108,6 @@ Window {
                         
                         // Handle null or empty data gracefully
                         if (!histogramData || histogramData.length === undefined || histogramData.length === 0) return
-
-                        // console.log(channelName, "len", histogramData ? histogramData.length : "null")
 
                         // --- Draw Grid ---
                         ctx.strokeStyle = gridLineColor
@@ -167,18 +167,20 @@ Window {
 
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter
-                    spacing: 15
+                    spacing: 5
+                    visible: histogramWindow.height > 80
                     
                     Text {
-                        text: "Pre-clip: " + preClipCount
+                        text: "P:" + preClipCount
                         color: primaryTextColor
-                        font.pixelSize: 11
+                        font.pixelSize: Math.max(8, Math.min(11, histogramWindow.height / 40))
+                        visible: histogramWindow.width > 400
                     }
                     Text {
-                        text: "Clipped: " + clipCount
+                        text: (histogramWindow.width > 400 ? "Clipped: " : "C:") + clipCount
                         color: clipCount > 0 ? "red" : primaryTextColor
                         font.bold: clipCount > 0
-                        font.pixelSize: 11
+                        font.pixelSize: Math.max(8, Math.min(11, histogramWindow.height / 40))
                     }
                 }
             }
@@ -187,8 +189,8 @@ Window {
 
     RowLayout {
         anchors.fill: parent
-        anchors.margins: 15
-        spacing: 15
+        anchors.margins: histogramWindow.width > 200 ? 15 : 2
+        spacing: histogramWindow.width > 200 ? 15 : 2
 
         Loader {
             id: redLoader
