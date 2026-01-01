@@ -50,13 +50,20 @@ Item {
         }
     }
 
+
     Keys.onReturnPressed: (event) => {
         if (uiState && uiState.isCropping && controller) {
-            uiState.setZoomed(false) // Force unzoom to reset geometry/fit after crop
+            // Force immediate rotation update before executing crop
+            if (mainMouseArea.cropRotation !== 0) {
+                controller.set_straighten_angle(mainMouseArea.cropRotation, -1)
+            }
+            
+            uiState.setZoomed(false)
             controller.execute_crop()
             event.accepted = true
         }
     }
+
     Keys.onPressed: (event) => {
         // Zoom Shortcuts (Ctrl+1..4)
         // Zoom Shortcuts (Ctrl+1..4)
@@ -211,9 +218,9 @@ Item {
                 // fit rotated canvas into viewport
                 var s = Math.min(imageViewport.width / width, imageViewport.height / height);
                 // Ensure fitScale is finite and positive
-                // Cap at 1.0 (don't upscale small images to fit)
+                // Allow upscaling to fit window (necessary for HiDPI logical sizing)
                 if (!isFinite(s) || s <= 0) s = 1.0;
-                else if (s > 1.0) s = 1.0;
+                // else if (s > 1.0) s = 1.0; // REMOVED: Cap prevented fitting small/logical images
 
                 fitScale = s;
 
@@ -364,14 +371,14 @@ Item {
                     return Screen.devicePixelRatio
                 }
 
-                onSourceSizeChanged: {
-                    if (sourceSize.width <= 0 || sourceSize.height <= 0) return
+                function handleSourceSizeChange() {
+                    if (mainImage.sourceSize.width <= 0 || mainImage.sourceSize.height <= 0) return
 
                     const dpr = _currentDpr()
 
                     // Treat baseW/baseH as *device-independent pixels* that correspond to 1:1 physical pixels at zoomScale=1
-                    imageRotator.baseW = sourceSize.width / dpr
-                    imageRotator.baseH = sourceSize.height / dpr
+                    imageRotator.baseW = mainImage.sourceSize.width / dpr
+                    imageRotator.baseH = mainImage.sourceSize.height / dpr
 
                     // Rebuild rotator + mainImage geometry based on the NEW resolution
                     imageRotator.updateRotatorGeometry()
@@ -379,16 +386,20 @@ Item {
                     // Force fit recompute so fitScale / zoom logic stabilizes immediately
                     imageRotator.recomputeFitScale(true)
 
-                    console.log("sourceSize changed:", sourceSize.width, sourceSize.height,
-                                "dpr:", dpr,
-                                "base:", imageRotator.baseW, imageRotator.baseH,
-                                "zoomScale:", imageRotator.zoomScale)
+                    if (uiState && uiState.debugMode) {
+                        console.log("sourceSize changed:", mainImage.sourceSize.width, mainImage.sourceSize.height,
+                                    "dpr:", dpr,
+                                    "base:", imageRotator.baseW, imageRotator.baseH,
+                                    "zoomScale:", imageRotator.zoomScale)
+                    }
                 }
+
+                onSourceSizeChanged: { handleSourceSizeChange() }
 
                 onStatusChanged: {
                    if (status === Image.Ready) {
                        // Some backends update sourceSize right as status flips
-                       mainImage.onSourceSizeChanged()
+                       mainImage.handleSourceSizeChange()
                        imageRotator.updateRotatorGeometry()
                    }
                 }
@@ -826,6 +837,22 @@ Item {
         onReleased: function(mouse) {
             isDraggingOutside = false
             if (uiState && uiState.isCropping && isCropDragging) {
+                // Fix: Prevent accidental tiny crops with Right Click
+                if (mouse.button === Qt.RightButton && cropDragMode === "new") {
+                    var dx = Math.abs(mouse.x - cropStartX)
+                    var dy = Math.abs(mouse.y - cropStartY)
+                    var maxDim = Math.max(dx, dy)
+                    var minDim = Math.min(dx, dy)
+                    
+                    // "at least 50 pixels in both dimensions"
+                    if (maxDim < 50 || minDim < 50) {
+                        if (controller) controller.cancel_crop_mode()
+                        isCropDragging = false
+                        cropDragMode = "none"
+                        return
+                    }
+                }
+
                 isCropDragging = false
                 cropDragMode = "none"
                 // Settle zoom/pan after rotation ends (Force recompute)

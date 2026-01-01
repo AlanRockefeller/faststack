@@ -2,6 +2,7 @@ import os
 import shutil
 import glob
 import re
+import math
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 try:
@@ -55,6 +56,110 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
     except OSError as e:
         print(f"Failed to create backup: {e}")
         return None
+
+# ----------------------------
+# Rotate + Autocrop helper
+# ----------------------------
+
+def _rotated_rect_with_max_area(w: int, h: int, angle_rad: float) -> tuple[int, int]:
+    """
+    Largest axis-aligned rectangle within a w x h rectangle rotated by angle_rad.
+    Returns (crop_w, crop_h) in pixels.
+    """
+    if w <= 0 or h <= 0:
+        return 0, 0
+
+    # fold angle into [0, pi/2)
+    angle_rad = abs(angle_rad) % (math.pi / 2)
+    if angle_rad > math.pi / 4:
+        angle_rad = (math.pi / 2) - angle_rad
+
+    sin_a = abs(math.sin(angle_rad))
+    cos_a = abs(math.cos(angle_rad))
+
+    # if basically unrotated
+    if sin_a < 1e-12:
+        return w, h
+
+    width_is_longer = w >= h
+    side_long = w if width_is_longer else h
+    side_short = h if width_is_longer else w
+
+    # "half constrained" case
+    if side_short <= 2.0 * sin_a * cos_a * side_long or abs(sin_a - cos_a) < 1e-12:
+        x = 0.5 * side_short
+        if width_is_longer:
+            wr = x / sin_a
+            hr = x / cos_a
+        else:
+            wr = x / cos_a
+            hr = x / sin_a
+    else:
+        cos_2a = cos_a * cos_a - sin_a * sin_a
+        wr = (w * cos_a - h * sin_a) / cos_2a
+        hr = (h * cos_a - w * sin_a) / cos_2a
+
+    cw = int(round(abs(wr)))
+    ch = int(round(abs(hr)))
+    cw = max(1, min(w, cw))
+    ch = max(1, min(h, ch))
+    return cw, ch
+
+
+def rotate_autocrop_rgb(img: Image.Image, angle_deg: float, inset: int = 2) -> Image.Image:
+    """
+    Rotate by any angle and then crop to the largest axis-aligned rectangle that contains
+    ONLY valid pixels (no wedges). Works for large angles.
+    """
+    if abs(angle_deg) < 0.01:
+        return img.convert("RGB")
+
+    img = img.convert("RGB")
+    w, h = img.size
+
+    # Reduce angle for rectangle math (rotation by 120° has same inscribed rect as 60°)
+    a = abs(angle_deg) % 180.0
+    if a > 90.0:
+        a = 180.0 - a
+    angle_rad = math.radians(a)
+
+    # Largest rectangle inside the rotated original (in original pixel coordinates)
+    crop_w, crop_h = _rotated_rect_with_max_area(w, h, angle_rad)
+    crop_w = max(1, min(w, crop_w))
+    crop_h = max(1, min(h, crop_h))
+
+    # Rotate with expand so content is preserved
+    rot = img.rotate(
+        -angle_deg,
+        resample=Image.Resampling.BICUBIC,
+        expand=True,
+        fillcolor=(0, 0, 0),
+    )
+
+    # Center-crop to the inscribed rectangle
+    cx = rot.width / 2.0
+    cy = rot.height / 2.0
+    left = int(round(cx - crop_w / 2.0))
+    top = int(round(cy - crop_h / 2.0))
+    right = left + crop_w
+    bottom = top + crop_h
+
+    # Small inset to remove any bicubic edge contamination
+    if inset > 0 and (right - left) > 2 * inset and (bottom - top) > 2 * inset:
+        left += inset
+        top += inset
+        right -= inset
+        bottom -= inset
+
+    # Clamp defensively
+    left = max(0, min(rot.width - 1, left))
+    top = max(0, min(rot.height - 1, top))
+    right = max(left + 1, min(rot.width, right))
+    bottom = max(top + 1, min(rot.height, bottom))
+
+    out = rot.crop((left, top, right, bottom)).convert("RGB")
+    return out
+
 
 class ImageEditor:
     """Handles core image manipulation using PIL."""
@@ -132,46 +237,66 @@ class ImageEditor:
             self._preview_image = None
             return False
 
+
     def _apply_edits(self, img: Image.Image, is_export: bool = False) -> Image.Image:
         """Applies all current edits to the provided PIL Image."""
-        # 1. Rotation
-        rotation = self.current_edits['rotation']
+        
+        # 1. Rotation (90 degree steps)
+        # (This remains first as it changes the coordinate system basis)
+        rotation = self.current_edits.get('rotation', 0)
         if rotation == 90:
-            img = img.transpose(Image.Transpose.ROTATE_270) # 90 CW = 270 CCW
+            img = img.transpose(Image.Transpose.ROTATE_270)
         elif rotation == 180:
             img = img.transpose(Image.Transpose.ROTATE_180)
         elif rotation == 270:
-            img = img.transpose(Image.Transpose.ROTATE_90) # 270 CW = 90 CCW
+            img = img.transpose(Image.Transpose.ROTATE_90)
 
-        # 2. Cropping (Standard axis-aligned crop)
-        # Semantics: Crop first (in original image coordinates), THEN rotate (straighten)
-        # This matches "applying rotation to the selected crop".
-        # If we rotate first, we get an AABB of the rotated content which is arguably wrong (too big).
-        
-        # Apply Crop if it exists
-        if 'crop_box' in self.current_edits and self.current_edits['crop_box']:
-            crop_box = self.current_edits['crop_box']
-            if crop_box and len(crop_box) == 4:
-                 width, height = img.size
-                 l = int(crop_box[0] * width / 1000)
-                 t = int(crop_box[1] * height / 1000)
-                 r = int(crop_box[2] * width / 1000)
-                 b = int(crop_box[3] * height / 1000)
-                 
-                 # Clamp coordinates to be within image bounds and ensure valid box
-                 l = max(0, min(width - 1, l))
-                 t = max(0, min(height - 1, t))
-                 r = max(l + 1, min(width, r)) # Ensure r > l
-                 b = max(t + 1, min(height, b)) # Ensure b > t
-                 
-                 img = img.crop((l, t, r, b))
+        # ---------------------------------------------------------
+        # CHANGE: Apply Free Rotation (Straighten) BEFORE Cropping
+        # ---------------------------------------------------------
+        straighten_angle = self.current_edits.get('straighten_angle', 0.0)
+        has_crop_box = 'crop_box' in self.current_edits and self.current_edits['crop_box']
 
-        # 3. Free Rotation (Straighten)
-        straighten_angle = self.current_edits['straighten_angle']
         if abs(straighten_angle) > 0.001:
-            # expand=True ensures we don't clip corners of the rotated crop
-            img = img.rotate(-straighten_angle, resample=Image.Resampling.BICUBIC, expand=True)
-        
+            if has_crop_box:
+                # Scenario A: Manual Crop. 
+                # Just rotate the image (expanding canvas). The subsequent 
+                # manual crop will trim off the black wedges.
+                img = img.convert("RGB").rotate(
+                    -straighten_angle,
+                    resample=Image.Resampling.BICUBIC,
+                    expand=True,
+                    fillcolor=(0, 0, 0) # These will be cropped out shortly
+                )
+            else:
+                # Scenario B: Straighten Only (No manual crop).
+                # Use your existing helper to Rotate + Auto-Shrink to remove wedges.
+                img = rotate_autocrop_rgb(img, straighten_angle)
+
+        # ---------------------------------------------------------
+        # CHANGE: Apply Cropping LAST
+        # ---------------------------------------------------------
+        if has_crop_box:
+            crop_box = self.current_edits['crop_box']
+            if len(crop_box) == 4:
+                # Normalize coordinates (0-1000) to pixel coordinates
+                # Note: We calculate this based on the *current* img size, 
+                # which might be larger now due to the rotation above.
+                w, h = img.size
+                l = int(crop_box[0] * w / 1000)
+                t = int(crop_box[1] * h / 1000)
+                r = int(crop_box[2] * w / 1000)
+                b = int(crop_box[3] * h / 1000)
+                
+                # Basic boundary checks
+                l = max(0, l)
+                t = max(0, t)
+                r = min(w, r)
+                b = min(h, b)
+                
+                if r > l and b > t:
+                    img = img.crop((l, t, r, b))
+
         # 3. Exposure (gamma-based)
         exposure = self.current_edits['exposure']
         if abs(exposure) > 0.001:
@@ -196,16 +321,17 @@ class ImageEditor:
         # 5. Highlights/Shadows
         highlights = self.current_edits['highlights']
         shadows = self.current_edits['shadows']
+
         if abs(highlights) > 0.001 or abs(shadows) > 0.001:
             arr = np.array(img, dtype=np.float32)
             if abs(shadows) > 0.001:
                 shadow_mask = 1.0 - np.clip(arr / 128.0, 0, 1)
                 arr += shadows * 60 * shadow_mask
-            
+
             if highlights < -0.001: # Negative highlights (recovery)
                 mask = np.clip((arr - 128) / 127.0, 0, 1) # targets bright pixels
                 # highlights is negative here, so 1.0 + (negative * positive) = something less than 1.0
-                factor = 1.0 + (highlights * 0.75 * mask) 
+                factor = 1.0 + (highlights * 0.75 * mask)
                 arr = arr * factor
             elif highlights > 0.001: # Positive highlights (keep existing)
                 highlight_mask = np.clip((arr - 128) / 127.0, 0, 1)
@@ -258,12 +384,12 @@ class ImageEditor:
             arr = np.array(img, dtype=np.float32)
             # Multiplicative White Balance (Gain-based)
             # This preserves black levels (0 * gain = 0) while adjusting the color balance of brighter pixels.
-            
+
             # Temperature (Blue-Yellow):
             # Positive = Warm (Yellow/Red), Negative = Cool (Blue)
             r_gain = 1.0 + by_val
             b_gain = 1.0 - by_val
-            
+
             # Tint (Magenta-Green):
             # Positive = Magenta (Red+Blue boost or Green cut), Negative = Green (Green boost)
             # Standard approach: Adjust Green channel opposite to the tint value.
@@ -273,7 +399,7 @@ class ImageEditor:
             arr[:, :, 0] = arr[:, :, 0] * r_gain
             arr[:, :, 1] = arr[:, :, 1] * g_gain
             arr[:, :, 2] = arr[:, :, 2] * b_gain
-            
+
             np.clip(arr, 0, 255, out=arr)
             img = Image.fromarray(arr.astype(np.uint8))
 
@@ -281,7 +407,7 @@ class ImageEditor:
         sharp_factor = 1.0 + self.current_edits['sharpness']
         if abs(sharp_factor - 1.0) > 0.001:
             img = ImageEnhance.Sharpness(img).enhance(sharp_factor)
-        
+
         # 13. Vignette
         vignette = self.current_edits['vignette']
         if vignette > 0.001:
@@ -313,6 +439,7 @@ class ImageEditor:
             for c in range(3):
                 arr[:,:,c] += local_details
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
+
 
         return img
 

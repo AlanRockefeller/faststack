@@ -151,7 +151,14 @@ class UIState(QObject):
         self._current_crop_box = [0, 0, 1000, 1000]
         self._crop_rotation = 0.0
         self._debug_mode = False
-        self._aspect_ratio_names = []
+        self._aspect_ratio_names = [
+            "Freeform",
+            "1:1 (Square)",
+            "4:5 (Portrait)",
+            "1.91:1 (Landscape)",
+            "16:9 (Wide)",
+            "9:16 (Story)"
+        ]
         self._current_aspect_ratio_index = 0
         self._any_slider_pressed = False
         self._sharpness = 0.0
