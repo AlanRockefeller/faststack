@@ -631,6 +631,23 @@ ApplicationWindow {
 
     property int footerHeight: 60
 
+    Shortcut {
+        sequence: "E"
+        context: Qt.ApplicationShortcut
+        onActivated: {
+            if (!uiState) return
+            
+            if (uiState.isEditorOpen) {
+                uiState.isEditorOpen = false
+            } else {
+                uiState.isEditorOpen = true
+                if (controller) {
+                    controller.load_image_for_editing()
+                }
+            }
+        }
+    }
+
     // -------- MAIN VIEW --------
     Item {
         id: contentArea
@@ -649,23 +666,8 @@ ApplicationWindow {
                     return
                 }
 
-                // Toggle Image Editor with 'E' key
-                // If editor is open, close it without saving. Otherwise open it.
-                if (event.key === Qt.Key_E && !event.isAutoRepeat) {
-                    if (uiState.isEditorOpen) {
-                        // Close editor without saving
-                        uiState.isEditorOpen = false
-                    } else {
-                        // Open editor
-                        uiState.isEditorOpen = true
-                        if (controller) {
-                            controller.load_image_for_editing()
-                        }
-                    }
-                    event.accepted = true
-                }
                 // Global Key for saving edited image (Ctrl+S) when editor is open
-                else if (event.key === Qt.Key_S && (event.modifiers & Qt.ControlModifier)) {
+                if (event.key === Qt.Key_S && (event.modifiers & Qt.ControlModifier)) {
                     if (uiState.isEditorOpen) {
                         controller.save_edited_image()
                         event.accepted = true

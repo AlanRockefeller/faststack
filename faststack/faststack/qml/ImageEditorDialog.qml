@@ -45,13 +45,6 @@ Window {
     color: imageEditorDialog.backgroundColor
 
     Shortcut {
-        sequence: "E"
-        context: Qt.WindowShortcut
-        onActivated: {
-            uiState.isEditorOpen = false
-        }
-    }
-    Shortcut {
         sequence: "Escape"
         context: Qt.WindowShortcut
         onActivated: {

@@ -8,8 +8,8 @@ Window {
     title: "RGB Histogram"
     width: 750
     height: 450
-    minimumWidth: 500
-    minimumHeight: 350
+    minimumWidth: 250
+    minimumHeight: 150
     visible: uiState ? uiState.isHistogramVisible : false
 
     FocusScope {
