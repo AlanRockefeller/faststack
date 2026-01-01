@@ -9,14 +9,14 @@ Window {
     width: 720
     height: 700
     title: "Image Editor"
-    visible: uiState.isEditorOpen
+    visible: uiState ? uiState.isEditorOpen : false
     flags: Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
     property int updatePulse: 0
     property color backgroundColor: "red" // Placeholder, will be set from Main.qml
     property color textColor: "white" // Placeholder, will be set from Main.qml
 
 
-    Material.theme: uiState.theme === 0 ? Material.Dark : Material.Light
+    Material.theme: (uiState && uiState.theme === 0) ? Material.Dark : Material.Light
     Material.accent: "#4fb360"
 
     // When the dialog is closed by the user (e.g. clicking X), update the state
@@ -33,7 +33,7 @@ Window {
 
     function getBackendValue(key) {
         var _dependency = updatePulse;
-        if (key in uiState) return uiState[key];
+        if (uiState && key in uiState) return uiState[key];
         return 0.0;
     }
 
@@ -290,7 +290,7 @@ Window {
                     height: 16
                     radius: 8
                     color: slider.pressed ? "#4fb360" : "#6fcf7c"
-                    border.color: uiState.theme === 0 ? Qt.darker(Material.accent, 1.2) : Qt.lighter(Material.accent, 1.2)
+                    border.color: (uiState && uiState.theme === 0) ? Qt.darker(Material.accent, 1.2) : Qt.lighter(Material.accent, 1.2)
                 }
             }
         }

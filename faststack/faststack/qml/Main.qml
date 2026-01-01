@@ -635,6 +635,8 @@ ApplicationWindow {
         }
     }
 
+    property int footerHeight: 60
+
     // -------- MAIN VIEW --------
     Item {
         id: contentArea
@@ -645,6 +647,7 @@ ApplicationWindow {
             anchors.fill: parent
             source: "Components.qml"
             focus: true
+            onLoaded: item.footerHeight = Qt.binding(function() { return root.footerHeight })
 
             // Key bindings implemented in old Main.qml
             Keys.onPressed: function(event) {
@@ -676,16 +679,16 @@ ApplicationWindow {
                 }
             }
         }
-    }
 
-    // -------- FOOTER / STATUS BAR (old version) --------
-    footer: Rectangle {
+    // -------- STATUS BAR OVERLAY --------
+    Rectangle {
+        z: 100
+        anchors.bottom: parent.bottom
         id: footerRect
         // Keep footer height fixed so the main image area doesn't change size when
         // stack/batch labels appear or disappear (prevents cache invalidations).
-        property int fixedHeight: 60
-        height: fixedHeight
-        implicitHeight: fixedHeight
+        height: root.footerHeight
+        implicitHeight: root.footerHeight
         anchors.left: parent.left
         anchors.right: parent.right
         color: Qt.rgba(root.currentBackgroundColor.r, root.currentBackgroundColor.g, root.currentBackgroundColor.b, 0.8)
@@ -830,6 +833,7 @@ ApplicationWindow {
             }
         }
     }
+    }
 
     // -------- DIALOGS --------
 
@@ -841,7 +845,7 @@ ApplicationWindow {
         modal: true
         closePolicy: Popup.CloseOnEscape
         focus: true
-        width: 600
+        width: 1000
         height: 750
 
         background: Rectangle {
@@ -850,45 +854,70 @@ ApplicationWindow {
 
         contentItem: ScrollView {
             clip: true
-            Text {
-                text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
-                      "<b>Navigation:</b><br>" +
-                      "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
-                      "&nbsp;&nbsp;K / Left Arrow: Previous Image<br>" +
-                      "&nbsp;&nbsp;G: Jump to Image Number<br>" +
-                      "&nbsp;&nbsp;I: Show EXIF Data<br><br>" +
-                      "<b>Viewing:</b><br>" +
-                      "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
-                      "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
-                      "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br><br>" +
-                      "<b>Stacking:</b><br>" +
-                      "&nbsp;&nbsp;[: Begin new stack<br>" +
-                      "&nbsp;&nbsp;]: End current stack<br>" +
-                      "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
-                      "<b>Batch Selection (for drag-and-drop):</b><br>" +
-                      "&nbsp;&nbsp;{: Begin new batch<br>" +
-                      "&nbsp;&nbsp;}: End current batch<br>" +
-                      "&nbsp;&nbsp;\\: Clear all batches<br>" +
-                      "&nbsp;&nbsp;X or S: Remove current image from batch/stack<br><br>" +
-                      "<b>Flag Toggles:</b><br>" +
-                      "&nbsp;&nbsp;U: Toggle uploaded flag<br>" +
-                      "&nbsp;&nbsp;Ctrl+E: Toggle edited flag<br>" +
-                      "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
-                      "<b>File Management:</b><br>" +
-                      "&nbsp;&nbsp;Delete: Move current image to recycle bin<br>" +
-                      "&nbsp;&nbsp;Ctrl+Z: Undo last action (delete, auto white balance, or crop)<br><br>" +
-                      "<b>Actions:</b><br>" +
-                      "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
-                      "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
-                      "&nbsp;&nbsp;A: Quick auto white balance (saves automatically)<br>" +
-                      "&nbsp;&nbsp;Ctrl+Shift+B: Quick auto white balance (saves automatically)<br>" +
-                      "&nbsp;&nbsp;O: Toggle crop mode (Enter to execute crop, ESC to cancel)<br>" +
-                      "&nbsp;&nbsp;H: Toggle histogram window<br>" +
-                      "&nbsp;&nbsp;E: Toggle Image Editor (closes without saving if open)<br>" +
-                      "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
-                padding: 10
-                wrapMode: Text.WordWrap
-                color: root.currentTextColor
+            
+            Row {
+                spacing: 20
+                
+                // Column 1
+                Text {
+                    width: 450
+                    text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
+                          "<b>Navigation:</b><br>" +
+                          "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
+                          "&nbsp;&nbsp;K / Left Arrow: Previous Image<br>" +
+                          "&nbsp;&nbsp;G: Jump to Image Number<br>" +
+                          "&nbsp;&nbsp;I: Show EXIF Data<br><br>" +
+                          "<b>Viewing:</b><br>" +
+                          "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
+                          "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
+                          "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br><br>" +
+                          "&nbsp;&nbsp;Ctrl+1: Zoom to 100%<br><br>" +
+                          "&nbsp;&nbsp;Ctrl+2: Zoom to 200%<br><br>" +
+                          "&nbsp;&nbsp;Ctrl+3: Zoom to 300%<br><br>" +
+                          "&nbsp;&nbsp;Ctrl+4: Zoom to 400%<br><br>" +
+                          "<b>Stacking:</b><br>" +
+                          "&nbsp;&nbsp;[: Begin new stack<br>" +
+                          "&nbsp;&nbsp;]: End current stack<br>" +
+                          "&nbsp;&nbsp;C: Clear all stacks<br>" +
+                          "&nbsp;&nbsp;S: Toggle current image in/out of stack<br>" +
+                          "&nbsp;&nbsp;X: Remove current image from batch/stack"
+                    padding: 10
+                    wrapMode: Text.WordWrap
+                    color: root.currentTextColor
+                }
+
+                // Column 2
+                Text {
+                    width: 450
+                    text: "<br><br>" + // Spacer to align with first section under title
+                          "<b>Batch Selection (for drag-and-drop):</b><br>" +
+                          "&nbsp;&nbsp;{: Begin new batch<br>" +
+                          "&nbsp;&nbsp;B: Toggle current image in/out of batch<br>" +
+                          "&nbsp;&nbsp;}: End current batch<br>" +
+                          "&nbsp;&nbsp;\\: Clear all batches<br>" +
+                          "<b>Flag Toggles:</b><br>" +
+                          "&nbsp;&nbsp;U: Toggle uploaded flag<br>" +
+                          "&nbsp;&nbsp;Ctrl+E: Toggle edited flag<br>" +
+                          "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
+                          "<b>File Management:</b><br>" +
+                          "&nbsp;&nbsp;Delete: Move current image to recycle bin<br>" +
+                          "&nbsp;&nbsp;Ctrl+Z: Undo last action (delete, auto white balance, or crop)<br><br>" +
+                          "<b>Actions:</b><br>" +
+                          "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
+                          "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
+                          "&nbsp;&nbsp;Backspace/Del: Move current image to recycle bin<br>" +
+                          "&nbsp;&nbsp;A: Quick auto white balance (saves automatically)<br>" +
+                          "&nbsp;&nbsp;L: Quick auto levels (saves automatically)<br>" +
+                          "&nbsp;&nbsp;Ctrl+Shift+B: Quick auto white balance (saves automatically)<br>" +
+                          "&nbsp;&nbsp;O (or right mouse click): Toggle crop mode (Enter to execute crop, ESC to cancel)<br>" +
+                          "&nbsp;&nbsp;H: Toggle histogram window<br>" +
+                          "&nbsp;&nbsp;E: Toggle Image Editor (closes without saving if open)<br>" +
+                          "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
+                          "&nbsp;&nbsp;Esc: Close active dialog, editor, or cancel crop"
+                    padding: 10
+                    wrapMode: Text.WordWrap
+                    color: root.currentTextColor
+                }
             }
         }
     }

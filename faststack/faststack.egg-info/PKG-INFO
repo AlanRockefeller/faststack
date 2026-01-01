@@ -69,5 +69,5 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - `E`: Edit in Photoshop
 - `Ctrl+C`: Copy image path to clipboard
 - `C`: Clear all stacks
-+- `H`: Show RGB Histogram
-+- `I`: Show EXIF Metadata
+- `H`: Show RGB Histogram
+- `I`: Show EXIF Metadata

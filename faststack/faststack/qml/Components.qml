@@ -7,125 +7,504 @@ import QtQuick.Window
 Item {
     id: loupeView
     anchors.fill: parent
+    focus: true
+    
+    // Height of the status bar footer in Main.qml
+    property int footerHeight: 60
+    
+    Connections {
+        target: uiState
+        function onCurrentIndexChanged() {
+            // Smart High-Res Logic:
+            // Before the new image loads, decide if we should keep high-res mode.
+            // Rule: Only keep high-res if we are currently "meaningfully zoomed" (> 1.1x fit).
+            // This prevents "sticky" high-res where zooming in once keeps it forever.
+            
+            if (imageRotator.zoomScale > imageRotator.fitScale * 1.1) {
+                // Keep high-res (setZoomed true if not already)
+                if (!uiState.isZoomed) uiState.setZoomed(true)
+            } else {
+                // Drop to low-res for the next image
+                if (uiState.isZoomed) uiState.setZoomed(false)
+            }
+        }
+    }
+    
+    Keys.onEscapePressed: (event) => {
+        if (uiState && uiState.isCropping) {
+            if (mainMouseArea.isRotating) {
+                // Revert rotation
+                mainMouseArea.cropRotation = mainMouseArea.cropStartRotation
+                if (controller) controller.set_straighten_angle(mainMouseArea.cropRotation, -1)
+                
+                mainMouseArea.isRotating = false
+                mainMouseArea.cropDragMode = "none"
+                mainMouseArea.isCropDragging = false
+                event.accepted = true
+            } else if (controller) {
+                controller.cancel_crop_mode()
+                mainMouseArea.cropRotation = 0 // Reset local rotation
+                event.accepted = true
+            }
+        }
+    }
+
+
+
+
+    Keys.onPressed: (event) => {
+        // Zoom Shortcuts (Ctrl+1..4)
+        if (event.modifiers & Qt.ControlModifier) {
+             if (event.key === Qt.Key_1) {
+                 uiState.request_absolute_zoom(1.0)
+                 event.accepted = true
+                 return
+             } else if (event.key === Qt.Key_2) {
+                 uiState.request_absolute_zoom(2.0)
+                 event.accepted = true
+                 return
+             } else if (event.key === Qt.Key_3) {
+                 uiState.request_absolute_zoom(3.0)
+                 event.accepted = true
+                 return
+             } else if (event.key === Qt.Key_4) {
+                 // 400% zoom
+                 uiState.request_absolute_zoom(4.0)
+                 event.accepted = true
+                 return
+             }
+        }
+        
+        // Handle Enter for Crop Execution (formerly Keys.onEnterPressed)
+        // We only accept the event if we actually act on it.
+        if ((event.key === Qt.Key_Enter || event.key === Qt.Key_Return) && uiState && uiState.isCropping && controller) {
+            // Force immediate rotation update before executing crop
+            if (mainMouseArea.cropRotation !== 0) {
+                controller.set_straighten_angle(mainMouseArea.cropRotation, -1)
+            }
+
+            uiState.setZoomed(false) // Force unzoom
+            controller.execute_crop()
+            event.accepted = true
+            return
+        }
+
+        // IMPORTANT: Allow unhandled keys to propagate to Python eventFilter logic
+        event.accepted = false
+    }
+
 
 
     // Connection to handle zoom/pan reset signal from Python
     Connections {
         target: uiState
         function onResetZoomPanRequested() {
-            scaleTransform.xScale = 1.0
-            scaleTransform.yScale = 1.0
+            imageRotator.zoomScale = imageRotator.fitScale
             panTransform.x = 0
             panTransform.y = 0
         }
+        function onAbsoluteZoomRequested(scale) {
+             if (uiState && uiState.debugMode) {
+                 console.log("QML: Absolute zoom requested: " + scale)
+             }
+             
+             imageRotator.zoomScale = scale
+             
+             // If we need to switch to high-res, flag this scale as the target 
+             // for the incoming source change so recomputeFitScale doesn't clobber it.
+             if (uiState && !uiState.isZoomed) {
+                 imageRotator.targetAbsoluteZoom = scale
+                 uiState.setZoomed(true)
+             }
+        }
     }
 
-    // The main image display
-    Image {
-        id: mainImage
-        anchors.fill: parent
-        source: uiState && uiState.imageCount > 0 ? uiState.currentImageSource : ""
-        fillMode: Image.PreserveAspectFit
-        cache: false // We do our own caching in Python
-	smooth: uiState && !uiState.anySliderPressed && !isZooming
-	mipmap: uiState && !uiState.anySliderPressed && !isZooming
-        
-        property bool isZooming: false
+    // Container that handles Viewport Clipping and Sizing
+    Item {
+        id: imageViewport
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: footerHeight
+        clip: true
 
-        Component.onCompleted: {
-            if (width > 0 && height > 0) {
-                var dpr = Screen.devicePixelRatio
-                uiState.onDisplaySizeChanged(Math.round(width * dpr), Math.round(height * dpr))
+        // Container that handles Rotation (Straightening)
+        // This item represents the "Canvas" that expands when rotated.
+        Item {
+            id: imageRotator
+            anchors.centerIn: parent
+            
+            // Size matches the AABB of the rotated image
+            // W' = W*|cos| + H*|sin|
+            // Geometry is now updated atomically via updateRotatorGeometry()
+            property real implicitWidth: 0
+            property real implicitHeight: 0
+            property bool isUpdatingGeometry: false
+            
+            // Fix A: Atomic Zoom Scale
+            property real zoomScale: 1.0
+            
+            // Fix C: Persist requested absolute zoom across source changes
+            property real targetAbsoluteZoom: -1.0
+            
+            onZoomScaleChanged: {
+                mainImage.updateZoomState()
+                if (cropOverlay.visible) cropOverlay.updateCropRect()
             }
-        }
 
-        onWidthChanged: {
-            if (width > 0 && height > 0) {
-                resizeDebounceTimer.restart()
+            // Fix B: Stable Logical Size
+            property real baseW: 0
+            property real baseH: 0
+
+            function updateRotatorGeometry() {
+               if (!mainImage || mainImage.sourceSize.width <= 0) return
+               
+               isUpdatingGeometry = true
+               
+               var rad = mainMouseArea.cropRotation * (Math.PI / 180.0)
+               
+               // Use base size if available (stable during zoom), otherwise sourceSize
+               var w = (baseW > 0) ? baseW : mainImage.sourceSize.width
+               var h = (baseH > 0) ? baseH : mainImage.sourceSize.height
+               
+               var newW = Math.abs(w * Math.cos(rad)) + Math.abs(h * Math.sin(rad))
+               var newH = Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad))
+               
+               width = newW
+               height = newH
+               
+               // Atomically update mainImage size to prevent aspect ratio distortion
+               mainImage.width = w
+               mainImage.height = h
+               
+               isUpdatingGeometry = false
+               recomputeFitScale()
             }
-        }
 
-        onHeightChanged: {
-            if (width > 0 && height > 0) {
-                resizeDebounceTimer.restart()
+            Connections {
+                target: mainMouseArea
+                function onCropRotationChanged() { imageRotator.updateRotatorGeometry() }
             }
-        }
+            // Trigger initial update (moved to end)
 
-        function updateZoomState() {
-            if (scaleTransform.xScale > 1.1 && !uiState.isZoomed) {
-                uiState.setZoomed(true);
-            } else if (scaleTransform.xScale <= 1.0 && uiState.isZoomed) {
-                uiState.setZoomed(false);
+            // NEW: fit-to-window scale (minimum zoom)
+            property real fitScale: 1.0
+
+            function recomputeFitScale(force) {
+                if (force === undefined) force = false;
+
+                if (width <= 0 || height <= 0 || imageViewport.width <= 0 || imageViewport.height <= 0)
+                    return;
+                
+                // Prevent jitter: Don't recompute fit scale while dragging (resize, move, or rotate)
+                // Unless forced (e.g. on release)
+                if (!force && mainMouseArea.isCropDragging) return;
+
+                // Capture current relative zoom to preserve it during resize/reload
+                var oldFit = fitScale
+                var currentScale = imageRotator.zoomScale
+                var ratio = 1.0
+                if (oldFit > 0) {
+                     ratio = currentScale / oldFit
+                }
+
+                // fit rotated canvas into viewport
+                var s = Math.min(imageViewport.width / width, imageViewport.height / height);
+                // Ensure fitScale is finite and positive
+                // Allow upscaling to fit window (necessary for HiDPI logical sizing)
+                if (!isFinite(s) || s <= 0) s = 1.0;
+                // else if (s > 1.0) s = 1.0; // REMOVED: Cap prevented fitting small/logical images
+
+                fitScale = s;
+
+                // Restore zoom level
+                if (targetAbsoluteZoom > 0) {
+                     // Check if we have a pending absolute zoom request (e.g. from Ctrl+1)
+                     // If so, use it directly (1.0 = 1:1 pixels) and consume the flag.
+                     imageRotator.zoomScale = targetAbsoluteZoom;
+                     targetAbsoluteZoom = -1.0;
+                } else {
+                     // Otherwise, preserve relative visual size (fit ratio)
+                     imageRotator.zoomScale = fitScale * ratio;
+                }
+                // Preserve Pan (don't reset to 0) as pan is in screen pixels (mostly)
+            }
+
+            onWidthChanged: if (!isUpdatingGeometry) recomputeFitScale()
+            onHeightChanged: if (!isUpdatingGeometry) recomputeFitScale()
+            Component.onCompleted: {
+                updateRotatorGeometry()
+                recomputeFitScale()
             }
             
-            // Update histogram with zoom/pan info if histogram is visible
-            if (uiState && uiState.isHistogramVisible && controller) {
-                var zoom = scaleTransform.xScale
-                var panX = panTransform.x
-                var panY = panTransform.y
-                // Calculate image scale (painted size vs actual size)
-                var imageScale = mainImage.paintedWidth > 0 ? (mainImage.paintedWidth / mainImage.sourceSize.width) : 1.0
-                controller.update_histogram(zoom, panX, panY, imageScale)
+            Connections {
+                target: imageViewport
+                function onWidthChanged() { imageRotator.recomputeFitScale() }
+                function onHeightChanged() { imageRotator.recomputeFitScale() }
             }
-        }
-        
-        function updateHistogramWithZoom() {
-            if (uiState && uiState.isHistogramVisible && controller) {
-                var zoom = scaleTransform.xScale
-                var panX = panTransform.x
-                var panY = panTransform.y
-                var imageScale = mainImage.paintedWidth > 0 ? (mainImage.paintedWidth / mainImage.sourceSize.width) : 1.0
-                controller.update_histogram(zoom, panX, panY, imageScale)
-            }
-        }
 
-        property alias scaleTransform: scaleTransform
-        property alias panTransform: panTransform
+            transform: [
+                Scale {
+                    id: scaleTransform
+                    origin.x: imageRotator.width / 2
+                    origin.y: imageRotator.height / 2
+                    xScale: imageRotator.zoomScale
+                    yScale: imageRotator.zoomScale
+                },
+                Translate {
+                    id: panTransform
+                    onXChanged: {
+                        mainImage.updateHistogramWithZoom()
+                        if (cropOverlay.visible) cropOverlay.updateCropRect()
+                    }
+                    onYChanged: {
+                        mainImage.updateHistogramWithZoom()
+                        if (cropOverlay.visible) cropOverlay.updateCropRect()
+                    }
+                }
+            ]
+
+            // The main image display
+            Image {
+                id: mainImage
+                anchors.centerIn: parent
+                
+                // Image size is now updated atomically in updateRotatorGeometry to prevent distortion
+                // width: sourceSize.width
+                // height: sourceSize.height
+                
+                rotation: mainMouseArea.cropRotation
+                
+                // Crop overlay - moved back to mainImage for Visual Orbit (Rotate Together)
+                // Coordinates are now Source Space, and backend handles conversion.
+                Item {
+                    id: cropOverlay
+                    property var cropBox: uiState ? uiState.currentCropBox : [0, 0, 1000, 1000]
+                    property bool hasActiveCrop: cropBox && cropBox.length === 4 && !(cropBox[0]===0 && cropBox[1]===0 && cropBox[2]===1000 && cropBox[3]===1000)
+                    
+                    visible: uiState && uiState.isCropping && (hasActiveCrop || mainMouseArea.isRotating)
+                    anchors.fill: parent // Fills mainImage (Source Space)
+                    z: 100
+                    
+                    onCropBoxChanged: { if (parent.source) updateCropRect() }
+                    Component.onCompleted: { if (parent.source) updateCropRect() }
+                    
+                    Connections {
+                        target: uiState
+                        function onCurrentCropBoxChanged() { if (cropOverlay.visible && mainImage.source) cropOverlay.updateCropRect() }
+                    }
+                    
+                    Connections {
+                         target: mainImage
+                         function onWidthChanged() { cropOverlay.updateCropRect() }
+                         function onHeightChanged() { cropOverlay.updateCropRect() }
+                    }
+                    
+                    function updateCropRect() {
+                        if (!uiState || !uiState.currentCropBox || uiState.currentCropBox.length !== 4) return
+                        var box = uiState.currentCropBox
+                        
+                        // Local coords in mainImage (Source Space)
+                        var localLeft = (box[0] / 1000) * parent.width
+                        var localTop = (box[1] / 1000) * parent.height
+                        var localRight = (box[2] / 1000) * parent.width
+                        var localBottom = (box[3] / 1000) * parent.height
+                        
+                        cropRect.x = localLeft
+                        cropRect.y = localTop
+                        cropRect.width = localRight - localLeft
+                        cropRect.height = localBottom - localTop
+                    }
+                    
+                    // Dimmer Rectangles
+                    Rectangle { x: 0; y: 0; width: parent.width; height: cropRect.y; color: "black"; opacity: 0.3 }
+                    Rectangle { x: 0; y: cropRect.y + cropRect.height; width: parent.width; height: parent.height - (cropRect.y + cropRect.height); color: "black"; opacity: 0.3 }
+                    Rectangle { x: 0; y: cropRect.y; width: cropRect.x; height: cropRect.height; color: "black"; opacity: 0.3 }
+                    Rectangle { x: cropRect.x + cropRect.width; y: cropRect.y; width: parent.width - (cropRect.x + cropRect.width); height: cropRect.height; color: "black"; opacity: 0.3 }
+                    
+                    Rectangle {
+                        id: cropRect
+                        color: "transparent"
+                        border.color: "white"
+                        border.width: 3 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
+                        
+                        // Rotation Handle Line
+                        Rectangle {
+                            id: handleLine
+                            visible: mainMouseArea.isRotating
+                            width: 2 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
+                            height: 25 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
+                            color: "white"
+                            anchors.top: parent.bottom
+                            anchors.horizontalCenter: parent.horizontalCenter
+                        }
+                        
+                        // Rotation Knob
+                        Rectangle {
+                            id: rotateKnob
+                            visible: mainMouseArea.isRotating
+                            width: 12 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
+                            height: 12 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
+                            radius: width / 2
+                            color: "white"
+                            border.color: "black"
+                            border.width: 1 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
+                            anchors.verticalCenter: handleLine.bottom
+                            anchors.horizontalCenter: handleLine.horizontalCenter
+                        }
+                    }
+                }
+                
+                source: uiState && uiState.imageCount > 0 ? uiState.currentImageSource : ""
+                
+                function _currentDpr() {
+                    // Per-window DPR is the safest (multi-monitor setups)
+                    if (mainImage.window && mainImage.window.devicePixelRatio)
+                        return mainImage.window.devicePixelRatio
+                    return Screen.devicePixelRatio
+                }
+
+                function handleSourceSizeChange() {
+                    if (mainImage.sourceSize.width <= 0 || mainImage.sourceSize.height <= 0) return
+
+                    const dpr = _currentDpr()
+
+                    // Treat baseW/baseH as *device-independent pixels* that correspond to 1:1 physical pixels at zoomScale=1
+                    imageRotator.baseW = mainImage.sourceSize.width / dpr
+                    imageRotator.baseH = mainImage.sourceSize.height / dpr
+
+                    // Rebuild rotator + mainImage geometry based on the NEW resolution
+                    imageRotator.updateRotatorGeometry()
+
+                    // Force fit recompute so fitScale / zoom logic stabilizes immediately
+                    imageRotator.recomputeFitScale(true)
+
+                    if (uiState && uiState.debugMode) {
+                        console.log("sourceSize changed:", mainImage.sourceSize.width, mainImage.sourceSize.height,
+                                    "dpr:", dpr,
+                                    "base:", imageRotator.baseW, imageRotator.baseH,
+                                    "zoomScale:", imageRotator.zoomScale)
+                    }
+                }
+
+                onSourceSizeChanged: { handleSourceSizeChange() }
+
+                onStatusChanged: {
+                   if (status === Image.Ready) {
+                       // Some backends update sourceSize right as status flips
+                       mainImage.handleSourceSizeChange()
+                       imageRotator.updateRotatorGeometry()
+                   }
+                }
+
+                // Force reset when source changes (existing logic)
+                onSourceChanged: {
+                    // Reset base size for new image so we pick up the new sourceSize
+                    imageRotator.baseW = 0
+                    imageRotator.baseH = 0
+                    
+                    // Smart Zoom Reset:
+                    // If we intended to keep high-res (isZoomed is true), preserve capabilities.
+                    // If not (isZoomed is false), reset to "fit" state for speed and consistency.
+                    if (uiState && !uiState.isZoomed) {
+                        mainMouseArea.cropRotation = 0
+                        mainMouseArea.isRotating = false
+                        mainMouseArea.cropDragMode = "none"
+                        
+                        imageRotator.zoomScale = imageRotator.fitScale
+                        panTransform.x = 0
+                        panTransform.y = 0
+                    }
+                }
+                fillMode: Image.PreserveAspectFit
+                cache: false // We do our own caching in Python
+                smooth: false // Crisp rendering for technical accuracy
+                mipmap: false // Crisp rendering
+                
+                property bool isZooming: false
         
-        transform: [
-            Scale {
-                id: scaleTransform
-                origin.x: mainImage.width / 2
-                origin.y: mainImage.height / 2
-                onXScaleChanged: {
-                    mainImage.updateZoomState()
-                    mainImage.updateHistogramWithZoom()
-                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+                // IMPORTANT: tell Python the *viewport* size, not the sourceSize size
+                function reportDisplaySize() {
+                    if (imageViewport.width > 0 && imageViewport.height > 0) {
+                        var dpr = Screen.devicePixelRatio
+                        uiState.onDisplaySizeChanged(
+                            Math.round(imageViewport.width * dpr),
+                            Math.round(imageViewport.height * dpr)
+                        )
+                    }
                 }
-                onYScaleChanged: {
-                    mainImage.updateZoomState()
-                    mainImage.updateHistogramWithZoom()
-                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+
+                Component.onCompleted: reportDisplaySize()
+                Connections {
+                    target: imageViewport
+                    function onWidthChanged() { mainImage.reportDisplaySize() }
+                    function onHeightChanged() { mainImage.reportDisplaySize() }
                 }
-            },
-            Translate {
-                id: panTransform
-                onXChanged: {
-                    mainImage.updateHistogramWithZoom()
-                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+        
+                // Removed direct onWidth/HeightChanged handlers for resizeDebounceTimer 
+                // because we now drive size reporting via viewport changes.
+
+                Timer {
+                    id: lowResDebounceTimer
+                    interval: 200 // 200ms debounce to prevent thrashing
+                    repeat: false
+                    onTriggered: {
+                        if (uiState && uiState.isZoomed) {
+                            uiState.setZoomed(false)
+                        }
+                    }
                 }
-                onYChanged: {
-                    mainImage.updateHistogramWithZoom()
-                    if (cropOverlay.visible) cropOverlay.updateCropRect()
+
+                function updateZoomState() {
+                    if (!uiState) return;
+                    
+                    // Thresholds for hysteresis
+                    var highResThreshold = imageRotator.fitScale * 1.1
+                    var lowResThreshold = imageRotator.fitScale * 1.02
+                    
+                    // Enable High-Res if zoomed in significantly
+                    if (imageRotator.zoomScale > highResThreshold) {
+                         lowResDebounceTimer.stop()
+                         if (!uiState.isZoomed) {
+                             uiState.setZoomed(true);
+                         }
+                    } 
+                    // Disable High-Res (return to low-res) if zoomed out to near-fit
+                    // formatting note: added hysteresis check AND debounce
+                    else if (imageRotator.zoomScale <= lowResThreshold) {
+                        if (uiState.isZoomed) {
+                            // Only drop to low-res after delay to handle wheel overshoot/jitter
+                            if (!lowResDebounceTimer.running) lowResDebounceTimer.start()
+                        }
+                    } else {
+                        // In hysteresis band: cancel any pending low-res switch
+                        lowResDebounceTimer.stop()
+                    }
+                    
+                    updateHistogramWithZoom()
                 }
+                
+                function updateHistogramWithZoom() {
+                    if (uiState && uiState.isHistogramVisible && controller) {
+                        var zoom = imageRotator.zoomScale
+                        var panX = panTransform.x
+                        var panY = panTransform.y
+                        var imageScale = imageRotator.zoomScale
+                        controller.update_histogram(zoom, panX, panY, imageScale)
+                    }
+                }
+
+
             }
-        ]
+
+
+        }
     }
 
     // Zoom and Pan logic would go here
     // For example, using PinchArea or MouseArea
-    Timer {
-        id: resizeDebounceTimer
-        interval: 100 // milliseconds
-        running: false
-        onTriggered: {
-            if (mainImage.width > 0 && mainImage.height > 0) {
-                var dpr = Screen.devicePixelRatio
-                uiState.onDisplaySizeChanged(Math.round(mainImage.width * dpr), Math.round(mainImage.height * dpr))
-            }
-            running = false
-        }
-    }
+
 
         MouseArea {
             id: mainMouseArea
@@ -159,8 +538,43 @@ Item {
         property bool isRotating: false
         property real cropStartAngle: 0
         property real cropStartRotation: 0
-        onCropRotationChanged: uiState.cropRotation = cropRotation
+        property real cropStartAspect: -1
         
+        // Reset rotation when image changes or updates (e.g. after crop save) to avoid persistence
+        Connections {
+            target: uiState
+            function onCurrentIndexChanged() {
+                mainMouseArea.cropRotation = 0
+            }
+        }
+
+
+        onIsRotatingChanged: {
+            if (uiState) {
+                if (isRotating) {
+                    uiState.statusMessage = "Press ESC to exit rotate mode"
+                } else {
+                    if (uiState.statusMessage === "Press ESC to exit rotate mode") {
+                        uiState.statusMessage = ""
+                    }
+                }
+            }
+        }
+        
+        property real pendingRotation: 0
+        property real pendingAspect: -1
+        
+        Timer {
+            id: rotationThrottleTimer
+            interval: 32 // ~30 fps
+            repeat: false
+            onTriggered: {
+                if (controller && uiState && uiState.isCropping) {
+                    controller.set_straighten_angle(mainMouseArea.pendingRotation, mainMouseArea.pendingAspect)
+                }
+            }
+        }
+
         onPressed: function(mouse) {
             lastX = mouse.x
             lastY = mouse.y
@@ -198,50 +612,83 @@ Item {
             }
             
             if (uiState && uiState.isCropping) {
-                // Check if clicking on existing crop box
-                var cropRect = getCropRect()
+                // Check if clicking on existing crop box - Using Image Space Hit Testing
                 var box = uiState.currentCropBox
                 var isFullImage = box && box.length === 4 && box[0] === 0 && box[1] === 0 && box[2] === 1000 && box[3] === 1000
                 
-                var edgeThreshold = 10 * Screen.devicePixelRatio
-                var inside = mouse.x >= cropRect.x && mouse.x <= cropRect.x + cropRect.width &&
-                             mouse.y >= cropRect.y && mouse.y <= cropRect.y + cropRect.height
+                var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+                var mx = coords.x * 1000
+                var my = coords.y * 1000
                 
-                // Hit test for rotation handle
-                var cropCenterX = cropRect.x + cropRect.width / 2
-                var cropCenterY = cropRect.y + cropRect.height / 2
-                var theta = mainMouseArea.cropRotation * Math.PI / 180
-                // Handle is at bottom center + 25px
-                var handleOffset = cropRect.height / 2 + 25
-                // Correct rotation handle placement (CW-positive UI)
-                var handleX = cropCenterX + handleOffset * Math.sin(theta)
-                var handleY = cropCenterY - handleOffset * Math.cos(theta)
+                // Calculate threshold in normalized units (approx 10 screen pixels)
+                var threshX = (10 / (scaleTransform.xScale * mainImage.width)) * 1000
+                var threshY = (10 / (scaleTransform.yScale * mainImage.height)) * 1000
                 
-                var dist = Math.sqrt(Math.pow(mouse.x - handleX, 2) + Math.pow(mouse.y - handleY, 2))
+                // Clamp threshold: min 5 normalized units (prevent too small), max 40 (prevent too large)
+                // This ensures handles remain usable at all zoom levels
+                var edgeThreshold = Math.max(5, Math.min(40, Math.max(threshX, threshY)))
 
-                if (dist < 20) {
-                    cropDragMode = "rotate"
-                    cropStartAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
-                    cropStartRotation = cropRotation
+                var inside = mx >= box[0] && mx <= box[2] && my >= box[1] && my <= box[3]
+                
+                // --- Hit test for rotation handle (robust: uses actual knob transform) ---
+                if (mainMouseArea.isRotating && cropOverlay.visible && rotateKnob.visible) {
+                    // knob center in mainMouseArea coords (includes cropRect rotation)
+                    // Note: rotateKnob is now inside mainImage -> cropOverlay -> cropRect
+                    // But mapFromItem should still work if we target the object properly.
+                    // We need to resolve `rotateKnob` which is inside cropOverlay.
+                    // If cropOverlay moves, we need to ensure this binding works.
+                    // IMPORTANT: cropOverlay is not moved yet in this call.
+                    // Current logic relies on existing structure. I will defer logic update if structure changes.
+                    // But hit testing via mapFromItem(rotateKnob) is robust to hierarchy changes as long as rotateKnob exists.
+                    
+                    var k = mainMouseArea.mapFromItem(rotateKnob, rotateKnob.width/2, rotateKnob.height/2)
+                    var dxk = mouse.x - k.x
+                    var dyk = mouse.y - k.y
+                    var distk = Math.sqrt(dxk*dxk + dyk*dyk)
+
+                    if (distk < 22 * Screen.devicePixelRatio) { // a little forgiving
+                        cropDragMode = "rotate"
+
+                        // crop center in mainMouseArea coords -> Changed to IMAGE center to avoid feedback loop
+                        var c = mainMouseArea.mapFromItem(mainImage, mainImage.width/2, mainImage.height/2)
+                        cropStartAngle = Math.atan2(mouse.y - c.y, mouse.x - c.x) * 180 / Math.PI
+                        cropStartRotation = cropRotation
+                        
+                        // Calculate start aspect ratio (in pixels)
+                        if (mainImage.width > 0) {
+                            var box = uiState.currentCropBox
+                            if (box && box.length === 4) {
+                                var boxW = (box[2] - box[0]) / 1000 * mainImage.width
+                                var boxH = (box[3] - box[1]) / 1000 * mainImage.height
+                                cropStartAspect = boxW / boxH
+                            }
+                        }
+
+
+                        // Seed cropBoxStart variables
+                        if (box && box.length === 4) {
+                            cropBoxStartLeft = box[0]
+                            cropBoxStartTop = box[1]
+                            cropBoxStartRight = box[2]
+                            cropBoxStartBottom = box[3]
+                        }
+
+                        isCropDragging = true
+                        return
+                    }
                 }
-                else if (mainMouseArea.isRotating) {
-                    cropDragMode = "rotate"
-                    var cropCenterX = cropRect.x + cropRect.width / 2
-                    var cropCenterY = cropRect.y + cropRect.height / 2
-                    cropStartAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
-                    cropStartRotation = cropRotation
-                }
+                
                 // If crop box is full image, always start a new crop
                 else if (isFullImage) {
                     cropDragMode = "new"
                     cropStartX = mouse.x
                     cropStartY = mouse.y
-                } else if (inside && cropRect.width > 0 && cropRect.height > 0) {
-                    // Determine which edge/corner is being dragged
-                    var nearLeft = Math.abs(mouse.x - cropRect.x) < edgeThreshold
-                    var nearRight = Math.abs(mouse.x - (cropRect.x + cropRect.width)) < edgeThreshold
-                    var nearTop = Math.abs(mouse.y - cropRect.y) < edgeThreshold
-                    var nearBottom = Math.abs(mouse.y - (cropRect.y + cropRect.height)) < edgeThreshold
+                } else if (inside) {
+                    // Determine which edge/corner is being dragged (Image Space)
+                    var nearLeft = Math.abs(mx - box[0]) < edgeThreshold
+                    var nearRight = Math.abs(mx - box[2]) < edgeThreshold
+                    var nearTop = Math.abs(my - box[1]) < edgeThreshold
+                    var nearBottom = Math.abs(my - box[3]) < edgeThreshold
                     
                     if (nearLeft && nearTop) cropDragMode = "topleft"
                     else if (nearRight && nearTop) cropDragMode = "topright"
@@ -254,8 +701,6 @@ Item {
                     else cropDragMode = "move"
                     
                     // Store initial crop box
-                    var box = uiState.currentCropBox
-                    if (!box || box.length !== 4) return
                     cropBoxStartLeft = box[0]
                     cropBoxStartTop = box[1]
                     cropBoxStartRight = box[2]
@@ -266,67 +711,20 @@ Item {
                     cropStartX = mouse.x
                     cropStartY = mouse.y
                     
-                    // Initialize anchors for aspect ratio constraint using normalized coordinates
-                    var startCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
-                    // Clamp to [0, 1] and convert to [0, 1000]
-                    var startNormX = Math.max(0, Math.min(1, startCoords.x)) * 1000
-                    var startNormY = Math.max(0, Math.min(1, startCoords.y)) * 1000
-                    
-                    cropBoxStartLeft = startNormX
-                    cropBoxStartRight = startNormX
-                    cropBoxStartTop = startNormY
-                    cropBoxStartBottom = startNormY
+                    // Initialize anchors
+                    cropBoxStartLeft = mx
+                    cropBoxStartRight = mx
+                    cropBoxStartTop = my
+                    cropBoxStartBottom = my
                 }
                 isCropDragging = true
             }
         }        
-        function getCropRect() {
-            if (!mainImage.source || !uiState || !uiState.currentCropBox || uiState.currentCropBox.length !== 4) {
-                return {x: 0, y: 0, width: 0, height: 0}
-            }
-            var imgWidth = mainImage.paintedWidth
-            var imgHeight = mainImage.paintedHeight
-            var imgX = (mainImage.width - imgWidth) / 2
-            var imgY = (mainImage.height - imgHeight) / 2
-            var box = uiState.currentCropBox
-            
-            // Account for zoom and pan transforms when displaying crop box
-            var scale = scaleTransform.xScale
-            var panX = panTransform.x
-            var panY = panTransform.y
-            
-            // Convert normalized crop box (0-1000) to image-local coordinates
-            var localX = (box[0] / 1000) * imgWidth
-            var localY = (box[1] / 1000) * imgHeight
-            var localWidth = (box[2] - box[0]) / 1000 * imgWidth
-            var localHeight = (box[3] - box[1]) / 1000 * imgHeight
-            
-            // Apply zoom and pan transforms to get screen coordinates
-            return {
-                x: imgX + (localX * scale) + panX,
-                y: imgY + (localY * scale) + panY,
-                width: localWidth * scale,
-                height: localHeight * scale
-            }
-        }
+        // Legacy getCropRect removed - using Image Space hit testing instead.
+        // mapToImageCoordinates now maps directly to mainImage
         function mapToImageCoordinates(screenPoint) {
-            var imgWidth = mainImage.paintedWidth
-            var imgHeight = mainImage.paintedHeight
-            var imgX = (mainImage.width - imgWidth) / 2
-            var imgY = (mainImage.height - imgHeight) / 2
-            
-            var scale = scaleTransform.xScale
-            var panX = panTransform.x
-            var panY = panTransform.y
-
-            // Inverse of getCropRect transform:
-            // Screen = imgX + (Local * Scale) + Pan
-            // Local = (Screen - Pan - imgX) / Scale
-            
-            var localX = (screenPoint.x - panX - imgX) / scale
-            var localY = (screenPoint.y - panY - imgY) / scale
-
-            return {x: localX / imgWidth, y: localY / imgHeight}
+            var p = mainMouseArea.mapToItem(mainImage, screenPoint.x, screenPoint.y)
+            return {x: p.x / mainImage.width, y: p.y / mainImage.height}
         }
         onPositionChanged: function(mouse) {
             if (uiState && uiState.isCropping && isCropDragging) {
@@ -334,11 +732,28 @@ Item {
                     // Update crop rectangle while dragging
                     updateCropBox(cropStartX, cropStartY, mouse.x, mouse.y, true)
                 } else if (cropDragMode === "rotate") {
-                    var cropCenterX = getCropRect().x + getCropRect().width / 2
-                    var cropCenterY = getCropRect().y + getCropRect().height / 2
-                    var currentAngle = Math.atan2(mouse.y - cropCenterY, mouse.x - cropCenterX) * 180 / Math.PI
-                    cropRotation = cropStartRotation - (currentAngle - cropStartAngle)
-                } else if (cropDragMode !== "none") {
+                    var c = mainMouseArea.mapFromItem(mainImage, mainImage.width/2, mainImage.height/2)
+                    var currentAngle = Math.atan2(mouse.y - c.y, mouse.x - c.x) * 180 / Math.PI
+                    var delta = currentAngle - cropStartAngle
+                    // Handle wrap-around
+                    if (delta > 180) delta -= 360
+                    if (delta < -180) delta += 360
+                    
+                    var newRotation = cropStartRotation + delta
+
+                    // Update rotation state
+                    cropRotation = newRotation
+                    
+                    // Update rotation in backend live (throttled)
+                    if (controller) {
+                        pendingRotation = cropRotation
+                        pendingAspect = cropStartAspect
+                        
+                        if (!rotationThrottleTimer.running) {
+                            rotationThrottleTimer.start()
+                        }
+                    }
+
                     
                     var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
 
@@ -398,7 +813,7 @@ Item {
                         globalPos.x > loupeView.width || globalPos.y > loupeView.height) {
                         // Mouse is outside window - initiate drag-and-drop
                         isDraggingOutside = true
-                        controller.start_drag_current_image()
+                        if (controller) controller.start_drag_current_image()
                         return
                     }
                 }
@@ -416,8 +831,26 @@ Item {
         onReleased: function(mouse) {
             isDraggingOutside = false
             if (uiState && uiState.isCropping && isCropDragging) {
+                // Fix: Prevent accidental tiny crops with Right Click
+                if (mouse.button === Qt.RightButton && cropDragMode === "new") {
+                    var dx = Math.abs(mouse.x - cropStartX)
+                    var dy = Math.abs(mouse.y - cropStartY)
+                    var maxDim = Math.max(dx, dy)
+                    var minDim = Math.min(dx, dy)
+                    
+                    // "at least 50 pixels in both dimensions"
+                    if (maxDim < 50 || minDim < 50) {
+                        if (controller) controller.cancel_crop_mode()
+                        isCropDragging = false
+                        cropDragMode = "none"
+                        return
+                    }
+                }
+
                 isCropDragging = false
                 cropDragMode = "none"
+                // Settle zoom/pan after rotation ends (Force recompute)
+                if (mainMouseArea.isRotating) imageRotator.recomputeFitScale(true)
             }
         }
 
@@ -431,113 +864,46 @@ Item {
             var scaleFactor = isZoomingIn ? 1.1 : 1 / 1.1;
             
             // Calculate old and new scale
-            var oldScale = scaleTransform.xScale
+            var oldScale = imageRotator.zoomScale
             var newScale = oldScale * scaleFactor
-            newScale = Math.max(0.1, Math.min(20.0, newScale))
+            // Allow zooming out past "Fit" to 5%. Cap max at 20x.
+            newScale = Math.max(0.05, Math.min(20.0, newScale))
+
+            // Current state
+            var currentPanX = panTransform.x
+            var currentPanY = panTransform.y
             
-            // Get the image's painted (displayed) bounds
-            var imgWidth = mainImage.paintedWidth
-            var imgHeight = mainImage.paintedHeight
-            var centerX = mainImage.width / 2
-            var centerY = mainImage.height / 2
+            // Screen center (Viewport center)
+            var centerX = imageViewport.width / 2
+            var centerY = imageViewport.height / 2
+
+            // Fix C: Use Viewport Coordinates (account for footer offset etc)
+            var p = mainMouseArea.mapToItem(imageViewport, wheel.x, wheel.y)
+            var mouseX = p.x
+            var mouseY = p.y
             
-            if (isZoomingIn) {
-                // Zoom in: zoom towards cursor position
-                var mouseX = wheel.x
-                var mouseY = wheel.y
-                var imgX = (mainImage.width - imgWidth) / 2
-                var imgY = (mainImage.height - imgHeight) / 2
-                
-                // Calculate the point in the image that's under the cursor
-                var pointInImageX = mouseX - imgX
-                var pointInImageY = mouseY - imgY
-                
-                // Only zoom towards cursor if cursor is over the image
-                if (pointInImageX >= 0 && pointInImageX <= imgWidth && 
-                    pointInImageY >= 0 && pointInImageY <= imgHeight) {
-                    
-                    // Calculate offset from image center in screen coordinates
-                    var centerOffsetX = pointInImageX - imgWidth / 2
-                    var centerOffsetY = pointInImageY - imgHeight / 2
-                    
-                    // The current screen position of a point is: (imgPoint * oldScale) + oldPan + center
-                    // We want to find what's currently under the cursor and keep it there
-                    // Instead of dividing by oldScale (which loses precision), work with scaled values
-                    
-                    // Calculate what the scaled image point currently is (before zoom)
-                    // This is: (centerOffset - pan) which represents (imgPoint * oldScale)
-                    var scaledImagePointX = centerOffsetX - panTransform.x
-                    var scaledImagePointY = centerOffsetY - panTransform.y
-                    
-                    // Adjust the scale origin to the cursor position
-                    scaleTransform.origin.x = mouseX
-                    scaleTransform.origin.y = mouseY
-                    
-                    // Apply the new scale first
-                    scaleTransform.xScale = newScale
-                    scaleTransform.yScale = newScale
-                    
-                    // After zoom, the scaled image point becomes: scaledImagePoint * (newScale / oldScale)
-                    // We want it to stay at the same screen position, so:
-                    // newPan = centerOffset - (scaledImagePoint * newScale / oldScale)
-                    // Use scaleRatio to avoid precision loss from repeated division
-                    var scaleRatio = newScale / oldScale
-                    var newPanX = centerOffsetX - (scaledImagePointX * scaleRatio)
-                    var newPanY = centerOffsetY - (scaledImagePointY * scaleRatio)
-                    
-                    // Apply the adjusted pan
-                    panTransform.x = newPanX
-                    panTransform.y = newPanY
-                } else {
-                    // If cursor is outside image, zoom from center
-                    scaleTransform.origin.x = centerX
-                    scaleTransform.origin.y = centerY
-                    scaleTransform.xScale = newScale
-                    scaleTransform.yScale = newScale
-                }
-            } else {
-                // Zoom out: always zoom towards center of screen, but keep current origin logic
-                // The issue is switching origin abruptly causes jumps.
-                // If we are zoomed in, we should zoom out relative to the current view center or cursor.
-                
-                // If we simply zoom out without changing origin, it zooms out from wherever the origin currently is.
-                // If the origin was set to a specific point during zoom in, keeping it there is fine.
-                // Resetting origin to center (centerX, centerY) causes the jump because the image shifts to align its center with the new origin.
-                
-                // Let's keep the current origin unless we are fully zoomed out.
-                // Or better: zoom out relative to the cursor just like zooming in, which feels most natural.
-                
-                var mouseX = wheel.x
-                var mouseY = wheel.y
-                
-                // Use cursor as origin for zoom out too
-                scaleTransform.origin.x = mouseX
-                scaleTransform.origin.y = mouseY
-                
-                // We need similar pan compensation to keep the point under cursor stable
-                var imgWidth = mainImage.paintedWidth
-                var imgHeight = mainImage.paintedHeight
-                var imgX = (mainImage.width - imgWidth) / 2
-                var imgY = (mainImage.height - imgHeight) / 2
-                var pointInImageX = mouseX - imgX
-                var pointInImageY = mouseY - imgY
-                
-                var centerOffsetX = pointInImageX - imgWidth / 2
-                var centerOffsetY = pointInImageY - imgHeight / 2
-                var scaledImagePointX = centerOffsetX - panTransform.x
-                var scaledImagePointY = centerOffsetY - panTransform.y
-                
-                scaleTransform.xScale = newScale
-                scaleTransform.yScale = newScale
-                
-                var scaleRatio = newScale / oldScale
-                var newPanX = centerOffsetX - (scaledImagePointX * scaleRatio)
-                var newPanY = centerOffsetY - (scaledImagePointY * scaleRatio)
-                
-                panTransform.x = newPanX
-                panTransform.y = newPanY
-            }
+            var mouseOffsetFromCenterX = mouseX - centerX
+            var mouseOffsetFromCenterY = mouseY - centerY
+
+            // Calculate the "image point" currently under the cursor (relative to image center, unscaled)
+            // ScreenPos = Center + Pan + (ImagePoint * Scale)
+            // ImagePoint = (ScreenPos - Center - Pan) / Scale
+            // ImagePoint = (MouseOffsetFromCenter - Pan) / Scale
+            var imagePointX = (mouseOffsetFromCenterX - currentPanX) / oldScale
+            var imagePointY = (mouseOffsetFromCenterY - currentPanY) / oldScale
+
+            // We want to keep this ImagePoint under the cursor after scaling:
+            // MouseOffsetFromCenter = Pan_New + (ImagePoint * Scale_New)
+            // Pan_New = MouseOffsetFromCenter - (ImagePoint * Scale_New)
             
+            var newPanX = mouseOffsetFromCenterX - (imagePointX * newScale)
+            var newPanY = mouseOffsetFromCenterY - (imagePointY * newScale)
+
+            // Apply updates
+            imageRotator.zoomScale = newScale
+            panTransform.x = newPanX
+            panTransform.y = newPanY
+
             // Re-enable smooth rendering after a short delay
             zoomSmoothTimer.restart()
         }
@@ -629,7 +995,7 @@ Item {
 
             var ratioName = uiState.aspectRatioNames[uiState.currentAspectRatioIndex];
             var ratioPair = getAspectRatio(ratioName);
-            if (!ratioPair || !mainImage.sourceSize || mainImage.sourceSize.width === 0 || mainImage.sourceSize.height === 0) {
+            if (!ratioPair || !mainImage || !imageRotator.width || !imageRotator.height) {
                 return [left, top, right, bottom];
             }
 
@@ -641,7 +1007,8 @@ Item {
             // width_norm / height_norm = targetAspect * (imgH / imgW)
             
             var pixelAspect = ratioPair[0] / ratioPair[1];
-            var imageAspect = mainImage.sourceSize.width / mainImage.sourceSize.height;
+            // Use mainImage (fixed canvas) for aspect ratio calculation
+            var imageAspect = mainImage.width / mainImage.height;
             var targetAspect = pixelAspect * (1.0 / imageAspect); // Normalized aspect ratio
 
             var currentWidth = right - left;
@@ -863,146 +1230,7 @@ Item {
         }
     }
     
-    // Crop rectangle overlay
-    Item {
-        id: cropOverlay
-        property var cropBox: uiState ? uiState.currentCropBox : [0, 0, 1000, 1000]
-        property bool hasActiveCrop: cropBox
-                                     && cropBox.length === 4
-                                     && !(cropBox[0] === 0
-                                          && cropBox[1] === 0
-                                          && cropBox[2] === 1000
-                                          && cropBox[3] === 1000)
-        visible: uiState && uiState.isCropping && hasActiveCrop
-        anchors.fill: parent
-        z: 100
-        
-        onCropBoxChanged: {
-            if (!mainImage.source) return
-            updateCropRect()
-        }
-        
-        Component.onCompleted: {
-            if (mainImage.source) updateCropRect()
-        }
-        
-        Connections {
-            target: mainImage
-            function onPaintedWidthChanged() { if (cropOverlay.visible) cropOverlay.updateCropRect() }
-            function onPaintedHeightChanged() { if (cropOverlay.visible) cropOverlay.updateCropRect() }
-        }
-        
-        Connections {
-            target: uiState
-            function onCurrentCropBoxChanged() {
-                cropOverlay.cropBox = uiState.currentCropBox
-                if (cropOverlay.visible && mainImage.source) {
-                    cropOverlay.updateCropRect()
-                }
-            }
-        }
-        
-        function updateCropRect() {
-            if (!mainImage.source) return
-            
-            var imgWidth = mainImage.paintedWidth
-            var imgHeight = mainImage.paintedHeight
-            var imgX = (mainImage.width - imgWidth) / 2
-            var imgY = (mainImage.height - imgHeight) / 2
-            
-            // Account for zoom and pan transforms when displaying crop box
-            var scale = mainImage.scaleTransform ? mainImage.scaleTransform.xScale : 1.0
-            var panX = mainImage.panTransform ? mainImage.panTransform.x : 0
-            var panY = mainImage.panTransform ? mainImage.panTransform.y : 0
-            
-            // Convert normalized crop box (0-1000) to image-local coordinates
-            var localLeft = (cropBox[0] / 1000) * imgWidth
-            var localTop = (cropBox[1] / 1000) * imgHeight
-            var localRight = (cropBox[2] / 1000) * imgWidth
-            var localBottom = (cropBox[3] / 1000) * imgHeight
-            
-            // Apply zoom and pan transforms to get screen coordinates
-            var left = imgX + (localLeft * scale) + panX
-            var top = imgY + (localTop * scale) + panY
-            var right = imgX + (localRight * scale) + panX
-            var bottom = imgY + (localBottom * scale) + panY
-            
-            cropRect.x = left
-            cropRect.y = top
-            cropRect.width = right - left
-            cropRect.height = bottom - top
-        }
-        
-        // Semi-transparent overlay - draw 4 rectangles around the crop area
-        Rectangle {
-            // Top
-            x: 0
-            y: 0
-            width: parent.width
-            height: cropRect.y
-            color: "black"
-            opacity: 0.3
-        }
-        Rectangle {
-            // Bottom
-            x: 0
-            y: cropRect.y + cropRect.height
-            width: parent.width
-            height: parent.height - (cropRect.y + cropRect.height)
-            color: "black"
-            opacity: 0.3
-        }
-        Rectangle {
-            // Left
-            x: 0
-            y: cropRect.y
-            width: cropRect.x
-            height: cropRect.height
-            color: "black"
-            opacity: 0.3
-        }
-        Rectangle {
-            // Right
-            x: cropRect.x + cropRect.width
-            y: cropRect.y
-            width: parent.width - (cropRect.x + cropRect.width)
-            height: cropRect.height
-            color: "black"
-            opacity: 0.3
-        }
-        
-        // Crop rectangle with thick white border
-        Rectangle {
-            id: cropRect
-            color: "transparent"
-            border.color: "white"
-            border.width: 3
-            rotation: mainMouseArea.cropRotation
-            transformOrigin: Item.Center
-
-            // Rotation Handle Line
-            Rectangle {
-                id: handleLine
-                width: 2
-                height: 25
-                color: "white"
-                anchors.top: parent.bottom
-                anchors.horizontalCenter: parent.horizontalCenter
-            }
-
-            // Rotation Handle Knob
-            Rectangle {
-                width: 12
-                height: 12
-                radius: 6
-                color: "white"
-                border.color: "black"
-                border.width: 1
-                anchors.verticalCenter: handleLine.bottom
-                anchors.horizontalCenter: handleLine.horizontalCenter
-            }
-        }
-    }
+    // Crop rectangle overlay (Moved to mainImage)
     
     // Aspect ratio selector window (upper left corner)
     Rectangle {
@@ -1072,33 +1300,30 @@ Item {
                 }
             }
             
-            Rectangle {
-                width: parent.width
-                height: 30
-                color: "transparent"
-                radius: 3
-                
-                Text {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 10
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "Rotate"
-                    color: aspectRatioWindow.isDark ? "white" : "black"
-                    font.pixelSize: 11
-                }
-                
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        mainMouseArea.isRotating = !mainMouseArea.isRotating
-                        if(mainMouseArea.isRotating) {
-                            mainMouseArea.cropDragMode = "rotate"
-                        } else {
+                Rectangle {
+                    width: parent.width
+                    height: 30
+                    color: mainMouseArea.isRotating ? "#555555" : "transparent"
+                    radius: 3
+                    
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Rotate"
+                        color: aspectRatioWindow.isDark ? "white" : "black"
+                        font.pixelSize: 11
+                        font.bold: mainMouseArea.isRotating
+                    }
+                    
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            mainMouseArea.isRotating = !mainMouseArea.isRotating
                             mainMouseArea.cropDragMode = "none"
                         }
                     }
                 }
-            }
         }
     }
 

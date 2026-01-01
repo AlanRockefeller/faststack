@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import math
 import struct
 import shlex
 import time
@@ -10,6 +11,9 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import date
 import os
+# Must set before importing PySide6
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime.warning=false"
+
 import concurrent.futures
 import threading
 import subprocess
@@ -72,8 +76,15 @@ log = logging.getLogger(__name__)
 # Global flag for debug mode - set by main()
 _debug_mode = False
 
+# Cache Thrashing Detection Constants
+CACHE_THRASH_WINDOW_SECS = 2.0
+CACHE_THRASH_THRESHOLD = 5
+CACHE_WARNING_COOLDOWN_SECS = 300
+
+
 class AppController(QObject):
     dataChanged = Signal() # New signal for general data changes
+    is_zoomed_changed = Signal(bool) # Signal for zoom state changes
 
     class ProgressReporter(QObject):
         progress_updated = Signal(int)
@@ -93,7 +104,11 @@ class AppController(QObject):
         self.display_width = 0
         self.display_height = 0
         self.display_generation = 0
-        self.is_zoomed = False
+        self._is_decoding = False
+        
+        # Cache Warning State
+        self._last_cache_warning_time = 0
+        self._eviction_timestamps = [] # List of eviction timestamps for rate detection
         self.display_ready = False  # Track if display size has been reported
         self.pending_prefetch_index: Optional[int] = None  # Deferred prefetch index
 
@@ -127,9 +142,11 @@ class AppController(QObject):
         self.ui_state = UIState(self)
         self.ui_state.theme = self.get_theme()
         self.ui_state.debugCache = self.debug_cache
+        self.ui_state.debugMode = _debug_mode # Set debug mode from global
         self.keybinder = Keybinder(self)
         self.ui_state.debugCache = self.debug_cache # Pass debug_cache state to UI
         self.ui_state.isDecoding = False # Initialize decoding indicator
+        self.is_zoomed = False # Track zoom state for high-res loading logic
 
         # -- Stacking State --
         self.stack_start_index: Optional[int] = None
@@ -249,13 +266,43 @@ class AppController(QObject):
         
         self.sync_ui_state() # To refresh the image
 
+    @Slot(bool)
     def set_zoomed(self, zoomed: bool):
-        if self.is_zoomed == zoomed:
-            return
-        self.is_zoomed = zoomed
+        if self.is_zoomed != zoomed:
+            if _debug_mode:
+                 log.info(f"AppController.set_zoomed: {self.is_zoomed} -> {zoomed}")
+            self.is_zoomed = zoomed
+            self.is_zoomed_changed.emit(zoomed)
         log.info("Zoom state changed to: %s", zoomed)
         self.display_generation += 1  # Invalidates old entries via cache key
         
+        # Invalidate current image to force reload with new resolution logic
+        if self.image_files and self.main_window:
+            # Force QML to reload the image by updating the URL generation
+            self.ui_refresh_generation += 1
+            self.ui_state.currentImageSourceChanged.emit()
+            self.main_window.update() # Force repaint
+            
+    # -- Zoom Shortcuts --
+    def zoom_100(self):
+        log.info("Zoom 100% requested")
+        self.ui_state.request_absolute_zoom(1.0)
+        # self.set_zoomed(True) - Handled by QML smart zoom logic
+
+    def zoom_200(self):
+        log.info("Zoom 200% requested")
+        self.ui_state.request_absolute_zoom(2.0)
+        # self.set_zoomed(True) - Handled by QML smart zoom logic
+
+    def zoom_300(self):
+        log.info("Zoom 300% requested")
+        self.ui_state.request_absolute_zoom(3.0)
+        # self.set_zoomed(True) - Handled by QML smart zoom logic
+
+    def zoom_400(self):
+        log.info("Zoom 400% requested")
+        self.ui_state.request_absolute_zoom(4.0)
+        # self.set_zoomed(True) - Handled by QML smart zoom logic
         # NOTE: We don't clear the cache here. The generation increment is enough.
         # Cache keys include display_generation, so zoomed/unzoomed images become
         # naturally unreachable and LRU will evict them. This lets us instantly
@@ -271,16 +318,15 @@ class AppController(QObject):
             return False
             
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
-            # Handle Enter key in crop mode
-            if self.ui_state.isCropping and (event.key() == Qt.Key_Enter or event.key() == Qt.Key_Return):
-                self.execute_crop()
-                return True
+            # QML handles Crop Enter/Esc keys now.
+            # We defer to QML to avoid double-triggering or focus conflicts.
+            # handled = self.keybinder.handle_key_press(event) ...
             
-            # Handle ESC key to exit crop mode
-            if self.ui_state.isCropping and event.key() == Qt.Key_Escape:
-                self.cancel_crop_mode()
-                return True
-            
+            # When cropping (or editing), let QML handle Enter/Esc and related keys.
+            # Otherwise keybinder can swallow them before QML sees them.
+            if getattr(self.ui_state, "isCropping", False) or getattr(self.ui_state, "isEditorOpen", False):
+                return False
+
             handled = self.keybinder.handle_key_press(event)
             if handled:
                 return True
@@ -361,11 +407,28 @@ class AppController(QObject):
             log.warning("get_decoded_image called with empty image_files or out of bounds index.")
             return None
 
-        # If editor is open for this image, return the live preview
-        if self.ui_state.isEditorOpen and self.image_editor.original_image and str(self.image_editor.current_filepath) == str(self.image_files[index].path):
-            preview_data = self.image_editor.get_preview_data()
-            if preview_data:
-                return preview_data
+        # Debug preview condition
+        if self.ui_state.isEditorOpen or self.ui_state.isCropping:
+            # Robust path comparison
+            editor_path = self.image_editor.current_filepath
+            file_path = self.image_files[index].path
+            
+            match = False
+            if editor_path and file_path:
+                try:
+                    match = Path(editor_path).resolve() == Path(file_path).resolve()
+                except (OSError, ValueError):
+                    match = str(editor_path) == str(file_path)
+            
+            if not match:
+                # Debug log if mismatch
+                log.debug(f"Path mismatch in preview. Editor: {editor_path}, File: {file_path}")
+            
+            # Return preview if Editor is open OR Cropping is active (for live rotation)
+            if match and self.image_editor.original_image:
+                preview_data = self.image_editor.get_preview_data()
+                if preview_data:
+                    return preview_data
 
         _, _, display_gen = self.get_display_info()
         image_path = self.image_files[index].path
@@ -1258,6 +1321,99 @@ class AppController(QObject):
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
 
+    @Slot(float)
+    @Slot(float, float)
+    def set_straighten_angle(self, angle: float, target_aspect_ratio: float = -1.0):
+        """Sets the straighten angle for the image editor and updates current view."""
+        if not (self.ui_state.isEditorOpen or self.ui_state.isCropping):
+            return
+        
+        # Optimization: Assume image is loaded by toggle_crop_mode or open_editor.
+        # Avoid disk I/O here to prevent stutter during drag.
+        if not self.image_editor.original_image:
+             return
+
+        # log.info(f"AppController.set_straighten_angle: {angle}, AR: {target_aspect_ratio}")
+        
+        # Update Aspect Ratio Compensation for Crop Box
+        # If we have a target aspect ratio, we need to adjust the normalized crop box 
+        # because the underlying canvas aspect ratio changes with rotation (expand=True).
+        if target_aspect_ratio > 0 and self.ui_state.currentCropBox:
+            left, top, right, bottom = self.ui_state.currentCropBox
+            w_norm = right - left
+            h_norm = bottom - top
+            
+            if w_norm > 0 and h_norm > 0:
+                # Calculate new canvas dimensions
+                # PIL expand=True logic:
+                im_w, im_h = self.image_editor.original_image.size
+                # math imported at top level
+                rad = math.radians(abs(angle))
+                # New dimensions
+                new_w = abs(im_w * math.cos(rad)) + abs(im_h * math.sin(rad))
+                new_h = abs(im_w * math.sin(rad)) + abs(im_h * math.cos(rad))
+                
+                if new_w > 0 and new_h > 0:
+                    canvas_aspect = new_w / new_h
+                    
+                    # We want PixelAspect = (w_norm * new_w/1000) / (h_norm * new_h/1000) = target_aspect
+                    # (w_norm / h_norm) * (new_w / new_h) = target_aspect
+                    # w_norm / h_norm = target_aspect / canvas_aspect
+                    
+                    target_norm_ratio = target_aspect_ratio / canvas_aspect
+                    
+                    # Adjust dimensions to match target_norm_ratio
+                    # Simple: Preserve Width, adjust Height.
+                    
+                    new_h_norm = w_norm / target_norm_ratio
+                    
+                    # If new height exceeds bounds (1000), constrain and adjust width instead
+                    if new_h_norm > 1000:
+                         new_h_norm = 1000
+                         w_norm = new_h_norm * target_norm_ratio
+                    # Recenter height
+                    cy = (top + bottom) / 2
+                    top = cy - new_h_norm / 2
+                    bottom = cy + new_h_norm / 2
+                    
+                    # Clamp vertical
+                    if top < 0: 
+                        bottom -= top # shift down
+                        top = 0
+                    if bottom > 1000:
+                        top -= (bottom - 1000) # shift up
+                        bottom = 1000
+                        if top < 0:
+                            top = 0 # double clamp
+                    
+                    # Recenter width (if changed)
+                    cx = (left + right) / 2
+                    left = cx - w_norm / 2
+                    right = cx + w_norm / 2
+                     
+                    # Clamp horizontal
+                    if left < 0:
+                        right -= left
+                        left = 0
+                    if right > 1000:
+                        left -= (right - 1000)
+                        right = 1000
+                        if left < 0:
+                            left = 0
+
+        log.debug(f"AppController.set_straighten_angle: {angle}")
+        # Invert angle because QML rotation is CW but PIL rotation (used in editor) handles direction logic internally 
+        # (ImageEditor._apply_edits uses negative angle for PIL).
+        # We pass the raw angle from QML (degrees CW for UI rotation) to the editor.
+        # Editor takes care of sign.
+        self.image_editor.set_edit_param("straighten_angle", angle)
+        
+        # Trigger refresh. Since we are editing, we are viewing the preview.
+        # Incrementing display generation invalidates cache, but for preview it just ensures freshness if logic depends on it.
+        # Crucially, sync_ui_state emits currentImageSourceChanged, forcing QML to reload.
+        # self.display_generation += 1 
+        # self.sync_ui_state() # DISABLE TO PREVENT FLASHING - QML handles preview live
+
     @Slot(result=int)
     def get_awb_warm_bias(self):
         return config.getint("awb", "warm_bias")
@@ -1929,11 +2085,32 @@ class AppController(QObject):
     
     def _on_cache_evict(self):
         """Callback for when the image cache evicts an item."""
-        if not self._has_warned_cache_full:
-            self._has_warned_cache_full = True
-            # Use QTimer.singleShot to ensure this runs on the main thread if called from a background thread
-            QTimer.singleShot(0, lambda: self.update_status_message("Cache full! Consider increasing cache size in settings."))
-            log.warning("Cache full, eviction started. User warned.")
+        now = time.time()
+        
+        # 1. Record eviction timestamp
+        self._eviction_timestamps.append(now)
+        
+        # 2. Prune timestamps older than window
+        # Keep list short
+        cutoff = now - CACHE_THRASH_WINDOW_SECS
+        self._eviction_timestamps = [t for t in self._eviction_timestamps if t > cutoff]
+        
+        # 3. Check for thrashing (e.g., > threshold evictions in window)
+        if len(self._eviction_timestamps) > CACHE_THRASH_THRESHOLD:
+            # 4. Rate limit the warning
+            if now - self._last_cache_warning_time > CACHE_WARNING_COOLDOWN_SECS:
+                self._last_cache_warning_time = now
+                self._has_warned_cache_full = True
+                
+                # Format usage info
+                used_gb = self.image_cache.currsize / (1024**3)
+                max_gb = self.image_cache.maxsize / (1024**3)
+                
+                msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in {CACHE_THRASH_WINDOW_SECS}s. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
+                
+                # Use QTimer.singleShot to ensure this runs on the main thread
+                QTimer.singleShot(0, lambda: self.update_status_message(msg))
+                log.warning(msg)
 
     def restore_all_from_recycle_bin(self):
         """Restores all files from recycle bin to working directory."""
@@ -2441,6 +2618,20 @@ class AppController(QObject):
             self.update_status_message(f"Histogram error: {e}")
     
     @Slot()
+    def cancel_crop_mode(self):
+         """Cancel crop mode without applying changes."""
+         if self.ui_state.isCropping:
+             self.ui_state.isCropping = False
+             self.ui_state.currentCropBox = [0, 0, 1000, 1000]
+             # Ensure preview rotation is cleared
+             self.image_editor.set_edit_param("straighten_angle", 0.0)
+             # Force QML to refresh if it's showing provider preview frames
+             self.ui_refresh_generation += 1
+             self.ui_state.currentImageSourceChanged.emit()
+             self.update_status_message("Crop cancelled")
+             log.info("Crop mode cancelled")
+
+    @Slot()
     def toggle_crop_mode(self):
         """Toggle crop mode on/off."""
         self.ui_state.isCropping = not self.ui_state.isCropping
@@ -2450,6 +2641,31 @@ class AppController(QObject):
             # Set aspect ratios for QML dropdown
             self.ui_state.aspectRatioNames = [r['name'] for r in ASPECT_RATIOS]
             self.ui_state.currentAspectRatioIndex = 0
+            
+            # Pre-load image into editor to ensure smooth rotation
+            if self.image_files and self.current_index < len(self.image_files):
+                 image_file = self.image_files[self.current_index]
+                 filepath = image_file.path
+                 editor_path = self.image_editor.current_filepath
+                 
+                 # Robust comparison
+                 match = False
+                 if editor_path:
+                     try:
+                         match = Path(editor_path).resolve() == Path(filepath).resolve()
+                     except (OSError, ValueError):
+                         match = str(editor_path) == str(filepath)
+                 
+                 if not match:
+                     log.debug(f"toggle_crop_mode: Loading {filepath} into editor")
+                     # Use cached preview if available to speed up using get_decoded_image(self.current_index)
+                     # note: get_decoded_image verifies index bounds
+                     cached_preview = self.get_decoded_image(self.current_index)
+                     self.image_editor.load_image(str(filepath), cached_preview=cached_preview)
+            
+            # Reset rotation to 0 when starting fresh crop mode
+            self.image_editor.set_edit_param("straighten_angle", 0.0)
+
             self.update_status_message("Crop mode: Drag to select area, Enter to crop")
             log.info("Crop mode enabled")
         else: # Exiting crop mode
@@ -2582,14 +2798,7 @@ class AppController(QObject):
             self.update_status_message("Failed to launch Helicon Focus.")
             
     
-    @Slot()
-    def cancel_crop_mode(self):
-        """Cancel crop mode without applying changes."""
-        if self.ui_state.isCropping:
-            self.ui_state.isCropping = False
-            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
-            self.update_status_message("Crop cancelled")
-            log.info("Crop mode cancelled")
+
     
     @Slot()
     def execute_crop(self):
@@ -2601,6 +2810,10 @@ class AppController(QObject):
         if not self.ui_state.isCropping:
             return
         
+        # Capture current rotation (straighten_angle) from editor state BEFORE any reload
+        # This is the single source of truth since set_straighten_angle updates it live.
+        current_rotation = float(self.image_editor.current_edits.get("straighten_angle", 0.0))
+
         # Ensure ImageEditor has the latest crop box (it should be synced via UIState, but good to be safe)
         crop_box_raw = self.ui_state.currentCropBox
         # ... (validation code remains similar or can be simplified since UIState validates) ...
@@ -2620,21 +2833,31 @@ class AppController(QObject):
             self.update_status_message("No crop area selected")
             return
 
-        # Ensure image is loaded in editor (crop mode might be active without editor open)
+        # Ensure image is loaded in editor
         image_file = self.image_files[self.current_index]
-        filepath = str(image_file.path)
-        if not self.image_editor.current_filepath or str(self.image_editor.current_filepath) != filepath:
-            # Load without preview if needed, but we likely have one cached
+        filepath = image_file.path
+        
+        # Robust path comparison
+        editor_path = self.image_editor.current_filepath
+        paths_match = False
+        if editor_path:
+            try:
+                paths_match = Path(editor_path).resolve() == Path(filepath).resolve()
+            except (OSError, ValueError):
+                paths_match = str(editor_path) == str(filepath)
+
+        if not paths_match:
+            log.debug(f"execute_crop reloading image due to path mismatch. Editor: {editor_path}, File: {filepath}")
             cached_preview = self.get_decoded_image(self.current_index)
-            if not self.image_editor.load_image(filepath, cached_preview=cached_preview):
+            if not self.image_editor.load_image(str(filepath), cached_preview=cached_preview):
                 self.update_status_message("Failed to load image for cropping")
                 return
 
         self.image_editor.set_crop_box(crop_box_raw)
         
-        # Sync straighten_angle (crop rotation) from UI to ImageEditor before saving
-        if hasattr(self.ui_state, 'cropRotation'):
-             self.image_editor.set_edit_param('straighten_angle', self.ui_state.cropRotation)
+        # Re-apply the captured rotation.
+        # This handles cases where we reloaded the image (resetting edits) or where UI state sync was flaky.
+        self.image_editor.set_edit_param('straighten_angle', current_rotation)
         
         # Save via ImageEditor (handles rotation + crop correctly)
         save_result = self.image_editor.save_image()

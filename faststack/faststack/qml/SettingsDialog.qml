@@ -123,7 +123,7 @@ Dialog {
                         id: checkMarkLabel
                         text: "✔"
                         color: "lightgreen"
-                        visible: uiState.check_path_exists(heliconPathField.text)
+                        visible: uiState && uiState.check_path_exists(heliconPathField.text)
                     }
                 }
 
@@ -147,7 +147,7 @@ Dialog {
                         id: photoshopCheckMarkLabel
                         text: "✔"
                         color: "lightgreen"
-                        visible: uiState.check_path_exists(photoshopPathField.text)
+                        visible: uiState && uiState.check_path_exists(photoshopPathField.text)
                     }
                 }
 
@@ -465,6 +465,8 @@ Dialog {
         interval: 1000
         repeat: true
         running: false
-        onTriggered: settingsDialog.cacheUsage = uiState.get_cache_usage_gb()
+        onTriggered: {
+            if (uiState) settingsDialog.cacheUsage = uiState.get_cache_usage_gb()
+        }
     }
 }

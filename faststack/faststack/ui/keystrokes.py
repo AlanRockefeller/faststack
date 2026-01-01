@@ -60,7 +60,12 @@ class Keybinder:
             (Qt.Key_Z, Qt.ControlModifier): "undo_delete",
             (Qt.Key_E, Qt.ControlModifier): "toggle_edited",
             (Qt.Key_S, Qt.ControlModifier): "toggle_stacked",
+
             (Qt.Key_B, Qt.ControlModifier | Qt.ShiftModifier): "quick_auto_white_balance",
+            (Qt.Key_1, Qt.ControlModifier): "zoom_100",
+            (Qt.Key_2, Qt.ControlModifier): "zoom_200",
+            (Qt.Key_3, Qt.ControlModifier): "zoom_300",
+            (Qt.Key_4, Qt.ControlModifier): "zoom_400",
         }
 
     def _call(self, method_name: str):
@@ -81,11 +86,14 @@ class Keybinder:
     def handle_key_press(self, event):
         key = event.key()
         text = event.text()
-        log.debug(f"Key pressed: {key} ({text!r}) with modifiers {event.modifiers()}")
+        modifiers = event.modifiers()
+        log.debug(f"Key pressed: {key} ({text!r}) with modifiers {modifiers}")
 
         # Check for modifier + key combinations
         for (mapped_key, mapped_modifier), method_name in self.modifier_key_map.items():
-            if key == mapped_key and event.modifiers() & mapped_modifier:
+            # Check if required modifier is present in event modifiers
+            if key == mapped_key and (modifiers & mapped_modifier):
+                log.debug(f"Matched modifier key: {key} + {mapped_modifier} -> {method_name}")
                 self._call(method_name)
                 return True
 
