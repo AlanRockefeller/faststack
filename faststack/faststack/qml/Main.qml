@@ -41,12 +41,6 @@ ApplicationWindow {
         exifDialog.open()
     }
 
-    Connections {
-        target: uiState
-        function onThemeChanged() {
-            root.isDarkTheme = uiState.theme === 0
-        }
-    }
 
     // -------- FLOATING MENU BAR (overlays content) --------
     Rectangle {
@@ -724,6 +718,11 @@ ApplicationWindow {
                 text: uiState ? ` | Edited on ${uiState.editedDate}` : ""
                 color: "lightgreen"
                 visible: uiState ? (uiState.imageCount > 0 && uiState.isEdited) : false
+            }
+            Label {
+                text: uiState ? ` | Restacked on ${uiState.restackedDate}` : ""
+                color: "cyan"
+                visible: uiState ? (uiState.imageCount > 0 && uiState.isRestacked) : false
             }
             Label {
                 text: uiState ? ` | Filter: "${uiState.filterString}"` : ""

@@ -29,9 +29,6 @@ Window {
     // Connections need to be outside the visibility check
     Connections {
         target: uiState
-        function onIsHistogramVisibleChanged() {
-            histogramWindow.visible = uiState.isHistogramVisible
-        }
         function onHistogramDataChanged() {
             if (histogramWindow.visible) {
                 // Since data is bound, the components will update automatically
@@ -79,6 +76,10 @@ Window {
             property int clipCount: 0
             property int preClipCount: 0
 
+            onHistogramDataChanged: {
+                if (canvas && canvas.available) canvas.requestPaint()
+            }
+
             ColumnLayout {
                 anchors.fill: parent
                 
@@ -94,12 +95,19 @@ Window {
                     id: canvas
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    
+
+                    onAvailableChanged: {
+                        if (available) requestPaint()
+                    }
+
                     onPaint: {
                         var ctx = getContext("2d")
                         ctx.clearRect(0, 0, canvas.width, canvas.height)
                         
-                        if (!histogramData || histogramData.length === 0) return
+                        // Handle null or empty data gracefully
+                        if (!histogramData || histogramData.length === undefined || histogramData.length === 0) return
+
+                        // console.log(channelName, "len", histogramData ? histogramData.length : "null")
 
                         // --- Draw Grid ---
                         ctx.strokeStyle = gridLineColor
@@ -129,7 +137,7 @@ Window {
                         ctx.moveTo(0, canvas.height)
                         
                         for (i = 0; i < histogramData.length; i++) {
-                            var x = (i / (histogramData.length - 1)) * canvas.width
+                            var x = histogramData.length > 1 ? (i / (histogramData.length - 1)) * canvas.width : canvas.width / 2
                             var y = canvas.height - (histogramData[i] / maxVal) * canvas.height
                             ctx.lineTo(x, y)
                         }
@@ -160,7 +168,7 @@ Window {
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter
                     spacing: 15
-
+                    
                     Text {
                         text: "Pre-clip: " + preClipCount
                         color: primaryTextColor
@@ -190,18 +198,16 @@ Window {
             onLoaded: {
                 item.channelName = "Red"
                 item.channelColor = "#e15050"
-            }
-            Connections {
-                target: uiState
-                function onHistogramDataChanged() {
-                    if (redLoader.item && uiState.histogramData) {
-                        redLoader.item.histogramData = uiState.histogramData.r
-                        redLoader.item.clipCount = uiState.histogramData.r_clip
-                        redLoader.item.preClipCount = uiState.histogramData.r_preclip
-                        // Access canvas through item: item.children[0].children[1] is fragile
-                        redLoader.item.children[0].children[1].requestPaint()
-                    }
-                }
+                
+                item.histogramData = Qt.binding(function() {
+                    return uiState && uiState.histogramData ? (uiState.histogramData["r"] || []) : []
+                })
+                item.clipCount = Qt.binding(function() {
+                    return uiState && uiState.histogramData ? (uiState.histogramData["r_clip"] || 0) : 0
+                })
+                item.preClipCount = Qt.binding(function() {
+                    return uiState && uiState.histogramData ? (uiState.histogramData["r_preclip"] || 0) : 0
+                })
             }
         }
         
@@ -213,17 +219,16 @@ Window {
             onLoaded: {
                 item.channelName = "Green"
                 item.channelColor = "#50e150"
-            }
-            Connections {
-                target: uiState
-                function onHistogramDataChanged() {
-                    if (greenLoader.item && uiState.histogramData) {
-                        greenLoader.item.histogramData = uiState.histogramData.g
-                        greenLoader.item.clipCount = uiState.histogramData.g_clip
-                        greenLoader.item.preClipCount = uiState.histogramData.g_preclip
-                        greenLoader.item.children[0].children[1].requestPaint()
-                    }
-                }
+
+                item.histogramData = Qt.binding(function() {
+                    return uiState && uiState.histogramData ? (uiState.histogramData["g"] || []) : []
+                })
+                item.clipCount = Qt.binding(function() {
+                    return uiState && uiState.histogramData ? (uiState.histogramData["g_clip"] || 0) : 0
+                })
+                item.preClipCount = Qt.binding(function() {
+                    return uiState && uiState.histogramData ? (uiState.histogramData["g_preclip"] || 0) : 0
+                })
             }
         }
 
@@ -235,17 +240,16 @@ Window {
             onLoaded: {
                 item.channelName = "Blue"
                 item.channelColor = "#5050e1"
-            }
-            Connections {
-                target: uiState
-                function onHistogramDataChanged() {
-                    if (blueLoader.item && uiState.histogramData) {
-                        blueLoader.item.histogramData = uiState.histogramData.b
-                        blueLoader.item.clipCount = uiState.histogramData.b_clip
-                        blueLoader.item.preClipCount = uiState.histogramData.b_preclip
-                        blueLoader.item.children[0].children[1].requestPaint()
-                    }
-                }
+
+                item.histogramData = Qt.binding(function() {
+                    return uiState && uiState.histogramData ? (uiState.histogramData["b"] || []) : []
+                })
+                item.clipCount = Qt.binding(function() {
+                    return uiState && uiState.histogramData ? (uiState.histogramData["b_clip"] || 0) : 0
+                })
+                item.preClipCount = Qt.binding(function() {
+                    return uiState && uiState.histogramData ? (uiState.histogramData["b_preclip"] || 0) : 0
+                })
             }
         }
     }

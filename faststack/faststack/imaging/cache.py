@@ -20,8 +20,6 @@ class ByteLRUCache(LRUCache):
     ):
         super().__init__(maxsize=max_bytes, getsizeof=size_of)
         self.on_evict = on_evict
-        self.hits = 0
-        self.misses = 0
         log.info(
             f"Initialized byte-aware LRU cache with {max_bytes / 1024**2:.2f} MB capacity."
         )
@@ -38,7 +36,7 @@ class ByteLRUCache(LRUCache):
         """Extend popitem to log eviction."""
         key, value = super().popitem()
         log.debug(
-            f"Evicted item '{key}' to free up space. Cache size: {self.currsize / 1024**2:.2f} MB"
+            f"Evicted item '{key}'. Cache size after eviction: {self.currsize / 1024**2:.2f} MB"
         )
 
         if self.on_evict:

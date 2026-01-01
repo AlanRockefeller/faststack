@@ -15,9 +15,9 @@ DEFAULT_CONFIG = {
         "theme": "dark",
         "default_directory": "",
         "optimize_for": "speed",  # "speed" or "quality"
-        "auto_level_threshold": "0.1",
-        "auto_level_strength": "1.0",
-        "auto_level_strength_auto": "False",
+        "auto_level_threshold": "0.1",  # Threshold for auto-level detection (0.0-1.0)
+        "auto_level_strength": "1.0",  # Strength of auto-level correction (0.0-1.0)
+        "auto_level_strength_auto": "False",  # Automatically adjust auto-level strength
     },
     "helicon": {
         "exe": "C:\\Program Files\\Helicon Software\\Helicon Focus 8\\HeliconFocus.exe",

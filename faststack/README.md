@@ -15,8 +15,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
 - **Instant Navigation:** Sub-10ms next/previous image switching, high performance decoding via `PyTurboJPEG`.
 - **Image Editor:** Built-in editor with exposure, contrast, white balance, sharpness, and more (E key)
-- **Quick Auto White Balance:** Press A to apply auto white balance and save automatically with undo support (Ctrl+Z).   For better white balance load the raw into Photoshop with the P key.
-- **Photoshop Integration:** Edit current image in Photoshop (P key) - always uses RAW files when available.
+- **Quick Auto White Balance:** Press A to apply auto white balance and save automatically with undo support (Ctrl+Z).   For better white balance, load the raw into Photoshop with the P key.- **Photoshop Integration:** Edit current image in Photoshop (P key) - always uses RAW files when available.
 - **Clipboard Support:** Copy image path to clipboard (Ctrl+C)
 - **Image Filtering:** Filter images by filename
 - **Drag & Drop:** Drag images to external applications.   Press { and } to batch files to drag & drop multiple images.

@@ -5,7 +5,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 
 Window {
-    id: editDialog
+    id: imageEditorDialog
     width: 720
     height: 700
     title: "Image Editor"
@@ -20,10 +20,12 @@ Window {
     Material.accent: "#4fb360"
 
     // When the dialog is closed by the user (e.g. clicking X), update the state
-    onVisibleChanged: {
-        if (!visible) {
-            uiState.isEditorOpen = false
-        }
+    // Use onClosing to handle the window close event (e.g. usage of the X button)
+    // Use onClosing to handle the window close event (e.g. usage of the X button)
+    onClosing: (close) => {
+        uiState.isEditorOpen = false
+        // We accept the close event, letting the window hide/close naturally.
+        // The binding to 'visible' will update next time uiState.isEditorOpen becomes true.
     }
 
     property int slidersPressedCount: 0
@@ -40,15 +42,26 @@ Window {
     // Background
     color: imageEditorDialog.backgroundColor
 
-    // Keyboard Shortcuts
-    Item {
-        anchors.fill: parent
-        focus: true
-        Keys.onPressed: (event) => {
-            if (event.key === Qt.Key_E || event.key === Qt.Key_Escape) {
-                uiState.isEditorOpen = false
-                event.accepted = true
-            }
+    Shortcut {
+        sequence: "E"
+        context: Qt.WindowShortcut
+        onActivated: {
+            uiState.isEditorOpen = false
+        }
+    }
+    Shortcut {
+        sequence: "Escape"
+        context: Qt.WindowShortcut
+        onActivated: {
+            uiState.isEditorOpen = false
+        }
+    }
+    Shortcut {
+        sequence: "S"
+        context: Qt.WindowShortcut
+        onActivated: {
+            controller.save_edited_image()
+            uiState.isEditorOpen = false
         }
     }
 
@@ -75,8 +88,8 @@ Window {
                     ListElement { name: "Exposure"; key: "exposure" }
                     ListElement { name: "Brightness"; key: "brightness" }
                     ListElement { name: "Highlights"; key: "highlights" }
+                    ListElement { name: "Whites"; key: "whites" }
                     ListElement { name: "Shadows"; key: "shadows" }
-                    ListElement { name: "Whites"; key: "whites"; reverse: true }
                     ListElement { name: "Blacks"; key: "blacks" }
                     ListElement { name: "Contrast"; key: "contrast" }
                 }
@@ -116,7 +129,7 @@ Window {
                     Layout.topMargin: 5
                     onClicked: {
                         controller.auto_white_balance()
-                        editDialog.updatePulse++
+                        imageEditorDialog.updatePulse++
                     }
                 }
                 
@@ -126,7 +139,7 @@ Window {
                     Layout.topMargin: 5
                     onClicked: {
                         controller.auto_levels()
-                        editDialog.updatePulse++
+                        imageEditorDialog.updatePulse++
                     }
                 }
 
@@ -154,11 +167,11 @@ Window {
                     Layout.fillWidth: true
                     onClicked: {
                         controller.reset_edit_parameters()
-                        editDialog.updatePulse++
+                        imageEditorDialog.updatePulse++
                     }
                 }
                 Button { 
-                    text: "Save and Close Editor (Ctrl+S)"
+                    text: "Save and Close (S)"
                     Layout.fillWidth: true
                     onClicked: {
                         controller.save_edited_image()
@@ -178,102 +191,70 @@ Window {
 
     Component {
         id: editSlider
-        ColumnLayout {
+        RowLayout {
             Layout.fillWidth: true
-            spacing: 0
+            spacing: 10
             
             property bool isReversed: model.reverse !== undefined ? model.reverse : false
-            property real displayValue: isReversed ? -slider.value : slider.value
             
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 5
-
-                Text {
-                    text: model.name + ":"
-                    color: imageEditorDialog.textColor
-                    font.pixelSize: 14
-                }
-                
-                Item { Layout.fillWidth: true } // Spacer
-
-                TextInput {
-                    id: valueInput
-                    text: displayValue.toFixed(0)
-                    color: imageEditorDialog.textColor
-                    font.pixelSize: 14
-                    selectByMouse: true
-                    validator: IntValidator { bottom: model.min === undefined ? -100 : model.min; top: model.max === undefined ? 100 : model.max }
-                    
-                    onEditingFinished: {
-                        var val = parseInt(text)
-                        if (isNaN(val)) return
-                        
-                        // Clamp value
-                        var min = model.min === undefined ? -100 : model.min
-                        var max = model.max === undefined ? 100 : model.max
-                        if (val < min) val = min
-                        if (val > max) val = max
-                        
-                        var sendValue = isReversed ? -val : val
-                        controller.set_edit_parameter(model.key, sendValue / (model.max === undefined ? 100.0 : model.max))
-                        editDialog.updatePulse++ // Force slider update
-                    }
-                }
+            // Label
+            Text {
+                text: model.name
+                color: imageEditorDialog.textColor
+                font.pixelSize: 14
+                Layout.preferredWidth: 80
+                Layout.alignment: Qt.AlignVCenter
             }
+            
+            // Slider
             Slider {
                 id: slider
                 Layout.fillWidth: true
-                Layout.minimumHeight: 30
+                Layout.alignment: Qt.AlignVCenter
                 from: model.min === undefined ? -100 : model.min
                 to: model.max === undefined ? 100 : model.max
                 stepSize: 1
                 
                 property real backendValue: {
-                    var val = editDialog.getBackendValue(model.key) * (model.max === undefined ? 100 : model.max)
+                    var val = imageEditorDialog.getBackendValue(model.key) * (model.max === undefined ? 100 : model.max)
                     return isReversed ? -val : val
                 }
                 
                 value: backendValue
-
-		Connections {
-			target: editDialog
-			function onUpdatePulseChanged() {
-			    if (!slider.pressed) {
-				// This forces the visual handle to snap to the backendValue
-				// even if backendValue hasn't numerically changed (e.g. 0 -> 0)
-				slider.value = slider.backendValue
-			    }
-			}
-		    }
+                
+                Connections {
+                    target: imageEditorDialog
+                    function onUpdatePulseChanged() {
+                        if (!slider.pressed) {
+                            slider.value = slider.backendValue
+                        }
+                    }
+                }
                 
                 onMoved: {
                     var sendValue = isReversed ? -value : value
                     controller.set_edit_parameter(model.key, sendValue / (model.max === undefined ? 100.0 : model.max))
                 }
-
-                // Double click/tap to reset
+                
                 TapHandler {
                     acceptedButtons: Qt.LeftButton
                     onDoubleTapped: {
                          controller.set_edit_parameter(model.key, 0.0)
                          slider.value = 0.0
-                         editDialog.updatePulse++
+                         imageEditorDialog.updatePulse++
                     }
                 }
-
+                
                 onPressedChanged: {
-                    if (pressed) editDialog.slidersPressedCount++; else editDialog.slidersPressedCount--;
+                    if (pressed) imageEditorDialog.slidersPressedCount++; else imageEditorDialog.slidersPressedCount--;
                 }
-
-		onBackendValueChanged: {
-			// Check '!pressed' to avoid fighting the user if they are 
-			// currently dragging the slider while an update comes in.
-			if (!pressed) {
-			    value = backendValue
-			}
-		    }
-
+                
+                onBackendValueChanged: {
+                    if (!pressed) {
+                        value = backendValue
+                    }
+                }
+                
                 background: Rectangle {
                     x: slider.leftPadding
                     y: slider.topPadding + slider.availableHeight / 2 - height / 2
@@ -284,13 +265,90 @@ Window {
                 }
 
                 handle: Rectangle {
-                    x: slider.leftPadding + slider.visualPosition * (slider.availableWidth - width)
-                    y: slider.topPadding + slider.availableHeight / 2 - height / 2
-                    width: 16
-                    height: 16
-                    radius: 8
-                    color: slider.pressed ? "#4fb360" : "#6fcf7c"
-                    border.color: (uiState && uiState.theme === 0) ? Qt.darker(Material.accent, 1.2) : Qt.lighter(Material.accent, 1.2)
+                     x: slider.leftPadding + slider.visualPosition * (slider.availableWidth - width)
+                     y: slider.topPadding + slider.availableHeight / 2 - height / 2
+                     width: 16
+                     height: 16
+                     radius: 8
+                     color: slider.pressed ? "#4fb360" : "#6fcf7c"
+                     border.color: (uiState && uiState.theme === 0) ? Qt.darker(Material.accent, 1.2) : Qt.lighter(Material.accent, 1.2)
+                }
+            }
+
+            // SpinBox
+            // SpinBox
+            SpinBox {
+                id: valueInput
+                from: model.min === undefined ? -100 : model.min
+                to: model.max === undefined ? 100 : model.max
+                stepSize: 1
+                editable: true
+                Layout.preferredWidth: 80 // Compact width
+                Layout.alignment: Qt.AlignVCenter
+                
+                value: isReversed ? -slider.value : slider.value
+                
+                onValueModified: {
+                     var val = value
+                     var sendValue = isReversed ? -val : val
+                     controller.set_edit_parameter(model.key, sendValue / (model.max === undefined ? 100.0 : model.max))
+                     imageEditorDialog.updatePulse++ 
+                }
+
+                // Customizations for compact look with small arrows
+                contentItem: TextInput {
+                    z: 2
+                    text: valueInput.textFromValue(valueInput.value, valueInput.locale)
+                    font: valueInput.font
+                    color: imageEditorDialog.textColor
+                    selectionColor: "#21be2b"
+                    selectedTextColor: "#ffffff"
+                    horizontalAlignment: Qt.AlignHCenter
+                    verticalAlignment: Qt.AlignVCenter
+                    readOnly: !valueInput.editable
+                    validator: valueInput.validator
+                    inputMethodHints: Qt.ImhFormattedNumbersOnly
+                }
+
+                up.indicator: Rectangle {
+                    x: valueInput.mirrored ? 0 : parent.width - width
+                    height: parent.height
+                    implicitWidth: 20 // Small width for buttons
+                    implicitHeight: 20
+                    color: "transparent"
+                    
+                    Text {
+                        text: "+"
+                        font.pixelSize: 14
+                        anchors.centerIn: parent
+                        color: valueInput.up.pressed ? "#4fb360" : imageEditorDialog.textColor
+                    }
+                    
+
+                }
+
+                down.indicator: Rectangle {
+                    x: valueInput.mirrored ? parent.width - width : 0
+                    height: parent.height
+                    implicitWidth: 20 // Small width for buttons
+                    implicitHeight: 20
+                    color: "transparent"
+                    
+                    Text {
+                        text: "-"
+                        font.pixelSize: 14
+                        anchors.centerIn: parent
+                        color: valueInput.down.pressed ? "#4fb360" : imageEditorDialog.textColor
+                    }
+
+                }
+
+                background: Rectangle {
+                    implicitWidth: 80
+                    color: "transparent"
+                    border.color: "#555555"
+                    border.width: 1
+                    radius: 2
                 }
             }
         }

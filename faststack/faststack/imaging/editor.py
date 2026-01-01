@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import glob
@@ -11,6 +12,8 @@ from io import BytesIO
 
 from faststack.models import DecodedImage
 from PySide6.QtGui import QImage
+
+log = logging.getLogger(__name__)
 
 # Aspect Ratios for cropping
 INSTAGRAM_RATIOS = {
@@ -51,7 +54,7 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
         shutil.copy2(original_path, backup_path)
         return backup_path
     except OSError as e:
-        print(f"Failed to create backup: {e}")
+        log.error(f"Failed to create backup: {e}")
         return None
 
 # ----------------------------
@@ -229,7 +232,7 @@ class ImageEditor:
 
             return True
         except Exception as e:
-            print(f"Error loading image for editing: {e}")
+            log.error(f"Error loading image for editing: {e}")
             self.original_image = None
             self._preview_image = None
             return False
@@ -310,7 +313,7 @@ class ImageEditor:
         if abs(blacks) > 0.001 or abs(whites) > 0.001:
             arr = np.array(img, dtype=np.float32)
             black_point = -blacks * 40
-            white_point = 255 + whites * 40
+            white_point = 255 - whites * 40
             # Prevent division by zero
             if abs(white_point - black_point) < 0.001:
                 white_point = black_point + 0.001
@@ -517,12 +520,12 @@ class ImageEditor:
                 final_val = int(rounded_deg) % 360
                 
                 if abs(val_deg - rounded_deg) > 1.0:
-                     print(f"Warning: 'rotation' received {value}. Rounding to {final_val}. Use 'straighten_angle' for free rotation.")
+                     log.warning(f"'rotation' received {value}. Rounding to {final_val}. Use 'straighten_angle' for free rotation.")
                 
                 self.current_edits[key] = final_val
                 return True
             except (ValueError, TypeError):
-                print(f"Error: Invalid value for rotation: {value}")
+                log.error(f"Invalid value for rotation: {value}")
                 return False
 
         if key in self.current_edits and key != 'crop_box':
@@ -550,7 +553,7 @@ class ImageEditor:
         try:
             original_stat = original_path.stat()
         except OSError as e:
-            print(f"Warning: Unable to read timestamps for {original_path}: {e}")
+            log.warning(f"Unable to read timestamps for {original_path}: {e}")
             original_stat = None
         
         # Use the reusable backup function
@@ -582,10 +585,10 @@ class ImageEditor:
                             else:
                                 # Fallback for older Pillow: skip writing EXIF if we can't sanitize it
                                 # to avoid double-rotation bug.
-                                print("Warning: Pillow too old to sanitize EXIF bytes. Skipping EXIF write to prevent double-rotation.")
+                                log.warning("Pillow too old to sanitize EXIF bytes. Skipping EXIF write to prevent double-rotation.")
                                 exif_bytes = None
                     except Exception as e:
-                        print(f"Warning: Failed to sanitize EXIF orientation: {e}")
+                        log.warning(f"Failed to sanitize EXIF orientation: {e}")
                         # Fallback: safer to skip EXIF than write bad orientation
                         exif_bytes = None
 
@@ -603,8 +606,8 @@ class ImageEditor:
                 final_img.save(original_path, **save_kwargs)
             except Exception as e:
                 exif_was_requested = 'exif' in save_kwargs
-                print(
-                    f"Warning: Could not save with original format settings"
+                log.warning(
+                    f"Could not save with original format settings"
                     f"{' (with EXIF)' if exif_was_requested else ''}: {e}"
                 )
 
@@ -614,23 +617,23 @@ class ImageEditor:
                     retry_kwargs.pop('exif', None)
                     try:
                         final_img.save(original_path, **retry_kwargs)
-                        print(
-                            "Note: Image saved without EXIF metadata; "
+                        log.info(
+                            "Image saved without EXIF metadata; "
                             "EXIF may be corrupted or incompatible with the edited image."
                         )
                     except Exception as e2:
-                        print(f"Warning: Could not save even without EXIF metadata: {e2}")
+                        log.warning(f"Could not save even without EXIF metadata: {e2}")
                         # Fall through to the final fallback below
 
                 # Final fallback: let Pillow infer format from suffix / image mode
                 try:
                     final_img.save(original_path)
-                    print(
-                        "Warning: Used final fallback save; image may not use the original "
+                    log.warning(
+                        "Used final fallback save; image may not use the original "
                         "format settings and EXIF metadata is likely lost."
                     )
                 except Exception as e3:
-                    print(f"Failed to save edited image even with fallback: {e3}")
+                    log.error(f"Failed to save edited image even with fallback: {e3}")
                     # Reraise so the outer except logs and returns None
                     raise
 
@@ -639,7 +642,7 @@ class ImageEditor:
 
             return original_path, backup_path
         except Exception as e:
-            print(f"Failed to save edited image or backup: {e}")
+            log.error(f"Failed to save edited image or backup: {e}")
             return None
 
     def _restore_file_times(self, path: Path, original_stat: os.stat_result) -> None:
@@ -647,7 +650,7 @@ class ImageEditor:
         try:
             os.utime(path, (original_stat.st_atime, original_stat.st_mtime))
         except OSError as e:
-            print(f"Warning: Unable to restore timestamps for {path}: {e}")
+            log.warning(f"Unable to restore timestamps for {path}: {e}")
 
     def rotate_image_cw(self):
         """Decreases the rotation edit parameter by 90° modulo 360 (clockwise)."""

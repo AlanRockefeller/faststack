@@ -21,6 +21,8 @@ class EntryMetadata:
     uploaded_date: Optional[str] = None
     edited: bool = False
     edited_date: Optional[str] = None
+    restacked: bool = False
+    restacked_date: Optional[str] = None
 
 
 @dataclasses.dataclass

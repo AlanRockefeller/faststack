@@ -656,19 +656,20 @@ Item {
                         
                         // Calculate start aspect ratio (in pixels)
                         if (mainImage.width > 0) {
-                            var box = uiState.currentCropBox
-                            if (box && box.length === 4) {
-                                var boxW = (box[2] - box[0]) / 1000 * mainImage.width
-                                var boxH = (box[3] - box[1]) / 1000 * mainImage.height
+                            var cb = uiState.currentCropBox
+                            if (cb && cb.length === 4) {
+                                var boxW = (cb[2] - cb[0]) / 1000 * mainImage.width
+                                var boxH = (cb[3] - cb[1]) / 1000 * mainImage.height
                                 cropStartAspect = boxW / boxH
                             }
                         }
 
 
                         // Seed cropBoxStart variables
-                        if (box && box.length === 4) {
-                            cropBoxStartLeft = box[0]
-                            cropBoxStartTop = box[1]
+                        var startBox = uiState.currentCropBox
+                        if (startBox && startBox.length === 4) {
+                            cropBoxStartLeft = startBox[0]
+                            cropBoxStartTop = startBox[1]
                             cropBoxStartRight = box[2]
                             cropBoxStartBottom = box[3]
                         }

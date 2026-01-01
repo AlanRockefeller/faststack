@@ -11,6 +11,7 @@ import mmap
 
 import numpy as np
 from PIL import Image as PILImage, ImageCms
+from PySide6.QtCore import QTimer
 
 from faststack.models import ImageFile, DecodedImage
 from faststack.imaging.jpeg import decode_jpeg_rgb, decode_jpeg_resized, TURBO_AVAILABLE
@@ -413,6 +414,8 @@ class Prefetcher:
                         h, w, _ = buffer.shape
                         bytes_per_line = w * 3
                         arr = buffer.reshape(-1).copy()
+                        # Align with non-fallback paths for timing/logging
+                        t_after_copy = time.perf_counter()
                         
                         if self.debug:
                             decoder = "TurboJPEG" if TURBO_AVAILABLE else "Pillow"
@@ -444,6 +447,8 @@ class Prefetcher:
                     h, w, _ = buffer.shape
                     bytes_per_line = w * 3
                     arr = buffer.reshape(-1).copy()
+                    # Align with non-fallback paths for timing/logging
+                    t_after_copy = time.perf_counter()
                     
                     if self.debug:
                         decoder = "TurboJPEG" if TURBO_AVAILABLE else "Pillow"
