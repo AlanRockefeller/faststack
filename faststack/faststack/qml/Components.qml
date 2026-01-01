@@ -10,7 +10,6 @@ Item {
     focus: true
     
     // Height of the status bar footer in Main.qml
-    // Height of the status bar footer in Main.qml
     property int footerHeight: 60
     
     Connections {
@@ -51,21 +50,9 @@ Item {
     }
 
 
-    Keys.onReturnPressed: (event) => {
-        if (uiState && uiState.isCropping && controller) {
-            // Force immediate rotation update before executing crop
-            if (mainMouseArea.cropRotation !== 0) {
-                controller.set_straighten_angle(mainMouseArea.cropRotation, -1)
-            }
-            
-            uiState.setZoomed(false)
-            controller.execute_crop()
-            event.accepted = true
-        }
-    }
+
 
     Keys.onPressed: (event) => {
-        // Zoom Shortcuts (Ctrl+1..4)
         // Zoom Shortcuts (Ctrl+1..4)
         if (event.modifiers & Qt.ControlModifier) {
              if (event.key === Qt.Key_1) {
@@ -91,6 +78,11 @@ Item {
         // Handle Enter for Crop Execution (formerly Keys.onEnterPressed)
         // We only accept the event if we actually act on it.
         if ((event.key === Qt.Key_Enter || event.key === Qt.Key_Return) && uiState && uiState.isCropping && controller) {
+            // Force immediate rotation update before executing crop
+            if (mainMouseArea.cropRotation !== 0) {
+                controller.set_straighten_angle(mainMouseArea.cropRotation, -1)
+            }
+
             uiState.setZoomed(false) // Force unzoom
             controller.execute_crop()
             event.accepted = true
@@ -200,7 +192,7 @@ Item {
             property real fitScale: 1.0
 
             function recomputeFitScale(force) {
-                if (typeof force === 'undefined') force = false;
+                if (force === undefined) force = false;
 
                 if (width <= 0 || height <= 0 || imageViewport.width <= 0 || imageViewport.height <= 0)
                     return;
@@ -1003,7 +995,7 @@ Item {
 
             var ratioName = uiState.aspectRatioNames[uiState.currentAspectRatioIndex];
             var ratioPair = getAspectRatio(ratioName);
-            if (!ratioPair || !imageRotator.width || !imageRotator.height) {
+            if (!ratioPair || !mainImage || !imageRotator.width || !imageRotator.height) {
                 return [left, top, right, bottom];
             }
 

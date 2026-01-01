@@ -5,10 +5,7 @@ import re
 import math
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
-try:
-    import numpy as np
-except ImportError:
-    np = None
+import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 from io import BytesIO
 
@@ -99,8 +96,8 @@ def _rotated_rect_with_max_area(w: int, h: int, angle_rad: float) -> tuple[int, 
         wr = (w * cos_a - h * sin_a) / cos_2a
         hr = (h * cos_a - w * sin_a) / cos_2a
 
-    cw = int(round(abs(wr)))
-    ch = int(round(abs(hr)))
+    cw = round(abs(wr))
+    ch = round(abs(hr))
     cw = max(1, min(w, cw))
     ch = max(1, min(h, ch))
     return cw, ch
@@ -139,8 +136,8 @@ def rotate_autocrop_rgb(img: Image.Image, angle_deg: float, inset: int = 2) -> I
     # Center-crop to the inscribed rectangle
     cx = rot.width / 2.0
     cy = rot.height / 2.0
-    left = int(round(cx - crop_w / 2.0))
-    top = int(round(cy - crop_h / 2.0))
+    left = round(cx - crop_w / 2.0)
+    top = round(cy - crop_h / 2.0)
     right = left + crop_w
     bottom = top + crop_h
 
@@ -238,7 +235,7 @@ class ImageEditor:
             return False
 
 
-    def _apply_edits(self, img: Image.Image, is_export: bool = False) -> Image.Image:
+    def _apply_edits(self, img: Image.Image, *, for_export: bool = False) -> Image.Image:
         """Applies all current edits to the provided PIL Image."""
         
         # 1. Rotation (90 degree steps)
@@ -254,10 +251,12 @@ class ImageEditor:
         # ---------------------------------------------------------
         # CHANGE: Apply Free Rotation (Straighten) BEFORE Cropping
         # ---------------------------------------------------------
-        straighten_angle = self.current_edits.get('straighten_angle', 0.0)
+        straighten_angle = float(self.current_edits.get('straighten_angle', 0.0))
         has_crop_box = 'crop_box' in self.current_edits and self.current_edits['crop_box']
 
-        if abs(straighten_angle) > 0.001:
+        # Only apply rotation if it's significant AND we are exporting.
+        # During preview (for_export=False), QML handles the visual rotation.
+        if for_export and abs(straighten_angle) > 0.001:
             if has_crop_box:
                 # Scenario A: Manual Crop. 
                 # Just rotate the image (expanding canvas). The subsequent 
@@ -283,19 +282,19 @@ class ImageEditor:
                 # Note: We calculate this based on the *current* img size, 
                 # which might be larger now due to the rotation above.
                 w, h = img.size
-                l = int(crop_box[0] * w / 1000)
+                left = int(crop_box[0] * w / 1000)
                 t = int(crop_box[1] * h / 1000)
                 r = int(crop_box[2] * w / 1000)
                 b = int(crop_box[3] * h / 1000)
                 
                 # Basic boundary checks
-                l = max(0, l)
+                left = max(0, left)
                 t = max(0, t)
                 r = min(w, r)
                 b = min(h, b)
                 
-                if r > l and b > t:
-                    img = img.crop((l, t, r, b))
+                if r > left and b > t:
+                    img = img.crop((left, t, r, b))
 
         # 3. Exposure (gamma-based)
         exposure = self.current_edits['exposure']
@@ -494,7 +493,7 @@ class ImageEditor:
 
         # Always start from a fresh copy of the small preview image
         img = self._preview_image.copy()
-        img = self._apply_edits(img, is_export=False)
+        img = self._apply_edits(img, for_export=False)
 
         # The image is in RGB mode after _apply_edits
         buffer = img.tobytes()
@@ -545,7 +544,7 @@ class ImageEditor:
             return None
 
         final_img = self.original_image.copy()
-        final_img = self._apply_edits(final_img, is_export=True)
+        final_img = self._apply_edits(final_img, for_export=True)
 
         original_path = self.current_filepath
         try:

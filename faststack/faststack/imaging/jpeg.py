@@ -162,8 +162,10 @@ def decode_jpeg_resized(
         from io import BytesIO
         img = Image.open(BytesIO(jpeg_bytes))
         
+
+
         if width == 0 or height == 0:
-             return np.array(img.convert("RGB"))
+            return np.array(img.convert("RGB"))
 
         scale_factor_ratio = min(img.width / width, img.height / height)
 

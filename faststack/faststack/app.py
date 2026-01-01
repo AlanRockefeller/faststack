@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import math
 import struct
 import shlex
 import time
@@ -10,11 +11,13 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import date
 import os
+# Must set before importing PySide6
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime.warning=false"
+
 import concurrent.futures
 import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
-os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime.warning=false"
 import PySide6
 from PySide6.QtGui import QDrag, QPixmap
 from PySide6.QtCore import (
@@ -72,6 +75,12 @@ log = logging.getLogger(__name__)
 
 # Global flag for debug mode - set by main()
 _debug_mode = False
+
+# Cache Thrashing Detection Constants
+CACHE_THRASH_WINDOW_SECS = 2.0
+CACHE_THRASH_THRESHOLD = 5
+CACHE_WARNING_COOLDOWN_SECS = 300
+
 
 class AppController(QObject):
     dataChanged = Signal() # New signal for general data changes
@@ -275,7 +284,6 @@ class AppController(QObject):
             self.main_window.update() # Force repaint
             
     # -- Zoom Shortcuts --
-    # -- Zoom Shortcuts --
     def zoom_100(self):
         log.info("Zoom 100% requested")
         self.ui_state.request_absolute_zoom(1.0)
@@ -401,26 +409,26 @@ class AppController(QObject):
 
         # Debug preview condition
         if self.ui_state.isEditorOpen or self.ui_state.isCropping:
-             # Robust path comparison
-             editor_path = self.image_editor.current_filepath
-             file_path = self.image_files[index].path
-             
-             match = False
-             if editor_path and file_path:
-                 try:
-                     match = Path(editor_path).resolve() == Path(file_path).resolve()
-                 except Exception:
-                     match = str(editor_path) == str(file_path)
-             
-             if not match:
-                 # Debug log if mismatch
-                 log.debug(f"Path mismatch in preview. Editor: {editor_path}, File: {file_path}")
-             
-             # Return preview if Editor is open OR Cropping is active (for live rotation)
-             if (self.ui_state.isEditorOpen or self.ui_state.isCropping) and match and self.image_editor.original_image:
-                 preview_data = self.image_editor.get_preview_data()
-                 if preview_data:
-                     return preview_data
+            # Robust path comparison
+            editor_path = self.image_editor.current_filepath
+            file_path = self.image_files[index].path
+            
+            match = False
+            if editor_path and file_path:
+                try:
+                    match = Path(editor_path).resolve() == Path(file_path).resolve()
+                except (OSError, ValueError):
+                    match = str(editor_path) == str(file_path)
+            
+            if not match:
+                # Debug log if mismatch
+                log.debug(f"Path mismatch in preview. Editor: {editor_path}, File: {file_path}")
+            
+            # Return preview if Editor is open OR Cropping is active (for live rotation)
+            if match and self.image_editor.original_image:
+                preview_data = self.image_editor.get_preview_data()
+                if preview_data:
+                    return preview_data
 
         _, _, display_gen = self.get_display_info()
         image_path = self.image_files[index].path
@@ -1331,15 +1339,15 @@ class AppController(QObject):
         # If we have a target aspect ratio, we need to adjust the normalized crop box 
         # because the underlying canvas aspect ratio changes with rotation (expand=True).
         if target_aspect_ratio > 0 and self.ui_state.currentCropBox:
-            l, t, r, b = self.ui_state.currentCropBox
-            w_norm = r - l
-            h_norm = b - t
+            left, top, right, bottom = self.ui_state.currentCropBox
+            w_norm = right - left
+            h_norm = bottom - top
             
             if w_norm > 0 and h_norm > 0:
                 # Calculate new canvas dimensions
                 # PIL expand=True logic:
                 im_w, im_h = self.image_editor.original_image.size
-                import math
+                # math imported at top level
                 rad = math.radians(abs(angle))
                 # New dimensions
                 new_w = abs(im_w * math.cos(rad)) + abs(im_h * math.sin(rad))
@@ -1364,36 +1372,34 @@ class AppController(QObject):
                          new_h_norm = 1000
                          w_norm = new_h_norm * target_norm_ratio
                     # Recenter height
-                    cy = (t + b) / 2
-                    t = cy - new_h_norm / 2
-                    b = cy + new_h_norm / 2
+                    cy = (top + bottom) / 2
+                    top = cy - new_h_norm / 2
+                    bottom = cy + new_h_norm / 2
                     
                     # Clamp vertical
-                    if t < 0: 
-                        b -= t # shift down
-                        t = 0
-                    if b > 1000:
-                        t -= (b - 1000) # shift up
-                        b = 1000
-                        if t < 0: t = 0 # double clamp
+                    if top < 0: 
+                        bottom -= top # shift down
+                        top = 0
+                    if bottom > 1000:
+                        top -= (bottom - 1000) # shift up
+                        bottom = 1000
+                        if top < 0:
+                            top = 0 # double clamp
                     
                     # Recenter width (if changed)
-                    cx = (l + r) / 2
-                    l = cx - w_norm / 2
-                    r = cx + w_norm / 2
+                    cx = (left + right) / 2
+                    left = cx - w_norm / 2
+                    right = cx + w_norm / 2
                      
                     # Clamp horizontal
-                    if l < 0:
-                        r -= l
-                        l = 0
-                    if r > 1000:
-                        l -= (r - 1000)
-                        r = 1000
-                        if l < 0: l = 0
-
-                    # IMPORTANT: Don't mutate currentCropBox here.
-                    # Doing so during rotation causes the crop box to walk and jitter.
-                    # self.ui_state.currentCropBox = [l, t, r, b]
+                    if left < 0:
+                        right -= left
+                        left = 0
+                    if right > 1000:
+                        left -= (right - 1000)
+                        right = 1000
+                        if left < 0:
+                            left = 0
 
         log.debug(f"AppController.set_straighten_angle: {angle}")
         # Invert angle because QML rotation is CW but PIL rotation (used in editor) handles direction logic internally 
@@ -2084,15 +2090,15 @@ class AppController(QObject):
         # 1. Record eviction timestamp
         self._eviction_timestamps.append(now)
         
-        # 2. Prune timestamps older than 2 seconds
+        # 2. Prune timestamps older than window
         # Keep list short
-        cutoff = now - 2.0
+        cutoff = now - CACHE_THRASH_WINDOW_SECS
         self._eviction_timestamps = [t for t in self._eviction_timestamps if t > cutoff]
         
-        # 3. Check for thrashing (e.g., > 5 evictions in 2 seconds)
-        if len(self._eviction_timestamps) > 5:
-            # 4. Rate limit the warning (once every 5 minutes = 300 seconds)
-            if now - self._last_cache_warning_time > 300:
+        # 3. Check for thrashing (e.g., > threshold evictions in window)
+        if len(self._eviction_timestamps) > CACHE_THRASH_THRESHOLD:
+            # 4. Rate limit the warning
+            if now - self._last_cache_warning_time > CACHE_WARNING_COOLDOWN_SECS:
                 self._last_cache_warning_time = now
                 self._has_warned_cache_full = True
                 
@@ -2100,7 +2106,7 @@ class AppController(QObject):
                 used_gb = self.image_cache.currsize / (1024**3)
                 max_gb = self.image_cache.maxsize / (1024**3)
                 
-                msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in 2s. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
+                msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in {CACHE_THRASH_WINDOW_SECS}s. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
                 
                 # Use QTimer.singleShot to ensure this runs on the main thread
                 QTimer.singleShot(0, lambda: self.update_status_message(msg))
@@ -2647,7 +2653,7 @@ class AppController(QObject):
                  if editor_path:
                      try:
                          match = Path(editor_path).resolve() == Path(filepath).resolve()
-                     except Exception:
+                     except (OSError, ValueError):
                          match = str(editor_path) == str(filepath)
                  
                  if not match:
@@ -2837,7 +2843,7 @@ class AppController(QObject):
         if editor_path:
             try:
                 paths_match = Path(editor_path).resolve() == Path(filepath).resolve()
-            except Exception:
+            except (OSError, ValueError):
                 paths_match = str(editor_path) == str(filepath)
 
         if not paths_match:

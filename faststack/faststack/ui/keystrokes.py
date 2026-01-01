@@ -60,7 +60,7 @@ class Keybinder:
             (Qt.Key_Z, Qt.ControlModifier): "undo_delete",
             (Qt.Key_E, Qt.ControlModifier): "toggle_edited",
             (Qt.Key_S, Qt.ControlModifier): "toggle_stacked",
-            (Qt.Key_S, Qt.ControlModifier): "toggle_stacked",
+
             (Qt.Key_B, Qt.ControlModifier | Qt.ShiftModifier): "quick_auto_white_balance",
             (Qt.Key_1, Qt.ControlModifier): "zoom_100",
             (Qt.Key_2, Qt.ControlModifier): "zoom_200",

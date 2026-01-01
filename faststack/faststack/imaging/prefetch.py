@@ -34,8 +34,12 @@ _icc_transform_cache: Dict[tuple, ImageCms.ImageCmsTransform] = {}
 # Thread lock for all ICC caches
 _icc_cache_lock = threading.Lock()
 
-def get_icc_transform(src_profile: ImageCms.ImageCmsProfile, monitor_profile: ImageCms.ImageCmsProfile, 
-                      src_profile_key: str, monitor_profile_path: str):
+def get_icc_transform(
+    src_profile: ImageCms.ImageCmsProfile,
+    monitor_profile: ImageCms.ImageCmsProfile,
+    src_profile_key: str,
+    monitor_profile_path: str,
+) -> ImageCms.ImageCmsTransform:
     """Get or create a cached ICC transform.
     
     Building transforms is expensive, so we cache them by stable keys:
@@ -60,7 +64,7 @@ def clear_icc_caches():
         _monitor_profile_warning_logged = False
         log.info("Cleared ICC profile and transform caches")
 
-def get_monitor_profile():
+def get_monitor_profile() -> Optional[ImageCms.ImageCmsProfile]:
     """Dynamically load monitor ICC profile based on current config.
     
     Caches the profile by path to reduce overhead and log spam.
