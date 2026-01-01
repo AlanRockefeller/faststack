@@ -112,7 +112,9 @@ Item {
             panTransform.y = 0
         }
         function onAbsoluteZoomRequested(scale) {
-             console.log("QML: Absolute zoom requested: " + scale)
+             if (uiState && uiState.debugMode) {
+                 console.log("QML: Absolute zoom requested: " + scale)
+             }
              
              imageRotator.zoomScale = scale
              

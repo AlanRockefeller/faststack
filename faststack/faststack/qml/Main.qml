@@ -865,15 +865,21 @@ ApplicationWindow {
                       "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
                       "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
                       "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br><br>" +
+                      "&nbsp;&nbsp;Ctrl+1: Zoom to 100%<br><br>" +
+                      "&nbsp;&nbsp;Ctrl+2: Zoom to 200%<br><br>" +
+                      "&nbsp;&nbsp;Ctrl+3: Zoom to 300%<br><br>" +
+                      "&nbsp;&nbsp;Ctrl+4: Zoom to 400%<br><br>" +
                       "<b>Stacking:</b><br>" +
                       "&nbsp;&nbsp;[: Begin new stack<br>" +
                       "&nbsp;&nbsp;]: End current stack<br>" +
-                      "&nbsp;&nbsp;C: Clear all stacks<br><br>" +
+                      "&nbsp;&nbsp;C: Clear all stacks<br>" +
+                      "&nbsp;&nbsp;S: Toggle current image in/out of stack<br>" +
+                      "&nbsp;&nbsp;X: Remove current image from batch/stack<br><br>" +
                       "<b>Batch Selection (for drag-and-drop):</b><br>" +
                       "&nbsp;&nbsp;{: Begin new batch<br>" +
+                      "&nbsp;&nbsp;B: Toggle current image in/out of batch<br>" +
                       "&nbsp;&nbsp;}: End current batch<br>" +
                       "&nbsp;&nbsp;\\: Clear all batches<br>" +
-                      "&nbsp;&nbsp;X or S: Remove current image from batch/stack<br><br>" +
                       "<b>Flag Toggles:</b><br>" +
                       "&nbsp;&nbsp;U: Toggle uploaded flag<br>" +
                       "&nbsp;&nbsp;Ctrl+E: Toggle edited flag<br>" +
@@ -884,12 +890,15 @@ ApplicationWindow {
                       "<b>Actions:</b><br>" +
                       "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
                       "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
+                      "&nbsp;&nbsp;Backspace/Del: Move current image to recycle bin<br>" +
                       "&nbsp;&nbsp;A: Quick auto white balance (saves automatically)<br>" +
+                      "&nbsp;&nbsp;L: Quick auto levels (saves automatically)<br>" +
                       "&nbsp;&nbsp;Ctrl+Shift+B: Quick auto white balance (saves automatically)<br>" +
-                      "&nbsp;&nbsp;O: Toggle crop mode (Enter to execute crop, ESC to cancel)<br>" +
+                      "&nbsp;&nbsp;O (or right mouse click): Toggle crop mode (Enter to execute crop, ESC to cancel)<br>" +
                       "&nbsp;&nbsp;H: Toggle histogram window<br>" +
                       "&nbsp;&nbsp;E: Toggle Image Editor (closes without saving if open)<br>" +
-                      "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard"
+                      "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
+                      "&nbsp;&nbsp;Esc: Close active dialog, editor, or cancel crop"
                 padding: 10
                 wrapMode: Text.WordWrap
                 color: root.currentTextColor

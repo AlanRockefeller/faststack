@@ -14,6 +14,7 @@ import concurrent.futures
 import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime.warning=false"
 import PySide6
 from PySide6.QtGui import QDrag, QPixmap
 from PySide6.QtCore import (

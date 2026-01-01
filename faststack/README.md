@@ -1,6 +1,6 @@
 # FastStack
 
-# Version 1.4 - December 1, 2025
+# Version 1.5 - January 1, 2026
 # By Alan Rockefeller
 
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW or JPG files for focus stacking and website upload.
@@ -9,20 +9,20 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 
 ## Features
 
-- **Crop:** Added the ability to crop images via the cr(O)p hotkey.   It can be a freeform crop, or constrained to several popular aspect ratios.
+- **Crop:** Added the ability to crop and rotate images via the cr(O)p hotkey (or right mouse click).   It can be a freeform crop, or constrained to several popular aspect ratios.
 - **Zoom & Pan:** Smooth zooming and panning.
 - **Stack Selection:** Group images into stacks (`[`, `]`) and select them for processing (`S`).
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
 - **Instant Navigation:** Sub-10ms next/previous image switching, high performance decoding via `PyTurboJPEG`.
 - **Image Editor:** Built-in editor with exposure, contrast, white balance, sharpness, and more (E key)
 - **Quick Auto White Balance:** Press A to apply auto white balance and save automatically with undo support (Ctrl+Z).   For better white balance load the raw into Photoshop with the P key.
-- **Photoshop Integration:** Edit current image in Photoshop (P key) - always uses RAW files when available, even for backup files
+- **Photoshop Integration:** Edit current image in Photoshop (P key) - always uses RAW files when available.
 - **Clipboard Support:** Copy image path to clipboard (Ctrl+C)
 - **Image Filtering:** Filter images by filename
 - **Drag & Drop:** Drag images to external applications.   Press { and } to batch files to drag & drop multiple images.
 - **Theme Support:** Toggle between light and dark themes
 - **Delete & Undo:** Move images to recycle bin (Delete/Backspace) with undo support (Ctrl+Z)
-- **Has Memory:** Starts where you left off, tells you which images have been edited, stacked and uploaded
+- **Has Memory:** Starts where you left off, tells you which images have been edited, stacked and uploaded.
 - **RAW Pairing:** Automatically maps JPGs to their corresponding RAW files (`.CR3`, `.ARW`, `.NEF`, etc.).
 - **Configurable:** Adjust cache sizes, prefetch behavior, and Helicon Focus / Photoshop paths via a settings dialog and a persistent `.ini` file.
 - **Accurate Colors:** Uses monitor ICC profile to display colors correctly.
@@ -44,24 +44,34 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 
 - `J` / `Right Arrow`: Next Image
 - `K` / `Left Arrow`: Previous Image
-- `G`: Go to image #
-- `S`: Toggle selection of current image for stacking 
-- `B`: Toggle selection of current image for batch drag & drop
+- `G`: Jump to Image Number
+- `I`: Show EXIF Data
+- `S`: Toggle current image in/out of stack
+- `X`: Remove current image from batch/stack
+- `B`: Toggle current image in/out of batch
 - `[`: Begin new stack group
 - `]`: End current stack group
+- `C`: Clear all stacks
 - `{`: Begin new drag & drop batch
 - `}`: End current drag & drop batch
-- '\': Clear drag & drop batch
-- 'U': Toggle uploaded flag
-- 'Ctrl+E': Toggle edited flag
-- 'Ctrl+S': Toggle stacked flag
+- `\`: Clear drag & drop batch
+- `U`: Toggle uploaded flag
+- `Ctrl+E`: Toggle edited flag
+- `Ctrl+S`: Toggle stacked flag
 - `Enter`: Launch Helicon Focus with selected RAWs
 - `P`: Edit in Photoshop (uses RAW file if available)
-- `O`: Toggle crop mode (cr(O)p hotkey; Enter to crop, Esc to cancel)
+- `O` (or Right-Click): Toggle crop mode (Enter to execute, Esc to cancel)
 - `Delete` / `Backspace`: Move image to recycle bin
-- `Ctrl+Z`: Undo last action (delete or auto white balance)
+- `Ctrl+Z`: Undo last action (delete, auto white balance, or crop)
 - `A`: Quick auto white balance (saves automatically)
+- `Ctrl+Shift+B`: Quick auto white balance (alternate)
+- `L`: Quick auto levels (saves automatically)
 - `E`: Toggle Image Editor
+- `Esc`: Close active dialog, editor, or cancel crop
+- `H`: Toggle histogram window
 - `Ctrl+C`: Copy image path to clipboard
-- `Ctrl+0`: Reset zoom and pan
-- `C`: Clear all stacks
+- `Ctrl+0`: Reset zoom and pan to fit window
+- `Ctrl+1`: Zoom to 100%
+- `Ctrl+2`: Zoom to 200%
+- `Ctrl+3`: Zoom to 300%
+- `Ctrl+4`: Zoom to 400%

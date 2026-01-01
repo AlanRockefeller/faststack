@@ -2,6 +2,12 @@
 
 Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   
 
+
+## [1.5.0] - 2025-12-01
+
+- Fixed rotating images via the crop interface.
+- Control-1 zooms to 1:1 magnification (100%).   Control-2 to 200, etc to control-4 (400%).
+
 ## [1.4.0] - 2025-12-01
 
 - Changed how image caching works for even faster display.   
@@ -9,7 +15,7 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 - Added batch delete with confirmation dialog.
 - Added the --cachedebug command line argument which gives info on the image cache in the status bar.   Doesn't seem to slow down the program at all, just takes up room in the status bar.A
 - Added a setting that switches between image display optimized for speed or quality.
-- **Auto-Levels:** Automatic image enhancement with configurable threshold and strength
+- **Auto-Levels:** Automatic image enhancement with configurable threshold and strength (L key)
 - **Image Metadata:** Extract and display EXIF metadata (I key)
 - **Image Processing:** Auto white balance, texture enhancement, and straightening
 - **Crop Operations:** Fixed crop functionality with rotation support
