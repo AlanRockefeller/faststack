@@ -142,7 +142,7 @@ class UIState(QObject):
         self._is_editor_open = False
         self._is_cropping = False
         self._is_histogram_visible = False
-        self._histogram_data = None  # Will be a dict with 'r', 'g', 'b' arrays
+        self._histogram_data = {}  # Will be a dict with 'r', 'g', 'b' arrays
         self._brightness = 0.0
         self._contrast = 0.0
         self._saturation = 0.0
@@ -291,6 +291,18 @@ class UIState(QObject):
         if not self.app_controller.image_files:
             return ""
         return self.app_controller.get_current_metadata().get("edited_date", "")
+
+    @Property(bool, notify=metadataChanged)
+    def isRestacked(self):
+        if not self.app_controller.image_files:
+            return False
+        return self.app_controller.get_current_metadata().get("restacked", False)
+    
+    @Property(str, notify=metadataChanged)
+    def restackedDate(self):
+        if not self.app_controller.image_files:
+            return ""
+        return self.app_controller.get_current_metadata().get("restacked_date", "")
 
     @Property(str, notify=stackSummaryChanged)
     def stackSummary(self):
@@ -606,8 +618,32 @@ class UIState(QObject):
             self.is_histogram_visible_changed.emit(new_value)
             if new_value:
                 # Update histogram when opened
-                self.app_controller.update_histogram()
-    
+                try:
+                    self.app_controller.update_histogram()
+                except Exception as e:
+                    log.warning(f"Failed to update histogram: {e}")
+
+    @Slot()
+    def reset_editor_state(self):
+        """Resets all editor-related properties to their default values."""
+        self.brightness = 0.0
+        self.contrast = 0.0
+        self.saturation = 0.0
+        self.white_balance_by = 0.0
+        self.white_balance_mg = 0.0
+        self.sharpness = 0.0
+        self.rotation = 0
+        self.exposure = 0.0
+        self.highlights = 0.0
+        self.shadows = 0.0
+        self.vibrance = 0.0
+        self.vignette = 0.0
+        self.blacks = 0.0
+        self.whites = 0.0
+        self.clarity = 0.0
+        self.cropRotation = 0.0
+        self.currentCropBox = (0, 0, 1000, 1000)
+        self.currentAspectRatioIndex = 0    
     @Property('QVariant', notify=histogram_data_changed)
     def histogramData(self):
         """Returns histogram data as a dict with 'r', 'g', 'b' keys, each containing a list of 256 values."""
@@ -749,7 +785,8 @@ class UIState(QObject):
             self._current_crop_box = new_value
             self.current_crop_box_changed.emit(new_value)
             # Sync with ImageEditor
-            self.app_controller.image_editor.set_crop_box(new_value)
+            if hasattr(self.app_controller, 'image_editor') and self.app_controller.image_editor:
+                self.app_controller.image_editor.set_crop_box(new_value)
 
     @Property(float, notify=crop_rotation_changed)
     def cropRotation(self) -> float:

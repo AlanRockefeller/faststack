@@ -22,6 +22,8 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
     Returns:
         Tuple of (success: bool, tmp_path: Optional[Path]).
         Returns (True, tmp_path) if launched successfully, (False, None) otherwise.
+        On success, the caller is responsible for deleting the returned temporary file
+        after Helicon Focus completes processing.
     """
     helicon_exe = config.get("helicon", "exe")
     if not helicon_exe or not isinstance(helicon_exe, str):

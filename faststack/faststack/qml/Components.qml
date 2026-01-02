@@ -276,15 +276,14 @@ Item {
                 
                 rotation: mainMouseArea.cropRotation
                 
-                // Crop overlay - moved back to mainImage for Visual Orbit (Rotate Together)
-                // Coordinates are now Source Space, and backend handles conversion.
+                // Crop overlay - anchored to mainImage to rotate with it
                 Item {
                     id: cropOverlay
                     property var cropBox: uiState ? uiState.currentCropBox : [0, 0, 1000, 1000]
                     property bool hasActiveCrop: cropBox && cropBox.length === 4 && !(cropBox[0]===0 && cropBox[1]===0 && cropBox[2]===1000 && cropBox[3]===1000)
                     
                     visible: uiState && uiState.isCropping && (hasActiveCrop || mainMouseArea.isRotating)
-                    anchors.fill: parent // Fills mainImage (Source Space)
+                    anchors.fill: parent // Fills mainImage
                     z: 100
                     
                     onCropBoxChanged: { if (parent.source) updateCropRect() }
@@ -499,6 +498,8 @@ Item {
             }
 
 
+
+
         }
     }
 
@@ -656,21 +657,22 @@ Item {
                         
                         // Calculate start aspect ratio (in pixels)
                         if (mainImage.width > 0) {
-                            var box = uiState.currentCropBox
-                            if (box && box.length === 4) {
-                                var boxW = (box[2] - box[0]) / 1000 * mainImage.width
-                                var boxH = (box[3] - box[1]) / 1000 * mainImage.height
+                            var cb = uiState.currentCropBox
+                            if (cb && cb.length === 4) {
+                                var boxW = (cb[2] - cb[0]) / 1000 * mainImage.width
+                                var boxH = (cb[3] - cb[1]) / 1000 * mainImage.height
                                 cropStartAspect = boxW / boxH
                             }
                         }
 
 
                         // Seed cropBoxStart variables
-                        if (box && box.length === 4) {
-                            cropBoxStartLeft = box[0]
-                            cropBoxStartTop = box[1]
-                            cropBoxStartRight = box[2]
-                            cropBoxStartBottom = box[3]
+                        var startBox = uiState.currentCropBox
+                        if (startBox && startBox.length === 4) {
+                            cropBoxStartLeft = startBox[0]
+                            cropBoxStartTop = startBox[1]
+                            cropBoxStartRight = startBox[2]
+                            cropBoxStartBottom = startBox[3]
                         }
 
                         isCropDragging = true
@@ -721,7 +723,7 @@ Item {
             }
         }        
         // Legacy getCropRect removed - using Image Space hit testing instead.
-        // mapToImageCoordinates now maps directly to mainImage
+        // mapToImageCoordinates maps directly to mainImage
         function mapToImageCoordinates(screenPoint) {
             var p = mainMouseArea.mapToItem(mainImage, screenPoint.x, screenPoint.y)
             return {x: p.x / mainImage.width, y: p.y / mainImage.height}
@@ -747,14 +749,16 @@ Item {
                     // Update rotation in backend live (throttled)
                     if (controller) {
                         pendingRotation = cropRotation
-                        pendingAspect = cropStartAspect
+                        pendingAspect = -1
                         
                         if (!rotationThrottleTimer.running) {
                             rotationThrottleTimer.start()
                         }
                     }
-
-                    
+                    // Return early to prevent overwriting crop box during rotation
+                    return
+                } else {
+                    // Handle move/resize (edge dragging)
                     var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
 
                     // Clamp to image bounds and convert to 0-1000 range

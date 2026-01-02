@@ -48,7 +48,10 @@ Dialog {
             verticalAlignment: TextInput.AlignVCenter
             color: filterDialog.textColor
             background: Rectangle {
-                color: filterDialog.backgroundColor
+                color: Qt.lighter(filterDialog.backgroundColor, 1.2)
+                border.color: "#505050"
+                border.width: 1
+                radius: 2
             }
             
             onTextChanged: {
@@ -58,7 +61,6 @@ Dialog {
             Keys.onReturnPressed: filterDialog.accept()
             Keys.onEnterPressed: filterDialog.accept()
         }
-
         Label {
             text: "Leave empty to show all images."
             font.italic: true
@@ -71,17 +73,19 @@ Dialog {
 
     onOpened: {
         // Load current filter string from controller
-        var current = controller.get_filter_string ? controller.get_filter_string() : ""
+        var current = controller && controller.get_filter_string ? controller.get_filter_string() : ""
         filterDialog.filterString = current || ""
         filterField.text = filterDialog.filterString
         filterField.forceActiveFocus()
         filterField.selectAll()
         // Notify Python that a dialog is open
-        controller.dialog_opened()
-    }
-    
+        if (controller && controller.dialog_opened) {
+            controller.dialog_opened()
+        }
     onClosed: {
         // Notify Python that dialog is closed
-        controller.dialog_closed()
-    }
+        if (controller && controller.dialog_closed) {
+            controller.dialog_closed()
+        }
+    }    }
 }

@@ -81,7 +81,7 @@ def test_rotate_autocrop_rgb_behavior():
     # At 45 deg, a square becomes a diamond. The max inscribed rect is w/(sqrt(2)) ~ 0.707*w
     # 100 * 0.707 = 70. 
     # We expect roughly 70x70 minus inset.
-    expected_approx = 70.0
+    # expected_approx = 70.0
     assert 60 < res.width < 80
     assert 60 < res.height < 80
     
@@ -129,7 +129,7 @@ def test_integration_straighten_modes():
     editor.current_edits['straighten_angle'] = angle
     editor.current_edits['crop_box'] = None
     
-    res_b = editor._apply_edits(img.copy())
+    res_b = editor._apply_edits(img.copy(), for_export=True)
     
     # Should define a specific size based on autocrop
     w_b, h_b = res_b.size
@@ -177,11 +177,11 @@ def test_integration_straighten_modes():
     
     editor.current_edits['crop_box'] = (n_left, n_top, n_right, n_bottom)
     
-    res_a = editor._apply_edits(img.copy())
+    res_a = editor._apply_edits(img.copy(), for_export=True)
     
     # Allow for 1-2 pixel differences due to int/round conversions in normalization
-    assert abs(res_a.width - res_b.width) < 5
-    assert abs(res_a.height - res_b.height) < 5
+    assert abs(res_a.width - w_b) < 5
+    assert abs(res_a.height - h_b) < 5
     
     # Verify both are Green (center pixel)
     assert res_a.getpixel((res_a.width//2, res_a.height//2)) == (0, 255, 0)

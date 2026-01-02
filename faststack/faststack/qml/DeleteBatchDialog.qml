@@ -80,7 +80,7 @@ Dialog {
                 }
                 contentItem: Text {
                     text: parent.text
-                    color: "white"
+                    color: deleteBatchDialog.textColor
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                     font.bold: true

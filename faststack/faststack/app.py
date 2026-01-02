@@ -177,6 +177,13 @@ class AppController(QObject):
         self.resize_timer.timeout.connect(self._handle_resize)
         self.pending_width = None
         self.pending_height = None
+        
+        # Histogram Throttle Timer
+        self.histogram_timer = QTimer(self)
+        self.histogram_timer.setSingleShot(True)
+        self.histogram_timer.setInterval(50)  # 50ms throttle (max 20fps)
+        self.histogram_timer.timeout.connect(self._perform_update_histogram)
+        self._pending_histogram_args = None
 
         # Track if any dialog is open to disable keybindings
         self._dialog_open = False
@@ -665,6 +672,30 @@ class AppController(QObject):
         self.update_status_message(f"Marked as {status}")
         log.info("Toggled edited flag to %s for %s", meta.edited, stem)
     
+    def toggle_restacked(self):
+        """Toggle restacked flag for current image."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+        
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        stem = self.image_files[self.current_index].path.stem
+        meta = self.sidecar.get_metadata(stem)
+        
+        meta.restacked = not meta.restacked
+        if meta.restacked:
+            meta.restacked_date = today
+        else:
+            meta.restacked_date = None
+        
+        self.sidecar.save()
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.sync_ui_state()
+        status = "restacked" if meta.restacked else "not restacked"
+        self.update_status_message(f"Marked as {status}")
+        log.info("Toggled restacked flag to %s for %s", meta.restacked, stem)
+    
     def toggle_stacked(self):
         """Toggle stacked flag for current image."""
         if not self.image_files or self.current_index >= len(self.image_files):
@@ -716,6 +747,8 @@ class AppController(QObject):
             "uploaded_date": meta.uploaded_date or "",
             "edited": meta.edited,
             "edited_date": meta.edited_date or "",
+            "restacked": meta.restacked,
+            "restacked_date": meta.restacked_date or "",
             "stack_info_text": stack_info,
             "batch_info_text": batch_info
         }
@@ -1401,6 +1434,9 @@ class AppController(QObject):
                         if left < 0:
                             left = 0
 
+                    self.ui_state.currentCropBox = (left, top, right, bottom)
+                    self.image_editor.set_crop_box((left, top, right, bottom))
+
         log.debug(f"AppController.set_straighten_angle: {angle}")
         # Invert angle because QML rotation is CW but PIL rotation (used in editor) handles direction logic internally 
         # (ImageEditor._apply_edits uses negative angle for PIL).
@@ -1783,10 +1819,23 @@ class AppController(QObject):
         # This way indices don't shift as we delete
         sorted_indices = sorted(indices_to_delete, reverse=True)
 
-        previous_index = self.current_index
-        preserved_path = None
-        if self.image_files and self.current_index not in indices_to_delete:
-            preserved_path = self.image_files[self.current_index].path
+        # Determine where to land after deletion
+        # We prefer to land on the image that was *conceptually* at the same position,
+        # which means following the last deleted index if we were deleting from right to left,
+        # or just staying at the start index of the batch.
+        
+        # If we just deleted a batch at the end of the list, we clamp to new length-1
+        # If we deleted a batch in the middle, we want to be at the index that *was* 
+        # immediately after the batch (which now shifts down by deleted_count).
+        
+        # Simpler logic:
+        # If we had a batch starting at index S with N items.
+        # After deleting N items, the item that was at S+N matches the new item at S.
+        # So we should generally effectively stay at 'start' (which finds the next image).
+        # We need to find the smallest index that was part of the deletion.
+        min_deleted_index = min(sorted_indices)
+        
+        previous_index = self.current_index # This might be inside the deleted range
 
         # Create recycle bin if it doesn't exist
         try:
@@ -1835,8 +1884,16 @@ class AppController(QObject):
             
             # Refresh image list
             self.refresh_image_list()
+            
             if self.image_files:
-                self._reposition_after_delete(preserved_path, previous_index)
+                # Calculate new index
+                # We essentially want to be at 'min_deleted_index'
+                # But clamped to boundaries.
+                new_index = min_deleted_index
+                new_index = max(0, min(new_index, len(self.image_files) - 1))
+                
+                self.current_index = new_index
+                
                 # Clear cache and invalidate display generation to force image reload
                 self.display_generation += 1
                 self.image_cache.clear()
@@ -2496,7 +2553,7 @@ class AppController(QObject):
     @Slot()
     @Slot(float, float, float, float)  # zoom, panX, panY, imageScale
     def update_histogram(self, zoom: float = 1.0, pan_x: float = 0.0, pan_y: float = 0.0, image_scale: float = 1.0):
-        """Update histogram data from current image.
+        """Throttled request to update histogram. Updates continuously but capped at interval.
         
         Args:
             zoom: Zoom scale factor (1.0 = no zoom)
@@ -2504,8 +2561,25 @@ class AppController(QObject):
             pan_y: Pan offset in Y direction (in image coordinates)
             image_scale: Scale factor of displayed image vs original
         """
-        # Return immediately if histogram is not visible
-        if not self.ui_state.isHistogramVisible:
+        # Early guard: don't even schedule if nothing is showing the histogram
+        if not (self.ui_state.isHistogramVisible or self.ui_state.isEditorOpen):
+            self._pending_histogram_args = None
+            return
+
+        self._pending_histogram_args = (zoom, pan_x, pan_y, image_scale)
+        if not self.histogram_timer.isActive():
+            self.histogram_timer.start()
+
+    def _perform_update_histogram(self):
+        """Actual histogram computation logic (called by timer)."""
+        if not self._pending_histogram_args:
+            return
+        
+        zoom, pan_x, pan_y, image_scale = self._pending_histogram_args
+        self._pending_histogram_args = None
+
+        # Return immediately if neither histogram window nor editor is visible
+        if not (self.ui_state.isHistogramVisible or self.ui_state.isEditorOpen):
             return
 
         if not self.image_files or self.current_index >= len(self.image_files):
@@ -2616,7 +2690,51 @@ class AppController(QObject):
         except Exception as e:
             log.exception("Failed to compute histogram: %s", e)
             self.update_status_message(f"Histogram error: {e}")
+        
+        # Check if new requests arrived while we were computing
+        if self._pending_histogram_args is not None:
+            self.histogram_timer.start()
     
+    @Slot()
+    def execute_crop(self):
+        """Execute crop."""
+        if not self.ui_state.isCropping:
+            return
+
+        try:
+            crop_box_raw = self.ui_state.currentCropBox
+
+            if isinstance(crop_box_raw, list):
+                crop_box_raw = tuple(crop_box_raw)
+
+            # if it is a QVariant, try toVariant
+            if not isinstance(crop_box_raw, tuple) and hasattr(crop_box_raw, "toVariant"):
+                try:
+                    crop_box_raw = tuple(crop_box_raw.toVariant())
+                except Exception:
+                    pass
+
+            if not (isinstance(crop_box_raw, tuple) and len(crop_box_raw) == 4):
+                 self.update_status_message("Invalid crop box")
+                 return
+            
+            # Apply crop by setting the crop box (this also updates UI state via set_crop_box)
+            # Ensure values are ints
+            left, top, right, bottom = map(int, crop_box_raw)
+            self.set_crop_box(left, top, right, bottom)
+            
+            # Exit crop mode
+            self.ui_state.isCropping = False
+            
+            # Apply edits (which includes crop) to preview
+            self.ui_refresh_generation += 1
+            self.ui_state.currentImageSourceChanged.emit()
+            self.update_status_message("Crop applied")
+
+        except Exception as e:
+            log.exception("Failed to execute crop: %s", e)
+            self.update_status_message(f"Crop failed: {e}")
+
     @Slot()
     def cancel_crop_mode(self):
          """Cancel crop mode without applying changes."""
@@ -2793,6 +2911,18 @@ class AppController(QObject):
         success = self._launch_helicon_with_files(found_raw_files)
 
         if success:
+            # Mark as restacked on success
+            from datetime import datetime
+            today = datetime.now().strftime("%Y-%m-%d")
+            stem = self.image_files[self.current_index].path.stem
+            meta = self.sidecar.get_metadata(stem)
+            meta.restacked = True
+            meta.restacked_date = today
+            self.sidecar.save()
+            self._metadata_cache_index = (-1, -1)
+            self.dataChanged.emit()
+            self.sync_ui_state()
+            
             self.update_status_message("Helicon Focus launched successfully.")
         else:
             self.update_status_message("Failed to launch Helicon Focus.")
@@ -2814,16 +2944,17 @@ class AppController(QObject):
         # This is the single source of truth since set_straighten_angle updates it live.
         current_rotation = float(self.image_editor.current_edits.get("straighten_angle", 0.0))
 
-        # Ensure ImageEditor has the latest crop box (it should be synced via UIState, but good to be safe)
         crop_box_raw = self.ui_state.currentCropBox
-        # ... (validation code remains similar or can be simplified since UIState validates) ...
-        # For robustness, we'll trust UIState's validation or do a quick check
+
+        # Ensure ImageEditor has the latest crop box (it should be synced via UIState, but good to be safe)
         if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:
              # Try to convert if it came as list
              try:
                  crop_box_raw = tuple(crop_box_raw) if isinstance(crop_box_raw, list) else tuple(crop_box_raw.toVariant())
-             except:
+             except Exception:
                  pass
+        
+        if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:                 pass
         
         if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:
              self.update_status_message("Invalid crop box")

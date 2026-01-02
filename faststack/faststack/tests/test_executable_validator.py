@@ -86,7 +86,7 @@ def test_non_exe_file():
 
 def test_is_executable_windows():
     """Test _is_executable on Windows."""
-    with patch('os.name', 'nt'):
+    with patch('os.name', new='nt'):
         exe_path = MagicMock()
         exe_path.suffix.lower.return_value = '.exe'
         assert _is_executable(exe_path)
@@ -94,7 +94,6 @@ def test_is_executable_windows():
         txt_path = MagicMock()
         txt_path.suffix.lower.return_value = '.txt'
         assert not _is_executable(txt_path)
-
 
 def test_is_subpath():
     """Test _is_subpath logic."""

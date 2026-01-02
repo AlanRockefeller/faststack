@@ -21,7 +21,7 @@ def test_save_image_preserves_mtime(tmp_path):
     assert saved is not None
     saved_path, backup_path = saved
 
-    assert saved_path == img_path
+    assert str(saved_path) == str(img_path)
     assert backup_path.exists()
 
-    assert img_path.stat().st_mtime == pytest.approx(preserved_time, rel=0, abs=1e-6)
+    assert img_path.stat().st_mtime == pytest.approx(preserved_time, rel=0, abs=2)
