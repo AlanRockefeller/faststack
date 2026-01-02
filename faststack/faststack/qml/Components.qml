@@ -276,15 +276,14 @@ Item {
                 
                 rotation: mainMouseArea.cropRotation
                 
-                // Crop overlay - moved back to mainImage for Visual Orbit (Rotate Together)
-                // Coordinates are now Source Space, and backend handles conversion.
+                // Crop overlay - anchored to mainImage to rotate with it
                 Item {
                     id: cropOverlay
                     property var cropBox: uiState ? uiState.currentCropBox : [0, 0, 1000, 1000]
                     property bool hasActiveCrop: cropBox && cropBox.length === 4 && !(cropBox[0]===0 && cropBox[1]===0 && cropBox[2]===1000 && cropBox[3]===1000)
                     
                     visible: uiState && uiState.isCropping && (hasActiveCrop || mainMouseArea.isRotating)
-                    anchors.fill: parent // Fills mainImage (Source Space)
+                    anchors.fill: parent // Fills mainImage
                     z: 100
                     
                     onCropBoxChanged: { if (parent.source) updateCropRect() }
@@ -499,6 +498,8 @@ Item {
             }
 
 
+
+
         }
     }
 
@@ -670,8 +671,8 @@ Item {
                         if (startBox && startBox.length === 4) {
                             cropBoxStartLeft = startBox[0]
                             cropBoxStartTop = startBox[1]
-                            cropBoxStartRight = box[2]
-                            cropBoxStartBottom = box[3]
+                            cropBoxStartRight = startBox[2]
+                            cropBoxStartBottom = startBox[3]
                         }
 
                         isCropDragging = true
@@ -722,7 +723,7 @@ Item {
             }
         }        
         // Legacy getCropRect removed - using Image Space hit testing instead.
-        // mapToImageCoordinates now maps directly to mainImage
+        // mapToImageCoordinates maps directly to mainImage
         function mapToImageCoordinates(screenPoint) {
             var p = mainMouseArea.mapToItem(mainImage, screenPoint.x, screenPoint.y)
             return {x: p.x / mainImage.width, y: p.y / mainImage.height}
@@ -748,7 +749,7 @@ Item {
                     // Update rotation in backend live (throttled)
                     if (controller) {
                         pendingRotation = cropRotation
-                        pendingAspect = cropStartAspect
+                        pendingAspect = -1
                         
                         if (!rotationThrottleTimer.running) {
                             rotationThrottleTimer.start()
