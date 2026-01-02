@@ -28,3 +28,4 @@ AGENTS.md
 faststack/.mypy_cache/
 .mypy_cache/
 var/
+faststack.egg-info/

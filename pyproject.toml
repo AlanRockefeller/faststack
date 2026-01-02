@@ -38,8 +38,9 @@ faststack = "faststack.app:cli"
 packages = ["faststack"]
 
 
-[tool.pytst.ini_options]
+[tool.pytest.ini_options]
+testpaths = ["faststack/tests"]
 python_files = ["test_*.py"]
 addopts = "-p no:cacheprovider -p no:doctest"
-norecursedirs = ["var"]
+norecursedirs = ["var", ".venv"]
 
