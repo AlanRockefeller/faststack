@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 name = "faststack"
 version = "1.4"
 authors = [
-    { name="Alan Rockefeller", email="alanrockefeller at gmail" },
+    { name="Alan Rockefeller"},
 ]
 description = "Ultra-fast JPG Viewer for Focus Stacking Selection"
 readme = "README.md"
@@ -36,3 +36,11 @@ faststack = "faststack.app:cli"
 
 [tool.setuptools]
 packages = ["faststack"]
+
+
+[tool.pytst.ini_options]
+python_files = ["test_*.py"]
+addopts = "-p no:cacheprovider -p no:doctest"
+norecursedirs = ["var"]
+e
+

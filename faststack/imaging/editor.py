@@ -11,7 +11,11 @@ from PIL import Image, ImageEnhance, ImageFilter
 from io import BytesIO
 
 from faststack.models import DecodedImage
-from PySide6.QtGui import QImage
+try:
+    from PySide6.QtGui import QImage
+except Exception:
+    QImage = None
+
 import threading
 
 log = logging.getLogger(__name__)
@@ -551,6 +555,10 @@ class ImageEditor:
 
         # Heavy computation outside lock using snapshot
         img = self._apply_edits(base, edits=edits, for_export=False)
+
+        if QImage is None:
+            raise ImportError("PySide6.QtGui.QImage is required for get_preview_data_cached")
+
         # The image is in RGB mode after _apply_edits
         buffer = img.tobytes()
         decoded = DecodedImage(
