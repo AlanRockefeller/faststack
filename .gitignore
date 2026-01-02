@@ -32,3 +32,7 @@ faststack.egg-info/
 
 # Local-only docs
 ARCHITECTURE.md
+
+# Local test/debug outputs
+out.txt
+test_out*.txt
