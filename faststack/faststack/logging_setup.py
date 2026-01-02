@@ -37,7 +37,7 @@ def setup_logging(debug: bool = False):
 
     root_logger = logging.getLogger()
     # Set log level based on debug flag
-    root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    root_logger.setLevel(logging.DEBUG if debug else logging.WARNING)
     root_logger.handlers.clear()
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)

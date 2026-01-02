@@ -191,6 +191,12 @@ class ImageEditor:
         # Optionally also reset edits if that matches your mental model:
         # self.current_edits = self._initial_edits()
 
+    def reset_edits(self):
+        """Reset edits to initial values and bump revision."""
+        with self._lock:
+            self.current_edits = self._initial_edits()
+            self._edits_rev += 1
+
     def _initial_edits(self) -> Dict[str, Any]:
         return {
             'brightness': 0.0,

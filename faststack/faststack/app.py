@@ -2538,7 +2538,7 @@ class AppController(QObject):
     @Slot()
     def reset_edit_parameters(self):
         """Resets all editing parameters in the editor."""
-        self.image_editor.current_edits = self.image_editor._initial_edits()
+        self.image_editor.reset_edits()
         if hasattr(self.ui_state, 'reset_editor_state'):
             self.ui_state.reset_editor_state()
 
@@ -2648,9 +2648,25 @@ class AppController(QObject):
             # But histogram is mostly for edits. If preview_data is None, we likely can't compute anyway.
             # We can try to peek at the image editor if _last_rendered_preview is unset.
             preview_data = self.image_editor.get_preview_data_cached(allow_compute=False)
+        
+        # If still no data, we cannot compute the histogram.
+        # Ensure we don't drop the request: keep _hist_pending set (it was cleared above, restore it?)
+        # Or just rely on the next preview update to trigger a histogram refresh.
+        if not preview_data:
+            self._hist_inflight = False
+            # Restore pending args so the next timer tick (or preview completion) retries
+            self._hist_pending = args
+            # Make sure timer is running to retry
+            if not self.histogram_timer.isActive():
+                self.histogram_timer.start()
+            return
 
-        fut = self._hist_executor.submit(self._compute_histogram_worker, token, args, preview_data)
-        fut.add_done_callback(self._on_histogram_done)
+        try:
+            fut = self._hist_executor.submit(self._compute_histogram_worker, token, args, preview_data)
+            fut.add_done_callback(self._on_histogram_done)
+        except RuntimeError:
+            log.warning("Histogram executor failed (shutting down?)")
+            self._hist_inflight = False
 
     @staticmethod
     def _compute_histogram_worker(token, args, decoded):
@@ -2763,8 +2779,12 @@ class AppController(QObject):
             token = self._preview_token
 
         # Submit task to dedicated preview executor
-        fut = self._preview_executor.submit(self._render_preview_worker, token, self.image_editor)
-        fut.add_done_callback(self._on_preview_done)
+        try:
+            fut = self._preview_executor.submit(self._render_preview_worker, token, self.image_editor)
+            fut.add_done_callback(self._on_preview_done)
+        except RuntimeError:
+            log.warning("Preview executor failed (shutting down?)")
+            self._preview_inflight = False
 
     @staticmethod
     def _render_preview_worker(token, image_editor):
