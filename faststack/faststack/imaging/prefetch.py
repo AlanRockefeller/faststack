@@ -419,10 +419,11 @@ class Prefetcher:
                         
                         if self.debug:
                             decoder = "TurboJPEG" if TURBO_AVAILABLE else "Pillow"
-                            log.info("ICC fallback decode timing for index %d (%s): read=%.3fs, decode=%.3fs, total=%.3fs, size=%dx%d",
+                            log.info("ICC fallback decode timing for index %d (%s): read=%.3fs, decode=%.3fs, copy=%.3fs, total=%.3fs, size=%dx%d",
                                      index, decoder, t_after_fallback_read - t_before_fallback_read,
                                      t_after_fallback_decode - t_after_fallback_read,
-                                     t_after_fallback_decode - t_start, w, h)
+                                     t_after_copy - t_after_fallback_decode,
+                                     t_after_copy - t_start, w, h)
                 else:
                     # Fall back to standard decode if ICC profile not available
                     log.warning("ICC mode selected but no monitor profile available, using standard decode")
@@ -452,9 +453,10 @@ class Prefetcher:
                     
                     if self.debug:
                         decoder = "TurboJPEG" if TURBO_AVAILABLE else "Pillow"
-                        log.info("Standard decode timing (no ICC profile) for index %d (%s): read=%.3fs, decode=%.3fs, total=%.3fs, size=%dx%d",
+                        log.info("Standard decode timing (no ICC profile) for index %d (%s): read=%.3fs, decode=%.3fs, copy=%.3fs, total=%.3fs, size=%dx%d",
                                  index, decoder, t_after_read - t_before_read, t_after_decode - t_after_read,
-                                 t_after_decode - t_start, w, h)
+                                 t_after_copy - t_after_decode,
+                                 t_after_copy - t_start, w, h)
             
             else:
                 # Standard decode path (Option A or no color management)

@@ -89,15 +89,12 @@ Window {
     Component {
         id: sectionHeader
         Label {
-            text: headerText
             font.bold: true
             font.pixelSize: 15
             font.letterSpacing: 1.0
             color: imageEditorDialog.accentColorHover
             Layout.topMargin: 5
             Layout.bottomMargin: 10
-            
-            property string headerText: ""
         }
     }
 
@@ -122,8 +119,8 @@ Window {
                 // --- Light Group ---
                 Loader { 
                     sourceComponent: sectionHeader 
-                    property string headerText: "☀ Light" 
                     Layout.topMargin: 0 // Remove top margin for the very first item
+                    onLoaded: item.text = "☀ Light"
                 }
                 ListModel {
                     id: lightModel
@@ -140,7 +137,10 @@ Window {
                 Loader { sourceComponent: sectionSeparator }
 
                 // --- Detail Group ---
-                Loader { sourceComponent: sectionHeader; property string headerText: "🔍 Detail" }
+                Loader { 
+                    sourceComponent: sectionHeader
+                    onLoaded: item.text = "🔍 Detail"
+                }
                 ListModel {
                     id: detailModel
                     ListElement { name: "Clarity"; key: "clarity" }
@@ -216,8 +216,8 @@ Window {
                 // --- Color Group ---
                 Loader { 
                     sourceComponent: sectionHeader 
-                    property string headerText: "🎨 Color" 
                     Layout.topMargin: 0 // Remove top margin for the very first item
+                    onLoaded: item.text = "🎨 Color"
                 }
                 ListModel {
                     id: colorModel
@@ -254,7 +254,10 @@ Window {
                 Loader { sourceComponent: sectionSeparator }
 
                 // --- Effects Group ---
-                Loader { sourceComponent: sectionHeader; property string headerText: "✨ Effects" }
+                Loader { 
+                    sourceComponent: sectionHeader
+                    onLoaded: item.text = "✨ Effects"
+                }
                 ListModel {
                     id: effectsModel
                     ListElement { name: "Vignette"; key: "vignette"; min: 0; max: 100 }
@@ -264,7 +267,10 @@ Window {
                 Loader { sourceComponent: sectionSeparator }
 
                 // --- Transform Group ---
-                Loader { sourceComponent: sectionHeader; property string headerText: "🔄 Transform" }
+                Loader { 
+                    sourceComponent: sectionHeader
+                    onLoaded: item.text = "🔄 Transform"
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 15
@@ -391,7 +397,28 @@ Window {
                     return isReversed ? -val : val
                 }
                 
-                value: backendValue
+                // Auto-sync visual slider with backend changes when not dragging
+                Binding {
+                    target: slider
+                    property: "value"
+                    value: slider.backendValue
+                    when: !slider.pressed
+                }
+
+                property real _pendingValue: 0
+                property real _lastSentValue: 0
+                Timer {
+                    id: sendTimer
+                    interval: 32 // ~30fps throttle
+                    repeat: true
+                    onTriggered: {
+                        if (Math.abs(slider._pendingValue - slider._lastSentValue) > 0.001) {
+                            var sendValue = slider.isReversed ? -slider._pendingValue : slider._pendingValue
+                            controller.set_edit_parameter(model.key, sendValue / maxVal)
+                            slider._lastSentValue = slider._pendingValue
+                        }
+                    }
+                }
                 
                 Connections {
                     target: imageEditorDialog
@@ -403,10 +430,8 @@ Window {
                 }
                 
                 onMoved: {
-                    var sendValue = isReversed ? -value : value
-                    controller.set_edit_parameter(model.key, sendValue / maxVal)
-                    // Trigger live histogram update (throttled by Python backend)
-                    if (controller) controller.update_histogram()
+                    _pendingValue = value
+                    if (!sendTimer.running) sendTimer.start()
                 }
                 
                 property double lastPressTime: 0
@@ -429,9 +454,16 @@ Window {
                         lastPressValue = value
                         
                         imageEditorDialog.slidersPressedCount++
+                        _pendingValue = value
+                        if (!sendTimer.running) sendTimer.start()
                     } else {
                         imageEditorDialog.slidersPressedCount--
-                        // Update histogram on release
+                        
+                        // Stop repeating sends, then send final value immediately
+                        sendTimer.stop()
+                        var sendValue = isReversed ? -value : value
+                        controller.set_edit_parameter(model.key, sendValue / maxVal)
+                        
                         if (controller) controller.update_histogram()
                     }
                 }

@@ -85,6 +85,8 @@ CACHE_WARNING_COOLDOWN_SECS = 300
 class AppController(QObject):
     dataChanged = Signal() # New signal for general data changes
     is_zoomed_changed = Signal(bool) # Signal for zoom state changes
+    histogramReady = Signal(object) # Signal for off-thread histogram result
+    previewReady = Signal(object) # Signal for off-thread preview result
 
     class ProgressReporter(QObject):
         progress_updated = Signal(int)
@@ -92,6 +94,24 @@ class AppController(QObject):
 
     def __init__(self, image_dir: Path, engine: QQmlApplicationEngine, debug_cache: bool = False):
         super().__init__()
+        # Histogram Offloading Setup
+        self._hist_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._hist_inflight = False
+        self._hist_pending = None
+        self._hist_token = 0
+        self._hist_lock = threading.Lock()
+        self.histogramReady.connect(self._apply_histogram_result)
+        self.previewReady.connect(self._apply_preview_result)
+
+        # Preview Offloading Setup
+        self._preview_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._preview_inflight = False
+        self._preview_pending = False
+        self._preview_token = 0
+        self._preview_lock = threading.Lock()
+        self._last_rendered_preview = None # Store latest valid render
+        self._shutting_down = False # Flag to gate async callbacks during shutdown
+
         self.image_dir = image_dir
         self.image_files: List[ImageFile] = []  # Filtered list for display
         self._all_images: List[ImageFile] = []  # Cached full list from disk
@@ -100,6 +120,9 @@ class AppController(QObject):
         self.main_window: Optional[QObject] = None
         self.engine = engine
         self.debug_cache = debug_cache # New debug_cache flag
+        
+        # Ensure clean shutdown of background threads
+        QCoreApplication.instance().aboutToQuit.connect(self._shutdown_executors)
 
         self.display_width = 0
         self.display_height = 0
@@ -182,8 +205,14 @@ class AppController(QObject):
         self.histogram_timer = QTimer(self)
         self.histogram_timer.setSingleShot(True)
         self.histogram_timer.setInterval(50)  # 50ms throttle (max 20fps)
-        self.histogram_timer.timeout.connect(self._perform_update_histogram)
-        self._pending_histogram_args = None
+        self.histogram_timer.timeout.connect(self._kick_histogram_worker)
+
+        # Preview Refresh Timer (Coalescing)
+        self._preview_refresh_pending = False
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(33) # ~30fps cap for smoother dragging
+        self.preview_timer.timeout.connect(self._do_preview_refresh)
 
         # Track if any dialog is open to disable keybindings
         self._dialog_open = False
@@ -235,6 +264,7 @@ class AppController(QObject):
     def get_display_info(self):
         if self.is_zoomed:
             return 0, 0, self.display_generation
+
         return self.display_width, self.display_height, self.display_generation
 
     def on_display_size_changed(self, width: int, height: int):
@@ -431,11 +461,10 @@ class AppController(QObject):
                 # Debug log if mismatch
                 log.debug(f"Path mismatch in preview. Editor: {editor_path}, File: {file_path}")
             
-            # Return preview if Editor is open OR Cropping is active (for live rotation)
+            # Return background-rendered preview if Editor is open OR Cropping is active
             if match and self.image_editor.original_image:
-                preview_data = self.image_editor.get_preview_data()
-                if preview_data:
-                    return preview_data
+                if self._last_rendered_preview:
+                    return self._last_rendered_preview
 
         _, _, display_gen = self.get_display_info()
         image_path = self.image_files[index].path
@@ -1835,8 +1864,6 @@ class AppController(QObject):
         # We need to find the smallest index that was part of the deletion.
         min_deleted_index = min(sorted_indices)
         
-        previous_index = self.current_index # This might be inside the deleted range
-
         # Create recycle bin if it doesn't exist
         try:
             self.recycle_bin_dir.mkdir(parents=True, exist_ok=True)
@@ -2126,6 +2153,13 @@ class AppController(QObject):
         self.prefetcher.shutdown()
         self.sidecar.set_last_index(self.current_index)
         self.sidecar.save()
+
+    def _shutdown_executors(self):
+        """Explicitly shuts down thread pools on app exit to prevent hanging."""
+        self._shutting_down = True
+        log.info("Shutting down background executors...")
+        self._hist_executor.shutdown(wait=False, cancel_futures=True)
+        self._preview_executor.shutdown(wait=False, cancel_futures=True)
 
     def empty_recycle_bin(self):
         """Permanently deletes all files in the recycle bin."""
@@ -2448,6 +2482,10 @@ class AppController(QObject):
                 self.ui_state.aspectRatioNames = [r['name'] for r in ASPECT_RATIOS]
                 self.ui_state.currentAspectRatioIndex = 0
                 self.ui_state.currentCropBox = (0, 0, 1000, 1000) # Reset crop box visually
+                
+                # Kick off initial background preview render
+                self._kick_preview_worker()
+                
                 return True
         return False
 
@@ -2456,21 +2494,38 @@ class AppController(QObject):
         """Gets the preview data of the currently edited image as a DecodedImage."""
         return self.image_editor.get_preview_data()
 
+    def _do_preview_refresh(self):
+        self._preview_refresh_pending = False
+        self._kick_preview_worker()
+
     @Slot(str, "QVariant")
     def set_edit_parameter(self, key: str, value: Any):
         """Sets an edit parameter and updates the UIState for the slider visual."""
-        if self.image_editor.set_edit_param(key, value):
-            # Update the corresponding UIState property to reflect the new value in QML
-            if hasattr(self.ui_state, key):
-                setattr(self.ui_state, key, value)
-
-            # Trigger a refresh of the image to show the edit
-            self.ui_refresh_generation += 1
-            self.ui_state.currentImageSourceChanged.emit()
+        try:
+            # Update actual edit state (this bumps _edits_rev and invalidates preview cache)
+            changed = False
+            if self.ui_state.isEditorOpen:
+                changed = self.image_editor.set_edit_param(key, value)
             
-            # Update histogram if visible
-            if self.ui_state.isHistogramVisible:
-                self.update_histogram()
+            # Sync UI state with backend (e.g., rotation might be rounded)
+            final_value = value
+            if changed:
+                # Use thread-safe accessor to get the actual value applied
+                actual = self.image_editor.get_edit_value(key)
+                if actual is not None:
+                    final_value = actual
+
+            # Update UI state regardless (visual sliders need to match what user dragged, OR the clamped backend value)
+            if hasattr(self.ui_state, key):
+                setattr(self.ui_state, key, final_value)
+
+            # Trigger a refresh of the image to show the edit (throttled), ONLY if something changed
+            if changed:
+                if not self._preview_refresh_pending:
+                    self._preview_refresh_pending = True
+                    self.preview_timer.start()
+        except Exception as e:
+            log.error("Error setting edit parameter %s=%s: %s", key, value, e)
 
     @Slot(int, int, int, int)
     def set_crop_box(self, left: int, top: int, right: int, bottom: int):
@@ -2489,7 +2544,7 @@ class AppController(QObject):
 
         # Trigger a refresh to show the reset image
         self.ui_refresh_generation += 1
-        self.ui_state.currentImageSourceChanged.emit()
+        self._kick_preview_worker()
 
     @Slot()
     def save_edited_image(self):
@@ -2563,97 +2618,79 @@ class AppController(QObject):
         """
         # Early guard: don't even schedule if nothing is showing the histogram
         if not (self.ui_state.isHistogramVisible or self.ui_state.isEditorOpen):
-            self._pending_histogram_args = None
+            self._hist_pending = None
             return
 
-        self._pending_histogram_args = (zoom, pan_x, pan_y, image_scale)
-        if not self.histogram_timer.isActive():
+        self._hist_pending = (zoom, pan_x, pan_y, image_scale)
+        if not self.histogram_timer.isActive() and not self._hist_inflight:
             self.histogram_timer.start()
 
-    def _perform_update_histogram(self):
-        """Actual histogram computation logic (called by timer)."""
-        if not self._pending_histogram_args:
+    def _kick_histogram_worker(self):
+        if getattr(self, "_shutting_down", False):
             return
-        
-        zoom, pan_x, pan_y, image_scale = self._pending_histogram_args
-        self._pending_histogram_args = None
-
-        # Return immediately if neither histogram window nor editor is visible
-        if not (self.ui_state.isHistogramVisible or self.ui_state.isEditorOpen):
+        if self._hist_inflight:
+            return
+        if self._hist_pending is None:
             return
 
-        if not self.image_files or self.current_index >= len(self.image_files):
-            return
-        
+        args = self._hist_pending
+        self._hist_pending = None
+
+        with self._hist_lock:
+            self._hist_token += 1
+            token = self._hist_token
+        self._hist_inflight = True
+
+        # Snap the currently known preview data to avoid racing with the editor
+        preview_data = self._last_rendered_preview
+        if not preview_data:
+            # Fallback for initial load if no edit preview yet (could use get_decoded_image?)
+            # But histogram is mostly for edits. If preview_data is None, we likely can't compute anyway.
+            # We can try to peek at the image editor if _last_rendered_preview is unset.
+            preview_data = self.image_editor.get_preview_data_cached(allow_compute=False)
+
+        fut = self._hist_executor.submit(self._compute_histogram_worker, token, args, preview_data)
+        fut.add_done_callback(self._on_histogram_done)
+
+    @staticmethod
+    def _compute_histogram_worker(token, args, decoded):
+        # IMPORTANT: do not touch QObjects here except thread-safe plain data
+        zoom, pan_x, pan_y, image_scale = args
+
+        # Use explicitly passed decoded data
+        if not decoded:
+            return token, None
+
+        import numpy as np
         try:
-            # Get the current image data
-            decoded = None
-            
-            # If editor is open and has a preview, use that instead
-            if self.ui_state.isEditorOpen and self.image_editor.original_image:
-                preview_data = self.image_editor.get_preview_data()
-                if preview_data:
-                    decoded = preview_data
-            
-            # Fallback to cached image
-            if not decoded:
-                decoded = self.get_decoded_image(self.current_index)
-            
-            if not decoded:
-                return
-            
-            # Convert buffer to numpy array
-            arr = np.frombuffer(decoded.buffer, dtype=np.uint8)
-            arr = arr.reshape((decoded.height, decoded.width, 3))
+            arr = np.frombuffer(decoded.buffer, dtype=np.uint8).reshape((decoded.height, decoded.width, 3))
             
             # If zoomed in, calculate visible region and only use that portion
-            if zoom > 1.1 and self.ui_state.isZoomed:
-                # Calculate visible region in image coordinates
-                # When zoomed, the visible area is the original image size divided by zoom
-                # The pan_x/pan_y are in screen coordinates relative to transform origin (center)
-                # image_scale is the scale factor of displayed image vs original
-                
-                # Visible size in original image coordinates
-                visible_width = decoded.width / zoom
-                visible_height = decoded.height / zoom
-                
-                # Center of visible region in image coordinates
-                # pan_x/pan_y are screen pixel offsets, convert to image pixels
-                # Account for image_scale: if image is scaled down for display, pan needs scaling too
-                center_x = decoded.width / 2
-                center_y = decoded.height / 2
-                
-                # Convert pan from screen pixels to image pixels
-                # If image_scale < 1, the image is displayed smaller, so pan needs to be scaled up
-                pan_x_image = pan_x / image_scale if image_scale > 0 else 0
-                pan_y_image = pan_y / image_scale if image_scale > 0 else 0
-                
-                # The visible center in image coordinates (accounting for pan)
-                visible_center_x = center_x - (pan_x_image / zoom)
-                visible_center_y = center_y - (pan_y_image / zoom)
-                
-                # Calculate bounds
-                visible_x_start = max(0, int(visible_center_x - visible_width / 2))
-                visible_y_start = max(0, int(visible_center_y - visible_height / 2))
-                visible_x_end = min(decoded.width, int(visible_center_x + visible_width / 2))
-                visible_y_end = min(decoded.height, int(visible_center_y + visible_height / 2))
-                
-                # Ensure we have valid bounds
-                if visible_x_end > visible_x_start and visible_y_end > visible_y_start:
-                    # Extract only the visible portion
-                    arr = arr[visible_y_start:visible_y_end, visible_x_start:visible_x_end, :]
-                    log.debug(f"Histogram: Using zoomed region {visible_x_start},{visible_y_start} to {visible_x_end},{visible_y_end} (zoom={zoom:.2f}, pan=({pan_x:.1f},{pan_y:.1f}))")
-            
-            # --- New Histogram Logic ---
+            if zoom > 1.1:
+                 visible_width = decoded.width / zoom
+                 visible_height = decoded.height / zoom
+                 center_x = decoded.width / 2
+                 center_y = decoded.height / 2
+                 pan_x_image = pan_x / image_scale if image_scale > 0 else 0
+                 pan_y_image = pan_y / image_scale if image_scale > 0 else 0
+                 visible_center_x = center_x - (pan_x_image / zoom)
+                 visible_center_y = center_y - (pan_y_image / zoom)
+                 
+                 visible_x_start = max(0, int(visible_center_x - visible_width / 2))
+                 visible_y_start = max(0, int(visible_center_y - visible_height / 2))
+                 visible_x_end = min(decoded.width, int(visible_center_x + visible_width / 2))
+                 visible_y_end = min(decoded.height, int(visible_center_y + visible_height / 2))
+                 
+                 if visible_x_end > visible_x_start and visible_y_end > visible_y_start:
+                     arr = arr[visible_y_start:visible_y_end, visible_x_start:visible_x_end, :]
+
             bins = 256
             value_range = (0, 256)
             
-            # Compute histograms for each channel
             r_hist = np.histogram(arr[:, :, 0], bins=bins, range=value_range)[0]
             g_hist = np.histogram(arr[:, :, 1], bins=bins, range=value_range)[0]
             b_hist = np.histogram(arr[:, :, 2], bins=bins, range=value_range)[0]
             
-            # Calculate clip and pre-clip counts *before* log scaling
             r_clip_count = int(r_hist[255])
             g_clip_count = int(g_hist[255])
             b_clip_count = int(b_hist[255])
@@ -2662,14 +2699,11 @@ class AppController(QObject):
             g_preclip_count = int(np.sum(g_hist[250:255]))
             b_preclip_count = int(np.sum(b_hist[250:255]))
             
-            # Apply log scaling for better visualization - keeping this per existing code style
-            # but converting to float as requested
             log_r_hist = [float(x) for x in np.log1p(r_hist)]
             log_g_hist = [float(x) for x in np.log1p(g_hist)]
             log_b_hist = [float(x) for x in np.log1p(b_hist)]
 
-            # Create the structured data for QML with keys 'r', 'g', 'b'
-            histogram_data = {
+            hist = {
                 'r': log_r_hist,
                 'g': log_g_hist,
                 'b': log_b_hist,
@@ -2680,60 +2714,104 @@ class AppController(QObject):
                 'g_preclip': g_preclip_count,
                 'b_preclip': b_preclip_count,
             }
-            
-            self.ui_state.histogramData = histogram_data
-            log.debug("Histogram updated with log scale and clip counts")
-            
-        except ImportError:
-            log.error("NumPy not available for histogram computation")
-            self.update_status_message("Histogram requires NumPy")
-        except Exception as e:
-            log.exception("Failed to compute histogram: %s", e)
-            self.update_status_message(f"Histogram error: {e}")
-        
-        # Check if new requests arrived while we were computing
-        if self._pending_histogram_args is not None:
-            self.histogram_timer.start()
-    
-    @Slot()
-    def execute_crop(self):
-        """Execute crop."""
-        if not self.ui_state.isCropping:
+            return token, hist
+        except Exception:
+            return token, None
+
+    def _on_histogram_done(self, fut):
+        if getattr(self, "_shutting_down", False):
             return
 
         try:
-            crop_box_raw = self.ui_state.currentCropBox
+            token, hist = fut.result()
+        except Exception:
+            token, hist = None, None
 
-            if isinstance(crop_box_raw, list):
-                crop_box_raw = tuple(crop_box_raw)
+        # bounce back to UI thread via signal
+        self.histogramReady.emit((token, hist))
 
-            # if it is a QVariant, try toVariant
-            if not isinstance(crop_box_raw, tuple) and hasattr(crop_box_raw, "toVariant"):
-                try:
-                    crop_box_raw = tuple(crop_box_raw.toVariant())
-                except Exception:
-                    pass
+    @Slot(object)
+    def _apply_histogram_result(self, payload):
+        if getattr(self, "_shutting_down", False):
+            return
 
-            if not (isinstance(crop_box_raw, tuple) and len(crop_box_raw) == 4):
-                 self.update_status_message("Invalid crop box")
-                 return
+        token, hist = payload
+        self._hist_inflight = False
+
+        if hist is not None:
+            with self._hist_lock:
+                if token == self._hist_token:
+                    self.ui_state.histogramData = hist
+
+        # If more updates arrived while we computed, run again soon
+        if self._hist_pending is not None:
+            self.histogram_timer.start()
+
+    def _kick_preview_worker(self):
+        """Kicks off a background preview render task."""
+        if getattr(self, "_shutting_down", False):
+            return
+
+        with self._preview_lock:
+            if self._preview_inflight:
+                self._preview_pending = True
+                return
             
-            # Apply crop by setting the crop box (this also updates UI state via set_crop_box)
-            # Ensure values are ints
-            left, top, right, bottom = map(int, crop_box_raw)
-            self.set_crop_box(left, top, right, bottom)
-            
-            # Exit crop mode
-            self.ui_state.isCropping = False
-            
-            # Apply edits (which includes crop) to preview
-            self.ui_refresh_generation += 1
-            self.ui_state.currentImageSourceChanged.emit()
-            self.update_status_message("Crop applied")
+            self._preview_inflight = True
+            self._preview_pending = False
+            self._preview_token += 1
+            token = self._preview_token
 
-        except Exception as e:
-            log.exception("Failed to execute crop: %s", e)
-            self.update_status_message(f"Crop failed: {e}")
+        # Submit task to dedicated preview executor
+        fut = self._preview_executor.submit(self._render_preview_worker, token, self.image_editor)
+        fut.add_done_callback(self._on_preview_done)
+
+    @staticmethod
+    def _render_preview_worker(token, image_editor):
+        # Heavy work (PIL apply_edits) happens here off-thread
+        try:
+            # allow_compute=True ensures we actually do the work
+            decoded = image_editor.get_preview_data_cached(allow_compute=True)
+            return token, decoded
+        except Exception:
+            log.exception("Preview render failed")
+            return token, None
+
+    def _on_preview_done(self, fut):
+        if getattr(self, "_shutting_down", False):
+            return
+
+        try:
+            token, decoded = fut.result()
+        except Exception:
+            token, decoded = None, None
+        
+        # Emit from worker thread; Qt will queue to UI thread
+        self.previewReady.emit((token, decoded))
+
+    @Slot(object)
+    def _apply_preview_result(self, payload):
+        if getattr(self, "_shutting_down", False):
+            return
+
+        token, decoded = payload
+        
+        with self._preview_lock:
+            self._preview_inflight = False
+            
+            if decoded is not None:
+                # Only accept if it matches the latest requested token
+                if token == self._preview_token:
+                    self._last_rendered_preview = decoded
+                    # Ensure QML/provider URL changes so we don't get a cached frame
+                    self.ui_refresh_generation += 1
+                    self.ui_state.currentImageSourceChanged.emit()
+            
+            # If new requests arrived while we were rendering, start the next one immediately
+            if self._preview_pending:
+                QTimer.singleShot(0, self._kick_preview_worker)
+    
+
 
     @Slot()
     def cancel_crop_mode(self):
@@ -2946,19 +3024,29 @@ class AppController(QObject):
 
         crop_box_raw = self.ui_state.currentCropBox
 
-        # Ensure ImageEditor has the latest crop box (it should be synced via UIState, but good to be safe)
-        if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:
-             # Try to convert if it came as list
-             try:
-                 crop_box_raw = tuple(crop_box_raw) if isinstance(crop_box_raw, list) else tuple(crop_box_raw.toVariant())
-             except Exception:
-                 pass
-        
-        if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:                 pass
-        
-        if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:
-             self.update_status_message("Invalid crop box")
-             return
+        # Normalize crop_box_raw to a tuple of 4 ints
+        try:
+            # Handle QJSValue/QVariant wrapper if present
+            if hasattr(crop_box_raw, "toVariant"):
+                crop_box_raw = crop_box_raw.toVariant()
+            
+            # Convert list to tuple if needed
+            if isinstance(crop_box_raw, list):
+                crop_box_raw = tuple(crop_box_raw)
+            
+            if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:
+                raise ValueError(f"Expected 4-item tuple, got {type(crop_box_raw)}: {crop_box_raw}")
+            
+            # Coerce elements to int and clamp to [0, 1000]
+            l, t, r, b = [max(0, min(1000, int(x))) for x in crop_box_raw]
+            
+            # Ensure correct order (left <= right, top <= bottom)
+            crop_box_raw = (min(l, r), min(t, b), max(l, r), max(t, b))
+            
+        except (ValueError, TypeError, AttributeError) as e:
+            log.warning("Invalid crop box format: %s", e)
+            self.update_status_message("Invalid crop selection")
+            return
 
         if crop_box_raw == (0, 0, 1000, 1000):
             self.update_status_message("No crop area selected")
