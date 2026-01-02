@@ -22,19 +22,26 @@ def setup_logging(debug: bool = False):
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "app.log"
 
-    handler = logging.handlers.RotatingFileHandler(
+    # File handler
+    file_handler = logging.handlers.RotatingFileHandler(
         log_file, maxBytes=10*1024*1024, backupCount=5
     )
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    handler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
+
+    # Console handler (for seeing logs in terminal)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
     # Set log level based on debug flag
     root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
     root_logger.handlers.clear()
-    root_logger.addHandler(handler)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
     # Configure logging for key modules
     if debug:
         logging.getLogger("faststack.imaging.cache").setLevel(logging.DEBUG)

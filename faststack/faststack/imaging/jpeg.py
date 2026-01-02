@@ -115,7 +115,7 @@ def decode_jpeg_resized(
     jpeg_bytes: bytes, width: int, height: int, fast_dct: bool = False
 ) -> Optional[np.ndarray]:
     """Decodes and resizes a JPEG to fit within the given dimensions."""
-    if width == 0 or height == 0:
+    if width <= 0 or height <= 0:
         return decode_jpeg_rgb(jpeg_bytes, fast_dct=fast_dct)
 
     if TURBO_AVAILABLE and jpeg_decoder:

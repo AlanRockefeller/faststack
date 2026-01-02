@@ -33,16 +33,41 @@ class ImageProvider(QQuickImageProvider):
         try:
             image_index_str = id.split('/')[0]
             index = int(image_index_str)
-            image_data = self.app_controller.get_decoded_image(index)
+            
+            # If editor is open, use the background-rendered preview buffer
+            # BUT only if the requested index matches the currently edited index!
+            # Otherwise we serve the editor preview for thumbnails/prefetch.
+            if self.app_controller.ui_state.isEditorOpen and index == self.app_controller.current_index:
+                image_data = self.app_controller._last_rendered_preview or self.app_controller.get_decoded_image(index)
+            else:
+                image_data = self.app_controller.get_decoded_image(index)
 
             if image_data:
+                # Handle format being None (from prefetcher) or missing
+                fmt = getattr(image_data, 'format', None)
+                if fmt is None:
+                    fmt = QImage.Format.Format_RGB888
+
                 qimg = QImage(
                     image_data.buffer,
                     image_data.width,
                     image_data.height,
                     image_data.bytes_per_line,
-                    QImage.Format.Format_RGB888
+                    fmt
                 )
+
+                
+                # Detach from Python buffer to prevent ownership issues and force proper texture upload
+                # OPTIMIZATION: Only do this expensive copy when serving the live editor preview,
+                # where we need to detach from the shared memory buffer that might change.
+                # For standard browsing/prefetch, the buffer is stable enough.
+                if self.app_controller.ui_state.isEditorOpen and index == self.app_controller.current_index:
+                    qimg = qimg.copy()
+                else:
+                    # SAFETY: Keep a reference to the underlying buffer to prevent garbage collection
+                    # while Qt holds the QImage. QImage created from bytes does NOT own the data.
+                    qimg.original_buffer = image_data.buffer
+
                 # Set sRGB color space for proper color management (if available)
                 # Skip this when using ICC mode - pixels are already in monitor space
                 color_mode = config.get('color', 'mode', fallback="none").lower()
@@ -56,8 +81,9 @@ class ImageProvider(QQuickImageProvider):
                         log.warning(f"Failed to set color space: {e}")
                 elif color_mode == "icc":
                     log.debug("ICC mode: skipping Qt color space (pixels already in monitor space)")
-                # keep buffer alive
-                qimg.original_buffer = image_data.buffer
+                
+                # Buffer is now safe to release (handled by copy), but original_buffer ref in Python object stays
+                # We don't need to manually attach original_buffer to qimg anymore since we copied.
                 return qimg
 
         except (ValueError, IndexError) as e:

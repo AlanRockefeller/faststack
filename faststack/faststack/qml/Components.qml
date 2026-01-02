@@ -615,6 +615,8 @@ Item {
             if (uiState && uiState.isCropping) {
                 // Check if clicking on existing crop box - Using Image Space Hit Testing
                 var box = uiState.currentCropBox
+                if (box && box.length === 4) box = box.slice(0)
+                
                 var isFullImage = box && box.length === 4 && box[0] === 0 && box[1] === 0 && box[2] === 1000 && box[3] === 1000
                 
                 var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
@@ -657,22 +659,20 @@ Item {
                         
                         // Calculate start aspect ratio (in pixels)
                         if (mainImage.width > 0) {
-                            var cb = uiState.currentCropBox
-                            if (cb && cb.length === 4) {
-                                var boxW = (cb[2] - cb[0]) / 1000 * mainImage.width
-                                var boxH = (cb[3] - cb[1]) / 1000 * mainImage.height
-                                cropStartAspect = boxW / boxH
+                            if (box && box.length === 4) {
+                                var boxW = (box[2] - box[0]) / 1000 * mainImage.width
+                                var boxH = (box[3] - box[1]) / 1000 * mainImage.height
+                                if (boxH > 0) cropStartAspect = boxW / boxH
                             }
                         }
 
 
                         // Seed cropBoxStart variables
-                        var startBox = uiState.currentCropBox
-                        if (startBox && startBox.length === 4) {
-                            cropBoxStartLeft = startBox[0]
-                            cropBoxStartTop = startBox[1]
-                            cropBoxStartRight = startBox[2]
-                            cropBoxStartBottom = startBox[3]
+                        if (box && box.length === 4) {
+                            cropBoxStartLeft = box[0]
+                            cropBoxStartTop = box[1]
+                            cropBoxStartRight = box[2]
+                            cropBoxStartBottom = box[3]
                         }
 
                         isCropDragging = true

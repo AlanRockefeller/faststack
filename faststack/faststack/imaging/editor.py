@@ -12,6 +12,7 @@ from io import BytesIO
 
 from faststack.models import DecodedImage
 from PySide6.QtGui import QImage
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
         shutil.copy2(original_path, backup_path)
         return backup_path
     except OSError as e:
-        log.error(f"Failed to create backup: {e}")
+        log.exception(f"Failed to create backup: {e}")
         return None
 
 # ----------------------------
@@ -172,11 +173,21 @@ class ImageEditor:
         self.current_edits: Dict[str, Any] = self._initial_edits()
         self.current_filepath: Optional[Path] = None
         
+        # Caching support for smooth updates
+        self._lock = threading.RLock()
+        self._edits_rev = 0
+        self._cached_rev = -1
+        self._cached_preview = None
+        
     def clear(self):
         """Clear all editor state so the next edit starts from a clean slate."""
-        self.original_image = None
-        self.current_filepath = None
-        self._preview_image = None
+        with self._lock:
+            self.original_image = None
+            self.current_filepath = None
+            self._preview_image = None
+            self._edits_rev += 1
+            self._cached_preview = None
+            self._cached_rev = -1
         # Optionally also reset edits if that matches your mental model:
         # self.current_edits = self._initial_edits()
 
@@ -205,45 +216,64 @@ class ImageEditor:
     def load_image(self, filepath: str, cached_preview: Optional[DecodedImage] = None):
         """Load a new image for editing."""
         if not filepath or not Path(filepath).exists():
-            self.original_image = None
-            self.current_filepath = None
-            self._preview_image = None
+            with self._lock:
+                self.original_image = None
+                self.current_filepath = None
+                self._preview_image = None
+                self._edits_rev += 1
+                self._cached_preview = None
+                self._cached_rev = -1
             return False
         
         self.current_filepath = Path(filepath)
-        # Reset edits
-        self.current_edits = self._initial_edits()
         
         try:
             # We must load and close the original file handle immediately
-            self.original_image = Image.open(self.current_filepath).convert("RGB")
+            with Image.open(self.current_filepath) as im:
+                original = im.convert("RGB")
 
             # Use the cached, display-sized preview if available
             if cached_preview:
-                self._preview_image = Image.frombytes(
+                preview = Image.frombytes(
                     "RGB",
                     (cached_preview.width, cached_preview.height),
                     bytes(cached_preview.buffer)
                 )
             else:
                 # Fallback: create a thumbnail if no preview is provided
-                self._preview_image = self.original_image.copy()
-                self._preview_image.thumbnail((1920, 1080)) # Reasonable fallback size
+                preview = original.copy()
+                preview.thumbnail((1920, 1080)) # Reasonable fallback size
+
+            with self._lock:
+                self.original_image = original
+                self._preview_image = preview
+                # Reset edits
+                self.current_edits = self._initial_edits()
+                self._edits_rev += 1
+                self._cached_preview = None
+                self._cached_rev = -1
 
             return True
         except Exception as e:
-            log.error(f"Error loading image for editing: {e}")
-            self.original_image = None
-            self._preview_image = None
+            log.exception(f"Error loading image for editing: {e}")
+            with self._lock:
+                self.original_image = None
+                self._preview_image = None
+                self._edits_rev += 1
+                self._cached_preview = None
+                self._cached_rev = -1
             return False
 
 
-    def _apply_edits(self, img: Image.Image, *, for_export: bool = False) -> Image.Image:
+    def _apply_edits(self, img: Image.Image, edits: Optional[Dict[str, Any]] = None, *, for_export: bool = False) -> Image.Image:
         """Applies all current edits to the provided PIL Image."""
         
+        if edits is None:
+            edits = self.current_edits
+
         # 1. Rotation (90 degree steps)
         # (This remains first as it changes the coordinate system basis)
-        rotation = self.current_edits.get('rotation', 0)
+        rotation = edits.get('rotation', 0)
         if rotation == 90:
             img = img.transpose(Image.Transpose.ROTATE_270)
         elif rotation == 180:
@@ -254,8 +284,8 @@ class ImageEditor:
         # ---------------------------------------------------------
         # CHANGE: Apply Free Rotation (Straighten) BEFORE Cropping
         # ---------------------------------------------------------
-        straighten_angle = float(self.current_edits.get('straighten_angle', 0.0))
-        has_crop_box = 'crop_box' in self.current_edits and self.current_edits['crop_box']
+        straighten_angle = float(edits.get('straighten_angle', 0.0))
+        has_crop_box = 'crop_box' in edits and edits['crop_box']
 
         # Only apply rotation if it's significant AND we are exporting.
         # During preview (for_export=False), QML handles the visual rotation.
@@ -279,7 +309,7 @@ class ImageEditor:
         # CHANGE: Apply Cropping LAST
         # ---------------------------------------------------------
         if has_crop_box:
-            crop_box = self.current_edits['crop_box']
+            crop_box = edits['crop_box']
             if len(crop_box) == 4:
                 # Normalize coordinates (0-1000) to pixel coordinates
                 # Note: We calculate this based on the *current* img size, 
@@ -300,7 +330,7 @@ class ImageEditor:
                     img = img.crop((left, t, r, b))
 
         # 3. Exposure (gamma-based)
-        exposure = self.current_edits['exposure']
+        exposure = edits['exposure']
         if abs(exposure) > 0.001:
             gamma = 1.0 / (1.0 + exposure) if exposure >= 0 else 1.0 - exposure
             arr = np.array(img, dtype=np.float32) / 255.0
@@ -308,8 +338,8 @@ class ImageEditor:
             arr = (arr * 255).clip(0, 255).astype(np.uint8)
             img = Image.fromarray(arr)
 
-        blacks = self.current_edits['blacks']
-        whites = self.current_edits['whites']
+        blacks = edits['blacks']
+        whites = edits['whites']
         if abs(blacks) > 0.001 or abs(whites) > 0.001:
             arr = np.array(img, dtype=np.float32)
             black_point = -blacks * 40
@@ -321,8 +351,8 @@ class ImageEditor:
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
         # 5. Highlights/Shadows
-        highlights = self.current_edits['highlights']
-        shadows = self.current_edits['shadows']
+        highlights = edits['highlights']
+        shadows = edits['shadows']
 
         if abs(highlights) > 0.001 or abs(shadows) > 0.001:
             arr = np.array(img, dtype=np.float32)
@@ -341,17 +371,17 @@ class ImageEditor:
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
         # 6. Brightness
-        bright_factor = 1.0 + self.current_edits['brightness']
+        bright_factor = 1.0 + edits['brightness']
         if abs(bright_factor - 1.0) > 0.001:
             img = ImageEnhance.Brightness(img).enhance(bright_factor)
 
         # 7. Contrast
-        contrast_factor = 1.0 + self.current_edits['contrast']
+        contrast_factor = 1.0 + edits['contrast']
         if abs(contrast_factor - 1.0) > 0.001:
             img = ImageEnhance.Contrast(img).enhance(contrast_factor)
 
         # 8. Clarity
-        clarity = self.current_edits['clarity']
+        clarity = edits['clarity']
         if abs(clarity) > 0.001:
             arr = np.array(img, dtype=np.float32)
             luminance = 0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2]
@@ -365,12 +395,12 @@ class ImageEditor:
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
         # 9. Saturation
-        saturation_factor = 1.0 + self.current_edits['saturation']
+        saturation_factor = 1.0 + edits['saturation']
         if abs(saturation_factor - 1.0) > 0.001:
             img = ImageEnhance.Color(img).enhance(saturation_factor)
 
         # 10. Vibrance
-        vibrance = self.current_edits['vibrance']
+        vibrance = edits['vibrance']
         if abs(vibrance) > 0.001:
             arr = np.array(img, dtype=np.float32)
             sat = (arr.max(axis=2) - arr.min(axis=2)) / 255.0
@@ -380,8 +410,8 @@ class ImageEditor:
             img = Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
         # 11. White Balance
-        by_val = self.current_edits['white_balance_by'] * 0.5
-        mg_val = self.current_edits['white_balance_mg'] * 0.5
+        by_val = edits['white_balance_by'] * 0.5
+        mg_val = edits['white_balance_mg'] * 0.5
         if abs(by_val) > 0.001 or abs(mg_val) > 0.001:
             arr = np.array(img, dtype=np.float32)
             # Multiplicative White Balance (Gain-based)
@@ -406,12 +436,12 @@ class ImageEditor:
             img = Image.fromarray(arr.astype(np.uint8))
 
         # 12. Sharpness
-        sharp_factor = 1.0 + self.current_edits['sharpness']
+        sharp_factor = 1.0 + edits['sharpness']
         if abs(sharp_factor - 1.0) > 0.001:
             img = ImageEnhance.Sharpness(img).enhance(sharp_factor)
 
         # 13. Vignette
-        vignette = self.current_edits['vignette']
+        vignette = edits['vignette']
         if vignette > 0.001:
             arr = np.array(img, dtype=np.float32)
             h, w = arr.shape[:2]
@@ -427,7 +457,7 @@ class ImageEditor:
 
         # 14. Texture (Fine Detail Local Contrast)
         # Similar to Clarity but with a smaller radius to target texture/fine details
-        texture = self.current_edits.get('texture', 0.0)
+        texture = edits.get('texture', 0.0)
         if abs(texture) > 0.001:
             arr = np.array(img, dtype=np.float32)
             luminance = 0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2]
@@ -473,69 +503,125 @@ class ImageEditor:
         # Calculate parameters to map p_low->0 and p_high->255
         # Logic matches _apply_edits:
         # black_point = -blacks * 40
-        # white_point = 255 + whites * 40
+        # white_point = 255 - whites * 40
         
         # We want black_point to be p_low
-        # p_low = -blacks * 40 => blacks = -p_low / 40.0
+        # p_low = -blacks * 40 => blacks = -float(p_low) / 40.0
         blacks = -float(p_low) / 40.0
         
         # We want white_point to be p_high
-        # p_high = 255 + whites * 40 => whites = (p_high - 255) / 40.0
-        whites = (float(p_high) - 255.0) / 40.0
+        # p_high = 255 - whites * 40 => whites = (255.0 - float(p_high)) / 40.0
+        whites = (255.0 - float(p_high)) / 40.0
         
         # Update state
-        self.current_edits['blacks'] = blacks
-        self.current_edits['whites'] = whites
+        with self._lock:
+            self.current_edits['blacks'] = blacks
+            self.current_edits['whites'] = whites
+            self._edits_rev += 1
         
         return blacks, whites
 
-    def get_preview_data(self) -> Optional[DecodedImage]:
-        """Apply current edits and return the data as a DecodedImage."""
-        if self._preview_image is None:
+    def get_preview_data_cached(self, allow_compute: bool = True) -> Optional[DecodedImage]:
+        """Return cached preview if available, otherwise compute and cache.
+        
+        Args:
+            allow_compute: If False, returns None immediately if cache is stale (avoids blocking).
+        """
+        with self._lock:
+            # Check cache validity
+            if self._cached_preview is not None and self._cached_rev == self._edits_rev:
+                return self._cached_preview
+            
+            if not allow_compute:
+                return None
+            
+            # Prepare for computation - snapshot data under lock
+            base = self._preview_image.copy() if self._preview_image is not None else None
+            edits = dict(self.current_edits)
+            rev = self._edits_rev
+
+        if base is None:
             return None
 
-        # Always start from a fresh copy of the small preview image
-        img = self._preview_image.copy()
-        img = self._apply_edits(img, for_export=False)
-
+        # Heavy computation outside lock using snapshot
+        img = self._apply_edits(base, edits=edits, for_export=False)
         # The image is in RGB mode after _apply_edits
         buffer = img.tobytes()
-        return DecodedImage(
+        decoded = DecodedImage(
             buffer=memoryview(buffer),
             width=img.width,
             height=img.height,
-            bytes_per_line=img.width * 3,  # 3 bytes per pixel for RGB
+            bytes_per_line=img.width * 3,
             format=QImage.Format.Format_RGB888
         )
 
+        with self._lock:
+            # Only cache if revision hasn't changed during computation
+            if self._edits_rev == rev:
+                self._cached_preview = decoded
+                self._cached_rev = rev
+        
+        return decoded
+
+    def get_preview_data(self) -> Optional[DecodedImage]:
+        """Apply current edits and return the data as a DecodedImage."""
+        return self.get_preview_data_cached()
+
+    def get_edit_value(self, key: str, default: Any = None) -> Any:
+        """Thread-safe retrieval of an edit parameter."""
+        with self._lock:
+            return self.current_edits.get(key, default)
+
     def set_edit_param(self, key: str, value: Any) -> bool:
         """Update a single edit parameter."""
-        if key == 'rotation':
-            # Guard against arbitrary angles in 'rotation'. It expects 90-degree steps.
-            # For arbitrary rotation (drag to rotate), use 'straighten_angle'.
-            try:
-                # Round to nearest 90 degrees
-                val_deg = float(value)
-                rounded_deg = round(val_deg / 90.0) * 90
-                final_val = int(rounded_deg) % 360
-                
-                if abs(val_deg - rounded_deg) > 1.0:
-                     log.warning(f"'rotation' received {value}. Rounding to {final_val}. Use 'straighten_angle' for free rotation.")
-                
-                self.current_edits[key] = final_val
-                return True
-            except (ValueError, TypeError):
-                log.error(f"Invalid value for rotation: {value}")
-                return False
+        with self._lock:
+            if key == 'rotation':
+                # Guard against arbitrary angles in 'rotation'. It expects 90-degree steps.
+                # For arbitrary rotation (drag to rotate), use 'straighten_angle'.
+                try:
+                    # Round to nearest 90 degrees
+                    val_deg = float(value)
+                    rounded_deg = round(val_deg / 90.0) * 90
+                    final_val = int(rounded_deg) % 360
+                    
+                    if abs(val_deg - rounded_deg) > 1.0:
+                         log.warning(f"'rotation' received {value}. Rounding to {final_val}. Use 'straighten_angle' for free rotation.")
+                    
+                    self.current_edits[key] = final_val
+                    self._edits_rev += 1
+                    return True
+                except (ValueError, TypeError) as e:
+                    log.warning(f"Invalid value for rotation {value!r}: {e}")
+                    return False
 
-        if key in self.current_edits and key != 'crop_box':
-            self.current_edits[key] = value
-            return True
-        return False
+
+
+            if key in self.current_edits and key != 'crop_box':
+                # Check for floating point equality to prevent cache thrashing
+                new_val = value
+                current_val = self.current_edits.get(key)
+                
+                # Try to compare as floats if possible
+                try:
+                    vf = float(new_val)
+                    cf = float(current_val)
+                    if math.isclose(vf, cf, rel_tol=1e-5, abs_tol=1e-7):
+                        return False
+                except (ValueError, TypeError):
+                    # Fallback to direct equality
+                    if current_val == new_val:
+                        return False
+
+                self.current_edits[key] = value
+                self._edits_rev += 1
+                return True
+            return False
     
     def set_crop_box(self, crop_box: Tuple[int, int, int, int]):
         """Set the normalized crop box (left, top, right, bottom) from 0-1000."""
-        self.current_edits['crop_box'] = crop_box
+        with self._lock:
+            self.current_edits['crop_box'] = crop_box
+            self._edits_rev += 1
 
     def save_image(self) -> Optional[Tuple[Path, Path]]:
         """Saves the edited image, backing up the original.
@@ -633,7 +719,7 @@ class ImageEditor:
                         "format settings and EXIF metadata is likely lost."
                     )
                 except Exception as e3:
-                    log.error(f"Failed to save edited image even with fallback: {e3}")
+                    log.exception(f"Failed to save edited image even with fallback: {e3}")
                     # Reraise so the outer except logs and returns None
                     raise
 
@@ -642,7 +728,7 @@ class ImageEditor:
 
             return original_path, backup_path
         except Exception as e:
-            log.error(f"Failed to save edited image or backup: {e}")
+            log.exception(f"Failed to save edited image or backup: {e}")
             return None
 
     def _restore_file_times(self, path: Path, original_stat: os.stat_result) -> None:
@@ -654,13 +740,17 @@ class ImageEditor:
 
     def rotate_image_cw(self):
         """Decreases the rotation edit parameter by 90° modulo 360 (clockwise)."""
-        current = self.current_edits.get('rotation', 0)
-        self.current_edits['rotation'] = (current - 90) % 360
+        with self._lock:
+            current = self.current_edits.get('rotation', 0)
+            self.current_edits['rotation'] = (current - 90) % 360
+            self._edits_rev += 1
 
     def rotate_image_ccw(self):
         """Increases the rotation edit parameter by 90° modulo 360 (counter-clockwise)."""
-        current = self.current_edits.get('rotation', 0)
-        self.current_edits['rotation'] = (current + 90) % 360
+        with self._lock:
+            current = self.current_edits.get('rotation', 0)
+            self.current_edits['rotation'] = (current + 90) % 360
+            self._edits_rev += 1
 
 # Dictionary of ratios for QML dropdown
 ASPECT_RATIOS = [{"name": name, "ratio": ratio} for name, ratio in INSTAGRAM_RATIOS.items()]
