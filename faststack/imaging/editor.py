@@ -275,7 +275,7 @@ class ImageEditor:
             return False
 
 
-    def _apply_edits(self, img: Image.Image, edits: Optional[Dict[str, Any]] = None, *, for_export: bool = False) -> Image.Image:
+    def _apply_edits(self, img: Image.Image, edits: Optional[Dict[str, Any]] = None, *, for_export: bool = True) -> Image.Image:
         """Applies all current edits to the provided PIL Image."""
         
         if edits is None:
@@ -353,7 +353,7 @@ class ImageEditor:
         if abs(blacks) > 0.001 or abs(whites) > 0.001:
             arr = np.array(img, dtype=np.float32)
             black_point = -blacks * 40
-            white_point = 255 - whites * 40
+            white_point = 255 + whites * 40
             # Prevent division by zero
             if abs(white_point - black_point) < 0.001:
                 white_point = black_point + 0.001
@@ -520,8 +520,8 @@ class ImageEditor:
         blacks = -float(p_low) / 40.0
         
         # We want white_point to be p_high
-        # p_high = 255 - whites * 40 => whites = (255.0 - float(p_high)) / 40.0
-        whites = (255.0 - float(p_high)) / 40.0
+        # p_high = 255 + whites * 40 => whites = (float(p_high) - 255) / 40.0
+        whites = (float(p_high) - 255.0) / 40.0
         
         # Update state
         with self._lock:

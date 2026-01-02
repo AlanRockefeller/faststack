@@ -29,3 +29,6 @@ faststack/.mypy_cache/
 .mypy_cache/
 var/
 faststack.egg-info/
+
+# Local-only docs
+ARCHITECTURE.md
