@@ -30,6 +30,19 @@ Window {
         uiState.isEditorOpen = false
     }
 
+    onVisibleChanged: {
+        if (visible) {
+            if (controller) controller.update_histogram()
+        }
+    }
+    
+    // Auto-update histogram when pulse changes (buttons, double-taps, spinbox)
+    onUpdatePulseChanged: {
+        if (visible && controller) {
+            controller.update_histogram()
+        }
+    }
+
     property int slidersPressedCount: 0
     onSlidersPressedCountChanged: {
         uiState.setAnySliderPressed(slidersPressedCount > 0)
@@ -90,7 +103,8 @@ Window {
 
     ScrollView {
         anchors.fill: parent
-        anchors.margins: 20
+        anchors.margins: 10
+        anchors.topMargin: 5
         clip: true
         contentWidth: availableWidth
 
@@ -106,7 +120,11 @@ Window {
                 spacing: 15
 
                 // --- Light Group ---
-                Loader { sourceComponent: sectionHeader; property string headerText: "☀ Light" }
+                Loader { 
+                    sourceComponent: sectionHeader 
+                    property string headerText: "☀ Light" 
+                    Layout.topMargin: 0 // Remove top margin for the very first item
+                }
                 ListModel {
                     id: lightModel
                     ListElement { name: "Exposure"; key: "exposure" }
@@ -130,6 +148,62 @@ Window {
                     ListElement { name: "Sharpness"; key: "sharpness" }
                 }
                 Repeater { model: detailModel; delegate: editSlider }
+
+                // --- Histogram Group ---
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 120
+                    Layout.topMargin: 5
+                    spacing: 5
+                    
+                    SingleChannelHistogram {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        
+                        channelName: "R"
+                        channelColor: "#e15050"
+                        gridLineColor: imageEditorDialog.controlBorder
+                        dangerColor: "#40ff0000"
+                        textColor: imageEditorDialog.textColor
+                        minimal: true
+                        
+                        histogramData: uiState && uiState.histogramData ? (uiState.histogramData["r"] || []) : []
+                        clipCount: uiState && uiState.histogramData ? (uiState.histogramData["r_clip"] || 0) : 0
+                        preClipCount: uiState && uiState.histogramData ? (uiState.histogramData["r_preclip"] || 0) : 0
+                    }
+                    
+                    SingleChannelHistogram {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        
+                        channelName: "G"
+                        channelColor: "#50e150"
+                        gridLineColor: imageEditorDialog.controlBorder
+                        dangerColor: "#40ff0000"
+                        textColor: imageEditorDialog.textColor
+                        minimal: true
+                        
+                        histogramData: uiState && uiState.histogramData ? (uiState.histogramData["g"] || []) : []
+                        clipCount: uiState && uiState.histogramData ? (uiState.histogramData["g_clip"] || 0) : 0
+                        preClipCount: uiState && uiState.histogramData ? (uiState.histogramData["g_preclip"] || 0) : 0
+                    }
+
+                    SingleChannelHistogram {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        
+                        channelName: "B"
+                        channelColor: "#5050e1"
+                        gridLineColor: imageEditorDialog.controlBorder
+                        dangerColor: "#40ff0000"
+                        textColor: imageEditorDialog.textColor
+                        minimal: true
+                        
+                        histogramData: uiState && uiState.histogramData ? (uiState.histogramData["b"] || []) : []
+                        clipCount: uiState && uiState.histogramData ? (uiState.histogramData["b_clip"] || 0) : 0
+                        preClipCount: uiState && uiState.histogramData ? (uiState.histogramData["b_preclip"] || 0) : 0
+                    }
+                }
             }
 
             // --- RIGHT COLUMN ---
@@ -140,7 +214,11 @@ Window {
                 spacing: 15
 
                 // --- Color Group ---
-                Loader { sourceComponent: sectionHeader; property string headerText: "🎨 Color" }
+                Loader { 
+                    sourceComponent: sectionHeader 
+                    property string headerText: "🎨 Color" 
+                    Layout.topMargin: 0 // Remove top margin for the very first item
+                }
                 ListModel {
                     id: colorModel
                     ListElement { name: "Saturation"; key: "saturation"; reverse: false }
@@ -327,19 +405,35 @@ Window {
                 onMoved: {
                     var sendValue = isReversed ? -value : value
                     controller.set_edit_parameter(model.key, sendValue / maxVal)
+                    // Trigger live histogram update (throttled by Python backend)
+                    if (controller) controller.update_histogram()
                 }
                 
-                TapHandler {
-                    acceptedButtons: Qt.LeftButton
-                    onDoubleTapped: {
-                         controller.set_edit_parameter(model.key, 0.0)
-                         slider.value = 0.0
-                         imageEditorDialog.updatePulse++
-                    }
-                }
+                property double lastPressTime: 0
+                property double lastPressValue: 0
                 
                 onPressedChanged: {
-                    if (pressed) imageEditorDialog.slidersPressedCount++; else imageEditorDialog.slidersPressedCount--;
+                    if (pressed) {
+                        var now = Date.now()
+                        var range = slider.to - slider.from
+                        var diff = Math.abs(value - lastPressValue)
+                        
+                        // Double click detection: <500ms time diff AND <5% value diff
+                        // This prevents false positives when dragging quickly
+                        if (now - lastPressTime < 500 && diff < (range * 0.05)) { 
+                             controller.set_edit_parameter(model.key, 0.0)
+                             imageEditorDialog.updatePulse++
+                             value = 0.0
+                        }
+                        lastPressTime = now
+                        lastPressValue = value
+                        
+                        imageEditorDialog.slidersPressedCount++
+                    } else {
+                        imageEditorDialog.slidersPressedCount--
+                        // Update histogram on release
+                        if (controller) controller.update_histogram()
+                    }
                 }
                 
                 onBackendValueChanged: {

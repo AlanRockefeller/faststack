@@ -754,8 +754,10 @@ Item {
                             rotationThrottleTimer.start()
                         }
                     }
-
-                    
+                    // Return early to prevent overwriting crop box during rotation
+                    return
+                } else {
+                    // Handle move/resize (edge dragging)
                     var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
 
                     // Clamp to image bounds and convert to 0-1000 range

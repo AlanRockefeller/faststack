@@ -177,6 +177,13 @@ class AppController(QObject):
         self.resize_timer.timeout.connect(self._handle_resize)
         self.pending_width = None
         self.pending_height = None
+        
+        # Histogram Throttle Timer
+        self.histogram_timer = QTimer(self)
+        self.histogram_timer.setSingleShot(True)
+        self.histogram_timer.setInterval(50)  # 50ms throttle (max 20fps)
+        self.histogram_timer.timeout.connect(self._perform_update_histogram)
+        self._pending_histogram_args = None
 
         # Track if any dialog is open to disable keybindings
         self._dialog_open = False
@@ -2546,7 +2553,7 @@ class AppController(QObject):
     @Slot()
     @Slot(float, float, float, float)  # zoom, panX, panY, imageScale
     def update_histogram(self, zoom: float = 1.0, pan_x: float = 0.0, pan_y: float = 0.0, image_scale: float = 1.0):
-        """Update histogram data from current image.
+        """Throttled request to update histogram. Updates continuously but capped at interval.
         
         Args:
             zoom: Zoom scale factor (1.0 = no zoom)
@@ -2554,8 +2561,25 @@ class AppController(QObject):
             pan_y: Pan offset in Y direction (in image coordinates)
             image_scale: Scale factor of displayed image vs original
         """
-        # Return immediately if histogram is not visible
-        if not self.ui_state.isHistogramVisible:
+        # Early guard: don't even schedule if nothing is showing the histogram
+        if not (self.ui_state.isHistogramVisible or self.ui_state.isEditorOpen):
+            self._pending_histogram_args = None
+            return
+
+        self._pending_histogram_args = (zoom, pan_x, pan_y, image_scale)
+        if not self.histogram_timer.isActive():
+            self.histogram_timer.start()
+
+    def _perform_update_histogram(self):
+        """Actual histogram computation logic (called by timer)."""
+        if not self._pending_histogram_args:
+            return
+        
+        zoom, pan_x, pan_y, image_scale = self._pending_histogram_args
+        self._pending_histogram_args = None
+
+        # Return immediately if neither histogram window nor editor is visible
+        if not (self.ui_state.isHistogramVisible or self.ui_state.isEditorOpen):
             return
 
         if not self.image_files or self.current_index >= len(self.image_files):
@@ -2666,6 +2690,10 @@ class AppController(QObject):
         except Exception as e:
             log.exception("Failed to compute histogram: %s", e)
             self.update_status_message(f"Histogram error: {e}")
+        
+        # Check if new requests arrived while we were computing
+        if self._pending_histogram_args is not None:
+            self.histogram_timer.start()
     
     @Slot()
     def execute_crop(self):
@@ -2915,6 +2943,8 @@ class AppController(QObject):
         # Capture current rotation (straighten_angle) from editor state BEFORE any reload
         # This is the single source of truth since set_straighten_angle updates it live.
         current_rotation = float(self.image_editor.current_edits.get("straighten_angle", 0.0))
+
+        crop_box_raw = self.ui_state.currentCropBox
 
         # Ensure ImageEditor has the latest crop box (it should be synced via UIState, but good to be safe)
         if not isinstance(crop_box_raw, tuple) or len(crop_box_raw) != 4:
