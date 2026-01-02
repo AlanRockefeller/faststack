@@ -42,5 +42,4 @@ packages = ["faststack"]
 python_files = ["test_*.py"]
 addopts = "-p no:cacheprovider -p no:doctest"
 norecursedirs = ["var"]
-e
 
