@@ -34,4 +34,4 @@ faststack/.mypy_cache/
 .mypy_cache/
 
 # Runtime/Data
-+var/
+var/
