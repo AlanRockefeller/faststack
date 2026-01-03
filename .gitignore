@@ -28,6 +28,7 @@ prompt.md
 WARP.md
 AGENTS.md
 ARCHITECTURE.md
+docs/COLOR_PROFILE_FIX.md
 
 # Caches
 faststack/.mypy_cache/
