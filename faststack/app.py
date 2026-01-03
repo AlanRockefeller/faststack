@@ -549,6 +549,55 @@ class AppController(QObject):
         with self._last_image_lock:
             return self.last_displayed_image
 
+    def _get_decoded_image_safe(self, index: int) -> Optional[DecodedImage]:
+        """Thread-safe version of get_decoded_image for background workers.
+        
+        Does NOT update UI iteration or access QObjects.
+        """
+        if not self.image_files or index < 0 or index >= len(self.image_files):
+            return None
+
+        # Lock to ensure thread safety when reading shared state if necessary (though simple reads are usually safe)
+        # However, get_display_info reads 'self.is_zoomed' which is fine.
+        # Accessing self.image_files is safe as long as list isn't cleared concurrently, 
+        # which only happens on directory change/refresh on main thread. 
+        # Since we are in a worker, there's a small race risk if directory changes *while* we run,
+        # but the worker would likely just fail gracefully or get an old image.
+        
+        _, _, display_gen = self.get_display_info()
+        try:
+            image_path = self.image_files[index].path
+        except IndexError:
+            return None
+
+        cache_key = build_cache_key(image_path, display_gen)
+
+        # Check cache (thread-safe read)
+        if cache_key in self.image_cache:
+            # We don't update stats/hits here to avoid race conditions on those counters
+            return self.image_cache[cache_key]
+        
+        # Cache miss: decode synchronously (in this worker thread)
+        try:
+            # Submit with priority=True
+            # Note: prefetcher.submit_task logic needs to be thread-safe. 
+            # Assuming futures dict access in submit_task handles strict GIL/thread safety or we might need locks there.
+            # But usually submitting to Executor is thread safe. 
+            # The danger is 'self.futures' management in Prefetcher.
+            future = self.prefetcher.submit_task(index, self.prefetcher.generation, priority=True)
+            if future:
+                result = future.result(timeout=5.0)
+                if result:
+                    decoded_path, decoded_display_gen = result
+                    # Re-verify key
+                    cache_key = build_cache_key(decoded_path, decoded_display_gen)
+                    if cache_key in self.image_cache:
+                        return self.image_cache[cache_key]
+        except Exception as e:
+            log.warning(f"_get_decoded_image_safe failed for index {index}: {e}")
+            
+        return None
+
     def sync_ui_state(self):
         """Forces the UI to update by emitting all state change signals."""
         self.ui_refresh_generation += 1
@@ -2649,15 +2698,15 @@ class AppController(QObject):
             # We can try to peek at the image editor if _last_rendered_preview is unset.
             preview_data = self.image_editor.get_preview_data_cached(allow_compute=False)
 
-        # Fallback: If still no preview data (e.g. editor not open), use the main image
+        # Fallback: If still no preview data (e.g. editor not open), we need to fetch the main image.
+        # But doing get_decoded_image() here blocks the main thread.
+        # Instead, we pass the index to the worker and let it fetch/decode if needed.
+        target_index = -1
         if not preview_data and 0 <= self.current_index < len(self.image_files):
-            # This ensures histogram works even if we haven't opened the editor
-            preview_data = self.get_decoded_image(self.current_index)
+            target_index = self.current_index
         
-        # If still no data, we cannot compute the histogram.
-        # Ensure we don't drop the request: keep _hist_pending set (it was cleared above, restore it?)
-        # Or just rely on the next preview update to trigger a histogram refresh.
-        if not preview_data:
+        # If no preview data AND no valid index, we can't compute.
+        if not preview_data and target_index == -1:
             self._hist_inflight = False
             # Restore pending args so the next timer tick (or preview completion) retries
             self._hist_pending = args
@@ -2667,18 +2716,23 @@ class AppController(QObject):
             return
 
         try:
-            fut = self._hist_executor.submit(self._compute_histogram_worker, token, args, preview_data)
+            # Pass simple data + controller reference + target_index
+            fut = self._hist_executor.submit(self._compute_histogram_worker, token, args, preview_data, self, target_index)
             fut.add_done_callback(self._on_histogram_done)
         except RuntimeError:
             log.warning("Histogram executor failed (shutting down?)")
             self._hist_inflight = False
 
     @staticmethod
-    def _compute_histogram_worker(token, args, decoded):
+    def _compute_histogram_worker(token, args, decoded, controller=None, target_index=-1):
         # IMPORTANT: do not touch QObjects here except thread-safe plain data
         zoom, pan_x, pan_y, image_scale = args
 
-        # Use explicitly passed decoded data
+        # If data wasn't provided, try to fetch it safely using the controller
+        if not decoded and controller and target_index >= 0:
+            decoded = controller._get_decoded_image_safe(target_index)
+
+        # Use explicitly passed or fetched decoded data
         if not decoded:
             return token, None
 

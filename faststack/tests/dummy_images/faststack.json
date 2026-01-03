@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "last_index": 0,
+  "entries": {
+    "test": {
+      "stack_id": null,
+      "stacked": false,
+      "stacked_date": null,
+      "uploaded": false,
+      "uploaded_date": null,
+      "edited": false,
+      "edited_date": null,
+      "restacked": false,
+      "restacked_date": null
+    }
+  },
+  "stacks": []
+}
