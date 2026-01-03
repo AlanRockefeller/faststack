@@ -2648,6 +2648,11 @@ class AppController(QObject):
             # But histogram is mostly for edits. If preview_data is None, we likely can't compute anyway.
             # We can try to peek at the image editor if _last_rendered_preview is unset.
             preview_data = self.image_editor.get_preview_data_cached(allow_compute=False)
+
+        # Fallback: If still no preview data (e.g. editor not open), use the main image
+        if not preview_data and 0 <= self.current_index < len(self.image_files):
+            # This ensures histogram works even if we haven't opened the editor
+            preview_data = self.get_decoded_image(self.current_index)
         
         # If still no data, we cannot compute the histogram.
         # Ensure we don't drop the request: keep _hist_pending set (it was cleared above, restore it?)
@@ -2826,6 +2831,9 @@ class AppController(QObject):
                     # Ensure QML/provider URL changes so we don't get a cached frame
                     self.ui_refresh_generation += 1
                     self.ui_state.currentImageSourceChanged.emit()
+                    
+                    # Trigger histogram update (always call, let update_histogram handle visibility guards)
+                    self.update_histogram()
             
             # If new requests arrived while we were rendering, start the next one immediately
             if self._preview_pending:

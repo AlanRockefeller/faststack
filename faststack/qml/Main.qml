@@ -22,7 +22,7 @@ ApplicationWindow {
     Material.accent: "#4fb360"
 
     property bool isDarkTheme: uiState ? uiState.theme === 0 : true
-    property color currentBackgroundColor: isDarkTheme ? "#2b2b2b" : "#ffffff"
+    property color currentBackgroundColor: isDarkTheme ? "#000000" : "#ffffff"
     property color currentTextColor: isDarkTheme ? "white" : "black"
     property color hoverColor: isDarkTheme ? Qt.lighter(currentBackgroundColor, 1.5) : Qt.darker(currentBackgroundColor, 1.1)
 

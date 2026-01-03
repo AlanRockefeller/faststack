@@ -16,7 +16,7 @@ def setup_logging(debug: bool = False):
     """Sets up logging to a rotating file in the app data directory.
     
     Args:
-        debug: If True, sets log level to DEBUG. Otherwise, sets to INFO to reduce noise.
+        debug: If True, sets log level to DEBUG. Otherwise, sets to WARNING to reduce noise.
     """
     log_dir = get_app_data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)

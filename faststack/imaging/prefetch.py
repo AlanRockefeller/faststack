@@ -14,7 +14,7 @@ from PIL import Image as PILImage, ImageCms
 try:
     from PySide6.QtCore import QTimer
     from PySide6.QtGui import QImage
-except Exception:
+except ImportError:
     QTimer = None
     QImage = None
 

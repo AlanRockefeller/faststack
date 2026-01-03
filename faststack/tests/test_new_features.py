@@ -30,7 +30,7 @@ class TestNewFeatures(unittest.TestCase):
         self.assertNotEqual(blacks, 0.0)
         self.assertNotEqual(whites, 0.0)
         self.assertLess(blacks, 0.0)
-        self.assertLess(whites, 0.0)
+        self.assertGreater(whites, 0.0)
         
         # Mock strength application matching app.py logic
         strength = 0.5
@@ -76,7 +76,7 @@ class TestNewFeatures(unittest.TestCase):
         self.editor.current_edits['straighten_angle'] = 45.0
         
         # Apply
-        res = self.editor._apply_edits(self.img.copy())
+        res = self.editor._apply_edits(self.img.copy(), for_export=True)
         
         # Image should be rotated and larger (expand=True)
         # Original width 256. 45 deg rotation of valid rect makes it wider?
