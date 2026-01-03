@@ -49,8 +49,12 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
         return {"summary": {}, "full": {}}
 
     try:
-        with Image.open(path) as img:
+        img = Image.open(path)
+        try:
             exif = img._getexif()
+        finally:
+            img.close()
+            
         if not exif:
             return {"summary": {}, "full": {}}
     except Exception as e:  # noqa: BLE001 - defensive catch for arbitrary EXIF parsing issues

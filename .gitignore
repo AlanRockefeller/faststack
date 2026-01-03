@@ -24,5 +24,15 @@ Thumbs.db
 
 prompt.md
 WARP.md
+AGENTS.md
 faststack/.mypy_cache/
 .mypy_cache/
+var/
+faststack.egg-info/
+
+# Local-only docs
+ARCHITECTURE.md
+
+# Local test/debug outputs
+out.txt
+test_out*.txt

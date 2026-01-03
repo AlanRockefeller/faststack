@@ -11,7 +11,12 @@ import mmap
 
 import numpy as np
 from PIL import Image as PILImage, ImageCms
-from PySide6.QtCore import QTimer
+try:
+    from PySide6.QtCore import QTimer
+    from PySide6.QtGui import QImage
+except Exception:
+    QTimer = None
+    QImage = None
 
 from faststack.models import ImageFile, DecodedImage
 from faststack.imaging.jpeg import decode_jpeg_rgb, decode_jpeg_resized, TURBO_AVAILABLE
@@ -516,7 +521,7 @@ class Prefetcher:
                 width=w,
                 height=h,
                 bytes_per_line=bytes_per_line,
-                format=None # Placeholder for QImage.Format.Format_RGB888
+                format=QImage.Format.Format_RGB888 if QImage else None
             )
             cache_key = build_cache_key(image_file.path, display_generation)
             self.cache_put(cache_key, decoded_image)

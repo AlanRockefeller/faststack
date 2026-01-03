@@ -1,6 +1,7 @@
 """QML Image Provider and application state bridge."""
 
 import logging
+import collections
 from PySide6.QtCore import QObject, Signal, Property, Slot, Qt
 from PySide6.QtGui import QImage
 from PySide6.QtQuick import QQuickImageProvider
@@ -24,6 +25,8 @@ class ImageProvider(QQuickImageProvider):
         self.app_controller = app_controller
         self.placeholder = QImage(256, 256, QImage.Format.Format_RGB888)
         self.placeholder.fill(Qt.GlobalColor.darkGray)
+        # Keepalive queue to prevent GC of buffers currently in use by QImage
+        self._keepalive = collections.deque(maxlen=32)
 
     def requestImage(self, id: str, size: object, requestedSize: object) -> QImage:
         """Handles image requests from QML."""
@@ -37,7 +40,8 @@ class ImageProvider(QQuickImageProvider):
             # If editor is open, use the background-rendered preview buffer
             # BUT only if the requested index matches the currently edited index!
             # Otherwise we serve the editor preview for thumbnails/prefetch.
-            if self.app_controller.ui_state.isEditorOpen and index == self.app_controller.current_index:
+            # FIX: If zoomed in, force full-res image instead of low-res preview
+            if self.app_controller.ui_state.isEditorOpen and index == self.app_controller.current_index and not self.app_controller.ui_state.isZoomed:
                 image_data = self.app_controller._last_rendered_preview or self.app_controller.get_decoded_image(index)
             else:
                 image_data = self.app_controller.get_decoded_image(index)
@@ -66,7 +70,7 @@ class ImageProvider(QQuickImageProvider):
                 else:
                     # SAFETY: Keep a reference to the underlying buffer to prevent garbage collection
                     # while Qt holds the QImage. QImage created from bytes does NOT own the data.
-                    qimg.original_buffer = image_data.buffer
+                    self._keepalive.append(image_data.buffer)
 
                 # Set sRGB color space for proper color management (if available)
                 # Skip this when using ICC mode - pixels are already in monitor space

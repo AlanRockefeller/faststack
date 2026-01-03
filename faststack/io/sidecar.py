@@ -10,6 +10,28 @@ from faststack.models import Sidecar, EntryMetadata
 
 log = logging.getLogger(__name__)
 
+def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
+    """
+    Helper to create EntryMetadata from JSON dict, handling legacy fields
+    and filtering unknown keys.
+    """
+    try:
+        # Handle legacy keys
+        # Legacy 'flag' and 'reject' do not map to current EntryMetadata fields, 
+        # so they will be filtered out by valid_keys check below.
+            
+        # stack_id IS in the current model, so we keep it (don't delete it).
+
+        # Filter out unknown keys
+        import dataclasses
+        valid_keys = {f.name for f in dataclasses.fields(EntryMetadata)}
+        filtered_meta = {k: v for k, v in meta.items() if k in valid_keys}
+        
+        return EntryMetadata(**filtered_meta)
+    except Exception as e:
+        log.warning(f"Error parsing metadata entry: {e}")
+        return EntryMetadata()
+
 class SidecarManager:
     def __init__(self, directory: Path, watcher, debug: bool = False):
         self.path = directory / "faststack.json"
@@ -44,7 +66,7 @@ class SidecarManager:
 
             # Reconstruct nested objects
             entries = { 
-                stem: EntryMetadata(**meta) 
+                stem: _entrymetadata_from_json(meta) 
                 for stem, meta in data.get("entries", {}).items()
             }
             return Sidecar(
