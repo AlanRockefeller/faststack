@@ -160,6 +160,7 @@ class Prefetcher:
             max_workers=optimal_workers,
             thread_name_prefix="Prefetcher"
         )
+        self._futures_lock = threading.RLock()
         self.futures: Dict[int, Future] = {}
         self.generation = 0
         self._scheduled: Dict[int, set] = {}  # generation -> set of scheduled indices
@@ -190,10 +191,10 @@ class Prefetcher:
         # zoom state, or color mode changes - events that actually invalidate cached images.
         # Navigation just shifts which indices to prefetch.
         
-        # Clean up old generation entries to prevent memory leak
-        old_generations = [g for g in self._scheduled if g < self.generation]
-        for g in old_generations:
-            del self._scheduled[g]
+        # OLD GENERATION CLEANUP MOVED TO INSIDE LOCK BELOW
+        # old_generations = [g for g in self._scheduled if g < self.generation]
+        # for g in old_generations:
+        #     del self._scheduled[g]
         
         # Track navigation direction
         if direction is not None:
@@ -227,36 +228,42 @@ class Prefetcher:
         log.debug("Prefetch range: [%d, %d) for index %d (direction=%d, behind=%d, ahead=%d)", 
                   start, end, current_index, self._last_navigation_direction, behind, ahead)
 
-        # Get scheduled set for current generation
-        scheduled = self._scheduled.setdefault(self.generation, set())
-        
         # Cancel stale futures and remove from scheduled
-        stale_keys = []
-        for index, future in list(self.futures.items()):
-            if index < start or index >= end:
-                if future.cancel():
-                    stale_keys.append(index)
-                    scheduled.discard(index)  # Remove from scheduled set
-        for key in stale_keys:
-            del self.futures[key]
+        with self._futures_lock:
+            # Clean up old generation entries to prevent memory leak
+            # MOVED INSIDE LOCK to prevent race with cancel_all()
+            old_generations = [g for g in self._scheduled if g < self.generation]
+            for g in old_generations:
+                del self._scheduled[g]
+            
+            # Get scheduled set for current generation (inside lock to prevent race)
+            scheduled = self._scheduled.setdefault(self.generation, set())
+            stale_keys = []
+            for index, future in list(self.futures.items()):
+                if index < start or index >= end:
+                    if future.cancel():
+                        stale_keys.append(index)
+                        scheduled.discard(index)  # Remove from scheduled set
+            for key in stale_keys:
+                del self.futures[key]
 
-        # Submit new tasks - prioritize current image and direction of travel
-        
-        # Build priority order: current first, then in direction of travel
-        priority_order = [current_index]
-        if self._last_navigation_direction > 0:
-            priority_order.extend(range(current_index + 1, end))
-            priority_order.extend(range(current_index - 1, start - 1, -1))
-        else:
-            priority_order.extend(range(current_index - 1, start - 1, -1))
-            priority_order.extend(range(current_index + 1, end))
-        
-        for i in priority_order:
-            if i < 0 or i >= len(self.image_files):
-                continue
-            if i not in scheduled and i not in self.futures:
-                self.submit_task(i, self.generation)
-                scheduled.add(i)
+            # Submit new tasks - prioritize current image and direction of travel
+            
+            # Build priority order: current first, then in direction of travel
+            priority_order = [current_index]
+            if self._last_navigation_direction > 0:
+                priority_order.extend(range(current_index + 1, end))
+                priority_order.extend(range(current_index - 1, start - 1, -1))
+            else:
+                priority_order.extend(range(current_index - 1, start - 1, -1))
+                priority_order.extend(range(current_index + 1, end))
+            
+            for i in priority_order:
+                if i < 0 or i >= len(self.image_files):
+                    continue
+                if i not in scheduled and i not in self.futures:
+                    self.submit_task(i, self.generation)
+                    scheduled.add(i)
 
     def submit_task(self, index: int, generation: int, priority: bool = False) -> Optional[Future]:
         """Submits a decoding task for a given index.
@@ -266,39 +273,40 @@ class Prefetcher:
             generation: Generation number for cache invalidation
             priority: If True, cancels lower-priority pending tasks to free up workers
         """
-        if index in self.futures and not self.futures[index].done():
-            return self.futures[index] # Already submitted
+        with self._futures_lock:
+            if index in self.futures and not self.futures[index].done():
+                return self.futures[index] # Already submitted
 
-        # For high-priority tasks (current image), cancel pending prefetch tasks
-        # to free up worker threads and reduce blocking time
-        if priority:
-            cancelled_count = 0
-            # Don't cancel tasks that are very close to the requested index (e.g. +/- 2)
-            # This prevents thrashing when the user is navigating quickly
-            safe_radius = 2
-            
-            for task_index, future in list(self.futures.items()):
-                # Skip the current task
-                if task_index == index:
-                    continue
+            # For high-priority tasks (current image), cancel pending prefetch tasks
+            # to free up worker threads and reduce blocking time
+            if priority:
+                cancelled_count = 0
+                # Don't cancel tasks that are very close to the requested index (e.g. +/- 2)
+                # This prevents thrashing when the user is navigating quickly
+                safe_radius = 2
                 
-                # Skip tasks within safe radius
-                if abs(task_index - index) <= safe_radius:
-                    continue
+                for task_index, future in list(self.futures.items()):
+                    # Skip the current task
+                    if task_index == index:
+                        continue
+                    
+                    # Skip tasks within safe radius
+                    if abs(task_index - index) <= safe_radius:
+                        continue
 
-                if not future.done() and future.cancel():
-                    cancelled_count += 1
-                    del self.futures[task_index]
-            if cancelled_count > 0:
-                log.debug("Cancelled %d pending prefetch tasks to prioritize index %d", cancelled_count, index)
+                    if not future.done() and future.cancel():
+                        cancelled_count += 1
+                        del self.futures[task_index]
+                if cancelled_count > 0:
+                    log.debug("Cancelled %d pending prefetch tasks to prioritize index %d", cancelled_count, index)
 
-        image_file = self.image_files[index]
-        display_width, display_height, display_generation = self.get_display_info()
+            image_file = self.image_files[index]
+            display_width, display_height, display_generation = self.get_display_info()
 
-        future = self.executor.submit(self._decode_and_cache, image_file, index, generation, display_width, display_height, display_generation)
-        self.futures[index] = future
-        log.debug("Submitted %s task for index %d", "priority" if priority else "prefetch", index)
-        return future
+            future = self.executor.submit(self._decode_and_cache, image_file, index, generation, display_width, display_height, display_generation)
+            self.futures[index] = future
+            log.debug("Submitted %s task for index %d", "priority" if priority else "prefetch", index)
+            return future
 
     def _decode_and_cache(self, image_file: ImageFile, index: int, generation: int, display_width: int, display_height: int, display_generation: int) -> Optional[tuple[Path, int]]:
         """The actual work done by the thread pool."""
@@ -384,8 +392,11 @@ class Prefetcher:
                         
                         rgb = np.array(img, dtype=np.uint8)
                         h, w, _ = rgb.shape
-                        bytes_per_line = w * 3
-                        arr = rgb.reshape(-1).copy()
+                        
+                        # Memory Optimization: Avoid explicit copy
+                        buffer = np.ascontiguousarray(rgb)
+                        bytes_per_line = buffer.strides[0]
+                        mv = memoryview(buffer).cast("B")
                         t_after_copy = time.perf_counter()
                         
                         if self.debug:
@@ -417,8 +428,12 @@ class Prefetcher:
                         t_after_fallback_decode = time.perf_counter()
                         
                         h, w, _ = buffer.shape
-                        bytes_per_line = w * 3
-                        arr = buffer.reshape(-1).copy()
+                        
+                        # Memory Optimization: Avoid explicit copy
+                        buffer = np.ascontiguousarray(buffer)
+                        bytes_per_line = buffer.strides[0]
+                        mv = memoryview(buffer).cast("B")
+
                         # Align with non-fallback paths for timing/logging
                         t_after_copy = time.perf_counter()
                         
@@ -451,8 +466,12 @@ class Prefetcher:
                     t_after_decode = time.perf_counter()
                     
                     h, w, _ = buffer.shape
-                    bytes_per_line = w * 3
-                    arr = buffer.reshape(-1).copy()
+                    
+                    # Memory Optimization: Avoid explicit copy
+                    buffer = np.ascontiguousarray(buffer)
+                    bytes_per_line = buffer.strides[0]
+                    mv = memoryview(buffer).cast("B")
+
                     # Align with non-fallback paths for timing/logging
                     t_after_copy = time.perf_counter()
                     
@@ -484,8 +503,12 @@ class Prefetcher:
                 t_after_decode = time.perf_counter()
                     
                 h, w, _ = buffer.shape
-                bytes_per_line = w * 3
-                arr = buffer.reshape(-1).copy()
+
+                # Memory Optimization: Avoid explicit copy
+                buffer = np.ascontiguousarray(buffer)
+                bytes_per_line = buffer.strides[0]
+                mv = memoryview(buffer).cast("B")
+
                 t_after_copy = time.perf_counter()
 
             # Apply saturation compensation if enabled
@@ -517,7 +540,7 @@ class Prefetcher:
                 return None
             
             decoded_image = DecodedImage(
-                buffer=arr.data,
+                buffer=mv,
                 width=w,
                 height=h,
                 bytes_per_line=bytes_per_line,
@@ -547,12 +570,13 @@ class Prefetcher:
 
     def cancel_all(self):
         """Cancels all pending prefetch tasks."""
-        log.info("Cancelling all prefetch tasks.")
-        self.generation += 1
-        for future in self.futures.values():
-            future.cancel()
-        self.futures.clear()
-        self._scheduled.clear()  # Clear scheduled indices when bumping generation
+        with self._futures_lock:
+            log.info("Cancelling all prefetch tasks.")
+            self.generation += 1
+            for future in self.futures.values():
+                future.cancel()
+            self.futures.clear()
+            self._scheduled.clear()  # Clear scheduled indices when bumping generation
 
     def shutdown(self):
         """Shuts down the thread pool executor."""

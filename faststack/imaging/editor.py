@@ -485,51 +485,82 @@ class ImageEditor:
 
         return img
 
-    def auto_levels(self, threshold_percent: float = 0.1) -> Tuple[float, float]:
+    def auto_levels(self, threshold_percent: float = 0.1) -> Tuple[float, float, float, float]:
         """
-        Automatically adjusts blacks and whites based on image histogram.
-        
-        Args:
-            threshold_percent: value 0.0-10.0, percentage of pixels to clip at each end.
-        
-        Returns:
-            Tuple of (blacks, whites) parameter values.
+        Returns (blacks, whites, p_low, p_high).
+        p_low/p_high are computed conservatively from RGB to avoid introducing new channel clipping.
         """
         if self.original_image is None:
-            return 0.0, 0.0
-            
-        # Use preview image for speed if available, otherwise original
+            return 0.0, 0.0, 0.0, 255.0
+
+        if np is None:
+            # Fallback: do nothing without numpy
+            return 0.0, 0.0, 0.0, 255.0
+
+        threshold_percent = max(0.0, min(10.0, threshold_percent))
         img = self._preview_image if self._preview_image else self.original_image
-        
-        # Convert to numpy array for histogram analysis
-        arr = np.array(img.convert('L')) # Use luminance for levels
-        
-        # Calculate percentiles
+
+        rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
+        # rgb shape: (H, W, 3)
+
         low_p = threshold_percent
         high_p = 100.0 - threshold_percent
-        
-        p_low, p_high = np.percentile(arr, [low_p, high_p])
-        
-        # Calculate parameters to map p_low->0 and p_high->255
-        # Logic matches _apply_edits:
-        # black_point = -blacks * 40
-        # white_point = 255 - whites * 40
-        
-        # We want black_point to be p_low
-        # p_low = -blacks * 40 => blacks = -float(p_low) / 40.0
-        blacks = -float(p_low) / 40.0
-        
-        # We want white_point to be p_high
-        # p_high = 255 - whites * 40 => whites = (255.0 - float(p_high)) / 40.0
-        whites = (255.0 - float(p_high)) / 40.0
-        
-        # Update state
+
+        # --- Detect pre-clipping (per-channel) ---
+        # If *any* channel already has clipped pixels, do not push that end further.
+        # eps_pct strategy: "Practical" - ignore tiny hot pixels (0.01%) but pin 
+        # if there is any meaningful pre-clipping, even if below the full threshold.
+        eps_pct = min(threshold_percent, 0.01)
+
+        total = rgb.shape[0] * rgb.shape[1]
+        clipped_low_pct = []
+        clipped_high_pct = []
+        p_lows = []
+        p_highs = []
+
+        for c in range(3):
+            chan = rgb[:, :, c]
+            # Treat near-white/near-black as clipped (JPEG artifacts often land on 254/1)
+            clipped_low_pct.append(100.0 * float(np.count_nonzero(chan <= 1)) / float(total))
+            clipped_high_pct.append(100.0 * float(np.count_nonzero(chan >= 254)) / float(total))
+            
+            # Use discrete selection methods to avoid interpolation surprises on uint8.
+            # Fallback for older numpy (<1.22) that doesn't support method=.
+            try:
+                p_lows.append(float(np.percentile(chan, low_p, method="lower")))
+                p_highs.append(float(np.percentile(chan, high_p, method="higher")))
+            except TypeError:
+                p_lows.append(float(np.percentile(chan, low_p, interpolation="lower")))
+                p_highs.append(float(np.percentile(chan, high_p, interpolation="higher")))
+
+        # Conservative anchors to avoid new channel clipping
+        p_low = min(p_lows)
+        p_high = max(p_highs)
+
+        # Pin ends if pre-clipping exists (prevents making it worse)
+        if max(clipped_high_pct) > eps_pct:
+            p_high = 255.0
+        if max(clipped_low_pct) > eps_pct:
+            p_low = 0.0
+
+        # Safety
+        p_low = max(0.0, min(255.0, p_low))
+        p_high = max(0.0, min(255.0, p_high))
+
+        # Check for degenerate range (e.g. flat image) to prevent extreme stretching
+        if (p_high - p_low) < 1.0:
+            blacks = 0.0
+            whites = 0.0
+        else:
+            blacks = -p_low / 40.0
+            whites = (255.0 - p_high) / 40.0
+
         with self._lock:
-            self.current_edits['blacks'] = blacks
-            self.current_edits['whites'] = whites
+            self.current_edits["blacks"] = blacks
+            self.current_edits["whites"] = whites
             self._edits_rev += 1
-        
-        return blacks, whites
+
+        return blacks, whites, float(p_low), float(p_high)
 
     def get_preview_data_cached(self, allow_compute: bool = True) -> Optional[DecodedImage]:
         """Return cached preview if available, otherwise compute and cache.

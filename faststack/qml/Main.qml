@@ -248,22 +248,6 @@ ApplicationWindow {
                 height: 36
                 text: "Settings..."
                 onClicked: {
-                    if (uiState) {
-                        settingsDialog.heliconPath      = uiState.get_helicon_path()
-                        settingsDialog.photoshopPath    = uiState.get_photoshop_path()
-                        settingsDialog.cacheSize        = uiState.get_cache_size()
-                        settingsDialog.prefetchRadius   = uiState.get_prefetch_radius()
-                        settingsDialog.theme            = uiState.theme
-                        settingsDialog.defaultDirectory = uiState.get_default_directory()
-                        settingsDialog.optimizeFor       = uiState.get_optimize_for()
-                        settingsDialog.awbMode          = uiState.awbMode
-                        settingsDialog.awbStrength      = uiState.awbStrength
-                        settingsDialog.awbWarmBias      = uiState.awbWarmBias
-                        settingsDialog.awbLumaLowerBound = uiState.awbLumaLowerBound
-                        settingsDialog.awbLumaUpperBound = uiState.awbLumaUpperBound
-                        settingsDialog.awbRgbLowerBound = uiState.awbRgbLowerBound
-                        settingsDialog.awbRgbUpperBound = uiState.awbRgbUpperBound
-                    }
                     settingsDialog.open()
                     fileMenu.close()
                 }
@@ -871,10 +855,10 @@ ApplicationWindow {
                           "<b>Viewing:</b><br>" +
                           "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
                           "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
-                          "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br><br>" +
-                          "&nbsp;&nbsp;Ctrl+1: Zoom to 100%<br><br>" +
-                          "&nbsp;&nbsp;Ctrl+2: Zoom to 200%<br><br>" +
-                          "&nbsp;&nbsp;Ctrl+3: Zoom to 300%<br><br>" +
+                          "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br>" +
+                          "&nbsp;&nbsp;Ctrl+1: Zoom to 100%<br>" +
+                          "&nbsp;&nbsp;Ctrl+2: Zoom to 200%<br>" +
+                          "&nbsp;&nbsp;Ctrl+3: Zoom to 300%<br>" +
                           "&nbsp;&nbsp;Ctrl+4: Zoom to 400%<br><br>" +
                           "<b>Stacking:</b><br>" +
                           "&nbsp;&nbsp;[: Begin new stack<br>" +
@@ -895,7 +879,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;{: Begin new batch<br>" +
                           "&nbsp;&nbsp;B: Toggle current image in/out of batch<br>" +
                           "&nbsp;&nbsp;}: End current batch<br>" +
-                          "&nbsp;&nbsp;\\: Clear all batches<br>" +
+                          "&nbsp;&nbsp;\\: Clear all batches<br><br>" +
                           "<b>Flag Toggles:</b><br>" +
                           "&nbsp;&nbsp;U: Toggle uploaded flag<br>" +
                           "&nbsp;&nbsp;Ctrl+E: Toggle edited flag<br>" +
@@ -910,7 +894,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;A: Quick auto white balance (saves automatically)<br>" +
                           "&nbsp;&nbsp;L: Quick auto levels (saves automatically)<br>" +
                           "&nbsp;&nbsp;Ctrl+Shift+B: Quick auto white balance (saves automatically)<br>" +
-                          "&nbsp;&nbsp;O (or right mouse click): Toggle crop mode (Enter to execute crop, ESC to cancel)<br>" +
+                          "&nbsp;&nbsp;O (or right mouse click): Toggle crop mode (Enter to execute, ESC to cancel)<br>" +
                           "&nbsp;&nbsp;H: Toggle histogram window<br>" +
                           "&nbsp;&nbsp;E: Toggle Image Editor (closes without saving if open)<br>" +
                           "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
