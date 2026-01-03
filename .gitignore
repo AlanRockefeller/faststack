@@ -10,7 +10,7 @@ __pycache__/
 dist/
 build/
 *.spec
-+faststack.egg-info/
+faststack.egg-info/
 
 # Logs
 *.log
