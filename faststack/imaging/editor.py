@@ -485,7 +485,7 @@ class ImageEditor:
 
         return img
 
-    def auto_levels(self, threshold_percent: float = 0.1) -> Tuple[float, float]:
+    def auto_levels(self, threshold_percent: float = 0.1) -> Tuple[float, float, float, float]:
         """
         Automatically adjusts blacks and whites based on image histogram.
         
@@ -493,10 +493,15 @@ class ImageEditor:
             threshold_percent: value 0.0-10.0, percentage of pixels to clip at each end.
         
         Returns:
-            Tuple of (blacks, whites) parameter values.
+            Tuple of (blacks, whites, p_low, p_high) where:
+            - blacks, whites: parameter values for the editor
+            - p_low, p_high: the actual percentile anchor points used in the calculation
         """
         if self.original_image is None:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0, 255.0
+        
+        # Defensive clamping
+        threshold_percent = max(0.0, min(10.0, threshold_percent))
             
         # Use preview image for speed if available, otherwise original
         img = self._preview_image if self._preview_image else self.original_image
@@ -529,7 +534,7 @@ class ImageEditor:
             self.current_edits['whites'] = whites
             self._edits_rev += 1
         
-        return blacks, whites
+        return blacks, whites, float(p_low), float(p_high)
 
     def get_preview_data_cached(self, allow_compute: bool = True) -> Optional[DecodedImage]:
         """Return cached preview if available, otherwise compute and cache.

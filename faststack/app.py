@@ -459,7 +459,7 @@ class AppController(QObject):
             
             if not match:
                 # Debug log if mismatch
-                log.debug(f"Path mismatch in preview. Editor: {editor_path}, File: {file_path}")
+                log.debug("Path mismatch in preview. Editor: %s, File: %s", editor_path, file_path)
             
             # Return background-rendered preview if Editor is open OR Cropping is active
             if match and self.image_editor.original_image:
@@ -514,33 +514,47 @@ class AppController(QObject):
         try:
             # Submit with priority=True to cancel pending prefetch tasks and free up workers
             future = self.prefetcher.submit_task(index, self.prefetcher.generation, priority=True)
-            if future:
-                try:
-                    # Wait for decode to complete (blocking but fast for JPEGs)
-                    result = future.result(timeout=5.0)  # 5 second timeout as safety
-                    if result:
-                        decoded_path, decoded_display_gen = result
-                        cache_key = build_cache_key(decoded_path, decoded_display_gen)
-                        if cache_key in self.image_cache:
-                            decoded = self.image_cache[cache_key]
-                            with self._last_image_lock:
-                                self.last_displayed_image = decoded
-                            if _debug_mode:
-                                elapsed = time.perf_counter() - decode_start
-                                log.info("Decoded image %d in %.3fs", index, elapsed)
-                            return decoded
-                except concurrent.futures.TimeoutError:
-                    log.exception("Timeout decoding image at index %d", index)
-                    with self._last_image_lock:
-                        return self.last_displayed_image
-                except concurrent.futures.CancelledError:
-                    log.warning("Decode cancelled for index %d", index)
-                    with self._last_image_lock:
-                        return self.last_displayed_image
-                except Exception as e:
-                    log.exception("Error decoding image at index %d", index)
-                    with self._last_image_lock:
-                        return self.last_displayed_image
+            if not future:
+                with self._last_image_lock:
+                    return self.last_displayed_image
+
+            try:
+                # Wait for decode to complete (blocking but fast for JPEGs)
+                result = future.result(timeout=5.0)  # 5 second timeout as safety
+            except concurrent.futures.TimeoutError:
+                log.warning("Timeout decoding image at index %d", index)
+                with self._last_image_lock:
+                    return self.last_displayed_image
+            except concurrent.futures.CancelledError:
+                log.debug("Decode cancelled for index %d", index)
+                with self._last_image_lock:
+                    return self.last_displayed_image
+            except Exception:
+                log.exception("Error decoding image at index %d", index)
+                with self._last_image_lock:
+                    return self.last_displayed_image
+
+            if not result:
+                if _debug_mode:
+                    log.debug("Decode returned no result for index %d", index)
+                with self._last_image_lock:
+                    return self.last_displayed_image
+
+            decoded_path, decoded_display_gen = result
+            cache_key = build_cache_key(decoded_path, decoded_display_gen)
+            if cache_key in self.image_cache:
+                decoded = self.image_cache[cache_key]
+                with self._last_image_lock:
+                    self.last_displayed_image = decoded
+                if _debug_mode:
+                    elapsed = time.perf_counter() - decode_start
+                    log.info("Decoded image %d in %.3fs", index, elapsed)
+                return decoded
+            else:
+                if _debug_mode:
+                    log.debug("Decode finished but cache_key missing (index=%d, key=%s)", index, cache_key)
+                with self._last_image_lock:
+                    return self.last_displayed_image
         finally:
             # Hide decoding indicator
             if self.debug_cache:
@@ -586,15 +600,23 @@ class AppController(QObject):
             # The danger is 'self.futures' management in Prefetcher.
             future = self.prefetcher.submit_task(index, self.prefetcher.generation, priority=True)
             if future:
-                result = future.result(timeout=5.0)
+                try:
+                    result = future.result(timeout=5.0)
+                except concurrent.futures.TimeoutError:
+                    log.warning(f"Timeout decoding image at index {index} (background)")
+                    return None
+                except concurrent.futures.CancelledError:
+                    log.debug(f"Decode cancelled for image at index {index} (background)")
+                    return None
+                
                 if result:
                     decoded_path, decoded_display_gen = result
                     # Re-verify key
                     cache_key = build_cache_key(decoded_path, decoded_display_gen)
                     if cache_key in self.image_cache:
                         return self.image_cache[cache_key]
-        except Exception as e:
-            log.warning(f"_get_decoded_image_safe failed for index {index}: {e}")
+        except Exception:
+            log.exception("_get_decoded_image_safe failed for index %d", index)
             
         return None
 
@@ -1300,14 +1322,14 @@ class AppController(QObject):
         config.set('core', 'cache_size_gb', size)
         config.save()
         
-        old_max_bytes = self.image_cache.maxsize
+        old_max_bytes = self.image_cache.max_bytes
         new_max_bytes = int(size * 1024**3)
         if old_max_bytes == new_max_bytes:
             return
         
         log.info("Resizing decoded image cache from %.2f GB to %.2f GB",
                  old_max_bytes / (1024**3), size)
-        self.image_cache.maxsize = new_max_bytes
+        self.image_cache.max_bytes = new_max_bytes
         
         # If the new size is smaller than current usage, evict until under limit
         while self.image_cache.currsize > new_max_bytes and len(self.image_cache) > 0:
@@ -2244,7 +2266,7 @@ class AppController(QObject):
                 
                 # Format usage info
                 used_gb = self.image_cache.currsize / (1024**3)
-                max_gb = self.image_cache.maxsize / (1024**3)
+                max_gb = self.image_cache.max_bytes / (1024**3)
                 
                 msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in {CACHE_THRASH_WINDOW_SECS}s. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
                 
@@ -3225,47 +3247,51 @@ class AppController(QObject):
                 return False
 
         # Calculate auto levels
-        blacks, whites = self.image_editor.auto_levels(self.auto_level_threshold)
+        # Calculate auto levels - now returns (blacks, whites, p_low, p_high)
+        blacks, whites, p_low, p_high = self.image_editor.auto_levels(self.auto_level_threshold)
         
-        # Scale by strength
-        skipped_due_to_clipping = False
+        # Auto-strength computation using stretch-factor capping
+        # 
+        # Philosophy: threshold_percent defines acceptable clipping (e.g., 0.1% at each end).
+        # Auto-strength should NOT prevent that clipping - it's intentional.
+        # Instead, auto-strength prevents INSANE levels on low-dynamic-range images.
+        #
+        # Approach: Cap the stretch factor to a reasonable maximum (e.g., 3-4x).
+        # - Full strength: stretch = 255 / (p_high - p_low)
+        # - If stretch is reasonable (<= cap), use full strength
+        # - If stretch is extreme (> cap), blend to limit effective stretch to cap
+        #
         if self.auto_level_strength_auto:
-            # Calculate optimal strength to prevent pre-clipping
-            try:
-                # Use preview image if available to ignore single hot-pixel outliers
-                img = self.image_editor._preview_image if self.image_editor._preview_image else self.image_editor.original_image
-                if img:
-                    # Get max value across all channels
-                    extrema = img.getextrema()
-                    if isinstance(extrema[0], tuple):
-                        max_val = max(ch[1] for ch in extrema)
-                    else:
-                        max_val = extrema[1]
-                    
-                    log.debug(f"Auto levels auto-strength: max_val={max_val}")
-                    
-                    if max_val < 250:
-                        denom = 40 * (250 * whites - 5 * blacks)
-                        if abs(denom) > 0.001:
-                            strength = (255 * (max_val - 250)) / denom
-                            strength = max(0.0, min(1.0, strength))
-                        else:
-                            strength = 0.0
-                    else:
-                        strength = 0.0
-                        skipped_due_to_clipping = True
+            # Calculate full-strength stretch factor
+            dynamic_range = p_high - p_low
+            if dynamic_range < 1.0:
+                # Degenerate case: nearly flat image
+                strength = 0.0
+                log.debug(f"Auto levels: degenerate dynamic range ({dynamic_range:.2f}), strength=0")
+            else:
+                stretch_full = 255.0 / dynamic_range
+                
+                # Cap stretch to prevent insane levels
+                # E.g., if image spans only 50-200 (range=150), full stretch would be 255/150 = 1.7x (fine)
+                # But if image spans 100-110 (range=10), full stretch would be 255/10 = 25.5x (insane!)
+                STRETCH_CAP = 4.0  # Maximum allowed stretch factor
+                
+                if stretch_full <= STRETCH_CAP:
+                    # Reasonable stretch, use full strength
+                    strength = 1.0
                 else:
-                    strength = self.auto_level_strength
-            except Exception as e:
-                log.warning(f"Failed to calculate auto strength: {e}")
-                strength = self.auto_level_strength
+                    # Excessive stretch - blend to cap it
+                    # effective_stretch = 1 + strength * (stretch_full - 1) = STRETCH_CAP
+                    # solving for strength: strength = (STRETCH_CAP - 1) / (stretch_full - 1)
+                    strength = (STRETCH_CAP - 1.0) / (stretch_full - 1.0)
+                    strength = max(0.0, min(1.0, strength))
+                
+                log.debug(f"Auto levels: p_low={p_low:.1f}, p_high={p_high:.1f}, "
+                         f"range={dynamic_range:.1f}, stretch_full={stretch_full:.2f}, strength={strength:.3f}")
         else:
             strength = self.auto_level_strength
 
-        if skipped_due_to_clipping:
-            self.update_status_message("No changes made to color levels to avoid clipping")
-            return False
-
+        # Apply strength scaling to blacks and whites parameters
         blacks *= strength
         whites *= strength
         

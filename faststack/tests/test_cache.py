@@ -15,7 +15,7 @@ class MockItem:
 def test_cache_init():
     """Tests cache initialization."""
     cache = ByteLRUCache(max_bytes=1000, size_of=lambda x: x.__sizeof__())
-    assert cache.maxsize == 1000
+    assert cache.max_bytes == 1000
     assert cache.currsize == 0
 
 def test_cache_add_items():

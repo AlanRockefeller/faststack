@@ -24,6 +24,18 @@ class ByteLRUCache(LRUCache):
             f"Initialized byte-aware LRU cache with {max_bytes / 1024**2:.2f} MB capacity."
         )
 
+    @property
+    def max_bytes(self) -> int:
+        """Get the maximum cache size in bytes."""
+        return self.maxsize
+
+    @max_bytes.setter
+    def max_bytes(self, value: int) -> None:
+        """Set the maximum cache size in bytes."""
+        v = max(0, int(value))
+        self.maxsize = v
+        log.debug(f"Cache max_bytes updated to {v / 1024**2:.2f} MB")
+
     def __setitem__(self, key, value):
         # Before adding a new item, we might need to evict others
         # This is handled by the parent class, which will call popitem if needed
