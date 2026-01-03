@@ -3309,9 +3309,28 @@ class AppController(QObject):
         if self.ui_state.isHistogramVisible:
             self.update_histogram()
             
-        self.update_status_message(f"Auto levels applied (preview only)")
-        log.info("Auto levels preview applied to %s (clip %.2f%%, str %.2f)", 
-                 filepath, self.auto_level_threshold, strength)
+        # Determine status message based on whether endpoints were pinned (clipping detected)
+        # We check p_high/p_low directly because whites/blacks might be small due to strength scaling
+        # even if not pinned.
+        msg = "Auto levels applied"
+        
+        # Check for essentially no-op (degenerate or already full range)
+        # Degenerate: dynamic range is tiny (< 1.0)
+        # Full range: p_low is near 0 and p_high near 255
+        if abs(p_high - p_low) < 1.0:
+            msg = "Auto levels: no changes (degenerate range)"
+        elif p_low <= 0 and p_high >= 255:
+            # We already cover the full range
+            msg = "Auto levels: no changes (image already covers full range)"
+        # Check for pinning
+        elif p_high >= 255.0:
+            msg = "Auto levels: highlights already clipped; only adjusting shadows"
+        elif p_low <= 0.0:
+            msg = "Auto levels: shadows already clipped; only adjusting highlights"
+
+        self.update_status_message(f"{msg} (preview only)")
+        log.info("Auto levels preview applied to %s (clip %.2f%%, str %.2f). Msg: %s", 
+                 filepath, self.auto_level_threshold, strength, msg)
         return True
 
     @Slot()

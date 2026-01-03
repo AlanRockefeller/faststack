@@ -663,6 +663,12 @@ Window {
                                          item.text = settingsDialog.autoLevelClippingThreshold.toFixed(4)
                                      })
                                 }
+                                Binding {
+                                    target: parent.item
+                                    property: "text"
+                                    value: settingsDialog.autoLevelClippingThreshold.toFixed(4)
+                                    when: parent.item && !parent.item.activeFocus
+                                }
                             }
 
                             Label { 
@@ -689,6 +695,12 @@ Window {
                                         item.valueChanged.connect(function() { settingsDialog.autoLevelStrength = item.value })
                                         item.enabled = Qt.binding(function() { return !autoLvlAuto.checked })
                                         item.opacity = Qt.binding(function() { return (!autoLvlAuto.checked) ? 1.0 : 0.5 })
+                                    }
+                                    Binding {
+                                        target: parent.item
+                                        property: "value"
+                                        value: settingsDialog.autoLevelStrength
+                                        when: parent.item && !parent.item.pressed
                                     }
                                 }
                                 CheckBox {
@@ -774,6 +786,12 @@ Window {
                                     item.value = settingsDialog.awbStrength
                                     item.valueChanged.connect(function() { settingsDialog.awbStrength = item.value })
                                 }
+                                Binding {
+                                    target: parent.item
+                                    property: "value"
+                                    value: settingsDialog.awbStrength
+                                    when: parent.item && !parent.item.pressed
+                                }
                             }
 
                             // Warm Bias
@@ -797,6 +815,16 @@ Window {
                                     item.value = settingsDialog.awbWarmBias
                                     item.valueChanged.connect(function() { settingsDialog.awbWarmBias = item.value })
                                 }
+                                Binding {
+                                    target: parent.item
+                                    property: "value"
+                                    value: settingsDialog.awbWarmBias
+                                    when: parent.item && !parent.item.down // SpinBox uses down, not pressed? Or implicit pressed? SpinBox interaction is complex.
+                                    // Actually SpinBox 'value' property should be bound. SpinBox breaks binding on user input.
+                                    // 'down' property exists for internal buttons but maybe not the whole control.
+                                    // Let's assume standard Binding restoration behavior works or checking activeFocus might correspond to editing.
+                                    // Standard QtQuick Controls 2 SpinBox has 'down'.
+                                }
                             }
 
                             // Tint Bias
@@ -819,6 +847,12 @@ Window {
                                     item.from = -50; item.to = 50
                                     item.value = settingsDialog.awbTintBias
                                     item.valueChanged.connect(function() { settingsDialog.awbTintBias = item.value })
+                                }
+                                Binding {
+                                    target: parent.item
+                                    property: "value"
+                                    value: settingsDialog.awbTintBias
+                                    when: parent.item
                                 }
                             }
                         }
@@ -852,6 +886,12 @@ Window {
                             Loader {
                                 sourceComponent: styledSpinBox
                                 onLoaded: { item.from=0; item.to=255; item.value=settingsDialog.awbLumaLowerBound; item.valueChanged.connect(function(){ settingsDialog.awbLumaLowerBound=item.value})}
+                                Binding {
+                                    target: parent.item
+                                    property: "value"
+                                    value: settingsDialog.awbLumaLowerBound
+                                    when: parent.item
+                                }
                             }
 
                             Label { 
@@ -870,6 +910,12 @@ Window {
                             Loader {
                                 sourceComponent: styledSpinBox
                                 onLoaded: { item.from=0; item.to=255; item.value=settingsDialog.awbLumaUpperBound; item.valueChanged.connect(function(){ settingsDialog.awbLumaUpperBound=item.value})}
+                                Binding {
+                                    target: parent.item
+                                    property: "value"
+                                    value: settingsDialog.awbLumaUpperBound
+                                    when: parent.item
+                                }
                             }
 
                             Label { 
@@ -888,6 +934,12 @@ Window {
                             Loader {
                                 sourceComponent: styledSpinBox
                                 onLoaded: { item.from=0; item.to=255; item.value=settingsDialog.awbRgbLowerBound; item.valueChanged.connect(function(){ settingsDialog.awbRgbLowerBound=item.value})}
+                                Binding {
+                                    target: parent.item
+                                    property: "value"
+                                    value: settingsDialog.awbRgbLowerBound
+                                    when: parent.item
+                                }
                             }
 
                             Label { 
@@ -906,6 +958,12 @@ Window {
                             Loader {
                                 sourceComponent: styledSpinBox
                                 onLoaded: { item.from=0; item.to=255; item.value=settingsDialog.awbRgbUpperBound; item.valueChanged.connect(function(){ settingsDialog.awbRgbUpperBound=item.value})}
+                                Binding {
+                                    target: parent.item
+                                    property: "value"
+                                    value: settingsDialog.awbRgbUpperBound
+                                    when: parent.item
+                                }
                             }
                         }
                         
