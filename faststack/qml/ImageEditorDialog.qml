@@ -449,6 +449,8 @@ Window {
                              controller.set_edit_parameter(model.key, 0.0)
                              imageEditorDialog.updatePulse++
                              value = 0.0
+                             _pendingValue = 0.0
+                             slider._lastSentValue = 0.0
                         }
                         lastPressTime = now
                         lastPressValue = value

@@ -27,6 +27,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gui = [
+    "PySide6>=6.0,<7.0",
+]
 dev = [
     "pytest>=8.0,<9.0",
 ]
@@ -41,6 +44,6 @@ packages = ["faststack"]
 [tool.pytest.ini_options]
 testpaths = ["faststack/tests"]
 python_files = ["test_*.py"]
-addopts = "-p no:cacheprovider -p no:doctest"
+addopts = "-p no:cacheprovider -p no:doctest --basetemp=./var/pytest-temp"
 norecursedirs = ["var", ".venv", "cache", "faststack.egg-info", "__pycache__"]
 

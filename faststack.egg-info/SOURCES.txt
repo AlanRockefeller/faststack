@@ -1,0 +1,15 @@
+LICENSE
+README.md
+pyproject.toml
+faststack/__init__.py
+faststack/app.py
+faststack/config.py
+faststack/logging_setup.py
+faststack/models.py
+faststack/verify_wb.py
+faststack.egg-info/PKG-INFO
+faststack.egg-info/SOURCES.txt
+faststack.egg-info/dependency_links.txt
+faststack.egg-info/entry_points.txt
+faststack.egg-info/requires.txt
+faststack.egg-info/top_level.txt

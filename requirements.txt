@@ -4,7 +4,3 @@ cachetools==5.*
 watchdog==4.*
 Pillow==10.*      # fallback decode; keep it
 
-
-[project.optional-dependencies]
-gui = ["PySide6>=6.0,<7.0"]
-dev = ["pytest>=8.0,<9.0"]

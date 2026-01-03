@@ -40,8 +40,6 @@ def test_sidecar_load_existing(mock_sidecar_dir):
 
     assert sm.data.last_index == 42
     assert len(sm.data.entries) == 2
-    assert sm.data.last_index == 42
-    assert len(sm.data.entries) == 2
     
     # flag and reject are legacy and not in current model, so they are dropped.
     # stack_id IS in the current model, so it should be preserved.

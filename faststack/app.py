@@ -2826,6 +2826,9 @@ class AppController(QObject):
                     # Ensure QML/provider URL changes so we don't get a cached frame
                     self.ui_refresh_generation += 1
                     self.ui_state.currentImageSourceChanged.emit()
+                    
+                    # Trigger histogram update (always call, let update_histogram handle visibility guards)
+                    self.update_histogram()
             
             # If new requests arrived while we were rendering, start the next one immediately
             if self._preview_pending:

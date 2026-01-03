@@ -46,6 +46,16 @@ class ByteLRUCache(LRUCache):
         # and we would explicitly free the GPU texture here.
         return key, value
 
+    def clear(self):
+        """Clear cache without triggering eviction callbacks."""
+        # Temporarily disable callback to prevent "thrashing" warnings during mass clear
+        callback = self.on_evict
+        self.on_evict = None
+        try:
+            super().clear()
+        finally:
+            self.on_evict = callback
+
 
 def get_decoded_image_size(item) -> int:
     """Calculates the size of a decoded image tuple (buffer, qimage)."""

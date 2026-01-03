@@ -1,11 +1,12 @@
 
 import logging
 import sys
-import os
+
+log = logging.getLogger(__name__)
 
 # Mock the parts of the app needed for setup_logging
 # We need to make sure we can import faststack modules
-sys.path.append(os.getcwd())
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from faststack.logging_setup import setup_logging
 
