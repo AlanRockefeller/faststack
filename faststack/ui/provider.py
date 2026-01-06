@@ -159,6 +159,7 @@ class UIState(QObject):
     cacheStatsChanged = Signal(str)
     isDecodingChanged = Signal(bool)
     debugModeChanged = Signal(bool) # General debug mode signal
+    isDialogOpenChanged = Signal(bool) # New signal for dialog state
 
     def __init__(self, app_controller):
         super().__init__()
@@ -206,6 +207,13 @@ class UIState(QObject):
         self._debug_cache = False
         self._cache_stats = ""
         self._is_decoding = False
+        self._is_dialog_open = False
+        
+        # Connect to controller's dialog state signal
+        self.app_controller.dialogStateChanged.connect(self._on_dialog_state_changed)
+
+    def _on_dialog_state_changed(self, is_open: bool):
+        self.isDialogOpen = is_open
 
     # ---- THEME PROPERTY ----
     @Property(int, notify=themeChanged)
@@ -490,6 +498,14 @@ class UIState(QObject):
         self.app_controller.set_photoshop_path(path)
 
     @Slot(result=str)
+    def get_rawtherapee_path(self):
+        return self.app_controller.get_rawtherapee_path()
+
+    @Slot(str)
+    def set_rawtherapee_path(self, path):
+        self.app_controller.set_rawtherapee_path(path)
+
+    @Slot(result=str)
     def open_file_dialog(self):
         return self.app_controller.open_file_dialog()
 
@@ -612,6 +628,16 @@ class UIState(QObject):
         if self._is_editor_open != new_value:
             self._is_editor_open = new_value
             self.is_editor_open_changed.emit(new_value)
+
+    @Property(bool, notify=isDialogOpenChanged)
+    def isDialogOpen(self) -> bool:
+        return self._is_dialog_open
+
+    @isDialogOpen.setter
+    def isDialogOpen(self, new_value: bool):
+        if self._is_dialog_open != new_value:
+            self._is_dialog_open = new_value
+            self.isDialogOpenChanged.emit(new_value)
 
     @Property(bool, notify=anySliderPressedChanged)
     def anySliderPressed(self):

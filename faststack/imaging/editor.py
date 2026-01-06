@@ -285,11 +285,11 @@ class ImageEditor:
         # (This remains first as it changes the coordinate system basis)
         rotation = edits.get('rotation', 0)
         if rotation == 90:
-            img = img.transpose(Image.Transpose.ROTATE_270)
+            img = img.transpose(Image.Transpose.ROTATE_90)
         elif rotation == 180:
             img = img.transpose(Image.Transpose.ROTATE_180)
         elif rotation == 270:
-            img = img.transpose(Image.Transpose.ROTATE_90)
+            img = img.transpose(Image.Transpose.ROTATE_270)
 
         # ---------------------------------------------------------
         # CHANGE: Apply Free Rotation (Straighten) BEFORE Cropping
@@ -536,6 +536,10 @@ class ImageEditor:
         # Conservative anchors to avoid new channel clipping
         p_low = min(p_lows)
         p_high = max(p_highs)
+
+        # NOTE: applying this stretch uniformly to RGB can clip individual channels 
+        # more than luminance predicts. That’s usually acceptable, but if we 
+        # ever see weird color clipping, that might be why.
 
         # Pin ends if pre-clipping exists (prevents making it worse)
         if max(clipped_high_pct) > eps_pct:

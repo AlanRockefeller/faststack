@@ -618,6 +618,7 @@ ApplicationWindow {
     Shortcut {
         sequence: "E"
         context: Qt.ApplicationShortcut
+        enabled: uiState ? !uiState.isDialogOpen : true
         onActivated: {
             if (!uiState) return
             

@@ -29,6 +29,7 @@ Window {
     property int theme: 0
     property string defaultDirectory: ""
     property string photoshopPath: ""
+    property string rawtherapeePath: ""
     property string optimizeFor: "speed"
 
     property string awbMode: "lab"
@@ -64,6 +65,7 @@ Window {
         if (uiState) {
             heliconPath = uiState.get_helicon_path()
             photoshopPath = uiState.get_photoshop_path()
+            rawtherapeePath = uiState.get_rawtherapee_path()
             cacheSize = uiState.get_cache_size()
             prefetchRadius = uiState.get_prefetch_radius()
             theme = uiState.theme
@@ -99,6 +101,7 @@ Window {
             // Reset all text fields from properties
             if (heliconField.item) heliconField.item.text = settingsDialog.heliconPath
             if (photoshopField.item) photoshopField.item.text = settingsDialog.photoshopPath
+            if (rawtherapeeField.item) rawtherapeeField.item.text = settingsDialog.rawtherapeePath
             if (defaultDirField.item) defaultDirField.item.text = settingsDialog.defaultDirectory
             if (cacheSizeField.item) cacheSizeField.item.text = settingsDialog.cacheSize.toFixed(1)
             // Note: ComboBoxes and SpinBoxes update automatically via bindings/connections
@@ -110,6 +113,7 @@ Window {
     function saveSettings() {
         uiState.set_helicon_path(heliconPath)
         uiState.set_photoshop_path(photoshopPath)
+        uiState.set_rawtherapee_path(rawtherapeePath)
         uiState.set_cache_size(cacheSize)
         uiState.set_prefetch_radius(prefetchRadius)
         uiState.set_theme(theme)
@@ -461,6 +465,40 @@ Window {
                             }
                         }
 
+                        // RawTherapee Path
+                        Label { text: "RawTherapee Path"; color: "#aaaaaa"; font.pixelSize: 12; Layout.topMargin: 5 }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Loader {
+                                id: rawtherapeeField
+                                sourceComponent: styledTextField
+                                Layout.fillWidth: true
+                                onLoaded: {
+                                    // Text is set once in onVisibleChanged
+                                    item.text = settingsDialog.rawtherapeePath
+                                    item.textEdited.connect(function() { settingsDialog.rawtherapeePath = item.text })
+                                }
+                            }
+                            Button {
+                                text: "Browse"
+                                flat: true
+                                onClicked: {
+                                    var path = uiState.open_file_dialog()
+                                    if (path) {
+                                        settingsDialog.rawtherapeePath = path
+                                        if (rawtherapeeField.item) rawtherapeeField.item.text = path
+                                    }
+                                }
+                                background: Rectangle { color: parent.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: parent.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            }
+                            Label {
+                                text: "✔"
+                                color: "#4ade80"
+                                visible: uiState && uiState.check_path_exists(settingsDialog.rawtherapeePath)
+                            }
+                        }
+
                         // Default Directory
                         Label { text: "Default Image Directory"; color: "#aaaaaa"; font.pixelSize: 12; Layout.topMargin: 5 }
                         RowLayout {
@@ -650,9 +688,10 @@ Window {
                                 }
                                 
                                 ToolTip.visible: clipThresholdHover.containsMouse
-                                ToolTip.text: "Percentage of pixels to clip at the dark and light ends of the histogram when auto-levels is applied. Higher values (e.g., 5%) increase contrast but risk hard clipping. Lower values (e.g., 0.1%) preserve more dynamic range. Default: 0.1%"
+                                ToolTip.text: "Percentage of pixels to clip at the dark and light ends of the histogram when auto-levels is applied. Higher values (e.g., 5%) increase contrast but risk making highlights appear clipped. Lower values (e.g., 0.1%) preserve more dynamic range. Default: 0.1%"
                             }
                             Loader {
+                                id: clipThresholdLoader
                                 sourceComponent: styledTextField
                                 Layout.preferredWidth: 80
                                 onLoaded: {
@@ -664,10 +703,10 @@ Window {
                                      })
                                 }
                                 Binding {
-                                    target: parent.item
+                                    target: clipThresholdLoader.item
                                     property: "text"
                                     value: settingsDialog.autoLevelClippingThreshold.toFixed(4)
-                                    when: parent.item && !parent.item.activeFocus
+                                    when: clipThresholdLoader.item && !clipThresholdLoader.item.activeFocus
                                 }
                             }
 
@@ -687,6 +726,7 @@ Window {
                             RowLayout {
                                 Layout.fillWidth: true
                                 Loader {
+                                    id: autoLevelStrengthLoader
                                     sourceComponent: styledSlider
                                     Layout.fillWidth: true
                                     onLoaded: {
@@ -697,10 +737,10 @@ Window {
                                         item.opacity = Qt.binding(function() { return (!autoLvlAuto.checked) ? 1.0 : 0.5 })
                                     }
                                     Binding {
-                                        target: parent.item
+                                        target: autoLevelStrengthLoader.item
                                         property: "value"
                                         value: settingsDialog.autoLevelStrength
-                                        when: parent.item && !parent.item.pressed
+                                        when: autoLevelStrengthLoader.item && !autoLevelStrengthLoader.item.pressed
                                     }
                                 }
                                 CheckBox {
@@ -787,10 +827,10 @@ Window {
                                     item.valueChanged.connect(function() { settingsDialog.awbStrength = item.value })
                                 }
                                 Binding {
-                                    target: parent.item
+                                    target: awbStrSlider.item
                                     property: "value"
                                     value: settingsDialog.awbStrength
-                                    when: parent.item && !parent.item.pressed
+                                    when: awbStrSlider.item && !awbStrSlider.item.pressed
                                 }
                             }
 
@@ -809,6 +849,7 @@ Window {
                                 ToolTip.text: "Shifts the white balance warmer (yellow, positive values) or cooler (blue, negative values) after auto correction. Useful to compensate for systematic color casts. Range: -50 to +50. Default: +6"
                             }
                             Loader {
+                                id: awbWarmBiasLoader
                                 sourceComponent: styledSpinBox
                                 onLoaded: {
                                     item.from = -50; item.to = 50
@@ -816,14 +857,10 @@ Window {
                                     item.valueChanged.connect(function() { settingsDialog.awbWarmBias = item.value })
                                 }
                                 Binding {
-                                    target: parent.item
+                                    target: awbWarmBiasLoader.item
                                     property: "value"
                                     value: settingsDialog.awbWarmBias
-                                    when: parent.item && !parent.item.down // SpinBox uses down, not pressed? Or implicit pressed? SpinBox interaction is complex.
-                                    // Actually SpinBox 'value' property should be bound. SpinBox breaks binding on user input.
-                                    // 'down' property exists for internal buttons but maybe not the whole control.
-                                    // Let's assume standard Binding restoration behavior works or checking activeFocus might correspond to editing.
-                                    // Standard QtQuick Controls 2 SpinBox has 'down'.
+                                    when: awbWarmBiasLoader.item && !awbWarmBiasLoader.item.activeFocus
                                 }
                             }
 
@@ -842,6 +879,7 @@ Window {
                                 ToolTip.text: "Shifts the color tint toward magenta (positive values) or green (negative values) after auto correction. Compensates for tint issues in the white balance. Range: -50 to +50. Default: 0"
                             }
                             Loader {
+                                id: awbTintBiasLoader
                                 sourceComponent: styledSpinBox
                                 onLoaded: {
                                     item.from = -50; item.to = 50
@@ -849,10 +887,10 @@ Window {
                                     item.valueChanged.connect(function() { settingsDialog.awbTintBias = item.value })
                                 }
                                 Binding {
-                                    target: parent.item
+                                    target: awbTintBiasLoader.item
                                     property: "value"
                                     value: settingsDialog.awbTintBias
-                                    when: parent.item
+                                    when: awbTintBiasLoader.item
                                 }
                             }
                         }
@@ -884,13 +922,14 @@ Window {
                                 ToolTip.text: "Minimum luminance (brightness) threshold for pixels to be included in AWB gray-point calculation. Pixels darker than this are excluded. Range: 0-255. Default: 30. Increase to ignore very dark areas."
                             }
                             Loader {
+                                id: awbLumaLowerLoader
                                 sourceComponent: styledSpinBox
                                 onLoaded: { item.from=0; item.to=255; item.value=settingsDialog.awbLumaLowerBound; item.valueChanged.connect(function(){ settingsDialog.awbLumaLowerBound=item.value})}
                                 Binding {
-                                    target: parent.item
+                                    target: awbLumaLowerLoader.item
                                     property: "value"
                                     value: settingsDialog.awbLumaLowerBound
-                                    when: parent.item
+                                    when: awbLumaLowerLoader.item
                                 }
                             }
 
@@ -908,13 +947,14 @@ Window {
                                 ToolTip.text: "Maximum luminance (brightness) threshold for pixels to be included in AWB gray-point calculation. Pixels brighter than this are excluded. Range: 0-255. Default: 220. Decrease to ignore very bright areas."
                             }
                             Loader {
+                                id: awbLumaUpperLoader
                                 sourceComponent: styledSpinBox
                                 onLoaded: { item.from=0; item.to=255; item.value=settingsDialog.awbLumaUpperBound; item.valueChanged.connect(function(){ settingsDialog.awbLumaUpperBound=item.value})}
                                 Binding {
-                                    target: parent.item
+                                    target: awbLumaUpperLoader.item
                                     property: "value"
                                     value: settingsDialog.awbLumaUpperBound
-                                    when: parent.item
+                                    when: awbLumaUpperLoader.item
                                 }
                             }
 
@@ -932,13 +972,14 @@ Window {
                                 ToolTip.text: "Minimum RGB channel value for pixels to be included in AWB calculation. Pixels with any channel below this are excluded. Range: 0-255. Default: 5. Increase to ignore very saturated colors."
                             }
                             Loader {
+                                id: awbRgbLowerLoader
                                 sourceComponent: styledSpinBox
                                 onLoaded: { item.from=0; item.to=255; item.value=settingsDialog.awbRgbLowerBound; item.valueChanged.connect(function(){ settingsDialog.awbRgbLowerBound=item.value})}
                                 Binding {
-                                    target: parent.item
+                                    target: awbRgbLowerLoader.item
                                     property: "value"
                                     value: settingsDialog.awbRgbLowerBound
-                                    when: parent.item
+                                    when: awbRgbLowerLoader.item
                                 }
                             }
 
@@ -956,13 +997,14 @@ Window {
                                 ToolTip.text: "Maximum RGB channel value for pixels to be included in AWB calculation. Pixels with any channel above this are excluded. Range: 0-255. Default: 250. Decrease to ignore near-white areas."
                             }
                             Loader {
+                                id: awbRgbUpperLoader
                                 sourceComponent: styledSpinBox
                                 onLoaded: { item.from=0; item.to=255; item.value=settingsDialog.awbRgbUpperBound; item.valueChanged.connect(function(){ settingsDialog.awbRgbUpperBound=item.value})}
                                 Binding {
-                                    target: parent.item
+                                    target: awbRgbUpperLoader.item
                                     property: "value"
                                     value: settingsDialog.awbRgbUpperBound
-                                    when: parent.item
+                                    when: awbRgbUpperLoader.item
                                 }
                             }
                         }
