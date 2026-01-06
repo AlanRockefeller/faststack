@@ -320,6 +320,11 @@ class Prefetcher:
             return None
 
         try:
+            # Check for empty file to avoid mmap error
+            if os.path.getsize(image_file.path) == 0:
+                log.warning("Skipping empty image file: %s", image_file.path)
+                return None
+
             # Get current color management mode and optimization setting
             color_mode = config.get('color', 'mode', fallback="none").lower()
             optimize_for = config.get('core', 'optimize_for', fallback='speed').lower()
@@ -515,6 +520,17 @@ class Prefetcher:
             if color_mode == "saturation":
                 try:
                     factor = float(config.get('color', 'saturation_factor', fallback="1.0"))
+                    
+                    # Ensure buffer is contiguous and create a 1D view for saturation compensation
+                    # Note: buffer is already made contiguous (np.ascontiguousarray) in the decode blocks above
+                    arr = buffer.ravel()
+                    
+                    # Verify shape expectations
+                    if self.debug:
+                        assert buffer.flags['C_CONTIGUOUS'], "Buffer must be C-contiguous for in-place modification"
+                        assert arr.size == h * bytes_per_line, f"Buffer size mismatch: {arr.size} != {h} * {bytes_per_line}"
+                        assert arr.dtype == np.uint8, f"Buffer dtype must be uint8, got {arr.dtype}"
+                    
                     apply_saturation_compensation(arr, w, h, bytes_per_line, factor)
                     t_after_saturation = time.perf_counter()
                     

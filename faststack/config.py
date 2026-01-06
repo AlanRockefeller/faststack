@@ -8,6 +8,53 @@ from faststack.logging_setup import get_app_data_dir
 
 log = logging.getLogger(__name__)
 
+import sys
+import glob
+import os
+import re
+
+def detect_rawtherapee_path():
+    """Attempts to find the RawTherapee executable on Windows."""
+    if sys.platform != "win32":
+        return None
+
+    # Pattern to match RawTherapee installations in Program Files (both x64 and x86)
+    # Finds paths like C:\Program Files\RawTherapee\5.9\rawtherapee.exe
+    base_patterns = [
+        r"C:\Program Files\RawTherapee*\**\rawtherapee.exe",
+        r"C:\Program Files (x86)\RawTherapee*\**\rawtherapee.exe"
+    ]
+    
+    try:
+        matches = []
+        for pattern in base_patterns:
+            matches.extend(glob.glob(pattern, recursive=True))
+
+        if not matches:
+            return None
+            
+        # Helper to extract version numbers for natural sorting
+        # e.g., "5.10" -> [5, 10]
+        def natural_sort_key(path):
+            return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', path)]
+
+        # Sort matches to try and get the latest version (by path name)
+        # 5.10 > 5.9
+        matches.sort(key=natural_sort_key, reverse=True)
+        return matches[0]
+    except Exception as e:
+        log.warning(f"Error detecting RawTherapee path: {e}")
+        return None
+
+
+# Determine default RawTherapee path based on OS
+if sys.platform == "win32":
+    DEFAULT_RT_PATH = r"C:\Program Files\RawTherapee\5.12\rawtherapee.exe"
+elif sys.platform == "darwin":
+    DEFAULT_RT_PATH = "/Applications/RawTherapee.app/Contents/MacOS/rawtherapee"
+else:
+    DEFAULT_RT_PATH = "/usr/bin/rawtherapee"
+
 DEFAULT_CONFIG = {
     "core": {
         "cache_size_gb": "1.5",
@@ -65,6 +112,10 @@ DEFAULT_CONFIG = {
         "rgb_lower_bound": "5",
         "rgb_upper_bound": "250",
     },
+    "rawtherapee": {
+        "exe": DEFAULT_RT_PATH,
+        "args": "",
+    },
     "raw": {
         "source_dir": "C:\\Users\\alanr\\pictures\\olympus.stack.input.photos",
         "mirror_base": "C:\\Users\\alanr\\Pictures\\Lightroom",
@@ -94,6 +145,17 @@ class AppConfig:
                     if not self.config.has_option(section, key):
                         self.config.set(section, key, value)
             self.save() # Save to add any missing keys
+
+            # Validate RawTherapee path (re-detect if missing)
+            if sys.platform == "win32":
+                current_rt_path = self.get("rawtherapee", "exe")
+                if not os.path.exists(current_rt_path):
+                    log.warning(f"Configured RawTherapee path not found: {current_rt_path}. Attempting re-detection...")
+                    new_path = detect_rawtherapee_path()
+                    if new_path and new_path != current_rt_path:
+                        log.info(f"Found new RawTherapee path: {new_path}")
+                        self.set("rawtherapee", "exe", new_path)
+                        self.save()
 
 
     def save(self):

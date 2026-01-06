@@ -186,3 +186,113 @@ def test_integration_straighten_modes():
     # Verify both are Green (center pixel)
     assert res_a.getpixel((res_a.width//2, res_a.height//2)) == (0, 255, 0)
 
+
+# -------------------------------------------------------------------------
+# Regression Tests for Rotation Direction (CW/CCW)
+# -------------------------------------------------------------------------
+
+def create_quadrant_image(w=100, h=100):
+    """
+    Creates an image with 4 distinct colored quadrants.
+    TL: Red (255, 0, 0)
+    TR: Green (0, 255, 0)
+    BL: Blue (0, 0, 255)
+    BR: White (255, 255, 255)
+    """
+    img = Image.new("RGB", (w, h))
+    pixels = img.load()
+    
+    cx, cy = w // 2, h // 2
+    
+    for y in range(h):
+        for x in range(w):
+            if x < cx and y < cy:
+                pixels[x, y] = (255, 0, 0) # TL Red
+            elif x >= cx and y < cy:
+                pixels[x, y] = (0, 255, 0) # TR Green
+            elif x < cx and y >= cy:
+                pixels[x, y] = (0, 0, 255) # BL Blue
+            else:
+                pixels[x, y] = (255, 255, 255) # BR White
+    return img
+
+def test_rotate_cw():
+    """Test that rotate_cw rotates 90 degrees Clockwise."""
+    editor = ImageEditor()
+    editor.original_image = create_quadrant_image(100, 100)
+    editor.current_filepath = "dummy.jpg"
+
+    # Initial state: 0 rotation
+    assert editor.current_edits['rotation'] == 0
+
+    # Rotate CW (Logic in app.py subtracts 90, so local state becomes 270)
+    # editor.rotate_image_cw() implementation: (current - 90) % 360
+    editor.rotate_image_cw()
+    
+    assert editor.current_edits['rotation'] == 270
+    
+    # Apply edits
+    # PIL Transpose constants:
+    # ROTATE_90: 90 CCW (Left)
+    # ROTATE_270: 270 CCW (Right/CW)
+    # Expected for CW: ROTATE_270 (which maps to 270 degrees CCW)
+    
+    res = editor._apply_edits(editor.original_image.copy())
+    
+    # Check pixels
+    # Original TL (Red) -> New TR
+    # Original TR (Green) -> New BR
+    # Original BL (Blue) -> New TL
+    # Original BR (White) -> New BL
+    
+    w, h = res.size
+    
+    # Sample center of quadrants
+    q_w, q_h = w // 4, h // 4
+    
+    # New TL (Should be Blue)
+    assert res.getpixel((q_w, q_h)) == (0, 0, 255), "TL should be Blue (was Red)"
+    
+    # New TR (Should be Red)
+    assert res.getpixel((w - q_w, q_h)) == (255, 0, 0), "TR should be Red"
+
+    # New BL (Should be White)
+    assert res.getpixel((q_w, h - q_h)) == (255, 255, 255), "BL should be White"
+
+    # New BR (Should be Green)
+    assert res.getpixel((w - q_w, h - q_h)) == (0, 255, 0), "BR should be Green"
+
+def test_rotate_ccw():
+    """Test that rotate_ccw rotates 90 degrees Counter-Clockwise."""
+    editor = ImageEditor()
+    editor.original_image = create_quadrant_image(100, 100)
+    editor.current_filepath = "dummy.jpg"
+
+    # Rotate CCW (Logic: current + 90) -> 90
+    editor.rotate_image_ccw()
+    
+    assert editor.current_edits['rotation'] == 90
+    
+    res = editor._apply_edits(editor.original_image.copy())
+    
+    w, h = res.size
+    q_w, q_h = w // 4, h // 4
+    
+    # CCW Rotation:
+    # TL (Red) -> BL
+    # TR (Green) -> TL
+    # BL (Blue) -> BR
+    # BR (White) -> TR
+    
+    # New TL (Should be Green)
+    assert res.getpixel((q_w, q_h)) == (0, 255, 0), "TL should be Green"
+    
+    # New TR (Should be White)
+    assert res.getpixel((w - q_w, q_h)) == (255, 255, 255), "TR should be White"
+
+    # New BL (Should be Red)
+    assert res.getpixel((q_w, h - q_h)) == (255, 0, 0), "BL should be Red"
+
+    # New BR (Should be Blue)
+    assert res.getpixel((w - q_w, h - q_h)) == (0, 0, 255), "BR should be Blue"
+

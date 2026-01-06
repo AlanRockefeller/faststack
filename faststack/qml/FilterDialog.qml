@@ -82,10 +82,12 @@ Dialog {
         if (controller && controller.dialog_opened) {
             controller.dialog_opened()
         }
+    }
+
     onClosed: {
         // Notify Python that dialog is closed
         if (controller && controller.dialog_closed) {
             controller.dialog_closed()
         }
-    }    }
+    }
 }

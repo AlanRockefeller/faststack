@@ -11,8 +11,13 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import date
 import os
+import shutil
 # Must set before importing PySide6
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime.warning=false"
+
+# Type Aliases for readability
+DeletePair = Tuple[Optional[Path], Optional[Path]]  # (src_path, recycle_bin_path)
+DeleteRecord = Tuple[DeletePair, DeletePair]        # (jpg_pair, raw_pair)
 
 import concurrent.futures
 import threading
@@ -87,6 +92,7 @@ class AppController(QObject):
     is_zoomed_changed = Signal(bool) # Signal for zoom state changes
     histogramReady = Signal(object) # Signal for off-thread histogram result
     previewReady = Signal(object) # Signal for off-thread preview result
+    dialogStateChanged = Signal(bool) # Signal for dialog open/close state
 
     class ProgressReporter(QObject):
         progress_updated = Signal(int)
@@ -139,6 +145,7 @@ class AppController(QObject):
         self.watcher = Watcher(self.image_dir, self.refresh_image_list)
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
         self.image_editor = ImageEditor() # Initialize the editor
+        self._dialog_open_count = 0 # Track nested dialogs
         
         # -- Caching & Prefetching --
         cache_size_gb = config.getfloat('core', 'cache_size_gb', 1.5)
@@ -191,9 +198,10 @@ class AppController(QObject):
         
         # -- Delete/Undo State --
         self.recycle_bin_dir = self.image_dir / "image recycle bin"
-        self.delete_history: List[Tuple[Path, Optional[Path]]] = []  # [(jpg_path, raw_path), ...]
+        self.delete_history: List[DeleteRecord] = []  # [((jpg_src, jpg_bin), (raw_src, raw_bin)), ...]
         # Track all undoable actions with timestamps
-        self.undo_history: List[Tuple[str, Any, float]] = []  # (action_type, action_data, timestamp)
+        # [(action_type, action_data, timestamp)]
+        self.undo_history: List[Tuple[str, Any, float]] = []
 
         self.resize_timer = QTimer()
         self.resize_timer.setSingleShot(True)
@@ -712,14 +720,21 @@ class AppController(QObject):
     @Slot()
     def dialog_opened(self):
         """Called when any dialog opens to disable global keybindings."""
-        self._dialog_open = True
-        log.debug("Dialog opened, disabling global keybindings")
+        self._dialog_open_count += 1
+        if self._dialog_open_count == 1:
+            self._dialog_open = True
+            self.dialogStateChanged.emit(True)
+            log.debug("Dialog opened (count=1), disabling global keybindings")
     
     @Slot()
     def dialog_closed(self):
         """Called when any dialog closes to re-enable global keybindings."""
-        self._dialog_open = False
-        log.debug("Dialog closed, re-enabling global keybindings")
+        prev = self._dialog_open_count
+        self._dialog_open_count = max(0, self._dialog_open_count - 1)
+        if prev > 0 and self._dialog_open_count == 0:
+            self._dialog_open = False
+            self.dialogStateChanged.emit(False)
+            log.debug("Dialog closed (count=0), re-enabling global keybindings")
 
     def toggle_grid_view(self):
         log.warning("Grid view not implemented yet.")
@@ -1298,6 +1313,13 @@ class AppController(QObject):
         config.set('photoshop', 'exe', path)
         config.save()
 
+    def get_rawtherapee_path(self):
+        return config.get('rawtherapee', 'exe')
+
+    def set_rawtherapee_path(self, path):
+        config.set('rawtherapee', 'exe', path)
+        config.save()
+
     def open_file_dialog(self):
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
@@ -1818,6 +1840,39 @@ class AppController(QObject):
         # Single image deletion - proceed normally
         self._delete_single_image(self.current_index)
 
+    def _move_to_recycle(self, src: Path) -> Optional[Path]:
+        """Moves a file to the recycle bin safely, handling collisions and cross-device moves."""
+        if not src.exists() or not src.is_file():
+            return None
+        
+        # Ensure recycle bin exists
+        try:
+            self.recycle_bin_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.error("Failed to create recycle bin: %s", e)
+            return None
+
+        dest = self.recycle_bin_dir / src.name
+        
+        # Handle collisions with timestamp loop
+        if dest.exists():
+            import time
+            timestamp = int(time.time())
+            base_name = f"{src.stem}.{timestamp}"
+            dest = self.recycle_bin_dir / f"{base_name}{src.suffix}"
+            counter = 1
+            while dest.exists():
+                dest = self.recycle_bin_dir / f"{base_name}_{counter}{src.suffix}"
+                counter += 1
+        
+        try:
+            shutil.move(str(src), str(dest))
+            log.info("Moved %s to recycle bin: %s", src.name, dest.name)
+            return dest
+        except OSError as e:
+            log.error("Failed to recycle %s: %s", src.name, e)
+            return None
+
     def _delete_single_image(self, index: int):
         """Internal method to delete a single image by index."""
         if not self.image_files or index < 0 or index >= len(self.image_files):
@@ -1829,39 +1884,23 @@ class AppController(QObject):
         jpg_path = image_file.path
         raw_path = image_file.raw_pair
         
-        # Create recycle bin if it doesn't exist
-        try:
-            self.recycle_bin_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            self.update_status_message(f"Failed to create recycle bin: {e}")
-            log.error("Failed to create recycle bin directory: %s", e)
-            return
-        
         # Move files to recycle bin
-        deleted_files = []
-        try:
-            if jpg_path.exists():
-                dest = self.recycle_bin_dir / jpg_path.name
-                jpg_path.rename(dest)
-                deleted_files.append(jpg_path.name)
-                log.info("Moved %s to recycle bin", jpg_path.name)
+        recycled_jpg = self._move_to_recycle(jpg_path)
+        recycled_raw = self._move_to_recycle(raw_path) if (raw_path and raw_path.exists()) else None
+        
+        # Add to delete history if anything was moved
+        if recycled_jpg or recycled_raw:
+            import time
+            timestamp = time.time()
+            # Store tuple of (src, bin_path) for each file
+            # Format: ( (jpg_src, jpg_bin), (raw_src, raw_bin) )
+            record = ( (jpg_path, recycled_jpg), (raw_path, recycled_raw) )
             
-            if raw_path and raw_path.exists():
-                dest = self.recycle_bin_dir / raw_path.name
-                raw_path.rename(dest)
-                deleted_files.append(raw_path.name)
-                log.info("Moved %s to recycle bin", raw_path.name)
+            self.delete_history.append(record)
+            self.undo_history.append(("delete", record, timestamp))
             
-            # Add to delete history only if at least one file was moved
-            if deleted_files:
-                import time
-                timestamp = time.time()
-                self.delete_history.append((jpg_path, raw_path))
-                self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
-            
-        except OSError as e:
-            self.update_status_message(f"Delete failed: {e}")
-            log.exception("Failed to delete image")
+        if not recycled_jpg and not recycled_raw:
+            self.update_status_message("Delete failed")
             return
         
         # Refresh image list and move to next image
@@ -1957,20 +1996,14 @@ class AppController(QObject):
             raw_path = image_file.raw_pair
             
             try:
-                if jpg_path.exists():
-                    dest = self.recycle_bin_dir / jpg_path.name
-                    jpg_path.rename(dest)
-                    log.info("Moved %s to recycle bin", jpg_path.name)
+                recycled_jpg = self._move_to_recycle(jpg_path)
+                recycled_raw = self._move_to_recycle(raw_path) if (raw_path and raw_path.exists()) else None
                 
-                if raw_path and raw_path.exists():
-                    dest = self.recycle_bin_dir / raw_path.name
-                    raw_path.rename(dest)
-                    log.info("Moved %s to recycle bin", raw_path.name)
-                
-                # Add to delete history
-                self.delete_history.append((jpg_path, raw_path))
-                self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
-                deleted_count += 1
+                if recycled_jpg or recycled_raw:
+                    record = ( (jpg_path, recycled_jpg), (raw_path, recycled_raw) )
+                    self.delete_history.append(record)
+                    self.undo_history.append(("delete", record, timestamp))
+                    deleted_count += 1
                 
             except OSError as e:
                 log.exception("Failed to delete image at index %d: %s", index, e)
@@ -2015,27 +2048,35 @@ class AppController(QObject):
         action_type, action_data, timestamp = self.undo_history.pop()
         
         if action_type == "delete":
-            jpg_path, raw_path = action_data
-            # Also remove from delete_history
-            if self.delete_history and self.delete_history[-1] == (jpg_path, raw_path):
+            # New record format: ( (jpg_src, jpg_bin), (raw_src, raw_bin) )
+            (jpg_src, jpg_bin), (raw_src, raw_bin) = action_data
+            
+            # Remove from delete_history if it matches
+            if self.delete_history and self.delete_history[-1] == action_data:
                 self.delete_history.pop()
             
             restored_files = []
             try:
+                # Helper to move back safely
+                def restore_file(src_path: Optional[Path], bin_path: Optional[Path]):
+                    if not src_path or not bin_path or not bin_path.exists():
+                        return False
+                    if src_path.exists():
+                        log.warning("Cannot restore %s: User file already exists at %s", bin_path.name, src_path)
+                        return False # Or maybe restore with new name? For now, skip to prevent overwrite
+                    
+                    shutil.move(str(bin_path), str(src_path))
+                    return True
+
                 # Restore JPG
-                jpg_in_bin = self.recycle_bin_dir / jpg_path.name
-                if jpg_in_bin.exists():
-                    jpg_in_bin.rename(jpg_path)
-                    restored_files.append(jpg_path.name)
-                    log.info("Restored %s from recycle bin", jpg_path.name)
+                if restore_file(jpg_src, jpg_bin):
+                    restored_files.append(jpg_src.name)
+                    log.info("Restored %s from recycle bin", jpg_src.name)
                 
                 # Restore RAW
-                if raw_path:
-                    raw_in_bin = self.recycle_bin_dir / raw_path.name
-                    if raw_in_bin.exists():
-                        raw_in_bin.rename(raw_path)
-                        restored_files.append(raw_path.name)
-                        log.info("Restored %s from recycle bin", raw_path.name)
+                if restore_file(raw_src, raw_bin):
+                    restored_files.append(raw_src.name)
+                    log.info("Restored %s from recycle bin", raw_src.name)
                 
                 # Update status
                 if restored_files:
@@ -2049,7 +2090,7 @@ class AppController(QObject):
                 
                 # Find and navigate to the restored image
                 for i, img_file in enumerate(self.image_files):
-                    if img_file.path == jpg_path:
+                    if img_file.path == jpg_src:
                         self.current_index = i
                         break
                 
@@ -2064,8 +2105,8 @@ class AppController(QObject):
                 self.update_status_message(f"Undo failed: {e}")
                 log.exception("Failed to restore image")
                 # Put it back in history if it failed
-                self.undo_history.append(("delete", (jpg_path, raw_path), timestamp))
-                self.delete_history.append((jpg_path, raw_path))
+                self.undo_history.append(("delete", action_data, timestamp))
+                self.delete_history.append(action_data)
         
         elif action_type == "auto_white_balance":
             saved_path, backup_path = action_data
