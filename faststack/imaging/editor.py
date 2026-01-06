@@ -538,7 +538,7 @@ class ImageEditor:
         p_high = max(p_highs)
 
         # NOTE: applying this stretch uniformly to RGB can clip individual channels 
-        # more than luminance predicts. That’s usually acceptable, but if we 
+        # more than luminance predicts. That's usually acceptable, but if we 
         # ever see weird color clipping, that might be why.
 
         # Pin ends if pre-clipping exists (prevents making it worse)
