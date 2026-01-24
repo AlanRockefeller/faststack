@@ -1,56 +1,86 @@
-# Virtual environments
+# ----------------------------
+# Python / virtualenvs
+# ----------------------------
 .venv/
 venv/
-verify_venv/
 env/
 
-# Python cache
+# Keep verify_venv locally but never track it (works anywhere in the repo)
+verify_venv/
+
+# Python caches
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# Build outputs
-dist/
+# Type checker caches
+.mypy_cache/
+
+# ----------------------------
+# Build / packaging outputs
+# ----------------------------
 build/
+dist/
 *.spec
-faststack.egg-info/
 *.egg-info/
+faststack.egg-info/
 
-
+# ----------------------------
 # Logs
+# ----------------------------
 *.log
 
+# ----------------------------
 # OS cruft
+# ----------------------------
 .DS_Store
 Thumbs.db
 
+# ----------------------------
 # IDE
+# ----------------------------
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Documentation/Generated
+# ----------------------------
+# Project docs we don't track
+# ----------------------------
 prompt.md
 WARP.md
 AGENTS.md
 ARCHITECTURE.md
 docs/COLOR_PROFILE_FIX.md
 
-# Caches
-faststack/.mypy_cache/
-.mypy_cache/
-
-# Runtime/Data
+# ----------------------------
+# Runtime / generated data
+# ----------------------------
 var/
 
-# Test outputs and temp files
-*.txt
-test_*.txt
+# ----------------------------
+# Local test/debug outputs 
+# ----------------------------
+debug_*.txt
+debug_test.py
 output*.txt
-debug*.*
-repro*.py
+test_fail*.log
+test_out*.txt
+test_output*.txt
+test_report*.log
+test_results.txt
 smoke_test_output.txt
 verify_result.txt
 
-# IDE/editor temp files
-*.swp
-*.swo
+# Same junk when produced inside the package dir
+faststack/debug_*.txt
+faststack/debug_test.py
+faststack/output*.txt
+faststack/test_fail*.log
+faststack/test_out*.txt
+faststack/test_output*.txt
+faststack/test_report*.log
+faststack/test_results.txt
+faststack/smoke_test_output.txt
+faststack/verify_result.txt
 

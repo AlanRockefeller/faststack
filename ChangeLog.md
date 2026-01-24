@@ -2,6 +2,31 @@
 
 Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   
 
+## [1.5.1] - 2026-01-23
+
+### Added
+- Added experimental RAW processing via Rawtherapee
+- Added explicit **JPEG vs RAW editing modes** with UI + signals to keep QML and backend in sync (`editSourceModeChanged`, `saveBehaviorMessage`). RAW mode can develop to a 16-bit working TIFF and optionally write a `*-developed.jpg` output while leaving the original JPEG untouched.
+- Added **RAW development workflow** via RawTherapee **CLI** (`rawtherapee-cli`) with configurable extra args, better error reporting, output validation, and timeout handling.
+- Added editor quality upgrades: **16-bit aware editing pipeline** using float32 working buffers, sRGB↔linear conversions for “true headroom” edits, OpenCV Gaussian blur helpers, and new **Texture** control.
+- Added editor metadata display in the window title (filename + detected bit depth).
+- Added robust undo/restore helper (`_restore_backup_safe`) to better handle locked files and tricky restore scenarios.
+- Added support for indexing and displaying `*-developed.jpg` images and **orphaned RAWs** in the browser list; updated pairing test expectations accordingly.
+
+### Changed
+- Reworked README installation instructions:
+  - macOS recommended flow with **Python 3.12** (Homebrew) + venv + `pip install .`
+  - Simplified run command (`faststack`) and clarified Windows/Linux steps.
+- Switched RawTherapee path detection defaults from GUI executable to **CLI executable** on Windows/macOS/Linux.
+- Improved Prefetcher decode behavior by using TurboJPEG **only for JPEGs**, with a Pillow fallback for non-JPEG formats or decode failures.
+- Centralized navigation state changes (`_set_current_index`) and ensured edit mode resets appropriately on navigation (defaults back to JPEG unless RAW-only).
+
+### Fixed
+- Fixed editor memory usage by clearing large editor buffers when the editor closes and resetting cached preview state.
+- Fixed a QML slider double-click reset edge case where the slider could remain in a pressed/dragging state (force release via a short disable/reenable tick).
+- Fixed histogram scheduling/thread-safety issues by tightening locking around pending/inflight state and improving failure handling when preview data is missing or executor submission fails.
+
+
 
 ## [1.5.0] - 2025-12-01
 
