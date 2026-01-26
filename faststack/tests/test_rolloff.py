@@ -1,63 +1,81 @@
+import unittest
+from unittest.mock import MagicMock, patch
 import numpy as np
-from faststack.imaging.editor import _apply_soft_shoulder
+import sys
 
-def test_apply_soft_shoulder_threshold():
-    # Test that values below threshold are unchanged
-    threshold = 0.9
-    x = np.array([0.0, 0.5, 0.8, 0.9])
-    out = _apply_soft_shoulder(x, threshold=threshold)
-    np.testing.assert_allclose(out, x)
-    print("test_apply_soft_shoulder_threshold passed")
+# We check for modules that might be missing and mock them if needed
+# inside the test setup to avoid import errors at module level.
 
-def test_apply_soft_shoulder_rolloff():
-    # Test that values above threshold are compressed but stay < 1.0
-    threshold = 0.9
-    x = np.array([0.91, 1.0, 2.0, 10.0])
-    out = _apply_soft_shoulder(x, threshold=threshold)
-    
-    # Check that they are compressed (out < x)
-    assert np.all(out[x > threshold] < x[x > threshold])
-    # Check that they stay below 1.0
-    assert np.all(out < 1.0)
-    # Check that they are still above threshold
-    assert np.all(out[x > threshold] > threshold)
-    print("test_apply_soft_shoulder_rolloff passed")
+class TestRolloff(unittest.TestCase):
+    def setUp(self):
+        # Now we use the pure math utils, so no need to mock cv2/gui/models
+        # unless math_utils unexpectedly depends on them.
+        
+        from faststack.imaging.math_utils import _apply_headroom_shoulder
+        self._apply_headroom_shoulder = _apply_headroom_shoulder
 
-def test_apply_soft_shoulder_monotonic():
-    # Test monotonicity
-    threshold = 0.8
-    x = np.linspace(0, 5, 100)
-    out = _apply_soft_shoulder(x, threshold=threshold)
-    
-    # Check if strictly increasing (mostly, due to float precision)
-    assert np.all(np.diff(out) > 0)
-    print("test_apply_soft_shoulder_monotonic passed")
+    def tearDown(self):
+        pass
 
-def test_apply_soft_shoulder_no_threshold():
-    # Test with threshold >= 1.0
-    x = np.array([0.0, 0.5, 1.2])
-    out = _apply_soft_shoulder(x, threshold=1.0)
-    np.testing.assert_allclose(out, x)
-    print("test_apply_soft_shoulder_no_threshold passed")
+    def test_apply_headroom_shoulder_threshold(self):
+        # Test that values <= 1.0 are unchanged
+        max_overshoot = 0.05
+        x = np.array([0.0, 0.5, 0.9, 1.0])
+        out = self._apply_headroom_shoulder(x, max_overshoot=max_overshoot)
+        np.testing.assert_allclose(out, x)
 
-def test_apply_soft_shoulder_none_above():
-    # Test when no values are above threshold
-    threshold = 0.9
-    x = np.array([0.1, 0.5, 0.8])
-    out = _apply_soft_shoulder(x, threshold=threshold)
-    np.testing.assert_allclose(out, x)
-    print("test_apply_soft_shoulder_none_above passed")
+    def test_apply_headroom_shoulder_rolloff(self):
+        # Test that values > 1.0 are compressed
+        max_overshoot = 0.05
+        # 1.0 + max_overshoot is the asymptote
+        x = np.array([1.01, 1.1, 2.0, 10.0])
+        out = self._apply_headroom_shoulder(x, max_overshoot=max_overshoot)
+        
+        # Check that they are compressed (out < x)
+        self.assertTrue(np.all(out < x))
+        
+        # Check that they stay above 1.0
+        self.assertTrue(np.all(out > 1.0))
+        
+        # Check asymptote (should never exceed 1.0 + max_overshoot)
+        self.assertTrue(np.all(out < 1.0 + max_overshoot))
+
+    def test_apply_headroom_shoulder_monotonic(self):
+        # Test monotonicity
+        max_overshoot = 0.05
+        x = np.linspace(0.9, 5.0, 100)
+        out = self._apply_headroom_shoulder(x, max_overshoot=max_overshoot)
+        
+        # Check if strictly increasing
+        diffs = np.diff(out)
+        self.assertTrue(np.all(diffs > 0), "Output should be monotonic increasing")
+
+    def test_apply_headroom_shoulder_continuity(self):
+        # Test continuity at 1.0
+        max_overshoot = 0.05
+        # Check very close to 1.0 from both sides
+        x = np.array([1.0 - 1e-7, 1.0, 1.0 + 1e-7])
+        out = self._apply_headroom_shoulder(x, max_overshoot=max_overshoot)
+        
+        # Difference should be negligible
+        diffs = np.diff(out)
+        # Should be very small but positive
+        self.assertTrue(np.all(np.abs(diffs) < 1e-6))
+        
+    def test_apply_headroom_shoulder_asymptote_check(self):
+        # Verification Plan Step: Feed synthetic array with very high values
+        max_overshoot = 0.05
+        x = np.array([1.0, 1.0 + max_overshoot/2, 1.0 + 1000.0])
+        out = self._apply_headroom_shoulder(x, max_overshoot=max_overshoot)
+        
+        # f(1.0) == 1.0
+        self.assertAlmostEqual(out[0], 1.0)
+        
+        # f(very_large) should be close to 1.0 + max_overshoot
+        self.assertAlmostEqual(out[2], 1.0 + max_overshoot, places=4)
+        
+        # values <= 1.0 + max_overshoot
+        self.assertTrue(np.all(out <= 1.0 + max_overshoot + 1e-9))
 
 if __name__ == "__main__":
-    try:
-        test_apply_soft_shoulder_threshold()
-        test_apply_soft_shoulder_rolloff()
-        test_apply_soft_shoulder_monotonic()
-        test_apply_soft_shoulder_no_threshold()
-        test_apply_soft_shoulder_none_above()
-        print("\nALL TESTS PASSED")
-    except Exception as e:
-        print(f"\nTEST FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+    unittest.main()

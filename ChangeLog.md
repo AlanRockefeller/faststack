@@ -2,6 +2,44 @@
 
 Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   
 
+
+## 1.5.2 (2026-01-25)
+
+#### Added
+- **Highlight recovery telemetry + UI indicators**
+  - New highlight state analysis in the editor pipeline (headroom/clipping/near-white metrics) and a UI signal (`highlightStateChanged`) to keep it live.
+  - Image editor dialog now shows **Headroom** and **Clipped** indicators under the histogram when relevant.
+- **Unified EXIF orientation handling**
+  - Editor now **bakes EXIF orientation into pixels on load** (Pillow original + float master buffer), and saving **sanitizes Orientation to 1** to prevent double-rotation in viewers.
+  - Prefetcher now applies EXIF orientation in a **single unified post-decode block**, reusing pre-read EXIF when available.
+- **Optional OpenCV dependency support**
+  - Centralized optional OpenCV usage (`optional_deps`) with fallbacks (e.g., Pillow-based Gaussian blur fallback when OpenCV is unavailable).
+  - Tests updated to skip/patch appropriately when OpenCV isn’t installed.
+
+#### Changed
+- **Save flow restored to “old behavior”**
+  - Saving now: **closes editor → clears editor state → refreshes image list → reselects saved image → clears cache/prefetches → syncs UI**.
+  - Save errors now surface as user-visible status messages with safer exception handling.
+- **Histogram rendering and layout improvements**
+  - Histogram panel height increased; channel labels expanded (Red/Green/Blue); non-minimal histogram display enabled.
+  - Single-channel histogram drawing now downsamples using **max-pooling** when canvas width is smaller than bin count to reduce aliasing/spikes.
+- **Slider double-click reset robustness**
+  - Reworked double-click-to-reset behavior with better drag-vs-click detection, an explicit reset path, a failsafe timer, and a binding to force value to 0 while resetting.
+- **Color/edit pipeline tuning**
+  - Contrast and saturation slider sensitivity reduced (scaled effect).
+  - Headroom “safety” shoulder moved to linear space (`_apply_headroom_shoulder`) replacing the old sRGB-side shoulder.
+  - Auto-levels now kicks the preview worker for immediate visual feedback; histogram updates are guarded by visibility in more places.
+
+#### Fixed
+- **EXIF orientation “double rotation” bugs**
+  - Saving now consistently drops/sanitizes EXIF when orientation can’t be safely serialized, preventing incorrect viewer rotations.
+  - Developed JPG sidecar EXIF from a paired JPEG is sanitized for Orientation as well.
+- **Prefetch stability under rapid scrolling**
+  - ImageProvider keepalive queue increased (32 → 128) to reduce crashes from QML/texture lifetime mismatches during thrash.
+- **RawTherapee Windows path detection**
+  - Improved version selection by sorting detected installs via a version-aware path component key (e.g., `5.10` > `5.9`).
+
+
 ## [1.5.1] - 2026-01-23
 
 ### Added

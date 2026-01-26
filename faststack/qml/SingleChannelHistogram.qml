@@ -81,13 +81,43 @@ Item {
                 ctx.moveTo(0, canvas.height)
                 
                 var len = root.histogramData.length
-                for (i = 0; i < len; i++) {
-                    var x = len > 1 ? (i / (len - 1)) * canvas.width : canvas.width / 2
-                    var y = canvas.height - (root.histogramData[i] / maxVal) * canvas.height
-                    ctx.lineTo(x, y)
+                var width = canvas.width
+                var height = canvas.height
+                
+                if (width >= len) {
+                    // Standard drawing for sufficient width (upscaling or 1:1)
+                    for (i = 0; i < len; i++) {
+                        var x = len > 1 ? (i / (len - 1)) * width : width / 2
+                        var y = height - (root.histogramData[i] / maxVal) * height
+                        ctx.lineTo(x, y)
+                    }
+                } else {
+                    // Downsampling with Max Pooling for small widths
+                    // This creates a "skyline" envelope, preserving peaks and preventing aliasing spikes
+                    for (var x = 0; x < width; x++) {
+                        // Determine which bins fall into this pixel column
+                        var binStart = Math.floor((x / width) * len)
+                        var binEnd = Math.ceil(((x + 1) / width) * len)
+                        
+                        // Clamp
+                        binStart = Math.max(0, Math.min(len - 1, binStart))
+                        binEnd = Math.max(binStart + 1, Math.min(len, binEnd))
+                        
+                        // Find max value in this range
+                        var localMax = 0
+                        for (var b = binStart; b < binEnd; b++) {
+                            // Boundary check just in case
+                            if (b < len) {
+                                localMax = Math.max(localMax, root.histogramData[b])
+                            }
+                        }
+                        
+                        var y = height - (localMax / maxVal) * height
+                        ctx.lineTo(x, y)
+                    }
                 }
                 
-                ctx.lineTo(canvas.width, canvas.height)
+                ctx.lineTo(width, height)
                 ctx.closePath()
 
                 // Create gradient fill

@@ -152,7 +152,7 @@ Window {
                 // --- Histogram Group ---
                 RowLayout {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 120
+                    Layout.preferredHeight: 140
                     Layout.topMargin: 5
                     spacing: 5
                     
@@ -160,12 +160,12 @@ Window {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         
-                        channelName: "R"
+                        channelName: "Red"
                         channelColor: "#e15050"
                         gridLineColor: imageEditorDialog.controlBorder
                         dangerColor: "#40ff0000"
                         textColor: imageEditorDialog.textColor
-                        minimal: true
+                        minimal: false
                         
                         histogramData: uiState && uiState.histogramData ? (uiState.histogramData["r"] || []) : []
                         clipCount: uiState && uiState.histogramData ? (uiState.histogramData["r_clip"] || 0) : 0
@@ -176,12 +176,12 @@ Window {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         
-                        channelName: "G"
+                        channelName: "Green"
                         channelColor: "#50e150"
                         gridLineColor: imageEditorDialog.controlBorder
                         dangerColor: "#40ff0000"
                         textColor: imageEditorDialog.textColor
-                        minimal: true
+                        minimal: false
                         
                         histogramData: uiState && uiState.histogramData ? (uiState.histogramData["g"] || []) : []
                         clipCount: uiState && uiState.histogramData ? (uiState.histogramData["g_clip"] || 0) : 0
@@ -192,17 +192,40 @@ Window {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         
-                        channelName: "B"
+                        channelName: "Blue"
                         channelColor: "#5050e1"
                         gridLineColor: imageEditorDialog.controlBorder
                         dangerColor: "#40ff0000"
                         textColor: imageEditorDialog.textColor
-                        minimal: true
+                        minimal: false
                         
                         histogramData: uiState && uiState.histogramData ? (uiState.histogramData["b"] || []) : []
                         clipCount: uiState && uiState.histogramData ? (uiState.histogramData["b_clip"] || 0) : 0
                         preClipCount: uiState && uiState.histogramData ? (uiState.histogramData["b_preclip"] || 0) : 0
                     }
+                }
+
+                // Highlight State Indicators
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 2
+                    spacing: 15
+                    
+                    Label {
+                        visible: (uiState && uiState.highlightState && uiState.highlightState.headroom_pct > 0.001)
+                        text: "📈 Headroom: " + (uiState && uiState.highlightState ? (uiState.highlightState.headroom_pct * 100).toFixed(1) : "0.0") + "%"
+                        font.pixelSize: 10
+                        color: "#50e150"  // Green - good, recoverable
+                        opacity: 0.8
+                    }
+                    Label {
+                        visible: (uiState && uiState.highlightState && uiState.highlightState.source_clipped_pct > 0.01)
+                        text: "⚠ Clipped: " + (uiState && uiState.highlightState ? (uiState.highlightState.source_clipped_pct * 100).toFixed(1) : "0.0") + "%"
+                        font.pixelSize: 10
+                        color: uiState && uiState.highlightState && uiState.highlightState.source_clipped_pct > 0.05 ? "#e15050" : "#e1a050"  // Red if severe, orange if mild
+                        opacity: 0.8
+                    }
+                    Item { Layout.fillWidth: true }  // Spacer
                 }
             }
 
@@ -460,71 +483,85 @@ Window {
                     }
                 }
                 
-                onMoved: {
-                    _pendingValue = value
-                    if (!sendTimer.running) sendTimer.start()
+                property bool isResetting: false
+                property double _lastPressTime: 0
+                
+                function triggerReset() {
+                    isResetting = true
+                    controller.set_edit_parameter(model.key, 0.0)
+                    slider.value = 0.0
+                    _pendingValue = 0.0
+                    slider._lastSentValue = 0.0
+                    imageEditorDialog.updatePulse++
                 }
                 
-                property double lastPressTime: 0
-                property double lastPressValue: 0
-                property bool isResetting: false
-                
+                // Failsafe timer to prevent sticky isResetting state
+                Timer {
+                    id: resetFailsafe
+                    interval: 200
+                    repeat: false
+                    onTriggered: {
+                        if (slider.isResetting) {
+                            console.warn("Slider reset stuck, forcing release")
+                            slider.isResetting = false
+                        }
+                    }
+                }
+
                 onPressedChanged: {
                     if (pressed) {
                         var now = Date.now()
-                        var range = slider.to - slider.from
-                        var diff = Math.abs(value - lastPressValue)
+                        // Double click logic with value delta guard
+                        // Only reset if clicked recently AND value hasn't drifted far (meaning it wasn't a drag)
+                        var timeDiff = now - _lastPressTime
+                        var valDiff = Math.abs(value - _pendingValue)
+                        var range = to - from
                         
-                        // Double click detection: <500ms time diff AND <5% value diff
-                        // This prevents false positives when dragging quickly
-                        if (now - lastPressTime < 500 && diff < (range * 0.05)) { 
-                             isResetting = true
-                             controller.set_edit_parameter(model.key, 0.0)
-                             
-                             // CRITICAL FIX: Force the slider to release 'pressed' state 
-                             // to stop tracking the mouse position.
-                             // We must wait a tick to ensure the internal state clears.
-                             slider.enabled = false
-                             resetTimer.start()
-                             
-                             _pendingValue = 0.0
-                             slider._lastSentValue = 0.0
-                             imageEditorDialog.updatePulse++
-                             isResetting = false
-                             return
+                        if (timeDiff < 600 && valDiff < (range * 0.05)) { 
+                             triggerReset()
+                             _lastPressTime = 0
+                             resetFailsafe.start() // Start failsafe
+                        } else {
+                             _lastPressTime = now
                         }
                         
-                        lastPressTime = now
-                        lastPressValue = value
-                        
                         imageEditorDialog.slidersPressedCount++
-                        _pendingValue = value
-                        if (!sendTimer.running) sendTimer.start()
+                        
+                        // Initialize drag logic only if not resetting
+                        if (!isResetting) {
+                            _pendingValue = value
+                            if (!sendTimer.running) sendTimer.start()
+                        }
                     } else {
-                        // Guard: If we are resetting, don't process the release logic
-                        if (isResetting) return
-
                         imageEditorDialog.slidersPressedCount--
                         
-                        // Stop repeating sends, then send final value immediately
-                        sendTimer.stop()
-                        var sendValue = isReversed ? -value : value
-                        controller.set_edit_parameter(model.key, sendValue / maxVal)
+                        if (isResetting) {
+                             isResetting = false
+                             // Force backend to 0 on release
+                             controller.set_edit_parameter(model.key, 0.0)
+                        } else {
+                             // Stop repeating sends, then send final value immediately
+                             sendTimer.stop()
+                             var sendValue = isReversed ? -value : value
+                             controller.set_edit_parameter(model.key, sendValue / maxVal)
+                        }
                         
-                        // Don't update histogram here if we are just starting to drag? 
-                        // Actually release is end of drag.
                         if (controller) controller.update_histogram()
                     }
                 }
                 
-                Timer {
-                    id: resetTimer
-                    interval: 50
-                    onTriggered: {
-                        slider.enabled = true
-                        // Ensure value is synced
-                        slider.value = slider.backendValue
-                    }
+                // Force 0 while resetting - this overrides the slider's internal mouse handling
+                Binding {
+                    target: slider
+                    property: "value"
+                    value: 0
+                    when: slider.isResetting
+                }
+                
+                onMoved: {
+                    if (isResetting) return
+                    _pendingValue = value
+                    if (!sendTimer.running) sendTimer.start()
                 }
                 
                 onBackendValueChanged: {
@@ -590,7 +627,7 @@ Window {
                      Behavior on color { ColorAnimation { duration: 150 } }
 
                      HoverHandler {
-                         id: hoverHandler
+                          id: hoverHandler
                      }
                 }
             }

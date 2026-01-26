@@ -8,18 +8,35 @@ from PIL import Image, ExifTags
 import numpy as np
 
 # Adjust path to import faststack
+from unittest.mock import MagicMock, patch
 import sys
+# Removed global sys.modules override
 sys.path.append(str(Path(__file__).parents[2]))
 
-from faststack.imaging.editor import ImageEditor
+# MOVED: from faststack.imaging.editor import ImageEditor
 
 class TestExifOrientation(unittest.TestCase):
     def setUp(self):
+        # Patch sys.modules safely per-test
+        self.modules_patcher = patch.dict(sys.modules, {'cv2': MagicMock()})
+        self.modules_patcher.start()
+        
+        # Import internally to respect the patch
+        try:
+            from faststack.imaging.editor import ImageEditor
+            self.ImageEditorClass = ImageEditor
+        except ImportError:
+            # Fallback if path issues persist (shouldn't with sys.path.append)
+            raise
+            
         self.test_dir = tempfile.mkdtemp()
-        self.editor = ImageEditor()
+        self.editor = self.ImageEditorClass()
         
     def tearDown(self):
+        self.modules_patcher.stop()
         shutil.rmtree(self.test_dir)
+        # Ensure we don't pollute other tests with our mocked-import version
+        sys.modules.pop('faststack.imaging.editor', None)
 
     def _create_test_image(self, filename, orientation=1):
         """Creates a dummy JPEG with specific EXIF orientation."""
@@ -67,8 +84,11 @@ class TestExifOrientation(unittest.TestCase):
                     
                     # Double rotation check: if we reload this image, it should look correct
                     # without any further rotation needed.
-                    # We can check dimensions: 100x50 rotated 90 -> 50x100
-                    self.assertEqual(res.size, (50, 100), f"Dimensions should be swapped for start {start_ori}")
+                    # Start 6 (Vertical 50x100) -> Baked (50x100) -> Rotate 90 -> 100x50
+                    # Start 8 (Vertical 50x100) -> Baked (50x100) -> Rotate 90 -> 100x50
+                    # Start 3 (Horizontal 100x50) -> Baked (100x50) -> Rotate 90 -> 50x100
+                    expected_size = (50, 100) if start_ori == 3 else (100, 50)
+                    self.assertEqual(res.size, expected_size, f"Dimensions check failed for start {start_ori} with rotation")
 
     def test_orientation_preserved_no_rotation(self):
         """Verify Orientation is PRESERVED if we do NOT rotate."""
@@ -90,8 +110,17 @@ class TestExifOrientation(unittest.TestCase):
                     exif = res.getexif()
                     orientation = exif.get(ExifTags.Base.Orientation)
                     
-                    # Should be preserved
-                    self.assertEqual(orientation, start_ori, f"Orientation {start_ori} should be preserved if no geometric transform")
+                    # Should be sanitized to 1 because editor now ALWAYS bakes orientation
+                    self.assertEqual(orientation, 1, f"Orientation should be sanitized to 1, got {orientation}")
+                    
+                    # Verify pixels are rotated if necessary (Start 5-8 involve 90 deg rotation or swap)
+                    # Start 3 (180) -> Same dims
+                    # Start 6 (90 CW) -> Swapped dims
+                    # Start 8 (90 CCW) -> Swapped dims
+                    if start_ori in [5, 6, 7, 8]:
+                        self.assertEqual(res.size, (50, 100), f"Dimensions should be swapped for start {start_ori} due to baking")
+                    else:
+                        self.assertEqual(res.size, (100, 50), f"Dimensions should be preserved for start {start_ori}")
 
     def test_raw_mode_exif_preservation(self):
         """Verify that camera EXIF from a source JPEG is preserved when 'developing' RAW (simulated with TIFF)."""

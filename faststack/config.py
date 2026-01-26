@@ -6,7 +6,7 @@ import sys
 import glob
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from faststack.logging_setup import get_app_data_dir
 
@@ -36,12 +36,15 @@ def detect_rawtherapee_path():
             
         # Helper to extract version numbers for natural sorting
         # e.g., "5.10" -> [5, 10]
-        def natural_sort_key(path):
-            return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', path)]
+        def version_sort_key(path):
+            for part in reversed(PureWindowsPath(path).parts):
+                if re.fullmatch(r'\d+(?:\.\d+)*', part):
+                    return [int(n) for n in part.split(".")]
+            return [0]
 
         # Sort matches to try and get the latest version (by path name)
         # 5.10 > 5.9
-        matches.sort(key=natural_sort_key, reverse=True)
+        matches.sort(key=version_sort_key, reverse=True)
         return matches[0]
     except Exception as e:
         log.warning(f"Error detecting RawTherapee path: {e}")

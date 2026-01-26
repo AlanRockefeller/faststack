@@ -1,7 +1,9 @@
-
 import unittest
-from unittest.mock import MagicMock
-from concurrent.futures import Future
+from unittest.mock import MagicMock, patch
+import sys
+
+# Mock config before importing prefetcher
+sys.modules['faststack.config'] = MagicMock()
 from faststack.imaging.prefetch import Prefetcher
 
 class TestPrefetcher(unittest.TestCase):

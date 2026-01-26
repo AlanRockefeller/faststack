@@ -57,6 +57,14 @@ class TestEditor(unittest.TestCase):
         import tempfile
         from pathlib import Path
         import shutil
+        try:
+            import cv2
+        except ImportError:
+            cv2 = None
+        
+        if cv2 is None:
+            self.skipTest("OpenCV not installed, skipping texture test")
+
         import numpy as np
         
         tmp_dir = tempfile.mkdtemp()

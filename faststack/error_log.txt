@@ -1,0 +1,10 @@
+ERROR in test_raw_mode_exif_preservation (tests.test_exif_orientation.TestExifOrientation.test_raw_mode_exif_preservation):
+Traceback (most recent call last):
+  File "C:\code\faststack\faststack\tests\test_exif_orientation.py", line 129, in test_raw_mode_exif_preservation
+    with Image.open(developed_path) as dev:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\alanr\AppData\Local\Programs\Python\Python312\Lib\site-packages\PIL\Image.py", line 3512, in open
+    fp = builtins.open(filename, "rb")
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\alanr\\AppData\\Local\\Temp\\tmph5g2del1\\working_source-developed.jpg'
+

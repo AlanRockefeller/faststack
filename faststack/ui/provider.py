@@ -8,6 +8,8 @@ from PySide6.QtQuick import QQuickImageProvider
 
 from faststack.models import DecodedImage
 from faststack.config import config
+from faststack.imaging.optional_deps import HAS_OPENCV
+from pathlib import Path
 
 # Try to import QColorSpace if available (Qt 6+)
 try:
@@ -26,7 +28,9 @@ class ImageProvider(QQuickImageProvider):
         self.placeholder = QImage(256, 256, QImage.Format.Format_RGB888)
         self.placeholder.fill(Qt.GlobalColor.darkGray)
         # Keepalive queue to prevent GC of buffers currently in use by QImage
-        self._keepalive = collections.deque(maxlen=32)
+        # Increased to 128 to prevent crashes during rapid scrolling/thrashing where
+        # QML might hold onto textures slightly longer than the Python GC expects.
+        self._keepalive = collections.deque(maxlen=128)
 
     def requestImage(self, id: str, size: object, requestedSize: object) -> QImage:
         """Handles image requests from QML."""
@@ -34,17 +38,30 @@ class ImageProvider(QQuickImageProvider):
             return self.placeholder
 
         try:
-            image_index_str = id.split('/')[0]
-            index = int(image_index_str)
+            # Parse index and optional generation
+            parts = id.split('/')
+            index = int(parts[0])
+            gen = int(parts[1]) if len(parts) > 1 else None
             
             # If editor is open, use the background-rendered preview buffer
             # BUT only if the requested index matches the currently edited index!
-            # Otherwise we serve the editor preview for thumbnails/prefetch.
+            # AND the generation matches (to avoid stale frames during rotation/param changes)
             # FIX: If zoomed in, force full-res image instead of low-res preview
-            if self.app_controller.ui_state.isEditorOpen and index == self.app_controller.current_index and not self.app_controller.ui_state.isZoomed:
-                image_data = self.app_controller._last_rendered_preview or self.app_controller.get_decoded_image(index)
-            else:
-                image_data = self.app_controller.get_decoded_image(index)
+            
+            use_editor_preview = (
+                self.app_controller.ui_state.isEditorOpen
+                and index == self.app_controller.current_index
+                and not self.app_controller.ui_state.isZoomed
+                and self.app_controller._last_rendered_preview is not None
+                and getattr(self.app_controller, "_last_rendered_preview_index", None) == index
+                and (gen is None or getattr(self.app_controller, "_last_rendered_preview_gen", None) == gen)
+            )
+
+            image_data = (
+                self.app_controller._last_rendered_preview 
+                if use_editor_preview 
+                else self.app_controller.get_decoded_image(index)
+            )
 
             if image_data:
                 # Handle format being None (from prefetcher) or missing
@@ -135,6 +152,7 @@ class UIState(QObject):
 
     is_histogram_visible_changed = Signal(bool)
     histogram_data_changed = Signal()
+    highlightStateChanged = Signal()  # New signal for highlight analysis updates
     brightness_changed = Signal(float)
     contrast_changed = Signal(float)
     saturation_changed = Signal(float)
@@ -521,6 +539,11 @@ class UIState(QObject):
         """Returns True if the current image is a stacked JPG."""
         return self.currentFilename.lower().endswith(" stacked.jpg")
 
+    @Property(bool, constant=True)
+    def hasOpenCV(self):
+        """Returns True if OpenCV is available."""
+        return HAS_OPENCV
+
     # --- Slots for QML to call ---
     @Slot()
     def nextImage(self):
@@ -695,9 +718,13 @@ class UIState(QObject):
     def editorFilename(self) -> str:
         """Returns the filename of the image currently being edited (may be .tif for developed RAW)."""
         editor = self.app_controller.image_editor
-        if editor and editor.current_filepath:
-            return editor.current_filepath.name
-        return ""
+        fp = getattr(editor, "current_filepath", None) if editor else None
+        if not fp:
+            return ""
+        try:
+            return Path(fp).name
+        except Exception:
+            return ""
 
     @Property(int, notify=editorImageChanged)
     def editorBitDepth(self) -> int:
@@ -790,6 +817,31 @@ class UIState(QObject):
         if self._histogram_data != new_value:
             self._histogram_data = new_value
             self.histogram_data_changed.emit()
+
+    @Property('QVariant', notify=highlightStateChanged)
+    def highlightState(self):
+        """Returns highlight analysis state for UI display.
+        
+        Returns dict with:
+        - headroom_pct: Fraction of pixels with recoverable data above 1.0 (16-bit sources)
+        - clipped_pct: Fraction of pixels clipped in the SOURCE image (JPEG flat-top @ 254+)
+        - near_white_pct: Fraction of pixels currently near white in the processed state.
+        """
+        editor = self.app_controller.image_editor
+        state = {}
+        if editor and hasattr(editor, '_last_highlight_state') and editor._last_highlight_state:
+            # Quick copy under lock to minimize contention
+            # Using the editor's lock ensures we don't read while it's being written
+            with editor._lock:
+                state = dict(editor._last_highlight_state)
+        
+        # Normalize for QML robustness: ensure stable keys exist regardless of internal naming
+        # Normalize for QML robustness: ensure stable keys exist
+        return {
+            'headroom_pct': state.get('headroom_pct', 0.0),
+            'source_clipped_pct': state.get('source_clipped_pct', 0.0),
+            'current_nearwhite_pct': state.get('current_nearwhite_pct', 0.0)
+        }
 
     @Property(float, notify=brightness_changed)
     def brightness(self) -> float:

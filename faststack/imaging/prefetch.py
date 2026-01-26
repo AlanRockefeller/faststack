@@ -21,6 +21,7 @@ except ImportError:
 from faststack.models import ImageFile, DecodedImage
 from faststack.imaging.jpeg import decode_jpeg_rgb, decode_jpeg_resized, TURBO_AVAILABLE
 from faststack.imaging.cache import build_cache_key
+from faststack.imaging.orientation import apply_exif_orientation
 from faststack.config import config
 
 log = logging.getLogger(__name__)
@@ -102,6 +103,9 @@ def get_monitor_profile() -> Optional[ImageCms.ImageCmsProfile]:
             _monitor_profile_cache[monitor_icc_path] = None
         
         return _monitor_profile_cache[monitor_icc_path]
+
+
+# apply_exif_orientation imported from orientation.py
 
 def apply_saturation_compensation(
     arr: np.ndarray,
@@ -313,6 +317,7 @@ class Prefetcher:
         import time
         
         t_start = time.perf_counter()
+        exif_obj = None  # Ensure variable is always initialized
         
         # Early check: if generation has already advanced since this task was submitted, skip it
         if generation != self.generation:
@@ -388,10 +393,12 @@ class Prefetcher:
                     img = PILImage.fromarray(buffer)
                     t_after_array_to_pil = time.perf_counter()
                     
-                    # Extract ICC profile from original file (need to read header only)
+                    # Extract ICC profile AND EXIF from original file (need to read header only)
                     t_before_profile_read = time.perf_counter()
+                    exif_obj = None
                     with PILImage.open(image_file.path) as orig:
                         icc_bytes = orig.info.get("icc_profile")
+                        exif_obj = orig.getexif() # Capture EXIF while open
                     t_after_profile_read = time.perf_counter()
                     
                     src_profile = None
@@ -421,7 +428,10 @@ class Prefetcher:
                         t_after_icc = time.perf_counter()
                         
                         rgb = np.array(img, dtype=np.uint8)
-                        h, w, _ = rgb.shape
+                        
+                        # Note: We do NOT apply EXIF orientation here anymore.
+                        # It is handled in the Unified EXIF Orientation Application block below.
+                        # This avoids "double rotation" or potential "apply and discard" bugs.
                         
                         # Memory Optimization: Avoid explicit copy
                         buffer = np.ascontiguousarray(rgb)
@@ -435,7 +445,7 @@ class Prefetcher:
                                      index, decoder, t_after_read - t_before_read, t_after_decode - t_after_read,
                                      t_after_array_to_pil - t_after_decode, t_after_profile_read - t_before_profile_read,
                                      t_after_icc - t_before_icc, t_after_copy - t_after_icc,
-                                     t_after_copy - t_start, w, h)
+                                     t_after_copy - t_start, buffer.shape[1], buffer.shape[0])
                     except (OSError, ImageCms.PyCMSError, ValueError) as e:
                         # ICC conversion failed, fall back to standard decode
                         log.warning("ICC profile conversion failed for %s: %s, falling back to standard decode", image_file.path, e)
@@ -457,7 +467,21 @@ class Prefetcher:
                             return None
                         t_after_fallback_decode = time.perf_counter()
                         
-                        h, w, _ = buffer.shape
+                        # EXIF orientation correction
+                        # In fallback path, we opened 'f' (file handle) and mmap.
+                        # We didn't keep a PIL image open suitable for EXIF extraction except inside the try block (line 456).
+                        # But line 456 `with PILImage.fromarray(buffer)` creates a new image from buffer, NO EXIF.
+                        # Wait, line 377 `with PILImage.open(image_file.path) as img:` IS handling non-JPEG logic if TurboJPEG fails?
+                        # No, this is inside `if is_jpeg`.
+                        
+                        # So inside ICC mode, failure fallback:
+                        # We use decode_jpeg_rgb/resized (TurboJPEG) OR generic Pillow.
+                        # If generic pillow (lines 373-383), it was `with PILImage.open... as img`.
+                        # But that loop closed.
+                        
+                        # Optimization: we can't easily reuse the object unless we restructure.
+                        # BUT, for the "Unified" block at the end, we can pass `exif_obj` if we have it.
+                        pass
                         
                         # Memory Optimization: Avoid explicit copy
                         buffer = np.ascontiguousarray(buffer)
@@ -473,7 +497,7 @@ class Prefetcher:
                                      index, decoder, t_after_fallback_read - t_before_fallback_read,
                                      t_after_fallback_decode - t_after_fallback_read,
                                      t_after_copy - t_after_fallback_decode,
-                                     t_after_copy - t_start, w, h)
+                                     t_after_copy - t_start, buffer.shape[1], buffer.shape[0])
                 else:
                     # Fall back to standard decode if ICC profile not available
                     log.warning("ICC mode selected but no monitor profile available, using standard decode")
@@ -495,7 +519,34 @@ class Prefetcher:
                         return None
                     t_after_decode = time.perf_counter()
                     
-                    h, w, _ = buffer.shape
+                    # EXIF orientation application
+                    # We have 'img' (PIL Image) open if we used the fallback path, but wait -
+                    # in this block (lines 482-501) we MIGHT use decode_jpeg_resized which doesn't give us a PIL Image.
+                    # Or we used Generic Pillow open (lines 494-496) where 'img' was capable.
+                    # Actually, if we used decode_jpeg_XXX, we don't have a PIL object handy unless we open one.
+                    # But optimization: if we used Pillow fallback, we might have it?
+                    # This block is "Standard decode path (Option A or no color management) FOR JPEG FALLBACK"
+                    
+                    # BUT WAIT: logic above: if TurboJPEG worked on JPEG, it returned buffer.
+                    # If TurboJPEG failed, it fell back to Pillow.
+                    
+                    # Actually, looking at the logic:
+                    # 1. ICC Mode -> TurboJPEG (if success, we have buffer) -> applyTransform -> buffer
+                    # 2. ICC Mode -> Fallback Pillow (if success, we have buffer)
+                    
+                    # The `apply_saturation_compensation` and `apply_exif_orientation` are effectively "Post Processing".
+                    # In previous code "Unified EXIF Orientation Application" was doing a fresh open.
+                    
+                    # We should move the EXIF application UP into the scopes where we might have the PIL object.
+                    
+                    # For this specific block (ICC Fallback or TurboJPEG):
+                    # In TurboJPEG case: we have 'img' (PIL Image from buffer). Does it have EXIF? No, it was created from raw bytes.
+                    # We did open 'orig' to get ICC profile. We could have gotten EXIF combined?
+                    # The TurboJPEG path opens 'orig' on line 397 (with PILImage.open(image_file.path) as orig).
+                    # We should get EXIF there!
+                    
+                    # Let's fix the TurboJPEG path first (Lines 345+):
+                    # We open 'orig' to read ICC (line 397). We should ALSO read EXIF there.
                     
                     # Memory Optimization: Avoid explicit copy
                     buffer = np.ascontiguousarray(buffer)
@@ -510,7 +561,7 @@ class Prefetcher:
                         log.info("Standard decode timing (no ICC profile) for index %d (%s): read=%.3fs, decode=%.3fs, copy=%.3fs, total=%.3fs, size=%dx%d",
                                  index, decoder, t_after_read - t_before_read, t_after_decode - t_after_read,
                                  t_after_copy - t_after_decode,
-                                 t_after_copy - t_start, w, h)
+                                 t_after_copy - t_start, buffer.shape[1], buffer.shape[0])
             
             else:
                 # Standard decode path (Option A or no color management)
@@ -547,7 +598,7 @@ class Prefetcher:
                     return None
                 t_after_decode = time.perf_counter()
                     
-                h, w, _ = buffer.shape
+                # EXIF orientation correction moved to post-decode block
 
                 # Memory Optimization: Avoid explicit copy
                 buffer = np.ascontiguousarray(buffer)
@@ -556,13 +607,38 @@ class Prefetcher:
 
                 t_after_copy = time.perf_counter()
 
+            # Unified EXIF Orientation Application
+            if buffer is not None:
+                pre_h, pre_w = buffer.shape[:2]
+                try:
+                    # Optimization: Use pre-read EXIF object if available (ICC path)
+                    # For non-ICC path, we might still need to open it.
+                    if exif_obj is not None:
+                         buffer = apply_exif_orientation(buffer, image_file.path, exif=exif_obj)
+                    else:
+                        # Fallback to opening (Non-ICC path or where we didn't capture it)
+                        with PILImage.open(image_file.path) as img:
+                             buffer = apply_exif_orientation(buffer, image_file.path, exif=img.getexif())
+                except Exception as e:
+                     log.warning("Failed to apply EXIF orientation for %s: %s", image_file.path, e)
+
+                # Always re-establish these no matter what happened
+                h, w = buffer.shape[:2]
+                buffer = np.ascontiguousarray(buffer)
+                bytes_per_line = buffer.strides[0]
+                mv = memoryview(buffer).cast("B")
+                t_after_orient = time.perf_counter()
+
+                if self.debug and (w != pre_w or h != pre_h):
+                        log.info("Applied EXIF orientation for index %d: %dx%d -> %dx%d", index, pre_w, pre_h, w, h)
+
             # Apply saturation compensation if enabled
             if color_mode == "saturation":
                 try:
                     factor = float(config.get('color', 'saturation_factor', fallback="1.0"))
                     
                     # Ensure buffer is contiguous and create a 1D view for saturation compensation
-                    # Note: buffer is already made contiguous (np.ascontiguousarray) in the decode blocks above
+                    # Note: buffer is already made contiguous (np.ascontiguousarray) in the decode blocks above or orientation block
                     arr = buffer.ravel()
                     
                     # Verify shape expectations
