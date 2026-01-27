@@ -1,20 +1,22 @@
 # Strip CRLF on commit (working tree may still be CRLF on Windows mounts)
 * text=auto eol=lf filter=crlf
 
-# Explicitly treat these as text (redundant but nice for clarity)
-*.py   text eol=lf
-*.sh   text eol=lf
-*.bash text eol=lf
-*.fish text eol=lf
-*.qml  text eol=lf
-*.md   text eol=lf
-*.txt  text eol=lf
-*.yml  text eol=lf
-*.yaml text eol=lf
-*.json text eol=lf
-*.toml text eol=lf
-*.ini  text eol=lf
-*.cfg  text eol=lf
+
+# Explicitly treat these as text (and also run the CRLF->LF clean filter)
+*.py   text eol=lf filter=crlf
+*.sh   text eol=lf filter=crlf
+*.bash text eol=lf filter=crlf
+*.fish text eol=lf filter=crlf
+*.qml  text eol=lf filter=crlf
+*.md   text eol=lf filter=crlf
+*.txt  text eol=lf filter=crlf
+*.yml  text eol=lf filter=crlf
+*.yaml text eol=lf filter=crlf
+*.json text eol=lf filter=crlf
+*.toml text eol=lf filter=crlf
+*.ini  text eol=lf filter=crlf
+*.cfg  text eol=lf filter=crlf
+
 
 # Keep binaries untouched (no eol conversions)
 *.png  binary
