@@ -456,7 +456,7 @@ Window {
                     target: slider
                     property: "value"
                     value: slider.backendValue
-                    when: !slider.pressed
+                    when: !slider.pressed && !slider.isResetting
                 }
 
                 property real _pendingValue: 0
@@ -467,24 +467,24 @@ Window {
                     repeat: true
                     onTriggered: {
                         if (Math.abs(slider._pendingValue - slider._lastSentValue) > 0.001) {
-                            var sendValue = slider.isReversed ? -slider._pendingValue : slider._pendingValue
+                            var sendValue = isReversed ? -slider._pendingValue : slider._pendingValue
                             controller.set_edit_parameter(model.key, sendValue / maxVal)
                             slider._lastSentValue = slider._pendingValue
                         }
                     }
                 }
                 
-                Connections {
-                    target: imageEditorDialog
-                    function onUpdatePulseChanged() {
-                        if (!slider.pressed) {
-                            slider.value = slider.backendValue
-                        }
+                // Double-click reset using TapHandler (coexists with Slider drag)
+                TapHandler {
+                    acceptedButtons: Qt.LeftButton
+                    gesturePolicy: TapHandler.DragThreshold
+                    onDoubleTapped: {
+                        if (!slider.isResetting)
+                            slider.triggerReset()
                     }
                 }
-                
+
                 property bool isResetting: false
-                property double _lastPressTime: 0
                 
                 // Timer to handle reset state duration
                 Timer {
@@ -498,6 +498,7 @@ Window {
                 
                 function triggerReset() {
                     slider.isResetting = true
+                    sendTimer.stop()
                     controller.set_edit_parameter(model.key, 0.0)
                     slider.value = 0.0
                     _pendingValue = 0.0
@@ -508,36 +509,23 @@ Window {
 
                 onPressedChanged: {
                     if (pressed) {
-                        var now = Date.now()
-                        // Double click logic with value delta guard
-                        // Only reset if clicked recently AND value hasn't drifted far (meaning it wasn't a drag)
-                        var timeDiff = now - _lastPressTime
-                        var valDiff = Math.abs(value - _pendingValue)
-                        var range = to - from
-                        
-                        if (timeDiff < 600 && valDiff < (range * 0.05)) { 
-                             triggerReset()
-                             _lastPressTime = 0
-                        } else {
-                             _lastPressTime = now
-                        }
-                        
                         imageEditorDialog.slidersPressedCount++
                         
                         // Initialize drag logic only if not resetting
                         if (!slider.isResetting) {
                             _pendingValue = value
+                            slider._lastSentValue = value
                             if (!sendTimer.running) sendTimer.start()
                         }
                     } else {
                         imageEditorDialog.slidersPressedCount--
+                        sendTimer.stop()
                         
                         if (slider.isResetting) {
                              // Force backend to 0 on release (redundant but safe)
                              controller.set_edit_parameter(model.key, 0.0)
                         } else {
-                             // Stop repeating sends, then send final value immediately
-                             sendTimer.stop()
+                             // Send final value immediately
                              var sendValue = isReversed ? -value : value
                              controller.set_edit_parameter(model.key, sendValue / maxVal)
                         }
@@ -546,24 +534,10 @@ Window {
                     }
                 }
                 
-                // Force 0 while resetting - this overrides the slider's internal mouse handling
-                Binding {
-                    target: slider
-                    property: "value"
-                    value: 0
-                    when: slider.isResetting
-                }
-                
                 onMoved: {
                     if (slider.isResetting) return
                     _pendingValue = value
                     if (!sendTimer.running) sendTimer.start()
-                }
-                
-                onBackendValueChanged: {
-                    if (!pressed && !slider.isResetting) {
-                        value = backendValue
-                    }
                 }
 
                 // Smooth transition for value changes from backend

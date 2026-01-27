@@ -5,7 +5,7 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 
 ## 1.5.2 (2026-01-25)
 
-#### Added
+### Added
 - **Highlight recovery telemetry + UI indicators**
   - New highlight state analysis in the editor pipeline (headroom/clipping/near-white metrics) and a UI signal (`highlightStateChanged`) to keep it live.
   - Image editor dialog now shows **Headroom** and **Clipped** indicators under the histogram when relevant.
@@ -16,7 +16,7 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
   - Centralized optional OpenCV usage (`optional_deps`) with fallbacks (e.g., Pillow-based Gaussian blur fallback when OpenCV is unavailable).
   - Tests updated to skip/patch appropriately when OpenCV isn’t installed.
 
-#### Changed
+### Changed
 - **Save flow restored to “old behavior”**
   - Saving now: **closes editor → clears editor state → refreshes image list → reselects saved image → clears cache/prefetches → syncs UI**.
   - Save errors now surface as user-visible status messages with safer exception handling.
@@ -24,13 +24,13 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
   - Histogram panel height increased; channel labels expanded (Red/Green/Blue); non-minimal histogram display enabled.
   - Single-channel histogram drawing now downsamples using **max-pooling** when canvas width is smaller than bin count to reduce aliasing/spikes.
 - **Slider double-click reset robustness**
-  - Reworked double-click-to-reset behavior with better drag-vs-click detection, an explicit reset path, a failsafe timer, and a binding to force value to 0 while resetting.
+  - Replaced heuristic double-click logic with `TapHandler` double-tap reset and removed competing `slider.value` writers for more deterministic behavior.
 - **Color/edit pipeline tuning**
   - Contrast and saturation slider sensitivity reduced (scaled effect).
   - Headroom “safety” shoulder moved to linear space (`_apply_headroom_shoulder`) replacing the old sRGB-side shoulder.
   - Auto-levels now kicks the preview worker for immediate visual feedback; histogram updates are guarded by visibility in more places.
 
-#### Fixed
+### Fixed
 - **EXIF orientation “double rotation” bugs**
   - Saving now consistently drops/sanitizes EXIF when orientation can’t be safely serialized, preventing incorrect viewer rotations.
   - Developed JPG sidecar EXIF from a paired JPEG is sanitized for Orientation as well.
