@@ -1,5 +1,5 @@
-# Normalize text files to LF in the repo, regardless of contributor OS
-* text=auto eol=lf
+# Strip CRLF on commit (working tree may still be CRLF on Windows mounts)
+* text=auto eol=lf filter=crlf
 
 # Explicitly treat these as text (redundant but nice for clarity)
 *.py   text eol=lf
