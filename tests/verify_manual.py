@@ -48,15 +48,13 @@ def run_checks():
     
     # Setup data
     img_jpg = MagicMock()
-    img_jpg.path = Path("test.jpg")
-    img_jpg.path.suffix = ".jpg"
+    img_jpg.path = Path("test.jpg")  # suffix is derived from Path, not assigned
     img_jpg.raw_pair = Path("test.CR2")
     img_jpg.working_tif_path = Path("test.tif")
     img_jpg.has_working_tif = False
-    
+
     img_raw = MagicMock()
-    img_raw.path = Path("orphan.CR2")
-    img_raw.path.suffix = ".CR2"
+    img_raw.path = Path("orphan.CR2")  # suffix is derived from Path, not assigned
     img_raw.raw_pair = None
     
     controller.image_files = [img_jpg, img_raw]

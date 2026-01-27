@@ -1,10 +1,10 @@
-
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
 import numpy as np
 
 # Mock modules before importing editor
+# Note: These mocks remain in sys.modules for the test to use
 sys.modules['cv2'] = MagicMock()
 sys.modules['PIL'] = MagicMock()
 sys.modules['PySide6.QtGui'] = MagicMock()
