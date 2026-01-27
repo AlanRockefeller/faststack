@@ -37,3 +37,16 @@
 *.so   binary
 *.dll  binary
 *.dylib binary
+*.tiff binary
+*.nef  binary
+*.cr2  binary
+*.cr3  binary
+*.arw  binary
+*.dng  binary
+*.orf  binary
+*.rw2  binary
+*.raf  binary
+*.heic binary
+*.mp4  binary
+*.mov  binary
+
