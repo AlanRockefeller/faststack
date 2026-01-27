@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import MagicMock, patch
+from concurrent.futures import Future
 import sys
 
 # Mock config before importing prefetcher

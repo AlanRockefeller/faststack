@@ -1,6 +1,7 @@
 import unittest
 import numpy as np
-from faststack.imaging.editor import ImageEditor, _apply_headroom_shoulder
+from faststack.imaging.editor import ImageEditor
+from faststack.imaging.math_utils import _apply_headroom_shoulder
 from faststack.ui.provider import UIState
 from faststack.app import AppController
 from PySide6.QtCore import QObject, Signal

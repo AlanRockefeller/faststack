@@ -147,7 +147,7 @@ Window {
                     ListElement { name: "Texture"; key: "texture" }
                     ListElement { name: "Sharpness"; key: "sharpness" }
                 }
-                Repeater { model: effectsModel; delegate: editSlider }
+                Repeater { model: detailModel; delegate: editSlider }
 
                 // --- Histogram Group ---
                 RowLayout {
@@ -316,7 +316,7 @@ Window {
                     id: effectsModel
                     ListElement { name: "Vignette"; key: "vignette"; min: 0; max: 100 }
                 }
-                Repeater { model: detailModel; delegate: editSlider }
+                Repeater { model: effectsModel; delegate: editSlider }
 
                 Loader { sourceComponent: sectionSeparator }
 

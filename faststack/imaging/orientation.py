@@ -43,6 +43,9 @@ def apply_orientation_to_np(buffer: np.ndarray, orientation: int) -> np.ndarray:
         Transformed numpy array. Guaranteed to be C-contiguous.
     """
     if orientation <= 1:
+        # Ensure C-contiguity even for identity orientation
+        if not buffer.flags['C_CONTIGUOUS']:
+            return np.ascontiguousarray(buffer)
         return buffer
         
     # Apply transformation based on orientation
@@ -68,6 +71,9 @@ def apply_orientation_to_np(buffer: np.ndarray, orientation: int) -> np.ndarray:
         # Rotated 90 CCW
         result = np.rot90(buffer, k=1)
     else:
+        # Unknown orientation - ensure C-contiguity
+        if not buffer.flags['C_CONTIGUOUS']:
+            return np.ascontiguousarray(buffer)
         return buffer
 
     # Ensure result is C-contiguous after flip/rotate

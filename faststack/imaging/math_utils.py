@@ -124,11 +124,9 @@ def _analyze_highlight_state(rgb_linear: np.ndarray, srgb_u8: Optional[np.ndarra
 
     # 2. Current Near-White Statistics (for Pivot Nudging)
     # This drives the "micro-contrast feel" based on how bright the image IS NOW.
-    # Re-calculate max_rgb if we didn't do it earlier (optimization)
+    # Calculate max_rgb if we didn't do it earlier (when pre_exposure_linear was provided)
     if pre_exposure_linear is not None:
         max_rgb = rgb_linear.max(axis=2)
-    elif 'max_rgb' not in locals():
-         max_rgb = rgb_linear.max(axis=2)
 
     current_nearwhite_pct = float(np.count_nonzero(
         (max_rgb >= _LINEAR_THRESHOLD_250) & (max_rgb < _LINEAR_THRESHOLD_254)
@@ -158,29 +156,27 @@ def _highlight_recover_linear(
     amount: float,
     *,
     pivot: float = 0.7,
-    k: float = 6.0,
     chroma_rolloff: float = 0.15,
     headroom_ceiling: float = 1.0,
 ) -> np.ndarray:
     """Apply highlight recovery using brightness-based rescaling to preserve hue.
-    
+
     Why brightness-based rescale?
     - Per-channel compression causes hue/chroma shifts (e.g., bright red becomes pink).
     - By computing a single brightness metric and rescaling all channels equally,
       we preserve the original RGB color ratios (hue and relative saturation).
-    
+
     For 16-bit sources with headroom (values > 1.0), the curve compresses into
     [pivot, headroom_ceiling] rather than [pivot, 1.0], preserving subtle tonal
     separation above 1.0 that represents real recovered detail.
-    
+
     Args:
         rgb_linear: Float32 RGB array (H, W, 3) in linear light, may have values > 1.0
         amount: Recovery strength 0.0-1.0 (mapped from slider -100 to 0)
         pivot: Brightness threshold below which no recovery occurs
-        k: Shoulder curve steepness (higher = more aggressive compression)
         chroma_rolloff: Desaturation amount in extreme highlights (0-1)
         headroom_ceiling: Maximum output brightness (> 1.0 preserves headroom detail)
-        
+
     Returns:
         Recovered float32 RGB array (linear)
     """

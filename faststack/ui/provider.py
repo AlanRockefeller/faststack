@@ -821,11 +821,11 @@ class UIState(QObject):
     @Property('QVariant', notify=highlightStateChanged)
     def highlightState(self):
         """Returns highlight analysis state for UI display.
-        
+
         Returns dict with:
         - headroom_pct: Fraction of pixels with recoverable data above 1.0 (16-bit sources)
-        - clipped_pct: Fraction of pixels clipped in the SOURCE image (JPEG flat-top @ 254+)
-        - near_white_pct: Fraction of pixels currently near white in the processed state.
+        - source_clipped_pct: Fraction of pixels clipped in the SOURCE image (JPEG flat-top @ 254+)
+        - current_nearwhite_pct: Fraction of pixels currently near white in the processed state.
         """
         editor = self.app_controller.image_editor
         state = {}

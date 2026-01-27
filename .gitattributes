@@ -1,0 +1,37 @@
+# Normalize text files to LF in the repo, regardless of contributor OS
+* text=auto eol=lf
+
+# Explicitly treat these as text (redundant but nice for clarity)
+*.py   text eol=lf
+*.sh   text eol=lf
+*.bash text eol=lf
+*.fish text eol=lf
+*.qml  text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.ini  text eol=lf
+*.cfg  text eol=lf
+
+# Keep binaries untouched (no eol conversions)
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.tif  binary
+*.tiff binary
+*.webp binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.7z   binary
+*.gz   binary
+*.bz2  binary
+*.xz   binary
+*.whl  binary
+*.so   binary
+*.dll  binary
+*.dylib binary

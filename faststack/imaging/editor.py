@@ -529,7 +529,11 @@ class ImageEditor:
                 #    re-render from the master float_image in the background.
                 # Since we already apply EXIF orientation to the master float_image above,
                 # we should also ensure the preview_arr matches orientation if it doesn't already.
-                # Generally, the Prefetcher already applies orientation to the cached preview.
+                # Generally, the Prefetcher already applies orientation to the cached preview,
+                # but if we detected an orientation > 1, we must ensure it's applied here too.
+                if orientation > 1:
+                    preview_arr = apply_orientation_to_np(preview_arr, orientation)
+
                 loaded_float_preview = preview_arr.astype(np.float32) / 255.0
             else:
                 # Downscale from float_image (which now has orientation applied)
@@ -1718,7 +1722,10 @@ class ImageEditor:
                     exif_bytes = sanitize_exif_orientation(self._source_exif_bytes)
                 elif self.original_image:
                     # Fallback to current image's EXIF (may be empty for TIFFs)
-                    exif_bytes = self.original_image.info.get("exif")
+                    # Must sanitize orientation because we baked it on load!
+                    exif_bytes = sanitize_exif_orientation(
+                        self.original_image.info.get("exif")
+                    )
 
                 # Use the same uint8 data
                 # Legacy soft shoulder moved to linear space

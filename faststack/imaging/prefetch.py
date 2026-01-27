@@ -585,7 +585,6 @@ class Prefetcher:
                 buffer = np.ascontiguousarray(buffer)
                 bytes_per_line = buffer.strides[0]
                 mv = memoryview(buffer).cast("B")
-                t_after_orient = time.perf_counter()
 
                 if self.debug and (w != pre_w or h != pre_h):
                         log.info("Applied EXIF orientation for index %d: %dx%d -> %dx%d", index, pre_w, pre_h, w, h)
@@ -641,8 +640,8 @@ class Prefetcher:
             log.debug("Successfully decoded and cached image at index %d for display gen %d", index, display_generation)
             return image_file.path, display_generation
             
-        except Exception:
-            log.exception("Error decoding image %s at index %d", image_file.path, index)
+        except (OSError, IOError, ValueError, MemoryError) as e:
+            log.warning("Error decoding image %s at index %d: %s", image_file.path, index, e)
         
         return None
 
