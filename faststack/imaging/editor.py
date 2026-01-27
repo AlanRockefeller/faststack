@@ -520,19 +520,13 @@ class ImageEditor:
                     cached_preview.buffer, dtype=np.uint8
                 ).reshape((cached_preview.height, cached_preview.width, 3))
 
-                # IMPORTANT: The cached_preview coming from the viewer is already "cooked"
-                # (it has Color Management / Saturation applied).
-                # Our editor expects a "raw" float buffer (non-managed) as its starting point for _apply_edits.
-                # To prevent a color "pop" when edits start, we have two choices:
-                # 1. "Un-cook" the preview (expensive/inaccurate).
-                # 2. Use the cooked preview for the VERY FIRST frame, but immediately
-                #    re-render from the master float_image in the background.
-                # Since we already apply EXIF orientation to the master float_image above,
-                # we should also ensure the preview_arr matches orientation if it doesn't already.
-                # Generally, the Prefetcher already applies orientation to the cached preview,
-                # but if we detected an orientation > 1, we must ensure it's applied here too.
-                if orientation > 1:
-                    preview_arr = apply_orientation_to_np(preview_arr, orientation)
+                # IMPORTANT: The cached_preview coming from the Prefetcher already has
+                # EXIF orientation applied (in prefetch.py's "Unified EXIF Orientation Application").
+                # Do NOT apply orientation again here - that would cause double rotation!
+                # The cached_preview is also "cooked" (has Color Management / Saturation applied).
+                # We use it for the VERY FIRST frame for fast display, then immediately
+                # re-render from the master float_image in the background.
+                log.debug("Using cached preview (assumed orientation-correct from prefetcher)")
 
                 loaded_float_preview = preview_arr.astype(np.float32) / 255.0
             else:
@@ -542,9 +536,8 @@ class ImageEditor:
                 thumb_rgb = thumb.convert("RGB")
                 loaded_float_preview = np.array(thumb_rgb).astype(np.float32) / 255.0
 
-                # If we applied orientation to the original, the thumbnail will already be correct
-                # because we derived it from loaded_original AFTER exif_transpose.
-                # If we derived from cached_preview, we might still need to apply orientation.
+                # Thumbnail is derived from loaded_original AFTER exif_transpose,
+                # so orientation is already correct.
 
             # Assign all state atomically under lock to prevent race with preview worker
             with self._lock:
