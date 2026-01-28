@@ -167,7 +167,7 @@ class TestThumbnailPrefetcher:
         result = prefetcher.submit(test_image, mtime_ns)
         assert result is False
 
-    def test_submit_deduplicates_inflight(self, prefetcher, test_image, cache):
+    def test_submit_deduplicates_inflight(self, prefetcher, test_image):
         """Test that duplicate in-flight jobs are skipped."""
         mtime_ns = test_image.stat().st_mtime_ns
 

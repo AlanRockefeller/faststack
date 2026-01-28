@@ -75,6 +75,11 @@ def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
         log.debug("Failed to parse %s: %s", json_path, e)
         return None
 
+    # Validate JSON root is a dict
+    if not isinstance(data, dict):
+        log.debug("Invalid JSON root in %s (expected dict)", json_path)
+        return None
+
     # Handle different sidecar formats
     entries = data.get("entries", {})
     if not isinstance(entries, dict):

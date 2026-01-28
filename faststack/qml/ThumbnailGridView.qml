@@ -7,19 +7,15 @@ Item {
     id: gridViewRoot
     anchors.fill: parent
 
+    // Theme property (bound by parent)
+    property bool isDarkTheme: false
+
     // Configuration
     property int cellWidth: 190
     property int cellHeight: 210
 
-    // Selection info (for keyboard handler and external access)
-    property var selectedPaths: uiState ? uiState.gridGetSelectedPaths() : []
-
-    Connections {
-        target: thumbnailModel
-        function onDataChanged() {
-            gridViewRoot.selectedPaths = uiState ? uiState.gridGetSelectedPaths() : []
-        }
-    }
+    // Selection count for keyboard handler (use gridSelectedCount for efficiency)
+    property int selectedCount: uiState ? uiState.gridSelectedCount : 0
 
     // Grid view
     GridView {
@@ -36,6 +32,9 @@ Item {
         delegate: ThumbnailTile {
             width: thumbnailGrid.cellWidth - 10
             height: thumbnailGrid.cellHeight - 10
+
+            // Theme binding from parent
+            isDarkTheme: gridViewRoot.isDarkTheme
 
             // Model role bindings - use attached property 'index' directly
             // Model roles become context properties in delegate
@@ -121,7 +120,7 @@ Item {
             anchors.centerIn: parent
             visible: thumbnailGrid.count === 0
             text: "No images in this folder"
-            color: root.isDarkTheme ? "#888888" : "#666666"
+            color: gridViewRoot.isDarkTheme ? "#888888" : "#666666"
             font.pixelSize: 16
         }
     }
@@ -130,7 +129,8 @@ Item {
     Keys.onPressed: function(event) {
         if (event.key === Qt.Key_Escape) {
             // Clear selection or switch to loupe
-            if (gridViewRoot.selectedPaths.length > 0) {
+            if (!uiState) return
+            if (gridViewRoot.selectedCount > 0) {
                 uiState.gridClearSelection()
             } else {
                 uiState.toggleGridView()
@@ -138,6 +138,7 @@ Item {
             event.accepted = true
         } else if (event.key === Qt.Key_Backspace) {
             // Navigate to parent
+            if (!uiState) return
             var model = thumbnailModel
             if (model && model.rowCount() > 0) {
                 // Check if first item is parent folder

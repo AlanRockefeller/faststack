@@ -1055,14 +1055,12 @@ class AppController(QObject):
             # Image might be in a different directory - don't switch view
             return
 
-        self.current_index = loupe_index
-
-        # Switch to loupe view
+        # Switch to loupe view first (avoids transient work while still in grid)
         self._set_grid_view_active(False)
 
-        # Sync UI and trigger image load
-        self.sync_ui_state()
-        self.prefetcher.update_prefetch(self.current_index)
+        # Then set index with navigation=True for proper state reset and prefetch
+        self._set_current_index(loupe_index, is_navigation=True)
+
         log.info("Opened image from grid: %s", entry.path)
 
     def _on_thumbnail_ready(self, thumbnail_id: str):
@@ -1091,7 +1089,8 @@ class AppController(QObject):
                 "edited": getattr(meta, "edited", False),
                 "restacked": getattr(meta, "restacked", False),
             }
-        except Exception:
+        except Exception as e:  # Broad catch for UI plumbing - don't crash grid view
+            log.debug("Failed to get metadata for %s: %s", stem, e)
             return {"stacked": False, "uploaded": False, "edited": False, "restacked": False}
 
     def _invalidate_batch_cache(self):

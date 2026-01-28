@@ -154,13 +154,12 @@ class TestShiftClick:
         model_with_images.clear_selection()
         model_with_images._last_selected_index = None
 
-        # Shift+click without anchor should just select the item
+        # Shift+click without anchor should just select the single item
         model_with_images.select_index(2, shift=True, ctrl=False)
 
-        # Should select from 0 to 2 or just the item depending on implementation
-        # In our implementation, if no anchor, it just selects the single item
+        # When no anchor exists, only the clicked item should be selected
         selected = model_with_images.get_selected_paths()
-        assert len(selected) >= 1
+        assert len(selected) == 1
 
 
 class TestFolderSelection:

@@ -159,7 +159,7 @@ class TestThumbnailModel:
         assert first_entry.is_folder is True
 
     @patch('faststack.thumbnail_view.model.find_images')
-    def test_no_parent_folder_at_base(self, mock_find_images, model, temp_folder):
+    def test_no_parent_folder_at_base(self, mock_find_images, model):
         """Test that no parent folder entry when at base directory."""
         from faststack.models import ImageFile
 
@@ -256,7 +256,7 @@ class TestThumbnailModelSelection:
         assert len(model.get_selected_paths()) == 0
 
     @patch('faststack.thumbnail_view.model.find_images')
-    def test_cannot_select_folders(self, mock_find_images, model, temp_folder):
+    def test_cannot_select_folders(self, mock_find_images, model):
         """Test that folders cannot be selected."""
         from faststack.models import ImageFile
 

@@ -10,6 +10,7 @@ from PySide6.QtGui import QImage, QPixmap, QColor
 from PySide6.QtQuick import QQuickImageProvider
 
 if TYPE_CHECKING:
+    from faststack.thumbnail_view.model import ThumbnailModel
     from faststack.thumbnail_view.prefetcher import ThumbnailPrefetcher, ThumbnailCache
 
 log = logging.getLogger(__name__)
@@ -213,7 +214,8 @@ class PathResolver:
         for i in range(model.rowCount()):
             entry = model.get_entry(i)
             if entry and not entry.is_folder:
-                path_hash = hashlib.md5(
+                # MD5 used for cache key only (non-cryptographic)
+                path_hash = hashlib.md5(  # noqa: S324
                     str(entry.path.resolve()).encode("utf-8")
                 ).hexdigest()[:16]
                 self._hash_to_path[path_hash] = entry.path

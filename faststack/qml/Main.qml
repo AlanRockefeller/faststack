@@ -741,6 +741,14 @@ ApplicationWindow {
                 active: true  // Keep loaded to preserve state during view toggle
                 visible: uiState && uiState.isGridViewActive
                 focus: uiState && uiState.isGridViewActive
+
+                // Bind theme property to loaded item
+                Binding {
+                    target: gridViewLoader.item
+                    property: "isDarkTheme"
+                    value: root.isDarkTheme
+                    when: gridViewLoader.item
+                }
             }
         }
     }
@@ -921,7 +929,7 @@ ApplicationWindow {
                 Button {
                     text: "Clear"
                     visible: uiState ? uiState.gridSelectedCount > 0 : false
-                    onClicked: uiState.gridClearSelection()
+                    onClicked: { if (uiState) uiState.gridClearSelection() }
                     implicitWidth: 60
                     implicitHeight: 28
                 }
@@ -929,7 +937,7 @@ ApplicationWindow {
                 // Refresh button
                 Button {
                     text: "Refresh"
-                    onClicked: uiState.gridRefresh()
+                    onClicked: { if (uiState) uiState.gridRefresh() }
                     implicitWidth: 70
                     implicitHeight: 28
                 }
@@ -937,7 +945,7 @@ ApplicationWindow {
                 // Single Image View button
                 Button {
                     text: "Single Image"
-                    onClicked: uiState.toggleGridView()
+                    onClicked: { if (uiState) uiState.toggleGridView() }
                     implicitWidth: 90
                     implicitHeight: 28
                 }

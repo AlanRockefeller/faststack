@@ -22,15 +22,18 @@ Item {
     property bool tileIsSelected: false
     property bool tileIsParentFolder: false
 
+    // Theme property (bound by parent)
+    property bool isDarkTheme: false
+
     // Configuration
     property int tileSize: 180
     property int thumbnailSize: 160
     property int textHeight: 24
-    property color textColor: root.isDarkTheme ? "white" : "black"
+    property color textColor: tile.isDarkTheme ? "white" : "black"
     property color selectedColor: "#4CAF50"
     property color currentColor: "#FFD700"  // Gold for current image
-    property color hoverColor: root.isDarkTheme ? "#404040" : "#e0e0e0"
-    property color backgroundColor: root.isDarkTheme ? "#2d2d2d" : "#fafafa"
+    property color hoverColor: tile.isDarkTheme ? "#404040" : "#e0e0e0"
+    property color backgroundColor: tile.isDarkTheme ? "#2d2d2d" : "#fafafa"
 
     width: tileSize
     height: tileSize + textHeight
@@ -97,7 +100,7 @@ Item {
                 Rectangle {
                     anchors.fill: parent
                     visible: thumbnailImage.status === Image.Loading
-                    color: root.isDarkTheme ? "#3c3c3c" : "#e0e0e0"
+                    color: tile.isDarkTheme ? "#3c3c3c" : "#e0e0e0"
 
                     BusyIndicator {
                         anchors.centerIn: parent

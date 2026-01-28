@@ -138,11 +138,13 @@ class TestReadFolderStats:
         stats1 = read_folder_stats(temp_folder)
         assert stats1.stacked_count == 1
 
-        # Modify file
-        import time
-        time.sleep(0.01)  # Ensure different mtime
+        # Modify file with explicit mtime change
+        import os
         data["entries"]["IMG_002"] = {"stacked": True}
         json_path.write_text(json.dumps(data))
+        # Set mtime to future to ensure cache invalidation
+        new_time = json_path.stat().st_mtime + 1
+        os.utime(json_path, (new_time, new_time))
 
         # Second read should get new data
         stats2 = read_folder_stats(temp_folder)

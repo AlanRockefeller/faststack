@@ -68,7 +68,7 @@ Dialog {
                 wrapMode: Text.Wrap
                 color: exifDialog.textColor
                 background: null
-                font.family: "Consolas, monospace"
+                font.family: "Monospace"
                 font.pixelSize: 14
             }
         }

@@ -447,18 +447,31 @@ class Prefetcher:
                         # ICC conversion failed, fall back to standard decode
                         log.warning("ICC profile conversion failed for %s: %s, falling back to standard decode", image_file.path, e)
                         t_before_fallback_read = time.perf_counter()
-                        with open(image_file.path, "rb") as f:
-                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
-                                # Pass mmap directly - no copy!
-                                if use_resized and should_resize:
-                                    buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
-                                else:
-                                    # Quality mode or Full Res: decode full image then resize with high quality
-                                    buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
-                                    if buffer is not None and should_resize:
-                                        img = PILImage.fromarray(buffer)
+
+                        if is_jpeg:
+                            # JPEG-specific fast path with mmap + TurboJPEG
+                            with open(image_file.path, "rb") as f:
+                                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                                    if use_resized and should_resize:
+                                        buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                                    else:
+                                        buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                                        if buffer is not None and should_resize:
+                                            img = PILImage.fromarray(buffer)
+                                            img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                            buffer = np.array(img)
+                        else:
+                            # Generic Pillow fallback for non-JPEGs
+                            try:
+                                with PILImage.open(image_file.path) as img:
+                                    img = img.convert("RGB")
+                                    if should_resize:
                                         img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
-                                        buffer = np.array(img)
+                                    buffer = np.array(img)
+                            except Exception as e:
+                                log.warning("Pillow fallback failed for %s: %s", image_file.path, e)
+                                return None
+
                         t_after_fallback_read = time.perf_counter()
                         if buffer is None:
                             return None
@@ -487,18 +500,31 @@ class Prefetcher:
                     # Fall back to standard decode if ICC profile not available
                     log.warning("ICC mode selected but no monitor profile available, using standard decode")
                     t_before_read = time.perf_counter()
-                    with open(image_file.path, "rb") as f:
-                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
-                            # Pass mmap directly - no copy!
-                            if use_resized and should_resize:
-                                buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
-                            else:
-                                # Quality mode or Full Res: decode full image then resize with high quality
-                                buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
-                                if buffer is not None and should_resize:
-                                    img = PILImage.fromarray(buffer)
+
+                    if is_jpeg:
+                        # JPEG-specific fast path with mmap + TurboJPEG
+                        with open(image_file.path, "rb") as f:
+                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                                if use_resized and should_resize:
+                                    buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                                else:
+                                    buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                                    if buffer is not None and should_resize:
+                                        img = PILImage.fromarray(buffer)
+                                        img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                        buffer = np.array(img)
+                    else:
+                        # Generic Pillow fallback for non-JPEGs
+                        try:
+                            with PILImage.open(image_file.path) as img:
+                                img = img.convert("RGB")
+                                if should_resize:
                                     img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
-                                    buffer = np.array(img)
+                                buffer = np.array(img)
+                        except Exception as e:
+                            log.warning("Pillow fallback failed for %s: %s", image_file.path, e)
+                            return None
+
                     t_after_read = time.perf_counter()
                     if buffer is None:
                         return None

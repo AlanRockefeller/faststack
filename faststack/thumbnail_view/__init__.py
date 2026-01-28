@@ -7,11 +7,11 @@ from .provider import ThumbnailProvider, PathResolver
 
 __all__ = [
     "FolderStats",
-    "read_folder_stats",
-    "ThumbnailModel",
-    "ThumbnailEntry",
-    "ThumbnailPrefetcher",
-    "ThumbnailCache",
-    "ThumbnailProvider",
     "PathResolver",
+    "read_folder_stats",
+    "ThumbnailCache",
+    "ThumbnailEntry",
+    "ThumbnailModel",
+    "ThumbnailPrefetcher",
+    "ThumbnailProvider",
 ]
