@@ -2,6 +2,32 @@
 
 Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   
 
+## 1.5.3 (2026-01-27)
+
+### Added
+- New **Thumbnail Grid View** (folder-style browser) with a fast thumbnail pipeline:
+  - `ThumbnailModel`, `ThumbnailProvider`, `ThumbnailPrefetcher`, `ThumbnailCache`, and `PathResolver` integrated into `AppController`.
+  - App now defaults to starting in grid view (thumbnail mode) and initializes the model/resolver on startup.
+  - Registered a dedicated QML image provider (`thumbnail://...`) and exposed `thumbnailModel` to QML.
+- UI controls to switch between **Thumbnail View** and **Single Image View**:
+  - Menu item in the actions menu to toggle views.
+  - `T` shortcut to toggle grid/loupe view.
+  - Grid-mode status bar controls for selection count, clear selection, refresh, and quick return to single image.
+
+### Changed
+- Implemented grid/loupe view switching using a `StackLayout` in `Main.qml` to keep both views loaded and preserve state while toggling.
+- Improved grid-to-loupe opening performance by adding an O(1) resolved-path → index map (`_path_to_index`) for quick lookup when opening an image from the grid.
+- Directory changes now refresh thumbnail infrastructure:
+  - Clear thumbnail cache before refresh to avoid stale thumbnails.
+  - Update model directories, refresh, update resolver, and emit `gridDirectoryChanged`.
+- Grid selection count is now exposed efficiently to QML via `uiState.gridSelectedCount` (avoids copying full selected-path lists just to display counts).
+
+### Fixed
+- Thread-safety for thumbnail completion callbacks:
+  - Thumbnail decode completion now hops to the GUI thread via an internal signal (`_thumbnailReadySignal`) using an explicit `Qt.QueuedConnection`.
+  - Added guards to avoid model updates during/after shutdown.
+- Added shutdown safety for thumbnail prefetcher (guard against partial initialization).
+
 
 ## 1.5.2 (2026-01-25)
 

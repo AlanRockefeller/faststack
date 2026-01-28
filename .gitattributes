@@ -37,7 +37,6 @@
 *.so   binary
 *.dll  binary
 *.dylib binary
-*.tiff binary
 *.nef  binary
 *.cr2  binary
 *.cr3  binary

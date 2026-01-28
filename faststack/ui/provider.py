@@ -1141,4 +1141,102 @@ class UIState(QObject):
 
     # --- RAW / Editor Source Logic ---
 
+    # --- Grid View Properties ---
+
+    # Signals for grid view
+    isGridViewActiveChanged = Signal(bool)
+    gridDirectoryChanged = Signal(str)
+    gridSelectedCountChanged = Signal()  # No args - QML property notify pattern
+
+    @Property(bool, notify=isGridViewActiveChanged)
+    def isGridViewActive(self) -> bool:
+        """Returns True if grid view is active, False for loupe view."""
+        return getattr(self.app_controller, '_is_grid_view_active', False)
+
+    @isGridViewActive.setter
+    def isGridViewActive(self, value: bool):
+        # Use controller method to ensure side effects (model refresh, resolver update) are applied
+        if hasattr(self.app_controller, '_set_grid_view_active'):
+            self.app_controller._set_grid_view_active(value)
+
+    @Property(str, notify=gridDirectoryChanged)
+    def gridDirectory(self) -> str:
+        """Returns the current directory shown in grid view."""
+        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+            return str(self.app_controller._thumbnail_model.current_directory)
+        return str(self.app_controller.image_dir)
+
+    @Property(int, notify=gridSelectedCountChanged)
+    def gridSelectedCount(self) -> int:
+        """Returns count of selected items in grid view (efficient, no list copy)."""
+        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+            return self.app_controller._thumbnail_model.selected_count
+        return 0
+
+    @Slot()
+    def toggleGridView(self):
+        """Toggle between grid view and loupe view."""
+        if hasattr(self.app_controller, 'toggle_grid_view'):
+            self.app_controller.toggle_grid_view()
+
+    @Slot(int)
+    def gridOpenIndex(self, index: int):
+        """Open an image from grid view in loupe view."""
+        if hasattr(self.app_controller, 'grid_open_index'):
+            self.app_controller.grid_open_index(index)
+
+    @Slot(str)
+    def gridNavigateTo(self, path: str):
+        """Navigate to a folder in grid view."""
+        if hasattr(self.app_controller, 'grid_navigate_to'):
+            self.app_controller.grid_navigate_to(path)
+
+    @Slot()
+    def gridClearSelection(self):
+        """Clear all selections in grid view."""
+        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+            self.app_controller._thumbnail_model.clear_selection()
+
+    @Slot(int, bool, bool)
+    def gridSelectIndex(self, index: int, shift: bool, ctrl: bool):
+        """Handle selection at index with modifier keys."""
+        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+            self.app_controller._thumbnail_model.select_index(index, shift, ctrl)
+
+    @Slot(result='QVariantList')
+    def gridGetSelectedPaths(self) -> list:
+        """Get list of selected image paths in grid view."""
+        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+            return [str(p) for p in self.app_controller._thumbnail_model.get_selected_paths()]
+        return []
+
+    @Slot()
+    def gridRefresh(self):
+        """Refresh the grid view."""
+        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+            self.app_controller._thumbnail_model.refresh()
+            # Also update path resolver
+            if hasattr(self.app_controller, '_path_resolver'):
+                self.app_controller._path_resolver.update_from_model(self.app_controller._thumbnail_model)
+
+    @Slot(int, int)
+    def gridPrefetchRange(self, startIndex: int, endIndex: int):
+        """Prefetch thumbnails for the given index range."""
+        if not hasattr(self.app_controller, '_thumbnail_model') or not self.app_controller._thumbnail_model:
+            return
+        if not hasattr(self.app_controller, '_thumbnail_prefetcher') or not self.app_controller._thumbnail_prefetcher:
+            return
+
+        model = self.app_controller._thumbnail_model
+        prefetcher = self.app_controller._thumbnail_prefetcher
+
+        # Clamp indices
+        startIndex = max(0, startIndex)
+        endIndex = min(model.rowCount() - 1, endIndex)
+
+        # Submit prefetch jobs for visible range
+        for i in range(startIndex, endIndex + 1):
+            entry = model.get_entry(i)
+            if entry and not entry.is_folder:
+                prefetcher.submit(entry.path, entry.mtime_ns)
 

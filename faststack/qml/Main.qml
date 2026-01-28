@@ -597,6 +597,33 @@ ApplicationWindow {
                     leftPadding: 10
                 }
             }
+
+            // Separator before grid view toggle
+            Rectangle {
+                width: 220
+                height: 1
+                color: root.isDarkTheme ? "#666666" : "#cccccc"
+            }
+
+            // Toggle Grid/Loupe View
+            ItemDelegate {
+                width: 220
+                height: 36
+                text: uiState && uiState.isGridViewActive ? "Single Image View" : "Thumbnail View"
+                onClicked: {
+                    if (uiState) uiState.toggleGridView();
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
         }
     }
 
@@ -642,7 +669,7 @@ ApplicationWindow {
         enabled: uiState ? !uiState.isDialogOpen : true
         onActivated: {
             if (!uiState) return
-            
+
             if (uiState.isEditorOpen) {
                 uiState.isEditorOpen = false
             } else {
@@ -654,33 +681,69 @@ ApplicationWindow {
         }
     }
 
+    // Grid View Toggle (T for Thumbnails)
+    Shortcut {
+        sequence: "T"
+        context: Qt.ApplicationShortcut
+        enabled: uiState ? !uiState.isDialogOpen : true
+        onActivated: {
+            if (uiState) uiState.toggleGridView()
+        }
+    }
+
     // -------- MAIN VIEW --------
-    Item {
+    // StackLayout to switch between loupe and grid view
+    StackLayout {
         id: contentArea
         anchors.fill: parent
+        currentIndex: uiState && uiState.isGridViewActive ? 1 : 0
 
-        Loader {
-            id: mainViewLoader
-            anchors.fill: parent
-            source: "Components.qml"
-            focus: true
-            onLoaded: item.footerHeight = Qt.binding(function() { return root.footerHeight })
+        // Index 0: Loupe View (single image)
+        Item {
+            id: loupeViewContainer
+            Layout.fillWidth: true
+            Layout.fillHeight: true
 
-            // Key bindings implemented in old Main.qml
-            Keys.onPressed: function(event) {
-                if (!uiState || !controller) {
-                    return
-                }
+            Loader {
+                id: mainViewLoader
+                anchors.fill: parent
+                source: "Components.qml"
+                focus: !uiState || !uiState.isGridViewActive
+                onLoaded: item.footerHeight = Qt.binding(function() { return root.footerHeight })
 
-                // Global Key for saving edited image (Ctrl+S) when editor is open
-                if (event.key === Qt.Key_S && (event.modifiers & Qt.ControlModifier)) {
-                    if (uiState.isEditorOpen) {
-                        controller.save_edited_image()
-                        event.accepted = true
+                // Key bindings implemented in old Main.qml
+                Keys.onPressed: function(event) {
+                    if (!uiState || !controller) {
+                        return
+                    }
+
+                    // Global Key for saving edited image (Ctrl+S) when editor is open
+                    if (event.key === Qt.Key_S && (event.modifiers & Qt.ControlModifier)) {
+                        if (uiState.isEditorOpen) {
+                            controller.save_edited_image()
+                            event.accepted = true
+                        }
                     }
                 }
             }
         }
+
+        // Index 1: Grid View (thumbnail browser)
+        Item {
+            id: gridViewContainer
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+
+            Loader {
+                id: gridViewLoader
+                anchors.fill: parent
+                source: "ThumbnailGridView.qml"
+                active: true  // Keep loaded to preserve state during view toggle
+                visible: uiState && uiState.isGridViewActive
+                focus: uiState && uiState.isGridViewActive
+            }
+        }
+    }
 
     // -------- STATUS BAR OVERLAY --------
     Rectangle {
@@ -838,8 +901,48 @@ ApplicationWindow {
                 visible: uiState ? (uiState.statusMessage !== "") : false
                 Layout.rightMargin: 10
             }
+
+            // Grid view controls (visible when in grid view)
+            Row {
+                visible: uiState && uiState.isGridViewActive
+                spacing: 8
+                Layout.rightMargin: 10
+
+                // Selection info (uses efficient count property, not full list)
+                Label {
+                    property int selCount: uiState ? uiState.gridSelectedCount : 0
+                    text: selCount > 0 ? selCount + " selected" : ""
+                    color: "#4CAF50"
+                    visible: selCount > 0
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // Clear selection button
+                Button {
+                    text: "Clear"
+                    visible: uiState ? uiState.gridSelectedCount > 0 : false
+                    onClicked: uiState.gridClearSelection()
+                    implicitWidth: 60
+                    implicitHeight: 28
+                }
+
+                // Refresh button
+                Button {
+                    text: "Refresh"
+                    onClicked: uiState.gridRefresh()
+                    implicitWidth: 70
+                    implicitHeight: 28
+                }
+
+                // Single Image View button
+                Button {
+                    text: "Single Image"
+                    onClicked: uiState.toggleGridView()
+                    implicitWidth: 90
+                    implicitHeight: 28
+                }
+            }
         }
-    }
     }
 
     // -------- DIALOGS --------
@@ -873,15 +976,19 @@ ApplicationWindow {
                           "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
                           "&nbsp;&nbsp;K / Left Arrow: Previous Image<br>" +
                           "&nbsp;&nbsp;G: Jump to Image Number<br>" +
-                          "&nbsp;&nbsp;I: Show EXIF Data<br><br>" +
+                          "&nbsp;&nbsp;I: Show EXIF Data<br>" +
+                          "&nbsp;&nbsp;T: Toggle Thumbnail Grid / Single Image View<br><br>" +
+                          "<b>Thumbnail Grid View:</b><br>" +
+                          "&nbsp;&nbsp;Click: Open image in single view<br>" +
+                          "&nbsp;&nbsp;Ctrl+Click: Toggle selection<br>" +
+                          "&nbsp;&nbsp;Shift+Click: Select range<br>" +
+                          "&nbsp;&nbsp;Backspace: Navigate to parent folder<br>" +
+                          "&nbsp;&nbsp;Esc: Clear selection or switch to single view<br><br>" +
                           "<b>Viewing:</b><br>" +
                           "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
                           "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
                           "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br>" +
-                          "&nbsp;&nbsp;Ctrl+1: Zoom to 100%<br>" +
-                          "&nbsp;&nbsp;Ctrl+2: Zoom to 200%<br>" +
-                          "&nbsp;&nbsp;Ctrl+3: Zoom to 300%<br>" +
-                          "&nbsp;&nbsp;Ctrl+4: Zoom to 400%<br><br>" +
+                          "&nbsp;&nbsp;Ctrl+1/2/3/4: Zoom to 100%/200%/300%/400%<br><br>" +
                           "<b>Stacking:</b><br>" +
                           "&nbsp;&nbsp;[: Begin new stack<br>" +
                           "&nbsp;&nbsp;]: End current stack<br>" +
@@ -907,20 +1014,23 @@ ApplicationWindow {
                           "&nbsp;&nbsp;Ctrl+E: Toggle edited flag<br>" +
                           "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
                           "<b>File Management:</b><br>" +
-                          "&nbsp;&nbsp;Delete: Move current image to recycle bin<br>" +
-                          "&nbsp;&nbsp;Ctrl+Z: Undo last action (delete, auto white balance, or crop)<br><br>" +
-                          "<b>Actions:</b><br>" +
+                          "&nbsp;&nbsp;Delete/Backspace: Move current image to recycle bin<br>" +
+                          "&nbsp;&nbsp;Ctrl+Z: Undo last action<br><br>" +
+                          "<b>Image Editing:</b><br>" +
+                          "&nbsp;&nbsp;E: Toggle Image Editor<br>" +
+                          "&nbsp;&nbsp;Ctrl+S (in editor): Save edited image<br>" +
+                          "&nbsp;&nbsp;A: Quick auto white balance<br>" +
+                          "&nbsp;&nbsp;L: Quick auto levels<br>" +
+                          "&nbsp;&nbsp;O (or right-click): Toggle crop mode<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;1/2/3/4: Set aspect ratio (1:1, 4:3, 3:2, 16:9)<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Enter: Execute crop<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Esc: Cancel crop<br><br>" +
+                          "<b>Other Actions:</b><br>" +
                           "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
                           "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
-                          "&nbsp;&nbsp;Backspace/Del: Move current image to recycle bin<br>" +
-                          "&nbsp;&nbsp;A: Quick auto white balance (saves automatically)<br>" +
-                          "&nbsp;&nbsp;L: Quick auto levels (saves automatically)<br>" +
-                          "&nbsp;&nbsp;Ctrl+Shift+B: Quick auto white balance (saves automatically)<br>" +
-                          "&nbsp;&nbsp;O (or right mouse click): Toggle crop mode (Enter to execute, ESC to cancel)<br>" +
                           "&nbsp;&nbsp;H: Toggle histogram window<br>" +
-                          "&nbsp;&nbsp;E: Toggle Image Editor (closes without saving if open)<br>" +
                           "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
-                          "&nbsp;&nbsp;Esc: Close active dialog, editor, or cancel crop"
+                          "&nbsp;&nbsp;Esc: Close active dialog or editor"
                     padding: 10
                     wrapMode: Text.WordWrap
                     color: root.currentTextColor

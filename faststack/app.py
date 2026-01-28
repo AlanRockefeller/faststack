@@ -8,7 +8,7 @@ import shlex
 import time
 import argparse
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 from datetime import date
 import os
 import shutil
@@ -58,6 +58,13 @@ from faststack.ui.provider import ImageProvider
 from faststack.ui.keystrokes import Keybinder
 from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, create_backup_file
 from faststack.imaging.metadata import get_exif_data
+from faststack.thumbnail_view import (
+    ThumbnailModel,
+    ThumbnailPrefetcher,
+    ThumbnailCache,
+    ThumbnailProvider,
+    PathResolver,
+)
 import re
 import numpy as np
 from faststack.io.indexer import RAW_EXTENSIONS
@@ -95,6 +102,8 @@ class AppController(QObject):
     histogramReady = Signal(object) # Signal for off-thread histogram result
     previewReady = Signal(object) # Signal for off-thread preview result
     dialogStateChanged = Signal(bool) # Signal for dialog open/close state
+    # Thread-safe signal for thumbnail ready (emitted from worker thread, received on GUI thread)
+    _thumbnailReadySignal = Signal(str)
 
     class ProgressReporter(QObject):
         progress_updated = Signal(int)
@@ -126,6 +135,7 @@ class AppController(QObject):
         self.image_dir = image_dir
         self.image_files: List[ImageFile] = []  # Filtered list for display
         self._all_images: List[ImageFile] = []  # Cached full list from disk
+        self._path_to_index: Dict[Path, int] = {}  # Resolved path -> index for O(1) lookup
         self.current_index: int = 0
         self.ui_refresh_generation = 0
         self.main_window: Optional[QObject] = None
@@ -177,6 +187,38 @@ class AppController(QObject):
         self.last_displayed_image: Optional[DecodedImage] = None  # Cache last image to avoid grey squares
         self._last_image_lock = threading.Lock()  # Protect last_displayed_image from race conditions
 
+        # -- Grid View (Thumbnail) Infrastructure --
+        self._is_grid_view_active = True  # Default to grid view on startup
+        self._thumbnail_cache = ThumbnailCache(
+            max_bytes=256 * 1024 * 1024,  # 256 MB
+            max_items=5000
+        )
+        self._path_resolver = PathResolver()
+        self._thumbnail_prefetcher = ThumbnailPrefetcher(
+            cache=self._thumbnail_cache,
+            on_ready_callback=self._on_thumbnail_ready,
+            target_size=200,
+        )
+        self._thumbnail_model = ThumbnailModel(
+            base_directory=self.image_dir,
+            current_directory=self.image_dir,
+            get_metadata_callback=self._get_metadata_dict,
+            get_batch_indices_callback=self._get_batch_indices,
+            get_current_index_callback=self._get_current_loupe_index,
+            thumbnail_size=200,
+            parent=self,  # Ensure proper Qt ownership to prevent GC issues
+        )
+        self._thumbnail_provider = ThumbnailProvider(
+            cache=self._thumbnail_cache,
+            prefetcher=self._thumbnail_prefetcher,
+            path_resolver=self._path_resolver.resolve,
+            default_size=200,
+        )
+        # Connect thread-safe thumbnail ready signal to GUI thread handler
+        # The callback is invoked from worker threads, so we use a signal to hop to GUI thread
+        # Explicit QueuedConnection ensures cross-thread safety
+        self._thumbnailReadySignal.connect(self._on_thumbnail_ready_gui, Qt.QueuedConnection)
+
         # -- UI State --
         self.ui_state = UIState(self)
         self.ui_state.theme = self.get_theme()
@@ -186,6 +228,10 @@ class AppController(QObject):
         self.ui_state.debugCache = self.debug_cache # Pass debug_cache state to UI
         self.ui_state.isDecoding = False # Initialize decoding indicator
         self.is_zoomed = False # Track zoom state for high-res loading logic
+
+        # Connect model selection changes to UIState for QML property notification
+        # Must connect to .emit (not the signal itself) for signal-to-signal forwarding
+        self._thumbnail_model.selectionChanged.connect(self.ui_state.gridSelectedCountChanged.emit)
 
         # -- Stacking State --
         self.stack_start_index: Optional[int] = None
@@ -485,8 +531,12 @@ class AppController(QObject):
             return
         self.prefetcher.update_prefetch(index, is_navigation=is_navigation, direction=direction)
     
-    def load(self):
-        """Loads images, sidecar data, and starts services."""
+    def load(self, skip_thumbnail_refresh: bool = False):
+        """Loads images, sidecar data, and starts services.
+
+        Args:
+            skip_thumbnail_refresh: If True, skip thumbnail model refresh (caller already did it).
+        """
         self.refresh_image_list()  # Initial scan from disk
         if not self.image_files:
             self.current_index = 0
@@ -496,10 +546,14 @@ class AppController(QObject):
         self.dataChanged.emit() # Emit after stacks are loaded
         self.watcher.start()
         self._do_prefetch(self.current_index)
-        
+
         # Defer initial UI sync until after images are loaded
         self.sync_ui_state()
 
+        # Initialize grid view if starting in grid mode (unless already done)
+        if self._is_grid_view_active and not skip_thumbnail_refresh:
+            self._thumbnail_model.refresh()
+            self._path_resolver.update_from_model(self._thumbnail_model)
 
     def refresh_image_list(self):
         """Rescans the directory for images from disk and updates cache.
@@ -525,9 +579,19 @@ class AppController(QObject):
         else:
             self.image_files = self._all_images
 
+        self._rebuild_path_to_index()
         self.prefetcher.set_image_files(self.image_files)
         self._metadata_cache_index = (-1, -1) # Invalidate cache
         self.ui_state.imageCountChanged.emit()
+
+    def _rebuild_path_to_index(self):
+        """Rebuild path-to-index dict for O(1) lookup in grid_open_index.
+
+        Call this whenever self.image_files is mutated (filter, sort, directory change).
+        """
+        self._path_to_index = {
+            img.path.resolve(): i for i, img in enumerate(self.image_files)
+        }
 
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
         """Retrieves a decoded image, blocking until ready to ensure correct display.
@@ -925,7 +989,140 @@ class AppController(QObject):
             log.debug("Dialog closed (count=0), re-enabling global keybindings")
 
     def toggle_grid_view(self):
-        log.warning("Grid view not implemented yet.")
+        """Toggle between grid view and loupe (single image) view."""
+        self._set_grid_view_active(not self._is_grid_view_active)
+
+    def _set_grid_view_active(self, active: bool):
+        """Set grid view active state and handle side effects."""
+        if self._is_grid_view_active == active:
+            return
+
+        self._is_grid_view_active = active
+
+        if active:
+            # Entering grid view - refresh the model
+            self._thumbnail_model.refresh()
+            # Update path resolver for the current directory
+            self._path_resolver.update_from_model(self._thumbnail_model)
+            log.info("Switched to grid view")
+        else:
+            log.info("Switched to loupe view")
+
+        # Notify UI state via signal
+        self.ui_state.isGridViewActiveChanged.emit(active)
+
+    def grid_navigate_to(self, path: str):
+        """Navigate to a folder in grid view.
+
+        This updates both the grid view AND the main working directory,
+        so loupe view will show images from the new folder.
+        """
+        if not self._is_grid_view_active:
+            return
+
+        folder_path = Path(path)
+        if not folder_path.is_dir():
+            log.warning("Cannot navigate to non-directory: %s", path)
+            return
+
+        # Use canonical directory switch (keeps base directory for grid navigation)
+        self._switch_to_directory(folder_path, update_base_directory=False)
+        log.info("Grid view navigated to: %s", folder_path)
+
+    def grid_open_index(self, index: int):
+        """Open an image from grid view in loupe view."""
+        entry = self._thumbnail_model.get_entry(index)
+        if not entry:
+            log.warning("grid_open_index: no entry at index %d", index)
+            return
+
+        if entry.is_folder:
+            # Navigate into folder instead of opening
+            self.grid_navigate_to(str(entry.path))
+            return
+
+        # Find this image in the main image list using O(1) lookup
+        resolved_path = entry.path.resolve()
+        loupe_index = self._path_to_index.get(resolved_path)
+
+        if loupe_index is None:
+            # Index might be stale - rebuild and retry once
+            self._rebuild_path_to_index()
+            loupe_index = self._path_to_index.get(resolved_path)
+
+        if loupe_index is None:
+            log.warning("grid_open_index: image not found in current list: %s", entry.path)
+            # Image might be in a different directory - don't switch view
+            return
+
+        self.current_index = loupe_index
+
+        # Switch to loupe view
+        self._set_grid_view_active(False)
+
+        # Sync UI and trigger image load
+        self.sync_ui_state()
+        self.prefetcher.update_prefetch(self.current_index)
+        log.info("Opened image from grid: %s", entry.path)
+
+    def _on_thumbnail_ready(self, thumbnail_id: str):
+        """Callback when a thumbnail finishes decoding (called from worker thread).
+
+        This emits a signal to hop to the GUI thread for thread-safe model updates.
+        """
+        self._thumbnailReadySignal.emit(thumbnail_id)
+
+    @Slot(str)
+    def _on_thumbnail_ready_gui(self, thumbnail_id: str):
+        """Handle thumbnail ready on GUI thread (thread-safe)."""
+        # Guard against callbacks during/after shutdown
+        if getattr(self, "_shutting_down", False):
+            return
+        if self._thumbnail_model:
+            self._thumbnail_model.thumbnailReady.emit(thumbnail_id)
+
+    def _get_metadata_dict(self, stem: str) -> dict:
+        """Get metadata for a file stem as a dict for thumbnail model."""
+        try:
+            meta = self.sidecar.get_metadata(stem)
+            return {
+                "stacked": getattr(meta, "stacked", False),
+                "uploaded": getattr(meta, "uploaded", False),
+                "edited": getattr(meta, "edited", False),
+                "restacked": getattr(meta, "restacked", False),
+            }
+        except Exception:
+            return {"stacked": False, "uploaded": False, "edited": False, "restacked": False}
+
+    def _invalidate_batch_cache(self):
+        """Clear the batch indices cache. Call after mutating self.batches."""
+        if hasattr(self, "_batch_indices_cache"):
+            self._batch_indices_cache = set()
+            self._batch_indices_cache_key = None
+
+    def _get_batch_indices(self) -> Set[int]:
+        """Get set of all indices that are in any batch (for thumbnail model).
+
+        Cached to avoid O(batch_span) computation on every delegate paint.
+        """
+        # Check if cache is valid (batches haven't changed)
+        cache_key = tuple(tuple(b) for b in self.batches)
+        if hasattr(self, '_batch_indices_cache_key') and self._batch_indices_cache_key == cache_key:
+            return self._batch_indices_cache
+
+        # Rebuild cache
+        indices: Set[int] = set()
+        for start, end in self.batches:
+            for i in range(start, end + 1):
+                indices.add(i)
+
+        self._batch_indices_cache = indices
+        self._batch_indices_cache_key = cache_key
+        return indices
+
+    def _get_current_loupe_index(self) -> int:
+        """Get current loupe view index (for thumbnail model)."""
+        return self.current_index
     
     def toggle_uploaded(self):
         """Toggle uploaded flag for current image."""
@@ -1100,6 +1297,7 @@ class AppController(QObject):
             end = max(self.batch_start_index, self.current_index)
             self.batches.append([start, end])
             self.batches.sort() # Keep batches sorted by start index
+            self._invalidate_batch_cache()
             log.info("Defined new batch: [%d, %d]", start, end)
             self.batch_start_index = None
             self._metadata_cache_index = (-1, -1) # Invalidate cache
@@ -1149,7 +1347,8 @@ class AppController(QObject):
         
         if batch_modified:
             self.batches = new_batches
-        
+            self._invalidate_batch_cache()
+
         # Check and remove from stacks
         # Check and remove from stacks
         if not removed:
@@ -1261,7 +1460,8 @@ class AppController(QObject):
                 
                 self.update_status_message("Added image to batch")
                 log.info("Added index %d to batch.", index_to_toggle)
-        
+
+        self._invalidate_batch_cache()
         self._metadata_cache_index = (-1, -1)
         self.dataChanged.emit()
         self.sync_ui_state()
@@ -1481,7 +1681,8 @@ class AppController(QObject):
         log.info("Clearing all defined batches.")
         self.batches = []
         self.batch_start_index = None
-        
+        self._invalidate_batch_cache()
+
         self._metadata_cache_index = (-1, -1)
         self.dataChanged.emit()
         self.sync_ui_state()
@@ -1879,47 +2080,75 @@ class AppController(QObject):
             return dialog.selectedFiles()[0]
         return ""
 
+    def _switch_to_directory(self, folder_path: Path, update_base_directory: bool = True):
+        """Canonical directory switch - used by both open_folder() and grid_navigate_to().
+
+        Args:
+            folder_path: The directory to switch to.
+            update_base_directory: If True, also updates the thumbnail model's base directory
+                                   (for File -> Open Folder). If False, keeps existing base
+                                   (for grid navigation within current base).
+        """
+        # Stop the old watcher
+        if self.watcher:
+            self.watcher.stop()
+
+        # Update the directory path
+        self.image_dir = folder_path
+
+        # Reinitialize directory-bound components
+        self.watcher = Watcher(self.image_dir, self.refresh_image_list)
+        self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
+        self.recycle_bin_dir = self.image_dir / "image recycle bin"
+
+        # Clear directory-specific state
+        self.delete_history = []
+        self.undo_history = []
+        self.stacks = []
+        self.batches = []
+        self.batch_start_index = None
+        self.stack_start_index = None
+
+        # Clear caches since they reference old directory's images
+        with self._last_image_lock:
+            self.last_displayed_image = None
+        self.image_cache.clear()
+        self.prefetcher.cancel_all()
+        self.display_generation += 1
+        self._metadata_cache = {}
+        self._metadata_cache_index = (-1, -1)
+
+        # Clear batch indices cache (avoids stale batch membership checks)
+        if hasattr(self, "_batch_indices_cache"):
+            self._batch_indices_cache = set()
+            self._batch_indices_cache_key = None
+
+        # Clear editor state if open
+        self.image_editor.clear()
+
+        # Clear thumbnail cache BEFORE refresh to avoid stale thumbs
+        if self._thumbnail_cache:
+            self._thumbnail_cache.clear()
+
+        # Update thumbnail view infrastructure
+        if self._thumbnail_model:
+            if update_base_directory:
+                self._thumbnail_model.set_directories(self.image_dir, self.image_dir)
+            else:
+                self._thumbnail_model.navigate_to(self.image_dir)
+            self._thumbnail_model.refresh()
+            self._path_resolver.update_from_model(self._thumbnail_model)
+            self.ui_state.gridDirectoryChanged.emit(str(self.image_dir))
+
+        # Load images from new directory (thumbnail model already refreshed above)
+        self.load(skip_thumbnail_refresh=True)
+
     @Slot()
     def open_folder(self):
         """Opens a directory dialog and reloads the application with the selected folder."""
         path = self.open_directory_dialog()
         if path:
-            # Stop the old watcher
-            if self.watcher:
-                self.watcher.stop()
-            
-            # Update the directory path
-            self.image_dir = Path(path)
-            
-            # Reinitialize directory-bound components
-            self.watcher = Watcher(self.image_dir, self.refresh_image_list)
-            self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
-            self.recycle_bin_dir = self.image_dir / "image recycle bin"
-            
-            # Clear directory-specific state
-            self.delete_history = []
-            self.undo_history = []
-            self.stacks = []
-            self.batches = []
-            self.batch_start_index = None
-            self.stack_start_index = None
-            
-            # Clear caches since they reference old directory's images
-            with self._last_image_lock:
-                self.last_displayed_image = None
-            self.image_cache.clear()
-            self.prefetcher.cancel_all()
-            self.display_generation += 1
-            self._metadata_cache = {}
-            self._metadata_cache_index = (-1, -1)
-            # Clear last displayed image since it references the old directory
-            with self._last_image_lock:
-                self.last_displayed_image = None
-            # Clear editor state if open
-            self.image_editor.clear()
-            
-            # Load images from new directory
-            self.load()
+            self._switch_to_directory(Path(path), update_base_directory=True)
 
 
     def preload_all_images(self):
@@ -2234,7 +2463,8 @@ class AppController(QObject):
             # Clear all batches after deletion
             self.batches = []
             self.batch_start_index = None
-            
+            self._invalidate_batch_cache()
+
             # Refresh image list
             self.refresh_image_list()
             
@@ -2519,6 +2749,9 @@ class AppController(QObject):
 
         self.watcher.stop()
         self.prefetcher.shutdown()
+        # Guard against partial init
+        if getattr(self, "_thumbnail_prefetcher", None):
+            self._thumbnail_prefetcher.shutdown()
         self.sidecar.set_last_index(self.current_index)
         self.sidecar.save()
 
@@ -2832,7 +3065,8 @@ class AppController(QObject):
             # Clear all batches after successful drag (like pressing \)
             self.batches = []
             self.batch_start_index = None
-            
+            self._invalidate_batch_cache()
+
             self._metadata_cache_index = (-1, -1)
             self.dataChanged.emit()
             self.sync_ui_state()
@@ -4256,11 +4490,14 @@ def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False):
         log.info("Startup: after AppController: %.3fs", time.perf_counter() - t0)
     image_provider = ImageProvider(controller)
     engine.addImageProvider("provider", image_provider)
+    # Register thumbnail provider for grid view
+    engine.addImageProvider("thumbnail", controller._thumbnail_provider)
 
     # Expose controller and UI state to QML
     context = engine.rootContext()
     context.setContextProperty("uiState", controller.ui_state)
     context.setContextProperty("controller", controller)
+    context.setContextProperty("thumbnailModel", controller._thumbnail_model)
 
     qml_file = Path(__file__).parent / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_file)))
