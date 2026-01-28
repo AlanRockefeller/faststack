@@ -780,24 +780,23 @@ class AppController(QObject):
             return
 
         if result:
-            saved_path, backup_path = result
-            
+            saved_path, _ = result  # backup_path unused
+
             # --- Restore Old Behavior ---
-            
+
             # 1. Close Editor UI
             self.ui_state.isEditorOpen = False
-            
+
             # 2. Clear Editor State (release memory)
             self.image_editor.clear()
-            
+
             # 3. Refresh List (to see new file or updated timestamp)
             self.refresh_image_list()
-            
+
             # 4. Find and Select the saved image
-            new_index = self.current_index # Default to keeping selection if not found
-            
+            new_index = self.current_index  # Default to keeping selection if not found
+
             # Try to find by exact path match
-            found_index = -1
             if saved_path:
                 try:
                     target_resolve = saved_path.resolve()
@@ -806,17 +805,15 @@ class AppController(QObject):
                             # Robust path comparison
                             if img.path.resolve() == target_resolve:
                                 new_index = i
-                                found_index = i
                                 break
                         except (OSError, RuntimeError):
                             # Fallback to string compare
                             if str(img.path) == str(saved_path):
                                 new_index = i
-                                found_index = i
                                 break
                 except (OSError, RuntimeError):
-                    pass # Keep current selection if resolution fails
-            
+                    pass  # Keep current selection if resolution fails
+
             self.current_index = new_index
             
             # 5. Force UI Sync / Prefetch

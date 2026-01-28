@@ -20,7 +20,7 @@ except ImportError:
 import numpy as np
 import time
 
-from faststack.imaging.editor import (
+from faststack.imaging.math_utils import (
     _highlight_recover_linear,
     _highlight_boost_linear,
     _apply_headroom_shoulder,
@@ -35,7 +35,7 @@ def test_monotonicity():
     gradient = np.linspace(0, 2.0, 100).reshape(10, 10)
     rgb = np.stack([gradient, gradient * 0.5, gradient * 0.3], axis=2).astype(np.float32)
     
-    recovered = _highlight_recover_linear(rgb, amount=1.0, pivot=0.5, k=6.0)
+    recovered = _highlight_recover_linear(rgb, amount=1.0, pivot=0.5)
     
     # Check max-channel brightness is non-decreasing
     brightness = recovered.max(axis=2).flatten()
@@ -60,7 +60,7 @@ def test_no_nan_inf():
     ]
     
     for i, arr in enumerate(test_cases):
-        recovered = _highlight_recover_linear(arr, amount=1.0, pivot=0.5, k=6.0)
+        recovered = _highlight_recover_linear(arr, amount=1.0, pivot=0.5)
         assert np.isfinite(recovered).all(), f"NaN/inf in test case {i}"
         
         boosted = _highlight_boost_linear(arr, amount=1.0, pivot=0.5)
@@ -75,7 +75,7 @@ def test_hue_preservation():
     brightness = np.linspace(0.1, 2.0, 50).reshape(5, 10)
     rgb = np.stack([brightness, brightness * 0.2, brightness * 0.2], axis=2).astype(np.float32)
     
-    recovered = _highlight_recover_linear(rgb, amount=0.8, pivot=0.5, k=6.0, chroma_rolloff=0.0)
+    recovered = _highlight_recover_linear(rgb, amount=0.8, pivot=0.5, chroma_rolloff=0.0)
     
     # Check R:G:B ratios where brightness > 0.01
     orig_brightness = rgb.max(axis=2)
@@ -99,7 +99,7 @@ def test_mask_isolation():
     # Create image with values below and above pivot
     low = np.ones((10, 10, 3), dtype=np.float32) * 0.3  # Below pivot 0.5
     
-    recovered = _highlight_recover_linear(low, amount=1.0, pivot=0.5, k=6.0)
+    recovered = _highlight_recover_linear(low, amount=1.0, pivot=0.5)
     
     # Changes should be minimal
     diff = np.abs(recovered - low).max()
@@ -113,7 +113,7 @@ def test_plateau_stability():
     # Uniform white plateau
     plateau = np.ones((20, 20, 3), dtype=np.float32)
     
-    recovered = _highlight_recover_linear(plateau, amount=1.0, pivot=0.5, k=6.0)
+    recovered = _highlight_recover_linear(plateau, amount=1.0, pivot=0.5)
     
     # All pixels should be the same (uniform)
     std = recovered.std()
@@ -182,12 +182,12 @@ def test_benchmark():
     arr = np.random.rand(1080, 1920, 3).astype(np.float32)
     
     # Warm up
-    _highlight_recover_linear(arr, amount=0.5, pivot=0.5, k=6.0)
-    
+    _highlight_recover_linear(arr, amount=0.5, pivot=0.5)
+
     # Benchmark
     start = time.perf_counter()
     for _ in range(3):
-        _highlight_recover_linear(arr, amount=0.5, pivot=0.5, k=6.0)
+        _highlight_recover_linear(arr, amount=0.5, pivot=0.5)
     elapsed = (time.perf_counter() - start) / 3
     
     print(f"test_benchmark: 1920x1080 recovery in {elapsed*1000:.1f}ms")
@@ -203,6 +203,7 @@ if __name__ == "__main__":
         test_plateau_stability()
         test_headroom_shoulder()
         test_analyze_highlight_state()
+        test_source_clipping_detection()
         test_benchmark()
         print("\nALL TESTS PASSED")
     except Exception as e:

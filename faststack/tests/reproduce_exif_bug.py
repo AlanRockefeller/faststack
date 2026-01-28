@@ -1,9 +1,9 @@
-
 import sys
+import os
 from unittest.mock import MagicMock
 
-# Hardcode path to project root
-sys.path.insert(0, r"c:\code\faststack")
+# Add parent directory to path for standalone execution
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.modules['cv2'] = MagicMock()
 
 import unittest

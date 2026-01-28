@@ -27,14 +27,8 @@ class DummyController:
         self.current_index = 0
         self.ui_state = MagicMock()
         self.ui_state.isHistogramVisible = False
-    
-    def __init__(self):
-        self.current_edit_source_mode = "jpeg"
-        self.image_files = []
-        self.current_index = 0
-        self.ui_state = MagicMock()
-        self.ui_state.isHistogramVisible = False
-    
+        self.editSourceModeChanged = MagicMock()  # Signal stub
+
     # Copy methods to test
     try:
         from faststack.app import AppController
@@ -77,15 +71,13 @@ class TestRawMode(unittest.TestCase):
         
         # Create mock image files
         self.img_jpg = MagicMock()
-        self.img_jpg.path = Path("test.jpg")
-        self.img_jpg.path.suffix = ".jpg"
+        self.img_jpg.path = Path("test.jpg")  # suffix is derived from Path, not assigned
         self.img_jpg.raw_pair = Path("test.CR2")
         self.img_jpg.working_tif_path = Path("test.tif")
-        self.img_jpg.has_working_tif = False # Initially false
-        
+        self.img_jpg.has_working_tif = False  # Initially false
+
         self.img_raw_only = MagicMock()
-        self.img_raw_only.path = Path("orphan.CR2")
-        self.img_raw_only.path.suffix = ".CR2"
+        self.img_raw_only.path = Path("orphan.CR2")  # suffix is derived from Path, not assigned
         self.img_raw_only.raw_pair = None
         
         self.controller.image_files = [self.img_jpg, self.img_raw_only]
@@ -119,19 +111,21 @@ class TestRawMode(unittest.TestCase):
         """Test 3: Enabling RAW should load TIFF if valid."""
         self.controller.current_index = 0
         self.img_jpg.has_working_tif = True
-        
+
         # Mock is_valid_working_tif to return True
         with patch.object(self.controller, 'is_valid_working_tif', return_value=True):
+            # Create mocks BEFORE calling enable_raw_editing
             self.controller.load_image_for_editing = MagicMock()
-            self.controller.enable_raw_editing()
-            
-            self.assertEqual(self.controller.current_edit_source_mode, "raw")
-            # Should NOT develop
             self.controller._develop_raw_backend = MagicMock()
+
+            self.controller.enable_raw_editing()
+
+            self.assertEqual(self.controller.current_edit_source_mode, "raw")
+            # Should NOT develop (mock was set up before the call)
             self.controller._develop_raw_backend.assert_not_called()
             # Should load immediately
             self.controller.load_image_for_editing.assert_called_once()
-            
+
             # Helper should return TIF
             path = self.controller.get_active_edit_path(0)
             self.assertEqual(path, Path("test.tif"))
