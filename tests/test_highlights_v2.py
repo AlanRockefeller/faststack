@@ -14,23 +14,23 @@ class MockAppController(QObject):
 
 class TestHighlightsV2(unittest.TestCase):
     def test_shoulder_asymptote(self):
-        """Verify the new shoulder asymptotes to 1.0 + steepness."""
+        """Verify the new shoulder asymptotes to 1.0 + max_overshoot."""
         x = np.array([1.0, 2.0, 10.0, 100.0], dtype=np.float32)
-        steepness = 0.05
-        out = _apply_headroom_shoulder(x, steepness=steepness)
+        max_overshoot = 0.05
+        out = _apply_headroom_shoulder(x, max_overshoot=max_overshoot)
 
         # At 1.0, should be 1.0
         self.assertAlmostEqual(out[0], 1.0, places=5)
 
-        # Above 1.0, should be < 1.0 + steepness
-        self.assertTrue(np.all(out[1:] < 1.0 + steepness))
+        # Above 1.0, should be < 1.0 + max_overshoot
+        self.assertTrue(np.all(out[1:] < 1.0 + max_overshoot))
 
         # Monotonicity
         self.assertTrue(out[1] > out[0])
         self.assertTrue(out[2] > out[1])
 
         # Asymptote check: at very large x, should be close to 1.05
-        self.assertAlmostEqual(out[-1], 1.0 + steepness, delta=0.001)
+        self.assertAlmostEqual(out[-1], 1.0 + max_overshoot, delta=0.001)
 
     def test_analysis_decoupling(self):
         """Verify analysis runs before adjustments and is cached."""
