@@ -54,6 +54,7 @@ AGENTS.md
 ARCHITECTURE.md
 docs/COLOR_PROFILE_FIX.md
 .claude/
+.agent/
 
 # ----------------------------
 # Runtime / generated data
