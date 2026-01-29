@@ -148,9 +148,9 @@ class AppController(QObject):
         self.image_dir = image_dir
         self.image_files: List[ImageFile] = []  # Filtered list for display
         self._all_images: List[ImageFile] = []  # Cached full list from disk
-        self._path_to_index: Dict[
-            Path, int
-        ] = {}  # Resolved path -> index for O(1) lookup
+        self._path_to_index: Dict[Path, int] = (
+            {}
+        )  # Resolved path -> index for O(1) lookup
         self.current_index: int = 0
         self.ui_refresh_generation = 0
         self.main_window: Optional[QObject] = None
@@ -208,9 +208,9 @@ class AppController(QObject):
 
         # -- Grid View (Thumbnail) Infrastructure --
         self._is_grid_view_active = True  # Default to grid view on startup
-        self._grid_nav_history: list[
-            Path
-        ] = []  # Stack of previous directories for back navigation
+        self._grid_nav_history: list[Path] = (
+            []
+        )  # Stack of previous directories for back navigation
         self._thumbnail_cache = ThumbnailCache(
             max_bytes=256 * 1024 * 1024,  # 256 MB
             max_items=5000,
@@ -280,9 +280,9 @@ class AppController(QObject):
         self.active_recycle_bins: Set[Path] = (
             set()
         )  # Track all recycle bins created/used
-        self.delete_history: List[
-            DeleteRecord
-        ] = []  # [((jpg_src, jpg_bin), (raw_src, raw_bin)), ...]
+        self.delete_history: List[DeleteRecord] = (
+            []
+        )  # [((jpg_src, jpg_bin), (raw_src, raw_bin)), ...]
 
         # Track all undoable actions with timestamps
         # [(action_type, action_data, timestamp)]

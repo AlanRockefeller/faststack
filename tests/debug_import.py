@@ -11,10 +11,12 @@ print(f"Sys Path[0]: {sys.path[0]}")
 try:
     print("Attempting import faststack.app...")
     import faststack.app as app
+
     print(f"Import faststack.app success! ({app.__file__})")
 
     print("Attempting import AppController...")
     from faststack.app import AppController
+
     print("Import AppController success!")
 
     print("Attributes:")

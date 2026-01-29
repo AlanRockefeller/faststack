@@ -45,9 +45,9 @@ def find_images(directory: Path) -> List[ImageFile]:
     # Separate developed JPGs, build base map, and process normal JPGs
     # base_map: filename.casefold() -> (mtime, name)
     base_map: Dict[str, Tuple[float, str]] = {}
-    developed_candidates: List[
-        Tuple[Path, os.stat_result, str]
-    ] = []  # path, stat, base_stem
+    developed_candidates: List[Tuple[Path, os.stat_result, str]] = (
+        []
+    )  # path, stat, base_stem
 
     image_entries: List[Tuple[Tuple[float, str, int, str], ImageFile]] = []
     used_raws = set()

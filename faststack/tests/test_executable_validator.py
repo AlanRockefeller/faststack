@@ -64,8 +64,8 @@ def test_suspicious_path_with_traversal():
             is_valid, error = validate_executable_path(suspicious_path)
             # Warning is logged for suspicious path, but doesn't fail with allow_custom_paths=True
             assert (
-                is_valid
-            )  # Default allow_custom_paths=True means it passes with warning
+                is_valid  # Default allow_custom_paths=True means it passes with warning
+            )
 
 
 def test_non_exe_file():

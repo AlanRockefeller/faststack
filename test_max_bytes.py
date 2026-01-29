@@ -34,8 +34,8 @@ print(f"After eviction - Current size: {cache.currsize}, Items: {list(cache.keys
 # "a" should have been evicted (LRU)
 assert "a" not in cache, "Item 'a' should have been evicted"
 assert "b" in cache or "c" in cache, "At least one of 'b' or 'c' should be in cache"
-assert cache.currsize <= cache.max_bytes, (
-    f"Current size {cache.currsize} should be <= max_bytes {cache.max_bytes}"
-)
+assert (
+    cache.currsize <= cache.max_bytes
+), f"Current size {cache.currsize} should be <= max_bytes {cache.max_bytes}"
 
 print("\n✓ All tests passed! ByteLRUCache.max_bytes works correctly.")

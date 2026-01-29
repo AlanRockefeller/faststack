@@ -828,15 +828,15 @@ class Prefetcher:
 
                     # Verify shape expectations
                     if self.debug:
-                        assert buffer.flags["C_CONTIGUOUS"], (
-                            "Buffer must be C-contiguous for in-place modification"
-                        )
-                        assert arr.size == h * bytes_per_line, (
-                            f"Buffer size mismatch: {arr.size} != {h} * {bytes_per_line}"
-                        )
-                        assert arr.dtype == np.uint8, (
-                            f"Buffer dtype must be uint8, got {arr.dtype}"
-                        )
+                        assert buffer.flags[
+                            "C_CONTIGUOUS"
+                        ], "Buffer must be C-contiguous for in-place modification"
+                        assert (
+                            arr.size == h * bytes_per_line
+                        ), f"Buffer size mismatch: {arr.size} != {h} * {bytes_per_line}"
+                        assert (
+                            arr.dtype == np.uint8
+                        ), f"Buffer dtype must be uint8, got {arr.dtype}"
 
                     apply_saturation_compensation(arr, w, h, bytes_per_line, factor)
                     t_after_saturation = time.perf_counter()

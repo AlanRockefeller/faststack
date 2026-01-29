@@ -159,16 +159,16 @@ def test_analyze_highlight_state():
     # Image with headroom
     headroom_img = np.ones((10, 10, 3), dtype=np.float32) * 1.5
     state = _analyze_highlight_state(headroom_img)
-    assert state["headroom_pct"] > 0.9, (
-        f"Should detect headroom: {state['headroom_pct']}"
-    )
+    assert (
+        state["headroom_pct"] > 0.9
+    ), f"Should detect headroom: {state['headroom_pct']}"
 
     # Normal image
     normal_img = np.ones((10, 10, 3), dtype=np.float32) * 0.5
     state = _analyze_highlight_state(normal_img)
-    assert state["headroom_pct"] < 0.01, (
-        f"Should not detect headroom: {state['headroom_pct']}"
-    )
+    assert (
+        state["headroom_pct"] < 0.01
+    ), f"Should not detect headroom: {state['headroom_pct']}"
 
     print("test_analyze_highlight_state passed")
 
