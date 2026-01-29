@@ -1,7 +1,7 @@
-
 import mmap
 import os
 import tempfile
+
 
 def reproduce():
     with tempfile.NamedTemporaryFile(delete=False) as f:
@@ -22,11 +22,12 @@ def reproduce():
                     print("VERIFIED: Reproduction successful.")
                 else:
                     print("VERIFIED: Reproduction successful (different message).")
-                    
+
     except Exception as e:
         print(f"Caught unexpected top level error: {e}")
     finally:
         os.unlink(path)
+
 
 if __name__ == "__main__":
     reproduce()

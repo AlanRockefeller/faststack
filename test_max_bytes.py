@@ -1,12 +1,15 @@
 """Quick test to verify ByteLRUCache.max_bytes works correctly."""
+
 from faststack.imaging.cache import ByteLRUCache
+
 
 class MockItem:
     def __init__(self, size: int):
         self._size = size
-    
+
     def __sizeof__(self) -> int:
         return self._size
+
 
 # Test 1: Initialize cache
 cache = ByteLRUCache(max_bytes=1000, size_of=lambda x: x.__sizeof__())
@@ -31,6 +34,8 @@ print(f"After eviction - Current size: {cache.currsize}, Items: {list(cache.keys
 # "a" should have been evicted (LRU)
 assert "a" not in cache, "Item 'a' should have been evicted"
 assert "b" in cache or "c" in cache, "At least one of 'b' or 'c' should be in cache"
-assert cache.currsize <= cache.max_bytes, f"Current size {cache.currsize} should be <= max_bytes {cache.max_bytes}"
+assert cache.currsize <= cache.max_bytes, (
+    f"Current size {cache.currsize} should be <= max_bytes {cache.max_bytes}"
+)
 
 print("\n✓ All tests passed! ByteLRUCache.max_bytes works correctly.")

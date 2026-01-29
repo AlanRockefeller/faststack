@@ -48,7 +48,7 @@ class Watcher:
         self.observer: Optional[Observer] = None  # Initialize to None
         self.event_handler = ImageDirectoryEventHandler(callback)
         self.directory = directory
-        self.callback = callback  # Store callback for new observer
+        self.callback = callback
 
     def start(self):
         """Starts watching the directory."""

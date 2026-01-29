@@ -41,7 +41,7 @@ from PySide6.QtCore import (
     QPoint,
     QCoreApplication,
 )
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog
 from PySide6.QtQml import QQmlApplicationEngine
 from PIL import Image
 

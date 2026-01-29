@@ -26,6 +26,7 @@ class ImageProvider(QQuickImageProvider):
     def __init__(self, app_controller):
         super().__init__(QQuickImageProvider.ImageType.Image)
         self.app_controller = app_controller
+        self._app_controller = app_controller  # Backward compatibility alias
         self.placeholder = QImage(256, 256, QImage.Format.Format_RGB888)
         self.placeholder.fill(Qt.GlobalColor.darkGray)
         # Keepalive queue to prevent GC of buffers currently in use by QImage
@@ -137,7 +138,6 @@ class UIState(QObject):
     metadataChanged = Signal()
     themeChanged = Signal()
     preloadingStateChanged = Signal()
-    preloadingStateChanged = Signal()
     preloadProgressChanged = Signal()
 
     # Recycle Bin Signals
@@ -214,6 +214,7 @@ class UIState(QObject):
     def __init__(self, app_controller):
         super().__init__()
         self.app_controller = app_controller
+        self._app_controller = app_controller  # Backward compatibility alias
         self._is_preloading = False
         self._preload_progress = 0
         # 1 = light, 0 = dark (controller will overwrite this on startup)

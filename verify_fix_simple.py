@@ -1,16 +1,16 @@
-
 import mmap
 import os
 import tempfile
+
 
 def verify():
     # Setup
     with tempfile.NamedTemporaryFile(delete=False) as f:
         f.close()
         path = f.name
-    
+
     print(f"Created empty file: {path}")
-    
+
     try:
         # Verify the logic I added to prefetch.py
         # Logic:
@@ -26,12 +26,13 @@ def verify():
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                     print("Mapped successfully")
             print("FAILURE: Should have skipped but didn't (or mmap worked unexpected)")
-            
+
     except Exception as e:
         print(f"FAILED with exception: {e}")
     finally:
         if os.path.exists(path):
             os.unlink(path)
+
 
 if __name__ == "__main__":
     verify()

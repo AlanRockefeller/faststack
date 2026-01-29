@@ -6,6 +6,17 @@ from PySide6.QtWidgets import QMessageBox
 
 log = logging.getLogger(__name__)
 
+
+def _mkdir(path: Path) -> None:
+    """Helper for mocking Path.mkdir safely."""
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _unlink(path: Path) -> None:
+    """Helper for mocking Path.unlink safely."""
+    path.unlink()
+
+
 def ensure_recycle_bin_dir(recycle_bin_dir: Path) -> bool:
     """Try to create the recycle bin directory.
 
@@ -14,11 +25,12 @@ def ensure_recycle_bin_dir(recycle_bin_dir: Path) -> bool:
         False if creation failed (e.g., permission denied).
     """
     try:
-        recycle_bin_dir.mkdir(parents=True, exist_ok=True)
+        _mkdir(recycle_bin_dir)
         return True
     except (PermissionError, OSError) as e:
-        log.error("Failed to create recycle bin directory: %s", e)
+        log.exception("Failed to create recycle bin directory: %s", e)
         return False
+
 
 def confirm_permanent_delete(image_file, reason: str = "") -> bool:
     """Show a confirmation dialog for permanent deletion of a single image.
@@ -34,9 +46,21 @@ def confirm_permanent_delete(image_file, reason: str = "") -> bool:
     raw_path = image_file.raw_pair
 
     # Build list of files that will be deleted
-    files_to_delete = [str(jpg_path.name)]
+    files_to_delete = []
+
+    # Handle primary JPG
+    if jpg_path:
+        files_to_delete.append(str(jpg_path.name))
+    else:
+        log.warning("confirm_permanent_delete called with image_file.path=None")
+
+    # Handle RAW pair
     if raw_path and raw_path.exists():
         files_to_delete.append(str(raw_path.name))
+
+    if not files_to_delete:
+        log.warning("No files to delete found for confirmation.")
+        return False
 
     file_list = "\n".join(f"  • {f}" for f in files_to_delete)
 
@@ -53,15 +77,14 @@ def confirm_permanent_delete(image_file, reason: str = "") -> bool:
         f"The following files will be permanently deleted:\n{file_list}"
     )
 
-    delete_btn = msg_box.addButton(
-        "Delete Permanently", QMessageBox.DestructiveRole
-    )
+    delete_btn = msg_box.addButton("Delete Permanently", QMessageBox.DestructiveRole)
     cancel_btn = msg_box.addButton("Cancel", QMessageBox.RejectRole)
     msg_box.setDefaultButton(cancel_btn)
 
     msg_box.exec()
 
     return msg_box.clickedButton() == delete_btn
+
 
 def confirm_batch_permanent_delete(images: list, reason: str = "") -> bool:
     """Show a confirmation dialog for permanent deletion of multiple images.
@@ -117,6 +140,7 @@ def confirm_batch_permanent_delete(images: list, reason: str = "") -> bool:
 
     return msg_box.clickedButton() == delete_btn
 
+
 def permanently_delete_image_files(image_file) -> bool:
     """Permanently delete an image and its RAW pair from disk.
 
@@ -135,19 +159,19 @@ def permanently_delete_image_files(image_file) -> bool:
     # Delete JPG
     if jpg_path and jpg_path.exists():
         try:
-            jpg_path.unlink()
+            _unlink(jpg_path)
             log.info("Permanently deleted: %s", jpg_path.name)
             deleted_any = True
         except OSError as e:
-            log.error("Failed to permanently delete %s: %s", jpg_path.name, e)
+            log.exception("Failed to permanently delete %s: %s", jpg_path.name, e)
 
     # Delete RAW if exists
     if raw_path and raw_path.exists():
         try:
-            raw_path.unlink()
+            _unlink(raw_path)
             log.info("Permanently deleted: %s", raw_path.name)
             deleted_any = True
         except OSError as e:
-            log.error("Failed to permanently delete %s: %s", raw_path.name, e)
+            log.exception("Failed to permanently delete %s: %s", raw_path.name, e)
 
     return deleted_any

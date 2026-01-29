@@ -51,7 +51,7 @@ sys.modules["PIL"] = mock_pil
 sys.modules["PIL.Image"] = mock_pil.Image
 
 # Mock numpy
-sys.modules["numpy"] = MagicMock()
+#sys.modules["numpy"] = MagicMock()
 
 # Mock faststack.config
 mock_config_module = MagicMock()
