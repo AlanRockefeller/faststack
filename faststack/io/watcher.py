@@ -9,8 +9,10 @@ from watchdog.observers import Observer
 
 log = logging.getLogger(__name__)
 
+
 class ImageDirectoryEventHandler(FileSystemEventHandler):
     """Handles filesystem events for the image directory."""
+
     def __init__(self, callback):
         super().__init__()
         self.callback = callback
@@ -38,13 +40,15 @@ class ImageDirectoryEventHandler(FileSystemEventHandler):
         # that don't change the content (e.g., antivirus scans).
         pass
 
+
 class Watcher:
     """Manages the filesystem observer."""
+
     def __init__(self, directory: Path, callback):
-        self.observer: Optional[Observer] = None # Initialize to None
+        self.observer: Optional[Observer] = None  # Initialize to None
         self.event_handler = ImageDirectoryEventHandler(callback)
         self.directory = directory
-        self.callback = callback # Store callback for new observer
+        self.callback = callback  # Store callback for new observer
 
     def start(self):
         """Starts watching the directory."""
@@ -53,7 +57,7 @@ class Watcher:
             return
 
         if self.observer and self.observer.is_alive():
-            return # Already running
+            return  # Already running
 
         # Create a new observer instance every time, as it cannot be restarted
         self.observer = Observer()
@@ -67,7 +71,7 @@ class Watcher:
             self.observer.stop()
             self.observer.join()
             log.info("Stopped watching directory.")
-            self.observer = None # Clear instance after stopping
+            self.observer = None  # Clear instance after stopping
 
     def is_alive(self) -> bool:
         """Checks if the watcher thread is alive."""

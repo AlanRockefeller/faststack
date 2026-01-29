@@ -2,11 +2,11 @@
 
 import logging
 import collections
+import threading
 from PySide6.QtCore import QObject, Signal, Property, Slot, Qt
 from PySide6.QtGui import QImage
 from PySide6.QtQuick import QQuickImageProvider
 
-from faststack.models import DecodedImage
 from faststack.config import config
 from faststack.imaging.optional_deps import HAS_OPENCV
 from pathlib import Path
@@ -14,6 +14,7 @@ from pathlib import Path
 # Try to import QColorSpace if available (Qt 6+)
 try:
     from PySide6.QtGui import QColorSpace
+
     HAS_COLOR_SPACE = True
 except ImportError:
     HAS_COLOR_SPACE = False
@@ -31,6 +32,8 @@ class ImageProvider(QQuickImageProvider):
         # Increased to 128 to prevent crashes during rapid scrolling/thrashing where
         # QML might hold onto textures slightly longer than the Python GC expects.
         self._keepalive = collections.deque(maxlen=128)
+        # Lock to protect keepalive deque from concurrent access by QML rendering threads
+        self._keepalive_lock = threading.Lock()
 
     def requestImage(self, id: str, size: object, requestedSize: object) -> QImage:
         """Handles image requests from QML."""
@@ -39,33 +42,38 @@ class ImageProvider(QQuickImageProvider):
 
         try:
             # Parse index and optional generation
-            parts = id.split('/')
+            parts = id.split("/")
             index = int(parts[0])
             gen = int(parts[1]) if len(parts) > 1 else None
-            
+
             # If editor is open, use the background-rendered preview buffer
             # BUT only if the requested index matches the currently edited index!
             # AND the generation matches (to avoid stale frames during rotation/param changes)
             # FIX: If zoomed in, force full-res image instead of low-res preview
-            
+
             use_editor_preview = (
                 self.app_controller.ui_state.isEditorOpen
                 and index == self.app_controller.current_index
                 and not self.app_controller.ui_state.isZoomed
                 and self.app_controller._last_rendered_preview is not None
-                and getattr(self.app_controller, "_last_rendered_preview_index", None) == index
-                and (gen is None or getattr(self.app_controller, "_last_rendered_preview_gen", None) == gen)
+                and getattr(self.app_controller, "_last_rendered_preview_index", None)
+                == index
+                and (
+                    gen is None
+                    or getattr(self.app_controller, "_last_rendered_preview_gen", None)
+                    == gen
+                )
             )
 
             image_data = (
-                self.app_controller._last_rendered_preview 
-                if use_editor_preview 
+                self.app_controller._last_rendered_preview
+                if use_editor_preview
                 else self.app_controller.get_decoded_image(index)
             )
 
             if image_data:
                 # Handle format being None (from prefetcher) or missing
-                fmt = getattr(image_data, 'format', None)
+                fmt = getattr(image_data, "format", None)
                 if fmt is None:
                     fmt = QImage.Format.Format_RGB888
 
@@ -74,24 +82,28 @@ class ImageProvider(QQuickImageProvider):
                     image_data.width,
                     image_data.height,
                     image_data.bytes_per_line,
-                    fmt
+                    fmt,
                 )
 
-                
                 # Detach from Python buffer to prevent ownership issues and force proper texture upload
                 # OPTIMIZATION: Only do this expensive copy when serving the live editor preview,
                 # where we need to detach from the shared memory buffer that might change.
                 # For standard browsing/prefetch, the buffer is stable enough.
-                if self.app_controller.ui_state.isEditorOpen and index == self.app_controller.current_index:
+                if (
+                    self.app_controller.ui_state.isEditorOpen
+                    and index == self.app_controller.current_index
+                ):
                     qimg = qimg.copy()
                 else:
                     # SAFETY: Keep a reference to the underlying buffer to prevent garbage collection
                     # while Qt holds the QImage. QImage created from bytes does NOT own the data.
-                    self._keepalive.append(image_data.buffer)
+                    # Lock protects against concurrent access from QML rendering threads.
+                    with self._keepalive_lock:
+                        self._keepalive.append(image_data.buffer)
 
                 # Set sRGB color space for proper color management (if available)
                 # Skip this when using ICC mode - pixels are already in monitor space
-                color_mode = config.get('color', 'mode', fallback="none").lower()
+                color_mode = config.get("color", "mode", fallback="none").lower()
                 if HAS_COLOR_SPACE and color_mode != "icc":
                     try:
                         # Create sRGB color space using constructor with NamedColorSpace enum
@@ -101,8 +113,10 @@ class ImageProvider(QQuickImageProvider):
                     except (RuntimeError, ValueError) as e:
                         log.warning(f"Failed to set color space: {e}")
                 elif color_mode == "icc":
-                    log.debug("ICC mode: skipping Qt color space (pixels already in monitor space)")
-                
+                    log.debug(
+                        "ICC mode: skipping Qt color space (pixels already in monitor space)"
+                    )
+
                 # Buffer is now safe to release (handled by copy), but original_buffer ref in Python object stays
                 # We don't need to manually attach original_buffer to qimg anymore since we copied.
                 return qimg
@@ -123,15 +137,23 @@ class UIState(QObject):
     metadataChanged = Signal()
     themeChanged = Signal()
     preloadingStateChanged = Signal()
+    preloadingStateChanged = Signal()
     preloadProgressChanged = Signal()
+
+    # Recycle Bin Signals
+    recycleBinStatsTextChanged = Signal()
+    hasRecycleBinItemsChanged = Signal()
+
     isZoomedChanged = Signal()
-    statusMessageChanged = Signal() # New signal for status messages
-    resetZoomPanRequested = Signal() # Signal to tell QML to reset zoom/pan
-    absoluteZoomRequested = Signal(float)  # New: Request absolute zoom level (1.0, 2.0, etc.)
-    stackSummaryChanged = Signal() # Signal for stack summary updates
-    filterStringChanged = Signal() # Signal for filter string updates
-    colorModeChanged = Signal() # Signal for color mode updates
-    saturationFactorChanged = Signal() # Signal for saturation factor updates
+    statusMessageChanged = Signal()  # New signal for status messages
+    resetZoomPanRequested = Signal()  # Signal to tell QML to reset zoom/pan
+    absoluteZoomRequested = Signal(
+        float
+    )  # New: Request absolute zoom level (1.0, 2.0, etc.)
+    stackSummaryChanged = Signal()  # Signal for stack summary updates
+    filterStringChanged = Signal()  # Signal for filter string updates
+    colorModeChanged = Signal()  # Signal for color mode updates
+    saturationFactorChanged = Signal()  # Signal for saturation factor updates
     awbModeChanged = Signal()
     awbStrengthChanged = Signal()
     awbWarmBiasChanged = Signal()
@@ -141,13 +163,16 @@ class UIState(QObject):
     awbRgbLowerBoundChanged = Signal()
     awbRgbUpperBoundChanged = Signal()
     default_directory_changed = Signal(str)
-    isStackedJpgChanged = Signal() # New signal for isStackedJpg
+    currentDirectoryChanged = Signal()  # Signal when working directory changes
+    isStackedJpgChanged = Signal()  # New signal for isStackedJpg
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
-    editorImageChanged = Signal() # New signal for when the image loaded in editor changes
+    editorImageChanged = (
+        Signal()
+    )  # New signal for when the image loaded in editor changes
     is_cropping_changed = Signal(bool)
 
     is_histogram_visible_changed = Signal(bool)
@@ -160,7 +185,9 @@ class UIState(QObject):
     white_balance_mg_changed = Signal(float)
     aspect_ratio_names_changed = Signal(list)
     current_aspect_ratio_index_changed = Signal(int)
-    current_crop_box_changed = Signal(tuple) # (left, top, right, bottom) normalized to 0-1000
+    current_crop_box_changed = Signal(
+        tuple
+    )  # (left, top, right, bottom) normalized to 0-1000
     crop_rotation_changed = Signal(float)
     anySliderPressedChanged = Signal(bool)
     sharpness_changed = Signal(float)
@@ -174,15 +201,15 @@ class UIState(QObject):
     whites_changed = Signal(float)
     clarity_changed = Signal(float)
     texture_changed = Signal(float)
-    
+
     # Debug Cache Signals
     debugCacheChanged = Signal(bool)
     cacheStatsChanged = Signal(str)
     isDecodingChanged = Signal(bool)
-    debugModeChanged = Signal(bool) # General debug mode signal
-    isDialogOpenChanged = Signal(bool) # New signal for dialog state
-    editSourceModeChanged = Signal(str) # Notify when JPEG/RAW mode changes
-    saveBehaviorMessageChanged = Signal() # Signal for save behavior message updates
+    debugModeChanged = Signal(bool)  # General debug mode signal
+    isDialogOpenChanged = Signal(bool)  # New signal for dialog state
+    editSourceModeChanged = Signal(str)  # Notify when JPEG/RAW mode changes
+    saveBehaviorMessageChanged = Signal()  # Signal for save behavior message updates
 
     def __init__(self, app_controller):
         super().__init__()
@@ -191,7 +218,7 @@ class UIState(QObject):
         self._preload_progress = 0
         # 1 = light, 0 = dark (controller will overwrite this on startup)
         self._theme = 1
-        self._status_message = "" # New private variable for status message
+        self._status_message = ""  # New private variable for status message
         # Image Editor State
         self._is_editor_open = False
         self._is_cropping = False
@@ -211,7 +238,7 @@ class UIState(QObject):
             "4:5 (Portrait)",
             "1.91:1 (Landscape)",
             "16:9 (Wide)",
-            "9:16 (Story)"
+            "9:16 (Story)",
         ]
         self._current_aspect_ratio_index = 0
         self._any_slider_pressed = False
@@ -226,22 +253,28 @@ class UIState(QObject):
         self._whites = 0.0
         self._clarity = 0.0
         self._texture = 0.0
-        
+
         # Debug Cache State
         self._debug_cache = False
         self._cache_stats = ""
         self._is_decoding = False
         self._is_dialog_open = False
-        
+
         # Connect to controller's dialog state signal
         self.app_controller.dialogStateChanged.connect(self._on_dialog_state_changed)
-        
+
         # Connect to controller's mode change signal
         # We need to ensure the signal exists on controller first (it does, I added it)
-        if hasattr(self.app_controller, 'editSourceModeChanged'):
-            self.app_controller.editSourceModeChanged.connect(self.editSourceModeChanged)
-            self.app_controller.editSourceModeChanged.connect(lambda _: self.saveBehaviorMessageChanged.emit())
-            self.app_controller.editSourceModeChanged.connect(lambda _: self.metadataChanged.emit()) # Also update metadata binding if needed
+        if hasattr(self.app_controller, "editSourceModeChanged"):
+            self.app_controller.editSourceModeChanged.connect(
+                self.editSourceModeChanged
+            )
+            self.app_controller.editSourceModeChanged.connect(
+                lambda _: self.saveBehaviorMessageChanged.emit()
+            )
+            self.app_controller.editSourceModeChanged.connect(
+                lambda _: self.metadataChanged.emit()
+            )  # Also update metadata binding if needed
 
     def _on_dialog_state_changed(self, is_open: bool):
         self.isDialogOpen = is_open
@@ -330,31 +363,31 @@ class UIState(QObject):
         if not self.app_controller.image_files:
             return ""
         return self.app_controller.get_current_metadata().get("stack_info_text", "")
-    
+
     @Property(bool, notify=metadataChanged)
     def isUploaded(self):
         if not self.app_controller.image_files:
             return False
         return self.app_controller.get_current_metadata().get("uploaded", False)
-    
+
     @Property(str, notify=metadataChanged)
     def uploadedDate(self):
         if not self.app_controller.image_files:
             return ""
         return self.app_controller.get_current_metadata().get("uploaded_date", "")
-    
+
     @Property(str, notify=metadataChanged)
     def batchInfoText(self):
         if not self.app_controller.image_files:
             return ""
         return self.app_controller.get_current_metadata().get("batch_info_text", "")
-    
+
     @Property(bool, notify=metadataChanged)
     def isEdited(self):
         if not self.app_controller.image_files:
             return False
         return self.app_controller.get_current_metadata().get("edited", False)
-    
+
     @Property(str, notify=metadataChanged)
     def editedDate(self):
         if not self.app_controller.image_files:
@@ -366,7 +399,7 @@ class UIState(QObject):
         if not self.app_controller.image_files:
             return False
         return self.app_controller.get_current_metadata().get("restacked", False)
-    
+
     @Property(str, notify=metadataChanged)
     def restackedDate(self):
         if not self.app_controller.image_files:
@@ -377,29 +410,39 @@ class UIState(QObject):
 
     @Property(bool, notify=metadataChanged)
     def hasRaw(self):
-        if not self.app_controller.image_files or self.app_controller.current_index >= len(self.app_controller.image_files):
+        if (
+            not self.app_controller.image_files
+            or self.app_controller.current_index >= len(self.app_controller.image_files)
+        ):
             return False
-        return self.app_controller.image_files[self.app_controller.current_index].has_raw
+        return self.app_controller.image_files[
+            self.app_controller.current_index
+        ].has_raw
 
     @Property(bool, notify=metadataChanged)
     def hasWorkingTif(self):
-        if not self.app_controller.image_files or self.app_controller.current_index >= len(self.app_controller.image_files):
+        if (
+            not self.app_controller.image_files
+            or self.app_controller.current_index >= len(self.app_controller.image_files)
+        ):
             return False
-        return self.app_controller.image_files[self.app_controller.current_index].has_working_tif
+        return self.app_controller.image_files[
+            self.app_controller.current_index
+        ].has_working_tif
 
     @Slot()
     def enableRawEditing(self):
         """Switches to RAW editing mode."""
-        if hasattr(self.app_controller, 'enable_raw_editing'):
+        if hasattr(self.app_controller, "enable_raw_editing"):
             self.app_controller.enable_raw_editing()
 
     @Property(bool, notify=editSourceModeChanged)
     def isRawActive(self):
         """Returns True if the editor is in RAW source mode."""
-        if hasattr(self.app_controller, 'current_edit_source_mode'):
+        if hasattr(self.app_controller, "current_edit_source_mode"):
             return self.app_controller.current_edit_source_mode == "raw"
         return False
-        
+
     @Slot(result=bool)
     def load_image_for_editing(self):
         """Loads the currently viewed image into the editor."""
@@ -410,7 +453,6 @@ class UIState(QObject):
         # Legacy support
         self.app_controller.develop_raw_for_current_image()
 
-
     @Property(str, notify=stackSummaryChanged)
     def stackSummary(self):
         if not self.app_controller.stacks:
@@ -418,15 +460,15 @@ class UIState(QObject):
         summary = f"Found {len(self.app_controller.stacks)} stacks:\n\n"
         for i, (start, end) in enumerate(self.app_controller.stacks):
             count = end - start + 1
-            summary += f"Stack {i+1}: {count} photos (indices {start}-{end})\n"
+            summary += f"Stack {i + 1}: {count} photos (indices {start}-{end})\n"
         return summary
 
     @Property(str, notify=saveBehaviorMessageChanged)
     def saveBehaviorMessage(self):
         """Returns a string describing what files will be affected by saving."""
-        if not hasattr(self.app_controller, 'current_edit_source_mode'):
+        if not hasattr(self.app_controller, "current_edit_source_mode"):
             return ""
-            
+
         if self.app_controller.current_edit_source_mode == "raw":
             return "Editing: RAW (writes working .tif + creates -developed.jpg; original JPG untouched)"
         else:
@@ -529,7 +571,7 @@ class UIState(QObject):
         self.app_controller.set_awb_rgb_upper_bound(value)
         self.awbRgbUpperBoundChanged.emit()
 
-    @Property(str, constant=True)
+    @Property(str, notify=currentDirectoryChanged)
     def currentDirectory(self):
         """Returns the path of the current working directory."""
         return str(self.app_controller.image_dir)
@@ -552,7 +594,6 @@ class UIState(QObject):
     @Slot()
     def prevImage(self):
         self.app_controller.prev_image()
-
 
     @Slot()
     def launch_helicon(self):
@@ -601,7 +642,7 @@ class UIState(QObject):
     @Slot(result=float)
     def get_cache_size(self):
         return self.app_controller.get_cache_size()
-    
+
     @Slot(result=float)
     def get_cache_usage_gb(self):
         return self.app_controller.get_cache_usage_gb()
@@ -631,7 +672,7 @@ class UIState(QObject):
     @Slot(result=str)
     def get_default_directory(self):
         return self.app_controller.get_default_directory()
-    
+
     @Slot(str)
     def set_default_directory(self, path):
         self.app_controller.set_default_directory(path)
@@ -639,7 +680,7 @@ class UIState(QObject):
     @Slot(result=str)
     def get_optimize_for(self):
         return self.app_controller.get_optimize_for()
-    
+
     @Slot(str)
     def set_optimize_for(self, optimize_for):
         self.app_controller.set_optimize_for(optimize_for)
@@ -679,7 +720,6 @@ class UIState(QObject):
     def open_folder(self):
         self.app_controller.open_folder()
 
-
     @Slot()
     def preloadAllImages(self):
         self.app_controller.preload_all_images()
@@ -707,7 +747,7 @@ class UIState(QObject):
     @Property(bool, notify=is_editor_open_changed)
     def isEditorOpen(self) -> bool:
         return self._is_editor_open
-    
+
     @isEditorOpen.setter
     def isEditorOpen(self, new_value: bool):
         if self._is_editor_open != new_value:
@@ -747,7 +787,7 @@ class UIState(QObject):
     @Property(bool, notify=anySliderPressedChanged)
     def anySliderPressed(self):
         return self._any_slider_pressed
-    
+
     @anySliderPressed.setter
     def anySliderPressed(self, value):
         if self._any_slider_pressed != value:
@@ -761,17 +801,17 @@ class UIState(QObject):
     @Property(bool, notify=is_cropping_changed)
     def isCropping(self) -> bool:
         return self._is_cropping
-    
+
     @isCropping.setter
     def isCropping(self, new_value: bool):
         if self._is_cropping != new_value:
             self._is_cropping = new_value
             self.is_cropping_changed.emit(new_value)
-    
+
     @Property(bool, notify=is_histogram_visible_changed)
     def isHistogramVisible(self) -> bool:
         return self._is_histogram_visible
-    
+
     @isHistogramVisible.setter
     def isHistogramVisible(self, new_value: bool):
         if self._is_histogram_visible != new_value:
@@ -806,19 +846,19 @@ class UIState(QObject):
         self.cropRotation = 0.0
         self.currentCropBox = (0, 0, 1000, 1000)
         self.currentAspectRatioIndex = 0
-    
-    @Property('QVariant', notify=histogram_data_changed)
+
+    @Property("QVariant", notify=histogram_data_changed)
     def histogramData(self):
         """Returns histogram data as a dict with 'r', 'g', 'b' keys, each containing a list of 256 values."""
         return self._histogram_data
-    
+
     @histogramData.setter
     def histogramData(self, new_value):
         if self._histogram_data != new_value:
             self._histogram_data = new_value
             self.histogram_data_changed.emit()
 
-    @Property('QVariant', notify=highlightStateChanged)
+    @Property("QVariant", notify=highlightStateChanged)
     def highlightState(self):
         """Returns highlight analysis state for UI display.
 
@@ -829,18 +869,22 @@ class UIState(QObject):
         """
         editor = self.app_controller.image_editor
         state = {}
-        if editor and hasattr(editor, '_last_highlight_state') and editor._last_highlight_state:
+        if (
+            editor
+            and hasattr(editor, "_last_highlight_state")
+            and editor._last_highlight_state
+        ):
             # Quick copy under lock to minimize contention
             # Using the editor's lock ensures we don't read while it's being written
             with editor._lock:
                 state = dict(editor._last_highlight_state)
-        
+
         # Normalize for QML robustness: ensure stable keys exist regardless of internal naming
         # Normalize for QML robustness: ensure stable keys exist
         return {
-            'headroom_pct': state.get('headroom_pct', 0.0),
-            'source_clipped_pct': state.get('source_clipped_pct', 0.0),
-            'current_nearwhite_pct': state.get('current_nearwhite_pct', 0.0)
+            "headroom_pct": state.get("headroom_pct", 0.0),
+            "source_clipped_pct": state.get("source_clipped_pct", 0.0),
+            "current_nearwhite_pct": state.get("current_nearwhite_pct", 0.0),
         }
 
     @Property(float, notify=brightness_changed)
@@ -892,25 +936,25 @@ class UIState(QObject):
         if self._white_balance_mg != new_value:
             self._white_balance_mg = new_value
             self.white_balance_mg_changed.emit(new_value)
-    
+
     # Snake_case aliases for QML bracket notation access
     @Property(float, notify=white_balance_by_changed)
     def white_balance_by(self) -> float:
         return self._white_balance_by
-    
+
     @white_balance_by.setter
     def white_balance_by(self, new_value: float):
         self.whiteBalanceBY = new_value
-    
+
     @Property(float, notify=white_balance_mg_changed)
     def white_balance_mg(self) -> float:
         return self._white_balance_mg
-    
+
     @white_balance_mg.setter
     def white_balance_mg(self, new_value: float):
         self.whiteBalanceMG = new_value
 
-    @Property('QVariantList', notify=aspect_ratio_names_changed)
+    @Property("QVariantList", notify=aspect_ratio_names_changed)
     def aspectRatioNames(self) -> list:
         return self._aspect_ratio_names
 
@@ -930,7 +974,7 @@ class UIState(QObject):
             self._current_aspect_ratio_index = new_value
             self.current_aspect_ratio_index_changed.emit(new_value)
 
-    @Property('QVariant', notify=current_crop_box_changed)
+    @Property("QVariant", notify=current_crop_box_changed)
     def currentCropBox(self) -> tuple:
         # QML will receive this as a list
         return self._current_crop_box
@@ -940,7 +984,7 @@ class UIState(QObject):
         # Convert QJSValue or list to tuple if needed
         original_value = new_value
         try:
-            if hasattr(new_value, 'toVariant'):
+            if hasattr(new_value, "toVariant"):
                 # It's a QJSValue, convert to tuple
                 variant = new_value.toVariant()
                 if isinstance(variant, (list, tuple)):
@@ -967,13 +1011,18 @@ class UIState(QObject):
             or len(new_value) != 4
             or not all(isinstance(v, (int, float)) for v in new_value)
         ):
-            log.warning("UIState.currentCropBox: ignoring invalid crop box %r", new_value)
-            return 
+            log.warning(
+                "UIState.currentCropBox: ignoring invalid crop box %r", new_value
+            )
+            return
         if self._current_crop_box != new_value:
             self._current_crop_box = new_value
             self.current_crop_box_changed.emit(new_value)
             # Sync with ImageEditor
-            if hasattr(self.app_controller, 'image_editor') and self.app_controller.image_editor:
+            if (
+                hasattr(self.app_controller, "image_editor")
+                and self.app_controller.image_editor
+            ):
                 self.app_controller.image_editor.set_crop_box(new_value)
 
     @Property(float, notify=crop_rotation_changed)
@@ -985,7 +1034,7 @@ class UIState(QObject):
         if self._crop_rotation != new_value:
             self._crop_rotation = new_value
             self.crop_rotation_changed.emit(new_value)
-    
+
     # --- New Properties ---
     @Property(float, notify=sharpness_changed)
     def sharpness(self) -> float:
@@ -1036,11 +1085,11 @@ class UIState(QObject):
         if self._shadows != new_value:
             self._shadows = new_value
             self.shadows_changed.emit(new_value)
-    
+
     @Property(float, notify=vibrance_changed)
     def vibrance(self) -> float:
         return self._vibrance
-    
+
     @vibrance.setter
     def vibrance(self, new_value: float):
         if self._vibrance != new_value:
@@ -1056,11 +1105,11 @@ class UIState(QObject):
         if self._vignette != new_value:
             self._vignette = new_value
             self.vignette_changed.emit(new_value)
-    
+
     @Property(float, notify=blacks_changed)
     def blacks(self) -> float:
         return self._blacks
-    
+
     @blacks.setter
     def blacks(self, new_value: float):
         if self._blacks != new_value:
@@ -1080,7 +1129,7 @@ class UIState(QObject):
     @Property(float, notify=clarity_changed)
     def clarity(self) -> float:
         return self._clarity
-    
+
     @clarity.setter
     def clarity(self, new_value: float):
         if self._clarity != new_value:
@@ -1090,7 +1139,7 @@ class UIState(QObject):
     @Property(float, notify=texture_changed)
     def texture(self) -> float:
         return self._texture
-    
+
     @texture.setter
     def texture(self, new_value: float):
         if self._texture != new_value:
@@ -1147,84 +1196,140 @@ class UIState(QObject):
     isGridViewActiveChanged = Signal(bool)
     gridDirectoryChanged = Signal(str)
     gridSelectedCountChanged = Signal()  # No args - QML property notify pattern
+    gridScrollToIndex = Signal(int)  # Scroll grid view to show this index
+    gridCanGoBackChanged = Signal()  # Emitted when back history changes
 
     @Property(bool, notify=isGridViewActiveChanged)
     def isGridViewActive(self) -> bool:
         """Returns True if grid view is active, False for loupe view."""
-        return getattr(self.app_controller, '_is_grid_view_active', False)
+        return getattr(self.app_controller, "_is_grid_view_active", False)
 
     @isGridViewActive.setter
     def isGridViewActive(self, value: bool):
         # Use controller method to ensure side effects (model refresh, resolver update) are applied
-        if hasattr(self.app_controller, '_set_grid_view_active'):
+        if hasattr(self.app_controller, "_set_grid_view_active"):
             self.app_controller._set_grid_view_active(value)
 
     @Property(str, notify=gridDirectoryChanged)
     def gridDirectory(self) -> str:
         """Returns the current directory shown in grid view."""
-        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+        if (
+            hasattr(self.app_controller, "_thumbnail_model")
+            and self.app_controller._thumbnail_model
+        ):
             return str(self.app_controller._thumbnail_model.current_directory)
         return str(self.app_controller.image_dir)
 
     @Property(int, notify=gridSelectedCountChanged)
     def gridSelectedCount(self) -> int:
         """Returns count of selected items in grid view (efficient, no list copy)."""
-        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+        if (
+            hasattr(self.app_controller, "_thumbnail_model")
+            and self.app_controller._thumbnail_model
+        ):
             return self.app_controller._thumbnail_model.selected_count
         return 0
 
     @Slot()
     def toggleGridView(self):
         """Toggle between grid view and loupe view."""
-        if hasattr(self.app_controller, 'toggle_grid_view'):
+        if hasattr(self.app_controller, "toggle_grid_view"):
             self.app_controller.toggle_grid_view()
 
     @Slot(int)
     def gridOpenIndex(self, index: int):
         """Open an image from grid view in loupe view."""
-        if hasattr(self.app_controller, 'grid_open_index'):
+        if hasattr(self.app_controller, "grid_open_index"):
             self.app_controller.grid_open_index(index)
 
     @Slot(str)
     def gridNavigateTo(self, path: str):
         """Navigate to a folder in grid view."""
-        if hasattr(self.app_controller, 'grid_navigate_to'):
+        if hasattr(self.app_controller, "grid_navigate_to"):
             self.app_controller.grid_navigate_to(path)
 
     @Slot()
     def gridClearSelection(self):
         """Clear all selections in grid view."""
-        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+        if (
+            hasattr(self.app_controller, "_thumbnail_model")
+            and self.app_controller._thumbnail_model
+        ):
             self.app_controller._thumbnail_model.clear_selection()
 
     @Slot(int, bool, bool)
     def gridSelectIndex(self, index: int, shift: bool, ctrl: bool):
         """Handle selection at index with modifier keys."""
-        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+        if (
+            hasattr(self.app_controller, "_thumbnail_model")
+            and self.app_controller._thumbnail_model
+        ):
             self.app_controller._thumbnail_model.select_index(index, shift, ctrl)
 
-    @Slot(result='QVariantList')
+    @Slot(result="QVariantList")
     def gridGetSelectedPaths(self) -> list:
         """Get list of selected image paths in grid view."""
-        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
-            return [str(p) for p in self.app_controller._thumbnail_model.get_selected_paths()]
+        if (
+            hasattr(self.app_controller, "_thumbnail_model")
+            and self.app_controller._thumbnail_model
+        ):
+            return [
+                str(p)
+                for p in self.app_controller._thumbnail_model.get_selected_paths()
+            ]
         return []
 
     @Slot()
     def gridRefresh(self):
         """Refresh the grid view."""
-        if hasattr(self.app_controller, '_thumbnail_model') and self.app_controller._thumbnail_model:
+        if (
+            hasattr(self.app_controller, "_thumbnail_model")
+            and self.app_controller._thumbnail_model
+        ):
             self.app_controller._thumbnail_model.refresh()
             # Also update path resolver
-            if hasattr(self.app_controller, '_path_resolver'):
-                self.app_controller._path_resolver.update_from_model(self.app_controller._thumbnail_model)
+            if hasattr(self.app_controller, "_path_resolver"):
+                self.app_controller._path_resolver.update_from_model(
+                    self.app_controller._thumbnail_model
+                )
+
+    @Property(bool, notify=gridCanGoBackChanged)
+    def gridCanGoBack(self) -> bool:
+        """Returns True if there's navigation history to go back to."""
+        if hasattr(self.app_controller, "_grid_nav_history"):
+            return len(self.app_controller._grid_nav_history) > 0
+        return False
+
+    @Slot()
+    def gridGoBack(self):
+        """Navigate back to the previous directory in grid view."""
+        if hasattr(self.app_controller, "grid_go_back"):
+            self.app_controller.grid_go_back()
+
+    @Slot()
+    def gridAddSelectionToBatch(self):
+        """Add grid-selected images to batch."""
+        if hasattr(self.app_controller, "grid_add_selection_to_batch"):
+            self.app_controller.grid_add_selection_to_batch()
+
+    @Slot(int)
+    def gridDeleteAtCursor(self, cursorIndex: int):
+        """Delete image(s) from grid view - selection or cursor image."""
+        if hasattr(self.app_controller, "grid_delete_at_cursor"):
+            self.app_controller.grid_delete_at_cursor(cursorIndex)
 
     @Slot(int, int)
     def gridPrefetchRange(self, startIndex: int, endIndex: int):
         """Prefetch thumbnails for the given index range."""
-        if not hasattr(self.app_controller, '_thumbnail_model') or not self.app_controller._thumbnail_model:
+        if (
+            not hasattr(self.app_controller, "_thumbnail_model")
+            or not self.app_controller._thumbnail_model
+        ):
             return
-        if not hasattr(self.app_controller, '_thumbnail_prefetcher') or not self.app_controller._thumbnail_prefetcher:
+        if (
+            not hasattr(self.app_controller, "_thumbnail_prefetcher")
+            or not self.app_controller._thumbnail_prefetcher
+        ):
             return
 
         model = self.app_controller._thumbnail_model
@@ -1240,3 +1345,29 @@ class UIState(QObject):
             if entry and not entry.is_folder:
                 prefetcher.submit(entry.path, entry.mtime_ns)
 
+    @Property(str, notify=recycleBinStatsTextChanged)
+    def recycleBinStatsText(self):
+        """Returns a formatted string of recycle bin stats."""
+        stats = self._app_controller.get_recycle_bin_stats()
+        if not stats:
+            return ""
+
+        summary = "The following recycle bins contain items:\n\n"
+        for item in stats:
+            summary += f"• {item['path']}: {item['count']} files\n"
+
+        summary += "\nDo you want to delete them before quitting?"
+        return summary
+
+    @Property(bool, notify=hasRecycleBinItemsChanged)
+    def hasRecycleBinItems(self):
+        """Returns True if there are items in any recycle bin."""
+        stats = self._app_controller.get_recycle_bin_stats()
+        return len(stats) > 0
+
+    @Slot()
+    def cleanupRecycleBins(self):
+        """Deletes all tracked recycle bins."""
+        self._app_controller.cleanup_recycle_bins()
+        self.recycleBinStatsTextChanged.emit()
+        self.hasRecycleBinItemsChanged.emit()

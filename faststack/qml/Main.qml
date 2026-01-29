@@ -3,6 +3,7 @@ import QtQuick.Window
 import QtQuick.Controls 2.15
 import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Dialogs
 import "."
 
 ApplicationWindow {
@@ -13,6 +14,22 @@ ApplicationWindow {
     minimumWidth: 800
     minimumHeight: 500
     title: "FastStack - " + (uiState ? uiState.currentDirectory : "Loading...")
+
+    property bool allowCloseWithRecycleBins: false
+
+    onClosing: function(close) {
+        if (allowCloseWithRecycleBins) {
+            close.accepted = true
+            return
+        }
+        if (uiState && uiState.hasRecycleBinItems) {
+            close.accepted = false
+            recycleBinCleanupDialog.text = uiState.recycleBinStatsText
+            recycleBinCleanupDialog.open()
+        } else {
+            close.accepted = true
+        }
+    }
 
     Component.onCompleted: {
         // Initialization complete
@@ -771,6 +788,8 @@ ApplicationWindow {
             id: footerRow
             spacing: 10
             anchors.verticalCenter: parent.verticalCenter
+            anchors.left: parent.left
+            anchors.right: parent.right
 
             Label {
                 Layout.leftMargin: 10
@@ -910,44 +929,122 @@ ApplicationWindow {
                 Layout.rightMargin: 10
             }
 
-            // Grid view controls (visible when in grid view)
+            // Grid view controls (visible when in grid view) - right side
             Row {
                 visible: uiState && uiState.isGridViewActive
-                spacing: 8
-                Layout.rightMargin: 10
+                spacing: 10
+                Layout.rightMargin: 15
 
                 // Selection info (uses efficient count property, not full list)
                 Label {
                     property int selCount: uiState ? uiState.gridSelectedCount : 0
                     text: selCount > 0 ? selCount + " selected" : ""
                     color: "#4CAF50"
+                    font.bold: true
                     visible: selCount > 0
                     anchors.verticalCenter: parent.verticalCenter
                 }
 
                 // Clear selection button
-                Button {
-                    text: "Clear"
+                Rectangle {
                     visible: uiState ? uiState.gridSelectedCount > 0 : false
-                    onClicked: { if (uiState) uiState.gridClearSelection() }
-                    implicitWidth: 60
-                    implicitHeight: 28
+                    width: clearLabel.implicitWidth + 16
+                    height: 26
+                    radius: 4
+                    color: clearMouseArea.containsMouse ? "#d32f2f" : "#c62828"
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Label {
+                        id: clearLabel
+                        anchors.centerIn: parent
+                        text: "Clear Selection"
+                        color: "white"
+                        font.pixelSize: 12
+                    }
+
+                    MouseArea {
+                        id: clearMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { if (uiState) uiState.gridClearSelection() }
+                    }
+                }
+
+                // Back button (only shown when there's history)
+                Rectangle {
+                    visible: uiState && uiState.gridCanGoBack
+                    width: backLabel.implicitWidth + 16
+                    height: 26
+                    radius: 4
+                    color: backMouseArea.containsMouse ? "#616161" : "#424242"
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Label {
+                        id: backLabel
+                        anchors.centerIn: parent
+                        text: "← Back"
+                        color: "white"
+                        font.pixelSize: 12
+                    }
+
+                    MouseArea {
+                        id: backMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { if (uiState) uiState.gridGoBack() }
+                    }
                 }
 
                 // Refresh button
-                Button {
-                    text: "Refresh"
-                    onClicked: { if (uiState) uiState.gridRefresh() }
-                    implicitWidth: 70
-                    implicitHeight: 28
+                Rectangle {
+                    width: refreshLabel.implicitWidth + 16
+                    height: 26
+                    radius: 4
+                    color: refreshMouseArea.containsMouse ? "#1976D2" : "#1565C0"
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Label {
+                        id: refreshLabel
+                        anchors.centerIn: parent
+                        text: "Refresh"
+                        color: "white"
+                        font.pixelSize: 12
+                    }
+
+                    MouseArea {
+                        id: refreshMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { if (uiState) uiState.gridRefresh() }
+                    }
                 }
 
                 // Single Image View button
-                Button {
-                    text: "Single Image"
-                    onClicked: { if (uiState) uiState.toggleGridView() }
-                    implicitWidth: 90
-                    implicitHeight: 28
+                Rectangle {
+                    width: singleViewLabel.implicitWidth + 16
+                    height: 26
+                    radius: 4
+                    color: singleViewMouseArea.containsMouse ? "#388E3C" : "#2E7D32"
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Label {
+                        id: singleViewLabel
+                        anchors.centerIn: parent
+                        text: "Single View"
+                        color: "white"
+                        font.pixelSize: 12
+                    }
+
+                    MouseArea {
+                        id: singleViewMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { if (uiState) uiState.toggleGridView() }
+                    }
                 }
             }
         }
@@ -987,10 +1084,14 @@ ApplicationWindow {
                           "&nbsp;&nbsp;I: Show EXIF Data<br>" +
                           "&nbsp;&nbsp;T: Toggle Thumbnail Grid / Single Image View<br><br>" +
                           "<b>Thumbnail Grid View:</b><br>" +
+                          "&nbsp;&nbsp;Arrow Keys: Navigate between images<br>" +
+                          "&nbsp;&nbsp;Enter: Open current image in single view<br>" +
+                          "&nbsp;&nbsp;Space: Toggle selection on current image<br>" +
                           "&nbsp;&nbsp;Click: Open image in single view<br>" +
-                          "&nbsp;&nbsp;Ctrl+Click: Toggle selection<br>" +
+                          "&nbsp;&nbsp;Right-click / Ctrl+Click: Toggle selection<br>" +
                           "&nbsp;&nbsp;Shift+Click: Select range<br>" +
-                          "&nbsp;&nbsp;Backspace: Navigate to parent folder<br>" +
+                          "&nbsp;&nbsp;B: Add selected images to batch<br>" +
+                          "&nbsp;&nbsp;Delete/Backspace: Delete selected or cursor image<br>" +
                           "&nbsp;&nbsp;Esc: Clear selection or switch to single view<br><br>" +
                           "<b>Viewing:</b><br>" +
                           "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
@@ -1038,7 +1139,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
                           "&nbsp;&nbsp;H: Toggle histogram window<br>" +
                           "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
-                          "&nbsp;&nbsp;Esc: Close active dialog or editor"
+                          "&nbsp;&nbsp;Esc: Close dialog/editor, or switch to grid view"
                     padding: 10
                     wrapMode: Text.WordWrap
                     color: root.currentTextColor
@@ -1145,6 +1246,31 @@ ApplicationWindow {
             text: "D"
             font.bold: true
             color: "black"
+        }
+    }
+    MessageDialog {
+        id: recycleBinCleanupDialog
+        title: "Clean up Recycle Bins?"
+        buttons: MessageDialog.Yes | MessageDialog.No | MessageDialog.Cancel
+        
+        // Custom button text isn't directly supported in standard MessageDialog
+        // So we interpret:
+        // Yes -> Delete and Quit
+        // No -> Quit (Keep Files)
+        // Cancel -> Don't Quit
+        
+        detailedText: "Select 'Yes' to permanently delete these files and quit.\nSelect 'No' to quit but keep files in the recycle bins."
+        
+        onButtonClicked: function(button, role) {
+            if (button === MessageDialog.Yes) {
+                uiState.cleanupRecycleBins()
+                allowCloseWithRecycleBins = true
+                Qt.quit()
+            } else if (button === MessageDialog.No) {
+                allowCloseWithRecycleBins = true
+                Qt.quit()
+            }
+            // Cancel does nothing, just closes dialog
         }
     }
 }

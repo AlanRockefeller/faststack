@@ -1,5 +1,5 @@
 """Debug script to run tests and capture full output."""
-import sys
+
 import os
 
 # Change to faststack directory
@@ -7,8 +7,9 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 # Run the test
 import unittest
+
 loader = unittest.TestLoader()
-suite = loader.discover('.', pattern='test_editor_loading.py')
+suite = loader.discover(".", pattern="test_editor_loading.py")
 runner = unittest.TextTestRunner(verbosity=2)
 result = runner.run(suite)
 

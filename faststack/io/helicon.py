@@ -13,6 +13,7 @@ from faststack.io.executable_validator import validate_executable_path
 
 log = logging.getLogger(__name__)
 
+
 def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
     """Launches Helicon Focus with the provided list of RAW files.
 
@@ -32,11 +33,9 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
 
     # Validate executable path securely
     is_valid, error_msg = validate_executable_path(
-        helicon_exe,
-        app_type="helicon",
-        allow_custom_paths=True
+        helicon_exe, app_type="helicon", allow_custom_paths=True
     )
-    
+
     if not is_valid:
         log.error(f"Helicon Focus executable validation failed: {error_msg}")
         return False, None
@@ -46,7 +45,9 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
         return False, None
 
     try:
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding='utf-8') as tmp:
+        with tempfile.NamedTemporaryFile(
+            "w", delete=False, suffix=".txt", encoding="utf-8"
+        ) as tmp:
             for f in raw_files:
                 # Ensure file path is resolved and exists
                 if not f.exists():
@@ -60,14 +61,14 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
 
         # Build command list safely
         args = [helicon_exe, "-i", str(tmp_path.resolve())]
-        
+
         # Parse additional args safely using shlex (handles quotes and escapes properly)
         extra_args = config.get("helicon", "args")
         if extra_args:
             try:
                 # Use shlex to properly parse arguments with quotes/escapes
                 # On Windows, use posix=False to handle Windows-style paths
-                parsed_args = shlex.split(extra_args, posix=(os.name != 'nt'))
+                parsed_args = shlex.split(extra_args, posix=(os.name != "nt"))
                 args.extend(parsed_args)
             except ValueError as e:
                 log.exception(f"Invalid helicon args format: {e}")
@@ -75,7 +76,7 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
 
         log.info(f"Launching Helicon Focus with {len(raw_files)} files")
         log.info(f"Command: {' '.join(args)}")
-        
+
         # SECURITY: Explicitly disable shell execution
         subprocess.Popen(
             args,
@@ -83,7 +84,7 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            close_fds=True  # Close unused file descriptors
+            close_fds=True,  # Close unused file descriptors
         )
         return True, tmp_path
     except (OSError, subprocess.SubprocessError) as e:

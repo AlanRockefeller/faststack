@@ -40,9 +40,7 @@ class ByteLRUCache(LRUCache):
         # Before adding a new item, we might need to evict others
         # This is handled by the parent class, which will call popitem if needed
         super().__setitem__(key, value)
-        log.debug(
-            f"Cached item '{key}'. Cache size: {self.currsize / 1024**2:.2f} MB"
-        )
+        log.debug(f"Cached item '{key}'. Cache size: {self.currsize / 1024**2:.2f} MB")
 
     def popitem(self):
         """Extend popitem to log eviction."""
@@ -86,7 +84,9 @@ def get_decoded_image_size(item) -> int:
             bytes_per_pixel = getattr(item, "channels", 4)  # Default to RGBA
             return item.width * item.height * bytes_per_pixel
 
-    log.warning(f"Unexpected item type in cache: {type(item)}. Returning estimated size of 1.")
+    log.warning(
+        f"Unexpected item type in cache: {type(item)}. Returning estimated size of 1."
+    )
     return 1  # Should not happen
 
 

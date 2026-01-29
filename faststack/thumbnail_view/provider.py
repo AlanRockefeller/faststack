@@ -1,6 +1,5 @@
 """QML Image Provider for thumbnail grid view."""
 
-import io
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -94,16 +93,12 @@ class ThumbnailProvider(QQuickImageProvider):
             margin,
             margin + tab_height,
             size - 2 * margin,
-            size - 2 * margin - tab_height
+            size - 2 * margin - tab_height,
         )
 
         # Tab extension
         painter.fillRect(
-            margin,
-            margin,
-            tab_width,
-            tab_height + 2,
-            QColor(100, 100, 100)
+            margin, margin, tab_width, tab_height + 2, QColor(100, 100, 100)
         )
 
         painter.end()
@@ -210,6 +205,7 @@ class PathResolver:
     def update_from_model(self, model: "ThumbnailModel"):
         """Update registrations from a ThumbnailModel."""
         import hashlib
+
         self.clear()
         for i in range(model.rowCount()):
             entry = model.get_entry(i)

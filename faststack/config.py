@@ -6,7 +6,7 @@ import sys
 import glob
 import os
 import re
-from pathlib import Path, PureWindowsPath
+from pathlib import PureWindowsPath
 
 from faststack.logging_setup import get_app_data_dir
 
@@ -23,9 +23,9 @@ def detect_rawtherapee_path():
     # Finds paths like C:\Program Files\RawTherapee\5.9\rawtherapee-cli.exe
     base_patterns = [
         r"C:\Program Files\RawTherapee*\**\rawtherapee-cli.exe",
-        r"C:\Program Files (x86)\RawTherapee*\**\rawtherapee-cli.exe"
+        r"C:\Program Files (x86)\RawTherapee*\**\rawtherapee-cli.exe",
     ]
-    
+
     try:
         matches = []
         for pattern in base_patterns:
@@ -33,12 +33,12 @@ def detect_rawtherapee_path():
 
         if not matches:
             return None
-            
+
         # Helper to extract version numbers for natural sorting
         # e.g., "5.10" -> [5, 10]
         def version_sort_key(path):
             for part in reversed(PureWindowsPath(path).parts):
-                if re.fullmatch(r'\d+(?:\.\d+)*', part):
+                if re.fullmatch(r"\d+(?:\.\d+)*", part):
                     return [int(n) for n in part.split(".")]
             return [0]
 
@@ -67,7 +67,6 @@ DEFAULT_CONFIG = {
         "theme": "dark",
         "default_directory": "",
         "optimize_for": "speed",  # "speed" or "quality"
-        
         # --- Auto Levels Configuration ---
         #
         # Behavior:
@@ -80,7 +79,7 @@ DEFAULT_CONFIG = {
         #   2. Construct a levels transform to map these points to 0 and 255.
         #   3. Blend the transformed image with the original using `auto_level_strength`.
         #   4. If `auto_level_strength_auto` is True, `auto_level_strength` acts as a maximum;
-        #      the system will automatically reduce the applied strength if the computed 
+        #      the system will automatically reduce the applied strength if the computed
         #      transform would cause excessive clipping or color instability.
         #
         # Practical Tuning:
@@ -89,7 +88,6 @@ DEFAULT_CONFIG = {
         #     Lower values (e.g. 0.001 = 0.1%) are gentler and preserve more dynamic range.
         #   - auto_level_strength: 1.0 applies the full mathematical correction. Lower values
         #     blend the result for a subtler effect.
-        
         "auto_level_threshold": "0.1",
         "auto_level_strength": "1.0",
         "auto_level_strength_auto": "False",
@@ -108,7 +106,7 @@ DEFAULT_CONFIG = {
         "monitor_icc_path": "",  # For 'icc' mode: path to monitor ICC profile
     },
     "awb": {
-        "mode": "lab",  # "lab" or "rgb"        
+        "mode": "lab",  # "lab" or "rgb"
         "strength": "0.7",
         "warm_bias": "6",
         "tint_bias": "0",
@@ -124,8 +122,9 @@ DEFAULT_CONFIG = {
     "raw": {
         "source_dir": "C:\\Users\\alanr\\pictures\\olympus.stack.input.photos",
         "mirror_base": "C:\\Users\\alanr\\Pictures\\Lightroom",
-    }
+    },
 }
+
 
 class AppConfig:
     def __init__(self):
@@ -149,19 +148,20 @@ class AppConfig:
                 for key, value in keys.items():
                     if not self.config.has_option(section, key):
                         self.config.set(section, key, value)
-            self.save() # Save to add any missing keys
+            self.save()  # Save to add any missing keys
 
             # Validate RawTherapee path (re-detect if missing)
             if sys.platform == "win32":
                 current_rt_path = self.get("rawtherapee", "exe")
                 if not os.path.exists(current_rt_path):
-                    log.warning(f"Configured RawTherapee path not found: {current_rt_path}. Attempting re-detection...")
+                    log.warning(
+                        f"Configured RawTherapee path not found: {current_rt_path}. Attempting re-detection..."
+                    )
                     new_path = detect_rawtherapee_path()
                     if new_path and new_path != current_rt_path:
                         log.info(f"Found new RawTherapee path: {new_path}")
                         self.set("rawtherapee", "exe", new_path)
                         self.save()
-
 
     def save(self):
         """Saves the current configuration to the INI file."""
@@ -189,6 +189,7 @@ class AppConfig:
         if not self.config.has_section(section):
             self.config.add_section(section)
         self.config.set(section, key, str(value))
+
 
 # Global config instance
 config = AppConfig()

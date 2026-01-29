@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt
 
 log = logging.getLogger(__name__)
 
+
 class Keybinder:
     def __init__(self, controller):
         """
@@ -16,31 +17,28 @@ class Keybinder:
 
         # map keys → method names (not callables)
         self.key_map = {
+            # View switching
+            Qt.Key_Escape: "switch_to_grid_view",
             # Navigation
             Qt.Key_J: "next_image",
             Qt.Key_Right: "next_image",
             Qt.Key_K: "prev_image",
             Qt.Key_Left: "prev_image",
             Qt.Key_G: "show_jump_to_image_dialog",
-
             # Stacking
             Qt.Key_BracketLeft: "begin_new_stack",
             Qt.Key_BracketRight: "end_current_stack",
             Qt.Key_S: "toggle_stack_membership",
-
             # Batching
             Qt.Key_BraceLeft: "begin_new_batch",
             Qt.Key_BraceRight: "end_current_batch",
             Qt.Key_Backslash: "clear_all_batches",
             Qt.Key_B: "toggle_batch_membership",
-
             # Remove from batch/stack
             Qt.Key_X: "remove_from_batch_or_stack",
-            
             # Toggle flags
             Qt.Key_U: "toggle_uploaded",
             Qt.Key_I: "show_exif_dialog",
-
             # Actions
             Qt.Key_Enter: "launch_helicon",
             Qt.Key_Return: "launch_helicon",
@@ -60,8 +58,10 @@ class Keybinder:
             (Qt.Key_Z, Qt.ControlModifier): "undo_delete",
             (Qt.Key_E, Qt.ControlModifier): "toggle_edited",
             (Qt.Key_S, Qt.ControlModifier): "toggle_stacked",
-
-            (Qt.Key_B, Qt.ControlModifier | Qt.ShiftModifier): "quick_auto_white_balance",
+            (
+                Qt.Key_B,
+                Qt.ControlModifier | Qt.ShiftModifier,
+            ): "quick_auto_white_balance",
             (Qt.Key_1, Qt.ControlModifier): "zoom_100",
             (Qt.Key_2, Qt.ControlModifier): "zoom_200",
             (Qt.Key_3, Qt.ControlModifier): "zoom_300",
@@ -81,7 +81,9 @@ class Keybinder:
             getattr(self.controller, method_name)()
             return
 
-        log.warning(f"Keybinder: neither main_window nor controller has '{method_name}'")
+        log.warning(
+            f"Keybinder: neither main_window nor controller has '{method_name}'"
+        )
 
     def handle_key_press(self, event):
         key = event.key()
@@ -93,7 +95,9 @@ class Keybinder:
         for (mapped_key, mapped_modifier), method_name in self.modifier_key_map.items():
             # Check if required modifier is present in event modifiers
             if key == mapped_key and (modifiers & mapped_modifier):
-                log.debug(f"Matched modifier key: {key} + {mapped_modifier} -> {method_name}")
+                log.debug(
+                    f"Matched modifier key: {key} + {mapped_modifier} -> {method_name}"
+                )
                 self._call(method_name)
                 return True
 

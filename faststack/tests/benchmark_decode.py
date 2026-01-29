@@ -1,9 +1,9 @@
-
 import time
 import io
 import numpy as np
 from PIL import Image
 from faststack.imaging.jpeg import decode_jpeg_resized, TURBO_AVAILABLE
+
 
 def create_test_jpeg(width=6000, height=4000):
     """Creates a large test JPEG in memory."""
@@ -14,6 +14,7 @@ def create_test_jpeg(width=6000, height=4000):
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
+
 
 def benchmark():
     jpeg_bytes = create_test_jpeg()
@@ -34,7 +35,8 @@ def benchmark():
 
     avg_time = (end - start) / iterations
     print(f"Average decode time (Current Implementation): {avg_time:.4f} s")
-    print(f"FPS: {1/avg_time:.2f}")
+    print(f"FPS: {1 / avg_time:.2f}")
+
 
 if __name__ == "__main__":
     benchmark()

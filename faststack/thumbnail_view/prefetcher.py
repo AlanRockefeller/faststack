@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 # Try to import turbojpeg for faster JPEG decoding
 try:
     from turbojpeg import TurboJPEG, TJPF_RGB, TJSAMP_444
+
     _tj = TurboJPEG()
     HAS_TURBOJPEG = True
 except ImportError:
@@ -62,7 +63,9 @@ class ThumbnailPrefetcher:
         self._cache = cache
         self._on_ready = on_ready_callback
         self._target_size = target_size
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="thumb")
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="thumb"
+        )
 
         # Track in-flight jobs to avoid duplicates
         # Key: (size, path_hash, mtime_ns)
@@ -72,8 +75,11 @@ class ThumbnailPrefetcher:
         # Track futures for potential cancellation
         self._futures: Dict[Tuple[int, str, int], Future] = {}
 
-        log.info("ThumbnailPrefetcher initialized with %d workers, target size %dpx",
-                 max_workers, target_size)
+        log.info(
+            "ThumbnailPrefetcher initialized with %d workers, target size %dpx",
+            max_workers,
+            target_size,
+        )
 
     def submit(self, path: Path, mtime_ns: int, size: int = None) -> bool:
         """Submit a thumbnail decode job.
@@ -112,7 +118,9 @@ class ThumbnailPrefetcher:
                 mtime_ns,
                 size,
             )
-            future.add_done_callback(lambda f: self._on_decode_done(f, job_key, cache_key))
+            future.add_done_callback(
+                lambda f: self._on_decode_done(f, job_key, cache_key)
+            )
 
             with self._inflight_lock:
                 self._futures[job_key] = future
@@ -161,6 +169,7 @@ class ThumbnailPrefetcher:
 
             # Use BytesIO to encode to JPEG
             import io
+
             buf = io.BytesIO()
             pil_image.save(buf, format="JPEG", quality=85)
             return buf.getvalue()
@@ -188,26 +197,34 @@ class ThumbnailPrefetcher:
 
                 # Calculate scale factor for turbojpeg (powers of 2: 1, 2, 4, 8)
                 scale_factor = 1
-                while (width // (scale_factor * 2) >= target_size and
-                       height // (scale_factor * 2) >= target_size and
-                       scale_factor < 8):
+                while (
+                    width // (scale_factor * 2) >= target_size
+                    and height // (scale_factor * 2) >= target_size
+                    and scale_factor < 8
+                ):
                     scale_factor *= 2
 
                 # Decode with scaling
                 scaling_factor = (1, scale_factor)
-                rgb = _tj.decode(jpeg_data, pixel_format=TJPF_RGB, scaling_factor=scaling_factor)
+                rgb = _tj.decode(
+                    jpeg_data, pixel_format=TJPF_RGB, scaling_factor=scaling_factor
+                )
 
                 # Further resize with PIL if needed
                 h, w = rgb.shape[:2]
                 if w > target_size or h > target_size:
                     pil_img = Image.fromarray(rgb)
-                    pil_img.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
+                    pil_img.thumbnail(
+                        (target_size, target_size), Image.Resampling.LANCZOS
+                    )
                     rgb = np.array(pil_img)
 
                 return rgb
 
             except Exception as e:
-                log.debug("TurboJPEG decode failed for %s, falling back to PIL: %s", path, e)
+                log.debug(
+                    "TurboJPEG decode failed for %s, falling back to PIL: %s", path, e
+                )
 
         # Fallback to PIL
         try:
@@ -224,7 +241,9 @@ class ThumbnailPrefetcher:
             log.debug("PIL decode failed for %s: %s", path, e)
             return None
 
-    def _on_decode_done(self, future: Future, job_key: Tuple[int, str, int], cache_key: str):
+    def _on_decode_done(
+        self, future: Future, job_key: Tuple[int, str, int], cache_key: str
+    ):
         """Callback when decode completes."""
         # Remove from inflight
         with self._inflight_lock:
@@ -301,8 +320,10 @@ class ThumbnailCache:
             self._current_bytes += len(value)
 
             # Evict if over limits
-            while (self._current_bytes > self._max_bytes or
-                   len(self._cache) > self._max_items) and self._order:
+            while (
+                self._current_bytes > self._max_bytes
+                or len(self._cache) > self._max_items
+            ) and self._order:
                 oldest = self._order.pop(0)
                 if oldest in self._cache:
                     self._current_bytes -= len(self._cache[oldest])

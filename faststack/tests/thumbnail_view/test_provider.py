@@ -1,8 +1,7 @@
 """Tests for PathResolver (ThumbnailProvider requires Qt GUI)."""
 
-import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from faststack.thumbnail_view.provider import PathResolver
 

@@ -1,10 +1,10 @@
-
 import logging
 from pathlib import Path
 from typing import Dict, Any, Union
 from PIL import Image, ExifTags
 
 log = logging.getLogger(__name__)
+
 
 def clean_exif_value(value: Any) -> str:
     """
@@ -16,30 +16,31 @@ def clean_exif_value(value: Any) -> str:
     if isinstance(value, bytes):
         try:
             # Try to decode as UTF-8, stripping nulls
-            decoded = value.decode('utf-8').strip('\x00')
+            decoded = value.decode("utf-8").strip("\x00")
             # Check if the result is printable
             if decoded.isprintable():
                 return decoded
             return f"<binary data: {len(value)} bytes>"
         except UnicodeDecodeError:
             return f"<binary data: {len(value)} bytes>"
-    
+
     if isinstance(value, str):
         # Strip null bytes and other common garbage
-        cleaned = value.strip('\x00').strip()
+        cleaned = value.strip("\x00").strip()
         # Remove other non-printable characters if necessary, but keep basic text
         # For now, just stripping nulls is the most important
         return cleaned
-        
+
     if isinstance(value, (list, tuple)):
         return str([clean_exif_value(v) for v in value])
-        
+
     return str(value)
+
 
 def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     """
     Extracts EXIF data from an image file.
-    
+
     Returns a dictionary with two keys:
     - 'summary': A dictionary of formatted common fields (Date, ISO, Aperture, etc.)
     - 'full': A dictionary of all decoded EXIF tags.
@@ -54,7 +55,7 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
             exif = img._getexif()
         finally:
             img.close()
-            
+
         if not exif:
             return {"summary": {}, "full": {}}
     except Exception as e:  # noqa: BLE001 - defensive catch for arbitrary EXIF parsing issues
@@ -67,7 +68,7 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
         decoded_exif[tag_name] = value
 
     summary = {}
-    
+
     # Helper to safely get value
     def get_val(key):
         return decoded_exif.get(key)
@@ -80,14 +81,16 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     # Camera Model
     make = get_val("Make")
     model = get_val("Model")
-    
+
     # Clean make and model first
-    if make: make = clean_exif_value(make)
-    if model: model = clean_exif_value(model)
-    
+    if make:
+        make = clean_exif_value(make)
+    if model:
+        model = clean_exif_value(model)
+
     if make and model:
         if make.lower() in model.lower():
-             summary["Camera"] = model
+            summary["Camera"] = model
         else:
             summary["Camera"] = f"{make} {model}"
     elif model:
@@ -111,7 +114,7 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
         try:
             # FNumber is often a tuple (numerator, denominator) or a float
             if isinstance(f_number, tuple) and len(f_number) == 2:
-                 val = f_number[0] / f_number[1]
+                val = f_number[0] / f_number[1]
             else:
                 val = float(f_number)
             summary["Aperture"] = f"f/{val:.1f}"
@@ -126,25 +129,25 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
                 val = exposure_time[0] / exposure_time[1]
             else:
                 val = float(exposure_time)
-            
+
             if val < 1:
-                summary["Shutter Speed"] = f"1/{int(1/val)}s"
+                summary["Shutter Speed"] = f"1/{int(1 / val)}s"
             else:
                 summary["Shutter Speed"] = f"{val}s"
         except Exception:
             summary["Shutter Speed"] = clean_exif_value(exposure_time)
-            
+
     # Focal Length
     focal_length = get_val("FocalLength")
     if focal_length:
         try:
-             if isinstance(focal_length, tuple) and len(focal_length) == 2:
-                 val = focal_length[0] / focal_length[1]
-             else:
-                 val = float(focal_length)
-             summary["Focal Length"] = f"{int(val)}mm"
+            if isinstance(focal_length, tuple) and len(focal_length) == 2:
+                val = focal_length[0] / focal_length[1]
+            else:
+                val = float(focal_length)
+            summary["Focal Length"] = f"{int(val)}mm"
         except Exception:
-             summary["Focal Length"] = clean_exif_value(focal_length)
+            summary["Focal Length"] = clean_exif_value(focal_length)
 
     # Flash
     flash = get_val("Flash")
@@ -158,6 +161,7 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     gps_info = get_val("GPSInfo")
     if gps_info:
         try:
+
             def convert_to_degrees(value):
                 d = float(value[0])
                 m = float(value[1])
@@ -166,20 +170,20 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
 
             lat = None
             lon = None
-            
-            # GPSInfo keys are integers. 
+
+            # GPSInfo keys are integers.
             # 1: GPSLatitudeRef, 2: GPSLatitude
             # 3: GPSLongitudeRef, 4: GPSLongitude
-            
+
             if 2 in gps_info and 4 in gps_info:
                 lat = convert_to_degrees(gps_info[2])
                 lon = convert_to_degrees(gps_info[4])
-                
-                if 1 in gps_info and gps_info[1] == 'S':
+
+                if 1 in gps_info and gps_info[1] == "S":
                     lat = -lat
-                if 3 in gps_info and gps_info[3] == 'W':
+                if 3 in gps_info and gps_info[3] == "W":
                     lon = -lon
-                    
+
                 summary["GPS"] = f"{lat:.5f}, {lon:.5f}"
         except Exception as e:
             log.warning(f"Failed to parse GPS info: {e}")
@@ -193,7 +197,4 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     # Apply cleaning to all values
     full_str = {str(k): clean_exif_value(v) for k, v in decoded_exif.items()}
 
-    return {
-        "summary": summary,
-        "full": full_str
-    }
+    return {"summary": summary, "full": full_str}

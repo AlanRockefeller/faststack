@@ -56,4 +56,5 @@ testpaths = ["faststack/tests"]
 python_files = ["test_*.py"]
 addopts = "-p no:cacheprovider -p no:doctest --basetemp=./var/pytest-temp"
 norecursedirs = ["var", ".venv", "cache", "faststack.egg-info", "__pycache__"]
+pythonpath = ["."]
 

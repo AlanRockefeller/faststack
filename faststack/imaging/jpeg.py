@@ -46,6 +46,7 @@ def decode_jpeg_rgb(jpeg_bytes: bytes, fast_dct: bool = False) -> Optional[np.nd
     # Fallback to Pillow
     try:
         from io import BytesIO
+
         img = Image.open(BytesIO(jpeg_bytes)).convert("RGB")
         return np.array(img)
     except Exception as e:
@@ -54,8 +55,7 @@ def decode_jpeg_rgb(jpeg_bytes: bytes, fast_dct: bool = False) -> Optional[np.nd
 
 
 def decode_jpeg_thumb_rgb(
-    jpeg_bytes: bytes,
-    max_dim: int = 256
+    jpeg_bytes: bytes, max_dim: int = 256
 ) -> Optional[np.ndarray]:
     """Decodes a JPEG into a thumbnail-sized RGB numpy array."""
     if TURBO_AVAILABLE and jpeg_decoder:
@@ -78,11 +78,14 @@ def decode_jpeg_thumb_rgb(
                 return np.array(img)
             return decoded
         except Exception as e:
-            log.exception(f"PyTurboJPEG failed to decode thumbnail: {e}. Trying Pillow.")
+            log.exception(
+                f"PyTurboJPEG failed to decode thumbnail: {e}. Trying Pillow."
+            )
 
     # Fallback to Pillow
     try:
         from io import BytesIO
+
         img = Image.open(BytesIO(jpeg_bytes))
         img.thumbnail((max_dim, max_dim))
         return np.array(img.convert("RGB"))
@@ -91,7 +94,9 @@ def decode_jpeg_thumb_rgb(
         return None
 
 
-def _get_turbojpeg_scaling_factor(width: int, height: int, max_dim: int) -> Optional[Tuple[int, int]]:
+def _get_turbojpeg_scaling_factor(
+    width: int, height: int, max_dim: int
+) -> Optional[Tuple[int, int]]:
     """Finds the best libjpeg-turbo scaling factor to get a thumbnail <= max_dim."""
     if not TURBO_AVAILABLE or not jpeg_decoder:
         return None
@@ -106,7 +111,7 @@ def _get_turbojpeg_scaling_factor(width: int, height: int, max_dim: int) -> Opti
     for num, den in supported_factors:
         if (width * num / den) <= max_dim and (height * num / den) <= max_dim:
             return (num, den)
-            
+
     # If no suitable factor is found, return the smallest one
     return supported_factors[-1] if supported_factors else None
 
@@ -132,7 +137,7 @@ def decode_jpeg_resized(
                 max_dim = height
 
             scale_factor = _get_turbojpeg_scaling_factor(img_width, img_height, max_dim)
-         
+
             if scale_factor:
                 flags = 0
                 if fast_dct:
@@ -140,15 +145,16 @@ def decode_jpeg_resized(
                     flags |= 2048
 
                 decoded = jpeg_decoder.decode(
-                    jpeg_bytes, 
+                    jpeg_bytes,
                     scaling_factor=scale_factor,
-                    pixel_format=TJPF_RGB, 
-                    flags=flags  # Proper color space handling
+                    pixel_format=TJPF_RGB,
+                    flags=flags,  # Proper color space handling
                 )
-                
+
                 # Only use Pillow for final resize if needed
                 if decoded.shape[0] > height or decoded.shape[1] > width:
                     from io import BytesIO
+
                     img = Image.fromarray(decoded)
                     # Use BILINEAR for speed
                     img.thumbnail((width, height), Image.Resampling.BILINEAR)
@@ -156,15 +162,15 @@ def decode_jpeg_resized(
                 return decoded
         except Exception as e:
             log.exception(f"PyTurboJPEG failed: {e}")
-    
+
     # Fallback to Pillow (existing code)
     try:
         from io import BytesIO
+
         img = Image.open(BytesIO(jpeg_bytes))
 
-
         if width <= 0 or height <= 0:
-             return np.array(img.convert("RGB"))
+            return np.array(img.convert("RGB"))
 
         scale_factor_ratio = min(img.width / width, img.height / height)
 
@@ -172,7 +178,9 @@ def decode_jpeg_resized(
         if scale_factor_ratio > 4:
             resampling = Image.Resampling.BILINEAR  # Much faster
         else:
-            resampling = Image.Resampling.LANCZOS  # Higher quality for smaller downscales
+            resampling = (
+                Image.Resampling.LANCZOS
+            )  # Higher quality for smaller downscales
 
         img.thumbnail((width, height), resampling)
         return np.array(img.convert("RGB"))

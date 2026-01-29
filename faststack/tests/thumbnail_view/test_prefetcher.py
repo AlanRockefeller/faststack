@@ -2,10 +2,8 @@
 
 import pytest
 import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from PIL import Image
-import numpy as np
 
 from faststack.thumbnail_view.prefetcher import (
     ThumbnailPrefetcher,
@@ -221,7 +219,6 @@ class TestThumbnailDecode:
         img = Image.new("RGB", (400, 200), color="blue")
 
         # Save with EXIF orientation (rotated 90 CW)
-        from PIL.ExifTags import TAGS
         exif_dict = img.getexif()
         exif_dict[274] = 6  # Orientation tag = 6 (90 CW)
 

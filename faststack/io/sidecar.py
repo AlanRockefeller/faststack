@@ -4,11 +4,11 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Optional
 
 from faststack.models import Sidecar, EntryMetadata
 
 log = logging.getLogger(__name__)
+
 
 def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
     """
@@ -17,20 +17,22 @@ def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
     """
     try:
         # Handle legacy keys
-        # Legacy 'flag' and 'reject' do not map to current EntryMetadata fields, 
+        # Legacy 'flag' and 'reject' do not map to current EntryMetadata fields,
         # so they will be filtered out by valid_keys check below.
-            
+
         # stack_id IS in the current model, so we keep it (don't delete it).
 
         # Filter out unknown keys
         import dataclasses
+
         valid_keys = {f.name for f in dataclasses.fields(EntryMetadata)}
         filtered_meta = {k: v for k, v in meta.items() if k in valid_keys}
-        
+
         return EntryMetadata(**filtered_meta)
     except Exception as e:
         log.warning(f"Error parsing metadata entry: {e}")
         return EntryMetadata()
+
 
 class SidecarManager:
     def __init__(self, directory: Path, watcher, debug: bool = False):
@@ -57,16 +59,18 @@ class SidecarManager:
             with self.path.open("r") as f:
                 data = json.load(f)
             json_load_time = time.perf_counter() - t_start
-            
+
             if self.debug:
-                log.info(f"SidecarManager.load: loading sidecar took {json_load_time:.3f}s")            
+                log.info(
+                    f"SidecarManager.load: loading sidecar took {json_load_time:.3f}s"
+                )
             if data.get("version") != 2:
                 log.warning("Old sidecar format detected. Starting fresh.")
                 return Sidecar()
 
             # Reconstruct nested objects
-            entries = { 
-                stem: _entrymetadata_from_json(meta) 
+            entries = {
+                stem: _entrymetadata_from_json(meta)
                 for stem, meta in data.get("entries", {}).items()
             }
             return Sidecar(
@@ -85,7 +89,11 @@ class SidecarManager:
         temp_path = self.path.with_suffix(".tmp")
         was_watcher_running = False
         try:
-            if self.watcher and hasattr(self.watcher, 'is_alive') and self.watcher.is_alive():
+            if (
+                self.watcher
+                and hasattr(self.watcher, "is_alive")
+                and self.watcher.is_alive()
+            ):
                 self.stop_watcher()
                 was_watcher_running = True
             with temp_path.open("w") as f:
@@ -94,13 +102,12 @@ class SidecarManager:
                     "version": self.data.version,
                     "last_index": self.data.last_index,
                     "entries": {
-                        stem: meta.__dict__
-                        for stem, meta in self.data.entries.items()
+                        stem: meta.__dict__ for stem, meta in self.data.entries.items()
                     },
                     "stacks": self.data.stacks,
                 }
                 json.dump(serializable_data, f, indent=2)
-            
+
             # Atomic rename
             temp_path.replace(self.path)
             log.debug(f"Saved sidecar file to {self.path}")

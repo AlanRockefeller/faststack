@@ -3,7 +3,7 @@
 import hashlib
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Callable
 
@@ -16,14 +16,56 @@ from PySide6.QtCore import (
 )
 
 from faststack.io.indexer import find_images
-from faststack.thumbnail_view.folder_stats import FolderStats, read_folder_stats
+from faststack.thumbnail_view.folder_stats import (
+    FolderStats,
+    count_images_in_folder,
+    read_folder_stats,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _is_filesystem_root(path: Path) -> bool:
+    r"""Check if a path is a filesystem root.
+
+    Handles:
+    - Unix roots: /
+    - Windows drive roots: C:\, D:\, etc.
+    - UNC roots: \\server\share (the share level is treated as root)
+
+    Args:
+        path: Path to check
+
+    Returns:
+        True if the path is a filesystem root.
+    """
+    resolved = path.resolve()
+
+    # Check if path equals its own parent (root condition)
+    if resolved == resolved.parent:
+        return True
+
+    # On Windows, check for drive root (e.g., C:\)
+    path_str = str(resolved)
+    if len(path_str) <= 3 and path_str[1:3] == ":\\":
+        return True
+
+    # Check for UNC root (\\server\share)
+    if path_str.startswith("\\\\"):
+        # UNC paths: \\server\share is the root level
+        # Count backslashes after the initial \\
+        parts = path_str[2:].split("\\")
+        # \\server\share has 2 parts (server, share)
+        if len(parts) <= 2:
+            return True
+
+    return False
 
 
 @dataclass
 class ThumbnailEntry:
     """A single entry in the thumbnail grid (file or folder)."""
+
     path: Path
     name: str
     is_folder: bool
@@ -144,6 +186,12 @@ class ThumbnailModel(QAbstractListModel):
                     "stacked_count": entry.folder_stats.stacked_count,
                     "uploaded_count": entry.folder_stats.uploaded_count,
                     "edited_count": entry.folder_stats.edited_count,
+                    "jpg_count": entry.folder_stats.jpg_count,  # Actually image-like files: JPG, PNG, etc.
+                    "raw_count": entry.folder_stats.raw_count,
+                    # Convert tuples to lists for safer QML type conversion
+                    "coverage_buckets": [
+                        list(t) for t in entry.folder_stats.coverage_buckets
+                    ],
                 }
             return None
         elif role == self.IsSelectedRole:
@@ -181,7 +229,7 @@ class ThumbnailModel(QAbstractListModel):
         # This requires access to the app controller's _path_to_index
         # We'll use the parent (AppController) to look this up
         parent = self.parent()
-        if parent and hasattr(parent, '_path_to_index'):
+        if parent and hasattr(parent, "_path_to_index"):
             return parent._path_to_index.get(entry.path.resolve())
         return None
 
@@ -228,103 +276,120 @@ class ThumbnailModel(QAbstractListModel):
             filter_string: Optional filter to apply to filenames (case-insensitive)
         """
         self.beginResetModel()
-
-        self._entries.clear()
-        self._id_to_row.clear()
-        self._selected_indices.clear()
-        self._last_selected_index = None
-
-        # Add parent folder entry if not at base
-        if self._current_directory != self._base_directory:
-            parent_path = self._current_directory.parent
-            self._entries.append(ThumbnailEntry(
-                path=parent_path,
-                name="..",
-                is_folder=True,
-                mtime_ns=0,
-            ))
-
-        # Scan for folders
-        folders: List[ThumbnailEntry] = []
         try:
-            for entry in os.scandir(self._current_directory):
-                if entry.is_dir() and not entry.name.startswith("."):
-                    folder_path = Path(entry.path)
-                    try:
-                        stat_info = entry.stat()
-                        mtime_ns = stat_info.st_mtime_ns
-                    except OSError:
-                        mtime_ns = 0
+            self._entries.clear()
+            self._id_to_row.clear()
+            self._selected_indices.clear()
+            self._last_selected_index = None
 
-                    folder_stats = read_folder_stats(folder_path)
-
-                    folders.append(ThumbnailEntry(
-                        path=folder_path,
-                        name=entry.name,
+            # Add parent folder entry if not at filesystem root
+            # (allows navigating up even above base_directory)
+            if not _is_filesystem_root(self._current_directory):
+                parent_path = self._current_directory.parent
+                self._entries.append(
+                    ThumbnailEntry(
+                        path=parent_path,
+                        name="..",
                         is_folder=True,
-                        folder_stats=folder_stats,
-                        mtime_ns=mtime_ns,
-                    ))
-        except OSError as e:
-            log.warning("Error scanning directory %s: %s", self._current_directory, e)
+                        mtime_ns=0,
+                    )
+                )
 
-        # Sort folders alphabetically
-        folders.sort(key=lambda e: e.name.lower())
-        self._entries.extend(folders)
-
-        # Get images using existing indexer (respects filter rules)
-        images = find_images(self._current_directory)
-
-        # Apply filter if specified
-        if filter_string:
-            needle = filter_string.lower()
-            images = [img for img in images if needle in img.path.stem.lower()]
-
-        # Convert ImageFile to ThumbnailEntry
-        for img in images:
+            # Scan for folders
+            folders: List[ThumbnailEntry] = []
             try:
-                stat_info = img.path.stat()
-                mtime_ns = stat_info.st_mtime_ns
-            except OSError:
-                mtime_ns = int(img.timestamp * 1e9) if img.timestamp else 0
+                for entry in os.scandir(self._current_directory):
+                    if entry.is_dir() and not entry.name.startswith("."):
+                        folder_path = Path(entry.path)
+                        try:
+                            stat_info = entry.stat()
+                            mtime_ns = stat_info.st_mtime_ns
+                        except OSError:
+                            mtime_ns = 0
 
-            # Get metadata if callback provided
-            is_stacked = False
-            is_uploaded = False
-            is_edited = False
-            is_restacked = False
+                        folder_stats = read_folder_stats(folder_path)
+                        # Fall back to counting actual files for folders without faststack.json
+                        # (e.g., recycle bin)
+                        if folder_stats is None:
+                            folder_stats = count_images_in_folder(folder_path)
 
-            if self._get_metadata:
+                        folders.append(
+                            ThumbnailEntry(
+                                path=folder_path,
+                                name=entry.name,
+                                is_folder=True,
+                                folder_stats=folder_stats,
+                                mtime_ns=mtime_ns,
+                            )
+                        )
+            except OSError as e:
+                log.warning(
+                    "Error scanning directory %s: %s", self._current_directory, e
+                )
+
+            # Sort folders alphabetically
+            folders.sort(key=lambda e: e.name.lower())
+            self._entries.extend(folders)
+
+            # Get images using existing indexer (respects filter rules)
+            images = find_images(self._current_directory)
+
+            # Apply filter if specified
+            if filter_string:
+                needle = filter_string.lower()
+                images = [img for img in images if needle in img.path.stem.lower()]
+
+            # Convert ImageFile to ThumbnailEntry
+            for img in images:
                 try:
-                    meta = self._get_metadata(img.path.stem)
-                    is_stacked = meta.get("stacked", False)
-                    is_uploaded = meta.get("uploaded", False)
-                    is_edited = meta.get("edited", False)
-                    is_restacked = meta.get("restacked", False)
-                except Exception:
-                    pass
+                    stat_info = img.path.stat()
+                    mtime_ns = stat_info.st_mtime_ns
+                except OSError:
+                    mtime_ns = int(img.timestamp * 1e9) if img.timestamp else 0
 
-            self._entries.append(ThumbnailEntry(
-                path=img.path,
-                name=img.path.name,
-                is_folder=False,
-                is_stacked=is_stacked,
-                is_uploaded=is_uploaded,
-                is_edited=is_edited,
-                is_restacked=is_restacked,
-                mtime_ns=mtime_ns,
-            ))
+                # Get metadata if callback provided
+                is_stacked = False
+                is_uploaded = False
+                is_edited = False
+                is_restacked = False
 
-        # Build id_to_row mapping
-        self._rebuild_id_mapping()
+                if self._get_metadata:
+                    try:
+                        meta = self._get_metadata(img.path.stem)
+                        is_stacked = meta.get("stacked", False)
+                        is_uploaded = meta.get("uploaded", False)
+                        is_edited = meta.get("edited", False)
+                        is_restacked = meta.get("restacked", False)
+                    except Exception:
+                        pass
 
-        self.endResetModel()
+                self._entries.append(
+                    ThumbnailEntry(
+                        path=img.path,
+                        name=img.path.name,
+                        is_folder=False,
+                        is_stacked=is_stacked,
+                        is_uploaded=is_uploaded,
+                        is_edited=is_edited,
+                        is_restacked=is_restacked,
+                        mtime_ns=mtime_ns,
+                    )
+                )
+
+            # Build id_to_row mapping
+            self._rebuild_id_mapping()
+
+        finally:
+            self.endResetModel()
+
         # Selection was cleared during refresh
         self.selectionChanged.emit()
-        log.info("ThumbnailModel refreshed: %d entries (%d folders, %d images)",
-                 len(self._entries),
-                 sum(1 for e in self._entries if e.is_folder),
-                 sum(1 for e in self._entries if not e.is_folder))
+        log.info(
+            "ThumbnailModel refreshed: %d entries (%d folders, %d images)",
+            len(self._entries),
+            sum(1 for e in self._entries if e.is_folder),
+            sum(1 for e in self._entries if not e.is_folder),
+        )
 
     def _rebuild_id_mapping(self):
         """Rebuild the id_to_row mapping for all entries."""
@@ -375,24 +440,37 @@ class ThumbnailModel(QAbstractListModel):
         self._last_selected_index = None
         # Don't call refresh() here - caller should do it after updating other state
 
-    def navigate_to(self, path: Path):
+    def navigate_to(self, path: Path, update_base_if_above: bool = False):
         """Navigate to a different directory.
 
         Args:
-            path: Directory to navigate to. Must be within base_directory.
+            path: Directory to navigate to.
+            update_base_if_above: If True and path is above base_directory,
+                                  update base_directory to path. Used for
+                                  "go up" navigation above initial directory.
         """
         resolved = path.resolve()
-
-        # Security check: don't navigate outside base directory
-        try:
-            resolved.relative_to(self._base_directory)
-        except ValueError:
-            log.warning("Attempted to navigate outside base directory: %s", resolved)
-            return
 
         if not resolved.is_dir():
             log.warning("Cannot navigate to non-directory: %s", resolved)
             return
+
+        # Check if navigating above base directory
+        try:
+            resolved.relative_to(self._base_directory)
+        except ValueError:
+            # path is outside base_directory
+            if update_base_if_above:
+                # Allow navigation up - update base_directory
+                log.info(
+                    "Navigating above base directory, updating base to: %s", resolved
+                )
+                self._base_directory = resolved
+            else:
+                log.warning(
+                    "Attempted to navigate outside base directory: %s", resolved
+                )
+                return
 
         self._current_directory = resolved
         self._selected_indices.clear()

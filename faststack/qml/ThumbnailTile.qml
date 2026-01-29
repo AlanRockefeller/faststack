@@ -21,6 +21,7 @@ Item {
     property var tileFolderStats: null
     property bool tileIsSelected: false
     property bool tileIsParentFolder: false
+    property bool tileHasCursor: false  // Keyboard cursor position
 
     // Theme property (bound by parent)
     property bool isDarkTheme: false
@@ -44,6 +45,12 @@ Item {
     property color editedColor: "#FFEB3B"    // Yellow for edited (E)
     property color restackedColor: "#FF9800" // Orange for restacked (R)
     property color batchColor: "#2196F3"     // Blue for batch (B)
+    property color cursorColor: "#00BFFF"    // Cyan for keyboard cursor
+    property color loadingColor: tile.isDarkTheme ? "#3c3c3c" : "#e0e0e0"
+    property color counterUploadedCol: "#7BBF7F"   // Muted green
+    property color counterStackedCol: "#E8A64C"    // Muted orange
+    property color counterEditedCol: "#E8D44C"     // Muted yellow
+    property color emptyTextColor: tile.isDarkTheme ? "#888888" : "#666666"
 
     // Background
     Rectangle {
@@ -53,6 +60,8 @@ Item {
                 return Qt.rgba(currentColor.r, currentColor.g, currentColor.b, 0.25)
             } else if (tile.tileIsSelected) {
                 return Qt.rgba(selectedColor.r, selectedColor.g, selectedColor.b, 0.3)
+            } else if (tile.tileHasCursor) {
+                return Qt.rgba(cursorColor.r, cursorColor.g, cursorColor.b, 0.15)
             } else if (tileMouseArea.containsMouse) {
                 return hoverColor
             }
@@ -60,16 +69,18 @@ Item {
         }
         radius: 4
 
-        // Border - current gets gold, selected gets green
+        // Border - current gets gold, selected gets green, cursor gets cyan
         border.color: {
             if (tile.tileIsCurrent && !tile.tileIsFolder) {
                 return currentColor
             } else if (tile.tileIsSelected) {
                 return selectedColor
+            } else if (tile.tileHasCursor) {
+                return cursorColor
             }
             return "transparent"
         }
-        border.width: (tile.tileIsCurrent || tile.tileIsSelected) && !tile.tileIsFolder ? 3 : 0
+        border.width: (tile.tileIsCurrent || tile.tileIsSelected || tile.tileHasCursor) && !tile.tileIsFolder ? 3 : (tile.tileHasCursor && tile.tileIsFolder ? 2 : 0)
     }
 
     // Content column
@@ -100,7 +111,7 @@ Item {
                 Rectangle {
                     anchors.fill: parent
                     visible: thumbnailImage.status === Image.Loading
-                    color: tile.isDarkTheme ? "#3c3c3c" : "#e0e0e0"
+                    color: tile.loadingColor
 
                     BusyIndicator {
                         anchors.centerIn: parent
@@ -111,13 +122,13 @@ Item {
                 }
             }
 
-            // Folder icon overlay (for folders without faststack.json)
+            // Folder icon overlay (flat folder icon for dark mode)
             Text {
                 anchors.centerIn: parent
                 visible: tile.tileIsFolder && !tile.tileIsParentFolder
-                text: "\uD83D\uDCC1"  // Folder emoji
-                font.pixelSize: 48
-                opacity: 0.8
+                text: "\uD83D\uDDC2"  // File cabinet / open folder emoji (cleaner look)
+                font.pixelSize: 44
+                opacity: 0.7
             }
 
             // Parent folder indicator
@@ -219,50 +230,216 @@ Item {
                 }
             }
 
-            // Folder stats overlay (for folders with faststack.json)
-            Rectangle {
+            // ============================================================
+            // TOP STATS OVERLAY: U (left), S (center), E (right)
+            // Colored text: U=green, S=orange, E=yellow
+            // Thin top scrim for readability
+            // ============================================================
+            Item {
+                id: topStatsOverlay
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: 22
+                visible: tile.tileIsFolder && tile.tileFolderStats && tile.tileFolderStats.total_images > 0
+
+                // Thin top scrim gradient
+                Rectangle {
+                    anchors.fill: parent
+                    gradient: Gradient {
+                        GradientStop { position: 0.0; color: Qt.rgba(0, 0, 0, 0.35) }
+                        GradientStop { position: 1.0; color: Qt.rgba(0, 0, 0, 0.0) }
+                    }
+                }
+
+                // Shared font for tabular numerals
+                property string numFont: "Consolas, Monaco, monospace"
+                property int numSize: 10
+                // Muted colors for counters
+                property color uploadedCol: tile.counterUploadedCol
+                property color stackedCol: tile.counterStackedCol
+                property color editedCol: tile.counterEditedCol
+                // Letter slightly dimmer than number
+                property real letterOpacity: 0.85
+                property real numberOpacity: 1.0
+
+                // U counter (top-left, always shown)
+                Row {
+                    anchors.left: parent.left
+                    anchors.top: parent.top
+                    anchors.leftMargin: 8
+                    anchors.topMargin: 5
+                    spacing: 3
+                    Text {
+                        text: "U"
+                        font.pixelSize: topStatsOverlay.numSize
+                        font.weight: Font.Medium
+                        font.family: topStatsOverlay.numFont
+                        color: topStatsOverlay.uploadedCol
+                        opacity: topStatsOverlay.letterOpacity
+                    }
+                    Text {
+                        text: tile.tileFolderStats ? tile.tileFolderStats.uploaded_count.toString() : "0"
+                        font.pixelSize: topStatsOverlay.numSize
+                        font.weight: Font.DemiBold
+                        font.family: topStatsOverlay.numFont
+                        color: topStatsOverlay.uploadedCol
+                        opacity: topStatsOverlay.numberOpacity
+                    }
+                }
+
+                // S counter (top-center, only if stacked_count > 0)
+                Row {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.top: parent.top
+                    anchors.topMargin: 5
+                    spacing: 3
+                    visible: tile.tileFolderStats && tile.tileFolderStats.stacked_count > 0
+                    Text {
+                        text: "S"
+                        font.pixelSize: topStatsOverlay.numSize
+                        font.weight: Font.Medium
+                        font.family: topStatsOverlay.numFont
+                        color: topStatsOverlay.stackedCol
+                        opacity: topStatsOverlay.letterOpacity
+                    }
+                    Text {
+                        text: tile.tileFolderStats ? tile.tileFolderStats.stacked_count.toString() : "0"
+                        font.pixelSize: topStatsOverlay.numSize
+                        font.weight: Font.DemiBold
+                        font.family: topStatsOverlay.numFont
+                        color: topStatsOverlay.stackedCol
+                        opacity: topStatsOverlay.numberOpacity
+                    }
+                }
+
+                // E counter (top-right, only if edited_count > 0)
+                Row {
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.rightMargin: 8
+                    anchors.topMargin: 5
+                    spacing: 3
+                    visible: tile.tileFolderStats && tile.tileFolderStats.edited_count > 0
+                    Text {
+                        text: "E"
+                        font.pixelSize: topStatsOverlay.numSize
+                        font.weight: Font.Medium
+                        font.family: topStatsOverlay.numFont
+                        color: topStatsOverlay.editedCol
+                        opacity: topStatsOverlay.letterOpacity
+                    }
+                    Text {
+                        text: tile.tileFolderStats ? tile.tileFolderStats.edited_count.toString() : "0"
+                        font.pixelSize: topStatsOverlay.numSize
+                        font.weight: Font.DemiBold
+                        font.family: topStatsOverlay.numFont
+                        color: topStatsOverlay.editedCol
+                        opacity: topStatsOverlay.numberOpacity
+                    }
+                }
+            }
+
+            // ============================================================
+            // BOTTOM OVERLAY: Sparkline + Centered file counts
+            // ============================================================
+            Item {
+                id: bottomOverlay
                 anchors.bottom: parent.bottom
                 anchors.left: parent.left
                 anchors.right: parent.right
-                height: tile.tileFolderStats && tile.tileFolderStats.total_images > 0 ? 36 : 0
-                color: Qt.rgba(0, 0, 0, 0.7)
+                height: 38
                 visible: tile.tileIsFolder && tile.tileFolderStats && tile.tileFolderStats.total_images > 0
 
-                Column {
-                    anchors.centerIn: parent
-                    spacing: 2
+                // Subtle 3-stop gradient scrim (starts at ~80%)
+                Rectangle {
+                    anchors.fill: parent
+                    gradient: Gradient {
+                        GradientStop { position: 0.0; color: Qt.rgba(0, 0, 0, 0.0) }
+                        GradientStop { position: 0.4; color: Qt.rgba(0, 0, 0, 0.20) }
+                        GradientStop { position: 1.0; color: Qt.rgba(0, 0, 0, 0.55) }
+                    }
+                }
+
+                // Shared font for tabular numerals
+                property string numFont: "Consolas, Monaco, monospace"
+                property int numSize: 11
+
+                // Coverage sparkline (dual-channel: upload green, stack orange)
+                Row {
+                    id: sparklineRow
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottom: countsRow.top
+                    anchors.bottomMargin: 4
+                    spacing: 1
+                    visible: tile.tileFolderStats && tile.tileFolderStats.coverage_buckets && tile.tileFolderStats.coverage_buckets.length > 0
+
+                    Repeater {
+                        model: tile.tileFolderStats && tile.tileFolderStats.coverage_buckets ? tile.tileFolderStats.coverage_buckets : []
+
+                        delegate: Column {
+                            spacing: 1
+                            // Upload bar (green) - top
+                            Rectangle {
+                                width: 3
+                                height: 2
+                                radius: 0.5
+                                color: tile.counterUploadedCol
+                                opacity: modelData[0] * 0.9 + 0.1  // 0.1 base opacity, up to 1.0
+                            }
+                            // Stack bar (orange) - bottom
+                            Rectangle {
+                                width: 3
+                                height: 2
+                                radius: 0.5
+                                color: tile.counterStackedCol
+                                opacity: modelData[1] * 0.9 + 0.1  // 0.1 base opacity, up to 1.0
+                            }
+                        }
+                    }
+                }
+
+                // File counts: "{jpg_count} JPG · {raw_count} RAW" (centered, always show both)
+                Row {
+                    id: countsRow
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 6
+                    spacing: 0
 
                     Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: tile.tileFolderStats ? tile.tileFolderStats.total_images + " images" : ""
-                        font.pixelSize: 10
-                        font.bold: true
-                        color: "white"
+                        text: tile.tileFolderStats ? tile.tileFolderStats.jpg_count.toString() : "0"
+                        font.pixelSize: bottomOverlay.numSize
+                        font.weight: Font.DemiBold
+                        font.family: bottomOverlay.numFont
+                        color: "#FFFFFF"
                     }
-
-                    Row {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        spacing: 6
-                        visible: tile.tileFolderStats && (tile.tileFolderStats.stacked_count > 0 || tile.tileFolderStats.uploaded_count > 0 || tile.tileFolderStats.edited_count > 0)
-
-                        Text {
-                            visible: tile.tileFolderStats && tile.tileFolderStats.stacked_count > 0
-                            text: "S:" + (tile.tileFolderStats ? tile.tileFolderStats.stacked_count : 0)
-                            font.pixelSize: 9
-                            color: "#FF9800"
-                        }
-                        Text {
-                            visible: tile.tileFolderStats && tile.tileFolderStats.uploaded_count > 0
-                            text: "U:" + (tile.tileFolderStats ? tile.tileFolderStats.uploaded_count : 0)
-                            font.pixelSize: 9
-                            color: "#4CAF50"
-                        }
-                        Text {
-                            visible: tile.tileFolderStats && tile.tileFolderStats.edited_count > 0
-                            text: "E:" + (tile.tileFolderStats ? tile.tileFolderStats.edited_count : 0)
-                            font.pixelSize: 9
-                            color: "#FFEB3B"
-                        }
+                    Text {
+                        text: " IMG"
+                        font.pixelSize: bottomOverlay.numSize
+                        font.weight: Font.Medium
+                        font.family: bottomOverlay.numFont
+                        color: Qt.rgba(1, 1, 1, 0.85)
+                    }
+                    Text {
+                        text: " · "
+                        font.pixelSize: bottomOverlay.numSize
+                        font.weight: Font.Medium
+                        color: Qt.rgba(1, 1, 1, 0.5)
+                    }
+                    Text {
+                        text: tile.tileFolderStats ? tile.tileFolderStats.raw_count.toString() : "0"
+                        font.pixelSize: bottomOverlay.numSize
+                        font.weight: Font.DemiBold
+                        font.family: bottomOverlay.numFont
+                        color: "#FFFFFF"
+                    }
+                    Text {
+                        text: " RAW"
+                        font.pixelSize: bottomOverlay.numSize
+                        font.weight: Font.Medium
+                        font.family: bottomOverlay.numFont
+                        color: Qt.rgba(1, 1, 1, 0.85)
                     }
                 }
             }
@@ -286,7 +463,7 @@ Item {
         id: tileMouseArea
         anchors.fill: parent
         hoverEnabled: true
-        acceptedButtons: Qt.LeftButton
+        acceptedButtons: Qt.LeftButton | Qt.RightButton
 
         onClicked: function(mouse) {
             if (tile.tileIsFolder) {
@@ -296,12 +473,16 @@ Item {
                 // Handle selection or opening
                 var hasShift = (mouse.modifiers & Qt.ShiftModifier)
                 var hasCtrl = (mouse.modifiers & Qt.ControlModifier)
+                var isRightClick = (mouse.button === Qt.RightButton)
 
-                if (hasShift || hasCtrl) {
-                    // Batch selection
+                if (isRightClick) {
+                    // Right-click: toggle selection (as per help text)
+                    uiState.gridSelectIndex(tile.tileIndex, false, true)
+                } else if (hasShift || hasCtrl) {
+                    // Shift: range select, Ctrl: add to selection
                     uiState.gridSelectIndex(tile.tileIndex, hasShift, hasCtrl)
                 } else {
-                    // Open in loupe view
+                    // Left-click without modifiers: open in loupe view
                     uiState.gridOpenIndex(tile.tileIndex)
                 }
             }

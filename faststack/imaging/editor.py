@@ -1,14 +1,12 @@
 import logging
 import os
 import shutil
-import glob
 import re
 import math
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ExifTags
-from io import BytesIO
+from PIL import Image, ImageFilter, ImageOps, ExifTags
 
 
 from faststack.models import DecodedImage
@@ -29,7 +27,7 @@ try:
 except ImportError:
     QImage = None
 
-from faststack.imaging.optional_deps import cv2, HAS_OPENCV
+from faststack.imaging.optional_deps import cv2
 
 import threading
 
@@ -57,13 +55,12 @@ def sanitize_exif_orientation(exif_bytes: bytes | None) -> bytes | None:
         exif = Image.Exif()
         exif.load(exif_bytes)
         # Pillow 9.1.0+ has ExifTags.Base.Orientation, fallback to 0x0112 if needed
-        orientation_tag = getattr(ExifTags.Base, 'Orientation', 0x0112)
+        orientation_tag = getattr(ExifTags.Base, "Orientation", 0x0112)
         exif[orientation_tag] = 1
         return exif.tobytes()
     except Exception:
         # If we can't parse/sanitize, safest is to drop EXIF to avoid rotation bugs
         return None
-
 
 
 def create_backup_file(original_path: Path) -> Optional[Path]:
@@ -145,7 +142,7 @@ def _gaussian_blur_float(arr: np.ndarray, radius: float) -> np.ndarray:
         try:
             h, w, c = arr.shape
             blurred_channels = []
-            
+
             # Process each channel independently
             for i in range(c):
                 ch_data = arr[:, :, i]
@@ -154,21 +151,25 @@ def _gaussian_blur_float(arr: np.ndarray, radius: float) -> np.ndarray:
                 mx = max(1.0, float(ch_data.max()))
                 mn = min(0.0, float(ch_data.min()))
                 scale = mx - mn
-                
+
                 if scale > 0:
                     ch_u8 = ((ch_data - mn) / scale * 255).astype(np.uint8)
-                    ch_img = Image.fromarray(ch_u8, mode='L')
+                    ch_img = Image.fromarray(ch_u8, mode="L")
                     # Pillow's GaussianBlur radius is roughly comparable to OpenCV sigma
-                    blurred_ch_img = ch_img.filter(ImageFilter.GaussianBlur(radius=radius))
+                    blurred_ch_img = ch_img.filter(
+                        ImageFilter.GaussianBlur(radius=radius)
+                    )
                     # Scale back to original float range
-                    blurred_ch = np.array(blurred_ch_img).astype(np.float32) / 255.0 * scale + mn
+                    blurred_ch = (
+                        np.array(blurred_ch_img).astype(np.float32) / 255.0 * scale + mn
+                    )
                     blurred_channels.append(blurred_ch)
                 else:
                     blurred_channels.append(ch_data.copy())
-            
+
             # Stack back into (H, W, C)
             return np.stack(blurred_channels, axis=-1)
-            
+
         except Exception as e:
             log.warning(f"Fallback blur failed: {e}")
             return arr
@@ -526,7 +527,9 @@ class ImageEditor:
                 # The cached_preview is also "cooked" (has Color Management / Saturation applied).
                 # We use it for the VERY FIRST frame for fast display, then immediately
                 # re-render from the master float_image in the background.
-                log.debug("Using cached preview (assumed orientation-correct from prefetcher)")
+                log.debug(
+                    "Using cached preview (assumed orientation-correct from prefetcher)"
+                )
 
                 loaded_float_preview = preview_arr.astype(np.float32) / 255.0
             else:
@@ -755,7 +758,7 @@ class ImageEditor:
         # Capture pre-exposure linear state for "True Headroom" calculation
         pre_exposure_linear_stride = None
         if should_analyze:
-             pre_exposure_linear_stride = arr[::4, ::4, :]
+            pre_exposure_linear_stride = arr[::4, ::4, :]
 
         # 6. Exposure (Linear Gain for True Headroom)
         exposure = edits.get("exposure", 0.0)
@@ -772,12 +775,15 @@ class ImageEditor:
         if should_analyze:
             # Check cache for analysis state to avoid expensive re-computation on downstream edits
             upstream_hash = self._get_upstream_edits_hash(edits)
-            
+
             cached_analysis = None
             with self._lock:
-                if self._cached_highlight_analysis and self._cached_highlight_analysis['hash'] == upstream_hash:
-                    cached_analysis = self._cached_highlight_analysis['state']
-            
+                if (
+                    self._cached_highlight_analysis
+                    and self._cached_highlight_analysis["hash"] == upstream_hash
+                ):
+                    cached_analysis = self._cached_highlight_analysis["state"]
+
             if cached_analysis:
                 analysis_state = cached_analysis
             else:
@@ -787,15 +793,15 @@ class ImageEditor:
                 # Pass pre_exposure_linear_stride to measure "True Headroom" before exposure boost
                 # arr_linear_stride is "Current State" (Post-WB, Post-Exposure)
                 analysis_state = _analyze_highlight_state(
-                    arr_linear_stride, 
-                    srgb_u8=srgb_u8_stride, # Source (Pre-Edit) State
-                    pre_exposure_linear=pre_exposure_linear_stride
+                    arr_linear_stride,
+                    srgb_u8=srgb_u8_stride,  # Source (Pre-Edit) State
+                    pre_exposure_linear=pre_exposure_linear_stride,
                 )
-                
+
                 with self._lock:
                     self._cached_highlight_analysis = {
-                        'hash': upstream_hash,
-                        'state': analysis_state
+                        "hash": upstream_hash,
+                        "state": analysis_state,
                     }
 
         if not for_export:
@@ -853,7 +859,11 @@ class ImageEditor:
             with self._lock:
                 cached = self._cached_detail_bands
                 # Verify both hash AND frozen values to avoid collisions
-                if cached and cached.get("hash") == detail_hash and cached.get("frozen") == detail_frozen:
+                if (
+                    cached
+                    and cached.get("hash") == detail_hash
+                    and cached.get("frozen") == detail_frozen
+                ):
                     Y20_cached = cached.get("Y20")
                     Y3_cached = cached.get("Y3")
                     Y1_cached = cached.get("Y1")
@@ -866,7 +876,11 @@ class ImageEditor:
             # exposure and detail bands, this scaling is APPROXIMATE when h/s is active.
             # The approximation is good enough for smooth 60fps dragging; exact render
             # happens when upstream params (WB/crop/rotate) change and cache invalidates.
-            exp_scale = current_exp_gain / cached_exp_gain if cache_hit and abs(cached_exp_gain) > 1e-9 else 1.0
+            exp_scale = (
+                current_exp_gain / cached_exp_gain
+                if cache_hit and abs(cached_exp_gain) > 1e-9
+                else 1.0
+            )
 
             # Safe extraction: use [..., 0] if 3D, else keep as-is (avoids squeeze() collapsing H/W)
             def _extract_2d(blur_result):
@@ -913,7 +927,11 @@ class ImageEditor:
                             "Y1": Y1_cached,
                         }
                         # Add newly computed blurs (they're at current_exp_gain, need to rescale to cached_exp_gain)
-                        rescale_to_cached = cached_exp_gain / current_exp_gain if abs(current_exp_gain) > 1e-9 else 1.0
+                        rescale_to_cached = (
+                            cached_exp_gain / current_exp_gain
+                            if abs(current_exp_gain) > 1e-9
+                            else 1.0
+                        )
                         for key, val in newly_computed.items():
                             if val is not None:
                                 new_cache[key] = val * rescale_to_cached
@@ -1371,7 +1389,7 @@ class ImageEditor:
             # Re-compute locally if not provided
             # We assume srgb_u8_stride is ALREADY STRIDED if passed (based on the name change)
             arr_stride = arr[::4, ::4, :]
-            # If srgb_u8_stride was passed, use it directly (it's already small). 
+            # If srgb_u8_stride was passed, use it directly (it's already small).
             # If it wasn't passed, we can't easily recreate the source state here without the original source buffer.
             # But the caller (_apply_edits) usually provides it.
             state = _analyze_highlight_state(arr_stride, srgb_u8=srgb_u8_stride)
@@ -1555,7 +1573,7 @@ class ImageEditor:
         Prefers cached source EXIF (from paired JPEG) if available,
         otherwise falls back to the current original_image's EXIF.
 
-        If sanitization or serialization fails, returns None (drops EXIF) 
+        If sanitization or serialization fails, returns None (drops EXIF)
         to prevent incorrect "double rotation" in viewers.
 
         Returns:
@@ -1599,13 +1617,17 @@ class ImageEditor:
 
             # 5. Guard for tobytes()
             if not hasattr(exif, "tobytes"):
-                log.warning("EXIF object has no tobytes() method, dropping EXIF to prevent rotation issues.")
+                log.warning(
+                    "EXIF object has no tobytes() method, dropping EXIF to prevent rotation issues."
+                )
                 return None
 
             try:
                 return exif.tobytes()
             except Exception as e:
-                log.warning(f"Failed to serialize sanitized EXIF: {e}. Dropping EXIF to prevent rotation issues.")
+                log.warning(
+                    f"Failed to serialize sanitized EXIF: {e}. Dropping EXIF to prevent rotation issues."
+                )
                 return None
         except Exception as e:
             log.warning(f"Failed to sanitize EXIF orientation: {e}. Dropping EXIF.")

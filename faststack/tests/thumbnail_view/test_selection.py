@@ -1,8 +1,6 @@
 """Tests for selection functionality in ThumbnailModel."""
 
 import pytest
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 from faststack.thumbnail_view.model import ThumbnailModel, ThumbnailEntry
 
@@ -28,11 +26,36 @@ def model_with_images(temp_folder):
 
     # Manually populate entries for testing
     model._entries = [
-        ThumbnailEntry(path=temp_folder / "image0.jpg", name="image0.jpg", is_folder=False, mtime_ns=1000),
-        ThumbnailEntry(path=temp_folder / "image1.jpg", name="image1.jpg", is_folder=False, mtime_ns=1001),
-        ThumbnailEntry(path=temp_folder / "image2.jpg", name="image2.jpg", is_folder=False, mtime_ns=1002),
-        ThumbnailEntry(path=temp_folder / "image3.jpg", name="image3.jpg", is_folder=False, mtime_ns=1003),
-        ThumbnailEntry(path=temp_folder / "image4.jpg", name="image4.jpg", is_folder=False, mtime_ns=1004),
+        ThumbnailEntry(
+            path=temp_folder / "image0.jpg",
+            name="image0.jpg",
+            is_folder=False,
+            mtime_ns=1000,
+        ),
+        ThumbnailEntry(
+            path=temp_folder / "image1.jpg",
+            name="image1.jpg",
+            is_folder=False,
+            mtime_ns=1001,
+        ),
+        ThumbnailEntry(
+            path=temp_folder / "image2.jpg",
+            name="image2.jpg",
+            is_folder=False,
+            mtime_ns=1002,
+        ),
+        ThumbnailEntry(
+            path=temp_folder / "image3.jpg",
+            name="image3.jpg",
+            is_folder=False,
+            mtime_ns=1003,
+        ),
+        ThumbnailEntry(
+            path=temp_folder / "image4.jpg",
+            name="image4.jpg",
+            is_folder=False,
+            mtime_ns=1004,
+        ),
     ]
 
     return model
@@ -175,8 +198,12 @@ class TestFolderSelection:
 
         # Add a folder entry
         model._entries = [
-            ThumbnailEntry(path=temp_folder / "subfolder", name="subfolder", is_folder=True),
-            ThumbnailEntry(path=temp_folder / "image.jpg", name="image.jpg", is_folder=False),
+            ThumbnailEntry(
+                path=temp_folder / "subfolder", name="subfolder", is_folder=True
+            ),
+            ThumbnailEntry(
+                path=temp_folder / "image.jpg", name="image.jpg", is_folder=False
+            ),
         ]
 
         # Try to select folder
@@ -195,9 +222,15 @@ class TestFolderSelection:
 
         # Add mixed entries
         model._entries = [
-            ThumbnailEntry(path=temp_folder / "image0.jpg", name="image0.jpg", is_folder=False),
-            ThumbnailEntry(path=temp_folder / "subfolder", name="subfolder", is_folder=True),
-            ThumbnailEntry(path=temp_folder / "image1.jpg", name="image1.jpg", is_folder=False),
+            ThumbnailEntry(
+                path=temp_folder / "image0.jpg", name="image0.jpg", is_folder=False
+            ),
+            ThumbnailEntry(
+                path=temp_folder / "subfolder", name="subfolder", is_folder=True
+            ),
+            ThumbnailEntry(
+                path=temp_folder / "image1.jpg", name="image1.jpg", is_folder=False
+            ),
         ]
 
         # Select first image, then shift-click third
@@ -292,7 +325,9 @@ class TestGetSelectedPaths:
         )
 
         model._entries = [
-            ThumbnailEntry(path=temp_folder / "image.jpg", name="image.jpg", is_folder=False),
+            ThumbnailEntry(
+                path=temp_folder / "image.jpg", name="image.jpg", is_folder=False
+            ),
         ]
 
         model.select_index(0, shift=False, ctrl=False)

@@ -5,6 +5,7 @@ import logging.handlers
 import os
 from pathlib import Path
 
+
 def get_app_data_dir() -> Path:
     """Returns the application data directory."""
     app_data = os.getenv("APPDATA")
@@ -12,9 +13,10 @@ def get_app_data_dir() -> Path:
         return Path(app_data) / "faststack"
     return Path.home() / ".faststack"
 
+
 def setup_logging(debug: bool = False):
     """Sets up logging to a rotating file in the app data directory.
-    
+
     Args:
         debug: If True, sets log level to DEBUG. Otherwise, sets to WARNING to reduce noise.
     """
@@ -24,7 +26,7 @@ def setup_logging(debug: bool = False):
 
     # File handler
     file_handler = logging.handlers.RotatingFileHandler(
-        log_file, maxBytes=10*1024*1024, backupCount=5
+        log_file, maxBytes=10 * 1024 * 1024, backupCount=5
     )
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

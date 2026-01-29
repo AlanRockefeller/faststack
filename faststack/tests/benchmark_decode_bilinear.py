@@ -1,9 +1,15 @@
-
 import time
 import io
 import numpy as np
 from PIL import Image
-from faststack.imaging.jpeg import decode_jpeg_rgb, _get_turbojpeg_scaling_factor, TURBO_AVAILABLE, jpeg_decoder, TJPF_RGB
+from faststack.imaging.jpeg import (
+    decode_jpeg_rgb,
+    _get_turbojpeg_scaling_factor,
+    TURBO_AVAILABLE,
+    jpeg_decoder,
+    TJPF_RGB,
+)
+
 
 def decode_jpeg_resized_bilinear(jpeg_bytes: bytes, width: int, height: int):
     """Decodes and resizes a JPEG to fit within the given dimensions using BILINEAR."""
@@ -22,15 +28,15 @@ def decode_jpeg_resized_bilinear(jpeg_bytes: bytes, width: int, height: int):
                 max_dim = height
 
             scale_factor = _get_turbojpeg_scaling_factor(img_width, img_height, max_dim)
-         
+
             if scale_factor:
                 decoded = jpeg_decoder.decode(
-                    jpeg_bytes, 
+                    jpeg_bytes,
                     scaling_factor=scale_factor,
-                    pixel_format=TJPF_RGB, 
-                    flags=0
+                    pixel_format=TJPF_RGB,
+                    flags=0,
                 )
-                
+
                 # Only use Pillow for final resize if needed
                 if decoded.shape[0] > height or decoded.shape[1] > width:
                     img = Image.fromarray(decoded)
@@ -40,7 +46,7 @@ def decode_jpeg_resized_bilinear(jpeg_bytes: bytes, width: int, height: int):
                 return decoded
         except Exception as e:
             print(f"PyTurboJPEG failed: {e}")
-    
+
     # Fallback to Pillow
     try:
         img = Image.open(io.BytesIO(jpeg_bytes))
@@ -50,6 +56,7 @@ def decode_jpeg_resized_bilinear(jpeg_bytes: bytes, width: int, height: int):
         print(f"Pillow failed: {e}")
         return None
 
+
 def create_test_jpeg(width=6000, height=4000):
     """Creates a large test JPEG in memory."""
     print(f"Creating test JPEG ({width}x{height})...")
@@ -58,6 +65,7 @@ def create_test_jpeg(width=6000, height=4000):
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
+
 
 def benchmark():
     jpeg_bytes = create_test_jpeg()
@@ -78,7 +86,8 @@ def benchmark():
 
     avg_time = (end - start) / iterations
     print(f"Average decode time (BILINEAR): {avg_time:.4f} s")
-    print(f"FPS: {1/avg_time:.2f}")
+    print(f"FPS: {1 / avg_time:.2f}")
+
 
 if __name__ == "__main__":
     benchmark()
