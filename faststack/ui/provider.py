@@ -1348,7 +1348,7 @@ class UIState(QObject):
     @Property(str, notify=recycleBinStatsTextChanged)
     def recycleBinStatsText(self):
         """Returns a formatted string of recycle bin stats."""
-        stats = self._app_controller.get_recycle_bin_stats()
+        stats = self.app_controller.get_recycle_bin_stats()
         if not stats:
             return ""
 
@@ -1362,12 +1362,13 @@ class UIState(QObject):
     @Property(bool, notify=hasRecycleBinItemsChanged)
     def hasRecycleBinItems(self):
         """Returns True if there are items in any recycle bin."""
-        stats = self._app_controller.get_recycle_bin_stats()
+        stats = self.app_controller.get_recycle_bin_stats()
         return len(stats) > 0
 
     @Slot()
     def cleanupRecycleBins(self):
         """Deletes all tracked recycle bins."""
-        self._app_controller.cleanup_recycle_bins()
+        self.app_controller.cleanup_recycle_bins()
+
         self.recycleBinStatsTextChanged.emit()
         self.hasRecycleBinItemsChanged.emit()

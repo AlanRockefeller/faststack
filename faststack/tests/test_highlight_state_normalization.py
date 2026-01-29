@@ -13,23 +13,17 @@ class TestUIStateNormalization(unittest.TestCase):
         self.mock_controller.image_editor = self.mock_editor
         self.ui_state = UIState(self.mock_controller)
 
-    def test_highlight_state_normalization_standard(self):
-        """Test with standard keys."""
+    def test_highlight_state_normalization_legacy_keys(self):
+        """Test with legacy keys."""
         self.mock_editor._last_highlight_state = {
             "headroom_pct": 0.1,
             "clipped_pct": 0.2,
             "near_white_pct": 0.3,
         }
-        # Controller returns canonical keys using the passed dict (even if they were wrong in backend, provider normalizes?
-        # NO, provider simply gets what is in the dict.
-        # Wait, provider logic:
-        # return {
-        #     'headroom_pct': state.get('headroom_pct', 0.0),
-        #     'source_clipped_pct': state.get('source_clipped_pct', 0.0),
-        #     'current_nearwhite_pct': state.get('current_nearwhite_pct', 0.0)
-        # }
-        # So if backend has OLD keys, provider will return 0.0 for new keys!
-        # This confirms that backend MUST populate new keys.
+        state = self.ui_state.highlightState
+        self.assertEqual(state["headroom_pct"], 0.1)
+        self.assertEqual(state["source_clipped_pct"], 0.0)
+        self.assertEqual(state["current_nearwhite_pct"], 0.0)
 
     def test_highlight_state_normalization_standard(self):
         """Test with canonical keys present."""

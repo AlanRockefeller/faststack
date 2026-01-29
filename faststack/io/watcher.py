@@ -75,4 +75,4 @@ class Watcher:
 
     def is_alive(self) -> bool:
         """Checks if the watcher thread is alive."""
-        return self.observer and self.observer.is_alive()
+        return bool(self.observer and self.observer.is_alive())

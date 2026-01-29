@@ -6,18 +6,32 @@ sys.path.append(os.getcwd())
 
 try:
     print("Importing faststack.app...")
+    import faststack.app
+
     print("Success faststack.app")
+except ImportError as e:
+    print(f"ImportError faststack.app: {e}")
+    import traceback
+
+    traceback.print_exc()
 except Exception as e:
-    print(f"Failed faststack.app: {e}")
+    print(f"Non-ImportError during import of faststack.app: {e}")
     import traceback
 
     traceback.print_exc()
 
 try:
     print("Importing faststack.tests.test_raw_pipeline...")
+    import faststack.tests.test_raw_pipeline
+
     print("Success test_raw_pipeline")
+except ImportError as e:
+    print(f"ImportError test_raw_pipeline: {e}")
+    import traceback
+
+    traceback.print_exc()
 except Exception as e:
-    print(f"Failed test_raw_pipeline: {e}")
+    print(f"Non-ImportError during import of test_raw_pipeline: {e}")
     import traceback
 
     traceback.print_exc()
