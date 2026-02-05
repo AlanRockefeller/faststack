@@ -58,9 +58,7 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
 
         if not exif:
             return {"summary": {}, "full": {}}
-    except (
-        Exception
-    ) as e:  
+    except Exception as e:
         log.warning(f"Failed to extract EXIF from {path}: {e}")
         return {"summary": {}, "full": {}}
 

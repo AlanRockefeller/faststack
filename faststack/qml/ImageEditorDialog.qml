@@ -7,7 +7,7 @@ import QtQuick.Window 2.15
 Window {
     id: imageEditorDialog
     width: 800
-    height: 750
+    height: 820
     title: uiState && uiState.editorFilename ? "Image Editor - " + uiState.editorFilename + " (" + uiState.editorBitDepth + "-bit)" : "Image Editor"
     visible: uiState ? uiState.isEditorOpen : false
     flags: Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
@@ -67,9 +67,10 @@ Window {
     Shortcut {
         sequence: "S"
         context: Qt.WindowShortcut
+        enabled: uiState ? !uiState.isSaving : true
         onActivated: {
             controller.save_edited_image()
-            uiState.isEditorOpen = false
+            // Note: Editor closes automatically via _on_save_finished callback
         }
     }
 
@@ -396,16 +397,17 @@ Window {
 
                     // Save (Primary)
                     Button { 
-                        text: "Save"
+                        text: uiState && uiState.isSaving ? "Saving..." : "Save"
                         Layout.preferredWidth: 100
                         highlighted: true
+                        enabled: uiState ? !uiState.isSaving : true
                         Material.background: imageEditorDialog.accentColor
                         onClicked: {
                             controller.save_edited_image()
-                            uiState.isEditorOpen = false
+                            // Note: Editor closes automatically via _on_save_finished callback
                         }
                         background: Rectangle {
-                            color: parent.pressed ? Qt.darker(imageEditorDialog.accentColor, 1.1) : imageEditorDialog.accentColor
+                            color: parent.enabled ? (parent.pressed ? Qt.darker(imageEditorDialog.accentColor, 1.1) : imageEditorDialog.accentColor) : Qt.darker(imageEditorDialog.accentColor, 1.5)
                             radius: 4
                             // Subtle shadow simulation
                             layer.enabled: true

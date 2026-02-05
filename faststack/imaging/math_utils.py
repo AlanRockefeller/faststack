@@ -166,6 +166,7 @@ def _highlight_recover_linear(
     amount: float,
     *,
     pivot: float = 0.7,
+    k: float = 8.0,
     chroma_rolloff: float = 0.15,
     headroom_ceiling: float = 1.0,
 ) -> np.ndarray:
@@ -184,6 +185,7 @@ def _highlight_recover_linear(
         rgb_linear: Float32 RGB array (H, W, 3) in linear light, may have values > 1.0
         amount: Recovery strength 0.0-1.0 (mapped from slider -100 to 0)
         pivot: Brightness threshold below which no recovery occurs
+        k: Compression factor (adaptive). Higher k = stronger shoulder.
         chroma_rolloff: Desaturation amount in extreme highlights (0-1)
         headroom_ceiling: Maximum output brightness (> 1.0 preserves headroom detail)
 
@@ -202,11 +204,25 @@ def _highlight_recover_linear(
     # Use headroom_ceiling instead of 1.0 for the normalization range
     mask = _smoothstep01((brightness - pivot) / (headroom_ceiling - pivot + eps))
 
-    # Highlights recovery should DIM bright areas to reveal detail/contrast.
-    # We use a gain-based approach that preserves the pivot and pull down highlights.
-    # strength of 0.3 means max 30% darkening at pure white.
-    recovery_strength = 0.3
-    target_brightness = brightness * (1.0 - amount * recovery_strength * mask)
+    # Highlights recovery: we want to pull down highlights to reveal detail.
+    # Rational compression formula: y = x / (1 + kx).
+    # We apply this relative to the pivot.
+    # normalization: brightness is already linear.
+    x_norm = (brightness - pivot) / (headroom_ceiling - pivot + eps)
+    x_norm = np.clip(x_norm, 0.0, None)
+
+    # Compressed value (normalized context)
+    # At amount=1, we use full rational compression.
+    # At amount=0, we use identity.
+    compressed_norm = x_norm / (1.0 + k * amount * x_norm)
+
+    # Map back to brightness scale
+    target_brightness = pivot + compressed_norm * (headroom_ceiling - pivot)
+    # Clamp to headroom_ceiling to satisfy docstring contract (small amount can cause overshoot)
+    target_brightness = np.minimum(target_brightness, headroom_ceiling)
+
+    # If brightness was below pivot, keep it as is
+    target_brightness = np.where(brightness > pivot, target_brightness, brightness)
 
     # Rescale RGB to preserve hue/chroma
     # Protect against div-by-zero or huge scale factors for near-black pixels

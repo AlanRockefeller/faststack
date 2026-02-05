@@ -1,6 +1,32 @@
 # ChangeLog
 
-Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   
+Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   Fix raw image support.
+
+## 1.5.4 (2026-02-04)
+
+### Fixed
+- Image rotation fixed - no more black wedges on the edges of the image.
+- Prevented “undo delete” from resurrecting files when recycle/rollback fails: if a JPG can’t be restored after a partial delete, it’s marked as deleted (`jpg_moved=True`), a warning is shown, and a `recycled_jpg_path` breadcrumb is stored for potential cleanup.
+- Improved crop behavior when straightening/rotating with `expand=True` by transforming crop coordinates from original image space into the expanded canvas.
+- Prevented exporting with stale preview-resolution blur caches by validating cached array shapes against the current Y channel dimensions.
+- Improved highlight recovery by switching to an adaptive rational compression shoulder (new `k` parameter) and added tests for identity-at-zero, pivot invariance, and increasing compression with higher amount.
+- Fixed QML empty-state message timing by only showing “No images in this folder” after the folder has been scanned at least once.
+- Improved Escape key reliability during crop/rotation by explicitly re-focusing the loupe view.
+
+### Changed
+- Refactored deletion into a unified core deletion engine (`_delete_indices`) shared by loupe, grid cursor, grid selection, and batch deletion paths.
+- Deletion now uses an optimistic UI update for instant feedback, with deferred/coalesced disk refresh to avoid flicker and “deleted items reappear” issues.
+- Grid deletion now supports multi-selection and cursor deletion through a single entry point, rebuilding the path→index mapping for reliable lookup.
+- Image saving is now offloaded to a background thread to keep the UI responsive:
+  - Added an `isSaving` state to disable Save actions and show “Saving…” feedback.
+  - Prevented “surprise close” by only auto-closing the editor if the user is still on the same image when the save completes.
+- Improved recycle-bin cleanup on quit:
+  - Replaced the simple message dialog with a richer dialog showing per-bin counts (JPG/RAW/other) and an optional detailed file list.
+
+### UI
+- Resized the Image Editor dialog to accommodate the saving state/controls.
+- Enhanced recycle bin cleanup dialog layout and interaction (expandable detailed list, clearer button actions).
+
 
 ## 1.5.3 (2026-01-27)
 

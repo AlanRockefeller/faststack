@@ -24,7 +24,6 @@ ApplicationWindow {
         }
         if (uiState && uiState.hasRecycleBinItems) {
             close.accepted = false
-            recycleBinCleanupDialog.text = uiState.recycleBinStatsText
             recycleBinCleanupDialog.open()
         } else {
             close.accepted = true
@@ -1248,29 +1247,130 @@ ApplicationWindow {
             color: "black"
         }
     }
-    MessageDialog {
+    Dialog {
         id: recycleBinCleanupDialog
         title: "Clean up Recycle Bins?"
-        buttons: MessageDialog.Yes | MessageDialog.No | MessageDialog.Cancel
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        width: Math.min(550, parent.width * 0.85)
+        modal: true
+        standardButtons: Dialog.NoButton
         
-        // Custom button text isn't directly supported in standard MessageDialog
-        // So we interpret:
-        // Yes -> Delete and Quit
-        // No -> Quit (Keep Files)
-        // Cancel -> Don't Quit
+        background: Rectangle {
+            color: root.isDarkTheme ? "#2d2d2d" : "#ffffff"
+            border.color: root.isDarkTheme ? "#555555" : "#cccccc"
+            radius: 8
+        }
         
-        detailedText: "Select 'Yes' to permanently delete these files and quit.\nSelect 'No' to quit but keep files in the recycle bins."
-        
-        onButtonClicked: function(button, role) {
-            if (button === MessageDialog.Yes) {
-                uiState.cleanupRecycleBins()
-                allowCloseWithRecycleBins = true
-                Qt.quit()
-            } else if (button === MessageDialog.No) {
-                allowCloseWithRecycleBins = true
-                Qt.quit()
+        header: Rectangle {
+            implicitHeight: 50
+            color: root.isDarkTheme ? "#333333" : "#f0f0f0"
+            radius: 8
+            Rectangle {
+                anchors.bottom: parent.bottom
+                width: parent.width
+                height: 8
+                color: parent.color
             }
-            // Cancel does nothing, just closes dialog
+            Text {
+                anchors.centerIn: parent
+                text: "Clean up Recycle Bins?"
+                color: root.currentTextColor
+                font.bold: true
+                font.pixelSize: 18
+            }
+        }
+
+        // Use Column inside the default content area
+        Column {
+            id: dialogContent
+            anchors.fill: parent
+            anchors.margins: 20
+            spacing: 12
+            
+            Text {
+                width: parent.width
+                text: uiState ? uiState.recycleBinStatsText : "Loading..."
+                color: root.currentTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: 14
+                lineHeight: 1.4
+            }
+
+            Text {
+                text: detailedSection.visible ? "▼ Hide File List" : "▶ Show File List"
+                color: "#4fb360"
+                font.pixelSize: 13
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: detailedSection.visible = !detailedSection.visible
+                }
+            }
+
+            Rectangle {
+                id: detailedSection
+                width: parent.width
+                height: visible ? 180 : 0
+                visible: false
+                color: root.isDarkTheme ? "#1a1a1a" : "#f5f5f5"
+                border.color: root.isDarkTheme ? "#444444" : "#cccccc"
+                border.width: 1
+                radius: 4
+                clip: true
+                
+                Behavior on height { NumberAnimation { duration: 150 } }
+
+                Flickable {
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    contentWidth: detailsText.width
+                    contentHeight: detailsText.height
+                    clip: true
+                    
+                    Text {
+                        id: detailsText
+                        text: uiState ? uiState.recycleBinDetailedText : ""
+                        color: root.currentTextColor
+                        font.family: "Consolas"
+                        font.pixelSize: 12
+                    }
+                }
+            }
+            
+            // Spacer
+            Item { width: 1; height: 10 }
+            
+            // Buttons row
+            Row {
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: 15
+                
+                Button {
+                    text: "Cancel"
+                    flat: true
+                    onClicked: recycleBinCleanupDialog.close()
+                }
+                Button {
+                    text: "Keep and Quit"
+                    onClicked: {
+                        allowCloseWithRecycleBins = true
+                        recycleBinCleanupDialog.close()
+                        Qt.quit()
+                    }
+                }
+                Button {
+                    text: "Delete and Quit"
+                    highlighted: true
+                    Material.accent: "#e57373"
+                    onClicked: {
+                        uiState.cleanupRecycleBins()
+                        allowCloseWithRecycleBins = true
+                        recycleBinCleanupDialog.close()
+                        Qt.quit()
+                    }
+                }
+            }
         }
     }
 }

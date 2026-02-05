@@ -644,6 +644,9 @@ class ImageEditor:
 
         apply_rotation = abs(straighten_angle) > 0.001 and (for_export or has_crop_box)
 
+        # Capture original dimensions BEFORE rotation for crop coordinate transformation
+        orig_h, orig_w = arr.shape[:2]
+
         if apply_rotation:
             # Use the float rotation helper
             # Note: rotate_autocrop_rgb logic was complex.
@@ -696,17 +699,46 @@ class ImageEditor:
         if has_crop_box:
             crop_box = edits.get("crop_box", 0.0)
             if len(crop_box) == 4:
-                # 0-1000 relative to current size
-                h, w = arr.shape[:2]
-                left = int(crop_box[0] * w / 1000)
-                t = int(crop_box[1] * h / 1000)
-                r = int(crop_box[2] * w / 1000)
-                b = int(crop_box[3] * h / 1000)
+                # The crop_box is in 0-1000 normalized coordinates relative to the
+                # ORIGINAL (un-rotated) image. After rotation with expand=True,
+                # the original image is centered within a larger canvas.
+                # We need to transform the coordinates from original image space
+                # to the expanded canvas space.
 
-                left = max(0, left)
-                t = max(0, t)
-                r = min(w, r)
-                b = min(h, b)
+                if apply_rotation and abs(straighten_angle) > 0.001:
+                    # The original image (orig_w x orig_h) is centered in the
+                    # rotated expanded canvas (new_w x new_h = arr.shape).
+                    new_h, new_w = arr.shape[:2]
+
+                    # Calculate the offset: the original image's center is at
+                    # the new canvas's center, so the top-left of the original
+                    # image is offset by (new_w - orig_w)/2 and (new_h - orig_h)/2
+                    offset_x = (new_w - orig_w) / 2.0
+                    offset_y = (new_h - orig_h) / 2.0
+
+                    # Convert crop_box from 0-1000 to pixel coordinates in
+                    # original image space, then offset to canvas space
+                    left = int(crop_box[0] * orig_w / 1000 + offset_x)
+                    t = int(crop_box[1] * orig_h / 1000 + offset_y)
+                    r = int(crop_box[2] * orig_w / 1000 + offset_x)
+                    b = int(crop_box[3] * orig_h / 1000 + offset_y)
+
+                    left = max(0, left)
+                    t = max(0, t)
+                    r = min(new_w, r)
+                    b = min(new_h, b)
+                else:
+                    # No rotation - use current dimensions directly
+                    h, w = arr.shape[:2]
+                    left = int(crop_box[0] * w / 1000)
+                    t = int(crop_box[1] * h / 1000)
+                    r = int(crop_box[2] * w / 1000)
+                    b = int(crop_box[3] * h / 1000)
+
+                    left = max(0, left)
+                    t = max(0, t)
+                    r = min(w, r)
+                    b = min(h, b)
 
                 if r > left and b > t:
                     arr = arr[t:b, left:r, :]
@@ -869,6 +901,16 @@ class ImageEditor:
                     Y1_cached = cached.get("Y1")
                     cached_exp_gain = cached.get("exp_gain", 1.0)
                     cache_hit = True
+
+                    # Validate cached array shapes match current Y dimensions
+                    # This prevents reusing preview-resolution blurs during export
+                    y_shape = Y.shape
+                    for cached_arr in (Y20_cached, Y3_cached, Y1_cached):
+                        if cached_arr is not None and cached_arr.shape != y_shape:
+                            # Shape mismatch - invalidate cache
+                            Y20_cached = Y3_cached = Y1_cached = None
+                            cache_hit = False
+                            break
 
             # Compute exposure scale factor for reusing cached blurs
             # blur(k*Y) = k*blur(Y) is exact only if Y scales linearly with exposure.

@@ -1,6 +1,6 @@
 # FastStack
 
-# Version 1.5 - January 1, 2026
+# Version 1.5.4 - February 4, 2026
 # By Alan Rockefeller
 
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW or JPG files for focus stacking and website upload.

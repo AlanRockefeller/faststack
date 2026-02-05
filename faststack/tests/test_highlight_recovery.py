@@ -159,16 +159,16 @@ def test_analyze_highlight_state():
     # Image with headroom
     headroom_img = np.ones((10, 10, 3), dtype=np.float32) * 1.5
     state = _analyze_highlight_state(headroom_img)
-    assert (
-        state["headroom_pct"] > 0.9
-    ), f"Should detect headroom: {state['headroom_pct']}"
+    assert state["headroom_pct"] > 0.9, (
+        f"Should detect headroom: {state['headroom_pct']}"
+    )
 
     # Normal image
     normal_img = np.ones((10, 10, 3), dtype=np.float32) * 0.5
     state = _analyze_highlight_state(normal_img)
-    assert (
-        state["headroom_pct"] < 0.01
-    ), f"Should not detect headroom: {state['headroom_pct']}"
+    assert state["headroom_pct"] < 0.01, (
+        f"Should not detect headroom: {state['headroom_pct']}"
+    )
 
     print("test_analyze_highlight_state passed")
 
@@ -210,6 +210,56 @@ def test_benchmark():
     # Informational only - no hard assertion for CI stability
 
 
+def test_amount_zero_identity():
+    """amount=0 should return input unchanged (identity transform)."""
+    arr = np.random.rand(20, 20, 3).astype(np.float32) * 1.5  # Include headroom
+
+    recovered = _highlight_recover_linear(arr.copy(), amount=0.0, pivot=0.5)
+
+    # Should be extremely close to identity
+    diff = np.abs(recovered - arr).max()
+    assert diff < 1e-6, f"amount=0 should be identity, but max diff = {diff}"
+
+    print("test_amount_zero_identity passed")
+
+
+def test_pivot_behavior():
+    """Values <= pivot should remain unchanged regardless of amount."""
+    np.random.seed(123)
+    low_values = np.random.rand(15, 15, 3).astype(np.float32) * 0.4  # All below 0.5
+
+    for amount in [0.0, 0.5, 1.0]:
+        recovered = _highlight_recover_linear(
+            low_values.copy(), amount=amount, pivot=0.5
+        )
+        diff = np.abs(recovered - low_values).max()
+        assert diff < 1e-5, (
+            f"Values below pivot changed with amount={amount}: max_diff={diff}"
+        )
+
+    print("test_pivot_behavior passed")
+
+
+def test_increasing_amount_increases_compression():
+    """Higher amount should result in more compression of highlights."""
+    # Create bright image with headroom
+    bright = np.ones((10, 10, 3), dtype=np.float32) * 1.5
+
+    recovered_low = _highlight_recover_linear(bright, amount=0.3, pivot=0.5)
+    recovered_high = _highlight_recover_linear(bright, amount=0.9, pivot=0.5)
+
+    # Higher amount should compress more (result closer to 1.0)
+    avg_low = recovered_low.mean()
+    avg_high = recovered_high.mean()
+
+    # avg_high should be lower (more compressed toward 1.0) than avg_low
+    assert avg_high <= avg_low, (
+        f"Higher amount should compress more: avg_low={avg_low:.4f}, avg_high={avg_high:.4f}"
+    )
+
+    print("test_increasing_amount_increases_compression passed")
+
+
 if __name__ == "__main__":
     try:
         test_monotonicity()
@@ -220,6 +270,9 @@ if __name__ == "__main__":
         test_headroom_shoulder()
         test_analyze_highlight_state()
         test_source_clipping_detection()
+        test_amount_zero_identity()
+        test_pivot_behavior()
+        test_increasing_amount_increases_compression()
         test_benchmark()
         print("\nALL TESTS PASSED")
     except Exception as e:

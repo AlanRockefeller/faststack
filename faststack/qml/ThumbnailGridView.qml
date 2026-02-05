@@ -130,7 +130,7 @@ Item {
         // Empty state
         Text {
             anchors.centerIn: parent
-            visible: thumbnailGrid.count === 0
+            visible: thumbnailGrid.count === 0 && uiState && uiState.isFolderLoaded
             text: "No images in this folder"
             color: gridViewRoot.isDarkTheme ? "#888888" : "#666666"
             font.pixelSize: 16

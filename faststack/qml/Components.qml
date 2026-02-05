@@ -609,6 +609,8 @@ Item {
                     
                     isCropDragging = true
                 }
+                // Ensure loupeView has active focus so Escape key works
+                loupeView.forceActiveFocus()
                 return
             }
             
@@ -855,6 +857,8 @@ Item {
                 cropDragMode = "none"
                 // Settle zoom/pan after rotation ends (Force recompute)
                 if (mainMouseArea.isRotating) imageRotator.recomputeFitScale(true)
+                // Ensure loupeView has active focus so Escape key works
+                loupeView.forceActiveFocus()
             }
         }
 

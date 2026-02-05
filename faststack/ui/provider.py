@@ -142,6 +142,7 @@ class UIState(QObject):
 
     # Recycle Bin Signals
     recycleBinStatsTextChanged = Signal()
+    recycleBinDetailedTextChanged = Signal()
     hasRecycleBinItemsChanged = Signal()
 
     isZoomedChanged = Signal()
@@ -210,6 +211,7 @@ class UIState(QObject):
     isDialogOpenChanged = Signal(bool)  # New signal for dialog state
     editSourceModeChanged = Signal(str)  # Notify when JPEG/RAW mode changes
     saveBehaviorMessageChanged = Signal()  # Signal for save behavior message updates
+    isSavingChanged = Signal(bool)  # Signal for save operation in progress
 
     def __init__(self, app_controller):
         super().__init__()
@@ -260,6 +262,7 @@ class UIState(QObject):
         self._cache_stats = ""
         self._is_decoding = False
         self._is_dialog_open = False
+        self._is_saving = False  # Save operation in progress
 
         # Connect to controller's dialog state signal
         self.app_controller.dialogStateChanged.connect(self._on_dialog_state_changed)
@@ -785,6 +788,16 @@ class UIState(QObject):
             self._is_dialog_open = new_value
             self.isDialogOpenChanged.emit(new_value)
 
+    @Property(bool, notify=isSavingChanged)
+    def isSaving(self) -> bool:
+        return self._is_saving
+
+    @isSaving.setter
+    def isSaving(self, new_value: bool):
+        if self._is_saving != new_value:
+            self._is_saving = new_value
+            self.isSavingChanged.emit(new_value)
+
     @Property(bool, notify=anySliderPressedChanged)
     def anySliderPressed(self):
         return self._any_slider_pressed
@@ -1199,6 +1212,15 @@ class UIState(QObject):
     gridSelectedCountChanged = Signal()  # No args - QML property notify pattern
     gridScrollToIndex = Signal(int)  # Scroll grid view to show this index
     gridCanGoBackChanged = Signal()  # Emitted when back history changes
+    isFolderLoadedChanged = Signal()  # Emitted after first model refresh
+
+    @Property(bool, notify=isFolderLoadedChanged)
+    def isFolderLoaded(self) -> bool:
+        """Returns True after the folder has been scanned at least once.
+
+        Used by QML to avoid showing 'No images' message during initial load.
+        """
+        return getattr(self.app_controller, "_folder_loaded", False)
 
     @Property(bool, notify=isGridViewActiveChanged)
     def isGridViewActive(self) -> bool:
@@ -1348,17 +1370,42 @@ class UIState(QObject):
 
     @Property(str, notify=recycleBinStatsTextChanged)
     def recycleBinStatsText(self):
-        """Returns a formatted string of recycle bin stats."""
+        """Returns a formatted string of recycle bin stats summary."""
         stats = self.app_controller.get_recycle_bin_stats()
         if not stats:
             return ""
 
-        summary = "The following recycle bins contain items:\n\n"
+        summary = "The following recycle bins contain items:\n"
         for item in stats:
-            summary += f"• {item['path']}: {item['count']} files\n"
+            counts = []
+            if item.get("jpg_count", 0) > 0:
+                counts.append(f"{item['jpg_count']} JPG")
+            if item.get("raw_count", 0) > 0:
+                counts.append(f"{item['raw_count']} RAW")
+            if item.get("other_count", 0) > 0:
+                counts.append(f"{item['other_count']} other")
 
-        summary += "\nDo you want to delete them before quitting?"
+            count_str = f" ({', '.join(counts)})" if counts else ""
+            summary += f"\n• {item['path']}:\n  {item['count']} files{count_str}\n"
+
+        summary += "\nDo you want to permanently delete them before quitting?"
         return summary
+
+    @Property(str, notify=recycleBinDetailedTextChanged)
+    def recycleBinDetailedText(self):
+        """Returns a detailed list of all file paths in recycle bins."""
+        stats = self.app_controller.get_recycle_bin_stats()
+        if not stats:
+            return ""
+
+        lines = []
+        for item in stats:
+            lines.append(f"Directory: {item['path']}")
+            for fname in item.get("file_paths", []):
+                lines.append(f"  - {fname}")
+            lines.append("")
+
+        return "\n".join(lines)
 
     @Property(bool, notify=hasRecycleBinItemsChanged)
     def hasRecycleBinItems(self):
@@ -1372,4 +1419,5 @@ class UIState(QObject):
         self.app_controller.cleanup_recycle_bins()
 
         self.recycleBinStatsTextChanged.emit()
+        self.recycleBinDetailedTextChanged.emit()
         self.hasRecycleBinItemsChanged.emit()
