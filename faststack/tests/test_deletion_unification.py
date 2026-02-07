@@ -190,13 +190,13 @@ def test_delete_current_image_triggers_batch_dialog(mock_controller):
     # Mock a batch containing the current image
     mock_controller.get_batch_count_for_current_image = Mock(return_value=5)
     mock_controller.main_window = Mock()
+    mock_controller._delete_indices = Mock()
 
     mock_controller.delete_current_image()
 
     # Verify dialog was opened instead of immediate deletion
     mock_controller.main_window.show_delete_batch_dialog.assert_called_once_with(5)
     # Ensure _delete_indices was NOT called (deletion is deferred to dialog)
-    mock_controller._delete_indices = Mock()
     assert mock_controller._delete_indices.call_count == 0
 
 

@@ -74,6 +74,8 @@ test_report*.log
 test_results.txt
 smoke_test_output.txt
 verify_result.txt
+faststack/*fail*.txt
+faststack/*final*.txt
 
 # Same junk when produced inside the package dir
 faststack/debug_*.txt
@@ -87,8 +89,3 @@ faststack/test_results.txt
 faststack/smoke_test_output.txt
 faststack/verify_result.txt
 
-
-# Local test/output artifacts
-test*
-faststack/*fail*.txt
-faststack/*final*.txt

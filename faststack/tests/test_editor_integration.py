@@ -26,14 +26,25 @@ class TestEditorIntegration(unittest.TestCase):
             patch("faststack.app.SidecarManager"),
             patch("faststack.app.Prefetcher"),
             patch("faststack.app.ByteLRUCache"),
+            patch("faststack.app.ThumbnailProvider"),
         ):
             self.controller = AppController(Path("."), self.mock_engine)
 
         # Mock the internal image_editor to verify delegation
         self.controller.image_editor = MagicMock()
+        self.controller.image_editor.current_edits = {}
         self.controller.image_editor.current_filepath = Path("test.jpg")
         self.controller.image_editor.float_image = MagicMock()
         self.controller.image_editor.original_image = MagicMock()
+        
+        # Initialize state for delegation tests
+        self.controller.image_files = [MagicMock(path=Path("test.jpg"))]
+        self.controller.current_index = 0
+        self.controller.auto_level_threshold = 0.001
+        
+        # Mock returns for methods that unpack results
+        self.controller.image_editor.auto_levels.return_value = (0, 255, 0, 255)
+        self.controller.image_editor.save_image.return_value = (Path("test.jpg"), None)
 
     def tearDown(self):
         self.config_patcher.stop()
@@ -54,14 +65,20 @@ class TestEditorIntegration(unittest.TestCase):
         # 2. rotate_image_cw
         try:
             self.controller.rotate_image_cw()
-            self.controller.image_editor.rotate_image_cw.assert_called_once()
+            # AppController delegates rotation via set_edit_param("rotation", ...)
+            self.controller.image_editor.set_edit_param.assert_any_call(
+                "rotation", 270
+            )
         except AttributeError:
             self.fail("AppController is missing method 'rotate_image_cw'")
 
         # 3. rotate_image_ccw
         try:
             self.controller.rotate_image_ccw()
-            self.controller.image_editor.rotate_image_ccw.assert_called_once()
+            # AppController delegates rotation via set_edit_param("rotation", ...)
+            self.controller.image_editor.set_edit_param.assert_any_call(
+                "rotation", 90
+            )
         except AttributeError:
             self.fail("AppController is missing method 'rotate_image_ccw'")
 

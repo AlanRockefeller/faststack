@@ -1364,7 +1364,7 @@ ApplicationWindow {
                     highlighted: true
                     Material.accent: "#e57373"
                     onClicked: {
-                        uiState.cleanupRecycleBins()
+                        if (uiState) uiState.cleanupRecycleBins()
                         allowCloseWithRecycleBins = true
                         recycleBinCleanupDialog.close()
                         Qt.quit()

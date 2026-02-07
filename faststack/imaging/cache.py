@@ -66,6 +66,38 @@ class ByteLRUCache(LRUCache):
         finally:
             self.on_evict = callback
 
+    def pop_path(self, path: Union[Path, str]):
+        """Targeted invalidation of all generations for a given path.
+        
+        Hardened to handle both Path objects and string keys, and resolved paths.
+        Expected type: Union[Path, str].
+        """
+        targets = {path, str(path), str(path).replace("\\", "/")}
+        try:
+            # Handle Path objects and ensure we check the resolved variant
+            p = Path(path)
+            resolved = p.resolve()
+            targets.update({resolved, str(resolved), resolved.as_posix()})
+        except (OSError, ValueError, TypeError):
+            pass
+
+        keys_to_remove = []
+        # Use list(self.keys()) to avoid mutation during iteration
+        for key in list(self.keys()):
+            key_str = str(key)
+            # Match exact path or path::generation pattern
+            for t in targets:
+                t_str = str(t)
+                if key_str == t_str or key_str.startswith(f"{t_str}::"):
+                    keys_to_remove.append(key)
+                    break
+        
+        for k in keys_to_remove:
+            self.pop(k, None)
+        
+        if keys_to_remove:
+            log.debug(f"Invalidated {len(keys_to_remove)} cache entries for path: {path}")
+
 
 def get_decoded_image_size(item) -> int:
     """Calculates the size of a decoded image tuple (buffer, qimage)."""

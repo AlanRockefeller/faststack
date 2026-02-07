@@ -171,7 +171,9 @@ class AppController(QObject):
         self.debug_cache = debug_cache  # New debug_cache flag
 
         # Ensure clean shutdown of background threads
-        QCoreApplication.instance().aboutToQuit.connect(self._shutdown_executors)
+        inst = QCoreApplication.instance()
+        if inst:
+            inst.aboutToQuit.connect(self._shutdown_executors)
 
         self.display_width = 0
         self.display_height = 0
@@ -1031,40 +1033,50 @@ class AppController(QObject):
             if editor_still_on_same_image:
                 self.ui_state.isEditorOpen = False
 
-            # 2. Clear Editor State (release memory)
-            self.image_editor.clear()
+            # 2. Clear Editor State (release memory) - only if still on same image
+            if editor_still_on_same_image:
+                self.image_editor.clear()
 
-            # 3. Refresh List (to see new file or updated timestamp)
-            self.refresh_image_list()
+            # 3. Refresh List and Handle Selection
+            if editor_still_on_same_image:
+                # Full refresh to see new file or updated timestamp
+                self.refresh_image_list()
 
-            # 4. Find and Select the saved image
-            new_index = self.current_index  # Default to keeping selection if not found
+                # 4. Find and re-select the saved image
+                new_index = (
+                    self.current_index
+                )  # Default to keeping selection if not found
 
-            # Try to find by exact path match
-            if saved_path:
-                try:
-                    target_resolve = saved_path.resolve()
-                    for i, img in enumerate(self.image_files):
-                        try:
-                            # Robust path comparison
-                            if img.path.resolve() == target_resolve:
-                                new_index = i
-                                break
-                        except (OSError, RuntimeError):
-                            # Fallback to string compare
-                            if str(img.path) == str(saved_path):
-                                new_index = i
-                                break
-                except (OSError, RuntimeError):
-                    pass  # Keep current selection if resolution fails
+                # Try to find by exact path match
+                if saved_path:
+                    try:
+                        target_resolve = saved_path.resolve()
+                        for i, img in enumerate(self.image_files):
+                            try:
+                                # Robust path comparison
+                                if img.path.resolve() == target_resolve:
+                                    new_index = i
+                                    break
+                            except (OSError, RuntimeError):
+                                # Fallback to string compare
+                                if str(img.path) == str(saved_path):
+                                    new_index = i
+                                    break
+                    except (OSError, RuntimeError):
+                        pass  # Keep current selection if resolution fails
 
-            self.current_index = new_index
+                self.current_index = new_index
 
-            # 5. Force UI Sync / Prefetch
-            self.image_cache.clear()  # Clear cache to ensure we reload valid image
-            self.prefetcher.cancel_all()
-            self.prefetcher.update_prefetch(self.current_index)
-            self.sync_ui_state()
+                # 5. Force UI Sync / Prefetch
+                self.image_cache.clear()  # Clear cache to ensure we reload valid image
+                self.prefetcher.cancel_all()
+                self.prefetcher.update_prefetch(self.current_index)
+                self.sync_ui_state()
+            else:
+                # User navigated away - skip full refresh to preserve their selection
+                # Just clear stale cache entry for the saved image
+                if saved_path:
+                    self.image_cache.pop_path(saved_path)
 
             self.update_status_message("Image saved")
         else:
@@ -2840,6 +2852,7 @@ class AppController(QObject):
         self.prefetcher.cancel_all()
         if self.image_files:
             self.prefetcher.update_prefetch(self.current_index)
+        self._rebuild_path_to_index()  # Keep path->index map in sync
         self.sync_ui_state()
 
         # NOTE: Thumbnail model refresh is deferred to Phase 4 to avoid disk rescan
@@ -2860,20 +2873,25 @@ class AppController(QObject):
             raw_path = img.raw_pair
 
             try:
+                # Check RAW existence BEFORE any moves (existence changes after move)
+                raw_exists = raw_path and raw_path.exists()
+
+                # Step 1: Move JPG first
                 recycled_jpg = self._move_to_recycle(jpg_path)
-                recycled_raw = (
-                    self._move_to_recycle(raw_path)
-                    if (raw_path and raw_path.exists())
-                    else None
-                )
 
-                if recycled_jpg:
-                    # Check for partial failure: RAW existed but failed to move
-                    raw_needed = raw_path and raw_path.exists()
-                    raw_failed = raw_needed and not recycled_raw
+                if not recycled_jpg:
+                    # JPG failed to move - don't attempt RAW, add to failed list
+                    log.error(f"Failed to recycle JPG: {jpg_path.name}")
+                    failed_recycles.append(img)
+                    continue
 
-                    if raw_failed:
-                        # Atomic unit behavior: undo JPG move and treat as failed
+                # Step 2: Only move RAW if JPG succeeded and RAW exists
+                recycled_raw = None
+                if raw_exists:
+                    recycled_raw = self._move_to_recycle(raw_path)
+
+                    if not recycled_raw:
+                        # RAW failed but JPG succeeded - atomic rollback
                         log.warning(
                             f"Partial recycle for {img.path.name}: JPG ok, RAW failed. "
                             "Undoing JPG move to keep pair consistent."
@@ -2908,21 +2926,19 @@ class AppController(QObject):
                         # If undo failed, permanent delete can't act on it properly
                         if undo_succeeded:
                             failed_recycles.append(img)
-                    else:
-                        # Full success (JPG moved, and RAW either moved or didn't exist)
-                        record = ((jpg_path, recycled_jpg), (raw_path, recycled_raw))
-                        self.delete_history.append(record)
-                        self.undo_history.append(("delete", record, timestamp))
-                        recycled_count += 1
-                        # Use resolved path as key for robustness
-                        resolved_key = img.path.resolve()
-                        successfully_deleted[resolved_key] = {
-                            "jpg_moved": True,
-                            "raw_moved": recycled_raw is not None or not raw_needed,
-                        }
-                else:
-                    log.error(f"Failed to recycle JPG: {jpg_path.name}")
-                    failed_recycles.append(img)
+                        continue
+
+                # Full success (JPG moved, and RAW either moved or didn't exist)
+                record = ((jpg_path, recycled_jpg), (raw_path, recycled_raw))
+                self.delete_history.append(record)
+                self.undo_history.append(("delete", record, timestamp))
+                recycled_count += 1
+                # Use resolved path as key for robustness
+                resolved_key = img.path.resolve()
+                successfully_deleted[resolved_key] = {
+                    "jpg_moved": True,
+                    "raw_moved": recycled_raw is not None or not raw_exists,
+                }
             except (OSError, PermissionError) as e:
                 log.warning(f"Recycle exception for {jpg_path.name}: {e}")
                 failed_recycles.append(img)
@@ -2991,6 +3007,7 @@ class AppController(QObject):
                 self.prefetcher.cancel_all()
                 if self.image_files:
                     self.prefetcher.update_prefetch(self.current_index)
+                self._rebuild_path_to_index()  # Keep path->index map in sync after rollback
                 self.sync_ui_state()
 
         # --- PHASE 3: Status messages (immediate feedback) ---
@@ -4768,7 +4785,7 @@ class AppController(QObject):
 
             # Invalidate cache and refresh display
             self.display_generation += 1
-            self.image_cache.clear()
+            self.image_cache.pop_path(saved_path)
             self.prefetcher.cancel_all()
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
@@ -4976,7 +4993,7 @@ class AppController(QObject):
                 )
 
             self.display_generation += 1
-            self.image_cache.clear()
+            self.image_cache.pop_path(saved_path)
             self.prefetcher.cancel_all()
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
@@ -5052,7 +5069,7 @@ class AppController(QObject):
             # Invalidate cache for the edited image so it's reloaded from disk
             # This ensures the Image Editor will see the updated version
             self.display_generation += 1
-            self.image_cache.clear()
+            self.image_cache.pop_path(saved_path)
             self.prefetcher.cancel_all()
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
@@ -5476,3 +5493,4 @@ def cli():
 
 if __name__ == "__main__":
     cli()
+

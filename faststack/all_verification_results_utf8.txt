@@ -1,0 +1,19 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.0.2, pluggy-1.6.0 -- C:\code\faststack\faststack\verify_venv\Scripts\python.exe
+rootdir: C:\code\faststack
+configfile: pyproject.toml
+collecting ... collected 14 items
+
+tests\test_editor_rotation.py::test_rotated_rect_edge_cases PASSED       [  7%]
+tests\test_editor_rotation.py::test_rotated_rect_calculation_branches[100-100-0] PASSED [ 14%]
+tests\test_editor_rotation.py::test_rotated_rect_calculation_branches[200-100-45] PASSED [ 21%]
+tests\test_editor_rotation.py::test_rotated_rect_calculation_branches[1000-500-15] PASSED [ 28%]
+tests\test_editor_rotation.py::test_rotated_rect_calculation_branches[500-1000-15] PASSED [ 35%]
+tests\test_editor_rotation.py::test_rotate_autocrop_rgb_behavior PASSED  [ 42%]
+tests\test_editor_rotation.py::test_boundary_clamping PASSED             [ 50%]
+tests\test_editor_rotation.py::test_integration_straighten_modes FAILED  [ 57%]
+tests\test_editor_rotation.py::test_rotate_cw PASSED                     [ 64%]
+tests\test_editor_rotation.py::test_rotate_ccw PASSED                    [ 71%]
+tests\test_rotation_unittest.py::TestEditorRotation::test_rotate_cw PASSED [ 78%]
+tests\test_rotation_unittest.py::TestEditorRotation::test_straighten_angle PASSED [ 85%]
+tests\test_editor_integration.py::TestEditorIntegration::test_missing_methods 
