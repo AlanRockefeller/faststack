@@ -2,6 +2,33 @@
 
 Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   Fix raw image support.
 
+# Changelog
+
+## 1.5.5 (2026-02-07)
+
+### Changed
+- Image save behavior in the editor is now navigation-aware:
+  - Only clear editor state / close editor UI when the user is still on the same image.
+  - Only perform a full list refresh + re-select logic when the user is still on the same image.
+  - If the user navigated away, preserve their selection and only invalidate the saved image’s cache entry.
+
+- Recycle/delete of JPG+RAW pairs is now more atomic and robust:
+  - Check RAW existence **before** any moves to avoid post-move existence ambiguity.
+  - Move JPG first; only attempt RAW move if JPG succeeds and RAW existed.
+  - If RAW move fails after JPG succeeds, roll back the JPG move to keep pairs consistent.
+  - Track `raw_moved` based on whether RAW existed and whether it was moved successfully.
+
+- Cache invalidation after edits is now targeted instead of global:
+  - Replace multiple `image_cache.clear()` calls after save/export with `image_cache.pop_path(saved_path)` to invalidate only the edited file.
+
+- Keep internal path→index lookup consistent:
+  - Rebuild the path-to-index map after operations that mutate the image list, including after recycle/rollback flows.
+
+### Fixed
+- Rotation/autocrop and straighten edge handling:
+  - Use `floor()` instead of `round()` in inscribed-rectangle and crop coordinate math to reduce off-by-one drift.
+  - Skip inset trimming for exact 90° rotations to preserve full dimensions and avoid unnecessary cropping.
+
 ## 1.5.4 (2026-02-04)
 
 ### Fixed

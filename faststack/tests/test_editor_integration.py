@@ -46,6 +46,24 @@ class TestEditorIntegration(unittest.TestCase):
         self.controller.image_editor.auto_levels.return_value = (0, 255, 0, 255)
         self.controller.image_editor.save_image.return_value = (Path("test.jpg"), None)
 
+        # Mock _save_executor to be synchronous to avoid race conditions
+        self.controller._save_executor = MagicMock()
+
+        def mock_submit(fn, *args, **kwargs):
+            # Execute synchronously
+            result = fn(*args, **kwargs)
+            # Return a mock future that triggers callbacks immediately
+            mock_future = MagicMock()
+            mock_future.result.return_value = result
+
+            def mock_add_done_callback(callback):
+                callback(mock_future)
+
+            mock_future.add_done_callback.side_effect = mock_add_done_callback
+            return mock_future
+
+        self.controller._save_executor.submit.side_effect = mock_submit
+
     def tearDown(self):
         self.config_patcher.stop()
 

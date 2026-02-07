@@ -19,6 +19,7 @@ def qapp():
 @pytest.fixture
 def mock_controller(tmp_path, qapp):
     """Creates an AppController with mocked dependencies."""
+    _ = qapp  # Keep QApplication active for UI-touching code
     engine = Mock()
     with (
         patch("faststack.app.Watcher"),

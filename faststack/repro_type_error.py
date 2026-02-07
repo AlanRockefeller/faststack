@@ -2,7 +2,8 @@ import sys
 from pathlib import Path
 
 # Ensure we can import faststack
-sys.path.insert(0, r"C:\code\faststack")
+repo_root = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
 
 from faststack.imaging.editor import ImageEditor
 from PIL import Image
@@ -22,7 +23,7 @@ try:
         )
     else:
         print("Result is None!")
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     print(f"Caught exception: {type(e).__name__}: {e}")
     import traceback
 

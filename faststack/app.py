@@ -2905,7 +2905,7 @@ class AppController(QObject):
                             log.info(f"Restored {jpg_path.name} from recycle bin")
                             undo_succeeded = True
                         except (OSError, shutil.Error) as undo_err:
-                            log.error(
+                            log.exception(
                                 f"Failed to undo JPG move for {jpg_path.name}: {undo_err}"
                             )
                             # Mark as deleted to prevent rollback from resurrecting missing image
@@ -2992,7 +2992,9 @@ class AppController(QObject):
                 log.info(
                     f"Rolling back {len(items_to_restore)} items after incomplete deletion"
                 )
-                # Restore items in ascending index order
+                # Restore items in descending index order
+                # Restore in descending order to preserve index validity
+                items_to_restore.sort(key=lambda x: x[0], reverse=True)
                 for idx, img in items_to_restore:
                     # Clamp insertion index to valid range
                     insert_idx = min(idx, len(self.image_files))
