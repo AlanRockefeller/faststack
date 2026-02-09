@@ -177,24 +177,28 @@ class Prefetcher:
         self.debug = debug
         # Use CPU count for I/O-bound JPEG decoding
         # Rule of thumb: 2x CPU cores for I/O bound, 1x for CPU bound
-        optimal_workers = min((os.cpu_count() or 1) * 2, 4)  # Cap at 4
+        optimal_workers = min((os.cpu_count() or 1) * 2, 8)  # Cap at 8 for fast navigation
 
         self.executor = ThreadPoolExecutor(
-            max_workers=optimal_workers, thread_name_prefix="Prefetcher"
+            max_workers=optimal_workers,
+            thread_name_prefix="Prefetcher",
         )
         self._futures_lock = threading.RLock()
         self.futures: Dict[int, Future] = {}
         self.generation = 0
         self._scheduled: Dict[int, set] = {}  # generation -> set of scheduled indices
 
+        # Cooperative cancellation flag for shutdown
+        self._stop_event = threading.Event()
+
         # Adaptive prefetch: start with smaller radius, expand after user navigates
-        self._initial_radius = 2  # Small radius at startup to reduce cache thrash
+        self._initial_radius = 4  # Increased for faster initial responsiveness
         self._navigation_count = 0  # Track how many times user has navigated
         self._radius_expanded = False
 
         # Directional prefetching
         self._last_navigation_direction: int = 1  # 1 = forward, -1 = backward
-        self._direction_bias: float = 0.7  # 70% of radius in travel direction
+        self._direction_bias: float = 0.85  # 85% of radius in travel direction
 
     def set_image_files(self, image_files: List[ImageFile]):
         if self.image_files != image_files:
@@ -214,6 +218,11 @@ class Prefetcher:
             is_navigation: True if this is from user navigation (arrow keys, etc.)
             direction: 1 for forward, -1 for backward, None to use last direction
         """
+        if self.debug:
+            import time
+            _t_start = time.perf_counter()
+            print(f"[DBGCACHE] {_t_start*1000:.3f} update_prefetch: START index={current_index} dir={direction}")
+
         # NOTE: Generation is NOT incremented here. It only changes when display size,
         # zoom state, or color mode changes - events that actually invalidate cached images.
         # Navigation just shifts which indices to prefetch.
@@ -270,6 +279,7 @@ class Prefetcher:
         )
 
         # Cancel stale futures and remove from scheduled
+        tasks_submitted = 0
         with self._futures_lock:
             # Clean up old generation entries to prevent memory leak
             # MOVED INSIDE LOCK to prevent race with cancel_all()
@@ -305,6 +315,11 @@ class Prefetcher:
                 if i not in scheduled and i not in self.futures:
                     self.submit_task(i, self.generation)
                     scheduled.add(i)
+                    tasks_submitted += 1
+
+        if self.debug:
+            _t_end = time.perf_counter()
+            print(f"[DBGCACHE] {_t_end*1000:.3f} update_prefetch: DONE submitted={tasks_submitted} total={(_t_end - _t_start)*1000:.2f}ms")
 
     def submit_task(
         self, index: int, generation: int, priority: bool = False
@@ -316,6 +331,15 @@ class Prefetcher:
             generation: Generation number for cache invalidation
             priority: If True, cancels lower-priority pending tasks to free up workers
         """
+        # Don't submit new work if shutdown is in progress
+        if self._stop_event.is_set():
+            return None
+
+        import time
+        if self.debug and priority:
+            _t_start = time.perf_counter()
+            print(f"[DBGCACHE] {_t_start*1000:.3f} submit_task: PRIORITY index={index} gen={generation}")
+
         with self._futures_lock:
             if index in self.futures and not self.futures[index].done():
                 return self.futures[index]  # Already submitted
@@ -390,6 +414,11 @@ class Prefetcher:
                 generation,
                 self.generation,
             )
+            return None
+
+        # Cooperative abort: check if shutdown is in progress
+        if self._stop_event.is_set():
+            log.debug("Aborting decode for index %d - shutdown in progress", index)
             return None
 
         try:
@@ -933,5 +962,9 @@ class Prefetcher:
     def shutdown(self):
         """Shuts down the thread pool executor."""
         log.info("Shutting down prefetcher thread pool.")
+        # Set stop event first to signal workers to abort
+        self._stop_event.set()
         self.cancel_all()
-        self.executor.shutdown(wait=False)
+        # cancel_futures=True cancels queued work immediately (Python 3.9+)
+        # wait=False so we don't block on slow decode tasks
+        self.executor.shutdown(wait=False, cancel_futures=True)

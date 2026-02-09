@@ -6,6 +6,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from threading import Lock
+import threading
 from typing import Dict, Optional, Set, Tuple, Callable
 
 import numpy as np
@@ -14,6 +15,19 @@ from PIL import Image
 from faststack.imaging.orientation import get_exif_orientation, apply_orientation_to_np
 
 log = logging.getLogger(__name__)
+
+# Optional Qt dispatch so callbacks always run on Qt thread when available
+try:
+    from PySide6.QtCore import QObject, Signal, Qt, QCoreApplication
+
+    class _ReadyEmitter(QObject):
+        ready = Signal(str)
+
+    _HAS_QT = True
+except Exception:
+    _ReadyEmitter = None
+    _HAS_QT = False
+    QCoreApplication = None
 
 # Try to import turbojpeg for faster JPEG decoding
 try:
@@ -63,6 +77,7 @@ class ThumbnailPrefetcher:
         self._cache = cache
         self._on_ready = on_ready_callback
         self._target_size = target_size
+        self._stop_event = threading.Event()
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="thumb"
         )
@@ -74,6 +89,17 @@ class ThumbnailPrefetcher:
 
         # Track futures for potential cancellation
         self._futures: Dict[Tuple[int, str, int], Future] = {}
+
+        # If Qt is available AND a QApplication exists, forward ready notifications
+        # to Qt/main thread. This prevents Qt warnings/crashes from worker-thread callbacks.
+        self._ready_emitter = None
+        if _HAS_QT and self._on_ready:
+            try:
+                if QCoreApplication.instance() is not None:
+                    self._ready_emitter = _ReadyEmitter()  # created on constructing thread (should be Qt thread)
+                    self._ready_emitter.ready.connect(self._on_ready, Qt.QueuedConnection)
+            except Exception:
+                self._ready_emitter = None
 
         log.info(
             "ThumbnailPrefetcher initialized with %d workers, target size %dpx",
@@ -92,6 +118,10 @@ class ThumbnailPrefetcher:
         Returns:
             True if job was submitted, False if already in-flight or cached
         """
+        # Don't accept new work once shutdown begins
+        if self._stop_event.is_set():
+            return False
+
         if size is None:
             size = self._target_size
 
@@ -118,12 +148,15 @@ class ThumbnailPrefetcher:
                 mtime_ns,
                 size,
             )
-            future.add_done_callback(
-                lambda f: self._on_decode_done(f, job_key, cache_key)
-            )
 
             with self._inflight_lock:
                 self._futures[job_key] = future
+
+            # Add callback *after* registering future. If already done, add_done_callback
+            # may invoke immediately in this thread, so we want state initialized first.
+            future.add_done_callback(
+                lambda f: self._on_decode_done(f, job_key, cache_key)
+            )
 
             return True
         except RuntimeError:
@@ -245,12 +278,20 @@ class ThumbnailPrefetcher:
         self, future: Future, job_key: Tuple[int, str, int], cache_key: str
     ):
         """Callback when decode completes."""
-        # Remove from inflight
+        # Always remove bookkeeping first to avoid stranding entries
         with self._inflight_lock:
             self._inflight.discard(job_key)
             self._futures.pop(job_key, None)
 
+        # Then bail if shutting down
+        if self._stop_event.is_set():
+            return
+
         try:
+            # If cancelled, don't call result()
+            if future.cancelled():
+                return
+
             jpeg_bytes = future.result()
             if jpeg_bytes:
                 # Store in cache
@@ -258,24 +299,36 @@ class ThumbnailPrefetcher:
 
                 # Notify ready
                 if self._on_ready:
-                    # Extract thumbnail_id from cache_key (same format)
-                    self._on_ready(cache_key)
+                    # If Qt emitter exists, this will run callback on Qt thread.
+                    if self._ready_emitter is not None:
+                        self._ready_emitter.ready.emit(cache_key)
+                    else:
+                        self._on_ready(cache_key)
 
         except Exception as e:
             log.debug("Thumbnail decode failed: %s", e)
 
     def cancel_all(self):
         """Cancel all pending jobs."""
+        # Snapshot under lock, cancel outside lock to avoid deadlock:
+        # Future.cancel() can synchronously run callbacks.
         with self._inflight_lock:
-            for future in self._futures.values():
-                future.cancel()
+            futures = list(self._futures.values())
             self._futures.clear()
             self._inflight.clear()
 
+        for f in futures:
+            try:
+                f.cancel()
+            except Exception:
+                pass
+
     def shutdown(self):
         """Shutdown the executor."""
+        self._stop_event.set()
         self.cancel_all()
-        self._executor.shutdown(wait=False)
+        # cancel_futures=True cancels queued tasks immediately (Py3.9+)
+        self._executor.shutdown(wait=False, cancel_futures=True)
         log.info("ThumbnailPrefetcher shutdown")
 
 

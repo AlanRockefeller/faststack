@@ -63,7 +63,7 @@ else:
 DEFAULT_CONFIG = {
     "core": {
         "cache_size_gb": "1.5",
-        "prefetch_radius": "4",
+        "prefetch_radius": "6",
         "theme": "dark",
         "default_directory": "",
         "optimize_for": "speed",  # "speed" or "quality"

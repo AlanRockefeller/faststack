@@ -38,6 +38,12 @@ class ImageProvider(QQuickImageProvider):
 
     def requestImage(self, id: str, size: object, requestedSize: object) -> QImage:
         """Handles image requests from QML."""
+        import time
+        _debug = getattr(self.app_controller, 'debug_cache', False)
+        if _debug:
+            _t_start = time.perf_counter()
+            print(f"[DBGCACHE] {_t_start*1000:.3f} requestImage: START id={id}")
+
         if not id:
             return self.placeholder
 
@@ -66,11 +72,18 @@ class ImageProvider(QQuickImageProvider):
                 )
             )
 
+            if _debug:
+                _t_get = time.perf_counter()
+
             image_data = (
                 self.app_controller._last_rendered_preview
                 if use_editor_preview
                 else self.app_controller.get_decoded_image(index)
             )
+
+            if _debug:
+                _t_got = time.perf_counter()
+                print(f"[DBGCACHE] {_t_got*1000:.3f} requestImage: got image_data in {(_t_got - _t_get)*1000:.2f}ms")
 
             if image_data:
                 # Handle format being None (from prefetcher) or missing
@@ -117,6 +130,10 @@ class ImageProvider(QQuickImageProvider):
                     log.debug(
                         "ICC mode: skipping Qt color space (pixels already in monitor space)"
                     )
+
+                if _debug:
+                    _t_end = time.perf_counter()
+                    print(f"[DBGCACHE] {_t_end*1000:.3f} requestImage: DONE id={id} total={(_t_end - _t_start)*1000:.2f}ms")
 
                 # Buffer is now safe to release (handled by copy), but original_buffer ref in Python object stays
                 # We don't need to manually attach original_buffer to qimg anymore since we copied.
