@@ -4,12 +4,12 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 
 ## 1.5.6 (2026-02-08)
 
-#### Performance
+### Performance
 - Debounced `metadataChanged` / `highlightStateChanged` emissions to reduce UI overhead during rapid navigation.
 - Increased default prefetch radius to **6** and raised prefetch worker cap to **8** for smoother fast navigation.
 - Added optional `[DBGCACHE]` timing logs for image request/decode and UI refresh paths when `debug_cache` is enabled.
 
-#### Stability
+### Stability
 - Refactored shutdown into `shutdown_qt()` (main thread) and `shutdown_nonqt()` (background-safe), wired from `aboutToQuit` in `main()` with a timeout/stacks fallback to diagnose hangs.
 - Added cooperative cancellation and `cancel_futures=True` shutdown behavior to both main image and thumbnail prefetchers.
 - Ensured thumbnail “ready” callbacks run on the Qt thread when available; hardened cancellation/callback ordering to avoid deadlocks and worker-thread Qt warnings.

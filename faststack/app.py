@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import uuid
+import bisect
 import functools
 
 # Must set before importing PySide6
@@ -50,7 +51,7 @@ Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 from faststack.config import config
 from faststack.logging_setup import setup_logging
 from faststack.models import ImageFile, DecodedImage
-from faststack.io.indexer import find_images
+from faststack.io.indexer import find_images, _parse_developed
 from faststack.io.sidecar import SidecarManager
 from faststack.io.watcher import Watcher
 from faststack.io.helicon import launch_helicon_focus
@@ -82,6 +83,20 @@ from faststack.io.deletion import (
     confirm_batch_permanent_delete,
     permanently_delete_image_files,
 )
+
+
+# AWB thresholds on the -1..+1 normalised slider range.
+# NOOP: skip applying correction entirely (≈ 0.64 Lab units — below perceptible).
+# LABEL: below this the direction word becomes "neutral" in the status message.
+_AWB_NOOP_EPS = 0.005
+_AWB_LABEL_EPS = 0.002
+
+
+def _awb_direction(value: float, pos_label: str, neg_label: str) -> str:
+    """Return a human-readable direction label for an AWB shift value."""
+    if abs(value) < _AWB_LABEL_EPS:
+        return "neutral"
+    return pos_label if value > 0 else neg_label
 
 
 def make_hdrop(paths):
@@ -157,6 +172,7 @@ class AppController(QObject):
         self._shutting_down = False  # Flag to gate async callbacks during shutdown
         self._refresh_scheduled = False  # Coalesce guard for deferred disk refresh
         self._opencv_warning_shown = False  # Only show OpenCV warning once per session
+        self._last_auto_levels_msg: str = ""  # Detail message from last auto_levels() call
 
         self.image_dir = image_dir
         self.image_files: List[ImageFile] = []  # Filtered list for display
@@ -711,6 +727,77 @@ class AppController(QObject):
         self._path_to_index = {
             img.path.resolve(): i for i, img in enumerate(self.image_files)
         }
+
+    def _insert_backup_into_list(self, backup_path: str, current_path: str) -> bool:
+        """Insert a newly-created backup file into the image list without a full rescan.
+
+        Uses bisect.bisect_right with the same sort key as indexer.py to maintain
+        order, then list.insert at the found position.
+        Falls back to refresh_image_list() on any error.
+
+        Returns True if the current_path was found in the updated list.
+        """
+        try:
+            bp = Path(backup_path)
+            cp = Path(current_path)
+            mtime = bp.stat().st_mtime
+            img = ImageFile(path=bp, raw_pair=None, timestamp=mtime)
+
+            # Sort key matches indexer.py:70 — (mtime, name_cf, is_developed, name_cf)
+            # Backup files don't match the -developed suffix, so position 2 = 0
+            key = (mtime, bp.name.casefold(), 0, bp.name.casefold())
+
+            # Build parallel key list for bisect — uses _parse_developed from
+            # indexer.py so the is_developed bit stays in sync with the canonical rule.
+            # f.timestamp is st_mtime, set in indexer.py:68 (ImageFile(timestamp=stat.st_mtime)).
+            # Rebuilding keys is O(n) but still far cheaper than a full directory scan.
+            keys = [
+                (
+                    f.timestamp,
+                    f.path.name.casefold(),
+                    int(_parse_developed(f.path)[0]),
+                    f.path.name.casefold(),
+                )
+                for f in self._all_images
+            ]
+            idx = bisect.bisect_right(keys, key)
+            self._all_images.insert(idx, img)
+
+            # Re-apply filter and rebuild index
+            self._apply_filter_to_cached_list()
+
+            # Re-derive current_index from the updated path-to-index map
+            resolved = cp.resolve()
+            new_idx = self._path_to_index.get(resolved)
+            if new_idx is not None:
+                self.current_index = new_idx
+                return True
+
+            # Name-based fallback (handles drive letter / symlink mismatches)
+            target_name = cp.name
+            for i, img_file in enumerate(self.image_files):
+                if img_file.path.name == target_name:
+                    self.current_index = i
+                    return True
+
+            log.warning(
+                "_insert_backup_into_list: could not find %s after insertion", current_path
+            )
+            return False
+
+        except Exception:
+            log.warning(
+                "_insert_backup_into_list: falling back to refresh_image_list",
+                exc_info=True,
+            )
+            self.refresh_image_list()
+            # Attempt to find current_path in refreshed list
+            target_name = Path(current_path).name
+            for i, img_file in enumerate(self.image_files):
+                if img_file.path.name == target_name:
+                    self.current_index = i
+                    return True
+            return False
 
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
         """Retrieves a decoded image, blocking until ready to ensure correct display.
@@ -5007,24 +5094,22 @@ class AppController(QObject):
         if self.ui_state.isHistogramVisible:
             self.update_histogram()
 
-        # Determine status message based on whether endpoints were pinned (clipping detected)
-        # We check p_high/p_low directly because whites/blacks might be small due to strength scaling
-        # even if not pinned.
-        msg = "Auto levels applied"
-
-        # Check for essentially no-op (degenerate or already full range)
-        # Degenerate: dynamic range is tiny (< 1.0)
-        # Full range: p_low is near 0 and p_high near 255
-        if abs(p_high - p_low) < 1.0:
-            msg = "Auto levels: no changes (degenerate range)"
+        # Determine status message with computed details
+        dynamic_range = p_high - p_low
+        if dynamic_range < 1.0:
+            msg = "Auto levels: no change (flat image)"
         elif p_low <= 0 and p_high >= 255:
-            # We already cover the full range
-            msg = "Auto levels: no changes (image already covers full range)"
-        # Check for pinning
+            msg = "Auto levels: no change (already full range)"
         elif p_high >= 255.0:
-            msg = "Auto levels: highlights already clipped; only adjusting shadows"
+            msg = f"Auto levels: highlights clipped; shadows only (blacks {blacks:+.1f})"
         elif p_low <= 0.0:
-            msg = "Auto levels: shadows already clipped; only adjusting highlights"
+            msg = f"Auto levels: shadows clipped; highlights only (whites {whites:+.1f})"
+        else:
+            gain = 255.0 / dynamic_range if dynamic_range > 0 else 1.0
+            msg = (
+                f"Auto levels: blacks {blacks:+.1f}, whites {whites:+.1f} "
+                f"(range {p_low:.0f}\u2013{p_high:.0f}, gain {gain:.2f})"
+            )
 
         self._kick_preview_worker()
 
@@ -5036,6 +5121,8 @@ class AppController(QObject):
             strength,
             msg,
         )
+        # Store detail message for quick_auto_levels to pick up
+        self._last_auto_levels_msg = msg
         return True
 
     @Slot()
@@ -5045,8 +5132,12 @@ class AppController(QObject):
             self.update_status_message("No image to adjust")
             return
 
+        t_start = time.perf_counter()
+
         # Apply the preview first (loads image + sets params)
+        self._last_auto_levels_msg = ""
         applied = self.auto_levels()
+        t_compute = time.perf_counter()
 
         # If in auto mode and no changes were made (skipped), don't save
         if self.auto_level_strength_auto and not applied:
@@ -5063,6 +5154,7 @@ class AppController(QObject):
             log.exception(f"quick_auto_levels: Unexpected error during save: {e}")
             self.update_status_message("Failed to save image")
             return
+        t_save = time.perf_counter()
 
         if save_result:
             saved_path, backup_path = save_result
@@ -5074,30 +5166,9 @@ class AppController(QObject):
             # Force reload to ensure disk consistency
             self.image_editor.clear()
 
-            # Refresh list/cache/UI (standard save pattern)
-            # Note: We must locate the saved_path again because the list order
-            # might have changed (e.g., if a backup file was inserted before it).
-            self.refresh_image_list()
-
-            # Find image again using robust path matching
-            new_index = -1
-            target_name = Path(saved_path).name
-
-            for i, img_file in enumerate(self.image_files):
-                # Match by filename alone - safest for flat directory structures
-                # avoiding drive letter/symlink/casing issues with full paths
-                if img_file.path.name == target_name:
-                    new_index = i
-                    break
-
-            if new_index != -1:
-                self.current_index = new_index
-            else:
-                log.warning(
-                    "Auto levels: Could not find saved image %s (name: %s) in refreshed list",
-                    saved_path,
-                    target_name,
-                )
+            # Insert backup into list without full directory rescan
+            self._insert_backup_into_list(backup_path, saved_path)
+            t_list = time.perf_counter()
 
             self.display_generation += 1
             self.image_cache.pop_path(saved_path)
@@ -5108,7 +5179,18 @@ class AppController(QObject):
             if self.ui_state.isHistogramVisible:
                 self.update_histogram()
 
-            self.update_status_message("Auto levels applied and saved")
+            t_total = time.perf_counter()
+            total_ms = int((t_total - t_start) * 1000)
+            log.debug(
+                "Auto levels: compute=%dms save=%dms list=%dms total=%dms",
+                int((t_compute - t_start) * 1000),
+                int((t_save - t_compute) * 1000),
+                int((t_list - t_save) * 1000),
+                total_ms,
+            )
+            detail = self._last_auto_levels_msg
+            saved_msg = f"{detail} \u2014 saved ({total_ms} ms)" if detail else f"Auto levels applied and saved ({total_ms} ms)"
+            self.update_status_message(saved_msg)
             log.info(
                 "Quick auto levels saved for %s. New index: %d",
                 saved_path,
@@ -5124,17 +5206,33 @@ class AppController(QObject):
             self.update_status_message("No image to adjust")
             return
 
+        t_start = time.perf_counter()
+
         image_file = self.image_files[self.current_index]
         filepath = str(image_file.path)
 
-        # Load the image into the editor if not already loaded
-        cached_preview = self.get_decoded_image(self.current_index)
-        if not self.image_editor.load_image(filepath, cached_preview=cached_preview):
-            self.update_status_message("Failed to load image")
-            return
+        # Ensure image is loaded in editor (skip if already loaded)
+        if (
+            not self.image_editor.current_filepath
+            or str(self.image_editor.current_filepath) != filepath
+        ):
+            cached_preview = self.get_decoded_image(self.current_index)
+            if not self.image_editor.load_image(
+                filepath, cached_preview=cached_preview
+            ):
+                self.update_status_message("Failed to load image")
+                return
+        t_load = time.perf_counter()
 
         # Calculate and apply auto white balance
-        self.auto_white_balance()
+        # Returns detail string if applied, None if no change
+        detail_msg = self.auto_white_balance()
+        t_compute = time.perf_counter()
+
+        # If no correction was needed, skip saving
+        if not detail_msg:
+            # Status message already set by auto_white_balance()
+            return
 
         # Save the edited image (this creates a backup automatically)
         try:
@@ -5149,6 +5247,7 @@ class AppController(QObject):
             )
             self.update_status_message("Failed to save image")
             return
+        t_save = time.perf_counter()
 
         if save_result:
             saved_path, backup_path = save_result
@@ -5161,18 +5260,11 @@ class AppController(QObject):
             # Force the image editor to clear its current state so it reloads fresh
             self.image_editor.clear()
 
-            # Refresh the view - need to refresh image list since backup file was created
-            original_path = Path(filepath)
-            self.refresh_image_list()
-
-            # Find the edited image (not the backup) in the refreshed list
-            for i, img_file in enumerate(self.image_files):
-                if img_file.path == original_path:
-                    self.current_index = i
-                    break
+            # Insert backup into list without full directory rescan
+            self._insert_backup_into_list(backup_path, saved_path)
+            t_list = time.perf_counter()
 
             # Invalidate cache for the edited image so it's reloaded from disk
-            # This ensures the Image Editor will see the updated version
             self.display_generation += 1
             self.image_cache.pop_path(saved_path)
             self.prefetcher.cancel_all()
@@ -5183,41 +5275,59 @@ class AppController(QObject):
             if self.ui_state.isHistogramVisible:
                 self.update_histogram()
 
-            self.update_status_message("Auto white balance applied and saved")
+            t_total = time.perf_counter()
+            total_ms = int((t_total - t_start) * 1000)
+            log.debug(
+                "AWB: load=%dms compute=%dms save=%dms list=%dms total=%dms",
+                int((t_load - t_start) * 1000),
+                int((t_compute - t_load) * 1000),
+                int((t_save - t_compute) * 1000),
+                int((t_list - t_save) * 1000),
+                total_ms,
+            )
+            self.update_status_message(
+                f"{detail_msg} \u2014 saved ({total_ms} ms)"
+            )
             log.info("Quick auto white balance applied to %s", filepath)
         else:
             self.update_status_message("Failed to save image")
 
     @Slot()
-    def auto_white_balance(self):
+    def auto_white_balance(self) -> Optional[str]:
         """
         Dispatcher for auto white balance. Calls the appropriate method based on
         the mode set in the config ('lab' or 'rgb').
+
+        Returns the detail message string if a correction was applied, or None
+        if no change / error.
         """
         mode = config.get("awb", "mode", fallback="lab")
         if mode == "lab":
-            self.auto_white_balance_lab()
+            return self.auto_white_balance_lab()
         elif mode == "rgb":
-            self.auto_white_balance_legacy()
+            return self.auto_white_balance_legacy()
         else:
             log.error(f"Unknown AWB mode: {mode}")
             self.update_status_message(f"Error: Unknown AWB mode '{mode}'")
+            return None
 
-    def auto_white_balance_legacy(self):
+    def auto_white_balance_legacy(self) -> Optional[str]:
         """
         Calculates and applies auto white balance using the legacy grey world
         assumption on the entire RGB image.
+
+        Returns the detail message string if a correction was applied, or None.
         """
         if not self.image_editor.original_image:
             log.warning("No image loaded in editor for auto white balance")
-            return
+            return None
 
         try:
             import numpy as np
         except ImportError:
             log.error("NumPy not found. Please install with: pip install numpy")
             self.update_status_message("Error: NumPy not installed")
-            return
+            return None
 
         log.info("Applying legacy (RGB Grey World) Auto White Balance")
 
@@ -5242,6 +5352,11 @@ class AppController(QObject):
         by_value = float(np.clip(by_value, -1.0, 1.0))
         mg_value = float(np.clip(mg_value, -1.0, 1.0))
 
+        # No-change detection
+        if abs(by_value) < _AWB_NOOP_EPS and abs(mg_value) < _AWB_NOOP_EPS:
+            self.update_status_message("AWB: no correction needed (already neutral)")
+            return None
+
         self.image_editor.set_edit_param("white_balance_by", by_value)
         self.image_editor.set_edit_param("white_balance_mg", mg_value)
 
@@ -5250,33 +5365,54 @@ class AppController(QObject):
 
         self.ui_refresh_generation += 1
         self.ui_state.currentImageSourceChanged.emit()
-        self.update_status_message("Auto white balance applied (Legacy)")
 
-    def auto_white_balance_lab(self):
+        by_dir = _awb_direction(by_value, "warming", "cooling")
+        mg_dir = _awb_direction(mg_value, "magenta", "greener")
+        msg = f"AWB (Legacy): B/Y {by_value:+.2f} ({by_dir}), M/G {mg_value:+.2f} ({mg_dir})"
+        self.update_status_message(msg)
+        return msg
+
+    def auto_white_balance_lab(self) -> Optional[str]:
         """
         Calculates and applies auto white balance using the Lab color space,
         filtering out clipped and saturated pixels for a more robust result.
+
+        Returns the detail message string if a correction was applied, or None.
         """
         if not self.image_editor.original_image:
             log.warning("No image loaded in editor for auto white balance")
-            return
+            return None
 
         try:
-            import cv2
-            import numpy as np
+            import cv2  # numpy is already imported at module level (line 79)
         except ImportError:
             log.error(
-                "OpenCV or NumPy not found. Please install with: pip install opencv-python numpy"
+                "OpenCV not found. Please install with: pip install opencv-python"
             )
-            self.update_status_message("Error: OpenCV or NumPy not installed")
-            return
+            self.update_status_message("Error: OpenCV not installed")
+            return None
 
-        img = self.image_editor.original_image
-        # Ensure image is RGB before processing
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-
-        arr = np.array(img, dtype=np.uint8)
+        # Subsample from float_image for speed.  float_image is the authoritative
+        # display-referred sRGB float32 buffer (editor.py:504-505 does
+        # np.array(rgb) / 255.0 from Pillow sRGB), same colour space as the
+        # old PIL-based path, so the AWB result is identical (within subsampling noise).
+        img_arr = self.image_editor.float_image
+        if img_arr is not None:
+            h, w = img_arr.shape[:2]
+            TARGET_PIXELS = 2_000_000
+            stride = max(1, int(np.sqrt(h * w / TARGET_PIXELS)))
+            sub = np.ascontiguousarray(img_arr[::stride, ::stride])  # contiguous for cv2
+            arr = (np.clip(sub, 0.0, 1.0) * 255).astype(np.uint8)
+            log.debug(
+                "AWB: subsampled %dx%d -> %dx%d (stride %d)",
+                w, h, arr.shape[1], arr.shape[0], stride,
+            )
+        else:
+            # Fallback: use original_image (full PIL Image)
+            img = self.image_editor.original_image
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            arr = np.array(img, dtype=np.uint8)
 
         # --- Tunable Constants for Auto White Balance (from config) ---
         _LOWER_BOUND_RGB = config.getint("awb", "rgb_lower_bound", 5)
@@ -5308,7 +5444,7 @@ class AppController(QObject):
                 "Auto white balance: No pixels found after clipping and luma filter. Aborting."
             )
             self.update_status_message("AWB failed: no valid pixels found")
-            return
+            return None
 
         # --- 2. Work in Lab color space ---
         lab_image = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
@@ -5344,6 +5480,11 @@ class AppController(QObject):
 
         log.info(f"Auto white balance values: B/Y={by_value:.3f}, M/G={mg_value:.3f}")
 
+        # No-change detection — see _AWB_NOOP_EPS definition for rationale
+        if abs(by_value) < _AWB_NOOP_EPS and abs(mg_value) < _AWB_NOOP_EPS:
+            self.update_status_message("AWB: no correction needed (already neutral)")
+            return None
+
         self.image_editor.set_edit_param("white_balance_by", by_value)
         self.image_editor.set_edit_param("white_balance_mg", mg_value)
 
@@ -5352,7 +5493,16 @@ class AppController(QObject):
 
         self.ui_refresh_generation += 1
         self.ui_state.currentImageSourceChanged.emit()
-        self.update_status_message("Auto white balance applied")
+
+        by_dir = _awb_direction(by_value, "warming", "cooling")
+        mg_dir = _awb_direction(mg_value, "magenta", "greener")
+        msg = (
+            f"AWB: B/Y {by_value:+.2f} ({by_dir}), M/G {mg_value:+.2f} ({mg_dir})"
+            f" \u2014 a*={a_mean:.0f}\u2192{_TARGET_A_LAB:.0f},"
+            f" b*={b_mean:.0f}\u2192{_TARGET_B_LAB:.0f}"
+        )
+        self.update_status_message(msg)
+        return msg
 
     def _get_stack_info(self, index: int) -> str:
         info = ""
@@ -5531,7 +5681,15 @@ def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False):
         image_dir_path = Path(image_dir)
 
     if not image_dir_path.is_dir():
-        log.error("Image directory not found: %s", image_dir_path)
+        print(f"\nDirectory not found: {image_dir_path}\n")
+        # Show which part of the path exists to help the user spot the typo
+        check = image_dir_path
+        while check != check.parent:
+            if check.exists():
+                print(f"  Closest existing path: {check}")
+                break
+            check = check.parent
+        print("\nUsage: faststack <directory>")
         sys.exit(1)
     app.setOrganizationName("FastStack")
     app.setOrganizationDomain("faststack.dev")
