@@ -9,6 +9,10 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 - Improve auto-levels/AWB UX: detailed status messages and per-stage timing logs (compute/save/list/total).
 - Track last auto-levels detail string for “saved” message reuse; minor import/indexer integration tweaks.
 - Centralize canonical image sort key in indexer; store developed adjacency name on ImageFile.
+- Sync filename filter to the thumbnail grid model (apply/clear) and cancel stale thumbnail prefetch jobs so filtered thumbnails load quickly.
+- Add debug timing logs for auto-levels and auto white balance (subsample/mask/Lab compute) to pinpoint slow stages.
+- Add debug-only timing breakdowns for image load, auto-levels percentile analysis, and save pipeline in `ImageEditor`.
+- Refactor `ThumbnailModel` filtering into `set_filter()` with an active filter state; assert refresh runs on the GUI thread to catch threading mistakes.`
 
 
 ## 1.5.6 (2026-02-08)
