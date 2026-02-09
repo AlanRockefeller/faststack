@@ -170,10 +170,7 @@ class AppController(QObject):
         self.engine = engine
         self.debug_cache = debug_cache  # New debug_cache flag
 
-        # Ensure clean shutdown of background threads
-        inst = QCoreApplication.instance()
-        if inst:
-            inst.aboutToQuit.connect(self._shutdown_executors)
+        # Shutdown is handled in main() via aboutToQuit connection
 
         self.display_width = 0
         self.display_height = 0
@@ -321,6 +318,13 @@ class AppController(QObject):
         # - When render completes, _apply_preview_result chains immediately if pending
         # This removes the extra 16ms delay in the fast-render case by chaining
         # immediately on completion. QML's 16ms slider timer remains the fps cap.
+
+        # Debounce timer for metadata/highlight signals during rapid navigation
+        # Only emits these signals once user stops navigating (16ms = 1 frame debounce)
+        self._metadata_debounce_timer = QTimer(self)
+        self._metadata_debounce_timer.setSingleShot(True)
+        self._metadata_debounce_timer.setInterval(16)  # 16ms debounce (1 frame)
+        self._metadata_debounce_timer.timeout.connect(self._emit_debounced_metadata_signals)
 
         # Track if any dialog is open to disable keybindings
         self._dialog_open = False
@@ -715,6 +719,10 @@ class AppController(QObject):
         where users expect to see the correct image immediately. The prefetcher minimizes
         cache misses by decoding adjacent images in advance.
         """
+        if self.debug_cache:
+            _t_start = time.perf_counter()
+            print(f"[DBGCACHE] {_t_start*1000:.3f} get_decoded_image: START index={index}")
+
         if not self.image_files or index < 0 or index >= len(self.image_files):
             log.warning(
                 "get_decoded_image called with empty image_files or out of bounds index."
@@ -759,6 +767,11 @@ class AppController(QObject):
             decoded = self.image_cache[cache_key]
             with self._last_image_lock:
                 self.last_displayed_image = decoded
+
+            if self.debug_cache:
+                _t_end = time.perf_counter()
+                print(f"[DBGCACHE] {_t_end*1000:.3f} get_decoded_image: CACHE HIT index={index} total={(_t_end - _t_start)*1000:.2f}ms")
+
             return decoded
 
         self.image_cache.misses += 1  # Increment miss counter
@@ -771,6 +784,8 @@ class AppController(QObject):
                 if key.startswith(prefix)
             ]
             cache_usage_gb = self.image_cache.currsize / (1024**3)
+            _t_miss = time.perf_counter()
+            print(f"[DBGCACHE] {_t_miss*1000:.3f} get_decoded_image: CACHE MISS index={index} gen={display_gen} (after {(_t_miss - _t_start)*1000:.2f}ms)")
             log.info(
                 "Cache miss for %s (index=%d gen=%d). Cached gens: %s. Cache usage=%.2fGB entries=%d",
                 image_path.name,
@@ -836,6 +851,9 @@ class AppController(QObject):
                 if _debug_mode:
                     elapsed = time.perf_counter() - decode_start
                     log.info("Decoded image %d in %.3fs", index, elapsed)
+                if self.debug_cache:
+                    _t_decoded = time.perf_counter()
+                    print(f"[DBGCACHE] {_t_decoded*1000:.3f} get_decoded_image: DECODED index={index} total={(_t_decoded - _t_start)*1000:.2f}ms")
                 return decoded
             else:
                 if _debug_mode:
@@ -916,23 +934,50 @@ class AppController(QObject):
         return None
 
     def sync_ui_state(self):
-        """Forces the UI to update by emitting all state change signals."""
+        """Forces the UI to update by emitting all state change signals.
+        
+        Essential signals (currentIndexChanged, currentImageSourceChanged) are emitted
+        immediately. Non-essential signals (highlightStateChanged, metadataChanged) are
+        debounced to reduce overhead during rapid navigation.
+        """
+        if self.debug_cache:
+            _t_start = time.perf_counter()
+            print(f"[DBGCACHE] {_t_start*1000:.3f} sync_ui_state: START gen={self.ui_refresh_generation + 1}")
+
         self.ui_refresh_generation += 1
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
 
-        # tell QML that index and image changed
+        # Essential signals - emit immediately for responsive image display
         self.ui_state.currentIndexChanged.emit()
         self.ui_state.currentImageSourceChanged.emit()
-        self.ui_state.highlightStateChanged.emit()  # Notify UI of new highlight stats
 
-        # this is the one your footer needs
-        self.ui_state.metadataChanged.emit()
+        # Debounce non-essential signals during rapid navigation
+        # These will emit once after user stops navigating (16ms)
+        self._metadata_debounce_timer.start()
+
+        if self.debug_cache:
+            _t_end = time.perf_counter()
+            print(f"[DBGCACHE] {_t_end*1000:.3f} sync_ui_state: DONE signals emitted, total={(_t_end - _t_start)*1000:.2f}ms")
 
         log.debug(
             "UI State Synced: Index=%d, Count=%d",
             self.ui_state.currentIndex,
             self.ui_state.imageCount,
         )
+
+    def _emit_debounced_metadata_signals(self):
+        """Emit deferred metadata/highlight signals after navigation stops."""
+        if self.debug_cache:
+            _t_start = time.perf_counter()
+            print(f"[DBGCACHE] {_t_start*1000:.3f} _emit_debounced_metadata_signals: emitting deferred signals")
+
+        self.ui_state.highlightStateChanged.emit()
+        self.ui_state.metadataChanged.emit()
+
+        if self.debug_cache:
+            _t_end = time.perf_counter()
+            print(f"[DBGCACHE] {_t_end*1000:.3f} _emit_debounced_metadata_signals: DONE total={(_t_end - _t_start)*1000:.2f}ms")
+
         log.debug(
             "Metadata Synced: Filename=%s, Uploaded=%s, StackInfo='%s', BatchInfo='%s'",
             self.ui_state.currentFilename,
@@ -1088,6 +1133,10 @@ class AppController(QObject):
         self, index: int, direction: int = 0, is_navigation: bool = True
     ):
         """Centralized method to change current image index and reset state."""
+        if self.debug_cache:
+            _t_start = time.perf_counter()
+            print(f"[DBGCACHE] {_t_start*1000:.3f} _set_current_index: START index={index} dir={direction}")
+
         if index < 0 or index >= len(self.image_files):
             return
 
@@ -1110,22 +1159,52 @@ class AppController(QObject):
         self.current_index = index  # Set index first so signals pick up correct image
 
         self._reset_crop_settings()
+
+        if self.debug_cache:
+            _t_prefetch = time.perf_counter()
+            print(f"[DBGCACHE] {_t_prefetch*1000:.3f} _set_current_index: calling _do_prefetch")
+
         self._do_prefetch(
             self.current_index, is_navigation=is_navigation, direction=direction
         )
+
+        if self.debug_cache:
+            _t_sync = time.perf_counter()
+            print(f"[DBGCACHE] {_t_sync*1000:.3f} _set_current_index: calling sync_ui_state (prefetch took {(_t_sync - _t_prefetch)*1000:.2f}ms)")
+
         self.sync_ui_state()
 
         # Update histogram if visible
         if self.ui_state.isHistogramVisible:
             self.update_histogram()
 
+        if self.debug_cache:
+            _t_end = time.perf_counter()
+            print(f"[DBGCACHE] {_t_end*1000:.3f} _set_current_index: DONE total={(_t_end - _t_start)*1000:.2f}ms")
+
     def next_image(self):
+        if self.debug_cache:
+            _t_start = time.perf_counter()
+            print(f"[DBGCACHE] {_t_start*1000:.3f} next_image: START from index={self.current_index}")
+
         if self.current_index < len(self.image_files) - 1:
             self._set_current_index(self.current_index + 1, direction=1)
 
+        if self.debug_cache:
+            _t_end = time.perf_counter()
+            print(f"[DBGCACHE] {_t_end*1000:.3f} next_image: DONE total={(_t_end - _t_start)*1000:.2f}ms")
+
     def prev_image(self):
+        if self.debug_cache:
+            _t_start = time.perf_counter()
+            print(f"[DBGCACHE] {_t_start*1000:.3f} prev_image: START from index={self.current_index}")
+
         if self.current_index > 0:
             self._set_current_index(self.current_index - 1, direction=-1)
+
+        if self.debug_cache:
+            _t_end = time.perf_counter()
+            print(f"[DBGCACHE] {_t_end*1000:.3f} prev_image: DONE total={(_t_end - _t_start)*1000:.2f}ms")
 
     @Slot(int)
     def jump_to_image(self, index: int):
@@ -3409,19 +3488,32 @@ class AppController(QObject):
                 if Path(backup_path).exists():
                     self.undo_history.append(("crop", action_data, timestamp))
 
-    def shutdown(self):
-        log.info("Application shutting down.")
+    def shutdown_qt(self):
+        """Shutdown Qt objects only - MUST run on main/Qt thread."""
+        self._shutting_down = True  # set EARLY to make all slots no-op
+        log.info("Application shutting down (Qt cleanup).")
 
-        # Check tracked recycle bins plus explicit base bin check if it exists
+        # Stop Qt timers
+        try:
+            self._metadata_debounce_timer.stop()
+        except Exception:
+            pass
+
+        # Stop QFileSystemWatcher if it's Qt-based
+        try:
+            self.watcher.stop()
+        except Exception:
+            pass
+
+        # Check tracked recycle bins for logging
         bins_to_check = set(self.active_recycle_bins)
-        # Also check local "image recycle bin" in current/base folders just in case
         try:
             bins_to_check.add(self.image_dir / "image recycle bin")
         except Exception:
             pass
 
         total_files = 0
-        bin_stats = {}  # bin_path -> count
+        bin_stats = {}
 
         for bin_dir in bins_to_check:
             if bin_dir.exists() and bin_dir.is_dir():
@@ -3435,37 +3527,56 @@ class AppController(QObject):
                     pass
 
         if total_files > 0:
-            # In a GUI app, we can't easily show a blocking QMessageBox here because shutdown()
-            # might be called after loop exit or during cleanup.
-            # However, we implemented the QML close interception (Main.qml) which calls cleanup.
-            # This python-side check is a fallback or for CLI usage.
-            # Since we moved the logic to QML's onClosing, we mainly just log here.
             log.info(
                 "Shutdown with %d files in recycle bins: %s",
                 total_files,
                 list(bin_stats.keys()),
             )
 
-        # Clear QML context property to prevent TypeErrors during shutdown
+        # Clear QML engine reference (but don't delete - let Qt handle it)
         if self.engine:
-            log.info("Clearing uiState context property in QML.")
-            del self.engine  # Explicitly delete the engine
+            log.info("Detaching QML engine.")
+            self.engine = None
 
-        self.watcher.stop()
-        self.prefetcher.shutdown()
-        # Guard against partial init
-        if getattr(self, "_thumbnail_prefetcher", None):
-            self._thumbnail_prefetcher.shutdown()
-        self.sidecar.set_last_index(self.current_index)
-        self.sidecar.save()
+    def shutdown_nonqt(self):
+        """Shutdown non-Qt resources - safe to run in background thread."""
+        log.info("Shutting down background resources.")
 
-    def _shutdown_executors(self):
-        """Explicitly shuts down thread pools on app exit to prevent hanging."""
-        self._shutting_down = True
-        log.info("Shutting down background executors...")
-        self._hist_executor.shutdown(wait=False, cancel_futures=True)
-        self._preview_executor.shutdown(wait=False, cancel_futures=True)
-        self._save_executor.shutdown(wait=False, cancel_futures=True)
+        # Shutdown thread pool executors
+        try:
+            log.info("Shutting down background executors...")
+            self._hist_executor.shutdown(wait=False, cancel_futures=True)
+            self._preview_executor.shutdown(wait=False, cancel_futures=True)
+            self._save_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:
+            log.warning("Error shutting down executors: %s", e)
+
+        # Shutdown prefetcher
+        try:
+            self.prefetcher.shutdown()
+        except Exception as e:
+            log.warning("Error shutting down prefetcher: %s", e)
+
+        # Shutdown thumbnail prefetcher
+        try:
+            if getattr(self, "_thumbnail_prefetcher", None):
+                self._thumbnail_prefetcher.shutdown()
+        except Exception as e:
+            log.warning("Error shutting down thumbnail prefetcher: %s", e)
+
+        # Save sidecar state
+        try:
+            self.sidecar.set_last_index(self.current_index)
+            self.sidecar.save()
+        except Exception as e:
+            log.warning("Error saving sidecar: %s", e)
+
+        log.info("Background shutdown complete.")
+
+    def shutdown(self):
+        """Legacy shutdown method - calls both Qt and non-Qt shutdown."""
+        self.shutdown_qt()
+        self.shutdown_nonqt()
 
     def empty_recycle_bin(self):
         """Permanently deletes all files in all tracked recycle bins."""
@@ -4764,9 +4875,6 @@ class AppController(QObject):
         if save_result:
             saved_path, backup_path = save_result
 
-            # Track for undo
-            import time
-
             timestamp = time.time()
             self.undo_history.append(
                 ("crop", (str(saved_path), str(backup_path)), timestamp)
@@ -4945,9 +5053,6 @@ class AppController(QObject):
             # Status message already set by auto_levels ("No changes made...")
             return
 
-        # Save
-        import time
-
         try:
             save_result = self.image_editor.save_image()
         except RuntimeError as e:
@@ -5018,8 +5123,6 @@ class AppController(QObject):
         if not self.image_files:
             self.update_status_message("No image to adjust")
             return
-
-        import time
 
         image_file = self.image_files[self.current_index]
         filepath = str(image_file.path)
@@ -5398,6 +5501,15 @@ def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False):
     app = QApplication(
         sys.argv
     )  # QApplication is correct for desktop apps with widgets
+
+    # Enable Ctrl-C to terminate the application
+    import signal
+    signal.signal(signal.SIGINT, lambda *args: app.quit())
+    # Ensure Python's signal handler runs (Qt blocks main thread)
+    timer = QTimer()
+    timer.start(500)  # Check for signals every 500ms
+    timer.timeout.connect(lambda: None)
+
     if debug:
         log.info("Startup: after QApplication: %.3fs", time.perf_counter() - t0)
 
@@ -5467,8 +5579,61 @@ def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False):
     if debug:
         log.info("Startup: after controller.load(): %.3fs", time.perf_counter() - t0)
 
-    # Graceful shutdown
-    app.aboutToQuit.connect(controller.shutdown)
+    # Graceful shutdown with timeout fallback
+    import threading
+    import faulthandler
+
+    def _log_live_threads(tag: str):
+        """Log non-daemon threads for debugging shutdown hangs."""
+        threads = threading.enumerate()
+        alive = [
+            t for t in threads
+            if t.is_alive()
+            and not t.daemon
+            and t.name != "MainThread"
+        ]
+        if not alive:
+            return
+
+        log.warning("%s: %d NON-DAEMON threads still alive:", tag, len(alive))
+        for t in alive:
+            log.warning("  - name=%r ident=%r daemon=%r", t.name, t.ident, t.daemon)
+
+    def _shutdown_with_timeout():
+        """Graceful shutdown with Python timer fallback."""
+        log.info("aboutToQuit fired")
+
+        # Backstop MUST start first, or it won't run if shutdown blocks.
+        killer = threading.Timer(3.0, lambda: os._exit(1))
+        killer.daemon = True
+        killer.start()
+
+        # After 2s, dump stacks to stderr so we can see what's hung.
+        faulthandler.dump_traceback_later(2.0, repeat=False)
+
+        try:
+            # Stop Qt timers on main thread
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+            # Run Qt cleanup on main thread
+            controller.shutdown_qt()
+            
+            # Run non-Qt cleanup synchronously (should be fast with wait=False)
+            controller.shutdown_nonqt()
+            _log_live_threads("after shutdown_nonqt")
+
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+            killer.cancel()  # if we got here, no need to force-kill
+
+    app.aboutToQuit.connect(_shutdown_with_timeout)
+
+    # Ensure closing last window actually quits the app
+    app.setQuitOnLastWindowClosed(True)
+    app.lastWindowClosed.connect(app.quit)
 
     sys.exit(app.exec())
 
