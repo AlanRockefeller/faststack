@@ -13,6 +13,10 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 - Add debug timing logs for auto-levels and auto white balance (subsample/mask/Lab compute) to pinpoint slow stages.
 - Add debug-only timing breakdowns for image load, auto-levels percentile analysis, and save pipeline in `ImageEditor`.
 - Refactor `ThumbnailModel` filtering into `set_filter()` with an active filter state; assert refresh runs on the GUI thread to catch threading mistakes.`
+- Export performance: Skip the expensive sRGB→Linear→sRGB round-trip when no linear-space edits are active (WB/exposure/highlights/shadows/clarity/texture/sharpness), and clamp export output to [0,1] on that path.
+- Save performance: Avoid float_image.copy() during export when the edit set guarantees the pipeline won’t mutate the input buffer.
+- Load performance: Apply EXIF orientation on the 8-bit Pillow path before float conversion (rotate uint8), and only rotate the float buffer on the 16-bit OpenCV path.
+- Logging/robustness: Switch warnings/errors to lazy log formatting and improve load/save diagnostics.
 
 
 ## 1.5.6 (2026-02-08)
