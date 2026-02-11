@@ -1,6 +1,7 @@
 """Filesystem watcher to detect changes in the image directory."""
 
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -9,30 +10,48 @@ from watchdog.observers import Observer
 
 log = logging.getLogger(__name__)
 
+# Matches FastStack backup filenames: name-backup.jpg, name-backup2.jpg, etc.
+_BACKUP_RE = re.compile(r"-backup\d*\.jpe?g$")
+
+
+def _is_ignored_path(path: str) -> bool:
+    """Return True for paths the watcher should silently ignore."""
+    p = path.lower()
+    return (
+        p.endswith(".tmp")
+        or p.endswith("faststack.json")
+        or ".__faststack_tmp__" in p
+        or _BACKUP_RE.search(p) is not None
+    )
+
 
 class ImageDirectoryEventHandler(FileSystemEventHandler):
-    """Handles filesystem events for the image directory."""
+    """Handles filesystem events for the image directory.
+
+    Events are forwarded to the callback immediately.  The callback is
+    expected to handle debouncing (e.g. via QTimer on the UI thread).
+    """
 
     def __init__(self, callback):
         super().__init__()
         self.callback = callback
 
     def on_created(self, event):
-        if event.src_path.endswith(".tmp") or event.src_path.endswith("faststack.json"):
+        if _is_ignored_path(event.src_path):
             return
-        log.info(f"Detected file creation: {event}. Triggering refresh.")
+        log.info("Detected file creation: %s. Requesting refresh.", event)
         self.callback()
 
     def on_deleted(self, event):
-        if event.src_path.endswith(".tmp") or event.src_path.endswith("faststack.json"):
+        if _is_ignored_path(event.src_path):
             return
-        log.info(f"Detected file deletion: {event}. Triggering refresh.")
+        log.info("Detected file deletion: %s. Requesting refresh.", event)
         self.callback()
 
     def on_moved(self, event):
-        if event.src_path.endswith(".tmp") or event.src_path.endswith("faststack.json"):
+        if _is_ignored_path(event.src_path) or _is_ignored_path(event.dest_path):
             return
-        log.info(f"Detected file move: {event}. Triggering refresh.")
+        log.info("Detected file move: %s. Requesting refresh.", event)
         self.callback()
 
     def on_modified(self, event):

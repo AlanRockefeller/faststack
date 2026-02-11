@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import List, Dict, Tuple
@@ -15,6 +16,9 @@ RAW_EXTENSIONS = {".orf", ".rw2", ".cr2", ".cr3", ".arw", ".nef", ".raf", ".dng"
 JPG_EXTENSIONS = {".jpg", ".jpeg", ".jpe"}
 
 _DEVELOPED_SUFFIX = "-developed"
+
+# Matches FastStack backup stems: name-backup, name-backup2, name-backup33, etc.
+_BACKUP_STEM_RE = re.compile(r"-backup\d*$", re.IGNORECASE)
 
 
 def find_images(directory: Path) -> List[ImageFile]:
@@ -32,6 +36,9 @@ def find_images(directory: Path) -> List[ImageFile]:
                 p = Path(entry.path)
                 ext = p.suffix.lower()
                 if ext in JPG_EXTENSIONS:
+                    # Skip FastStack backup files (name-backup.jpg, name-backup2.jpg, etc.)
+                    if _BACKUP_STEM_RE.search(p.stem):
+                        continue
                     all_jpgs.append((p, entry.stat()))
                 elif ext in RAW_EXTENSIONS:
                     stem = p.stem.casefold()
@@ -164,7 +171,7 @@ def image_sort_key(img: ImageFile) -> Tuple[float, str, int, str]:
          fallback for developed ImageFiles created outside find_images().
       3. Own filename — used for all non-developed images.
 
-    All code paths — find_images(), _insert_backup_into_list(), etc. — use
+    All code paths — find_images(), _reindex_after_save(), etc. — use
     this single function so the sort order is always consistent.
     """
     own_name_cf = img.path.name.casefold()

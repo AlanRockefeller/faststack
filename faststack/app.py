@@ -35,6 +35,7 @@ from PySide6.QtCore import (
     QTimer,
     QObject,
     QEvent,
+    QMetaObject,
     Signal,
     Slot,
     QMimeData,
@@ -204,7 +205,7 @@ class AppController(QObject):
         self.current_edit_source_mode: str = "jpeg"
 
         # -- Backend Components --
-        self.watcher = Watcher(self.image_dir, self.refresh_image_list)
+        self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
         self.image_editor = ImageEditor()  # Initialize the editor
         self._dialog_open_count = 0  # Track nested dialogs
@@ -334,6 +335,14 @@ class AppController(QObject):
         # - When render completes, _apply_preview_result chains immediately if pending
         # This removes the extra 16ms delay in the fast-render case by chaining
         # immediately on completion. QML's 16ms slider timer remains the fps cap.
+
+        # Debounce timer for filesystem watcher refresh.
+        # Coalesces bursts (backup-create + atomic-replace delete + move)
+        # into a single refresh on the UI thread.
+        self._watcher_debounce_timer = QTimer(self)
+        self._watcher_debounce_timer.setSingleShot(True)
+        self._watcher_debounce_timer.setInterval(200)  # 200ms debounce
+        self._watcher_debounce_timer.timeout.connect(self.refresh_image_list)
 
         # Debounce timer for metadata/highlight signals during rapid navigation
         # Only emits these signals once user stops navigating (16ms = 1 frame debounce)
@@ -695,6 +704,30 @@ class AppController(QObject):
             self._folder_loaded = True
             self.ui_state.isFolderLoadedChanged.emit()
 
+    def _request_watcher_refresh(self):
+        """Thread-safe entry point for the filesystem watcher.
+
+        Called from the watchdog thread.  Uses QMetaObject.invokeMethod with
+        QueuedConnection to safely restart the debounce QTimer on the UI
+        thread, so bursts of events (backup-create, atomic-replace delete,
+        move) are coalesced into a single ``refresh_image_list`` call.
+        """
+        try:
+            QMetaObject.invokeMethod(
+                self, "_start_watcher_debounce_timer", Qt.QueuedConnection
+            )
+        except RuntimeError:
+            pass  # QObject already deleted during shutdown
+
+    @Slot()
+    def _start_watcher_debounce_timer(self) -> None:
+        """Non-overloaded slot to restart the watcher debounce timer.
+
+        QTimer.start is overloaded (start() / start(int)), which can cause
+        ambiguity with QMetaObject.invokeMethod in some PySide versions.
+        """
+        self._watcher_debounce_timer.start()
+
     def refresh_image_list(self):
         """Rescans the directory for images from disk and updates cache.
 
@@ -739,64 +772,35 @@ class AppController(QObject):
             img.path.resolve(): i for i, img in enumerate(self.image_files)
         }
 
-    def _insert_backup_into_list(self, backup_path: str, current_path: str) -> bool:
-        """Insert a newly-created backup file into the image list without a full rescan.
+    def _reindex_after_save(self, saved_path: str) -> bool:
+        """Re-derive current_index to point at *saved_path* after a save.
 
-        Uses bisect.bisect_right with the canonical image_sort_key() from
-        indexer.py to maintain order, then list.insert at the found position.
-        Falls back to refresh_image_list() on any error.
+        Backup files are excluded from the visible image list (the indexer
+        skips ``-backup`` stems), so the list itself is unchanged.  We just
+        need to make sure current_index still points at the right entry.
 
-        Returns True if the current_path was found in the updated list.
+        Returns True if saved_path was found.
         """
-        try:
-            bp = Path(backup_path)
-            cp = Path(current_path)
-            mtime = bp.stat().st_mtime
-            img = ImageFile(path=bp, raw_pair=None, timestamp=mtime)
+        cp = Path(saved_path)
 
-            # Use the canonical sort key for both the new entry and existing list.
-            # Rebuilding keys is O(n) but still far cheaper than a full directory scan.
-            key = image_sort_key(img)
-            keys = [image_sort_key(f) for f in self._all_images]
-            idx = bisect.bisect_right(keys, key)
-            self._all_images.insert(idx, img)
+        # Fast path: resolve-based lookup
+        resolved = cp.resolve(strict=False)
+        new_idx = self._path_to_index.get(resolved)
+        if new_idx is not None:
+            self.current_index = new_idx
+            return True
 
-            # Re-apply filter and rebuild index
-            self._apply_filter_to_cached_list()
-
-            # Re-derive current_index from the updated path-to-index map
-            # strict=False avoids exceptions from symlinks / missing intermediates
-            resolved = cp.resolve(strict=False)
-            new_idx = self._path_to_index.get(resolved)
-            if new_idx is not None:
-                self.current_index = new_idx
+        # Name-based fallback (drive letter / symlink mismatches)
+        target_name = cp.name
+        for i, img_file in enumerate(self.image_files):
+            if img_file.path.name == target_name:
+                self.current_index = i
                 return True
 
-            # Name-based fallback (handles drive letter / symlink mismatches)
-            target_name = cp.name
-            for i, img_file in enumerate(self.image_files):
-                if img_file.path.name == target_name:
-                    self.current_index = i
-                    return True
-
-            log.warning(
-                "_insert_backup_into_list: could not find %s after insertion", current_path
-            )
-            return False
-
-        except Exception:
-            log.warning(
-                "_insert_backup_into_list: falling back to refresh_image_list",
-                exc_info=True,
-            )
-            self.refresh_image_list()
-            # Attempt to find current_path in refreshed list
-            target_name = Path(current_path).name
-            for i, img_file in enumerate(self.image_files):
-                if img_file.path.name == target_name:
-                    self.current_index = i
-                    return True
-            return False
+        log.warning(
+            "_reindex_after_save: could not find %s in list", saved_path
+        )
+        return False
 
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
         """Retrieves a decoded image, blocking until ready to ensure correct display.
@@ -2716,7 +2720,7 @@ class AppController(QObject):
         self.image_dir = folder_path
 
         # Reinitialize directory-bound components
-        self.watcher = Watcher(self.image_dir, self.refresh_image_list)
+        self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
 
         # Only update recycle bin when switching base directories (not subfolder navigation)
@@ -5153,6 +5157,18 @@ class AppController(QObject):
 
         t_start = time.perf_counter()
 
+        # Pre-load with preview_only for uint8 fast path (skips float32 conversion)
+        image_file = self.image_files[self.current_index]
+        filepath = str(image_file.path)
+        if (
+            not self.image_editor.current_filepath
+            or str(self.image_editor.current_filepath) != filepath
+        ):
+            cached_preview = self.get_decoded_image(self.current_index)
+            self.image_editor.load_image(
+                filepath, cached_preview=cached_preview, preview_only=True
+            )
+
         # Apply the preview first (loads image + sets params)
         self._last_auto_levels_msg = ""
         applied = self.auto_levels()
@@ -5164,7 +5180,10 @@ class AppController(QObject):
             return
 
         try:
-            save_result = self.image_editor.save_image()
+            # Try uint8 fast path first, fall back to regular save
+            save_result = self.image_editor.save_image_uint8_levels()
+            if save_result is None:
+                save_result = self.image_editor.save_image()
         except RuntimeError as e:
             log.warning(f"quick_auto_levels: Save failed: {e}")
             self.update_status_message(f"Failed to save image: {e}")
@@ -5185,8 +5204,8 @@ class AppController(QObject):
             # Force reload to ensure disk consistency
             self.image_editor.clear()
 
-            # Insert backup into list without full directory rescan
-            self._insert_backup_into_list(backup_path, saved_path)
+            # Re-derive current_index (backup is excluded from visible list)
+            self._reindex_after_save(saved_path)
             t_list = time.perf_counter()
 
             self.display_generation += 1
@@ -5283,8 +5302,8 @@ class AppController(QObject):
             # Force the image editor to clear its current state so it reloads fresh
             self.image_editor.clear()
 
-            # Insert backup into list without full directory rescan
-            self._insert_backup_into_list(backup_path, saved_path)
+            # Re-derive current_index (backup is excluded from visible list)
+            self._reindex_after_save(saved_path)
             t_list = time.perf_counter()
 
             # Invalidate cache for the edited image so it's reloaded from disk

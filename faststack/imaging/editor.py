@@ -4,8 +4,9 @@ import shutil
 import re
 import math
 import time
+import uuid
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps, ExifTags
 
@@ -353,6 +354,10 @@ class ImageEditor:
         # Stores: {'hash': int, 'Y20': ndarray, 'Y3': ndarray, 'Y1': ndarray}
         self._cached_detail_bands: Optional[Dict[str, Any]] = None
 
+        # Cached 768-entry LUT list for save_image_uint8_levels (R+G+B tables),
+        # keyed on (round(blacks, 3), round(whites, 3)).
+        self._cached_u8_lut: Optional[Tuple[Tuple[float, float], List[int]]] = None
+
     def clear(self):
         """Clear all editor state so the next edit starts from a clean slate."""
         with self._lock:
@@ -368,6 +373,7 @@ class ImageEditor:
             self._last_highlight_state = None  # Explicit reset
             self._cached_highlight_analysis = None
             self._cached_detail_bands = None
+            self._cached_u8_lut = None
         # Optionally also reset edits if that matches your mental model:
         # self.current_edits = self._initial_edits()
 
@@ -465,6 +471,7 @@ class ImageEditor:
         filepath: str,
         cached_preview: Optional[DecodedImage] = None,
         source_exif: Optional[bytes] = None,
+        preview_only: bool = False,
     ):
         """Load a new image for editing.
 
@@ -472,6 +479,9 @@ class ImageEditor:
             filepath: Path to the image file
             cached_preview: Optional byte-buffer for faster initial display
             source_exif: Optional EXIF bytes from original source (preserve camera metadata)
+            preview_only: If True and image is 8-bit, skip cv2 and float32 conversion.
+                          Loads only PIL image + float_preview for histogram analysis.
+                          float_image stays None.  Ignored for 16-bit (TIFF) files.
         """
         if not filepath or not Path(filepath).exists():
             with self._lock:
@@ -510,7 +520,10 @@ class ImageEditor:
 
             # --- Convert to Float32 ---
             # Use OpenCV for reliable 16-bit loading as Pillow often downsamples to 8-bit RGB
-            if cv2 is None:
+            _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
+            if preview_only and not _is_tiff:
+                cv_img = None
+            elif cv2 is None:
                 log.warning(
                     "OpenCV not installed, falling back to Pillow (may lose 16-bit depth)"
                 )
@@ -581,8 +594,9 @@ class ImageEditor:
                 if orientation > 1:
                     loaded_original = ImageOps.exif_transpose(loaded_original)
                     float_image_orientation_applied = True
-                rgb = loaded_original.convert("RGB")
-                loaded_float_image = np.array(rgb).astype(np.float32) / 255.0
+                if not preview_only:
+                    rgb = loaded_original.convert("RGB")
+                    loaded_float_image = np.array(rgb).astype(np.float32) / 255.0
                 log.info("Loaded 8-bit image via Pillow: %s", load_filepath)
             if _debug:
                 t_float = time.perf_counter()
@@ -1878,6 +1892,15 @@ class ImageEditor:
             log.warning("Failed to sanitize EXIF orientation: %s. Dropping EXIF.", e)
             return None
 
+    def _ensure_float_image(self) -> None:
+        """Ensure self.float_image exists. Needed when load_image(preview_only=True)."""
+        if self.float_image is not None:
+            return
+        if self.original_image is None:
+            raise RuntimeError("No image loaded")
+        rgb = self.original_image.convert("RGB")
+        self.float_image = np.array(rgb).astype(np.float32) / 255.0
+
     def save_image(
         self, write_developed_jpg: bool = False, developed_path: Optional[Path] = None
     ) -> Optional[Tuple[Path, Path]]:
@@ -1892,7 +1915,13 @@ class ImageEditor:
         Returns:
             A tuple of (saved_path, backup_path) on success, otherwise None.
         """
-        if self.float_image is None or self.current_filepath is None:
+        if self.current_filepath is None or self.original_image is None:
+            return None
+
+        # Ensure float master exists (preview_only loads may not have it)
+        try:
+            self._ensure_float_image()
+        except RuntimeError:
             return None
 
         _debug = log.isEnabledFor(logging.DEBUG)
@@ -2031,6 +2060,142 @@ class ImageEditor:
         except Exception as e:
             log.exception("Failed to save %s: %s", self.current_filepath, e)
             raise RuntimeError("Save failed: %s" % str(e)) from e
+
+    def save_image_uint8_levels(self) -> Optional[Tuple[Path, Path]]:
+        """Fast-path save using a uint8 LUT for levels-only edits.
+
+        Instead of float_convert -> _apply_edits -> uint8, builds a 256-entry
+        lookup table from the blacks/whites levels formula and applies it
+        directly to the original uint8 PIL image data.
+
+        Returns:
+            (saved_path, backup_path) on success, None if the fast path is not
+            applicable (TIFF, missing image, non-levels edits active).
+        """
+        if self.original_image is None or self.current_filepath is None:
+            return None
+
+        original_path = self.current_filepath
+
+        # TIFF needs 16-bit pipeline
+        if original_path.suffix.lower() in (".tif", ".tiff"):
+            return None
+
+        # Only applicable when blacks/whites are the sole active edits
+        edits = self.current_edits
+        for key, default in self._initial_edits().items():
+            if key in ("blacks", "whites"):
+                continue
+            val = edits.get(key, default)
+            if isinstance(default, float):
+                try:
+                    if abs(float(val) - float(default)) > 0.001:
+                        return None
+                except (TypeError, ValueError):
+                    return None
+            elif val != default:
+                return None
+
+        try:
+            blacks = float(edits.get("blacks", 0.0))
+            whites = float(edits.get("whites", 0.0))
+        except (TypeError, ValueError):
+            return None
+
+        # Nothing to apply
+        if abs(blacks) <= 0.001 and abs(whites) <= 0.001:
+            return None
+
+        _debug = log.isEnabledFor(logging.DEBUG)
+        if _debug:
+            t0 = time.perf_counter()
+
+        # Build 768-entry LUT matching _apply_edits step 13 (cached by rounded key)
+        cache_key = (round(blacks, 3), round(whites, 3))
+        cached = self._cached_u8_lut
+        if cached is not None and cached[0] == cache_key:
+            lut_rgb = cached[1]
+        else:
+            bp = -blacks * 0.15
+            wp = 1.0 - (whites * 0.15)
+            if abs(wp - bp) < 0.0001:
+                wp = bp + 0.0001
+            lut = np.arange(256, dtype=np.float32) / 255.0
+            lut = (lut - bp) / (wp - bp)
+            lut = np.clip(lut, 0.0, 1.0)
+            lut_rgb = (lut * 255.0).astype(np.uint8).tolist() * 3  # 768 entries
+            self._cached_u8_lut = (cache_key, lut_rgb)
+
+        # Apply LUT via Pillow .point() — single C call, no large NumPy allocation
+        rgb_img = self.original_image
+        if rgb_img.mode != "RGB":
+            rgb_img = rgb_img.convert("RGB")
+        img_u8 = rgb_img.point(lut_rgb)
+
+        if _debug:
+            t_lut = time.perf_counter()
+
+        try:
+            original_stat = original_path.stat()
+        except OSError:
+            original_stat = None
+
+        # Backup
+        backup_path = create_backup_file(original_path)
+        if backup_path is None:
+            return None
+
+        if _debug:
+            t_backup = time.perf_counter()
+
+        # EXIF
+        exif_bytes = self._get_sanitized_exif_bytes()
+        save_kwargs = {"quality": 95}
+        if exif_bytes:
+            save_kwargs["exif"] = exif_bytes
+
+        # Atomic write: temp file + os.replace() to prevent partial-write visibility
+        tmp_path = original_path.with_name(
+            f"{original_path.stem}.__faststack_tmp__{uuid.uuid4().hex}{original_path.suffix}"
+        )
+        try:
+            try:
+                img_u8.save(tmp_path, **save_kwargs)
+            except Exception:
+                # Fallback without EXIF, keep quality
+                img_u8.save(tmp_path, quality=95)
+            try:
+                os.replace(tmp_path, original_path)
+            except OSError as e:
+                # Windows: destination may be held open by another process
+                log.warning("Atomic replace failed (%s); falling back to direct save", e)
+                try:
+                    img_u8.save(original_path, **save_kwargs)
+                except Exception:
+                    img_u8.save(original_path, quality=95)
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+        if original_stat is not None:
+            self._restore_file_times(original_path, original_stat)
+
+        if _debug:
+            t_write = time.perf_counter()
+            w, h = img_u8.size
+            log.debug(
+                "[SAVE_IMAGE_U8] lut+apply=%dms backup=%dms write=%dms total=%dms  (%dx%d, %s)",
+                int((t_lut - t0) * 1000),
+                int((t_backup - t_lut) * 1000),
+                int((t_write - t_backup) * 1000),
+                int((t_write - t0) * 1000),
+                w, h,
+                original_path.name,
+            )
+        return original_path, backup_path
 
     def _restore_file_times(self, path: Path, original_stat: os.stat_result) -> None:
         """Best-effort restoration of access/modify timestamps after saving."""
