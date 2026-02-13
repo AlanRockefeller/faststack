@@ -85,6 +85,15 @@ from faststack.io.deletion import (
     confirm_batch_permanent_delete,
     permanently_delete_image_files,
 )
+from faststack.deletion_types import (
+    DeleteJob,
+    DeleteResult,
+    DeleteRecord,
+    DeleteWarning,
+    DeleteWarning,
+    DeleteFailure,
+    DeletionErrorCodes,
+)
 
 
 # AWB thresholds on the -1..+1 normalised slider range.
@@ -181,7 +190,7 @@ class AppController(QObject):
             max_workers=1, thread_name_prefix="Deleter"
         )
         self._deleteFinished.connect(self._on_delete_finished)
-        self._pending_delete_jobs: Dict[int, dict] = {}  # job_id -> job snapshot
+        self._pending_delete_jobs: Dict[int, DeleteJob] = {}  # job_id -> DeleteJob
         self._next_delete_job_id = 0
 
         # Preview Offloading Setup
@@ -320,6 +329,7 @@ class AppController(QObject):
         self.batches: List[List[int]] = []  # List of [start, end] ranges
 
         self._filter_string: str = ""  # Default filter
+        self._filter_flags: list = []  # Active flag filters (e.g. ["uploaded", "stacked"])
         self._filter_enabled: bool = False
 
         self._metadata_cache = {}
@@ -469,14 +479,16 @@ class AppController(QObject):
         return img.path
 
     @Slot(str)
-    def apply_filter(self, filter_string: str):
+    def apply_filter(self, filter_string: str, filter_flags: list = None):
         filter_string = filter_string.strip()
+        flags = list(filter_flags) if filter_flags else []
 
-        if not filter_string:
+        if not filter_string and not flags:
             self.clear_filter()
             return
 
         self._filter_string = filter_string
+        self._filter_flags = flags
         self._filter_enabled = True
         self._apply_filter_to_cached_list()  # Fast in-memory filtering
         self.display_generation += (
@@ -489,6 +501,7 @@ class AppController(QObject):
         # cancel stale thumbnail jobs so the filtered view's thumbnails load quickly
         self._thumbnail_prefetcher.cancel_all()
         self._thumbnail_model.set_filter(filter_string)
+        self._thumbnail_model.set_filter_flags(flags)
 
         # reset to start of filtered list
         self.current_index = 0
@@ -500,12 +513,18 @@ class AppController(QObject):
         # return current string, or "" if filter off
         return self._filter_string
 
+    @Slot(result="QVariantList")
+    def get_filter_flags(self):
+        """Return current flag filters (e.g. ["uploaded", "stacked"]) for dialog restoration."""
+        return list(self._filter_flags)
+
     @Slot()
     def clear_filter(self):
-        if not self._filter_enabled and not self._filter_string:
+        if not self._filter_enabled and not self._filter_string and not self._filter_flags:
             return
         self._filter_enabled = False
         self._filter_string = ""
+        self._filter_flags = []
         self._apply_filter_to_cached_list()  # Fast in-memory filtering
         self.display_generation += (
             1  # Invalidate cache keys to prevent showing stale images
@@ -517,6 +536,7 @@ class AppController(QObject):
         # cancel stale thumbnail jobs so the new view's thumbnails load quickly
         self._thumbnail_prefetcher.cancel_all()
         self._thumbnail_model.set_filter("")
+        self._thumbnail_model.set_filter_flags([])
 
         self.current_index = min(self.current_index, max(0, len(self.image_files) - 1))
         self.sync_ui_state()
@@ -790,12 +810,23 @@ class AppController(QObject):
         """Applies current filter to cached image list without disk I/O."""
         if self._filter_enabled and self._filter_string:
             needle = self._filter_string.lower()
-            self.image_files = [
+            filtered = [
                 img for img in self._all_images if needle in img.path.stem.lower()
             ]
         else:
-            self.image_files = self._all_images
+            filtered = list(self._all_images)
 
+        # Apply flag-based filtering (AND logic: image must have ALL checked flags)
+        if self._filter_enabled and self._filter_flags:
+            flags = self._filter_flags
+            result = []
+            for img in filtered:
+                meta = self.sidecar.get_metadata(img.path.stem)
+                if all(getattr(meta, flag, False) for flag in flags):
+                    result.append(img)
+            filtered = result
+
+        self.image_files = filtered
         self._rebuild_path_to_index()
         self.prefetcher.set_image_files(self.image_files)
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
@@ -821,9 +852,9 @@ class AppController(QObject):
         """
         cp = Path(saved_path)
 
-        # Fast path: resolve-based lookup
-        resolved = cp.resolve(strict=False)
-        new_idx = self._path_to_index.get(resolved)
+        # Fast path: normalized key lookup (must match _rebuild_path_to_index format)
+        path_key = self._key(cp)
+        new_idx = self._path_to_index.get(path_key)
         if new_idx is not None:
             self.current_index = new_idx
             return True
@@ -1503,13 +1534,13 @@ class AppController(QObject):
             return
 
         # Find this image in the main image list using O(1) lookup
-        resolved_path = entry.path.resolve()
-        loupe_index = self._path_to_index.get(resolved_path)
+        path_key = self._key(entry.path)
+        loupe_index = self._path_to_index.get(path_key)
 
         if loupe_index is None:
             # Index might be stale - rebuild and retry once
             self._rebuild_path_to_index()
-            loupe_index = self._path_to_index.get(resolved_path)
+            loupe_index = self._path_to_index.get(path_key)
 
         if loupe_index is None:
             log.warning(
@@ -2382,20 +2413,31 @@ class AppController(QObject):
         if "straighten_angle" in self.image_editor.current_edits:
             self.image_editor.current_edits["straighten_angle"] = 0.0
 
-    def launch_helicon(self):
-        """Launches Helicon with selected files (RAW preferred, JPG fallback) or stacks."""
+    @Slot()
+    def launch_helicon_default(self):
+        """Slot for QML/Keys that cannot pass arguments. Defaults to use_raw=True."""
+        self.launch_helicon(use_raw=True)
+
+    @Slot(bool)
+    def launch_helicon(self, use_raw: bool = True):
+        """Launches Helicon with selected files (RAW preferred if use_raw=True, else JPG) or stacks."""
         if self.stacks:
-            log.info("Launching Helicon for %d defined stacks.", len(self.stacks))
+            log.info(
+                "Launching Helicon for %d defined stacks (use_raw=%s).",
+                len(self.stacks),
+                use_raw,
+            )
             any_success = False
             for start, end in self.stacks:
                 files_to_process = []
                 for idx in range(start, end + 1):
                     if idx < len(self.image_files):
                         img_file = self.image_files[idx]
-                        # Use RAW if available, otherwise use JPG
-                        file_to_use = (
-                            img_file.raw_pair if img_file.raw_pair else img_file.path
-                        )
+                        # Use RAW if available and requested, otherwise use JPG
+                        if use_raw and img_file.raw_pair:
+                            file_to_use = img_file.raw_pair
+                        else:
+                            file_to_use = img_file.path
                         files_to_process.append(file_to_use)
 
                 if files_to_process:
@@ -3160,6 +3202,44 @@ class AppController(QObject):
             if executor:
                 executor.shutdown(wait=False, cancel_futures=True)
 
+        # Shutdown prefetchers (they own their own thread pools)
+        try:
+            self.prefetcher.shutdown()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_thumbnail_prefetcher", None):
+                self._thumbnail_prefetcher.shutdown()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _perm_delete_worker(
+        job_id: int,
+        items: list,  # List of (original_index, ImageFile)
+    ) -> dict:
+        """Background worker: performs permanent deletion. No Qt access."""
+        perm_success = []
+        perm_fail = []
+
+        for idx, img in items:
+            try:
+                # permanently_delete_image_files is imported from faststack.io.deletion
+                if permanently_delete_image_files(img):
+                    perm_success.append((idx, img))
+                else:
+                    perm_fail.append((idx, img))
+            except Exception as e:
+                log.error("Perm delete failed for %s: %s", img.path, e)
+                perm_fail.append((idx, img))
+
+        return {
+            "job_id": job_id,
+            "_perm_result": True,
+            "perm_success": perm_success,
+            "perm_fail": perm_fail,
+        }
+
     @staticmethod
     def _delete_worker(
         job_id: int,
@@ -3189,11 +3269,30 @@ class AppController(QObject):
         processed_count = 0
         did_cancel = False
 
-        for jpg_path, raw_path in images_to_delete:
+        for item in images_to_delete:
             if cancel_event.is_set():
                 log.info("Delete job %d cancelled mid-flight", job_id)
                 did_cancel = True
                 break
+
+            # Sanity Check for Problem A (AttributeError):
+            # images_to_delete MUST be List[Tuple[Path, Optional[Path]]]
+            # If item is (0, (path, raw)), it's a nested structure from incorrect calling code.
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                log.error("CRITICAL: _delete_worker received invalid item format: %r", item)
+                continue
+
+            jpg_path, raw_path = item
+            
+            # Robustness: if raw_path is a tuple/list, we have a nested structure error.
+            if isinstance(raw_path, (tuple, list)):
+                log.error("CRITICAL: _delete_worker received nested tuple item: %r", item)
+                # Fallback: try to extract the inner tuple if it looks right
+                # This prevents the 'tuple' object has no attribute 'exists' crash.
+                if len(raw_path) == 2 and isinstance(raw_path[0], Path):
+                     jpg_path, raw_path = raw_path
+                else:
+                    continue
 
             processed_count += 1
             actual_raw_exists = bool(raw_path and raw_path.exists())
@@ -3204,7 +3303,7 @@ class AppController(QObject):
                     failures.append({
                         "jpg": jpg_path,
                         "raw": raw_path,
-                        "code": "recycle_failed"
+                        "code": DeletionErrorCodes.RECYCLE_FAILED
                     })
                     continue
 
@@ -3262,194 +3361,252 @@ class AppController(QObject):
             "cancelled": did_cancel,
         }
 
-    def _on_delete_finished(self, result: dict) -> None:
-        """Main-thread completion handler for async delete worker."""
-        t_start = time.perf_counter()
-        
+    def _on_delete_finished(self, result_dict: dict) -> None:
+        """Main-thread completion handler for async delete worker.
+
+        Refactored to 3-phase flow with typed data structures.
+        """
         if self._shutting_down:
             return
 
-        # 1. Handle permanent delete result (separate path)
-        if result.get("_perm_result"):
-            self._handle_permanent_delete_result(result)
+        # --- Phase 1: Resolve Job & Result ---
+        # Convert raw dict to typed result immediately
+        result = DeleteResult.from_worker_dict(result_dict)
+
+        # Retrieve job context
+        job = self._pending_delete_jobs.pop(result.job_id, None)
+
+        if job:
+            # Remove pending_delete placeholders from undo history
+            self.undo_history = [
+                entry for entry in self.undo_history
+                if not (entry[0] == "pending_delete" and entry[1] == job.job_id)
+            ]
+        else:
+            # Job might have been popped by undo_delete logic already?
+            # Or this is a stray signal.
+            log.warning("Delete job %d completed but not found in pending jobs", result.job_id)
             return
 
-        # 2. Retrieve and finalize job
-        job_id = result["job_id"]
-        job = self._finalize_pending_delete(job_id)
-        if job is None:
-            log.warning("Delete job %d completed but not found in pending jobs", job_id)
+
+        # --- Phase 1.5: Handle Perm Delete Result ---
+        if result.is_perm_result:
+            if result.perm_success:
+                self.update_status_message(f"Permanently deleted {len(result.perm_success)} images")
+                
+                # Update suppression for permanent deletes (prevent watcher re-scans)
+                ttl = 2.0
+                now = time.monotonic()
+                with self._suppressed_paths_lock:
+                    for _, img in result.perm_success:
+                        if img.path:
+                            self._suppressed_paths[self._key(img.path)] = now + ttl
+                        if img.raw_pair:
+                            self._suppressed_paths[self._key(img.raw_pair)] = now + ttl
+            
+            if result.perm_fail:
+                # Rollback failures (they have original indices)
+                # Note: job context is required for rollback (restores index/batches/focus)
+                self._rollback_ui_items(result.perm_fail, job)
+
+            self._rebuild_path_to_index()
+            self.sync_ui_state()
+            self._schedule_delete_refresh()
             return
             
-        t_finalize = time.perf_counter()
-
-        # 3. Unpack and normalize results
-        successes, warnings, failures = self._normalize_worker_results(result)
-        timestamp = job["timestamp"]
-        user_undone = job.get("user_undone", False)
-
-        t_normalize = time.perf_counter()
-
-        # 4. Suppression for watcher
-        # Add all successfully moved/deleted files to suppressed paths
+        # --- Phase 2: Apply Results ---
+        
+        # 2a. Update suppression (prevent watcher loops for moved files)
         ttl = 2.0
         now = time.monotonic()
         with self._suppressed_paths_lock:
-            for s in successes:
-                self._suppressed_paths[self._key(s["jpg"])] = now + ttl
-                if s.get("raw"):
-                    self._suppressed_paths[self._key(s["raw"])] = now + ttl
+            for s in result.successes:
+                if s.jpg:
+                    self._suppressed_paths[self._key(s.jpg)] = now + ttl
+                if s.raw:
+                    self._suppressed_paths[self._key(s.raw)] = now + ttl
 
-        # 5. Bookkeeping for successes (undo history, recycle bin tracking)
-        self._apply_success_records(successes, warnings, timestamp, user_undone)
-        
-        t_apply = time.perf_counter()
-
-        # 6. Handle "Option A": if cancelled/undone but files moved, remove from UI
-        if user_undone:
-            if successes:
-                self._remove_moved_files_from_ui(successes, job_id)
+        # 2b. Handle Policy 1: Auto-Restore if Undo Requested
+        # If user hit Undo while worker was running, we must restore any moved files immediately.
+        if job.undo_requested:
+            if result.successes:
+                log.info("Job %d was undone mid-flight; auto-restoring %d moved files", 
+                         job.job_id, len(result.successes))
+                self._auto_restore_moved_files(result.successes)
+            # Do NOT record history.
+            # Failures/Cancelled items are already handled by the undo_delete logic (restored to UI)
+            # or simply ignored because they never moved.
+            
+            # Update status
+            self.update_status_message("Deletion cancelled (files restored)")
             self._schedule_delete_refresh()
             return
 
-        # 7. Handle failures (things to restore to UI)
-        # With new semantics, failures only contains items that need restoration.
-        # Warnings (RAW failures) are already in successes and kept removed from UI.
-        if failures:
-            self._handle_failures_and_rollback(failures, job, result["cancelled"])
-            
-        t_rollback = time.perf_counter()
-
-        # 8. Final status update and refresh
-        self._post_delete_cleanup(successes, warnings, failures, job["action_type"], result["cancelled"])
+        # 2c. Normal Completion: Record History & Handle Failures
         
-        t_end = time.perf_counter()
+        # Track recycle bins
+        for s in result.successes:
+            if s.recycled_jpg:
+                self.active_recycle_bins.add(s.recycled_jpg.parent)
         
-        if _debug_mode:
-            log.info(
-                "delete_finished timing: finalize=%.4f normalize=%.4f apply=%.4f rollback=%.4f total=%.4f job_id=%d n_succ=%d n_warn=%d n_fail=%d",
-                t_finalize - t_start,
-                t_normalize - t_finalize,
-                t_apply - t_normalize,
-                t_rollback - t_apply,
-                t_end - t_start,
-                job_id,
-                len(successes),
-                len(warnings),
-                len(failures)
-            )
+        # Log warnings
+        for w in result.warnings:
+            log.warning("Partial delete warning for %s: %s", w.jpg, w.message)
 
-    def _handle_permanent_delete_result(self, result: dict) -> None:
-        """Handle completion of a permanent delete confirmation task."""
-        successes = result.get("perm_success", [])
-        failures = result.get("perm_fail", [])
+        # Add to undo history
+        for s in result.successes:
+            # Store tuple of tuples: ((jpg, recycled_jpg), (raw, recycled_raw))
+            record = ((s.jpg, s.recycled_jpg), (s.raw, s.recycled_raw))
+            self.delete_history.append(record)
+            self.undo_history.append(("delete", record, job.timestamp))
 
-        if successes:
-            self.update_status_message(f"Permanently deleted {len(successes)} image(s)")
+        # Handle Failures / Rollback UI
+        # Only failed items need to be restored to UI.
+        # Check for permanent delete candidates (recycle bin failures).
+        self._handle_delete_failures(result, job)
 
-        if failures:
-            log.warning("%d permanent deletions failed; restoring to UI", len(failures))
-            self.update_status_message(f"Delete failed for {len(failures)} image(s). Restored to list.")
-            # Restore failed items to UI (descending order to preserve indices)
-            for idx, img in sorted(failures, key=lambda x: x[0], reverse=True):
-                self.image_files.insert(min(idx, len(self.image_files)), img)
-            self.sync_ui_state()
+        # --- Phase 3: Post Actions ---
+        
+        # Status Message
+        count = len(result.successes)
+        if count > 0:
+            msg = f"Deleted {count} images"
+            if result.warnings:
+                msg += " (some RAW moves failed)"
+            elif count == 1:
+                msg = "Image moved to recycle bin"
+            self.update_status_message(msg)
+        elif result.failures:
+            self.update_status_message("Deletion cancelled" if result.cancelled else "Delete failed")
 
         self._schedule_delete_refresh()
 
-    def _finalize_pending_delete(self, job_id: int) -> Optional[dict]:
-        """Retrieve job, remove from pending, and clean up placeholder undo entries."""
-        job = self._pending_delete_jobs.pop(job_id, None)
-        if job:
-            # Remove pending_delete placeholders for this job from undo history
-            self.undo_history = [
-                entry for entry in self.undo_history
-                if not (entry[0] == "pending_delete" and entry[1] == job_id)
-            ]
-        return job
-
-    def _normalize_worker_results(self, result: dict) -> Tuple[list, list, list]:
-        """Ensure all paths in worker results are Path objects or None."""
-        successes = result.get("successes", [])
-        warnings = result.get("warnings", [])
-        failures = result.get("failures", [])
-
-        def _norm_p(p):
-            return Path(p) if p is not None else None
-
+    def _auto_restore_moved_files(self, successes: List[DeleteRecord]) -> None:
+        """Policy 1: Automatically move files back from recycle bin if undo was requested."""
+        restored = 0
         for s in successes:
-            s["jpg"] = _norm_p(s.get("jpg"))
-            s["recycled_jpg"] = _norm_p(s.get("recycled_jpg"))
-            s["raw"] = _norm_p(s.get("raw"))
-            s["recycled_raw"] = _norm_p(s.get("recycled_raw"))
-        for w in warnings:
-            w["jpg"] = _norm_p(w.get("jpg"))
-            w["raw"] = _norm_p(w.get("raw"))
-        for f in failures:
-            f["jpg"] = _norm_p(f.get("jpg"))
-            f["raw"] = _norm_p(f.get("raw"))
-        
-        return successes, warnings, failures
+            # Restore JPG
+            if s.jpg and s.recycled_jpg:
+                ok, reason = self._restore_from_recycle_bin_safe(s.jpg, s.recycled_jpg)
+                if ok: restored += 1
+                else: log.error("Failed to auto-restore JPG %s: %s", s.jpg, reason)
+            
+            # Restore RAW
+            if s.raw and s.recycled_raw:
+                ok, reason = self._restore_from_recycle_bin_safe(s.raw, s.recycled_raw)
+                if not ok: log.error("Failed to auto-restore RAW %s: %s", s.raw, reason)
 
-    def _apply_success_records(self, successes: list, warnings: list, timestamp: float, user_undone: bool) -> None:
-        """Update undo history and tracking for successful moves."""
-        # Track recycle bins used
-        for s in successes:
-            if s.get("recycled_jpg"):
-                self.active_recycle_bins.add(s["recycled_jpg"].parent)
+    def _handle_delete_failures(self, result: DeleteResult, job: DeleteJob) -> None:
+        """Handle items that failed to delete. Rollback UI or prompt for perm delete."""
+        if not result.failures:
+            return
 
-        # Log warnings for partial successes
-        for w in warnings:
-             log.warning("Partial success for %s: JPG recycled, but RAW failed: %s", 
-                        w["jpg"].name, w["message"])
+        # Identify which UI items failed (map back using paths)
+        # Note: We use the _key() mapping to ensure we match robustly
+        failed_keys = {self._key(f.jpg) for f in result.failures if f.jpg}
+        
+        failed_indices_and_imgs = []
+        for idx, img in job.removed_items:
+            if self._key(img.path) in failed_keys:
+                failed_indices_and_imgs.append((idx, img))
 
-        # Add to undo_history
-        # If user_undone=True, we still add to undo so they can Undo again (redundant but safe)
-        for s in successes:
-            record = ((s["jpg"], s["recycled_jpg"]), (s["raw"], s["recycled_raw"]))
-            self.delete_history.append(record)
-            self.undo_history.append(("delete", record, timestamp))
+        if not failed_indices_and_imgs:
+            return
 
-    def _remove_moved_files_from_ui(self, successes: list, job_id: int) -> None:
-        """Implement 'Option A': remove successfully moved files from UI even if user cancelled/undone."""
-        success_resolved = {self._key(s["jpg"]) for s in successes if s.get("jpg")}
+        # Check if we should offer permanent delete (recycle bin error)
+        perm_candidates = [] # List of (idx, img)
         
-        to_remove = []
-        for idx, img in enumerate(self.image_files):
-            if self._key(img.path) in success_resolved:
-                to_remove.append(idx)
+        # Helper to find if a specific failure code warrants perm delete
+        recycle_codes = {
+            DeletionErrorCodes.RECYCLE_FAILED,
+            DeletionErrorCodes.PERMISSION_DENIED,
+            DeletionErrorCodes.TRASH_FULL
+        }
         
-        # Remove from bottom to top to preserve indices
-        for idx in sorted(to_remove, reverse=True):
-            del self.image_files[idx]
-        
-        self.update_status_message(
-            f"Cancel requested; {len(successes)} file(s) already moved. Use Undo again to restore them."
-        )
-        log.info(
-            "Delete job %d was undone; %d files already moved; removed from view",
-            job_id, len(successes),
-        )
+        # Map failure code by key for easy lookup
+        failure_map = {self._key(f.jpg): f for f in result.failures if f.jpg}
+
+        for idx, img in failed_indices_and_imgs:
+             f = failure_map.get(self._key(img.path))
+             if f and f.code in recycle_codes:
+                 perm_candidates.append((idx, img))
+
+        if perm_candidates:
+            # Prompt user for permanent delete
+            
+            # 1. Rollback non-candidates first
+            candidate_ids = {id(img) for _, img in perm_candidates}
+            to_rollback = [(i, img) for i, img in failed_indices_and_imgs if id(img) not in candidate_ids]
+            
+            if to_rollback:
+                self._rollback_ui_items(to_rollback, job)
+
+            # 2. Ask user
+            candidate_imgs = [img for _, img in perm_candidates]
+            
+            reason = "Recycle bin failure"
+            confirmed = False
+            if len(candidate_imgs) == 1:
+                confirmed = confirm_permanent_delete(candidate_imgs[0], reason=reason)
+            else:
+                confirmed = confirm_batch_permanent_delete(candidate_imgs, reason=reason)
+
+            if confirmed:
+                # ASYNC permanent delete
+                # Put job back in pending map so _on_delete_finished can find it again
+                self._pending_delete_jobs[job.job_id] = job
+                
+                # Define callback to bridge back to main thread
+                def _on_perm_done(future):
+                    try:
+                        res = future.result()
+                        # Emit on main thread via signal
+                        self._deleteFinished.emit(res)
+                    except Exception as e:
+                        log.error("Perm delete worker exception: %s", e)
+
+                fut = self._delete_executor.submit(
+                    self._perm_delete_worker,
+                    job.job_id,
+                    perm_candidates
+                )
+                fut.add_done_callback(_on_perm_done)
+                
+                self.update_status_message("Permanently deleting files...")
+                # Return EARLY so we don't rebuild index/sync UI yet
+                return
+
+            else:
+                # User said NO, rollback candidates too
+                self._rollback_ui_items(perm_candidates, job)
+
+        else:
+            # Just rollback everything
+            self._rollback_ui_items(failed_indices_and_imgs, job)
+
+        self._rebuild_path_to_index()
         self.sync_ui_state()
 
-    def _handle_failures_and_rollback(self, failures: list, job: dict, job_cancelled: bool) -> None:
-        """Identify failed items and rollback (restore) to UI."""
-        removed_items = job["removed_items"]
-        failed_images_with_indices = []
-
-        if failures:
-            # Filter matches from removed_items
-            real_failed_paths = {self._key(f["jpg"]) for f in failures if f.get("jpg")}
-            
-            for idx, img in removed_items:
-                if self._key(img.path) in real_failed_paths:
-                    failed_images_with_indices.append((idx, img))
-
-        # Rollback failed/cancelled items to the UI
-        if failed_images_with_indices:
-            self._rollback_failed_items(failed_images_with_indices, job)
+    def _rollback_ui_items(self, items: List[Tuple[int, Any]], job: DeleteJob) -> None:
+        """Restore items to the UI list in correct order."""
+        # Sort reverse by index to insert correctly
+        # Access attributes of DeleteJob
+        items.sort(key=lambda x: x[0], reverse=True)
+        for idx, img in items:
+            self.image_files.insert(min(idx, len(self.image_files)), img)
         
-        self._rebuild_path_to_index()
+        # Restore selection/focus (approximated)
+        self.current_index = min(job.previous_index, len(self.image_files) - 1)
+        self.display_generation += 1
+        self.image_cache.clear()
+        if self.image_files:
+            self.prefetcher.update_prefetch(self.current_index)
+
+        # Restore saved batch state if present
+        if job.saved_batches and items:
+            self.batches = job.saved_batches
+            self.batch_start_index = job.saved_batch_start_index
+            self._invalidate_batch_cache()
 
     def _finalize_perm_delete_choice(self, perm_candidates: list, real_failures: list) -> Tuple[bool, str]:
         """Determine reason and prompt user for permanent delete."""
@@ -3467,80 +3624,7 @@ class AppController(QObject):
         else:
             return confirm_batch_permanent_delete(perm_candidates, reason=reason), reason
 
-    def _submit_perm_delete_worker(self, perm_candidates_with_indices: list) -> None:
-        """Submit the permanent delete worker."""
-        def _perm_delete_worker():
-            perm_success = []
-            perm_fail = []
-            for idx, img in perm_candidates_with_indices:
-                if permanently_delete_image_files(img):
-                    perm_success.append((idx, img))
-                else:
-                    perm_fail.append((idx, img))
-            return {"perm_success": perm_success, "perm_fail": perm_fail}
 
-        def _on_perm_done(fut):
-            try:
-                r = fut.result()
-                res = {
-                    "_perm_result": True,
-                    "perm_success": r["perm_success"],
-                    "perm_fail": r["perm_fail"]
-                }
-                # Emit signal directly (thread-safe from worker to GUI thread via Signal)
-                self._deleteFinished.emit(res)
-            except Exception as e:
-                log.error("Permanent delete worker failed: %s", e)
-
-        fut = self._delete_executor.submit(_perm_delete_worker)
-        fut.add_done_callback(_on_perm_done)
-
-    def _rollback_failed_items(self, failed_images_with_indices: list, job: dict) -> None:
-        """Restore failed items to the UI list and restore selection state."""
-        log.info(
-            "Rolling back %d items after incomplete async deletion",
-            len(failed_images_with_indices),
-        )
-        failed_images_with_indices.sort(key=lambda x: x[0], reverse=True)
-        for idx, img in failed_images_with_indices:
-            self.image_files.insert(min(idx, len(self.image_files)), img)
-        
-        self.current_index = min(job.get("previous_index", 0), len(self.image_files) - 1)
-        self.display_generation += 1
-        self.image_cache.clear()
-        self.prefetcher.cancel_all()
-        if self.image_files:
-            self.prefetcher.update_prefetch(self.current_index)
-        self._rebuild_path_to_index()
-        self.sync_ui_state()
-
-        if "saved_batches" in job and failed_images_with_indices:
-            self.batches = job["saved_batches"]
-            self.batch_start_index = job.get("saved_batch_start_index")
-            self._invalidate_batch_cache()
-
-    def _post_delete_cleanup(self, successes: list, warnings: list, failures: list, action_type: str, cancelled: bool) -> None:
-        """Update status message and schedule refresh."""
-        recycled_count = len(successes)
-
-        if recycled_count > 0:
-            if warnings:
-                self.update_status_message(f"Deleted {recycled_count} images (some RAW moves failed)")
-            elif recycled_count == 1:
-                self.update_status_message("Image moved to recycle bin")
-            else:
-                self.update_status_message(f"Deleted {recycled_count} images")
-            log.info(
-                "Async deletion complete: type='%s', recycled=%d, warnings=%d, failures=%d",
-                action_type, recycled_count, len(warnings), len(failures),
-            )
-        elif failures:
-            if cancelled:
-                self.update_status_message("Deletion cancelled")
-            else:
-                self.update_status_message("Delete failed")
-
-        self._schedule_delete_refresh()
 
     def _schedule_delete_refresh(self) -> None:
         """Debounce post-delete refresh: coalesce rapid deletes into one refresh."""
@@ -3706,14 +3790,15 @@ class AppController(QObject):
         cancel_event = threading.Event()
         timestamp = time.time()
 
-        self._pending_delete_jobs[job_id] = {
-            "removed_items": removed_items,
-            "action_type": action_type,
-            "timestamp": timestamp,
-            "cancel_event": cancel_event,
-            "previous_index": previous_index,
-            "images_to_delete": images_to_delete,
-        }
+        self._pending_delete_jobs[job_id] = DeleteJob(
+            job_id=job_id,
+            removed_items=removed_items,
+            action_type=action_type,
+            timestamp=timestamp,
+            cancel_event=cancel_event,
+            previous_index=previous_index,
+            images_to_delete=images_to_delete,
+        )
 
         # Add single placeholder undo entry per job
         self.undo_history.append(("pending_delete", job_id, timestamp))
@@ -3803,8 +3888,8 @@ class AppController(QObject):
         # 4. Clear batches optimistically; save state in job for rollback
         job_id = summary["job_id"]
         if job_id in self._pending_delete_jobs:
-            self._pending_delete_jobs[job_id]["saved_batches"] = saved_batches
-            self._pending_delete_jobs[job_id]["saved_batch_start_index"] = saved_batch_start
+            self._pending_delete_jobs[job_id].saved_batches = saved_batches
+            self._pending_delete_jobs[job_id].saved_batch_start_index = saved_batch_start
 
         self.batches = []
         self.batch_start_index = None
@@ -3966,13 +4051,14 @@ class AppController(QObject):
 
             if job is not None:
                 # Cancel the background worker (best-effort)
-                job["cancel_event"].set()
-                # Mark as user-undone so completion handler skips bookkeeping
-                job["user_undone"] = True
+                job.cancel_event.set()
+                # Mark as undo_requested so completion handler automatically restores files (Policy 1)
+                job.undo_requested = True
+                job.user_undone = True  # Keep for logic that checks if user intervened
 
                 # Restore removed items to in-memory list immediately
-                removed_items = job["removed_items"]
-                previous_index = job["previous_index"]
+                removed_items = job.removed_items
+                previous_index = job.previous_index
 
                 # Re-insert in descending order to preserve correct indices
                 for idx, img in sorted(removed_items, key=lambda x: x[0], reverse=True):
@@ -5642,12 +5728,12 @@ class AppController(QObject):
         dynamic_range = p_high - p_low
         if dynamic_range < 1.0:
             msg = "Auto levels: no change (flat image)"
-            self.update_status_message(f"{msg} (preview only)")
+            self.update_status_message(f"{msg} (preview only)", timeout=9000)
             self._last_auto_levels_msg = msg
             return False
         if p_low <= 0 and p_high >= 255:
             msg = "Auto levels: no change (already full range)"
-            self.update_status_message(f"{msg} (preview only)")
+            self.update_status_message(f"{msg} (preview only)", timeout=9000)
             self._last_auto_levels_msg = msg
             return False
 
@@ -5679,7 +5765,7 @@ class AppController(QObject):
 
         self._kick_preview_worker()
 
-        self.update_status_message(f"{msg} (preview only)")
+        self.update_status_message(f"{msg} (preview only)", timeout=9000)
         log.info(
             "Auto levels preview applied to %s (clip %.2f%%, str %.2f). Msg: %s",
             filepath,
@@ -5784,7 +5870,7 @@ class AppController(QObject):
                 if detail
                 else f"Auto levels applied and saved ({total_ms} ms)"
             )
-            self.update_status_message(saved_msg)
+            self.update_status_message(saved_msg, timeout=9000)
             log.info(
                 "Quick auto levels saved for %s. New index: %d",
                 saved_path,
@@ -6333,6 +6419,10 @@ class AppController(QObject):
         stats = []
         # Filter out bins that don't exist anymore
         active_bins = {p for p in self.active_recycle_bins if p.exists() and p.is_dir()}
+        # Always check the local directory's recycle bin for items from previous sessions
+        local_bin = self.image_dir / "image recycle bin"
+        if local_bin.exists() and local_bin.is_dir():
+            active_bins.add(local_bin)
         self.active_recycle_bins = active_bins
 
         for bin_path in self.active_recycle_bins:
@@ -6384,71 +6474,6 @@ class AppController(QObject):
 
         # Clear stats cache since we deleted files/folders
         clear_raw_count_cache()
-
-
-    def get_recycle_bin_stats(self) -> List[Dict]:
-        """Return stats for all tracked recycle bins.
-
-        Returns:
-            List of dicts, each containing 'path', 'count', 'jpg_count',
-            'raw_count', 'other_count', and 'file_paths'.
-        """
-        all_stats = []
-        try:
-            # Filter out bins that don't exist anymore
-            active_bins = {p for p in self.active_recycle_bins if p.exists() and p.is_dir()}
-            self.active_recycle_bins = active_bins
-
-            for bin_path in self.active_recycle_bins:
-                stats = {
-                    "path": str(bin_path),
-                    "count": 0,
-                    "jpg_count": 0,
-                    "raw_count": 0,
-                    "other_count": 0,
-                    "file_paths": [],
-                }
-                
-                try:
-                    for item in bin_path.iterdir():
-                        if item.is_file():
-                            stats["count"] += 1
-                            ext = item.suffix.lower()
-                            if ext in self.JPG_EXTENSIONS:
-                                stats["jpg_count"] += 1
-                            elif ext in self.RAW_EXTENSIONS:
-                                stats["raw_count"] += 1
-                            else:
-                                stats["other_count"] += 1
-                            stats["file_paths"].append(item.name)
-                    
-                    if stats["count"] > 0:
-                        all_stats.append(stats)
-                except OSError as e:
-                    log.error(f"Error reading recycle bin {bin_path}: {e}")
-                    
-        except Exception as e:
-            log.error(f"Error getting recycle bin stats: {e}")
-        return all_stats
-
-    def cleanup_recycle_bins(self):
-        """Empty and remove all tracked recycle bins."""
-        import shutil
-        
-        bins_to_remove = list(self.active_recycle_bins)
-        
-        for bin_path in bins_to_remove:
-            try:
-                if bin_path.exists() and bin_path.is_dir():
-                    shutil.rmtree(bin_path)
-                    log.info(f"Cleaned up recycle bin: {bin_path}")
-                self.active_recycle_bins.discard(bin_path)
-            except Exception as e:
-                log.error(f"Failed to cleanup recycle bin {bin_path}: {e}")
-                
-        # Notify UI
-        if hasattr(self, "dialogStateChanged"):
-            self.dialogStateChanged.emit(False)
 
 
 def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False):
@@ -6549,10 +6574,12 @@ def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False):
     controller.main_window = main_window
     main_window.installEventFilter(controller)
 
-    # Load data and start services
-    controller.load()
+    # Defer heavy loading to after event loop starts so the window appears instantly.
+    # controller.load() does disk scanning, image decode, and thumbnail model refresh —
+    # all of which can run after the first event loop iteration.
+    QTimer.singleShot(0, controller.load)
     if debug:
-        log.info("Startup: after controller.load(): %.3fs", time.perf_counter() - t0)
+        log.info("Startup: controller.load() deferred to event loop (%.3fs to window)", time.perf_counter() - t0)
 
     # Graceful shutdown with timeout fallback
     import threading

@@ -652,9 +652,9 @@ class UIState(QObject):
     def prevImage(self):
         self.app_controller.prev_image()
 
-    @Slot()
-    def launch_helicon(self):
-        self.app_controller.launch_helicon()
+    @Slot(bool)
+    def launch_helicon(self, use_raw: bool = True):
+        self.app_controller.launch_helicon(use_raw)
 
     @Slot()
     def clear_all_stacks(self):
@@ -793,10 +793,11 @@ class UIState(QObject):
     def stack_source_raws(self):
         self.app_controller.stack_source_raws()
 
-    @Slot(str)
-    def applyFilter(self, filter_string: str):
-        """Applies a filter string to the image list."""
-        self.app_controller.apply_filter(filter_string)
+    @Slot(str, "QVariantList")
+    def applyFilter(self, filter_string: str, filter_flags=None):
+        """Applies a filter string and/or flag filters to the image list."""
+        flags = list(filter_flags) if filter_flags else []
+        self.app_controller.apply_filter(filter_string, filter_flags=flags)
 
     @Slot(int, int)
     def onDisplaySizeChanged(self, width: int, height: int):

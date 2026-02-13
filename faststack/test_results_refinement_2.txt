@@ -1,0 +1,34 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.0.2, pluggy-1.6.0 -- C:\code\faststack\faststack\verify_venv\Scripts\python.exe
+rootdir: C:\code\faststack
+configfile: pyproject.toml
+collecting ... collected 15 items
+
+tests\test_deletion_unification.py::test_delete_batch_optimistic_removal PASSED [  6%]
+tests\test_deletion_unification.py::test_grid_delete_selection PASSED    [ 13%]
+tests\test_deletion_unification.py::test_grid_cursor_correct_mapping PASSED [ 20%]
+tests\test_deletion_unification.py::test_delete_current_image_triggers_batch_dialog PASSED [ 26%]
+tests\test_deletion_unification.py::test_grid_cursor_not_found_feedback PASSED [ 33%]
+tests\test_deletion_unification.py::test_delete_indices_summary_return PASSED [ 40%]
+tests\test_deletion_unification.py::test_grid_cursor_mapping_regression PASSED [ 46%]
+tests\test_deletion_unification.py::test_grid_delete_folder_feedback PASSED [ 53%]
+tests\test_deletion_unification.py::test_delete_schedules_refresh PASSED [ 60%]
+tests\test_deletion_unification.py::test_undo_pending_delete_restores_items PASSED [ 66%]
+tests\test_deletion_unification.py::test_undo_pending_batch_delete_restores_all PASSED [ 73%]
+tests\test_deletion_unification.py::test_cancel_midlight_restores_unprocessed PASSED [ 80%]
+tests\test_deletion_unification.py::test_undo_pending_auto_restores_moved_files PASSED [ 86%]
+tests\test_deletion_unification.py::test_recycle_failure_prompts_perm_delete FAILED [ 93%]
+tests\test_deletion_unification.py::test_batch_restored_on_rollback PASSED [100%]
+
+================================== FAILURES ===================================
+__________________ test_recycle_failure_prompts_perm_delete ___________________
+tests\test_deletion_unification.py:384: in test_recycle_failure_prompts_perm_delete
+    mock_controller._delete_executor.submit.assert_called_once()
+C:\Users\alanr\AppData\Local\Programs\Python\Python312\Lib\unittest\mock.py:928: in assert_called_once
+    raise AssertionError(msg)
+E   AssertionError: Expected 'submit' to have been called once. Called 2 times.
+E   Calls: [call(<function AppController._delete_worker at 0x000001D0FF6874C0>, 0, [(WindowsPath('C:/code/faststack/faststack/var/pytest-temp/test_recycle_failure_prompts_p0/test.jpg'), None)], <threading.Event at 0x1d0ffb54920: unset>),
+E    call(<function AppController._perm_delete_worker at 0x000001D0FF687420>, 0, [(0, ImageFile(path=WindowsPath('C:/code/faststack/faststack/var/pytest-temp/test_recycle_failure_prompts_p0/test.jpg'), raw_pair=None, timestamp=0.0, sort_name_cf=None))])].
+=========================== short test summary info ===========================
+FAILED tests\test_deletion_unification.py::test_recycle_failure_prompts_perm_delete
+======================== 1 failed, 14 passed in 0.82s =========================

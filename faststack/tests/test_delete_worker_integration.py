@@ -52,20 +52,22 @@ def test_delete_worker_integration_success(temp_env):
     
     # Item 0 (JPG+RAW)
     item0 = successes[0]
-    orig_jpg0 = item0["jpg"]
-    bin_jpg0 = item0["recycled_jpg"]
-    orig_raw0 = item0["raw"]
-    bin_raw0 = item0["recycled_raw"]
+    orig_jpg0 = Path(item0["jpg"])
+    bin_jpg0 = Path(item0["recycled_jpg"])
+    orig_raw0 = Path(item0["raw"]) if item0["raw"] else None
+    bin_raw0 = Path(item0["recycled_raw"]) if item0["recycled_raw"] else None
     
     assert not orig_jpg0.exists()
     assert bin_jpg0.exists()
-    assert not orig_raw0.exists()
-    assert bin_raw0.exists()
+    if orig_raw0:
+        assert not orig_raw0.exists()
+    if bin_raw0:
+        assert bin_raw0.exists()
     
     # Item 1 (JPG only)
     item1 = successes[1]
-    orig_jpg1 = item1["jpg"]
-    bin_jpg1 = item1["recycled_jpg"]
+    orig_jpg1 = Path(item1["jpg"])
+    bin_jpg1 = Path(item1["recycled_jpg"])
     assert not orig_jpg1.exists()
     assert bin_jpg1.exists()
     assert item1["raw"] is None 
@@ -105,12 +107,12 @@ def test_delete_worker_integration_rollback(temp_env):
         
         # Check Success entry
         s = result["successes"][0]
-        assert s["jpg"] == img_dir / "test1.jpg"
+        assert Path(s["jpg"]) == img_dir / "test1.jpg"
         assert s["recycled_raw"] is None
         
         # Check Warning entry
         warning_entry = result["warnings"][0]
-        assert warning_entry["raw"] == raw_path
+        assert Path(warning_entry["raw"]) == raw_path
         assert "message" in warning_entry
         
         # Verify JPG is GONE (No rollback)

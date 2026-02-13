@@ -394,3 +394,140 @@ class TestIsFilesystemRoot:
         """Test that \\server alone is not considered a root (requires share)."""
         # Just \\server (no share) shouldn't be a root according to implementation
         assert _is_filesystem_root(Path("\\\\server")) is False
+
+
+class TestThumbnailModelFlagFilter:
+    """Tests for flag-based filtering in ThumbnailModel."""
+
+    @patch("faststack.thumbnail_view.model.find_images")
+    def test_flag_filter_uploaded(self, mock_find_images, temp_folder):
+        """Test filtering by a single flag (uploaded)."""
+        from faststack.models import ImageFile
+
+        def mock_metadata(stem):
+            return {
+                "img1": {"uploaded": True, "stacked": False, "edited": False, "restacked": False, "favorite": False},
+                "img2": {"uploaded": False, "stacked": True, "edited": False, "restacked": False, "favorite": False},
+                "img3": {"uploaded": True, "stacked": True, "edited": False, "restacked": False, "favorite": False},
+            }.get(stem, {})
+
+        model = ThumbnailModel(
+            base_directory=temp_folder,
+            current_directory=temp_folder,
+            get_metadata_callback=mock_metadata,
+            thumbnail_size=200,
+        )
+
+        mock_find_images.return_value = [
+            ImageFile(path=temp_folder / "img1.jpg", timestamp=1.0),
+            ImageFile(path=temp_folder / "img2.jpg", timestamp=2.0),
+            ImageFile(path=temp_folder / "img3.jpg", timestamp=3.0),
+        ]
+
+        model.set_filter_flags(["uploaded"])
+
+        # Should have folders + 2 uploaded images (img1, img3)
+        image_entries = [e for e in [model.get_entry(i) for i in range(model.rowCount())] if e and not e.is_folder]
+        assert len(image_entries) == 2
+        names = {e.name for e in image_entries}
+        assert names == {"img1.jpg", "img3.jpg"}
+
+    @patch("faststack.thumbnail_view.model.find_images")
+    def test_flag_filter_multiple_and_logic(self, mock_find_images, temp_folder):
+        """Test filtering by multiple flags uses AND logic."""
+        from faststack.models import ImageFile
+
+        def mock_metadata(stem):
+            return {
+                "img1": {"uploaded": True, "stacked": False, "edited": False, "restacked": False, "favorite": True},
+                "img2": {"uploaded": True, "stacked": True, "edited": False, "restacked": False, "favorite": True},
+                "img3": {"uploaded": False, "stacked": True, "edited": False, "restacked": False, "favorite": True},
+            }.get(stem, {})
+
+        model = ThumbnailModel(
+            base_directory=temp_folder,
+            current_directory=temp_folder,
+            get_metadata_callback=mock_metadata,
+            thumbnail_size=200,
+        )
+
+        mock_find_images.return_value = [
+            ImageFile(path=temp_folder / "img1.jpg", timestamp=1.0),
+            ImageFile(path=temp_folder / "img2.jpg", timestamp=2.0),
+            ImageFile(path=temp_folder / "img3.jpg", timestamp=3.0),
+        ]
+
+        # Only img2 has both uploaded AND stacked
+        model.set_filter_flags(["uploaded", "stacked"])
+
+        image_entries = [e for e in [model.get_entry(i) for i in range(model.rowCount())] if e and not e.is_folder]
+        assert len(image_entries) == 1
+        assert image_entries[0].name == "img2.jpg"
+
+    @patch("faststack.thumbnail_view.model.find_images")
+    def test_flag_filter_combined_with_text(self, mock_find_images, temp_folder):
+        """Test that text filter and flag filter compose (AND logic)."""
+        from faststack.models import ImageFile
+
+        def mock_metadata(stem):
+            return {
+                "alpha_1": {"uploaded": True, "stacked": False, "edited": False, "restacked": False, "favorite": False},
+                "beta_2": {"uploaded": True, "stacked": False, "edited": False, "restacked": False, "favorite": False},
+                "alpha_3": {"uploaded": False, "stacked": False, "edited": False, "restacked": False, "favorite": False},
+            }.get(stem, {})
+
+        model = ThumbnailModel(
+            base_directory=temp_folder,
+            current_directory=temp_folder,
+            get_metadata_callback=mock_metadata,
+            thumbnail_size=200,
+        )
+
+        mock_find_images.return_value = [
+            ImageFile(path=temp_folder / "alpha_1.jpg", timestamp=1.0),
+            ImageFile(path=temp_folder / "beta_2.jpg", timestamp=2.0),
+            ImageFile(path=temp_folder / "alpha_3.jpg", timestamp=3.0),
+        ]
+
+        # Set both text filter and flag filter
+        model._active_filter = "alpha"
+        model.set_filter_flags(["uploaded"])
+
+        # Only alpha_1 matches both "alpha" in name AND uploaded=True
+        image_entries = [e for e in [model.get_entry(i) for i in range(model.rowCount())] if e and not e.is_folder]
+        assert len(image_entries) == 1
+        assert image_entries[0].name == "alpha_1.jpg"
+
+    @patch("faststack.thumbnail_view.model.find_images")
+    def test_flag_filter_clear(self, mock_find_images, temp_folder):
+        """Test that clearing flag filter shows all images again."""
+        from faststack.models import ImageFile
+
+        def mock_metadata(stem):
+            return {
+                "img1": {"uploaded": True, "stacked": False, "edited": False, "restacked": False, "favorite": False},
+                "img2": {"uploaded": False, "stacked": False, "edited": False, "restacked": False, "favorite": False},
+            }.get(stem, {})
+
+        model = ThumbnailModel(
+            base_directory=temp_folder,
+            current_directory=temp_folder,
+            get_metadata_callback=mock_metadata,
+            thumbnail_size=200,
+        )
+
+        mock_find_images.return_value = [
+            ImageFile(path=temp_folder / "img1.jpg", timestamp=1.0),
+            ImageFile(path=temp_folder / "img2.jpg", timestamp=2.0),
+        ]
+
+        # Apply uploaded filter — only img1
+        model.set_filter_flags(["uploaded"])
+        image_entries = [e for e in [model.get_entry(i) for i in range(model.rowCount())] if e and not e.is_folder]
+        assert len(image_entries) == 1
+
+        # Clear filter — both should appear
+        model.set_filter_flags([])
+        image_entries = [e for e in [model.get_entry(i) for i in range(model.rowCount())] if e and not e.is_folder]
+        assert len(image_entries) == 2
+

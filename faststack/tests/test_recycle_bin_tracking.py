@@ -130,3 +130,22 @@ def test_cleanup_handles_missing_bin(app_controller):
     app_controller.cleanup_recycle_bins()
 
     assert len(app_controller.active_recycle_bins) == 0
+
+
+def test_get_recycle_bin_stats_untracked_existing_bin(app_controller):
+    """Test that existing local recycle bin is detected even if not in active_recycle_bins."""
+    # Create bin manually - simulate existing bin from previous session
+    recycle_bin = app_controller.image_dir / "image recycle bin"
+    recycle_bin.mkdir(parents=True)
+    (recycle_bin / "existing.jpg").touch()
+
+    # Do NOT add to active_recycle_bins
+
+    # Get stats
+    stats = app_controller.get_recycle_bin_stats()
+
+    assert len(stats) == 1
+    assert stats[0]["path"] == str(recycle_bin)
+    assert stats[0]["count"] == 1
+    # Check that it was auto-added to active_recycle_bins for future cleanup
+    assert recycle_bin in app_controller.active_recycle_bins

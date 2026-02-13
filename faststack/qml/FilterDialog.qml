@@ -9,9 +9,10 @@ Dialog {
     standardButtons: Dialog.Ok | Dialog.Cancel
     closePolicy: Popup.CloseOnEscape
     width: 500
-    height: 250
+    height: 400
 
     property string filterString: ""
+    property var filterFlags: []
     property color backgroundColor: "#1e1e1e"
     property color textColor: "white"
 
@@ -27,7 +28,7 @@ Dialog {
     }
 
     contentItem: Column {
-        spacing: 16
+        spacing: 12
         padding: 20
 
         Label {
@@ -61,8 +62,61 @@ Dialog {
             Keys.onReturnPressed: filterDialog.accept()
             Keys.onEnterPressed: filterDialog.accept()
         }
+
+        // Flag filter section
         Label {
-            text: "Leave empty to show all images."
+            text: "Show only images with these flags:"
+            wrapMode: Text.WordWrap
+            width: parent.width - parent.padding * 2
+            color: filterDialog.textColor
+            topPadding: 4
+        }
+
+        Grid {
+            columns: 3
+            columnSpacing: 16
+            rowSpacing: 4
+            width: parent.width - parent.padding * 2
+
+            CheckBox {
+                id: cbUploaded
+                text: "Uploaded"
+                checked: false
+                Material.foreground: filterDialog.textColor
+                Material.accent: "#4fc3f7"
+            }
+            CheckBox {
+                id: cbStacked
+                text: "Stacked"
+                checked: false
+                Material.foreground: filterDialog.textColor
+                Material.accent: "#81c784"
+            }
+            CheckBox {
+                id: cbEdited
+                text: "Edited"
+                checked: false
+                Material.foreground: filterDialog.textColor
+                Material.accent: "#ffb74d"
+            }
+            CheckBox {
+                id: cbRestacked
+                text: "Restacked"
+                checked: false
+                Material.foreground: filterDialog.textColor
+                Material.accent: "#ce93d8"
+            }
+            CheckBox {
+                id: cbFavorite
+                text: "Favorite"
+                checked: false
+                Material.foreground: filterDialog.textColor
+                Material.accent: "#ffd54f"
+            }
+        }
+
+        Label {
+            text: "Leave empty and unchecked to show all images."
             font.italic: true
             opacity: 0.7
             wrapMode: Text.WordWrap
@@ -71,11 +125,34 @@ Dialog {
         }
     }
 
+    function _collectFlags() {
+        var flags = []
+        if (cbUploaded.checked) flags.push("uploaded")
+        if (cbStacked.checked) flags.push("stacked")
+        if (cbEdited.checked) flags.push("edited")
+        if (cbRestacked.checked) flags.push("restacked")
+        if (cbFavorite.checked) flags.push("favorite")
+        filterDialog.filterFlags = flags
+    }
+
+    onAccepted: {
+        _collectFlags()
+    }
+
     onOpened: {
         // Load current filter string from controller
         var current = controller && controller.get_filter_string ? controller.get_filter_string() : ""
         filterDialog.filterString = current || ""
         filterField.text = filterDialog.filterString
+
+        // Load current filter flags from controller
+        var currentFlags = controller && controller.get_filter_flags ? controller.get_filter_flags() : []
+        cbUploaded.checked = currentFlags.indexOf("uploaded") >= 0
+        cbStacked.checked = currentFlags.indexOf("stacked") >= 0
+        cbEdited.checked = currentFlags.indexOf("edited") >= 0
+        cbRestacked.checked = currentFlags.indexOf("restacked") >= 0
+        cbFavorite.checked = currentFlags.indexOf("favorite") >= 0
+
         filterField.forceActiveFocus()
         filterField.selectAll()
         // Notify Python that a dialog is open

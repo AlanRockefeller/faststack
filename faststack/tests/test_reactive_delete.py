@@ -1,6 +1,6 @@
 import pytest
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, Mock
 from pathlib import Path
 from faststack.models import ImageFile
 
@@ -226,17 +226,23 @@ def test_cancel_midlight_with_real_files(app_controller):
     assert len(delete_entries) == 1
 
 
-def test_undo_then_completion_no_bookkeeping(app_controller):
-    """After undo, completion handler must not add delete undo entries."""
+def test_undo_midflight_auto_restores(app_controller, tmp_path):
+    """Test Policy 1: Undo mid-flight causes auto-restore of moved files without new undo entries."""
     p1 = (app_controller.image_dir / "test.jpg").resolve()
     p1.write_text("content")
     img1 = ImageFile(p1)
     app_controller.image_files = [img1]
 
+    # Mock restore to avoid real file ops and ensure success
+    app_controller._restore_from_recycle_bin_safe = Mock(return_value=(True, ""))
+
     summary = app_controller._delete_indices([0], "test")
     job_id = summary["job_id"]
+    
+    # Removed optimistically
+    assert len(app_controller.image_files) == 0
 
-    # User undoes immediately
+    # User undoes immediately -> undo_requested=True
     app_controller.undo_delete()
     assert len(app_controller.image_files) == 1
 
@@ -254,10 +260,12 @@ def test_undo_then_completion_no_bookkeeping(app_controller):
     }
     app_controller._on_delete_finished(result)
 
-    # A "delete" undo entry SHOULD be added for the already-moved file
-    # so the user can "Undo" again to restore it.
+    # 1. No new undo entry (consumed by auto-restore)
     delete_entries = [e for e in app_controller.undo_history if e[0] == "delete"]
-    assert len(delete_entries) == 1
+    assert len(delete_entries) == 0
 
-    # UI removed the image again because it was successfully moved
-    assert len(app_controller.image_files) == 0
+    # 2. UI keeps the image (restored by undo, kept by auto-restore)
+    assert len(app_controller.image_files) == 1
+    
+    # 3. Restore was attempted
+    app_controller._restore_from_recycle_bin_safe.assert_called_with(p1, Path("recycle/test.jpg"))

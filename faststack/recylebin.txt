@@ -1,0 +1,377 @@
+FILE: qml/Main.qml (Lines 20-33)
+----------------------------------
+    property bool allowCloseWithRecycleBins: false
+
+    onClosing: function(close) {
+        if (allowCloseWithRecycleBins) {
+            close.accepted = true
+            return
+        }
+        if (uiState && uiState.hasRecycleBinItems) {
+            close.accepted = false
+            recycleBinCleanupDialog.open()
+        } else {
+            close.accepted = true
+        }
+    }
+
+FILE: qml/Main.qml (Lines 1334-1554)
+------------------------------------
+    Dialog {
+        id: recycleBinCleanupDialog
+        title: "Clean up Recycle Bins?"
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        width: Math.min(600, parent.width * 0.9)
+        modal: true
+        standardButtons: Dialog.NoButton
+        
+        // Ensure the dialog is fully opaque and has a solid background
+        background: Rectangle {
+            color: root.isDarkTheme ? "#1e1e1e" : "#fdfdfd"
+            border.color: root.isDarkTheme ? "#444444" : "#dddddd"
+            border.width: 1
+            radius: 12
+        }
+        
+        header: Rectangle {
+            implicitHeight: 60
+            color: root.isDarkTheme ? "#252525" : "#f2f2f2"
+            radius: 12
+            // Bottom corners should not be rounded to merge with body
+            Rectangle {
+                anchors.bottom: parent.bottom
+                width: parent.width
+                height: 12
+                color: parent.color
+            }
+            Text {
+                anchors.centerIn: parent
+                text: "Clean up Recycle Bins?"
+                color: root.currentTextColor
+                font.bold: true
+                font.pixelSize: 20
+            }
+        }
+
+        contentItem: Column {
+            id: dialogContent
+            width: recycleBinCleanupDialog.width
+            spacing: 20
+            topPadding: 10
+            bottomPadding: 10
+            leftPadding: 20
+            rightPadding: 20
+            
+            Label {
+                width: dialogContent.width - 40
+                text: uiState ? uiState.recycleBinStatsText : "Loading..."
+                color: root.isDarkTheme ? "#efefef" : "#333333"
+                wrapMode: Text.WordWrap
+                font.pixelSize: 16
+                lineHeight: 1.3
+            }
+
+            property bool detailsExpanded: false
+
+            Row {
+                width: dialogContent.width - 40
+                spacing: 12
+                
+                Label {
+                    text: "Files to be removed:"
+                    color: "#81C784" // Soft green
+                    font.pixelSize: 15
+                    font.bold: true
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Rectangle {
+                    width: detailsToggleText.implicitWidth + 20
+                    height: 28
+                    radius: 14
+                    color: toggleMouseArea.containsMouse ? (root.isDarkTheme ? "#333333" : "#e0e0e0") : "transparent"
+                    border.color: root.isDarkTheme ? "#555555" : "#cccccc"
+                    border.width: 1
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Text {
+                        id: detailsToggleText
+                        anchors.centerIn: parent
+                        text: dialogContent.detailsExpanded ? "Hide Details" : "Show Details"
+                        color: root.currentTextColor
+                        font.pixelSize: 12
+                    }
+
+                    MouseArea {
+                        id: toggleMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: dialogContent.detailsExpanded = !dialogContent.detailsExpanded
+                    }
+                }
+            }
+
+            Rectangle {
+                id: detailedSection
+                width: dialogContent.width - 40
+                height: dialogContent.detailsExpanded ? Math.min(250, root.height * 0.4) : 0
+                visible: height > 0
+                color: root.isDarkTheme ? "#121212" : "#f9f9f9"
+                border.color: root.isDarkTheme ? "#333333" : "#eeeeee"
+                border.width: 1
+                radius: 8
+                clip: true
+                
+                Behavior on height { NumberAnimation { duration: 250; easing.type: Easing.OutCubic } }
+                
+                ScrollView {
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    ScrollBar.vertical.policy: ScrollBar.AlwaysOn
+                    
+                    TextArea {
+                        id: detailsText
+                        text: uiState ? uiState.recycleBinDetailedText : ""
+                        color: root.isDarkTheme ? "#bbbbbb" : "#444444"
+                        font.family: "Consolas, 'Courier New', monospace"
+                        font.pixelSize: 13
+                        padding: 10
+                        wrapMode: Text.WrapAnywhere
+                        readOnly: true
+                        background: null
+                    }
+                }
+            }
+            
+            // Premium Pill Buttons
+            Row {
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: 15
+                topPadding: 10
+                
+                // Cancel Button
+                Rectangle {
+                    width: cancelBtnText.implicitWidth + 40
+                    height: 44
+                    radius: 22
+                    color: "transparent"
+                    border.color: root.isDarkTheme ? "#555555" : "#cccccc"
+                    border.width: 1
+                    
+                    Text {
+                        id: cancelBtnText
+                        anchors.centerIn: parent
+                        text: "Cancel"
+                        color: root.currentTextColor
+                        font.pixelSize: 15
+                        font.bold: true
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onClicked: recycleBinCleanupDialog.close()
+                        cursorShape: Qt.PointingHandCursor
+                        onEntered: parent.color = root.isDarkTheme ? "#2a2a2a" : "#eeeeee"
+                        onExited: parent.color = "transparent"
+                    }
+                }
+
+                // Keep and Quit Button
+                Rectangle {
+                    width: keepBtnText.implicitWidth + 40
+                    height: 44
+                    radius: 22
+                    color: root.isDarkTheme ? "#333333" : "#e0e0e0"
+                    
+                    Text {
+                        id: keepBtnText
+                        anchors.centerIn: parent
+                        text: "Keep and Quit"
+                        color: root.currentTextColor
+                        font.pixelSize: 15
+                        font.bold: true
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onClicked: {
+                            allowCloseWithRecycleBins = true
+                            recycleBinCleanupDialog.close()
+                            Qt.quit()
+                        }
+                        cursorShape: Qt.PointingHandCursor
+                        onEntered: parent.color = root.isDarkTheme ? "#444444" : "#d0d0d0"
+                        onExited: parent.color = root.isDarkTheme ? "#333333" : "#e0e0e0"
+                    }
+                }
+
+                // Delete and Quit Button (Primary Action)
+                Rectangle {
+                    width: deleteBtnText.implicitWidth + 40
+                    height: 44
+                    radius: 22
+                    color: "#ef5350" // Premium Red
+                    
+                    Text {
+                        id: deleteBtnText
+                        anchors.centerIn: parent
+                        text: "Delete and Quit"
+                        color: "white"
+                        font.pixelSize: 15
+                        font.bold: true
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onClicked: {
+                            if (uiState) uiState.cleanupRecycleBins()
+                            allowCloseWithRecycleBins = true
+                            recycleBinCleanupDialog.close()
+                            Qt.quit()
+                        }
+                        cursorShape: Qt.PointingHandCursor
+                        onEntered: parent.color = "#f44336"
+                        onExited: parent.color = "#ef5350"
+                    }
+                }
+            }
+        }
+    }
+
+
+FILE: ui/provider.py (Lines 1454-1507)
+--------------------------------------
+    @Property(str, notify=recycleBinStatsTextChanged)
+    def recycleBinStatsText(self):
+        """Returns a formatted string of recycle bin stats summary."""
+        stats = self.app_controller.get_recycle_bin_stats()
+        if not stats:
+            return ""
+
+        summary = "The following recycle bins contain items:
+"
+        for item in stats:
+            counts = []
+            if item.get("jpg_count", 0) > 0:
+                counts.append(f"{item['jpg_count']} JPG")
+            if item.get("raw_count", 0) > 0:
+                counts.append(f"{item['raw_count']} RAW")
+            if item.get("other_count", 0) > 0:
+                counts.append(f"{item['other_count']} other")
+
+            count_str = f" ({', '.join(counts)})" if counts else ""
+            summary += f"
+• {item['path']}:
+  {item['count']} files{count_str}
+"
+
+        summary += "
+Do you want to permanently delete them before quitting?"
+        return summary
+
+    @Property(str, notify=recycleBinDetailedTextChanged)
+    def recycleBinDetailedText(self):
+        """Returns a detailed list of all file paths in recycle bins."""
+        stats = self.app_controller.get_recycle_bin_stats()
+        if not stats:
+            return ""
+
+        lines = []
+        for item in stats:
+            lines.append(f"Directory: {item['path']}")
+            for fname in item.get("file_paths", []):
+                lines.append(f"  - {fname}")
+            lines.append("")
+
+        return "
+".join(lines)
+
+    @Property(bool, notify=hasRecycleBinItemsChanged)
+    def hasRecycleBinItems(self):
+        """Returns True if there are items in any recycle bin."""
+        stats = self.app_controller.get_recycle_bin_stats()
+        return len(stats) > 0
+
+    @Slot()
+    def cleanupRecycleBins(self):
+        """Deletes all tracked recycle bins."""
+        self.app_controller.cleanup_recycle_bins()
+
+        self.recycleBinStatsTextChanged.emit()
+        self.recycleBinDetailedTextChanged.emit()
+        self.hasRecycleBinItemsChanged.emit()
+
+
+FILE: app.py (Lines 339, 3338, 6353-6415)
+-----------------------------------------
+(L339)  self.active_recycle_bins: Set[Path] = (set())  # Track all recycle bins created/used
+
+(L3338) if s.recycled_jpg:
+            self.active_recycle_bins.add(s.recycled_jpg.parent)
+
+(L6353-6415)
+    def get_recycle_bin_stats(self) -> List[Dict]:
+        """Return stats for all tracked recycle bins.
+
+        Returns:
+            List of dicts, each containing 'path', 'count', 'jpg_count',
+            'raw_count', 'other_count', and 'file_paths'.
+        """
+        all_stats = []
+        try:
+            # Filter out bins that don't exist anymore
+            active_bins = {p for p in self.active_recycle_bins if p.exists() and p.is_dir()}
+            self.active_recycle_bins = active_bins
+
+            for bin_path in self.active_recycle_bins:
+                stats = {
+                    "path": str(bin_path),
+                    "count": 0,
+                    "jpg_count": 0,
+                    "raw_count": 0,
+                    "other_count": 0,
+                    "file_paths": [],
+                }
+                
+                try:
+                    for item in bin_path.iterdir():
+                        if item.is_file():
+                            stats["count"] += 1
+                            ext = item.suffix.lower()
+                            if ext in self.JPG_EXTENSIONS:
+                                stats["jpg_count"] += 1
+                            elif ext in self.RAW_EXTENSIONS:
+                                stats["raw_count"] += 1
+                            else:
+                                stats["other_count"] += 1
+                            stats["file_paths"].append(item.name)
+                    
+                    if stats["count"] > 0:
+                        all_stats.append(stats)
+                except OSError as e:
+                    log.error(f"Error reading recycle bin {bin_path}: {e}")
+                    
+        except Exception as e:
+            log.error(f"Error getting recycle bin stats: {e}")
+        return all_stats
+
+    def cleanup_recycle_bins(self):
+        """Empty and remove all tracked recycle bins."""
+        import shutil
+        
+        bins_to_remove = list(self.active_recycle_bins)
+        
+        for bin_path in bins_to_remove:
+            try:
+                if bin_path.exists() and bin_path.is_dir():
+                    shutil.rmtree(bin_path)
+                    log.info(f"Cleaned up recycle bin: {bin_path}")
+                self.active_recycle_bins.discard(bin_path)
+            except Exception as e:
+                log.error(f"Failed to cleanup recycle bin {bin_path}: {e}")
+                
+        # Notify UI
+        if hasattr(self, "dialogStateChanged"):
+            self.dialogStateChanged.emit(False)

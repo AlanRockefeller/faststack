@@ -1,0 +1,32 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.0.2, pluggy-1.6.0 -- C:\code\faststack\faststack\verify_venv\Scripts\python.exe
+rootdir: C:\code\faststack
+configfile: pyproject.toml
+collecting ... collected 15 items
+
+tests\test_deletion_unification.py::test_delete_batch_optimistic_removal PASSED [  6%]
+tests\test_deletion_unification.py::test_grid_delete_selection PASSED    [ 13%]
+tests\test_deletion_unification.py::test_grid_cursor_correct_mapping PASSED [ 20%]
+tests\test_deletion_unification.py::test_delete_current_image_triggers_batch_dialog PASSED [ 26%]
+tests\test_deletion_unification.py::test_grid_cursor_not_found_feedback PASSED [ 33%]
+tests\test_deletion_unification.py::test_delete_indices_summary_return PASSED [ 40%]
+tests\test_deletion_unification.py::test_grid_cursor_mapping_regression PASSED [ 46%]
+tests\test_deletion_unification.py::test_grid_delete_folder_feedback PASSED [ 53%]
+tests\test_deletion_unification.py::test_delete_schedules_refresh PASSED [ 60%]
+tests\test_deletion_unification.py::test_undo_pending_delete_restores_items PASSED [ 66%]
+tests\test_deletion_unification.py::test_undo_pending_batch_delete_restores_all PASSED [ 73%]
+tests\test_deletion_unification.py::test_cancel_midlight_restores_unprocessed PASSED [ 80%]
+tests\test_deletion_unification.py::test_undo_pending_auto_restores_moved_files PASSED [ 86%]
+tests\test_deletion_unification.py::test_recycle_failure_prompts_perm_delete FAILED [ 93%]
+tests\test_deletion_unification.py::test_batch_restored_on_rollback PASSED [100%]
+
+================================== FAILURES ===================================
+__________________ test_recycle_failure_prompts_perm_delete ___________________
+tests\test_deletion_unification.py:385: in test_recycle_failure_prompts_perm_delete
+    mock_perm.assert_called_once_with(img)
+C:\Users\alanr\AppData\Local\Programs\Python\Python312\Lib\unittest\mock.py:960: in assert_called_once_with
+    raise AssertionError(msg)
+E   AssertionError: Expected 'permanently_delete_image_files' to be called once. Called 0 times.
+=========================== short test summary info ===========================
+FAILED tests\test_deletion_unification.py::test_recycle_failure_prompts_perm_delete
+======================== 1 failed, 14 passed in 0.85s =========================

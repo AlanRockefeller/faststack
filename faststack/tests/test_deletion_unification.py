@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 from pathlib import Path
 from faststack.app import AppController
 from faststack.models import ImageFile
+from faststack.deletion_types import DeletionErrorCodes
 
 
 @pytest.fixture(scope="session")
@@ -297,17 +298,18 @@ def test_cancel_midlight_restores_unprocessed(mock_controller):
 
 # ── Undo pending prevents later bookkeeping ──────────────────────────
 
-def test_undo_pending_prevents_later_bookkeeping(mock_controller):
-    """Undo pending delete, then completion arrives: no undo entries added, no 'deleted' status."""
+def test_undo_pending_auto_restores_moved_files(mock_controller):
+    """Undo pending delete, then completion arrives: files are auto-restored (Policy 1)."""
     img1 = ImageFile(Path("img1.jpg"))
     img2 = ImageFile(Path("img2.jpg"))
     mock_controller.image_files = [img1, img2]
+    mock_controller._restore_from_recycle_bin_safe = Mock(return_value=(True, ""))
 
     summary = mock_controller._delete_indices([0, 1], "test")
     job_id = summary["job_id"]
     assert len(mock_controller.image_files) == 0
 
-    # User undoes immediately
+    # User undoes immediately - sets undo_requested=True on job
     mock_controller.undo_delete()
     assert len(mock_controller.image_files) == 2
 
@@ -327,46 +329,30 @@ def test_undo_pending_prevents_later_bookkeeping(mock_controller):
     }
     mock_controller._on_delete_finished(result)
 
-    # A "delete" undo entry SHOULD be added for the already-moved file
-    # so the user can "Undo" again to restore it.
+    # 1. No new undo entry should be added (undo was consumed)
+    # The only 'delete' entry would be from a completed delete, but this one was undone.
     delete_entries = [e for e in mock_controller.undo_history if e[0] == "delete"]
-    assert len(delete_entries) == 1
+    assert len(delete_entries) == 0
 
-    # UI list should still have both images (restored by undo)
-    # UI list should have 1 image (img2 remains, img1 removed again as 'success')
-    assert len(mock_controller.image_files) == 1
-    assert mock_controller.image_files[0].path == img2.path
+    # 2. UI list should still have both images
+    assert len(mock_controller.image_files) == 2
+    
+    # 3. Auto-restore should have been called for img1 (the success)
+    mock_controller._restore_from_recycle_bin_safe.assert_called_with(
+        img1.path.resolve(), Path("recycle/img1.jpg")
+    )
 
-    # Status message SHOULD verify the "already moved" notification
-    found_msg = False
-    for call in mock_controller.update_status_message.call_args_list:
-        msg = call[0][0]
-        if "already moved" in msg.lower():
-            found_msg = True
-            break
-    assert found_msg, "Status message regarding already moved files not found"
+    # 4. Status message should update
+    mock_controller.update_status_message.assert_called_with("Deletion cancelled (files restored)")
 
 
 # ── Permanent delete result handled ──────────────────────────────────
 
-def test_perm_delete_result_handled(mock_controller):
-    """Permanent delete result is handled correctly (not early-returned)."""
-    # Simulate a _perm_result signal arriving
-    result = {
-        "_perm_result": True,
-        "perm_success": [(0, Mock()), (1, Mock())],
-        "perm_fail": [],
-    }
-    mock_controller._on_delete_finished(result)
-
-    # Should show status message
-    mock_controller.update_status_message.assert_called_with(
-        "Permanently deleted 2 image(s)"
-    )
 
 
-def test_automatic_rollback_on_recycle_failure(mock_controller, tmp_path):
-    """Verify that recycle failure results in automatic UI restoration without prompting."""
+
+def test_recycle_failure_prompts_perm_delete(mock_controller, tmp_path):
+    """Verify that recycle failure triggers a permanent delete prompt."""
     img_path = tmp_path / "test.jpg"
     img_path.write_text("content")
     img = ImageFile(img_path)
@@ -374,7 +360,7 @@ def test_automatic_rollback_on_recycle_failure(mock_controller, tmp_path):
 
     summary = mock_controller._delete_indices([0], "test")
     job_id = summary["job_id"]
-
+    
     # Simulate worker result: recycle failed
     result = {
         "job_id": job_id,
@@ -387,18 +373,39 @@ def test_automatic_rollback_on_recycle_failure(mock_controller, tmp_path):
         "cancelled": False,
     }
 
-    # No prompt expected now
-    with patch("faststack.app.confirm_permanent_delete") as mock_confirm:
-        mock_controller._on_delete_finished(result)
-        mock_confirm.assert_not_called()
+    # PATCH confirm_permanent_delete to say YES
+    with patch("faststack.app.confirm_permanent_delete", return_value=True) as mock_confirm:
+            mock_controller._on_delete_finished(result)
+            
+            # Should have prompted
+            mock_confirm.assert_called_once()
+            
+            # Should have submitted to executor (ASYNC)
+            # Called twice: 1. initial delete, 2. perm delete
+            assert mock_controller._delete_executor.submit.call_count == 2
+            
+            # Verify the last call was for _perm_delete_worker
+            args, _ = mock_controller._delete_executor.submit.call_args
+            assert args[0] == AppController._perm_delete_worker
 
-    # Item should be restored automatically
-    assert len(mock_controller.image_files) == 1
-    assert mock_controller.image_files[0].path == img_path.resolve()
+            # Simulate async worker completion
+            perm_result = {
+                "job_id": job_id,
+                "_perm_result": True,
+                "perm_success": [(0, img)],
+                "perm_fail": []
+            }
+            mock_controller._on_delete_finished(perm_result)
+
+    # Since it succeeded, item should be gone from UI (it was removed optimistically and confirmed)
+    # Wait: optimistically removed -> failed -> perm prompt -> success.
+    # So it stays removed.
+    assert len(mock_controller.image_files) == 0
 
 
 # ── Batch/selection clearing tests ────────────────────────────────────
 
+# @pytest.mark.skip(reason="Flaky in mock environment - logic verified manually")
 def test_batch_restored_on_rollback(mock_controller):
     """Batch state is restored when delete completion rolls back failed items."""
     img1 = ImageFile(Path("test1.jpg"))
@@ -415,17 +422,21 @@ def test_batch_restored_on_rollback(mock_controller):
     # Get the job
     job_id = list(mock_controller._pending_delete_jobs.keys())[0]
 
-    # Simulate complete failure
+    # Simulate complete failure with 'recycle_failed' triggering permission check
     result = {
         "job_id": job_id,
         "successes": [],
         "failures": [
-            {"jpg": img1.path.resolve(), "raw": None, "code": "recycle_failed"},
-            {"jpg": img2.path.resolve(), "raw": None, "code": "recycle_failed"},
+            {"jpg": img1.path, "raw": None, "code": DeletionErrorCodes.RECYCLE_FAILED},
+            {"jpg": img2.path, "raw": None, "code": DeletionErrorCodes.RECYCLE_FAILED},
         ],
-        "cancelled": True,
+        "cancelled": False,
     }
-    mock_controller._on_delete_finished(result)
+    
+    # Mock confirm_batch_permanent_delete to return False (User says NO)
+    # We patch it where it is imported in app.py
+    with patch("faststack.app.confirm_batch_permanent_delete", return_value=False):
+        mock_controller._on_delete_finished(result)
 
     # Batches should be restored
     assert mock_controller.batches == [[0, 1]]

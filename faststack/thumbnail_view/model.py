@@ -139,6 +139,7 @@ class ThumbnailModel(QAbstractListModel):
         self._selected_indices: Set[int] = set()
         self._last_selected_index: Optional[int] = None
         self._active_filter: str = ""  # current filename filter (set by AppController)
+        self._active_filter_flags: list = []  # current flag filters (e.g. ["uploaded", "stacked"])
 
         # Mapping from thumbnail_id (without query params) to row index
         # id format: "{size}/{path_hash}/{mtime_ns}"
@@ -291,6 +292,17 @@ class ThumbnailModel(QAbstractListModel):
         self._active_filter = filter_string
         self.refresh()
 
+    def set_filter_flags(self, flags: list) -> None:
+        """Set the active flag filters and refresh the model.
+
+        Args:
+            flags: List of flag names to filter by (e.g. ["uploaded", "stacked"]).
+                   Images must have ALL listed flags set to True (AND logic).
+                   Pass empty list to clear flag filters.
+        """
+        self._active_filter_flags = list(flags)
+        self.refresh()
+
     def _add_folders_to_entries(self):
         """Scan for folders and add them to self._entries."""
         # Add parent folder entry if not at filesystem root
@@ -357,10 +369,23 @@ class ThumbnailModel(QAbstractListModel):
             # Get images using existing indexer (respects filter rules)
             images = find_images(self._current_directory)
 
-            # Apply active filter if set
+            # Apply active filename filter if set
             if self._active_filter:
                 needle = self._active_filter.lower()
                 images = [img for img in images if needle in img.path.stem.lower()]
+
+            # Apply active flag filters (AND logic)
+            if self._active_filter_flags and self._get_metadata:
+                flags = self._active_filter_flags
+                filtered = []
+                for img in images:
+                    try:
+                        meta = self._get_metadata(img.path.stem)
+                        if all(meta.get(flag, False) for flag in flags):
+                            filtered.append(img)
+                    except Exception:
+                        pass  # Skip images with metadata errors
+                images = filtered
 
             self._add_images_to_entries(images)
             t2 = time.perf_counter()
@@ -461,11 +486,29 @@ class ThumbnailModel(QAbstractListModel):
             self._add_folders_to_entries()
             t1 = time.perf_counter()
             
-            # Apply active filter if set
+            # Apply active filename filter if set
             if self._active_filter:
                 needle = self._active_filter.lower()
                 images = [img for img in images if needle in img.path.stem.lower()]
-                
+
+            # Apply active flag filters (AND logic)
+            if self._active_filter_flags:
+                flags = self._active_filter_flags
+                filtered = []
+                for img in images:
+                    try:
+                        if metadata_map:
+                            meta = metadata_map.get(img.path.stem, {})
+                        elif self._get_metadata:
+                            meta = self._get_metadata(img.path.stem)
+                        else:
+                            continue
+                        if all(meta.get(flag, False) for flag in flags):
+                            filtered.append(img)
+                    except Exception:
+                        pass  # Skip images with metadata errors
+                images = filtered
+
             self._add_images_to_entries(images, metadata_map)
             t2 = time.perf_counter()
             self._rebuild_id_mapping()
@@ -534,14 +577,13 @@ class ThumbnailModel(QAbstractListModel):
     def _rebuild_id_mapping(self):
         """Rebuilds the path/stack_id -> row mapping."""
         self._id_to_row.clear()
-        
-        # We need a stable identifier for QML
-        # Now using fast string hashing (no filesystem calls)
-        self._id_to_row = {
-            compute_path_hash(e.path): i 
-            for i, e in enumerate(self._entries)
-            if not e.is_folder
-        }
+
+        # Key must match the thumbnail_id format emitted by the prefetcher:
+        # "{size}/{path_hash}/{mtime_ns}" — same as _make_thumbnail_id()
+        for i, e in enumerate(self._entries):
+            if not e.is_folder:
+                tid = self._make_thumbnail_id(e)
+                self._id_to_row[tid] = i
 
     def _make_thumbnail_id(self, entry: ThumbnailEntry) -> str:
         """Create thumbnail ID without query params."""

@@ -502,8 +502,23 @@ ApplicationWindow {
             ItemDelegate {
                 width: 220
                 height: 36
-                text: "Run Stacks"
-                onClicked: { if (uiState) uiState.launch_helicon(); actionsMenu.close() }
+                text: "Run Stacks (raw)"
+                onClicked: { if (uiState) uiState.launch_helicon(true); actionsMenu.close() }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
+            ItemDelegate {
+                width: 220
+                height: 36
+                text: "Run Stacks (jpg)"
+                onClicked: { if (uiState) uiState.launch_helicon(false); actionsMenu.close() }
                 background: Rectangle {
                     color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
                 }
@@ -1238,7 +1253,7 @@ ApplicationWindow {
         backgroundColor: root.currentBackgroundColor
         textColor: root.currentTextColor
         onAccepted: {
-            if (uiState) uiState.applyFilter(filterString)
+            if (uiState) uiState.applyFilter(filterString, filterFlags)
         }
     }
 
@@ -1425,7 +1440,7 @@ ApplicationWindow {
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
-                    ScrollBar.vertical.policy: ScrollBar.AlwaysOn
+
                     
                     TextArea {
                         id: detailsText
