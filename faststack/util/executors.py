@@ -11,51 +11,65 @@ from typing import Any, Callable
 log = logging.getLogger(__name__)
 
 
+import weakref
+from concurrent.futures.thread import _worker, _threads_queues
+
+class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor whose worker threads are daemon threads.
+
+    Near-literal copy of CPython 3.12.2 ``_adjust_thread_count``
+    (Lib/concurrent/futures/thread.py) with the sole change:
+    ``t.daemon = True`` before ``t.start()``.
+
+    No hasattr guard — if CPython internals change, this will raise
+    AttributeError immediately rather than silently falling back to
+    non-daemon threads.
+
+    Thread-safety note: ``_adjust_thread_count`` is only called from
+    ``submit()``, which already holds ``_global_shutdown_lock``, so the
+    mutation of ``_threads_queues`` is safe without acquiring it again.
+    """
+
+    def _adjust_thread_count(self) -> None:
+        # if idle threads are available, don't spin new threads
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        # When the executor gets lost, the weakref callback will wake up
+        # the worker threads.
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = '%s_%d' % (self._thread_name_prefix or self,
+                                     num_threads)
+            t = threading.Thread(name=thread_name, target=_worker,
+                                 args=(weakref.ref(self, weakref_cb),
+                                       self._work_queue,
+                                       self._initializer,
+                                       self._initargs))
+            t.daemon = True
+            t.start()
+            self._threads.add(t)
+            # Safe without explicit locking: submit() already holds
+            # _global_shutdown_lock when calling _adjust_thread_count().
+            _threads_queues[t] = self._work_queue
+
+
 def create_daemon_threadpool_executor(
     max_workers: int, thread_name_prefix: str = ""
 ) -> ThreadPoolExecutor:
     """
-    Create a standard ThreadPoolExecutor whose worker threads are daemon.
-
-    ThreadPoolExecutor worker threads are created with daemon=None, so they inherit
-    the daemon status of the thread that creates them. This helper creates the executor
-    from a short-lived daemon thread and forces worker creation so the workers become
-    daemon threads (suitable for expendable background work like prefetching/previews).
-
-    NOTE: For critical tasks (saving/deleting), prefer a normal non-daemon executor.
+    Create a ThreadPoolExecutor whose worker threads are daemon threads.
+    Returns a DaemonThreadPoolExecutor instance which is a subclass of ThreadPoolExecutor.
     """
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
 
-    executor_container: dict[str, ThreadPoolExecutor] = {}
-    error_container: list[BaseException] = []
-
-    def creator() -> None:
-        try:
-            executor = ThreadPoolExecutor(
-                max_workers=max_workers, thread_name_prefix=thread_name_prefix
-            )
-            executor_container["executor"] = executor
-
-            # Pre-spawn workers so they inherit daemon status from this daemon creator thread.
-            futs = [executor.submit(lambda: None) for _ in range(max_workers)]
-            for f in futs:
-                f.result()
-        except BaseException as e:
-            error_container.append(e)
-
-    t = threading.Thread(target=creator, name=f"{thread_name_prefix}_Creator", daemon=True)
-    t.start()
-    t.join()
-
-    if error_container:
-        raise error_container[0]
-
-    executor = executor_container.get("executor")
-    if executor is None:
-        raise RuntimeError("Failed to create daemon ThreadPoolExecutor")
-
-    return executor
+    return DaemonThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix=thread_name_prefix
+    )
 
 
 def create_priority_executor(

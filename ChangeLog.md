@@ -12,6 +12,7 @@ Todo:   Make it work on Linux / Mac.   Create Windows .exe.   Write better docum
 - Improved **thumbnail responsiveness**: visible thumbnails are now queued with higher priority than background prefetch.
 - Improved **prefetch stability/performance**: prefetch work runs on daemon threads and cleans up finished futures.
 - UI tweaks: recycle-bin details text is selectable and uses updated colors; metadata filename now shows RAW extension when present (e.g., `IMG_0001.JPG + ORF`).
+- Helicon Focus: Avoid a race condition by deferring deletion of temporary file lists until app shutdown.
 
 ## 1.5.7 (2026-02-09)
 

@@ -12,7 +12,7 @@ from PIL import Image, ExifTags
 # Adjust path to import faststack
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from faststack.imaging.prefetch import apply_exif_orientation
+from faststack.imaging.orientation import apply_exif_orientation
 
 
 class TestExifDisplayOrientation(unittest.TestCase):

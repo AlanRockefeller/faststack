@@ -1614,6 +1614,7 @@ class ImageEditor:
         shadows: float,
         *,
         srgb_u8_stride: Optional[np.ndarray] = None,
+        srgb_u8: Optional[np.ndarray] = None,
         analysis_state: Optional[Dict[str, float]] = None,
         edits: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
@@ -1633,24 +1634,26 @@ class ImageEditor:
             shadows: -1.0 to 1.0, positive lifts shadows, negative crushes
             srgb_u8_stride: Optional uint8 sRGB array (strided) for accurate JPEG clipping detection
                      (should be the image BEFORE linearization)
+            srgb_u8: Keyword-only alias for srgb_u8_stride (preferred if provided).
             analysis_state: Optional pre-computed analysis state to avoid re-work.
 
         Returns:
             Adjusted float32 RGB array (linear)
         """
         arr = linear
+        effective_srgb_u8 = srgb_u8 if srgb_u8 is not None else srgb_u8_stride
 
         # Analyze highlight state if needed
         # If caller passed analysis_state, usage that.
         state = analysis_state
         if state is None:
             # Re-compute locally if not provided
-            # We assume srgb_u8_stride is ALREADY STRIDED if passed (based on the name change)
+            # We assume effective_srgb_u8 is ALREADY STRIDED if passed 
             arr_stride = arr[::4, ::4, :]
-            # If srgb_u8_stride was passed, use it directly (it's already small).
+            # If effective_srgb_u8 was passed, use it directly (it's already small).
             # If it wasn't passed, we can't easily recreate the source state here without the original source buffer.
             # But the caller (_apply_edits) usually provides it.
-            state = _analyze_highlight_state(arr_stride, srgb_u8=srgb_u8_stride)
+            state = _analyze_highlight_state(arr_stride, srgb_u8=effective_srgb_u8)
 
         # Ensure we have edits dict to check upstream hash
         if edits is None:
@@ -1802,6 +1805,8 @@ class ImageEditor:
             self.current_edits["crop_box"] = crop_box
             self._edits_rev += 1
 
+
+
     def _write_tiff_16bit(self, path: Path, arr_float: np.ndarray):
         """
         Writes a float32 (0-1) numpy array as an uncompressed 16-bit RGB TIFF using OpenCV.
@@ -1894,15 +1899,33 @@ class ImageEditor:
 
     def _ensure_float_image(self) -> None:
         """Ensure self.float_image exists. Needed when load_image(preview_only=True)."""
-        if self.float_image is not None:
-            return
-        if self.original_image is None:
-            raise RuntimeError("No image loaded")
-        rgb = self.original_image.convert("RGB")
-        self.float_image = np.array(rgb).astype(np.float32) / 255.0
+        # 1. Quick check under lock
+        with self._lock:
+            if self.float_image is not None:
+                return
+            if self.original_image is None:
+                raise RuntimeError("No image loaded")
+            # Snapshot original image to convert outside lock
+            original_ref = self.original_image
+
+        # 2. Expensive conversion outside lock
+        rgb = original_ref.convert("RGB")
+        float_arr = np.array(rgb).astype(np.float32) / 255.0
+
+        # 3. Store result under lock (checking if someone beat us to it, or if image changed)
+        with self._lock:
+            # Only assign if original_image hasn't changed
+            if self.original_image is original_ref:
+                if self.float_image is None:
+                    self.float_image = float_arr
+
+
 
     def save_image(
-        self, write_developed_jpg: bool = False, developed_path: Optional[Path] = None
+        self,
+        write_developed_jpg: bool = False,
+        developed_path: Optional[Path] = None,
+        save_target_path: Optional[Path] = None,
     ) -> Optional[Tuple[Path, Path]]:
         """Saves the edited image, backing up the original.
 
@@ -1911,43 +1934,71 @@ class ImageEditor:
                                  This should be True only when editing RAW files.
             developed_path: Optional explicit path for the developed JPG.
                             If not provided, it's derived from current_filepath.
+            save_target_path: Optional override for the output path. When saving
+                              from a variant (backup/developed), this should be
+                              the Main file's path. Backup is created for Main,
+                              the variant source file is left untouched.
 
         Returns:
             A tuple of (saved_path, backup_path) on success, otherwise None.
+
+        Raises:
+            RuntimeError: If preconditions are not met (no path, no image) or if saving fails.
         """
-        if self.current_filepath is None or self.original_image is None:
-            return None
+        if self.current_filepath is None:
+            raise RuntimeError("No file path set")
+        if self.original_image is None:
+            raise RuntimeError("No image loaded")
 
         # Ensure float master exists (preview_only loads may not have it)
         try:
             self._ensure_float_image()
         except RuntimeError:
-            return None
+            raise
 
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
 
         # 1. Apply Edits to Full Resolution
-        # Skip the expensive .copy() when safe — see _edits_can_share_input().
-        _safe_no_copy = self._edits_can_share_input(self.current_edits)
-        source_arr = self.float_image if _safe_no_copy else self.float_image.copy()
-        if _safe_no_copy:
-            log.debug("save_image: skipping float_image.copy() (safe no-copy path)")
+        # Snapshot state under lock to avoid races
+        with self._lock:
+            # Re-check float image existence under lock (though _ensure calls it too)
+            # Previously returned None, now raising to be explicit about failure
+            if self.float_image is None:
+                raise RuntimeError("save_image called with no float_image (race condition?)")
+            
+            # Determine if we can skip copy
+            _safe_no_copy = self._edits_can_share_input(self.current_edits)
+            
+            # Snapshot the source data
+            # If safe to share (read-only), we just grab the reference
+            # If not safe, we MUST copy it here while holding the lock
+            if _safe_no_copy:
+                source_arr = self.float_image
+                log.debug("save_image: skipping float_image.copy() (safe no-copy path)")
+            else:
+                source_arr = self.float_image.copy()
+
+            # Snapshot edits
+            edits_snapshot = self.current_edits.copy()
+
+        # Expensive computation runs WITHOUT the lock
         final_float = self._apply_edits(
-            source_arr, for_export=True
+            source_arr, edits=edits_snapshot, for_export=True
         )  # (H,W,3) float32
+
         if _debug:
             t_edits = time.perf_counter()
 
-        original_path = self.current_filepath
+        original_path = save_target_path if save_target_path else self.current_filepath
         try:
             original_stat = original_path.stat()
         except OSError as e:
             log.warning("Unable to read timestamps for %s: %s", original_path, e)
             original_stat = None
 
-        # 2. Backup
+        # 2. Backup (always backs up original_path, which is Main when save_target_path is set)
         backup_path = create_backup_file(original_path)
         if backup_path is None:
             return None
@@ -1963,9 +2014,9 @@ class ImageEditor:
                 self._write_tiff_16bit(original_path, final_float)
             else:
                 # Check for geometric transforms
-                rotation = self.current_edits.get("rotation", 0)
+                rotation = edits_snapshot.get("rotation", 0)
                 straighten_angle = float(
-                    self.current_edits.get("straighten_angle", 0.0)
+                    edits_snapshot.get("straighten_angle", 0.0)
                 )
                 transforms_applied = (rotation != 0) or (abs(straighten_angle) > 0.001)
 
@@ -2007,9 +2058,9 @@ class ImageEditor:
                     developed_path = original_path.with_name(f"{stem}-developed.jpg")
 
                 # Check for geometric transforms (re-check not strictly needed but for clarity)
-                rotation = self.current_edits.get("rotation", 0)
+                rotation = edits_snapshot.get("rotation", 0)
                 straighten_angle = float(
-                    self.current_edits.get("straighten_angle", 0.0)
+                    edits_snapshot.get("straighten_angle", 0.0)
                 )
                 transforms_applied = (rotation != 0) or (abs(straighten_angle) > 0.001)
 
@@ -2061,12 +2112,17 @@ class ImageEditor:
             log.exception("Failed to save %s: %s", self.current_filepath, e)
             raise RuntimeError("Save failed: %s" % str(e)) from e
 
-    def save_image_uint8_levels(self) -> Optional[Tuple[Path, Path]]:
+    def save_image_uint8_levels(
+        self, save_target_path: Optional[Path] = None,
+    ) -> Optional[Tuple[Path, Path]]:
         """Fast-path save using a uint8 LUT for levels-only edits.
 
         Instead of float_convert -> _apply_edits -> uint8, builds a 256-entry
         lookup table from the blacks/whites levels formula and applies it
         directly to the original uint8 PIL image data.
+
+        Args:
+            save_target_path: Optional override for the output path (variant save).
 
         Returns:
             (saved_path, backup_path) on success, None if the fast path is not
@@ -2075,7 +2131,7 @@ class ImageEditor:
         if self.original_image is None or self.current_filepath is None:
             return None
 
-        original_path = self.current_filepath
+        original_path = save_target_path if save_target_path else self.current_filepath
 
         # TIFF needs 16-bit pipeline
         if original_path.suffix.lower() in (".tif", ".tiff"):

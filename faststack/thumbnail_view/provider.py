@@ -43,6 +43,7 @@ class ThumbnailProvider(QQuickImageProvider):
         prefetcher: "ThumbnailPrefetcher",
         path_resolver: callable = None,
         default_size: int = 200,
+        debug_timing: bool = False,
     ):
         """Initialize the provider.
 
@@ -51,17 +52,25 @@ class ThumbnailProvider(QQuickImageProvider):
             prefetcher: Prefetcher to schedule decodes
             path_resolver: Function to resolve path_hash to actual Path
             default_size: Default thumbnail size
+            debug_timing: Enable [THUMB-TIMING] log lines
         """
         super().__init__(QQuickImageProvider.ImageType.Pixmap)
         self._cache = cache
         self._prefetcher = prefetcher
         self._path_resolver = path_resolver
         self._default_size = default_size
+        self._debug_timing = debug_timing
 
         # Pre-create placeholder pixmaps
         self._placeholder = self._create_placeholder(default_size, PLACEHOLDER_COLOR)
         self._folder_placeholder = self._create_folder_placeholder(default_size)
         self._error_placeholder = self._create_placeholder(default_size, ERROR_COLOR)
+
+        # Timing stats for requestPixmap
+        self._first_request_time: Optional[float] = None
+        self._request_count = 0
+        self._first_second_logged = False
+        self._first_hit_logged = False
 
         log.debug("ThumbnailProvider initialized with default size %d", default_size)
 
@@ -125,6 +134,21 @@ class ThumbnailProvider(QQuickImageProvider):
         # Format: {size}/{path_hash}/{mtime_ns}?r={rev}
         # Or: folder/{path_hash}/{mtime_ns}?r={rev}
 
+        # Timing: track first call and request rate
+        if self._debug_timing:
+            now = time.perf_counter()
+            if self._first_request_time is None:
+                self._first_request_time = now
+                log.info("[THUMB-TIMING] ThumbnailProvider.requestPixmap first call at %.3fs", now)
+            self._request_count += 1
+            elapsed = now - self._first_request_time
+            if not self._first_second_logged and elapsed >= 1.0:
+                self._first_second_logged = True
+                log.info(
+                    "[THUMB-TIMING] ThumbnailProvider: %d requests in first %.1fs (%.0f req/s)",
+                    self._request_count, elapsed, self._request_count / elapsed,
+                )
+
         # Strip query params
         id_clean = id_str.split("?")[0]
         parts = id_clean.split("/")
@@ -163,6 +187,12 @@ class ThumbnailProvider(QQuickImageProvider):
             # Decode JPEG bytes to pixmap
             pixmap = self._bytes_to_pixmap(cached_bytes)
             if pixmap and not pixmap.isNull():
+                if self._debug_timing and not self._first_hit_logged:
+                    self._first_hit_logged = True
+                    log.info(
+                        "[THUMB-TIMING] first thumbnail delivered to UI at %.3fs (req #%d)",
+                        time.perf_counter(), self._request_count,
+                    )
                 return pixmap
 
         # Not in cache - schedule decode if we can resolve the path

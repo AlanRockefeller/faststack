@@ -5,8 +5,10 @@ prompt.md
 WARP.md
 ARCHITECTURE.md
 AGENTS.md
+ANTIGRAVITY_RULES.md
 .claude/
 .agent/
+tools/
 
 # We don't have any good docs yet
 docs/
@@ -70,6 +72,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+pyrightconfig.json
 
 # ----------------------------
 # Local scratch / test / debug outputs (anywhere)
@@ -84,6 +87,7 @@ test_report*.log
 test_results.txt
 smoke_test_output.txt
 verify_result.txt
+*test_output.txt
 
 **/*fail*.txt
 **/*final*.txt

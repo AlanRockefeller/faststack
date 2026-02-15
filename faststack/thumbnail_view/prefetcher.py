@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock
@@ -70,6 +71,7 @@ class ThumbnailPrefetcher:
         on_ready_callback: Optional[Callable[[str], None]] = None,
         max_workers: int = None,
         target_size: int = 200,
+        debug_timing: bool = False,
     ):
         """Initialize the prefetcher.
 
@@ -78,6 +80,7 @@ class ThumbnailPrefetcher:
             on_ready_callback: Called with thumbnail_id when decode completes
             max_workers: Number of worker threads (default: min(4, cpu_count//2))
             target_size: Target thumbnail size in pixels
+            debug_timing: Enable [THUMB-TIMING] log lines
         """
         if max_workers is None:
             max_workers = min(4, max(1, (os.cpu_count() or 4) // 2))
@@ -108,6 +111,10 @@ class ThumbnailPrefetcher:
                     self._ready_emitter.ready.connect(self._on_ready, Qt.QueuedConnection)
             except Exception:
                 self._ready_emitter = None
+
+        # Timing stats
+        self._debug_timing = debug_timing
+        self._submit_count = 0
 
         log.info(
             "ThumbnailPrefetcher initialized with %d workers, target size %dpx",
@@ -158,6 +165,14 @@ class ThumbnailPrefetcher:
 
         # Submit decode job
         try:
+            self._submit_count += 1
+            if self._debug_timing:
+                queue_depth = len(self._inflight)
+                log.debug(
+                    "[THUMB-TIMING] submit #%d path=%s prio=%d queue_depth=%d",
+                    self._submit_count, path.name, priority, queue_depth,
+                )
+
             future = self._executor.submit(
                 self._decode_worker,
                 path,
@@ -205,6 +220,10 @@ class ThumbnailPrefetcher:
 
         Returns JPEG bytes or None on error.
         """
+        _timing = self._debug_timing
+        if _timing:
+            t0 = time.perf_counter()
+            log.debug("[THUMB-TIMING] worker START %s", path.name)
         try:
             # Read and decode
             rgb_array = self._decode_image(path, size)
@@ -223,7 +242,14 @@ class ThumbnailPrefetcher:
 
             buf = io.BytesIO()
             pil_image.save(buf, format="JPEG", quality=85)
-            return buf.getvalue()
+            result = buf.getvalue()
+            if _timing:
+                dt = time.perf_counter() - t0
+                log.debug(
+                    "[THUMB-TIMING] worker END %s %.1fms (%d bytes)",
+                    path.name, dt * 1000, len(result),
+                )
+            return result
 
         except Exception as e:
             log.debug("Failed to decode thumbnail for %s: %s", path, e)

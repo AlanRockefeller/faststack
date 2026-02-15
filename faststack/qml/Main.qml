@@ -965,6 +965,51 @@ ApplicationWindow {
                     font.pixelSize: 16
                 }
             }
+            // Variant badges (loupe view only, when multiple variants exist)
+            Row {
+                spacing: 4
+                visible: uiState && !uiState.isGridViewActive && uiState.variantBadges.length > 1
+
+                Repeater {
+                    model: uiState ? uiState.variantBadges : []
+
+                    delegate: Rectangle {
+                        width: badgeLabel.implicitWidth + 12
+                        height: 22
+                        radius: 3
+                        color: modelData.active ? "white" : "#555"
+                        border.color: modelData.active ? "#333" : "transparent"
+                        border.width: modelData.active ? 1 : 0
+
+                        Text {
+                            id: badgeLabel
+                            anchors.centerIn: parent
+                            text: modelData.label
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: modelData.active ? "black" : "white"
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (uiState) uiState.setVariantOverride(modelData.path)
+                            }
+                        }
+                    }
+                }
+
+                Label {
+                    text: uiState ? uiState.variantSaveHint : ""
+                    color: root.isDarkTheme ? "#aaa" : "#666"
+                    font.pixelSize: 11
+                    font.italic: true
+                    visible: text !== ""
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+            }
+
             Rectangle {
                 Layout.fillWidth: true
                 color: "transparent"

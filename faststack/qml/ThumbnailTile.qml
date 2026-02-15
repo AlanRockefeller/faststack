@@ -23,6 +23,8 @@ Item {
     property bool tileIsSelected: false
     property bool tileIsParentFolder: false
     property bool tileHasCursor: false  // Keyboard cursor position
+    property bool tileHasBackups: false
+    property bool tileHasDeveloped: false
 
     // Theme property (bound by parent)
     property bool isDarkTheme: false
@@ -245,6 +247,27 @@ Item {
                         font.bold: true
                         color: "white"
                     }
+                }
+            }
+
+            // Variant badges row (top-right corner of thumbnail)
+            Row {
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: 4
+                spacing: 2
+                visible: !tile.tileIsFolder
+                layoutDirection: Qt.RightToLeft
+
+                Rectangle {
+                    visible: tile.tileHasBackups
+                    width: 18; height: 18; radius: 3; color: "#9C27B0"
+                    Text { anchors.centerIn: parent; text: "Bk"; font.pixelSize: 9; font.bold: true; color: "white" }
+                }
+                Rectangle {
+                    visible: tile.tileHasDeveloped
+                    width: 18; height: 18; radius: 3; color: "#009688"
+                    Text { anchors.centerIn: parent; text: "D"; font.pixelSize: 11; font.bold: true; color: "white" }
                 }
             }
 
@@ -474,6 +497,11 @@ Item {
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
         }
+    }
+
+    Component.onCompleted: {
+        if (tile.tileIndex === 0 && uiState && uiState.debugThumbTiming)
+            console.log("[THUMB-TIMING] first delegate created (index 0) t=" + Date.now() + "ms")
     }
 
     // Mouse area for interactions

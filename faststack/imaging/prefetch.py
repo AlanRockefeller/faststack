@@ -117,9 +117,7 @@ def get_monitor_profile() -> Optional[ImageCms.ImageCmsProfile]:
         return _monitor_profile_cache[monitor_icc_path]
 
 
-# apply_orientation_to_np imported from orientation.py
-
-_EXIF_ORIENTATION_TAG = 274  # Exif "Orientation"
+# apply_orientation_to_np and apply_exif_orientation imported from orientation.py
 
 
 
@@ -207,9 +205,10 @@ class Prefetcher:
         self._direction_bias: float = 0.85  # 85% of radius in travel direction
 
     def set_image_files(self, image_files: List[ImageFile]):
-        if self.image_files != image_files:
-            self.image_files = image_files
-            self.cancel_all()
+        with self._futures_lock:
+            if self.image_files != image_files:
+                self.image_files = image_files
+                self._cancel_all_locked()
 
     def update_prefetch(
         self,
@@ -268,49 +267,58 @@ class Prefetcher:
             ahead = max(1, int(effective_radius * (1 - self._direction_bias)))
             behind = effective_radius - ahead + 1
 
-        start = max(0, current_index - behind)
-        end = min(len(self.image_files), current_index + ahead + 1)
+        # Invariant: All reads/writes of self.futures, self._scheduled, self.generation,
+        # and self.image_files that participate in scheduling or cancellation MUST
+        # happen under _futures_lock.
 
-        log.debug(
-            "Prefetch range: [%d, %d) for index %d (direction=%d, behind=%d, ahead=%d)",
-            start,
-            end,
-            current_index,
-            self._last_navigation_direction,
-            behind,
-            ahead,
-        )
-
-        # Cancel stale futures and remove from scheduled
-        tasks_submitted = 0
+        # Snapshoting and range computation inside lock
         with self._futures_lock:
-            # Clean up old generation entries to prevent memory leak
-            old_generations = [g for g in self._scheduled if g < self.generation]
-            for g in old_generations:
-                del self._scheduled[g]
+            n = len(self.image_files)
+            if n == 0:
+                return
+            # Ensure current_index is clamped
+            safe_current = max(0, min(n - 1, current_index))
 
-            # Get scheduled set for current generation (inside lock)
+            start = max(0, safe_current - behind)
+            end = min(n, safe_current + ahead + 1)
+
+            log.debug(
+                "Prefetch range: [%d, %d) for index %d (direction=%d, behind=%d, ahead=%d)",
+                start,
+                end,
+                safe_current,
+                self._last_navigation_direction,
+                behind,
+                ahead,
+            )
+
+            # Build priority order: current first, then in direction of travel
+            priority_order = [safe_current]
+            if self._last_navigation_direction > 0:
+                priority_order.extend(range(safe_current + 1, end))
+                priority_order.extend(range(safe_current - 1, start - 1, -1))
+            else:
+                priority_order.extend(range(safe_current - 1, start - 1, -1))
+                priority_order.extend(range(safe_current + 1, end))
+
+            # Cancel stale futures and remove from scheduled
+            tasks_submitted = 0
+            # Clean up old generation entries to prevent memory leak
+            old_generations = [g for g in list(self._scheduled.keys()) if g < self.generation]
+            for g in old_generations:
+                self._scheduled.pop(g, None)
+
+            # Get scheduled set for current generation
             scheduled = self._scheduled.setdefault(self.generation, set())
-            stale_keys = []
+            
             for index, future in list(self.futures.items()):
                 if index < start or index >= end:
                     if future.cancel():
-                        stale_keys.append(index)
+                        self.futures.pop(index, None)
                         scheduled.discard(index)
-            for key in stale_keys:
-                del self.futures[key]
-
-            # Build priority order: current first, then in direction of travel
-            priority_order = [current_index]
-            if self._last_navigation_direction > 0:
-                priority_order.extend(range(current_index + 1, end))
-                priority_order.extend(range(current_index - 1, start - 1, -1))
-            else:
-                priority_order.extend(range(current_index - 1, start - 1, -1))
-                priority_order.extend(range(current_index + 1, end))
 
             for i in priority_order:
-                if i < 0 or i >= len(self.image_files):
+                if i < 0 or i >= n:
                     continue
                 if i not in scheduled and i not in self.futures:
                     self.submit_task(i, self.generation)
@@ -346,7 +354,7 @@ class Prefetcher:
 
                     if not future.done() and future.cancel():
                         cancelled_count += 1
-                        del self.futures[task_index]
+                        self.futures.pop(task_index, None)
                 if cancelled_count > 0:
                     log.debug(
                         "Cancelled %d pending prefetch tasks to prioritize index %d",
@@ -385,7 +393,7 @@ class Prefetcher:
         if generation != self.generation or self._stop_event.is_set():
             return None
 
-        exif_obj = None
+
 
         try:
             if os.path.getsize(image_file.path) == 0:
@@ -401,8 +409,8 @@ class Prefetcher:
 
             buffer = None
             icc_bytes = None
-            exif_obj = None
 
+            orientation = 1
             if color_mode == "icc":
                 monitor_profile = get_monitor_profile()
                 monitor_icc_path = config.get("color", "monitor_icc_path", fallback="").strip()
@@ -423,11 +431,11 @@ class Prefetcher:
                                     
                                     if buffer is not None:
                                         try:
+                                            # Seek to beginning of mmapped file for PIL
                                             mmapped.seek(0)
                                             with PILImage.open(mmapped) as pil_img:
                                                 icc_bytes = pil_img.info.get("icc_profile")
-                                                if exif_obj is None:
-                                                    exif_obj = pil_img.getexif()
+                                                orientation = pil_img.getexif().get(274, 1)
                                         except Exception:
                                             pass
                         except Exception as e:
@@ -437,6 +445,7 @@ class Prefetcher:
                     if buffer is None:
                         try:
                             with PILImage.open(image_file.path) as img:
+                                orientation = img.getexif().get(274, 1)
                                 img = img.convert("RGB")
                                 if should_resize:
                                     img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
@@ -447,13 +456,13 @@ class Prefetcher:
 
                     img = PILImage.fromarray(buffer)
                     
-                    if icc_bytes is None or exif_obj is None:
+                    if icc_bytes is None:
                         try:
+                            # Try to get ICC if we don't have it yet (but orientation should be set)
                             with PILImage.open(image_file.path) as orig:
-                                if icc_bytes is None:
-                                    icc_bytes = orig.info.get("icc_profile")
-                                if exif_obj is None:
-                                    exif_obj = orig.getexif()
+                                icc_bytes = orig.info.get("icc_profile")
+                                if orientation == 1:
+                                    orientation = orig.getexif().get(274, 1)
                         except Exception as e:
                             log.warning("Failed to read metadata from %s: %s", image_file.path, e)
 
@@ -491,12 +500,12 @@ class Prefetcher:
                                         img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
                                         buffer = np.array(img)
                                 
+                                # Capture orientation if we have a buffer
                                 if buffer is not None:
                                     try:
                                         mmapped.seek(0)
                                         with PILImage.open(mmapped) as pil_img:
-                                            if exif_obj is None:
-                                                exif_obj = pil_img.getexif()
+                                            orientation = pil_img.getexif().get(274, 1)
                                     except Exception:
                                         pass
                     except Exception:
@@ -505,10 +514,7 @@ class Prefetcher:
                 if buffer is None:
                     try:
                         with PILImage.open(image_file.path) as img:
-                            # Optimization: capture EXIF while the file is open
-                            if exif_obj is None:
-                                exif_obj = img.getexif()
-
+                            orientation = img.getexif().get(274, 1)
                             img = img.convert("RGB")
                             if should_resize:
                                 img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
@@ -521,19 +527,15 @@ class Prefetcher:
                 return None
 
             buffer = np.ascontiguousarray(buffer)
-            bytes_per_line = buffer.strides[0]
 
+            # Apply captured orientation
             try:
-                if exif_obj is None:
-                    with PILImage.open(image_file.path) as orig:
-                        exif_obj = orig.getexif()
-                orientation = exif_obj.get(274, 1) if exif_obj else 1
                 if orientation > 1:
                     buffer = apply_orientation_to_np(buffer, orientation)
-                    buffer = np.ascontiguousarray(buffer)
-                    bytes_per_line = buffer.strides[0]
             except Exception as e:
                 log.warning("Failed to apply EXIF orientation: %s", e)
+
+            bytes_per_line = buffer.strides[0]
 
             if color_mode == "saturation":
                 # Safer pattern for custom config wrappers
@@ -569,16 +571,24 @@ class Prefetcher:
             # Only remove if it's the specific future we're tracking
             # (to avoid race if a new task for the same index was submitted)
             if self.futures.get(index) is future:
-                del self.futures[index]
+                self.futures.pop(index, None)
+
+    def _cancel_all_locked(self):
+        """Internal helper to cancel all pending prefetching tasks.
+        Assumes _futures_lock is already held.
+        """
+        self.generation += 1  # Invalidate in-flight tasks
+        # Snapshot values before cancelling
+        all_futures = list(self.futures.values())
+        for future in all_futures:
+            future.cancel()
+        self.futures.clear()
+        self._scheduled.clear()
 
     def cancel_all(self):
         """Cancels all pending prefetching tasks."""
         with self._futures_lock:
-            self.generation += 1  # Invalidate in-flight tasks
-            for index, future in list(self.futures.items()):
-                future.cancel()
-                del self.futures[index]
-            self._scheduled.clear()
+            self._cancel_all_locked()
 
 
     def shutdown(self):

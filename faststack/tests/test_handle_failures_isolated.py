@@ -1,6 +1,6 @@
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 from faststack.deletion_types import DeletionErrorCodes, DeleteResult, DeleteFailure, DeleteJob
 
@@ -22,69 +22,14 @@ class MockController:
     def _key(self, p):
         return str(p) if p else None
 
-    # COPIED LOGIC FROM app.py _handle_delete_failures
-    def _handle_delete_failures(self, result: DeleteResult, job: DeleteJob) -> None:
-        """Handle items that failed to delete. Rollback UI or prompt for perm delete."""
-        if not result.failures:
-            return
+    # Dynamically bind the real method we want to test
+    # This ensures we test the ACTUAL logic in app.py, not a copy
+    from faststack.app import AppController
+    _handle_delete_failures = AppController._handle_delete_failures
 
-        # Identify which UI items failed (map back using paths)
-        # Note: We use the _key() mapping to ensure we match robustly
-        failed_keys = {self._key(f.jpg) for f in result.failures if f.jpg}
-        
-        failed_indices_and_imgs = []
-        for idx, img in job.removed_items:
-            if self._key(img.path) in failed_keys:
-                failed_indices_and_imgs.append((idx, img))
-
-        if not failed_indices_and_imgs:
-            return
-
-        # Check if we should offer permanent delete (recycle bin error)
-        perm_candidates = [] # List of (idx, img)
-        
-        # Helper to find if a specific failure code warrants perm delete
-        recycle_codes = {
-            DeletionErrorCodes.RECYCLE_FAILED.value,
-            DeletionErrorCodes.PERMISSION_DENIED.value,
-            DeletionErrorCodes.TRASH_FULL.value
-        }
-        
-        # Map failure code by key for easy lookup
-        failure_map = {self._key(f.jpg): f for f in result.failures if f.jpg}
-
-        for idx, img in failed_indices_and_imgs:
-             f = failure_map.get(self._key(img.path))
-             if f and f.code in recycle_codes:
-                 perm_candidates.append((idx, img))
-
-        if perm_candidates:
-            # Prompt user for permanent delete
-            
-            # 1. Rollback non-candidates first
-            candidate_keys = {self._key(img.path) for _, img in perm_candidates}
-            to_rollback = [(i, img) for i, img in failed_indices_and_imgs if self._key(img.path) not in candidate_keys]
-            
-            if to_rollback:
-                self._rollback_ui_items(to_rollback, job)
-
-            # 2. Ask user
-            # candidate_imgs = [img for _, img in perm_candidates]
-            
-            # Using global mocks here instead of real imports
-            # confirmed = confirm_permanent_delete(...)
-            
-            # For test purpose, we just assert that we identified candidates correctly
-            pass
-
-        else:
-            # Just rollback everything
-            self._rollback_ui_items(failed_indices_and_imgs, job)
-
-        self._rebuild_path_to_index()
-        self.sync_ui_state()
-
-def test_handle_delete_failures_recycle_codes_isolation():
+@patch("faststack.app.confirm_permanent_delete", return_value=True)
+@patch("faststack.app.confirm_batch_permanent_delete", return_value=True)
+def test_handle_delete_failures_recycle_codes_isolation(mock_confirm, mock_batch_confirm):
     controller = MockController()
     
     # Create failure with RECYCLE_FAILED code

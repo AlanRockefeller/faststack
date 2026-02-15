@@ -60,6 +60,8 @@ Item {
             tileFolderStats: folderStats || null
             tileIsSelected: isSelected || false
             tileIsParentFolder: isParentFolder || false
+            tileHasBackups: hasBackups || false
+            tileHasDeveloped: hasDeveloped || false
             tileHasCursor: index === thumbnailGrid.currentIndex
         }
 
@@ -73,12 +75,12 @@ Item {
         property int prefetchMargin: 2  // rows
 
         onContentYChanged: {
-            prefetchTimer.restart()
+            if (!prefetchTimer.running) prefetchTimer.start()  // Throttle
         }
 
         Timer {
             id: prefetchTimer
-            interval: 100
+            interval: 50
             repeat: false
             onTriggered: {
                 thumbnailGrid.triggerPrefetch()
@@ -86,33 +88,42 @@ Item {
         }
 
         function triggerPrefetch() {
-            if (thumbnailGrid.count === 0) return
+            if (!uiState || thumbnailGrid.count === 0) return
 
-            // Calculate visible range
-            var topIndex = thumbnailGrid.indexAt(thumbnailGrid.contentX, thumbnailGrid.contentY)
-            var bottomIndex = thumbnailGrid.indexAt(
-                thumbnailGrid.contentX + thumbnailGrid.width,
-                thumbnailGrid.contentY + thumbnailGrid.height
-            )
+            var cellW = thumbnailGrid.cellWidth
+            var cellH = thumbnailGrid.cellHeight
+            if (cellW <= 0 || cellH <= 0) return
 
-            if (topIndex < 0) topIndex = 0
-            if (bottomIndex < 0) bottomIndex = thumbnailGrid.count - 1
+            // Calculate columns and visible rows
+            var cols = Math.max(1, Math.floor(thumbnailGrid.width / cellW))
+            var firstRow = Math.max(0, Math.floor(thumbnailGrid.contentY / cellH))
+            var rowsVisible = Math.max(1, Math.ceil(thumbnailGrid.height / cellH))
 
-            // Add margin (with epsilon to handle sub-pixel rounding during resize)
-            var cols = Math.floor((thumbnailGrid.width + 1) / thumbnailGrid.cellWidth)
-            if (cols < 1) cols = 1
-            var marginItems = cols * thumbnailGrid.prefetchMargin
-            topIndex = Math.max(0, topIndex - marginItems)
-            bottomIndex = Math.min(thumbnailGrid.count - 1, bottomIndex + marginItems)
+            // Padding rows for smoother scrolling
+            var padRows = thumbnailGrid.prefetchMargin || 4
+            var startRow = Math.max(0, firstRow - padRows)
+            var endRow = firstRow + rowsVisible + padRows
+
+            // Calculate item indices
+            var topIndex = startRow * cols
+            var bottomIndex = (endRow * cols) - 1
+
+            // Clamp to model boundaries
+            topIndex = Math.max(0, Math.min(topIndex, thumbnailGrid.count - 1))
+            bottomIndex = Math.max(0, Math.min(bottomIndex, thumbnailGrid.count - 1))
+
+            // Determine budget (intended items to prefetch)
+            var maxCount = (rowsVisible + 2 * padRows) * cols
+            maxCount = Math.max(200, Math.min(maxCount, 800))
 
             // Log for debugging
             if (uiState && uiState.debugMode) {
-                console.log("Prefetch range:", topIndex, "-", bottomIndex)
+                console.log("Prefetch range:", topIndex, "-", bottomIndex, "maxCount=" + maxCount + " cols=" + cols)
             }
 
             // Actually trigger prefetch
             if (uiState) {
-                uiState.gridPrefetchRange(topIndex, bottomIndex)
+                uiState.gridPrefetchRange(topIndex, bottomIndex, maxCount)
             }
         }
 
@@ -202,23 +213,18 @@ Item {
         }
     }
 
-    // Focus handling
+    // Focus and layout triggers
+    onWidthChanged: prefetchTimer.restart()
+    onHeightChanged: prefetchTimer.restart()
+
     Component.onCompleted: {
+        if (uiState && uiState.debugThumbTiming)
+            console.log("[THUMB-TIMING] GridView Component.onCompleted t=" + Date.now() + "ms")
         thumbnailGrid.forceActiveFocus()
-        // Trigger initial prefetch after a short delay
-        initialPrefetchTimer.start()
+        // Trigger initial prefetch after geometry stabilizes
+        Qt.callLater(function() { prefetchTimer.restart() })
     }
 
-    Timer {
-        id: initialPrefetchTimer
-        interval: 200
-        repeat: false
-        onTriggered: {
-            if (thumbnailGrid.count > 0) {
-                thumbnailGrid.triggerPrefetch()
-            }
-        }
-    }
 
     Connections {
         target: uiState

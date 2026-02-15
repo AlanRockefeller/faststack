@@ -1,4 +1,3 @@
-
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
@@ -26,11 +25,11 @@ dependencies = [
     "cachetools>=5.0,<6.0",
     "watchdog>=4.0,<5.0",
     "Pillow>=10.0,<11.0",
-    "opencv-python>=4.0,<5.0",
+    # CRITICAL FIX: OpenCV 4.10+ is required for NumPy 2.0 binary compatibility
+    "opencv-python>=4.10.0,<5.0",
 ]
 
 [project.optional-dependencies]
-
 dev = [
     "pytest>=8.0,<9.0",
     "build",
@@ -50,11 +49,13 @@ include = ["faststack*"]
 [tool.setuptools.package-data]
 faststack = ["qml/**/*"]
 
-
 [tool.pytest.ini_options]
+minversion = "8.0"
 testpaths = ["faststack/tests"]
 python_files = ["test_*.py"]
-addopts = "-p no:cacheprovider -p no:doctest --basetemp=./var/pytest-temp"
+
+# FIX: Add import-mode=importlib to fix resolution errors
+addopts = "--import-mode=importlib -p no:cacheprovider -p no:doctest --basetemp=./var/pytest-temp"
+
 norecursedirs = ["var", ".venv", "cache", "faststack.egg-info", "__pycache__"]
 pythonpath = ["."]
-

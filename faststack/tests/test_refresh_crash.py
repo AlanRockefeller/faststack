@@ -16,7 +16,7 @@ def model(tmp_path):
         model.beginResetModel = Mock()
         model.endResetModel = Mock()
         model.selectionChanged = Mock()
-        return model
+        yield model
 
 def test_refresh_no_name_error(model):
     """Verify that refresh() doesn't raise NameError (fix for regression)."""

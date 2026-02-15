@@ -84,9 +84,21 @@ def apply_orientation_to_np(buffer: np.ndarray, orientation: int) -> np.ndarray:
     return result
 
 
-def apply_exif_orientation(
-    buffer: np.ndarray, image_path: Path, exif: Optional[Image.Exif] = None
-) -> np.ndarray:
-    """Helper that reads orientation and applies it to a numpy buffer."""
-    orientation = get_exif_orientation(image_path, exif)
-    return apply_orientation_to_np(buffer, orientation)
+def apply_exif_orientation(rgb: np.ndarray, path: Path) -> np.ndarray:
+    """Read EXIF orientation from path and apply it to the numpy buffer.
+
+    Requirements:
+    - Reads EXIF orientation from path using PIL.
+    - If file missing / cannot read EXIF / no EXIF: return input unchanged (as C-contiguous).
+    - If orientation > 1: call apply_orientation_to_np and ensure contiguity.
+    - No Qt deps.
+    """
+    orientation = get_exif_orientation(path)
+    if orientation <= 1:
+        # Return input unchanged but ensure C-contiguous
+        if not rgb.flags["C_CONTIGUOUS"]:
+            return np.ascontiguousarray(rgb)
+        return rgb
+
+    # apply_orientation_to_np already ensures C-contiguity
+    return apply_orientation_to_np(rgb, orientation)

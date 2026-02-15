@@ -52,7 +52,11 @@ Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 from faststack.config import config
 from faststack.logging_setup import setup_logging
 from faststack.models import ImageFile, DecodedImage
-from faststack.io.indexer import find_images, image_sort_key
+from faststack.io.indexer import find_images, find_images_with_variants, image_sort_key
+from faststack.io.variants import (
+    VariantGroup, build_badge_list, get_group_key_for_path,
+    norm_path,
+)
 from faststack.io.sidecar import SidecarManager
 from faststack.io.watcher import Watcher
 from faststack.io.helicon import launch_helicon_focus
@@ -128,8 +132,9 @@ def make_hdrop(paths):
 
 log = logging.getLogger(__name__)
 
-# Global flag for debug mode - set by main()
+# Global flags for debug modes - set by main()
 _debug_mode = False
+_debug_thumb_timing = False
 
 # Cache Thrashing Detection Constants
 CACHE_THRASH_WINDOW_SECS = 2.0
@@ -171,9 +176,10 @@ class AppController(QObject):
     )  # Signal for async delete completion (result dict from worker)
 
     def __init__(
-        self, image_dir: Path, engine: QQmlApplicationEngine, debug_cache: bool = False
+        self, image_dir: Path, engine: QQmlApplicationEngine, debug_cache: bool = False, debug_thumb_timing: bool = False
     ):
         super().__init__()
+        self.debug_thumb_timing = debug_thumb_timing
         # Histogram Offloading Setup
         self._hist_executor = create_daemon_threadpool_executor(max_workers=1, thread_name_prefix="Histogram")
         self._hist_inflight = False
@@ -211,6 +217,11 @@ class AppController(QObject):
         self._opencv_warning_shown = False  # Only show OpenCV warning once per session
         self._last_auto_levels_msg: str = ""  # Detail message from last auto_levels() call
 
+        # Variant state
+        self._variant_map: Dict[str, VariantGroup] = {}
+        self.view_override_path: Optional[str] = None  # normalized absolute string
+        self.view_override_kind: Optional[str] = None   # "main"|"developed"|"backup"
+
         self.image_dir = image_dir
         self.image_files: List[ImageFile] = []  # Filtered list for display
         self._all_images: List[ImageFile] = []  # Cached full list from disk
@@ -232,6 +243,7 @@ class AppController(QObject):
 
         # Cache Warning State
         self._last_cache_warning_time = 0
+        self._eviction_lock = threading.Lock()
         self._eviction_timestamps = []  # List of eviction timestamps for rate detection
         self.display_ready = False  # Track if display size has been reported
         self.pending_prefetch_index: Optional[int] = None  # Deferred prefetch index
@@ -288,6 +300,7 @@ class AppController(QObject):
             cache=self._thumbnail_cache,
             on_ready_callback=self._on_thumbnail_ready,
             target_size=200,
+            debug_timing=self.debug_thumb_timing,
         )
         self._thumbnail_model = ThumbnailModel(
             base_directory=self.image_dir,
@@ -303,6 +316,7 @@ class AppController(QObject):
             prefetcher=self._thumbnail_prefetcher,
             path_resolver=self._path_resolver.resolve,
             default_size=200,
+            debug_timing=self.debug_thumb_timing,
         )
         # Connect thread-safe thumbnail ready signal to GUI thread handler
         # The callback is invoked from worker threads, so we use a signal to hop to GUI thread
@@ -316,6 +330,7 @@ class AppController(QObject):
         self.ui_state.theme = self.get_theme()
         self.ui_state.debugCache = self.debug_cache
         self.ui_state.debugMode = _debug_mode  # Set debug mode from global
+        self.ui_state.debugThumbTiming = self.debug_thumb_timing
         self.keybinder = Keybinder(self)
         self.ui_state.debugCache = self.debug_cache  # Pass debug_cache state to UI
         self.ui_state.isDecoding = False  # Initialize decoding indicator
@@ -808,7 +823,9 @@ class AppController(QObject):
         # Clear folder stats cache so subfolder counts are fresh
         clear_raw_count_cache()
 
-        self._all_images = find_images(self.image_dir)
+        images, variant_map = find_images_with_variants(self.image_dir)
+        self._all_images = images
+        self._variant_map = variant_map
         self._apply_filter_to_cached_list()
 
         # Refresh thumbnail model if it exists (for external file changes)
@@ -889,6 +906,75 @@ class AppController(QObject):
         )
         return False
 
+    # --- Variant Badge Logic ---
+
+    def get_variant_badges(self) -> list:
+        """Return badge list for the current image's variant group."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return []
+        img = self.image_files[self.current_index]
+        key_cf = get_group_key_for_path(img.path, self._variant_map)
+        if key_cf is None:
+            return []
+        group = self._variant_map[key_cf]
+        if len(group.all_files) <= 1:
+            return []
+        badges = build_badge_list(group)
+
+        # Determine which badge is active
+        if self.view_override_path:
+            active_norm = self.view_override_path
+        else:
+            active_norm = norm_path(img.path)
+
+        # Create a new list with COPIED dicts to avoid mutating the cached result from build_badge_list
+        result_badges = []
+        for badge in badges:
+            b_copy = badge.copy()
+            b_copy["active"] = (badge["path"] == active_norm)
+            result_badges.append(b_copy)
+        return result_badges
+
+    def set_variant_override(self, path_str: str):
+        """Switch loupe view to a different variant file."""
+        norm = norm_path(Path(path_str))
+
+        # If selecting main, clear override
+        if self.image_files and self.current_index < len(self.image_files):
+            main_norm = norm_path(self.image_files[self.current_index].path)
+            if norm == main_norm:
+                self.view_override_path = None
+                self.view_override_kind = None
+            else:
+                self.view_override_path = norm
+                # Determine kind
+                img = self.image_files[self.current_index]
+                key_cf = get_group_key_for_path(img.path, self._variant_map)
+                if key_cf and key_cf in self._variant_map:
+                    group = self._variant_map[key_cf]
+                    if group.developed_path and norm_path(group.developed_path) == norm:
+                        self.view_override_kind = "developed"
+                    else:
+                        self.view_override_kind = "backup"
+                else:
+                    self.view_override_kind = "backup"
+
+        # Bump generation to bust cache, trigger re-render
+        self.ui_refresh_generation += 1
+        if self.ui_state:
+            self.ui_state.variantBadgesChanged.emit()
+            self.ui_state.variantSaveHintChanged.emit()
+            self.ui_state.currentImageSourceChanged.emit()
+
+    def _clear_variant_override(self):
+        """Clear variant override state (called on navigation)."""
+        if self.view_override_path is not None:
+            self.view_override_path = None
+            self.view_override_kind = None
+            if self.ui_state:
+                self.ui_state.variantBadgesChanged.emit()
+                self.ui_state.variantSaveHintChanged.emit()
+
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
         """Retrieves a decoded image, blocking until ready to ensure correct display.
 
@@ -933,7 +1019,15 @@ class AppController(QObject):
                     return self._last_rendered_preview
 
         _, _, display_gen = self.get_display_info()
-        image_path = self.image_files[index].path
+
+        # Variant override: use override path for current index
+        if (
+            self.view_override_path
+            and index == self.current_index
+        ):
+            image_path = Path(self.view_override_path)
+        else:
+            image_path = self.image_files[index].path
         path_str = image_path.as_posix()
         cache_key = build_cache_key(image_path, display_gen)
 
@@ -1150,6 +1244,8 @@ class AppController(QObject):
 
         self.ui_state.highlightStateChanged.emit()
         self.ui_state.metadataChanged.emit()
+        self.ui_state.variantBadgesChanged.emit()
+        self.ui_state.variantSaveHintChanged.emit()
 
         if self.debug_cache:
             _t_end = time.perf_counter()
@@ -1163,7 +1259,34 @@ class AppController(QObject):
             self.ui_state.batchInfoText,
         )
 
+    def get_variant_save_hint(self) -> str:
+        """Returns a string describing the save behavior when viewing a variant."""
+        if self.view_override_path and self._get_save_target_path_for_current_view():
+            return "Saving will restore to main image (backup will be created)."
+        return ""
+
     # --- Image Editor Integration ---
+
+    def _get_save_target_path_for_current_view(self) -> Optional[Path]:
+        """Determine the target path for saving edits based on current view.
+
+        If we are viewing a variant (backup or developed) via override, we want
+        to save changes "as" the main image so that a NEW backup of the main
+        image is created (Policy A).
+        """
+        if not self.view_override_path:
+            return None
+        
+        # Policy Change: When editing a "developed" variant (e.g. from RawTherapee),
+        # we want to save IN-PLACE (overwrite the developed file) rather than 
+        # overwriting the Main source file. This prevents accidental data loss/confusion.
+        # Editing a "backup" still targets the Main file (restore behavior).
+        if self.view_override_kind == "developed":
+            return None
+
+        if self.current_index is not None and 0 <= self.current_index < len(self.image_files):
+            return self.image_files[self.current_index].path
+        return None
 
     @Slot()
     def save_edited_image(self):
@@ -1185,6 +1308,9 @@ class AppController(QObject):
         if write_sidecar and 0 <= self.current_index < len(self.image_files):
             dev_path = self.image_files[self.current_index].developed_jpg_path
 
+        # Determine save_target_path for variant saves
+        save_target_path = self._get_save_target_path_for_current_view()
+        
         # Store save token to prevent "surprise close" if user navigates away during save
         self._save_initiated_path = self.image_editor.current_filepath
 
@@ -1197,7 +1323,9 @@ class AppController(QObject):
             """Worker function that runs in background thread."""
             try:
                 result = self.image_editor.save_image(
-                    write_developed_jpg=write_sidecar, developed_path=dev_path
+                    write_developed_jpg=write_sidecar,
+                    developed_path=dev_path,
+                    save_target_path=save_target_path,
                 )
                 return {"success": True, "result": result}
             except RuntimeError as e:
@@ -1259,6 +1387,10 @@ class AppController(QObject):
             if editor_still_on_same_image:
                 self.image_editor.clear()
 
+            # 2b. Clear variant override (save always targets Main)
+            if editor_still_on_same_image:
+                self._clear_variant_override()
+
             # 3. Refresh List and Handle Selection
             if editor_still_on_same_image:
                 # Full refresh to see new file or updated timestamp
@@ -1284,6 +1416,9 @@ class AppController(QObject):
                 self.prefetcher.cancel_all()
                 self.prefetcher.update_prefetch(self.current_index)
                 self.sync_ui_state()
+                # Refresh variant badges (backup was created)
+                if self.ui_state:
+                    self.ui_state.variantBadgesChanged.emit()
             else:
                 # User navigated away - skip full refresh to preserve their selection
                 # Just clear stale cache entry for the saved image
@@ -1324,6 +1459,9 @@ class AppController(QObject):
             self.editSourceModeChanged.emit(new_mode)
 
         self.current_index = index  # Set index first so signals pick up correct image
+
+        # Clear variant override on navigation
+        self._clear_variant_override()
 
         self._reset_crop_settings()
 
@@ -4453,34 +4591,32 @@ class AppController(QObject):
         clear_raw_count_cache()
         log.info("Emptied recycle bins and cleared delete history")
 
-    def _on_cache_evict(self):
+    def _on_cache_evict(self, key, value):
         """Callback for when the image cache evicts an item."""
         now = time.time()
 
-        # 1. Record eviction timestamp
-        self._eviction_timestamps.append(now)
+        with self._eviction_lock:
+            # 1. Record eviction timestamp / prune
+            self._eviction_timestamps.append(now)
+            cutoff = now - CACHE_THRASH_WINDOW_SECS
+            self._eviction_timestamps = [t for t in self._eviction_timestamps if t > cutoff]
 
-        # 2. Prune timestamps older than window
-        # Keep list short
-        cutoff = now - CACHE_THRASH_WINDOW_SECS
-        self._eviction_timestamps = [t for t in self._eviction_timestamps if t > cutoff]
+            # 2. Check for thrashing (e.g., > threshold evictions in window)
+            if len(self._eviction_timestamps) > CACHE_THRASH_THRESHOLD:
+                # 3. Rate limit the warning
+                if now - self._last_cache_warning_time > CACHE_WARNING_COOLDOWN_SECS:
+                    self._last_cache_warning_time = now
+                    self._has_warned_cache_full = True
 
-        # 3. Check for thrashing (e.g., > threshold evictions in window)
-        if len(self._eviction_timestamps) > CACHE_THRASH_THRESHOLD:
-            # 4. Rate limit the warning
-            if now - self._last_cache_warning_time > CACHE_WARNING_COOLDOWN_SECS:
-                self._last_cache_warning_time = now
-                self._has_warned_cache_full = True
-
-                # Format usage info
-                used_gb = self.image_cache.currsize / (1024**3)
-                max_gb = self.image_cache.max_bytes / (1024**3)
-
-                msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in {CACHE_THRASH_WINDOW_SECS}s. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
-
-                # Use QTimer.singleShot to ensure this runs on the main thread
-                QTimer.singleShot(0, lambda: self.update_status_message(msg))
-                log.warning(msg)
+                    # UI update logic
+                    used_gb = self.image_cache.currsize / (1024**3)
+                    max_gb = self.image_cache.max_bytes / (1024**3)
+                    msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in {CACHE_THRASH_WINDOW_SECS}s. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
+                    
+                    # Schedule UI work safely on main thread
+                    # QTimer.singleShot(0, ...) is thread-safe entry to main loop
+                    QTimer.singleShot(0, lambda: self.update_status_message(msg))
+                    log.warning(msg)
 
     def restore_all_from_recycle_bin(self):
         """Restores all files from tracked recycle bins to their parent folders."""
@@ -4925,7 +5061,11 @@ class AppController(QObject):
         This provides a centralized entry point for loading the editor correctly.
         """
         try:
-            active_path = self.get_active_edit_path(self.current_index)
+            # Use variant override path if active
+            if self.view_override_path:
+                active_path = Path(self.view_override_path)
+            else:
+                active_path = self.get_active_edit_path(self.current_index)
             filepath = str(active_path)
 
             # Fetch cached preview if available for faster initial display
@@ -5943,10 +6083,17 @@ class AppController(QObject):
             return
 
         try:
+            # Determine save_target_path for variant saves (Policy A)
+            save_target_path = self._get_save_target_path_for_current_view()
+
             # Try uint8 fast path first, fall back to regular save
-            save_result = self.image_editor.save_image_uint8_levels()
+            save_result = self.image_editor.save_image_uint8_levels(
+                save_target_path=save_target_path
+            )
             if save_result is None:
-                save_result = self.image_editor.save_image()
+                save_result = self.image_editor.save_image(
+                    save_target_path=save_target_path
+                )
         except RuntimeError as e:
             log.warning(f"quick_auto_levels: Save failed: {e}")
             self.update_status_message(f"Failed to save image: {e}")
@@ -6038,9 +6185,14 @@ class AppController(QObject):
                 return False
 
             try:
-                save_result = self.image_editor.save_image_uint8_levels()
+                save_target_path = self._get_save_target_path_for_current_view()
+                save_result = self.image_editor.save_image_uint8_levels(
+                    save_target_path=save_target_path
+                )
                 if save_result is None:
-                    save_result = self.image_editor.save_image()
+                    save_result = self.image_editor.save_image(
+                        save_target_path=save_target_path
+                    )
             except Exception as e:
                 log.warning("batch auto levels: save failed for %s: %s", filepath, e)
                 return False
@@ -6601,10 +6753,11 @@ class AppController(QObject):
         clear_raw_count_cache()
 
 
-def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False):
+def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False, debug_thumb_timing: bool = False):
     """FastStack Application Entry Point"""
-    global _debug_mode
+    global _debug_mode, _debug_thumb_timing
     _debug_mode = debug
+    _debug_thumb_timing = debug_thumb_timing
 
     t0 = time.perf_counter()
     setup_logging(debug)
@@ -6671,7 +6824,7 @@ def main(image_dir: str = "", debug: bool = False, debug_cache: bool = False):
         os.path.join(os.path.dirname(PySide6.__file__), "qml", "Qt5Compat")
     )
 
-    controller = AppController(image_dir_path, engine, debug_cache=debug_cache)
+    controller = AppController(image_dir_path, engine, debug_cache=debug_cache, debug_thumb_timing=debug_thumb_timing)
     if debug:
         log.info("Startup: after AppController: %.3fs", time.perf_counter() - t0)
     image_provider = ImageProvider(controller)
@@ -6784,8 +6937,20 @@ def cli():
     parser.add_argument(
         "--debugcache", action="store_true", help="Enable debug cache features"
     )
+    parser.add_argument(
+        "--debug-thumbtiming",
+        action="store_true",
+        help="Enable thumbnail pipeline timing logs (implies --debug)",
+    )
     args = parser.parse_args()
-    main(image_dir=args.image_dir, debug=args.debug, debug_cache=args.debugcache)
+    if args.debug_thumbtiming:
+        args.debug = True
+    main(
+        image_dir=args.image_dir,
+        debug=args.debug,
+        debug_cache=args.debugcache,
+        debug_thumb_timing=args.debug_thumbtiming,
+    )
 
 
 if __name__ == "__main__":

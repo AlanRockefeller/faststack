@@ -16,8 +16,6 @@ class ReproFuturesCleanup(unittest.TestCase):
         mock_cache_put = MagicMock()
         mock_get_display_info = MagicMock(return_value=(100, 100, 1))
         image_files = [MagicMock(path=Path(f"test_{i}.jpg")) for i in range(10)]
-        for img in image_files:
-            img.path.suffix = ".jpg"
 
         prefetcher = Prefetcher(
             image_files=image_files,

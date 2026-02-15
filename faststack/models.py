@@ -16,6 +16,8 @@ class ImageFile:
     # is the *base* image's name (so the pair sorts adjacently); for everything
     # else it defaults to None which means "use path.name.casefold()".
     sort_name_cf: Optional[str] = None
+    has_backups: bool = False
+    has_developed: bool = False
 
     @property
     def raw_path(self) -> Optional[Path]:

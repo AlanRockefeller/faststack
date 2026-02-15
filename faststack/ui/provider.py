@@ -225,6 +225,7 @@ class UIState(QObject):
     cacheStatsChanged = Signal(str)
     isDecodingChanged = Signal(bool)
     debugModeChanged = Signal(bool)  # General debug mode signal
+    debugThumbTimingChanged = Signal(bool)  # Thumbnail pipeline timing
     isDialogOpenChanged = Signal(bool)  # New signal for dialog state
     editSourceModeChanged = Signal(str)  # Notify when JPEG/RAW mode changes
     saveBehaviorMessageChanged = Signal()  # Signal for save behavior message updates
@@ -232,10 +233,17 @@ class UIState(QObject):
     batchAutoLevelsProgressChanged = Signal()
     batchAutoLevelsActiveChanged = Signal()
 
-    def __init__(self, app_controller):
+    # Variant badges
+    variantBadgesChanged = Signal()
+    variantSaveHintChanged = Signal()
+
+    def __init__(self, app_controller, clock_func=None):
         super().__init__()
         self.app_controller = app_controller
         self._app_controller = app_controller  # Backward compatibility alias
+        self._clock = clock_func or (lambda: __import__("time").monotonic())
+        self._last_prefetch_data = None  # (startIndex, endIndex, maxCount)
+        self._last_prefetch_time = 0
         self._is_preloading = False
         self._preload_progress = 0
         # 1 = light, 0 = dark (controller will overwrite this on startup)
@@ -282,6 +290,7 @@ class UIState(QObject):
         self._is_decoding = False
         self._is_dialog_open = False
         self._is_saving = False  # Save operation in progress
+        self._debug_thumb_timing = False
         self._batch_al_current = 0
         self._batch_al_total = 0
         self._batch_al_active = False
@@ -540,6 +549,11 @@ class UIState(QObject):
         if self._status_message != value:
             self._status_message = value
             self.statusMessageChanged.emit()
+
+    @Property(str, notify=variantSaveHintChanged)
+    def variantSaveHint(self):
+        """Returns a hint message when saving from a variant."""
+        return self.app_controller.get_variant_save_hint()
 
     @Property(str, notify=filterStringChanged)
     def filterString(self):
@@ -1291,7 +1305,38 @@ class UIState(QObject):
             self._debug_mode = value
             self.debugModeChanged.emit(value)
 
+    @Property(bool, notify=debugThumbTimingChanged)
+    def debugThumbTiming(self) -> bool:
+        return self._debug_thumb_timing
+
+    @debugThumbTiming.setter
+    def debugThumbTiming(self, value: bool):
+        if self._debug_thumb_timing != value:
+            self._debug_thumb_timing = value
+            self.debugThumbTimingChanged.emit(value)
+
     # --- RAW / Editor Source Logic ---
+
+    # --- Variant Badge Properties ---
+
+    @Property(list, notify=variantBadgesChanged)
+    def variantBadges(self) -> list:
+        """Returns the badge list for the current image's variant group."""
+        if hasattr(self.app_controller, "get_variant_badges"):
+            return self.app_controller.get_variant_badges()
+        return []
+
+    @Property(str, notify=variantBadgesChanged)
+    def activeVariantKind(self) -> str:
+        """Returns 'main', 'developed', 'backup', or '' for current view."""
+        kind = getattr(self.app_controller, "view_override_kind", None)
+        return kind if kind else "main"
+
+    @Slot(str)
+    def setVariantOverride(self, path_str: str):
+        """Switch loupe view to a different variant file."""
+        if hasattr(self.app_controller, "set_variant_override"):
+            self.app_controller.set_variant_override(path_str)
 
     # --- Grid View Properties ---
 
@@ -1430,9 +1475,9 @@ class UIState(QObject):
         if hasattr(self.app_controller, "grid_delete_at_cursor"):
             self.app_controller.grid_delete_at_cursor(cursorIndex)
 
-    @Slot(int, int)
-    def gridPrefetchRange(self, startIndex: int, endIndex: int):
-        """Prefetch thumbnails for the given index range."""
+    @Slot(int, int, int)
+    def gridPrefetchRange(self, startIndex: int, endIndex: int, maxCount: int = 800):
+        """Prefetch thumbnails for the given index range with budget and duplicate suppression."""
         if (
             not hasattr(self.app_controller, "_thumbnail_model")
             or not self.app_controller._thumbnail_model
@@ -1447,16 +1492,43 @@ class UIState(QObject):
         model = self.app_controller._thumbnail_model
         prefetcher = self.app_controller._thumbnail_prefetcher
 
-        # Clamp indices
-        startIndex = max(0, startIndex)
-        endIndex = min(model.rowCount() - 1, endIndex)
+        # 1. Index Validation
+        rowCount = model.rowCount()
+        if rowCount <= 0:
+            return
+
+        # Clamp indices to valid boundaries
+        startIndex = max(0, min(startIndex, rowCount - 1))
+        endIndex = max(0, min(endIndex, rowCount - 1))
+
+        if startIndex > endIndex:
+            return
+
+        # 2. Duplicate Suppression
+        now = self._clock()
+        current_req = (startIndex, endIndex, maxCount)
+        if current_req == self._last_prefetch_data and (now - self._last_prefetch_time) < 0.030:
+            return
+
+        self._last_prefetch_data = current_req
+        self._last_prefetch_time = now
+
+        # 3. Budgeting / Hard Cap
+        HARD_LIMIT = 800
+        budget = max(1, min(maxCount, HARD_LIMIT))
+        
+        # Trim endIndex if the requested range exceeds the budget
+        if (endIndex - startIndex + 1) > budget:
+            endIndex = startIndex + budget - 1
 
         # Submit prefetch jobs for visible range
+        # Defensive fallback if thumbnail_size is refactored away
+        size = getattr(model, "thumbnail_size", None) or getattr(prefetcher, "_target_size", None)
         for i in range(startIndex, endIndex + 1):
             entry = model.get_entry(i)
             if entry and not entry.is_folder:
                 prefetcher.submit(
-                    entry.path, entry.mtime_ns, priority=prefetcher.PRIO_MED
+                    entry.path, entry.mtime_ns, size=size, priority=prefetcher.PRIO_MED
                 )
 
     @Property(str, notify=recycleBinStatsTextChanged)

@@ -6,11 +6,20 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # Minimal Qt imports needed for the model
-from PySide6.QtCore import Qt, QModelIndex
+from PySide6.QtCore import Qt, QModelIndex, QCoreApplication
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """Ensure a QCoreApplication exists for the test session."""
+    app = QCoreApplication.instance()
+    if app is None:
+        app = QCoreApplication([])
+    yield app
 
 
 @pytest.fixture
-def thumbnail_model():
+def thumbnail_model(qapp):
     """Create a ThumbnailModel with fake entries for testing."""
     from faststack.thumbnail_view.model import ThumbnailModel, ThumbnailEntry
 
