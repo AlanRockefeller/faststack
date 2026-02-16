@@ -189,6 +189,7 @@ class Prefetcher:
         )
         self._futures_lock = threading.RLock()
         self.futures: Dict[int, Future] = {}
+        self.future_paths: Dict[int, Path] = {}
         self.generation = 0
         self._scheduled: Dict[int, set] = {}  # generation -> set of scheduled indices
 
@@ -330,19 +331,36 @@ class Prefetcher:
             print(f"[DBGCACHE] {_t_end*1000:.3f} update_prefetch: DONE submitted={tasks_submitted} total={(_t_end - _t_start)*1000:.2f}ms")
 
     def submit_task(
-        self, index: int, generation: int, priority: bool = False
+        self, index: int, generation: int, priority: bool = False, override_path: Optional[Path] = None
     ) -> Optional[Future]:
         """Submits a decoding task for a given index."""
         if self._stop_event.is_set():
             return None
 
+        # Capture list snapshot and check bounds before accessing path
+        image_files = self.image_files
+        if index < 0 or index >= len(image_files):
+            return None
+
+        requested_path = override_path if override_path is not None else image_files[index].path
+
         if self.debug and priority:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} submit_task: PRIORITY index={index} gen={generation}")
+            print(f"[DBGCACHE] {_t_start*1000:.3f} submit_task: PRIORITY index={index} gen={generation} override={override_path}")
 
         with self._futures_lock:
+            # We track by index. If we already have a job for this index, 
+            # we must cancel it if the requested path is different 
+            # (e.g. switching between main and variants).
             if index in self.futures and not self.futures[index].done():
-                return self.futures[index]
+                current_path = self.future_paths.get(index)
+                if current_path != requested_path:
+                    # Force cancel the old one to switch paths
+                    self.futures[index].cancel()
+                    self.futures.pop(index, None)
+                    self.future_paths.pop(index, None)
+                else:
+                    return self.futures[index]
 
             if priority:
                 cancelled_count = 0
@@ -373,8 +391,10 @@ class Prefetcher:
                 display_width,
                 display_height,
                 display_generation,
+                override_path,
             )
             self.futures[index] = future
+            self.future_paths[index] = requested_path
             future.add_done_callback(lambda f, idx=index: self._cleanup_future(idx, f))
             return future
 
@@ -388,16 +408,18 @@ class Prefetcher:
         display_width: int,
         display_height: int,
         display_generation: int,
+        override_path: Optional[Path] = None,
     ) -> Optional[tuple[Path, int]]:
         """The actual work done by the thread pool."""
         if generation != self.generation or self._stop_event.is_set():
             return None
 
-
+        # Use override path if provided, otherwise default to image_file.path
+        target_path = override_path if override_path is not None else image_file.path
 
         try:
-            if os.path.getsize(image_file.path) == 0:
-                log.warning("Skipping empty image file: %s", image_file.path)
+            if os.path.getsize(target_path) == 0:
+                log.warning("Skipping empty image file: %s", target_path)
                 return None
 
             color_mode = config.get("color", "mode", fallback="none").lower()
@@ -405,7 +427,7 @@ class Prefetcher:
             fast_dct = optimize_for == "speed"
             use_resized = optimize_for == "speed"
             should_resize = display_width > 0 and display_height > 0
-            is_jpeg = image_file.path.suffix.lower() in {".jpg", ".jpeg", ".jpe"}
+            is_jpeg = target_path.suffix.lower() in {".jpg", ".jpeg", ".jpe"}
 
             buffer = None
             icc_bytes = None
@@ -418,7 +440,7 @@ class Prefetcher:
                 if monitor_profile is not None:
                     if is_jpeg:
                         try:
-                            with open(image_file.path, "rb") as f:
+                            with open(target_path, "rb") as f:
                                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                                     if use_resized and should_resize:
                                         buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
@@ -439,19 +461,19 @@ class Prefetcher:
                                         except Exception:
                                             pass
                         except Exception as e:
-                            log.warning("Decode failed (ICC path) index=%d path=%s: %s", index, image_file.path, e)
+                            log.warning("Decode failed (ICC path) index=%d path=%s: %s", index, target_path, e)
                             buffer = None
 
                     if buffer is None:
                         try:
-                            with PILImage.open(image_file.path) as img:
+                            with PILImage.open(target_path) as img:
                                 orientation = img.getexif().get(274, 1)
                                 img = img.convert("RGB")
                                 if should_resize:
                                     img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
                                 buffer = np.array(img)
                         except Exception as e:
-                            log.warning("Decode failed (ICC fallback) index=%d path=%s: %s", index, image_file.path, e)
+                            log.warning("Decode failed (ICC fallback) index=%d path=%s: %s", index, target_path, e)
                             return None
 
                     img = PILImage.fromarray(buffer)
@@ -459,12 +481,12 @@ class Prefetcher:
                     if icc_bytes is None:
                         try:
                             # Try to get ICC if we don't have it yet (but orientation should be set)
-                            with PILImage.open(image_file.path) as orig:
+                            with PILImage.open(target_path) as orig:
                                 icc_bytes = orig.info.get("icc_profile")
                                 if orientation == 1:
                                     orientation = orig.getexif().get(274, 1)
                         except Exception as e:
-                            log.warning("Failed to read metadata from %s: %s", image_file.path, e)
+                            log.warning("Failed to read metadata from %s: %s", target_path, e)
 
                     src_profile = None
                     src_profile_key = None
@@ -489,7 +511,7 @@ class Prefetcher:
             if buffer is None:
                 if is_jpeg:
                     try:
-                        with open(image_file.path, "rb") as f:
+                        with open(target_path, "rb") as f:
                             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
                                 if use_resized and should_resize:
                                     buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
@@ -513,14 +535,14 @@ class Prefetcher:
 
                 if buffer is None:
                     try:
-                        with PILImage.open(image_file.path) as img:
+                        with PILImage.open(target_path) as img:
                             orientation = img.getexif().get(274, 1)
                             img = img.convert("RGB")
                             if should_resize:
                                 img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
                             buffer = np.array(img)
                     except Exception as e:
-                        log.warning("Decode failed index=%d path=%s: %s", index, image_file.path, e)
+                        log.warning("Decode failed index=%d path=%s: %s", index, target_path, e)
                         return None
 
             if buffer is None:
@@ -556,9 +578,9 @@ class Prefetcher:
             if generation != self.generation or self._stop_event.is_set():
                 return None
 
-            cache_key = build_cache_key(image_file.path, display_generation)
+            cache_key = build_cache_key(target_path, display_generation)
             self.cache_put(cache_key, decoded)
-            return (image_file.path, display_generation)
+            return (target_path, display_generation)
 
         except Exception as e:
             # Downgraded from ERROR to prevent log noise on bad files
@@ -572,6 +594,7 @@ class Prefetcher:
             # (to avoid race if a new task for the same index was submitted)
             if self.futures.get(index) is future:
                 self.futures.pop(index, None)
+                self.future_paths.pop(index, None)
 
     def _cancel_all_locked(self):
         """Internal helper to cancel all pending prefetching tasks.
@@ -583,6 +606,7 @@ class Prefetcher:
         for future in all_futures:
             future.cancel()
         self.futures.clear()
+        self.future_paths.clear()
         self._scheduled.clear()
 
     def cancel_all(self):

@@ -764,7 +764,7 @@ class AppController(QObject):
         return super().eventFilter(watched, event)
 
     def _do_prefetch(
-        self, index: int, is_navigation: bool = False, direction: Optional[int] = None
+        self, index: int, is_navigation: bool = False, direction: Optional[int] = None, override_path: Optional[Path] = None
     ):
         """Helper to defer prefetch until display size is stable.
 
@@ -772,6 +772,7 @@ class AppController(QObject):
             index: The index to prefetch around
             is_navigation: True if called from user navigation (arrow keys, etc.)
             direction: 1 for forward, -1 for backward, None to use last direction
+            override_path: Optional explicit path to decode for the current index.
         """
         if not self._loupe_decode_allowed():
             return
@@ -786,6 +787,17 @@ class AppController(QObject):
             log.debug("Display not ready, deferring prefetch for index %d", index)
             self.pending_prefetch_index = index
             return
+
+        # If override_path is provided, it's a priority request for the current image
+        if override_path is not None:
+            self.prefetcher.submit_task(
+                index,
+                self.prefetcher.generation,
+                priority=True,
+                override_path=override_path,
+            )
+            return  # Skip adjacent prefetch when viewing a variant override
+
         self.prefetcher.update_prefetch(
             index, is_navigation=is_navigation, direction=direction
         )
@@ -1029,6 +1041,11 @@ class AppController(QObject):
 
         # Bump generation to bust cache, trigger re-render
         self.ui_refresh_generation += 1
+        
+        # Trigger decode for the new variant
+        override_p = Path(self.view_override_path) if self.view_override_path else None
+        self._maybe_decode_current_image(reason="variant-switch", override_path=override_p)
+
         if self.ui_state:
             self.ui_state.variantBadgesChanged.emit()
             self.ui_state.variantSaveHintChanged.emit()
@@ -1048,7 +1065,7 @@ class AppController(QObject):
         # Only decode full-res when we are in loupe mode and the folder is loaded.
         return (not self._is_grid_view_active) and self._folder_loaded
 
-    def _maybe_decode_current_image(self, reason: str = "") -> None:
+    def _maybe_decode_current_image(self, reason: str = "", override_path: Optional[Path] = None) -> None:
         """Trigger decode of current image if allowed."""
         if not self._loupe_decode_allowed():
             return
@@ -1058,7 +1075,7 @@ class AppController(QObject):
             log.debug(f"Triggering decode: {reason}")
 
         # Trigger prefetch/decode for current index
-        self._do_prefetch(self.current_index)
+        self._do_prefetch(self.current_index, override_path=override_path)
 
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
         """Retrieves a decoded image, blocking until ready to ensure correct display.
@@ -1111,11 +1128,15 @@ class AppController(QObject):
         _, _, display_gen = self.get_display_info()
 
         # Variant override: use override path for current index
+        current_override = None
         if (
             self.view_override_path
             and index == self.current_index
         ):
+            if _debug_mode:
+                log.debug("DISPLAY OVERRIDE kind=%s path=%s", self.view_override_kind, self.view_override_path)
             image_path = Path(self.view_override_path)
+            current_override = image_path
         else:
             image_path = self.image_files[index].path
         path_str = image_path.as_posix()
@@ -1175,7 +1196,10 @@ class AppController(QObject):
         try:
             # Submit with priority=True to cancel pending prefetch tasks and free up workers
             future = self.prefetcher.submit_task(
-                index, self.prefetcher.generation, priority=True
+                index,
+                self.prefetcher.generation,
+                priority=True,
+                override_path=current_override,
             )
             if not future:
                 with self._last_image_lock:
