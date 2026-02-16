@@ -17,6 +17,11 @@ Item {
     // Selection count for keyboard handler (use gridSelectedCount for efficiency)
     property int selectedCount: uiState ? uiState.gridSelectedCount : 0
 
+    // Wrapper to expose function to Loader
+    function setPrefetchEnabled(enabled) {
+        thumbnailGrid.setPrefetchEnabled(enabled)
+    }
+
     // Grid view
     GridView {
         id: thumbnailGrid
@@ -73,9 +78,29 @@ Item {
 
         // Visible range prefetch
         property int prefetchMargin: 2  // rows
+        property bool prefetchEnabled: false  // Gate for prefetch requests (default off for startup safety)
+
+        function setPrefetchEnabled(enabled) {
+            prefetchEnabled = enabled
+            if (enabled) {
+                // Restore position to ensure we don't prefetch top-of-list by accident
+                if (thumbnailGrid.currentIndex >= 0) {
+                    thumbnailGrid.positionViewAtIndex(thumbnailGrid.currentIndex, GridView.Contain)
+                }
+                // Schedule a fresh prefetch with a slight delay to allow layout to settle
+                // This prevents "coalesced_from=prefetch" delays for visible items
+                Qt.callLater(function() {
+                    if (prefetchEnabled) prefetchTimer.restart()
+                })
+            } else {
+                prefetchTimer.stop()
+                // Cancel any queued work immediately to clear the backlog
+                if (uiState) uiState.cancelThumbnailPrefetch()
+            }
+        }
 
         onContentYChanged: {
-            if (!prefetchTimer.running) prefetchTimer.start()  // Throttle
+            if (prefetchEnabled && !prefetchTimer.running) prefetchTimer.start()  // Throttle
         }
 
         Timer {
@@ -88,6 +113,7 @@ Item {
         }
 
         function triggerPrefetch() {
+            if (!prefetchEnabled) return
             if (!uiState || thumbnailGrid.count === 0) return
 
             var cellW = thumbnailGrid.cellWidth
@@ -214,15 +240,19 @@ Item {
     }
 
     // Focus and layout triggers
-    onWidthChanged: prefetchTimer.restart()
-    onHeightChanged: prefetchTimer.restart()
+    onWidthChanged: { if (thumbnailGrid.prefetchEnabled) prefetchTimer.restart() }
+    onHeightChanged: { if (thumbnailGrid.prefetchEnabled) prefetchTimer.restart() }
 
     Component.onCompleted: {
         if (uiState && uiState.debugThumbTiming)
             console.log("[THUMB-TIMING] GridView Component.onCompleted t=" + Date.now() + "ms")
         thumbnailGrid.forceActiveFocus()
-        // Trigger initial prefetch after geometry stabilizes
-        Qt.callLater(function() { prefetchTimer.restart() })
+        
+        // Sync initial cursor position from state to prevent top-of-list prefetch
+        if (uiState && uiState.currentIndex >= 0 && uiState.currentIndex < thumbnailGrid.count) {
+            thumbnailGrid.currentIndex = uiState.currentIndex
+            thumbnailGrid.positionViewAtIndex(thumbnailGrid.currentIndex, GridView.Center)
+        }
     }
 
 
@@ -230,8 +260,8 @@ Item {
         target: uiState
         function onIsGridViewActiveChanged() {
             if (uiState.isGridViewActive) {
-                // Trigger prefetch when grid view becomes active
-                thumbnailGrid.triggerPrefetch()
+                // Prefetch triggering is now handled by Main.qml via setPrefetchEnabled
+                // to avoid transient state issues.
                 thumbnailGrid.forceActiveFocus()
             }
         }

@@ -304,6 +304,7 @@ class AppController(QObject):
         self._scan_count_variant = 0
         self._grid_refreshes = 0
         self._grid_model_dirty = True  # Start dirty to ensure initial load
+        self._folder_loaded = False  # Track if initial scan is complete
         self._thumbnail_cache = ThumbnailCache(
             max_bytes=256 * 1024 * 1024,  # 256 MB
             max_items=5000,
@@ -647,12 +648,13 @@ class AppController(QObject):
 
         self.prefetcher.cancel_all()  # Cancel stale tasks to avoid wasted work
 
-        # On first resize, execute deferred prefetch; on subsequent resizes, do normal prefetch
-        if is_first_resize and self.pending_prefetch_index is not None:
-            self.prefetcher.update_prefetch(self.pending_prefetch_index)
-            self.pending_prefetch_index = None
-        else:
-            self.prefetcher.update_prefetch(self.current_index)
+        if self._loupe_decode_allowed():
+            # On first resize, execute deferred prefetch; on subsequent resizes, do normal prefetch
+            if is_first_resize and self.pending_prefetch_index is not None:
+                self.prefetcher.update_prefetch(self.pending_prefetch_index)
+                self.pending_prefetch_index = None
+            else:
+                self.prefetcher.update_prefetch(self.current_index)
 
         self.sync_ui_state()  # To refresh the image
 
@@ -771,6 +773,9 @@ class AppController(QObject):
             is_navigation: True if called from user navigation (arrow keys, etc.)
             direction: 1 for forward, -1 for backward, None to use last direction
         """
+        if not self._loupe_decode_allowed():
+            return
+
         # If navigation occurs during resize debounce, cancel timer and apply resize immediately
         # to ensure prefetch uses correct dimensions
         if is_navigation and self.resize_timer.isActive():
@@ -808,9 +813,10 @@ class AppController(QObject):
         self.sync_ui_state()
 
         # Mark folder as loaded for UI
+        self._folder_loaded = True
+        self.ui_state.isFolderLoadedChanged.emit()
+
         if self._is_grid_view_active:
-            self._folder_loaded = True
-            self.ui_state.isFolderLoadedChanged.emit()
             
             # Ensure grid model is populated if starting in grid mode
             if self._thumbnail_model and self._grid_model_dirty and self._thumbnail_model.rowCount() == 0:
@@ -1037,6 +1043,23 @@ class AppController(QObject):
                 self.ui_state.variantBadgesChanged.emit()
                 self.ui_state.variantSaveHintChanged.emit()
 
+    def _loupe_decode_allowed(self) -> bool:
+        """Predicate to check if full-resolution decoding is allowed."""
+        # Only decode full-res when we are in loupe mode and the folder is loaded.
+        return (not self._is_grid_view_active) and self._folder_loaded
+
+    def _maybe_decode_current_image(self, reason: str = "") -> None:
+        """Trigger decode of current image if allowed."""
+        if not self._loupe_decode_allowed():
+            return
+        
+        # Log reason for debugging
+        if _debug_mode and reason:
+            log.debug(f"Triggering decode: {reason}")
+
+        # Trigger prefetch/decode for current index
+        self._do_prefetch(self.current_index)
+
     def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
         """Retrieves a decoded image, blocking until ready to ensure correct display.
 
@@ -1044,6 +1067,11 @@ class AppController(QObject):
         where users expect to see the correct image immediately. The prefetcher minimizes
         cache misses by decoding adjacent images in advance.
         """
+        if not self._loupe_decode_allowed():
+            if _debug_mode:
+                log.debug("get_decoded_image called but loupe decode not allowed (index=%d)", index)
+            return None
+
         if self.debug_cache:
             _t_start = time.perf_counter()
             print(f"[DBGCACHE] {_t_start*1000:.3f} get_decoded_image: START index={index}")
@@ -1702,7 +1730,15 @@ class AppController(QObject):
         self._is_grid_view_active = active
 
         if active:
-            # Entering grid view - refresh the model if dirty or empty
+            # Entering grid view
+            self.pending_prefetch_index = None
+            # Cancel inflight full-res decode jobs to free up resources
+            self.prefetcher.cancel_all()
+            # Cancel stale thumbnail jobs (e.g. from transient top-of-list state)
+            if hasattr(self, "_thumbnail_prefetcher"):
+                self._thumbnail_prefetcher.cancel_all()
+
+            # Refresh the model if dirty or empty
             needs_refresh = self._grid_model_dirty or self._thumbnail_model.rowCount() == 0
             if needs_refresh:
                 self._grid_refreshes += 1
@@ -1728,7 +1764,10 @@ class AppController(QObject):
 
             log.info("Switched to grid view")
         else:
+            # Entering loupe view
             log.info("Switched to loupe view")
+            # Trigger exactly one decode for the current index
+            self._maybe_decode_current_image("enter-loupe")
 
         # Notify UI state via signal
         self.ui_state.isGridViewActiveChanged.emit(active)

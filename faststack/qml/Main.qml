@@ -794,6 +794,39 @@ ApplicationWindow {
         }
     }
 
+    // Handle View Switching and Prefetch Gating
+    Connections {
+        target: uiState
+        function onIsGridViewActiveChanged() {
+            var gridItem = gridViewLoader.item
+            if (!gridItem) return
+
+            if (uiState.isGridViewActive) {
+                // Switching TO grid:
+                // 1. Immediately disable prefetch to block transient top-of-list requests
+                //    that happen before the view layout/scroll is restored.
+                if (typeof gridItem.setPrefetchEnabled === "function") {
+                    gridItem.setPrefetchEnabled(false)
+                }
+
+                // 2. Re-enable on next event loop tick.
+                //    This allows the GridView to restore its currentIndex/contentY position.
+                Qt.callLater(function() {
+                    var it = gridViewLoader.item
+                    if (uiState.isGridViewActive && it && typeof it.setPrefetchEnabled === "function") {
+                        it.setPrefetchEnabled(true)
+                    }
+                })
+            } else {
+                // Switching AWAY from grid:
+                // Disable immediately to stop background work.
+                if (typeof gridItem.setPrefetchEnabled === "function") {
+                    gridItem.setPrefetchEnabled(false)
+                }
+            }
+        }
+    }
+
     // -------- MAIN VIEW --------
     // StackLayout to switch between loupe and grid view
     StackLayout {
@@ -844,6 +877,19 @@ ApplicationWindow {
                 active: true  // Keep loaded to preserve state during view toggle
                 visible: uiState && uiState.isGridViewActive
                 focus: uiState && uiState.isGridViewActive
+
+                onLoaded: {
+                    // Enable prefetch on startup if grid is active (single owner)
+                    var loadedItem = item
+                    if (uiState && uiState.isGridViewActive && loadedItem && typeof loadedItem.setPrefetchEnabled === "function") {
+                        // Delay to match the toggle behavior (allow layout to settle)
+                        Qt.callLater(function() {
+                            if (gridViewLoader.item === loadedItem && uiState.isGridViewActive) {
+                                loadedItem.setPrefetchEnabled(true)
+                            }
+                        })
+                    }
+                }
 
                 // Bind theme property to loaded item
                 Binding {

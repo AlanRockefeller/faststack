@@ -269,6 +269,7 @@ Item {
             Image {
                 id: mainImage
                 anchors.centerIn: parent
+                visible: uiState && !uiState.isGridViewActive
                 
                 // Image size is now updated atomically in updateRotatorGeometry to prevent distortion
                 // width: sourceSize.width

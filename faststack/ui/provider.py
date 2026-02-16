@@ -320,6 +320,9 @@ class UIState(QObject):
             self.app_controller.batchAutoLevelsFinished.connect(
                 self._on_batch_al_finished
             )
+        
+        # Ensure image source updates when switching grid/loupe
+        self.isGridViewActiveChanged.connect(self.currentImageSourceChanged.emit)
 
     def _on_batch_al_progress(self, current: int, total: int):
         self._batch_al_current = current
@@ -398,6 +401,9 @@ class UIState(QObject):
 
     @Property(str, notify=currentImageSourceChanged)
     def currentImageSource(self):
+        # Prevent QML from requesting full-res images when in grid view
+        if self.isGridViewActive:
+            return ""
         return f"image://provider/{self.app_controller.current_index}/{self.app_controller.ui_refresh_generation}"
 
     @Property(str, notify=metadataChanged)
@@ -1465,6 +1471,15 @@ class UIState(QObject):
         """Delete image(s) from grid view - selection or cursor image."""
         if hasattr(self.app_controller, "grid_delete_at_cursor"):
             self.app_controller.grid_delete_at_cursor(cursorIndex)
+
+    @Slot()
+    def cancelThumbnailPrefetch(self):
+        """Cancels all pending thumbnail prefetch requests."""
+        if (
+            hasattr(self.app_controller, "_thumbnail_prefetcher")
+            and self.app_controller._thumbnail_prefetcher
+        ):
+            self.app_controller._thumbnail_prefetcher.cancel_all()
 
     @Slot(int, int, int)
     def gridPrefetchRange(self, startIndex: int, endIndex: int, maxCount: int = 800):
