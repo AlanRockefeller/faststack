@@ -16,6 +16,50 @@ ApplicationWindow {
     title: "FastStack - " + (uiState ? uiState.currentDirectory : "Loading...")
 
     property bool allowCloseWithRecycleBins: false
+    property bool fullScreenLoupe: false
+    property var savedWindowGeometry: ({})
+
+    function enterFullScreenLoupe() {
+        if (!uiState || uiState.isGridViewActive) return
+
+        savedWindowGeometry = {
+            x: root.x,
+            y: root.y,
+            width: root.width,
+            height: root.height,
+            visibility: root.visibility
+        }
+
+        fullScreenLoupe = true
+        root.showFullScreen()
+    }
+
+    function exitFullScreenLoupe() {
+        if (!fullScreenLoupe) return
+
+        fullScreenLoupe = false
+        
+        if (savedWindowGeometry.visibility === Window.Maximized) {
+            root.showMaximized()
+        } else {
+            root.showNormal()
+            if (savedWindowGeometry.visibility === Window.Windowed) {
+                root.x = savedWindowGeometry.x
+                root.y = savedWindowGeometry.y
+                root.width = savedWindowGeometry.width
+                root.height = savedWindowGeometry.height
+            }
+        }
+        root.requestActivate()
+    }
+
+    function toggleFullScreenLoupe() {
+        if (fullScreenLoupe) {
+            exitFullScreenLoupe()
+        } else {
+            enterFullScreenLoupe()
+        }
+    }
 
     onClosing: function(close) {
         if (allowCloseWithRecycleBins) {
@@ -67,6 +111,7 @@ ApplicationWindow {
         height: 40
         color: "transparent"
         z: 100  // Ensure it's above the content
+        visible: !root.fullScreenLoupe
 
         // Unified "menu active" flag to avoid flashing
         property bool menuActive: menuBarMouseArea.containsMouse
@@ -765,6 +810,21 @@ ApplicationWindow {
     }
 
     property int footerHeight: 60
+    property int effectiveFooterHeight: fullScreenLoupe ? 0 : footerHeight
+
+    Shortcut {
+        sequence: "F11"
+        context: Qt.ApplicationShortcut
+        enabled: uiState ? !uiState.isGridViewActive && !uiState.isDialogOpen : false
+        onActivated: root.toggleFullScreenLoupe()
+    }
+
+    Shortcut {
+        sequence: "Escape"
+        context: Qt.ApplicationShortcut
+        enabled: root.fullScreenLoupe
+        onActivated: root.exitFullScreenLoupe()
+    }
 
     Shortcut {
         sequence: "E"
@@ -798,6 +858,10 @@ ApplicationWindow {
     Connections {
         target: uiState
         function onIsGridViewActiveChanged() {
+            if (uiState.isGridViewActive && root.fullScreenLoupe) {
+                root.exitFullScreenLoupe()
+            }
+
             var gridItem = gridViewLoader.item
             if (!gridItem) return
 
@@ -845,10 +909,16 @@ ApplicationWindow {
                 anchors.fill: parent
                 source: "Components.qml"
                 focus: !uiState || !uiState.isGridViewActive
-                onLoaded: item.footerHeight = Qt.binding(function() { return root.footerHeight })
+                onLoaded: item.footerHeight = Qt.binding(function() { return root.effectiveFooterHeight })
 
                 // Key bindings implemented in old Main.qml
                 Keys.onPressed: function(event) {
+                    if (root.fullScreenLoupe && event.key === Qt.Key_Escape) {
+                        root.exitFullScreenLoupe()
+                        event.accepted = true
+                        return
+                    }
+
                     if (!uiState || !controller) {
                         return
                     }
@@ -909,12 +979,13 @@ ApplicationWindow {
         id: footerRect
         // Keep footer height fixed so the main image area doesn't change size when
         // stack/batch labels appear or disappear (prevents cache invalidations).
-        height: root.footerHeight
-        implicitHeight: root.footerHeight
+        height: root.effectiveFooterHeight
+        implicitHeight: root.effectiveFooterHeight
         anchors.left: parent.left
         anchors.right: parent.right
         color: Qt.rgba(root.currentBackgroundColor.r, root.currentBackgroundColor.g, root.currentBackgroundColor.b, 0.8)
         clip: true
+        visible: !root.fullScreenLoupe
 
         RowLayout {
             id: footerRow
@@ -1265,7 +1336,8 @@ ApplicationWindow {
                           "&nbsp;&nbsp;G: Jump to Image Number<br>" +
                           "&nbsp;&nbsp;Alt+U: Jump to Last Uploaded<br>" +
                           "&nbsp;&nbsp;I: Show EXIF Data<br>" +
-                          "&nbsp;&nbsp;T: Toggle Thumbnail Grid / Single Image View<br><br>" +
+                          "&nbsp;&nbsp;T: Toggle Thumbnail Grid / Single Image View<br>" +
+                          "&nbsp;&nbsp;F11: Toggle Fullscreen (Loupe View)<br><br>" +
                           "<b>Thumbnail Grid View:</b><br>" +
                           "&nbsp;&nbsp;Arrow Keys: Navigate between images<br>" +
                           "&nbsp;&nbsp;Enter: Open current image in single view<br>" +
@@ -1323,7 +1395,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
                           "&nbsp;&nbsp;H: Toggle histogram window<br>" +
                           "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
-                          "&nbsp;&nbsp;Esc: Close dialog/editor, or switch to grid view"
+                          "&nbsp;&nbsp;Esc: Close dialog/editor, switch to grid view, or exit fullscreen"
                     padding: 10
                     wrapMode: Text.WordWrap
                     color: root.currentTextColor

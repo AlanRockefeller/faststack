@@ -1,6 +1,6 @@
 # FastStack
 
-# Version 1.5.8 - February 12, 2026
+# Version 1.5.9 - February 16, 2026
 # By Alan Rockefeller
 
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW or JPG files for focus stacking and website upload.
@@ -12,6 +12,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Crop:** Added the ability to crop and rotate images via the cr(O)p hotkey (or right mouse click).   It can be a freeform crop, or constrained to several popular aspect ratios.
 - **Zoom & Pan:** Smooth zooming and panning.
 - **Stack Selection:** Group images into stacks (`[`, `]`) and select them for processing (`S`).
+- **Speak Line**: In grid view, a spark line is visible on each folder, so you can see how far you have gotten in uploading photos in each directory.
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
 - **Instant Navigation:** Sub-10ms next/previous image switching, high performance decoding via `PyTurboJPEG`.
 - **Image Editor:** Built-in editor with exposure, contrast, white balance, sharpness, and more (E key)
@@ -26,6 +27,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Configurable:** Adjust cache sizes, prefetch behavior, and Helicon Focus / Photoshop paths via a settings dialog and a persistent `.ini` file.
 - **Accurate Colors:** Uses monitor ICC profile to display colors correctly.
 - **RGB Histogram:** Pressing H brings up a RGB histogram which is designed to show even a little bit of highlight clipping and updates as you zoom in.
+- **Full Screen Mode:** Pressing F11 enters full screen mode - Esc/F11 exits.
 
 ## Installation
 
@@ -70,6 +72,7 @@ faststack
 - `K` / `Left Arrow`: Previous Image
 - `G`: Jump to Image Number
 - `I`: Show EXIF Data
+- `F11`: Toggle Fullscreen (Loupe View)
 - `S`: Toggle current image in/out of stack
 - `X`: Remove current image from batch/stack
 - `B`: Toggle current image in/out of batch
@@ -91,7 +94,7 @@ faststack
 - `Ctrl+Shift+B`: Quick auto white balance (alternate)
 - `L`: Quick auto levels (saves automatically)
 - `E`: Toggle Image Editor
-- `Esc`: Close active dialog, editor, or cancel crop
+- `Esc`: Close active dialog, editor, cancel crop, or exit fullscreen
 - `H`: Toggle histogram window
 - `Ctrl+C`: Copy image path to clipboard
 - `Ctrl+0`: Reset zoom and pan to fit window
