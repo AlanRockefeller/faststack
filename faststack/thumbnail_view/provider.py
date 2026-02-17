@@ -9,11 +9,10 @@ from typing import TYPE_CHECKING, Optional
 import faststack.util.thumb_debug as thumb_debug
 
 from PySide6.QtCore import QSize
-from PySide6.QtGui import QImage, QPixmap, QColor
+from PySide6.QtGui import QImage, QColor
 from PySide6.QtQuick import QQuickImageProvider
 
 from faststack.io.utils import compute_path_hash
-from faststack.models import DecodedImage
 
 if TYPE_CHECKING:
     from faststack.thumbnail_view.model import ThumbnailModel
@@ -31,7 +30,7 @@ class ThumbnailProvider(QQuickImageProvider):
     """QML Image Provider for thumbnails.
 
     Non-blocking O(1) implementation:
-    - Returns cached pixmap if available
+    - Returns cached QImage if available
     - Returns placeholder immediately if not cached
     - Schedules decode via prefetcher (does NOT decode inline)
 
@@ -59,7 +58,7 @@ class ThumbnailProvider(QQuickImageProvider):
             debug_timing: Enable [THUMB-TIMING] log lines
             debug_trace: Enable verbose trace logs
         """
-        super().__init__(QQuickImageProvider.ImageType.Pixmap)
+        super().__init__(QQuickImageProvider.ImageType.Image)
         self._cache = cache
         self._prefetcher = prefetcher
         self._path_resolver = path_resolver
@@ -67,12 +66,12 @@ class ThumbnailProvider(QQuickImageProvider):
         self._debug_timing = debug_timing
         self._debug_trace = debug_trace
 
-        # Pre-create placeholder pixmaps
+        # Pre-create placeholder images
         self._placeholder = self._create_placeholder(default_size, PLACEHOLDER_COLOR)
         self._folder_placeholder = self._create_folder_placeholder(default_size)
         self._error_placeholder = self._create_placeholder(default_size, ERROR_COLOR)
 
-        # Timing stats for requestPixmap
+        # Timing stats for requestImage
         self._first_request_time: Optional[float] = None
         self._request_count = 0
         self._first_second_logged = False
@@ -80,20 +79,20 @@ class ThumbnailProvider(QQuickImageProvider):
 
         log.debug("ThumbnailProvider initialized with default size %d", default_size)
 
-    def _create_placeholder(self, size: int, color: QColor) -> QPixmap:
-        """Create a solid color placeholder pixmap."""
-        pixmap = QPixmap(size, size)
-        pixmap.fill(color)
-        return pixmap
+    def _create_placeholder(self, size: int, color: QColor) -> QImage:
+        """Create a solid color placeholder image."""
+        image = QImage(size, size, QImage.Format.Format_RGB888)
+        image.fill(color)
+        return image
 
-    def _create_folder_placeholder(self, size: int) -> QPixmap:
+    def _create_folder_placeholder(self, size: int) -> QImage:
         """Create a folder icon placeholder."""
         from PySide6.QtGui import QPainter, QPen, QBrush
 
-        pixmap = QPixmap(size, size)
-        pixmap.fill(FOLDER_COLOR)
+        image = QImage(size, size, QImage.Format.Format_RGB888)
+        image.fill(FOLDER_COLOR)
 
-        painter = QPainter(pixmap)
+        painter = QPainter(image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # Draw a simple folder shape
@@ -121,24 +120,7 @@ class ThumbnailProvider(QQuickImageProvider):
         )
 
         painter.end()
-        return pixmap
-
-    def requestPixmap(self, id_str: str, size: QSize, requestedSize: QSize) -> QPixmap:
-        """Request a pixmap for the given ID.
-
-        This method is O(1) - returns immediately with cached data or placeholder.
-
-        Args:
-            id_str: URL path after "image://thumbnail/"
-            size: Output size reference (set by us)
-            requestedSize: Requested size from QML
-
-        Returns:
-            QPixmap of the thumbnail or placeholder
-        """
-        # Parse the ID
-        # Format: {size}/{path_hash}/{mtime_ns}?r={rev}
-        # Or: folder/{path_hash}/{mtime_ns}?r={rev}
+        return image
 
     def _parse_id(
         self, id_str: str
@@ -183,8 +165,8 @@ class ThumbnailProvider(QQuickImageProvider):
         except (ValueError, IndexError):
             return id_clean, parts, None, None, None, reason, is_folder, False
 
-    def requestPixmap(self, id_str: str, size: QSize, requestedSize: QSize) -> QPixmap:
-        """Request a pixmap for the given ID.
+    def requestImage(self, id_str: str, size: QSize, requestedSize: QSize) -> QImage:
+        """Request an image for the given ID.
 
         This method is O(1) - returns immediately with cached data or placeholder.
 
@@ -194,7 +176,7 @@ class ThumbnailProvider(QQuickImageProvider):
             requestedSize: Requested size from QML
 
         Returns:
-            QPixmap of the thumbnail or placeholder
+            QImage of the thumbnail or placeholder
         """
         # Parse the ID
         (
@@ -242,22 +224,22 @@ class ThumbnailProvider(QQuickImageProvider):
                     "cache_hit", rid=timer.rid, ms=f"{dt_cache_get:.3f}"
                 )
 
-            # Decode JPEG bytes to pixmap
-            t_pixmap_start = time.perf_counter() if timer else 0
-            pixmap = self._bytes_to_pixmap(cached_bytes)
-            dt_pixmap = (time.perf_counter() - t_pixmap_start) * 1000 if timer else 0
+            # Decode JPEG bytes to QImage
+            t_decode_start = time.perf_counter() if timer else 0
+            image = self._bytes_to_image(cached_bytes)
+            dt_decode = (time.perf_counter() - t_decode_start) * 1000 if timer else 0
 
-            if pixmap and not pixmap.isNull():
+            if image and not image.isNull():
                 if timer:
                     thumb_debug.log_trace(
-                        "delivered", rid=timer.rid, pixmap_ms=f"{dt_pixmap:.3f}"
+                        "delivered", rid=timer.rid, decode_ms=f"{dt_decode:.3f}"
                     )
                     timer.log_timing(
                         cache="hit",
                         cache_get_ms=f"{dt_cache_get:.3f}",
-                        pixmap_ms=f"{dt_pixmap:.3f}",
+                        pixmap_ms=f"{dt_decode:.3f}",  # keep tag for consistency in logs
                     )
-                return pixmap
+                return image
 
         if timer:
             thumb_debug.inc("req_cache_miss")
@@ -277,15 +259,16 @@ class ThumbnailProvider(QQuickImageProvider):
         # Return placeholder immediately (non-blocking)
         return self._placeholder
 
-    def _bytes_to_pixmap(self, jpeg_bytes: bytes) -> Optional[QPixmap]:
-        """Convert JPEG bytes to QPixmap."""
+    def _bytes_to_image(self, jpeg_bytes: bytes) -> Optional[QImage]:
+        """Convert JPEG bytes to QImage."""
         try:
-            qimage = QImage()
-            if qimage.loadFromData(jpeg_bytes, "JPEG"):
-                return QPixmap.fromImage(qimage)
+            image = QImage()
+            if image.loadFromData(jpeg_bytes, "JPEG"):
+                return image
         except Exception as e:
-            log.debug("Failed to convert bytes to pixmap: %s", e)
+            log.debug("Failed to convert bytes to image: %s", e)
         return None
+
 
 
 class PathResolver:
@@ -325,5 +308,7 @@ class PathResolver:
 
         dt = time.perf_counter() - t0
         log.debug(
-            f"PathResolver update took {dt*1000:.2f}ms for {model.rowCount()} items"
+            "PathResolver update took %.2fms for %d items",
+            dt * 1000,
+            model.rowCount(),
         )

@@ -66,7 +66,7 @@ def test_cache_popitem_callback_payload():
     assert evicted_items[0] == ("k1", img)
 
 
-def test_image_editor_save_exception(tmp_path):
+def test_image_editor_save_exception():
     """Verify ImageEditor.save_image raises RuntimeError if no float_image."""
     editor = ImageEditor()
     # No image loaded
@@ -106,7 +106,7 @@ def test_orphan_developed_preservation():
         pair_main.write_text("dummy")
         pair_dev.write_text("dummy")
 
-        visible, vmap = find_images_with_variants(tdp)
+        visible, _vmap = find_images_with_variants(tdp)
 
         visible_names = [img.path.name for img in visible]
         assert "orphan-developed.jpg" in visible_names

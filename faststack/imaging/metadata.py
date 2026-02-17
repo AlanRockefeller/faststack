@@ -70,18 +70,35 @@ def _exif_rational_to_seconds(x: Any) -> Optional[float]:
             n, d = int(x.numerator), int(x.denominator)
             if d != 0:
                 return float(Fraction(n, d))
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(
+                "_exif_rational_to_seconds failed for rational object %r (%s): %s",
+                x,
+                type(x).__name__,
+                e,
+            )
     if isinstance(x, (tuple, list)) and len(x) == 2:
         try:
             n, d = int(x[0]), int(x[1])
             if d != 0:
                 return float(Fraction(n, d))
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(
+                "_exif_rational_to_seconds failed for tuple/list %r (%s): %s",
+                x,
+                type(x).__name__,
+                e,
+            )
     try:
         return float(x)
-    except Exception:
+    except Exception as e:
+        if x is not None:
+            log.debug(
+                "_exif_rational_to_seconds failed for value %r (%s): %s",
+                x,
+                type(x).__name__,
+                e,
+            )
         return None
 
 
@@ -188,10 +205,12 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
 
     try:
         with Image.open(path) as img:
-            exif = img._getexif()
+            exif_obj = img.getexif()
 
-        if not exif:
+        if not exif_obj:
             return {"summary": {}, "full": {}}
+        # Normalize to a dict for consistency with older code that expected _getexif() return
+        exif = dict(exif_obj)
     except Exception as e:
         log.warning(f"Failed to extract EXIF from {path}: {e}")
         return {"summary": {}, "full": {}}

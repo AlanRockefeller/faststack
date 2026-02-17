@@ -83,11 +83,7 @@ def _assert_cache_cleanup(mock_controller, deleted_paths):
     if hasattr(cache, "evict_paths") and cache.evict_paths.call_count:
         args, _kwargs = cache.evict_paths.call_args
         assert args, "evict_paths should receive at least one arg"
-        arg0 = (
-            list(args[0])
-            if not isinstance(args[0], (list, tuple, set))
-            else list(args[0])
-        )
+        arg0 = list(args[0])
         deleted_strs = {str(p) for p in deleted_paths}
         arg0_strs = {str(p) for p in arg0}
         assert deleted_strs & arg0_strs, "evict_paths should include deleted path(s)"

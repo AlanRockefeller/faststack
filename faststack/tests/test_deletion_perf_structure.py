@@ -18,10 +18,10 @@ if not QApplication.instance():
 def mock_app():
     """Create a partial mock of AppController for deletion testing."""
     with (
-        patch("faststack.app.ByteLRUCache") as MockCache,
-        patch("faststack.app.ThumbnailModel") as MockModel,
-        patch("faststack.app.Prefetcher") as MockPrefetcher,
-        patch("faststack.app.PathResolver") as MockResolver,
+        patch("faststack.app.ByteLRUCache"),
+        patch("faststack.app.ThumbnailModel"),
+        patch("faststack.app.Prefetcher"),
+        patch("faststack.app.PathResolver"),
         patch("faststack.app.Watcher"),
         patch("faststack.app.uuid"),
         patch("faststack.app.QTimer"),
@@ -49,14 +49,14 @@ def test_delete_uses_targeted_eviction():
     """Verify delete_indices calls evict_paths and NOT clear."""
     # Setup - use real controller with patched subsystems
     with (
-        patch("faststack.app.ByteLRUCache") as MockCache,
-        patch("faststack.app.ThumbnailModel") as MockModel,
-        patch("faststack.app.Prefetcher") as MockPrefetcher,
-        patch("faststack.app.PathResolver") as MockResolver,
+        patch("faststack.app.ByteLRUCache"),
+        patch("faststack.app.ThumbnailModel"),
+        patch("faststack.app.Prefetcher"),
+        patch("faststack.app.PathResolver"),
         patch("faststack.app.Watcher"),
         patch("faststack.app.uuid"),
         patch("faststack.app.QTimer"),
-        patch("faststack.app.concurrent.futures.ThreadPoolExecutor") as MockExecutor,
+        patch("faststack.app.concurrent.futures.ThreadPoolExecutor"),
     ):
 
         mock_engine = MagicMock()

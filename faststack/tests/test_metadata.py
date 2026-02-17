@@ -36,7 +36,7 @@ class TestMetadata(unittest.TestCase):
                 },
             }
 
-            mock_img._getexif.return_value = exif_dict
+            mock_img.getexif.return_value = exif_dict
             mock_open.return_value.__enter__.return_value = mock_img
 
             # Test
@@ -91,10 +91,11 @@ class TestMetadata(unittest.TestCase):
         # Test lists
         self.assertEqual(clean_exif_value([1, 2]), "['1', '2']")
 
+    @patch("pathlib.Path.exists", return_value=True)
     @patch("faststack.imaging.metadata.Image.open")
-    def test_get_exif_data_no_exif(self, mock_open):
+    def test_get_exif_data_no_exif(self, mock_open, mock_exists):
         mock_img = MagicMock()
-        mock_img._getexif.return_value = None
+        mock_img.getexif.return_value = None
         mock_open.return_value.__enter__.return_value = mock_img
 
         result = get_exif_data(Path("dummy.jpg"))

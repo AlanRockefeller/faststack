@@ -2335,7 +2335,11 @@ class AppController(QObject):
         if not self.image_files or self.current_index >= len(self.image_files):
             return
         exif_key = self._exif_source_key(self.current_index)
+        if self._exif_pending_path is not None and self._exif_pending_path != exif_key:
+            return  # Different image path pending, or we aren't tracking this key.
+
         if exif_key in self._exif_brief_cache:
+            self._exif_pending_path = None
             return  # already cached
         # Resolve the actual file path for the EXIF source
         img = self.image_files[self.current_index]
@@ -2348,6 +2352,7 @@ class AppController(QObject):
         # Early return for non-JPEGs — EXIF extraction only supports JPEG
         if source_path.suffix.lower() not in self._JPEG_SUFFIXES:
             self._exif_brief_cache[exif_key] = ""
+            self._exif_pending_path = None
             return
         # Submit to histogram executor (daemon, 1 worker) to avoid blocking GUI
         signal = self._exifBriefReady

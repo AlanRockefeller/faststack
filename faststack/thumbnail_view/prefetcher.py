@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 import numpy as np
 import io
 from PIL import Image
+from contextlib import nullcontext
 
 from faststack.util.executors import create_priority_executor
 from faststack.imaging.orientation import get_exif_orientation, apply_orientation_to_np
@@ -222,7 +223,7 @@ class ThumbnailPrefetcher:
                 mtime_ns,
                 size,
                 timer,
-                priority,
+                priority=priority,
             )
 
             with self._inflight_lock:
@@ -260,7 +261,6 @@ class ThumbnailPrefetcher:
         mtime_ns: int,
         size: int,
         timer: Optional["thumb_debug.ThumbTimer"] = None,
-        priority: int = PRIO_MED,
     ) -> Optional[bytes]:
         """Worker function to decode a thumbnail.
 
@@ -270,7 +270,11 @@ class ThumbnailPrefetcher:
             timer.t_worker_start = time.perf_counter()
             timer.started = True
             thumb_debug.inc("decode_started")
-            thumb_debug.log_trace("worker_start", rid=timer.rid)
+            thumb_debug.log_trace(
+                "worker_start",
+                rid=timer.rid,
+                prio=getattr(timer, "prio_effective", None),
+            )
 
         try:
             # Read and decode
@@ -288,12 +292,7 @@ class ThumbnailPrefetcher:
                 return None
 
             # Get EXIF orientation and apply (single point of orientation)
-            # Use stage only if timer exists
-            if timer:
-                with timer.stage("orientation"):
-                    orientation = get_exif_orientation(path)
-                    rgb_array = apply_orientation_to_np(rgb_array, orientation)
-            else:
+            with timer.stage("orientation") if timer else nullcontext():
                 orientation = get_exif_orientation(path)
                 rgb_array = apply_orientation_to_np(rgb_array, orientation)
 
@@ -306,14 +305,7 @@ class ThumbnailPrefetcher:
                 return None
 
             # Encode to JPEG bytes for storage
-            # Use stage only if timer exists
-            if timer:
-                with timer.stage("encode"):
-                    pil_image = Image.fromarray(rgb_array, mode="RGB")
-                    buf = io.BytesIO()
-                    pil_image.save(buf, format="JPEG", quality=85)
-                    result = buf.getvalue()
-            else:
+            with timer.stage("encode") if timer else nullcontext():
                 pil_image = Image.fromarray(rgb_array, mode="RGB")
                 buf = io.BytesIO()
                 pil_image.save(buf, format="JPEG", quality=85)
@@ -346,33 +338,15 @@ class ThumbnailPrefetcher:
         # Try TurboJPEG for JPEG files
         if HAS_TURBOJPEG and suffix in (".jpg", ".jpeg"):
             try:
-                if timer:
-                    with timer.stage("io"):
-                        with open(path, "rb") as f:
-                            jpeg_data = f.read()
-
-                    with timer.stage("decode"):
-                        # Get dimensions first
-                        width, height, _, _ = _tj.decode_header(jpeg_data)
-
-                        # Calculate scale factor for turbojpeg (powers of 2: 1, 2, 4, 8)
-                        scale_factor = 1
-                        while (
-                            width // (scale_factor * 2) >= target_size
-                            and height // (scale_factor * 2) >= target_size
-                            and scale_factor < 8
-                        ):
-                            scale_factor *= 2
-
-                        # Decode with scaling
-                        scaling_factor = (1, scale_factor)
-                        rgb = _tj.decode(
-                            jpeg_data, pixel_format=TJPF_RGB, scaling_factor=scaling_factor
-                        )
-                else:
+                with timer.stage("io") if timer else nullcontext():
                     with open(path, "rb") as f:
                         jpeg_data = f.read()
+
+                with timer.stage("decode") if timer else nullcontext():
+                    # Get dimensions first
                     width, height, _, _ = _tj.decode_header(jpeg_data)
+
+                    # Calculate scale factor for turbojpeg (powers of 2: 1, 2, 4, 8)
                     scale_factor = 1
                     while (
                         width // (scale_factor * 2) >= target_size
@@ -380,6 +354,8 @@ class ThumbnailPrefetcher:
                         and scale_factor < 8
                     ):
                         scale_factor *= 2
+
+                    # Decode with scaling
                     scaling_factor = (1, scale_factor)
                     rgb = _tj.decode(
                         jpeg_data, pixel_format=TJPF_RGB, scaling_factor=scaling_factor
@@ -388,14 +364,7 @@ class ThumbnailPrefetcher:
                 # Further resize with PIL if needed
                 h, w = rgb.shape[:2]
                 if w > target_size or h > target_size:
-                    if timer:
-                        with timer.stage("resize"):
-                            pil_img = Image.fromarray(rgb)
-                            pil_img.thumbnail(
-                                (target_size, target_size), Image.Resampling.LANCZOS
-                            )
-                            rgb = np.array(pil_img)
-                    else:
+                    with timer.stage("resize") if timer else nullcontext():
                         pil_img = Image.fromarray(rgb)
                         pil_img.thumbnail(
                             (target_size, target_size), Image.Resampling.LANCZOS
@@ -411,20 +380,13 @@ class ThumbnailPrefetcher:
 
         # Fallback to PIL
         try:
-            if timer:
-                with timer.stage("decode"):
-                    pil_img = Image.open(path)
-                    # Convert to RGB if needed
-                    if pil_img.mode != "RGB":
-                        pil_img = pil_img.convert("RGB")
-
-                    # Resize
-                    pil_img.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
-                    return np.array(pil_img)
-            else:
+            with timer.stage("decode") if timer else nullcontext():
                 pil_img = Image.open(path)
+                # Convert to RGB if needed
                 if pil_img.mode != "RGB":
                     pil_img = pil_img.convert("RGB")
+
+                # Resize
                 pil_img.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
                 return np.array(pil_img)
 

@@ -91,20 +91,22 @@ class TestVariantsLogic(unittest.TestCase):
 
     def test_path_normalization(self):
         """Verify path normalization (case-insensitivity, absolute paths)."""
-        if os.name != "nt":
-            self.skipTest("Path normalization test is Windows-only")
-
-        p1 = Path("C:/Test/File.JPG")
-        p2 = Path("C:/Test/file.jpg")
-
-        n1 = Path(norm_path(p1))
-        n2 = Path(norm_path(p2))
-
-        # On Windows, these should match after normalization
-        self.assertEqual(n1, n2)
-
-        # Basic property check (should not be empty and should be absolute)
-        self.assertTrue(n1.is_absolute())
+        if os.name == "nt":
+            p1 = Path("C:/Test/File.JPG")
+            p2 = Path("C:/Test/file.jpg")
+            n1 = Path(norm_path(p1))
+            n2 = Path(norm_path(p2))
+            # On Windows, these should match after normalization
+            self.assertEqual(n1, n2)
+            self.assertTrue(n1.is_absolute())
+        else:
+            # On POSIX, case is preserved
+            p1 = Path("/tmp/File.JPG")
+            p2 = Path("/tmp/file.jpg")
+            n1 = norm_path(p1)
+            n2 = norm_path(p2)
+            self.assertNotEqual(n1, n2)
+            self.assertTrue(Path(n1).is_absolute())
 
 
 if __name__ == "__main__":

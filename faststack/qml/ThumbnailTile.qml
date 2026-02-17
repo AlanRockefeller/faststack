@@ -49,6 +49,8 @@ Item {
     property color restackedColor: "#FF9800" // Orange for restacked (R)
     property color favoriteColor: "#FFD700"  // Gold for favorite (F)
     property color batchColor: "#2196F3"     // Blue for batch (B)
+    property color backupsColor: "#9C27B0"   // Purple for backups (Bk)
+    property color developedColor: "#009688" // Teal for developed (D)
     property color cursorColor: "#00BFFF"    // Cyan for keyboard cursor
     property color loadingColor: tile.isDarkTheme ? "#3c3c3c" : "#e0e0e0"
     property color counterUploadedCol: "#7BBF7F"   // Muted green
@@ -265,7 +267,7 @@ Item {
                     width: 18
                     height: 18
                     radius: 3
-                    color: "#9C27B0"
+                    color: backupsColor
                     Text {
                         anchors.centerIn: parent
                         text: "Bk"
@@ -281,7 +283,7 @@ Item {
                     width: 18
                     height: 18
                     radius: 3
-                    color: "#009688"
+                    color: developedColor
                     Text {
                         anchors.centerIn: parent
                         text: "D"

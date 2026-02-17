@@ -35,11 +35,15 @@ def test_replacement_plus_lru_eviction():
     # a(40) + b(40) = 80.  Now replace a with 70 -> a(70) + b(40) = 110 > 100.
     cache["a"] = 70
 
-    keys = [k for k, _ in evicted]
-    assert "a" in keys, "old value of 'a' should be reported"
-    assert "b" in keys, "'b' should be evicted by LRU pressure"
-    assert dict(evicted)["a"] == 40
-    assert dict(evicted)["b"] == 40
+    from collections import defaultdict
+    evicted_map = defaultdict(list)
+    for k, v in evicted:
+        evicted_map[k].append(v)
+
+    assert "a" in evicted_map, "old value of 'a' should be reported"
+    assert "b" in evicted_map, "'b' should be evicted by LRU pressure"
+    assert 40 in evicted_map["a"]
+    assert 40 in evicted_map["b"]
 
 
 # ── LRU eviction ────────────────────────────────────────────────────

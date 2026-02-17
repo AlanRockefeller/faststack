@@ -28,9 +28,9 @@ def test_app_init_only():
         import sys
 
         if not QApplication.instance():
-            qapp = QApplication(sys.argv)
+            _ = QApplication(sys.argv)
         else:
-            qapp = QApplication.instance()
+            _ = QApplication.instance()
 
         mock_engine = MagicMock()
         try:

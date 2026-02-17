@@ -513,7 +513,7 @@ class ThumbnailModel(QAbstractListModel):
         """
         self._next_source_reason = "refresh"
         cur, own = QThread.currentThread(), self.thread()
-        assert cur == own, f"ThumbnailModel refresh thread mismatch"
+        assert cur == own, "ThumbnailModel refresh thread mismatch"
 
         self.beginResetModel()
         try:

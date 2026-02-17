@@ -995,12 +995,14 @@ ApplicationWindow {
             }
             Label {
                 text: (uiState && uiState.imageCount > 0)
-                      ? `${uiState.currentFilename || 'N/A'}`
-                      : " | N/A"
+                      ? (uiState.currentFilename || "N/A")
+                      : "N/A"
                 color: root.currentTextColor
             }
             Label {
-                text: uiState && uiState.exifBrief ? ` ${uiState.exifBrief}` : ""
+                text: (uiState && uiState.imageCount > 0)
+                      ? (uiState.exifBrief || "—")
+                      : "N/A"
                 color: root.currentTextColor
             }
             Item { Layout.fillWidth: true }
