@@ -198,9 +198,13 @@ class ThumbnailProvider(QQuickImageProvider):
 
         if not parsed.is_valid:
             log.debug("Invalid thumbnail ID: %s", id_str)
+            size.setWidth(self._error_placeholder.width())
+            size.setHeight(self._error_placeholder.height())
             return self._error_placeholder
 
         if parsed.is_folder:
+            size.setWidth(self._folder_placeholder.width())
+            size.setHeight(self._folder_placeholder.height())
             return self._folder_placeholder
 
         # Track total requests if logging enabled
@@ -210,9 +214,12 @@ class ThumbnailProvider(QQuickImageProvider):
         # Deferred logging setup
         timer = None
         cache_key = parsed.id_clean
+        
+        # Resolve path - we already have path_hash and mtime_ns
+        path = self._path_resolver(parsed.path_hash) if self._path_resolver else None
+
         if thumb_debug.timing_enabled or thumb_debug.trace_enabled:
             # Resolve path only if needed for trace
-            path = self._path_resolver(parsed.path_hash) if self._path_resolver else None
             timer = thumb_debug.ThumbTimer(
                 key=cache_key, path=path, reason=parsed.reason
             )
@@ -241,7 +248,7 @@ class ThumbnailProvider(QQuickImageProvider):
             image = self._bytes_to_image(cached_bytes)
             dt_decode = (time.perf_counter() - t_decode_start) * 1000 if timer else 0
 
-            if image and not image.isNull():
+            if image is not None and not image.isNull():
                 if timer:
                     thumb_debug.log_trace(
                         "delivered", rid=timer.rid, decode_ms=f"{dt_decode:.3f}"
@@ -251,14 +258,19 @@ class ThumbnailProvider(QQuickImageProvider):
                         cache_get_ms=f"{dt_cache_get:.3f}",
                         pixmap_ms=f"{dt_decode:.3f}",  # keep tag for consistency in logs
                     )
+                size.setWidth(image.width())
+                size.setHeight(image.height())
                 return image
+            else:
+                # Decode of cached bytes failed — evict the bad entry so
+                # the prefetcher can re-decode on the next request.
+                if self._cache.discard(cache_key):
+                    log.warning("Evicted bad cache entry: %s", cache_key)
 
         if timer:
             thumb_debug.inc("req_cache_miss")
             thumb_debug.log_trace("cache_miss", rid=timer.rid, ms=f"{dt_cache_get:.3f}")
 
-        # Resolve path - we already have path_hash and mtime_ns
-        path = self._path_resolver(parsed.path_hash) if self._path_resolver else None
         if path:
             self._prefetcher.submit(
                 path,
@@ -269,25 +281,24 @@ class ThumbnailProvider(QQuickImageProvider):
             )
 
         # Return placeholder immediately (non-blocking)
+        size.setWidth(self._placeholder.width())
+        size.setHeight(self._placeholder.height())
         return self._placeholder
 
-    def _bytes_to_image(self, jpeg_bytes: bytes) -> QImage:
+    def _bytes_to_image(self, jpeg_bytes: bytes) -> Optional[QImage]:
         """Convert JPEG bytes to QImage.
 
         Returns:
-            QImage of the decoded bytes, or self._error_placeholder on failure.
+            QImage of the decoded bytes, or None on failure.
         """
         try:
             image = QImage()
             if image.loadFromData(jpeg_bytes, "JPEG"):
                 return image
-            log.warning("JPEG decode failed for cached bytes; returning error placeholder")
+            log.warning("JPEG decode failed for cached bytes")
         except Exception as e:
-            log.debug("Failed to convert bytes to image: %s", e)
-            log.warning(
-                "Exception during JPEG decode from cache: %s; returning error placeholder", e
-            )
-        return self._error_placeholder
+            log.warning("Exception during JPEG decode from cache: %s", e)
+        return None
 
 
 class PathResolver:

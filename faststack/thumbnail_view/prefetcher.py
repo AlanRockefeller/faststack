@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+from collections import OrderedDict
 from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock
@@ -97,7 +98,7 @@ class ThumbnailPrefetcher:
         # Key: (size, path_hash, mtime_ns)
         # Value: (rid, ThumbTimer)
         self._inflight: Dict[
-            Tuple[int, str, int], Tuple[int, "thumb_debug.ThumbTimer"]
+            Tuple[int, str, int], Tuple[int, Optional["thumb_debug.ThumbTimer"]]
         ] = {}
         self._inflight_lock = Lock()
         self._debug_trace = debug_trace
@@ -134,7 +135,7 @@ class ThumbnailPrefetcher:
         self,
         path: Path,
         mtime_ns: int,
-        size: int = None,
+        size: Optional[int] = None,
         priority: int = PRIO_MED,
         timer: Optional["thumb_debug.ThumbTimer"] = None,
     ) -> bool:
@@ -175,7 +176,8 @@ class ThumbnailPrefetcher:
                 existing_rid, existing_timer = self._inflight[job_key]
                 if existing_timer:
                     # Capture where this request originated
-                    existing_timer.coalesced_from = timer.reason
+                    if timer:
+                        existing_timer.coalesced_from = timer.reason
                     # Update effective priority if this requested one is higher
                     if (
                         existing_timer.prio_effective is not None
@@ -498,8 +500,7 @@ class ThumbnailCache:
     def __init__(self, max_bytes: int = 256 * 1024 * 1024, max_items: int = 5000):
         self._max_bytes = max_bytes
         self._max_items = max_items
-        self._cache: Dict[str, bytes] = {}
-        self._order: list = []  # LRU order (oldest first)
+        self._cache: Dict[str, bytes] = OrderedDict()
         self._current_bytes = 0
         self._lock = Lock()
 
@@ -509,39 +510,47 @@ class ThumbnailCache:
             if key not in self._cache:
                 return None
             # Move to end (most recently used)
-            self._order.remove(key)
-            self._order.append(key)
+            self._cache.move_to_end(key, last=True)
             return self._cache[key]
 
     def put(self, key: str, value: bytes):
         """Put item in cache, evicting if necessary."""
         with self._lock:
-            # If already present, remove old entry first
+            # If already present, remove old entry logic by just updating (OrderedDict handles key existence)
+            # But we must update _current_bytes first if it exists
             if key in self._cache:
-                old_value = self._cache[key]
-                self._current_bytes -= len(old_value)
-                self._order.remove(key)
-
-            # Add new entry
+                self._current_bytes -= len(self._cache[key])
+                self._cache.move_to_end(key, last=True)
+            
             self._cache[key] = value
-            self._order.append(key)
             self._current_bytes += len(value)
 
             # Evict if over limits
             while (
                 self._current_bytes > self._max_bytes
                 or len(self._cache) > self._max_items
-            ) and self._order:
-                oldest = self._order.pop(0)
-                if oldest in self._cache:
-                    self._current_bytes -= len(self._cache[oldest])
-                    del self._cache[oldest]
+            ):
+                # Pop oldest (first item)
+                oldest_key, oldest_val = self._cache.popitem(last=False)
+                self._current_bytes -= len(oldest_val)
+
+    def discard(self, key: str) -> bool:
+        """Remove a single entry if present. No-op if missing.
+
+        Returns True if the key was present and removed, False otherwise.
+        """
+        with self._lock:
+            try:
+                val = self._cache.pop(key)
+            except KeyError:
+                return False
+            self._current_bytes -= len(val)
+            return True
 
     def clear(self):
         """Clear the cache."""
         with self._lock:
             self._cache.clear()
-            self._order.clear()
             self._current_bytes = 0
 
     @property

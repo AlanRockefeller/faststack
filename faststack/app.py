@@ -2314,7 +2314,9 @@ class AppController(QObject):
         self._metadata_cache_index = cache_key
         return self._metadata_cache
 
-    _JPEG_SUFFIXES = frozenset({".jpg", ".jpeg", ".jpe"})
+    _EXIF_SUFFIXES = frozenset(
+        {".jpg", ".jpeg", ".jpe", ".tif", ".tiff", ".heif", ".heic"}
+    )
 
     def _exif_source_key(self, index: int) -> str:
         """Return a normalized cache key for the EXIF source of image at *index*.
@@ -2354,8 +2356,8 @@ class AppController(QObject):
             group = self._variant_map[key_cf]
             if group.main_path is not None:
                 source_path = group.main_path
-        # Early return for non-JPEGs — EXIF extraction only supports JPEG
-        if source_path.suffix.lower() not in self._JPEG_SUFFIXES:
+        # Early return for formats without EXIF support
+        if source_path.suffix.lower() not in self._EXIF_SUFFIXES:
             self._exif_brief_cache[exif_key] = ""
             self._exif_pending_path = None
             return

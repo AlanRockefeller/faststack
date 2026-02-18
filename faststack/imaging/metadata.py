@@ -160,7 +160,10 @@ def get_exif_brief(path: Union[str, Path]) -> str:
         # Some cameras return a list/tuple for ISO
         if isinstance(iso, (list, tuple)) and len(iso) > 0:
             iso = iso[0]
-        parts.append(f"ISO {iso}")
+        try:
+            parts.append(f"ISO {int(iso)}")
+        except (ValueError, TypeError):
+            parts.append(f"ISO {iso}")
 
     # Aperture / FNumber (tag 0x829D)
     f_number = tags.get(0x829D)
@@ -213,11 +216,16 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     try:
         with Image.open(path) as img:
             exif_obj = img.getexif()
-
-        if not exif_obj:
-            return {"summary": {}, "full": {}}
-        # Normalize to a dict for consistency with older code that expected _getexif() return
+            if not exif_obj:
+                return {"summary": {}, "full": {}}
+            
+            # Merge sub-IFD tags (ISO, Lens, etc.)
+            exif_ifd = dict(exif_obj.get_ifd(ExifTags.IFD.Exif) if hasattr(ExifTags, "IFD") else {})
+            
+        # Normalize to a dict for consistency
         exif = dict(exif_obj)
+        exif.update(exif_ifd)
+        
     except Exception as e:
         log.warning(f"Failed to extract EXIF from {path}: {e}")
         return {"summary": {}, "full": {}}
@@ -236,7 +244,10 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     # Date Taken
     date_taken = get_val("DateTimeOriginal") or get_val("DateTime")
     if date_taken:
-        summary["Date Taken"] = clean_exif_value(date_taken)
+        try:
+            summary["Date Taken"] = clean_exif_value(date_taken)
+        except Exception as e:
+            log.debug("failed parsing EXIF date %r: %s", date_taken, e)
 
     # Camera Model
     make = get_val("Make")
@@ -268,7 +279,10 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     if iso:
         if isinstance(iso, (list, tuple)) and len(iso) > 0:
             iso = iso[0]
-        summary["ISO"] = clean_exif_value(iso)
+        try:
+            summary["ISO"] = str(int(iso))
+        except (ValueError, TypeError):
+            summary["ISO"] = clean_exif_value(iso)
 
     # Aperture (FNumber)
     f_number = get_val("FNumber")

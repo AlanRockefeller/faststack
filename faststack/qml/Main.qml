@@ -1000,9 +1000,8 @@ ApplicationWindow {
                 color: root.currentTextColor
             }
             Label {
-                text: (uiState && uiState.imageCount > 0)
-                      ? (uiState.exifBrief || "N/A")
-                      : "N/A"
+                visible: (uiState && uiState.imageCount > 0 && uiState.exifBrief && uiState.exifBrief.length > 0)
+                text: uiState ? (uiState.exifBrief || "") : ""
                 color: root.currentTextColor
             }
             Item { Layout.fillWidth: true }
