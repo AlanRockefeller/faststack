@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 
 from faststack.models import ImageFile
-from faststack.io.variants import VariantGroup, build_variant_map, parse_variant_stem
+from faststack.io.variants import (
+    VariantGroup,
+    build_variant_map,
+    norm_path,
+    parse_variant_stem,
+)
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +93,9 @@ def _build_image_list(
                 effective_name = base_name.casefold()
                 break
         img = ImageFile(
-            path=p, raw_pair=None, timestamp=effective_ts,
+            path=p,
+            raw_pair=None,
+            timestamp=effective_ts,
             sort_name_cf=effective_name,
         )
         image_entries.append((image_sort_key(img), img))
@@ -124,15 +131,19 @@ def find_images(directory: Path) -> List[ImageFile]:
 
     elapsed = time.perf_counter() - t_start
     paired_count = sum(
-        1 for im in image_files
+        1
+        for im in image_files
         if im.raw_pair and im.path.suffix.lower() in JPG_EXTENSIONS
     )
     raw_only_count = sum(
         1 for im in image_files if im.path.suffix.lower() not in JPG_EXTENSIONS
     )
     log.info(
-        "Found %d images (%d paired, %d raw-only).",
-        len(image_files), paired_count, raw_only_count,
+        "Found %d images (%d paired, %d raw-only) in %.2fs.",
+        len(image_files),
+        paired_count,
+        raw_only_count,
+        elapsed,
     )
     return image_files
 
@@ -176,15 +187,20 @@ def find_images_with_variants(
         group_key, _, _ = parse_variant_stem(img.path.stem)
         key_cf = group_key.casefold()
         group = variant_map.get(key_cf)
+        img_norm = Path(norm_path(img.path))
         if group is None or len(group.all_files) <= 1:
             # No variant group or singleton: keep as-is
             filtered.append(img)
-        elif group.main_path == img.path:
-            # This IS the main: keep it
+        elif group.main_path == img_norm:
+            # This IS the main: keep it (normalize to match build_variant_map)
             filtered.append(img)
         else:
             # This is a developed file reachable via badge: remove from visible list
-            log.debug("Filtering out variant %s (main=%s)", img.path.name, group.main_path.name if group.main_path else "?")
+            log.debug(
+                "Filtering out variant %s (main=%s)",
+                img.path.name,
+                group.main_path.name if group.main_path else "?",
+            )
 
     # Annotate images with variant flags
     for img in filtered:
@@ -196,7 +212,10 @@ def find_images_with_variants(
         group = variant_map.get(key_cf)
         if group:
             img.has_backups = bool(group.backup_paths)
-            img.has_developed = group.developed_path is not None and group.developed_path != group.main_path
+            img.has_developed = (
+                group.developed_path is not None
+                and group.developed_path != group.main_path
+            )
 
     image_files = filtered
 
@@ -210,21 +229,13 @@ def find_images_with_variants(
         1 for im in image_files if im.path.suffix.lower() not in JPG_EXTENSIONS
     )
 
-    if log.isEnabledFor(logging.DEBUG):
-        log.info(
-            "Found %d total, %d paired, %d raw-only in %.3fs",
-            len(image_files),
-            paired_count,
-            raw_only_count,
-            elapsed,
-        )
-    else:
-        log.info(
-            "Found %d images (%d paired, %d raw-only).",
-            len(image_files),
-            paired_count,
-            raw_only_count,
-        )
+    log.info(
+        "Found %d images (%d paired, %d raw-only) in %.2fs.",
+        len(image_files),
+        paired_count,
+        raw_only_count,
+        elapsed,
+    )
     return image_files, variant_map
 
 

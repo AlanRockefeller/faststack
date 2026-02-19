@@ -31,9 +31,24 @@ def thumbnail_model(qapp):
 
     # Manually add entries (bypass refresh which would scan disk)
     entries = [
-        ThumbnailEntry(path=Path("/fake/dir/img001.jpg"), name="img001.jpg", is_folder=False, mtime_ns=1000),
-        ThumbnailEntry(path=Path("/fake/dir/img002.jpg"), name="img002.jpg", is_folder=False, mtime_ns=2000),
-        ThumbnailEntry(path=Path("/fake/dir/img003.jpg"), name="img003.jpg", is_folder=False, mtime_ns=3000),
+        ThumbnailEntry(
+            path=Path("/fake/dir/img001.jpg"),
+            name="img001.jpg",
+            is_folder=False,
+            mtime_ns=1000,
+        ),
+        ThumbnailEntry(
+            path=Path("/fake/dir/img002.jpg"),
+            name="img002.jpg",
+            is_folder=False,
+            mtime_ns=2000,
+        ),
+        ThumbnailEntry(
+            path=Path("/fake/dir/img003.jpg"),
+            name="img003.jpg",
+            is_folder=False,
+            mtime_ns=3000,
+        ),
     ]
 
     model.beginResetModel()
@@ -100,5 +115,7 @@ def test_all_entries_have_mapping(thumbnail_model):
     for i, entry in enumerate(thumbnail_model._entries):
         if not entry.is_folder:
             tid = thumbnail_model._make_thumbnail_id(entry)
-            assert tid in thumbnail_model._id_to_row, f"Entry {i} ({entry.name}) not in _id_to_row"
+            assert (
+                tid in thumbnail_model._id_to_row
+            ), f"Entry {i} ({entry.name}) not in _id_to_row"
             assert thumbnail_model._id_to_row[tid] == i

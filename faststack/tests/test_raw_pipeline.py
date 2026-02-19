@@ -25,6 +25,7 @@ class DummyImageFile:
     This avoids test-order issues where other tests may monkeypatch
     sys.modules["faststack.models"] and turn ImageFile into a MagicMock.
     """
+
     path: Path
     raw_pair: Path | None = None
 
@@ -286,7 +287,9 @@ class TestRawPipeline(unittest.TestCase):
             with open(path, "wb") as f:
                 f.write(b"II\x2a\x00")
 
-        with patch.object(editor, "_write_tiff_16bit", side_effect=fake_write_tiff_16bit):
+        with patch.object(
+            editor, "_write_tiff_16bit", side_effect=fake_write_tiff_16bit
+        ):
             res = editor.save_image(write_developed_jpg=True)
 
         self.assertIsNotNone(res)
@@ -332,4 +335,3 @@ class TestRawPipeline(unittest.TestCase):
         edits = {"brightness": 0.5}
         res = editor._apply_edits(arr.copy(), edits, for_export=True)
         np.testing.assert_allclose(res, 0.75, atol=0.01)
-

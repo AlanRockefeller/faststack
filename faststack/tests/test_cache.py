@@ -63,3 +63,54 @@ def test_cache_update_item():
     # Replace with a smaller item
     cache["a"] = MockItem(10)
     assert cache.currsize == 10
+
+
+def test_get_decoded_image_size_with_nbytes():
+    """Tests when buffer has nbytes."""
+    from faststack.imaging.cache import get_decoded_image_size
+    from faststack.models import DecodedImage
+
+    class MockBuffer:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+    buffer = MockBuffer(nbytes=100)
+    item = DecodedImage(
+        buffer=buffer, width=10, height=10, bytes_per_line=40, format=None
+    )
+    assert get_decoded_image_size(item) == 100
+
+
+def test_get_decoded_image_size_fallback_metadata():
+    """Tests fallback when buffer lacks nbytes but has metadata."""
+    from faststack.imaging.cache import get_decoded_image_size
+    from faststack.models import DecodedImage
+
+    class MockBuffer:
+        pass
+
+    buffer = MockBuffer()
+    item = DecodedImage(
+        buffer=buffer, width=10, height=10, bytes_per_line=30, format=None
+    )
+    # bytes_per_pixel = 30 // 10 = 3 (RGB, no overcounting)
+    # size = 10 * 10 * 3 = 300
+    assert get_decoded_image_size(item) == 300
+
+
+def test_get_decoded_image_size_fallback_default():
+    """Tests fallback when metadata is missing (should default to 4)."""
+    from faststack.imaging.cache import get_decoded_image_size
+    from types import SimpleNamespace
+
+    class MockBuffer:
+        pass
+
+    buffer = MockBuffer()
+    # Use SimpleNamespace to build a minimal object that lacks bytes_per_line
+    item = SimpleNamespace(
+        buffer=buffer, width=10, height=10
+    )
+
+    # size = 10 * 10 * 4 = 400
+    assert get_decoded_image_size(item) == 400

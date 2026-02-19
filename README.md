@@ -12,7 +12,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Crop:** Added the ability to crop and rotate images via the cr(O)p hotkey (or right mouse click).   It can be a freeform crop, or constrained to several popular aspect ratios.
 - **Zoom & Pan:** Smooth zooming and panning.
 - **Stack Selection:** Group images into stacks (`[`, `]`) and select them for processing (`S`).
-- **Speak Line**: In grid view, a spark line is visible on each folder, so you can see how far you have gotten in uploading photos in each directory.
+- **Spark Line**: In grid view, a spark line is visible on each folder, so you can see how far you have gotten in uploading photos in each directory.
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
 - **Instant Navigation:** Sub-10ms next/previous image switching, high performance decoding via `PyTurboJPEG`.
 - **Image Editor:** Built-in editor with exposure, contrast, white balance, sharpness, and more (E key)

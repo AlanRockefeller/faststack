@@ -162,7 +162,7 @@ Item {
             if (currentIndex >= count) {
                 currentIndex = count - 1
             }
-            prefetchTimer.restart()
+            if (prefetchEnabled) prefetchTimer.restart()
         }
 
         // Empty state

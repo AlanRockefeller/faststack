@@ -8,7 +8,12 @@ from faststack.imaging.editor import ImageEditor
 
 def fingerprint(arr: np.ndarray):
     """Strong content + identity-ish fingerprint."""
-    return (str(arr.dtype), arr.shape, arr.strides, hashlib.sha256(arr.tobytes()).hexdigest())
+    return (
+        str(arr.dtype),
+        arr.shape,
+        arr.strides,
+        hashlib.sha256(arr.tobytes()).hexdigest(),
+    )
 
 
 def make_editor_with_image() -> ImageEditor:
@@ -59,7 +64,9 @@ def test_apply_edits_no_copy_does_not_mutate_input():
     _out = ed._apply_edits(ed.float_image, for_export=True)
     after = fingerprint(ed.float_image)
 
-    assert after == before, "float_image was mutated by _apply_edits on the no-copy path"
+    assert (
+        after == before
+    ), "float_image was mutated by _apply_edits on the no-copy path"
 
 
 def test_save_image_passes_float_image_without_copy_when_safe(tmp_path):
@@ -69,14 +76,14 @@ def test_save_image_passes_float_image_without_copy_when_safe(tmp_path):
     to avoid global Path patches.
     """
     ed = make_editor_with_image()
-    
+
     # Create a real dummy file so we don't need to patch Path.exists/stat globally
     dummy_file = tmp_path / "test.jpg"
     dummy_file.write_bytes(b"fake_jpg_content")
-    
+
     # Set modify time to something non-zero for stat checks
     # (though typically write_bytes sets mtime)
-    
+
     ed.current_filepath = dummy_file
 
     # Safe edits only (no vignette/geometry/linear edits)
@@ -115,20 +122,27 @@ def test_save_image_passes_float_image_without_copy_when_safe(tmp_path):
 
     # Mock all the save_image I/O edges locally or on the instance
     # We no longer patch Path.exists or Path.stat globally!
-    
+
     # We still need to patch create_backup_file to avoid actual backup copying logic
-    # or just let it run if we don't care? 
+    # or just let it run if we don't care?
     # The existing test patched it. Let's patch it to return a dummy path without side effects.
-    
-    with patch.object(ed, "_apply_edits", side_effect=spy_apply), \
-         patch("faststack.imaging.editor.create_backup_file", return_value=tmp_path / "backup.jpg"), \
-         patch("PIL.Image.Image.save"), \
-         patch.object(ed, "_restore_file_times"), \
-         patch.object(ed, "_get_sanitized_exif_bytes", return_value=None):
+
+    with (
+        patch.object(ed, "_apply_edits", side_effect=spy_apply),
+        patch(
+            "faststack.imaging.editor.create_backup_file",
+            return_value=tmp_path / "backup.jpg",
+        ),
+        patch("PIL.Image.Image.save"),
+        patch.object(ed, "_restore_file_times"),
+        patch.object(ed, "_get_sanitized_exif_bytes", return_value=None),
+    ):
 
         ed.save_image()
 
-    assert seen["same_obj"] is True, "save_image did not pass self.float_image directly on safe no-copy path"
+    assert (
+        seen["same_obj"] is True
+    ), "save_image did not pass self.float_image directly on safe no-copy path"
 
 
 def test_edits_can_share_input_exclusions():

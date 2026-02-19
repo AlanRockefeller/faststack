@@ -13,6 +13,7 @@ from PySide6.QtCore import (
     QAbstractListModel,
     QModelIndex,
     QThread,
+    QTimer,
     Qt,
     Signal,
     Slot,
@@ -132,6 +133,7 @@ class ThumbnailModel(QAbstractListModel):
         parent=None,
     ):
         super().__init__(parent)
+        self._next_source_reason: Optional[str] = None
         self._base_directory = base_directory.resolve()
         self._current_directory = current_directory.resolve()
         self._get_metadata = get_metadata_callback
@@ -143,17 +145,13 @@ class ThumbnailModel(QAbstractListModel):
         self._selected_indices: Set[int] = set()
         self._last_selected_index: Optional[int] = None
         self._active_filter: str = ""  # current filename filter (set by AppController)
-        self._active_filter_flags: list = []  # current flag filters (e.g. ["uploaded", "stacked"])
-        
-        # One-shot reason for logging
-        self._next_source_reason: Optional[str] = None
+        self._active_filter_flags: list = (
+            []
+        )  # current flag filters (e.g. ["uploaded", "stacked"])
 
         # Mapping from thumbnail_id (without query params) to row index
         # id format: "{size}/{path_hash}/{mtime_ns}"
         self._id_to_row: Dict[str, int] = {}
-        
-        # One-shot reason for logging
-        self._next_source_reason: Optional[str] = None
 
         # Connect our own signal to handle thumbnail ready events
         self.thumbnailReady.connect(self._on_thumbnail_ready)
@@ -204,8 +202,6 @@ class ThumbnailModel(QAbstractListModel):
             return entry.is_edited
         elif role == self.ThumbnailSourceRole:
             reason = self._next_source_reason or "scroll"
-            # Consume one-shot reason
-            self._next_source_reason = None
             return self._get_thumbnail_source(entry, reason=reason)
         elif role == self.FolderStatsRole:
             if entry.folder_stats:
@@ -291,7 +287,9 @@ class ThumbnailModel(QAbstractListModel):
             self.HasDevelopedRole: b"hasDeveloped",
         }
 
-    def _get_thumbnail_source(self, entry: ThumbnailEntry, reason: str = "scroll") -> str:
+    def _get_thumbnail_source(
+        self, entry: ThumbnailEntry, reason: str = "scroll"
+    ) -> str:
         """Build thumbnail URL for QML Image source.
 
         Format: image://thumbnail/{size}/{path_hash}/{mtime_ns}?r={rev}&reason={reason}
@@ -369,9 +367,9 @@ class ThumbnailModel(QAbstractListModel):
     def refresh(self):
         """Refresh the model by rescanning the current directory."""
         cur, own = QThread.currentThread(), self.thread()
-        assert cur == own, (
-            f"ThumbnailModel.refresh() thread mismatch: current={cur}, owner={own}"
-        )
+        assert (
+            cur == own
+        ), f"ThumbnailModel.refresh() thread mismatch: current={cur}, owner={own}"
         self.beginResetModel()
         t0 = time.perf_counter()
         try:
@@ -400,9 +398,11 @@ class ThumbnailModel(QAbstractListModel):
                         meta = self._get_metadata(img.path.stem)
                         if not isinstance(meta, dict):
                             # Ensure it's a dict before .get()
-                            log.debug("Metadata for %s is not a dict: %r", img.path.stem, meta)
+                            log.debug(
+                                "Metadata for %s is not a dict: %r", img.path.stem, meta
+                            )
                             continue
-                            
+
                         if all(meta.get(flag, False) for flag in flags):
                             filtered.append(img)
                     except Exception as e:
@@ -418,6 +418,8 @@ class ThumbnailModel(QAbstractListModel):
         finally:
             self.endResetModel()
 
+        # Defer clear so QML's next render frame still sees the reason
+        QTimer.singleShot(0, self._clear_next_source_reason)
         self._folder_count = sum(1 for e in self._entries if e.is_folder)
         self.selectionChanged.emit()
         log.info(
@@ -428,7 +430,11 @@ class ThumbnailModel(QAbstractListModel):
         )
         log.info(
             "refresh timings: folders=%.3f images=%.3f idmap=%.3f total=%.3f n=%d",
-            t1-t0, t2-t1, t3-t2, t3-t0, len(images)
+            t1 - t0,
+            t2 - t1,
+            t3 - t2,
+            t3 - t0,
+            len(images),
         )
 
     def remove_rows_by_path(self, paths: List[Path]) -> None:
@@ -447,7 +453,9 @@ class ThumbnailModel(QAbstractListModel):
             return
 
         # Count folders being removed (for cached counter)
-        folders_removed = sum(1 for i in indices_to_remove if self._entries[i].is_folder)
+        folders_removed = sum(
+            1 for i in indices_to_remove if self._entries[i].is_folder
+        )
 
         # 2. Sort in reverse to maintain index validity during removal
         indices_to_remove.sort(reverse=True)
@@ -455,7 +463,10 @@ class ThumbnailModel(QAbstractListModel):
         # 3. Group consecutive indices for batch removal calls
         ranges = []
         if indices_to_remove:
-            current_range = [indices_to_remove[0], indices_to_remove[0]] # [last, first]
+            current_range = [
+                indices_to_remove[0],
+                indices_to_remove[0],
+            ]  # [last, first]
             for idx in indices_to_remove[1:]:
                 if idx == current_range[1] - 1:
                     current_range[1] = idx
@@ -487,18 +498,23 @@ class ThumbnailModel(QAbstractListModel):
         # 7. Rebuild mapping
         self._rebuild_id_mapping()
         self.selectionChanged.emit()
-        log.info("ThumbnailModel removed %d rows via targeted removal", len(indices_to_remove))
+        log.info(
+            "ThumbnailModel removed %d rows via targeted removal",
+            len(indices_to_remove),
+        )
 
-    def refresh_from_controller(self, images: List, metadata_map: Optional[Dict[str, dict]] = None):
+    def refresh_from_controller(
+        self, images: List, metadata_map: Optional[Dict[str, dict]] = None
+    ):
         """Refresh images from a pre-loaded list without scanning disk.
-        
+
         Folders are still scanned, but image entries are built from the
         provided objects.
         """
         self._next_source_reason = "refresh"
         cur, own = QThread.currentThread(), self.thread()
-        assert cur == own, f"ThumbnailModel refresh thread mismatch"
-        
+        assert cur == own, "ThumbnailModel refresh thread mismatch"
+
         self.beginResetModel()
         try:
             self._entries.clear()
@@ -509,7 +525,7 @@ class ThumbnailModel(QAbstractListModel):
             t0 = time.perf_counter()
             self._add_folders_to_entries()
             t1 = time.perf_counter()
-            
+
             # Apply active filename filter if set
             if self._active_filter:
                 needle = self._active_filter.lower()
@@ -527,9 +543,11 @@ class ThumbnailModel(QAbstractListModel):
                             meta = self._get_metadata(img.path.stem)
                         else:
                             continue
-                            
+
                         if not isinstance(meta, dict):
-                            log.debug("Metadata for %s is not a dict: %r", img.path.stem, meta)
+                            log.debug(
+                                "Metadata for %s is not a dict: %r", img.path.stem, meta
+                            )
                             continue
 
                         if all(meta.get(flag, False) for flag in flags):
@@ -546,19 +564,27 @@ class ThumbnailModel(QAbstractListModel):
         finally:
             self.endResetModel()
 
+        QTimer.singleShot(0, self._clear_next_source_reason)
         self._folder_count = sum(1 for e in self._entries if e.is_folder)
         self.selectionChanged.emit()
         log.info(
             "refresh_from_controller timings: folders=%.3f images=%.3f idmap=%.3f total=%.3f n=%d (bulk_meta=%s)",
-            t1-t0, t2-t1, t3-t2, t3-t0, len(images), metadata_map is not None
+            t1 - t0,
+            t2 - t1,
+            t3 - t2,
+            t3 - t0,
+            len(images),
+            metadata_map is not None,
         )
 
-    def _add_images_to_entries(self, images: List, metadata_map: Optional[Dict[str, dict]] = None):
+    def _add_images_to_entries(
+        self, images: List, metadata_map: Optional[Dict[str, dict]] = None
+    ):
         """Convert list of objects (ImageFile or similar) to ThumbnailEntry."""
         for img in images:
             try:
                 # Use mtime from object if available to avoid stat()
-                if hasattr(img, 'timestamp') and img.timestamp:
+                if hasattr(img, "timestamp") and img.timestamp:
                     mtime_ns = int(img.timestamp * 1e9)
                 else:
                     mtime_ns = img.path.stat().st_mtime_ns
@@ -589,12 +615,14 @@ class ThumbnailModel(QAbstractListModel):
                         is_restacked = meta.get("restacked", False)
                         is_favorite = meta.get("favorite", False)
                     else:
-                        log.debug("Metadata for %s is not a dict: %r", img.path.stem, meta)
+                        log.debug(
+                            "Metadata for %s is not a dict: %r", img.path.stem, meta
+                        )
                 except Exception as e:
                     log.debug("Error getting metadata for %s: %s", img.path, e)
 
-            has_backups = getattr(img, 'has_backups', False)
-            has_developed = getattr(img, 'has_developed', False)
+            has_backups = getattr(img, "has_backups", False)
+            has_developed = getattr(img, "has_developed", False)
 
             self._entries.append(
                 ThumbnailEntry(
@@ -636,10 +664,14 @@ class ThumbnailModel(QAbstractListModel):
         """Handle thumbnail ready signal - bump revision and emit dataChanged."""
         if thumbnail_id not in self._id_to_row:
             if log.isEnabledFor(logging.DEBUG):
-                actual_size = thumbnail_id.split("/", 1)[0] if "/" in thumbnail_id else "?"
+                actual_size = (
+                    thumbnail_id.split("/", 1)[0] if "/" in thumbnail_id else "?"
+                )
                 log.debug(
                     "thumbnail ready id not in model map: id=%s expected_size=%s actual_size=%s",
-                    thumbnail_id, self._thumbnail_size, actual_size,
+                    thumbnail_id,
+                    self._thumbnail_size,
+                    actual_size,
                 )
             return
 
@@ -706,6 +738,10 @@ class ThumbnailModel(QAbstractListModel):
         self._last_selected_index = None
         self._next_source_reason = "jump"
         self.refresh()
+
+    def _clear_next_source_reason(self):
+        """Deferred clear of _next_source_reason (called via QTimer.singleShot)."""
+        self._next_source_reason = None
 
     # Selection methods
 
@@ -793,7 +829,7 @@ class ThumbnailModel(QAbstractListModel):
 
     def _compute_path_hash(self, path: Path) -> str:
         """Computes a stable hash for the given path.
-        
+
         Now uses centralized helper which is purely string-based (no .resolve() calls).
         """
         return compute_path_hash(path)

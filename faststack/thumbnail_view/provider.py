@@ -2,17 +2,17 @@
 
 import logging
 import time
+from urllib.parse import unquote
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, NamedTuple
 
 import faststack.util.thumb_debug as thumb_debug
 
 from PySide6.QtCore import QSize
-from PySide6.QtGui import QImage, QPixmap, QColor
+from PySide6.QtGui import QImage, QColor
 from PySide6.QtQuick import QQuickImageProvider
 
 from faststack.io.utils import compute_path_hash
-from faststack.models import DecodedImage
 
 if TYPE_CHECKING:
     from faststack.thumbnail_view.model import ThumbnailModel
@@ -26,11 +26,24 @@ FOLDER_COLOR = QColor(80, 80, 80)  # Slightly different for folders
 ERROR_COLOR = QColor(80, 40, 40)  # Dark red for errors
 
 
+class ParsedId(NamedTuple):
+    """Container for parsed thumbnail ID fields."""
+
+    id_clean: str
+    parts: list[str]
+    thumb_size: Optional[int]
+    path_hash: Optional[str]
+    mtime_ns: Optional[int]
+    reason: str
+    is_folder: bool
+    is_valid: bool
+
+
 class ThumbnailProvider(QQuickImageProvider):
     """QML Image Provider for thumbnails.
 
     Non-blocking O(1) implementation:
-    - Returns cached pixmap if available
+    - Returns cached QImage if available
     - Returns placeholder immediately if not cached
     - Schedules decode via prefetcher (does NOT decode inline)
 
@@ -58,7 +71,7 @@ class ThumbnailProvider(QQuickImageProvider):
             debug_timing: Enable [THUMB-TIMING] log lines
             debug_trace: Enable verbose trace logs
         """
-        super().__init__(QQuickImageProvider.ImageType.Pixmap)
+        super().__init__(QQuickImageProvider.ImageType.Image)
         self._cache = cache
         self._prefetcher = prefetcher
         self._path_resolver = path_resolver
@@ -66,12 +79,12 @@ class ThumbnailProvider(QQuickImageProvider):
         self._debug_timing = debug_timing
         self._debug_trace = debug_trace
 
-        # Pre-create placeholder pixmaps
+        # Pre-create placeholder images
         self._placeholder = self._create_placeholder(default_size, PLACEHOLDER_COLOR)
         self._folder_placeholder = self._create_folder_placeholder(default_size)
         self._error_placeholder = self._create_placeholder(default_size, ERROR_COLOR)
 
-        # Timing stats for requestPixmap
+        # Timing stats for requestImage
         self._first_request_time: Optional[float] = None
         self._request_count = 0
         self._first_second_logged = False
@@ -79,20 +92,20 @@ class ThumbnailProvider(QQuickImageProvider):
 
         log.debug("ThumbnailProvider initialized with default size %d", default_size)
 
-    def _create_placeholder(self, size: int, color: QColor) -> QPixmap:
-        """Create a solid color placeholder pixmap."""
-        pixmap = QPixmap(size, size)
-        pixmap.fill(color)
-        return pixmap
+    def _create_placeholder(self, size: int, color: QColor) -> QImage:
+        """Create a solid color placeholder image."""
+        image = QImage(size, size, QImage.Format.Format_RGB888)
+        image.fill(color)
+        return image
 
-    def _create_folder_placeholder(self, size: int) -> QPixmap:
+    def _create_folder_placeholder(self, size: int) -> QImage:
         """Create a folder icon placeholder."""
         from PySide6.QtGui import QPainter, QPen, QBrush
 
-        pixmap = QPixmap(size, size)
-        pixmap.fill(FOLDER_COLOR)
+        image = QImage(size, size, QImage.Format.Format_RGB888)
+        image.fill(FOLDER_COLOR)
 
-        painter = QPainter(pixmap)
+        painter = QPainter(image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # Draw a simple folder shape
@@ -120,147 +133,171 @@ class ThumbnailProvider(QQuickImageProvider):
         )
 
         painter.end()
-        return pixmap
+        return image
 
-    def requestPixmap(self, id_str: str, size: QSize, requestedSize: QSize) -> QPixmap:
-        """Request a pixmap for the given ID.
+    def _parse_id(self, id_str: str) -> ParsedId:
+        """Parse the thumbnail ID string.
+
+        Format: {size}/{path_hash}/{mtime_ns}?r={rev}
+        Or: folder/{path_hash}/{mtime_ns}?r={rev}
+
+        Returns:
+            ParsedId named tuple with extracted fields.
+        """
+        # Split query params
+        parts_query = id_str.split("?")
+        id_clean = parts_query[0]
+        reason = "unknown"
+
+        if len(parts_query) > 1:
+            query = parts_query[1]
+            for param in query.split("&"):
+                if param.startswith("reason="):
+                    # Robust parsing with split(..., 1) and URL decoding
+                    reason = unquote(param.split("=", 1)[1])
+
+        parts = id_clean.split("/")
+        if len(parts) < 3:
+            return ParsedId(id_clean, parts, None, None, None, reason, False, False)
+
+        is_folder = parts[0] == "folder"
+        try:
+            # If folder, we don't have a thumb_size in the first part,
+            # but we need path_hash and mtime_ns.
+            if is_folder:
+                thumb_size = self._default_size
+                path_hash = parts[1]
+                mtime_ns = int(parts[2])
+            else:
+                thumb_size = int(parts[0])
+                path_hash = parts[1]
+                mtime_ns = int(parts[2])
+            return ParsedId(
+                id_clean, parts, thumb_size, path_hash, mtime_ns, reason, is_folder, True
+            )
+        except (ValueError, IndexError):
+            return ParsedId(
+                id_clean, parts, None, None, None, reason, is_folder, False
+            )
+
+    def requestImage(self, id_str: str, size: QSize, _requestedSize: QSize) -> QImage:
+        """Request an image for the given ID.
 
         This method is O(1) - returns immediately with cached data or placeholder.
 
         Args:
             id_str: URL path after "image://thumbnail/"
             size: Output size reference (set by us)
-            requestedSize: Requested size from QML
+            _requestedSize: Requested size from QML (unused)
 
         Returns:
-            QPixmap of the thumbnail or placeholder
+            QImage of the thumbnail or placeholder
         """
         # Parse the ID
-        # Format: {size}/{path_hash}/{mtime_ns}?r={rev}
-        # Or: folder/{path_hash}/{mtime_ns}?r={rev}
+        parsed = self._parse_id(id_str)
 
-        # Strip query params
-        id_clean = id_str.split("?")[0]
-        
+        if not parsed.is_valid:
+            log.debug("Invalid thumbnail ID: %s", id_str)
+            size.setWidth(self._error_placeholder.width())
+            size.setHeight(self._error_placeholder.height())
+            return self._error_placeholder
+
+        if parsed.is_folder:
+            size.setWidth(self._folder_placeholder.width())
+            size.setHeight(self._folder_placeholder.height())
+            return self._folder_placeholder
+
         # Track total requests if logging enabled
         if thumb_debug.timing_enabled or thumb_debug.trace_enabled:
             thumb_debug.inc_request_count()
 
         # Deferred logging setup
         timer = None
+        cache_key = parsed.id_clean
+        
+        # Resolve path - we already have path_hash and mtime_ns
+        path = self._path_resolver(parsed.path_hash) if self._path_resolver else None
+
         if thumb_debug.timing_enabled or thumb_debug.trace_enabled:
-            # Parse reason
-            reason = "unknown"
-            parts_query = id_str.split("?")
-            if len(parts_query) > 1:
-                query = parts_query[1]
-                for param in query.split("&"):
-                    if param.startswith("reason="):
-                        reason = param.split("=")[1]
-            
-            # Key/ID parts
-            # Key format: {size}/{path_hash}/{mtime_ns}
-            parts = id_clean.split("/")
-            if len(parts) < 3:
-                log.debug("Invalid thumbnail ID format: %s", id_str)
-                return self._error_placeholder
-
-            # Determine if folder (early exit for folders)
-            if parts[0] == "folder":
-                return self._folder_placeholder
-
-            try:
-                thumb_size = int(parts[0])
-                path_hash = parts[1]
-                mtime_ns = int(parts[2])
-            except (ValueError, IndexError):
-                log.debug("Invalid thumbnail ID: %s", id_str)
-                return self._error_placeholder
-
-            cache_key = f"{thumb_size}/{path_hash}/{mtime_ns}"
-            # Resolve path only if needed for trace
-            path = self._path_resolver(path_hash) if self._path_resolver else None
-            timer = thumb_debug.ThumbTimer(key=cache_key, path=path, reason=reason)
-            thumb_debug.log_trace("requested", rid=timer.rid, key=timer.key, src=timer.src, reason=reason)
-        else:
-            # Normal fast path — already have id_clean
-            cache_key = id_clean
+            timer = thumb_debug.ThumbTimer(
+                key=cache_key, path=path, reason=parsed.reason
+            )
+            thumb_debug.log_trace(
+                "requested",
+                rid=timer.rid,
+                key=timer.key,
+                src=timer.src,
+                reason=parsed.reason,
+            )
 
         # Check cache (O(1) lookup)
-        t_cache_get_start = time.perf_counter()
+        t_cache_get_start = time.perf_counter() if timer else 0
         cached_bytes = self._cache.get(cache_key)
-        dt_cache_get = (time.perf_counter() - t_cache_get_start) * 1000
-        
+        dt_cache_get = (time.perf_counter() - t_cache_get_start) * 1000 if timer else 0
+
         if cached_bytes:
             if timer:
                 thumb_debug.inc("req_cache_hit")
-                thumb_debug.log_trace("cache_hit", rid=timer.rid, ms=f"{dt_cache_get:.3f}")
-            
-            # Decode JPEG bytes to pixmap
-            t_pixmap_start = time.perf_counter()
-            pixmap = self._bytes_to_pixmap(cached_bytes)
-            dt_pixmap = (time.perf_counter() - t_pixmap_start) * 1000
+                thumb_debug.log_trace(
+                    "cache_hit", rid=timer.rid, ms=f"{dt_cache_get:.3f}"
+                )
 
-            if pixmap and not pixmap.isNull():
+            # Decode JPEG bytes to QImage
+            t_decode_start = time.perf_counter() if timer else 0
+            image = self._bytes_to_image(cached_bytes)
+            dt_decode = (time.perf_counter() - t_decode_start) * 1000 if timer else 0
+
+            if image is not None and not image.isNull():
                 if timer:
-                    thumb_debug.log_trace("delivered", rid=timer.rid, pixmap_ms=f"{dt_pixmap:.3f}")
-                    timer.log_timing(
-                        cache="hit", 
-                        cache_get_ms=f"{dt_cache_get:.3f}",
-                        pixmap_ms=f"{dt_pixmap:.3f}"
+                    thumb_debug.log_trace(
+                        "delivered", rid=timer.rid, decode_ms=f"{dt_decode:.3f}"
                     )
-                return pixmap
-        
+                    timer.log_timing(
+                        cache="hit",
+                        cache_get_ms=f"{dt_cache_get:.3f}",
+                        pixmap_ms=f"{dt_decode:.3f}",  # keep tag for consistency in logs
+                    )
+                size.setWidth(image.width())
+                size.setHeight(image.height())
+                return image
+            else:
+                # Decode of cached bytes failed — evict the bad entry so
+                # the prefetcher can re-decode on the next request.
+                if self._cache.discard(cache_key):
+                    log.warning("Evicted bad cache entry: %s", cache_key)
+
         if timer:
             thumb_debug.inc("req_cache_miss")
             thumb_debug.log_trace("cache_miss", rid=timer.rid, ms=f"{dt_cache_get:.3f}")
 
-        # Not in cache - parse parts if we haven't already
-        # If timer was created, parts, thumb_size, path_hash, mtime_ns are already set.
-        # If not, we need to parse them now.
-        if not timer:
-            parts = id_clean.split("/")
-            if len(parts) < 3:
-                log.debug("Invalid thumbnail ID format: %s", id_str)
-                return self._error_placeholder
-
-            # Determine if folder (early exit for folders)
-            if parts[0] == "folder":
-                path_hash = parts[1]
-                try:
-                    mtime_ns = int(parts[2])
-                except ValueError:
-                    return self._error_placeholder
-                return self._folder_placeholder
-
-            try:
-                thumb_size = int(parts[0])
-                path_hash = parts[1]
-                mtime_ns = int(parts[2])
-            except (ValueError, IndexError):
-                log.debug("Invalid thumbnail ID: %s", id_str)
-                return self._error_placeholder
-
-        # Resolve path
-        path = self._path_resolver(path_hash) if self._path_resolver else None
         if path:
             self._prefetcher.submit(
-                path, mtime_ns, thumb_size, 
+                path,
+                parsed.mtime_ns,
+                parsed.thumb_size,
                 priority=self._prefetcher.PRIO_HIGH,
-                timer=timer
+                timer=timer,
             )
 
         # Return placeholder immediately (non-blocking)
+        size.setWidth(self._placeholder.width())
+        size.setHeight(self._placeholder.height())
         return self._placeholder
 
-    def _bytes_to_pixmap(self, jpeg_bytes: bytes) -> Optional[QPixmap]:
-        """Convert JPEG bytes to QPixmap."""
+    def _bytes_to_image(self, jpeg_bytes: bytes) -> Optional[QImage]:
+        """Convert JPEG bytes to QImage.
+
+        Returns:
+            QImage of the decoded bytes, or None on failure.
+        """
         try:
-            qimage = QImage()
-            if qimage.loadFromData(jpeg_bytes, "JPEG"):
-                return QPixmap.fromImage(qimage)
+            image = QImage()
+            if image.loadFromData(jpeg_bytes, "JPEG"):
+                return image
+            log.warning("JPEG decode failed for cached bytes")
         except Exception as e:
-            log.debug("Failed to convert bytes to pixmap: %s", e)
+            # Guard against Qt/C++ interop runtime errors or other failures during decode
+            log.warning("Exception during JPEG decode from cache: %s", e, exc_info=True)
         return None
 
 
@@ -300,4 +337,8 @@ class PathResolver:
                 self._hash_to_path[path_hash] = entry.path
 
         dt = time.perf_counter() - t0
-        log.debug(f"PathResolver update took {dt*1000:.2f}ms for {model.rowCount()} items")
+        log.debug(
+            "PathResolver update took %.2fms for %d items",
+            dt * 1000,
+            model.rowCount(),
+        )

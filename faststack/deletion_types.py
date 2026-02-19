@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 
-
 from enum import Enum
+
 
 class DeletionErrorCodes(str, Enum):
     """Standardized error codes for deletion failures."""
+
     RECYCLE_FAILED = "recycle_failed"
     PERMISSION_DENIED = "permission_denied"
     TRASH_FULL = "trash_full"
@@ -115,29 +116,35 @@ class DeleteResult:
 
         successes = []
         for s in raw.get("successes", []):
-            successes.append(DeleteRecord(
-                jpg=_to_path(s.get("jpg")),
-                recycled_jpg=_to_path(s.get("recycled_jpg")),
-                raw=_to_path(s.get("raw")),
-                recycled_raw=_to_path(s.get("recycled_raw")),
-            ))
+            successes.append(
+                DeleteRecord(
+                    jpg=_to_path(s.get("jpg")),
+                    recycled_jpg=_to_path(s.get("recycled_jpg")),
+                    raw=_to_path(s.get("raw")),
+                    recycled_raw=_to_path(s.get("recycled_raw")),
+                )
+            )
 
         warnings = []
         for w in raw.get("warnings", []):
-            warnings.append(DeleteWarning(
-                jpg=_to_path(w.get("jpg")),
-                raw=_to_path(w.get("raw")),
-                message=w.get("message", ""),
-            ))
+            warnings.append(
+                DeleteWarning(
+                    jpg=_to_path(w.get("jpg")),
+                    raw=_to_path(w.get("raw")),
+                    message=w.get("message", ""),
+                )
+            )
 
         failures = []
         for f in raw.get("failures", []):
-            failures.append(DeleteFailure(
-                jpg=_to_path(f.get("jpg")),
-                raw=_to_path(f.get("raw")),
-                code=f.get("code", ""),
-                message=f.get("message", ""),
-            ))
+            failures.append(
+                DeleteFailure(
+                    jpg=_to_path(f.get("jpg")),
+                    raw=_to_path(f.get("raw")),
+                    code=f.get("code", ""),
+                    message=f.get("message", ""),
+                )
+            )
 
         return cls(
             job_id=raw.get("job_id", 0),

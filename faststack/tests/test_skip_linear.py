@@ -17,7 +17,7 @@ class TestSkipLinearOptimization(unittest.TestCase):
         np.random.seed(42)
         self.editor = ImageEditor()
         # Deterministic float32 image in [0.1, 0.9] — avoids clip boundaries
-        self.arr = (np.random.rand(100, 100, 3).astype(np.float32) * 0.8 + 0.1)
+        self.arr = np.random.rand(100, 100, 3).astype(np.float32) * 0.8 + 0.1
 
     def test_skip_linear_output_matches_full_pipeline(self):
         """Skip-linear uint8 output must match full-pipeline output within 1/255.
@@ -32,7 +32,9 @@ class TestSkipLinearOptimization(unittest.TestCase):
 
         # Skip path: exposure == 0 → _skip_linear=True
         result_skip = self.editor._apply_edits(
-            self.arr.copy(), edits=edits_base, for_export=True,
+            self.arr.copy(),
+            edits=edits_base,
+            for_export=True,
         )
         u8_skip = (np.clip(result_skip, 0.0, 1.0) * 255).astype(np.uint8)
 
@@ -40,13 +42,18 @@ class TestSkipLinearOptimization(unittest.TestCase):
         edits_full = dict(edits_base)
         edits_full["exposure"] = 0.002
         result_full = self.editor._apply_edits(
-            self.arr.copy(), edits=edits_full, for_export=True,
+            self.arr.copy(),
+            edits=edits_full,
+            for_export=True,
         )
         u8_full = (np.clip(result_full, 0.0, 1.0) * 255).astype(np.uint8)
 
-        max_diff = int(np.max(np.abs(u8_skip.astype(np.int16) - u8_full.astype(np.int16))))
+        max_diff = int(
+            np.max(np.abs(u8_skip.astype(np.int16) - u8_full.astype(np.int16)))
+        )
         self.assertLessEqual(
-            max_diff, 1,
+            max_diff,
+            1,
             f"Skip-linear output diverged from full pipeline by {max_diff}/255",
         )
 
@@ -75,7 +82,8 @@ class TestSkipLinearOptimization(unittest.TestCase):
 
         # source must be identical (byte-for-byte)
         self.assertEqual(
-            source.data.tobytes().__hash__(), source_hash,
+            source.data.tobytes().__hash__(),
+            source_hash,
             "float_image was mutated by _apply_edits on the no-copy path",
         )
 

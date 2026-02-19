@@ -10,6 +10,7 @@ from pathlib import Path
 sys.modules["faststack.config"] = MagicMock()
 from faststack.imaging.prefetch import Prefetcher
 
+
 class ReproFuturesCleanup(unittest.TestCase):
     def test_newer_future_is_not_deleted_by_older_task(self):
         # Dependencies
@@ -32,36 +33,45 @@ class ReproFuturesCleanup(unittest.TestCase):
 
         future_a = MagicMock(spec=Future)
         future_a.done.return_value = False
-        
+
         future_b = MagicMock(spec=Future)
         future_b.done.return_value = False
 
         index = 1
         prefetcher.futures[index] = future_a
-        
+
         # Simulate Task A's finally block running with its 'future' reference
         # but the actual prefetcher.futures[index] has been replaced by future_b
         prefetcher.futures[index] = future_b
-        
+
         # Now simulate Task A completing its cleanup
         # This is what _decode_and_cache does in its finally block:
         # with self._futures_lock:
         #     if self.futures.get(index) is future:
         #         del self.futures[index]
-        
+
         def simulate_cleanup(prefetcher, idx, fut):
             with prefetcher._futures_lock:
                 if prefetcher.futures.get(idx) is fut:
                     del prefetcher.futures[idx]
 
         simulate_cleanup(prefetcher, index, future_a)
-        
-        self.assertIn(index, prefetcher.futures, "Newer future was deleted by older task cleanup!")
-        self.assertIs(prefetcher.futures[index], future_b, "The future in self.futures is not the newer one!")
-        
+
+        self.assertIn(
+            index, prefetcher.futures, "Newer future was deleted by older task cleanup!"
+        )
+        self.assertIs(
+            prefetcher.futures[index],
+            future_b,
+            "The future in self.futures is not the newer one!",
+        )
+
         # Now simulate Task B cleanup
         simulate_cleanup(prefetcher, index, future_b)
-        self.assertNotIn(index, prefetcher.futures, "Future was not deleted after its OWN cleanup!")
+        self.assertNotIn(
+            index, prefetcher.futures, "Future was not deleted after its OWN cleanup!"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

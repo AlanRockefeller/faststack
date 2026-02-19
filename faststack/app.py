@@ -54,7 +54,9 @@ from faststack.logging_setup import setup_logging
 from faststack.models import ImageFile, DecodedImage
 from faststack.io.indexer import find_images, find_images_with_variants, image_sort_key
 from faststack.io.variants import (
-    VariantGroup, build_badge_list, get_group_key_for_path,
+    VariantGroup,
+    build_badge_list,
+    get_group_key_for_path,
     norm_path,
 )
 from faststack.io.sidecar import SidecarManager
@@ -156,7 +158,7 @@ class AppController(QObject):
     _thumbnailReadySignal = Signal(str)
 
     MAX_FAILED_RESTORATIONS_TO_LOG = 10
-    
+
     @staticmethod
     def _key(p: Optional[Path]) -> Optional[str]:
         """Normalize path for consistent comparison without slow resolve()."""
@@ -175,21 +177,27 @@ class AppController(QObject):
     _deleteFinished = Signal(
         object
     )  # Signal for async delete completion (result dict from worker)
+    _exifBriefReady = Signal(str, str)  # (path_str, brief) from background thread
 
     def __init__(
-        self, image_dir: Path, engine: QQmlApplicationEngine, 
-        debug_cache: bool = False, 
+        self,
+        image_dir: Path,
+        engine: QQmlApplicationEngine,
+        debug_cache: bool = False,
         debug_thumb_timing: bool = False,
-        debug_thumb_trace: bool = False
+        debug_thumb_trace: bool = False,
     ):
         super().__init__()
         self.debug_thumb_timing = debug_thumb_timing
         self.debug_thumb_trace = debug_thumb_trace
 
         import faststack.util.thumb_debug as thumb_debug
+
         thumb_debug.init(timing=self.debug_thumb_timing, trace=self.debug_thumb_trace)
         # Histogram Offloading Setup
-        self._hist_executor = create_daemon_threadpool_executor(max_workers=1, thread_name_prefix="Histogram")
+        self._hist_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="Histogram"
+        )
         self._hist_inflight = False
         self._hist_pending = None
         self._hist_token = 0
@@ -214,7 +222,13 @@ class AppController(QObject):
         self._next_delete_job_id = 0
 
         # Preview Offloading Setup
-        self._preview_executor = create_daemon_threadpool_executor(max_workers=1, thread_name_prefix="Preview")
+        self._preview_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="Preview"
+        )
+        # EXIF Brief Offloading Setup (dedicated executor to avoid blocking histograms)
+        self._exif_executor = create_daemon_threadpool_executor(
+            max_workers=2, thread_name_prefix="EXIF"
+        )
         self._preview_inflight = False
         self._preview_pending = False
         self._preview_token = 0
@@ -223,12 +237,14 @@ class AppController(QObject):
         self._shutting_down = False  # Flag to gate async callbacks during shutdown
         self._refresh_scheduled = False  # Coalesce guard for deferred disk refresh
         self._opencv_warning_shown = False  # Only show OpenCV warning once per session
-        self._last_auto_levels_msg: str = ""  # Detail message from last auto_levels() call
+        self._last_auto_levels_msg: str = (
+            ""  # Detail message from last auto_levels() call
+        )
 
         # Variant state
         self._variant_map: Dict[str, VariantGroup] = {}
         self.view_override_path: Optional[str] = None  # normalized absolute string
-        self.view_override_kind: Optional[str] = None   # "main"|"developed"|"backup"
+        self.view_override_kind: Optional[str] = None  # "main"|"developed"|"backup"
 
         self.image_dir = image_dir
         self.image_files: List[ImageFile] = []  # Filtered list for display
@@ -267,7 +283,9 @@ class AppController(QObject):
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
         self.image_editor = ImageEditor()  # Initialize the editor
         self._dialog_open_count = 0  # Track nested dialogs
-        self._temp_files_to_clean: List[Path] = []  # Track temp files for cleanup on shutdown
+        self._temp_files_to_clean: List[Path] = (
+            []
+        )  # Track temp files for cleanup on shutdown
 
         # -- Caching & Prefetching --
         cache_size_gb = config.getfloat("core", "cache_size_gb", 1.5)
@@ -367,11 +385,15 @@ class AppController(QObject):
         self.batches: List[List[int]] = []  # List of [start, end] ranges
 
         self._filter_string: str = ""  # Default filter
-        self._filter_flags: list = []  # Active flag filters (e.g. ["uploaded", "stacked"])
+        self._filter_flags: list = (
+            []
+        )  # Active flag filters (e.g. ["uploaded", "stacked"])
         self._filter_enabled: bool = False
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
+        self._exif_brief_cache: dict = {}  # normalized path key → formatted EXIF string
+        self._exif_pending_path: Optional[str] = None  # path currently awaiting EXIF read
         with self._last_image_lock:
             self.last_displayed_image = None
         self._logged_empty_metadata = False
@@ -419,16 +441,26 @@ class AppController(QObject):
         if self.debug_thumb_timing or self.debug_thumb_trace:
             self._thumb_summary_timer = QTimer(self)
             self._thumb_summary_timer.setInterval(1000)  # Check every second
-            self._thumb_summary_timer.timeout.connect(thumb_debug.check_periodic_summary)
+            self._thumb_summary_timer.timeout.connect(
+                thumb_debug.check_periodic_summary
+            )
             self._thumb_summary_timer.start()
-
 
         # Debounce timer for metadata/highlight signals during rapid navigation
         # Only emits these signals once user stops navigating (16ms = 1 frame debounce)
         self._metadata_debounce_timer = QTimer(self)
         self._metadata_debounce_timer.setSingleShot(True)
         self._metadata_debounce_timer.setInterval(16)  # 16ms debounce (1 frame)
-        self._metadata_debounce_timer.timeout.connect(self._emit_debounced_metadata_signals)
+        self._metadata_debounce_timer.timeout.connect(
+            self._emit_debounced_metadata_signals
+        )
+
+        # Debounce timer for EXIF reads — only fires after user stops scrolling
+        self._exif_debounce_timer = QTimer(self)
+        self._exif_debounce_timer.setSingleShot(True)
+        self._exif_debounce_timer.setInterval(150)  # 150ms debounce
+        self._exif_debounce_timer.timeout.connect(self._read_exif_deferred)
+        self._exifBriefReady.connect(self._on_exif_brief_ready)
 
         # Track if any dialog is open to disable keybindings
         self._dialog_open = False
@@ -576,7 +608,11 @@ class AppController(QObject):
 
     @Slot()
     def clear_filter(self):
-        if not self._filter_enabled and not self._filter_string and not self._filter_flags:
+        if (
+            not self._filter_enabled
+            and not self._filter_string
+            and not self._filter_flags
+        ):
             return
         self._filter_enabled = False
         self._filter_string = ""
@@ -764,7 +800,11 @@ class AppController(QObject):
         return super().eventFilter(watched, event)
 
     def _do_prefetch(
-        self, index: int, is_navigation: bool = False, direction: Optional[int] = None, override_path: Optional[Path] = None
+        self,
+        index: int,
+        is_navigation: bool = False,
+        direction: Optional[int] = None,
+        override_path: Optional[Path] = None,
     ):
         """Helper to defer prefetch until display size is stable.
 
@@ -802,7 +842,7 @@ class AppController(QObject):
             index, is_navigation=is_navigation, direction=direction
         )
 
-    def load(self):
+    def load(self, skip_thumbnail_refresh: bool = False):
         """Loads images, sidecar data, and starts services."""
         # Reset instrumentation for this load operation
         self._scan_count_variant = 0
@@ -828,10 +868,14 @@ class AppController(QObject):
         self._folder_loaded = True
         self.ui_state.isFolderLoadedChanged.emit()
 
-        if self._is_grid_view_active:
-            
+        if self._is_grid_view_active and not skip_thumbnail_refresh:
+
             # Ensure grid model is populated if starting in grid mode
-            if self._thumbnail_model and self._grid_model_dirty and self._thumbnail_model.rowCount() == 0:
+            if (
+                self._thumbnail_model
+                and self._grid_model_dirty
+                and self._thumbnail_model.rowCount() == 0
+            ):
                 self._grid_refreshes += 1
                 self._thumbnail_model.refresh_from_controller(self.image_files)
                 self._path_resolver.update_from_model(self._thumbnail_model)
@@ -861,7 +905,10 @@ class AppController(QObject):
                 if expiry:
                     if now < expiry:
                         if _debug_mode:
-                            log.debug("Suppressing watcher refresh for recently deleted path: %s", path)
+                            log.debug(
+                                "Suppressing watcher refresh for recently deleted path: %s",
+                                path,
+                            )
                         return
                     else:
                         # Cleanup expired entry
@@ -934,7 +981,7 @@ class AppController(QObject):
                 meta = entries.get(stem)
                 if not meta:
                     continue
-                
+
                 # Check if all flags are present
                 # EntryMetadata is a simple object, getattr is fast
                 if all(getattr(meta, flag, False) for flag in flags):
@@ -981,9 +1028,7 @@ class AppController(QObject):
                 self.current_index = i
                 return True
 
-        log.warning(
-            "_reindex_after_save: could not find %s in list", saved_path
-        )
+        log.warning("_reindex_after_save: could not find %s in list", saved_path)
         return False
 
     # --- Variant Badge Logic ---
@@ -1011,7 +1056,7 @@ class AppController(QObject):
         result_badges = []
         for badge in badges:
             b_copy = badge.copy()
-            b_copy["active"] = (badge["path"] == active_norm)
+            b_copy["active"] = badge["path"] == active_norm
             result_badges.append(b_copy)
         return result_badges
 
@@ -1041,10 +1086,12 @@ class AppController(QObject):
 
         # Bump generation to bust cache, trigger re-render
         self.ui_refresh_generation += 1
-        
+
         # Trigger decode for the new variant
         override_p = Path(self.view_override_path) if self.view_override_path else None
-        self._maybe_decode_current_image(reason="variant-switch", override_path=override_p)
+        self._maybe_decode_current_image(
+            reason="variant-switch", override_path=override_p
+        )
 
         if self.ui_state:
             self.ui_state.variantBadgesChanged.emit()
@@ -1065,11 +1112,13 @@ class AppController(QObject):
         # Only decode full-res when we are in loupe mode and the folder is loaded.
         return (not self._is_grid_view_active) and self._folder_loaded
 
-    def _maybe_decode_current_image(self, reason: str = "", override_path: Optional[Path] = None) -> None:
+    def _maybe_decode_current_image(
+        self, reason: str = "", override_path: Optional[Path] = None
+    ) -> None:
         """Trigger decode of current image if allowed."""
         if not self._loupe_decode_allowed():
             return
-        
+
         # Log reason for debugging
         if _debug_mode and reason:
             log.debug(f"Triggering decode: {reason}")
@@ -1086,12 +1135,17 @@ class AppController(QObject):
         """
         if not self._loupe_decode_allowed():
             if _debug_mode:
-                log.debug("get_decoded_image called but loupe decode not allowed (index=%d)", index)
+                log.debug(
+                    "get_decoded_image called but loupe decode not allowed (index=%d)",
+                    index,
+                )
             return None
 
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} get_decoded_image: START index={index}")
+            print(
+                f"[DBGCACHE] {_t_start*1000:.3f} get_decoded_image: START index={index}"
+            )
 
         if not self.image_files or index < 0 or index >= len(self.image_files):
             log.warning(
@@ -1129,12 +1183,13 @@ class AppController(QObject):
 
         # Variant override: use override path for current index
         current_override = None
-        if (
-            self.view_override_path
-            and index == self.current_index
-        ):
+        if self.view_override_path and index == self.current_index:
             if _debug_mode:
-                log.debug("DISPLAY OVERRIDE kind=%s path=%s", self.view_override_kind, self.view_override_path)
+                log.debug(
+                    "DISPLAY OVERRIDE kind=%s path=%s",
+                    self.view_override_kind,
+                    self.view_override_path,
+                )
             image_path = Path(self.view_override_path)
             current_override = image_path
         else:
@@ -1152,7 +1207,9 @@ class AppController(QObject):
 
             if self.debug_cache:
                 _t_end = time.perf_counter()
-                print(f"[DBGCACHE] {_t_end*1000:.3f} get_decoded_image: CACHE HIT index={index} total={(_t_end - _t_start)*1000:.2f}ms")
+                print(
+                    f"[DBGCACHE] {_t_end*1000:.3f} get_decoded_image: CACHE HIT index={index} total={(_t_end - _t_start)*1000:.2f}ms"
+                )
 
             return decoded
 
@@ -1167,7 +1224,9 @@ class AppController(QObject):
             ]
             cache_usage_gb = self.image_cache.currsize / (1024**3)
             _t_miss = time.perf_counter()
-            print(f"[DBGCACHE] {_t_miss*1000:.3f} get_decoded_image: CACHE MISS index={index} gen={display_gen} (after {(_t_miss - _t_start)*1000:.2f}ms)")
+            print(
+                f"[DBGCACHE] {_t_miss*1000:.3f} get_decoded_image: CACHE MISS index={index} gen={display_gen} (after {(_t_miss - _t_start)*1000:.2f}ms)"
+            )
             log.info(
                 "Cache miss for %s (index=%d gen=%d). Cached gens: %s. Cache usage=%.2fGB entries=%d",
                 image_path.name,
@@ -1238,7 +1297,9 @@ class AppController(QObject):
                     log.info("Decoded image %d in %.3fs", index, elapsed)
                 if self.debug_cache:
                     _t_decoded = time.perf_counter()
-                    print(f"[DBGCACHE] {_t_decoded*1000:.3f} get_decoded_image: DECODED index={index} total={(_t_decoded - _t_start)*1000:.2f}ms")
+                    print(
+                        f"[DBGCACHE] {_t_decoded*1000:.3f} get_decoded_image: DECODED index={index} total={(_t_decoded - _t_start)*1000:.2f}ms"
+                    )
                 return decoded
             else:
                 if _debug_mode:
@@ -1320,14 +1381,16 @@ class AppController(QObject):
 
     def sync_ui_state(self):
         """Forces the UI to update by emitting all state change signals.
-        
+
         Essential signals (currentIndexChanged, currentImageSourceChanged) are emitted
         immediately. Non-essential signals (highlightStateChanged, metadataChanged) are
         debounced to reduce overhead during rapid navigation.
         """
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} sync_ui_state: START gen={self.ui_refresh_generation + 1}")
+            print(
+                f"[DBGCACHE] {_t_start*1000:.3f} sync_ui_state: START gen={self.ui_refresh_generation + 1}"
+            )
 
         self.ui_refresh_generation += 1
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
@@ -1342,7 +1405,9 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(f"[DBGCACHE] {_t_end*1000:.3f} sync_ui_state: DONE signals emitted, total={(_t_end - _t_start)*1000:.2f}ms")
+            print(
+                f"[DBGCACHE] {_t_end*1000:.3f} sync_ui_state: DONE signals emitted, total={(_t_end - _t_start)*1000:.2f}ms"
+            )
 
         log.debug(
             "UI State Synced: Index=%d, Count=%d",
@@ -1352,9 +1417,14 @@ class AppController(QObject):
 
     def _emit_debounced_metadata_signals(self):
         """Emit deferred metadata/highlight signals after navigation stops."""
+        if not self.ui_state:
+            return
+
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} _emit_debounced_metadata_signals: emitting deferred signals")
+            print(
+                f"[DBGCACHE] {_t_start*1000:.3f} _emit_debounced_metadata_signals: emitting deferred signals"
+            )
 
         self.ui_state.highlightStateChanged.emit()
         self.ui_state.metadataChanged.emit()
@@ -1363,7 +1433,9 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(f"[DBGCACHE] {_t_end*1000:.3f} _emit_debounced_metadata_signals: DONE total={(_t_end - _t_start)*1000:.2f}ms")
+            print(
+                f"[DBGCACHE] {_t_end*1000:.3f} _emit_debounced_metadata_signals: DONE total={(_t_end - _t_start)*1000:.2f}ms"
+            )
 
         log.debug(
             "Metadata Synced: Filename=%s, Uploaded=%s, StackInfo='%s', BatchInfo='%s'",
@@ -1390,15 +1462,17 @@ class AppController(QObject):
         """
         if not self.view_override_path:
             return None
-        
+
         # Policy Change: When editing a "developed" variant (e.g. from RawTherapee),
-        # we want to save IN-PLACE (overwrite the developed file) rather than 
+        # we want to save IN-PLACE (overwrite the developed file) rather than
         # overwriting the Main source file. This prevents accidental data loss/confusion.
         # Editing a "backup" still targets the Main file (restore behavior).
         if self.view_override_kind == "developed":
             return None
 
-        if self.current_index is not None and 0 <= self.current_index < len(self.image_files):
+        if self.current_index is not None and 0 <= self.current_index < len(
+            self.image_files
+        ):
             return self.image_files[self.current_index].path
         return None
 
@@ -1424,7 +1498,7 @@ class AppController(QObject):
 
         # Determine save_target_path for variant saves
         save_target_path = self._get_save_target_path_for_current_view()
-        
+
         # Store save token to prevent "surprise close" if user navigates away during save
         self._save_initiated_path = self.image_editor.current_filepath
 
@@ -1551,7 +1625,9 @@ class AppController(QObject):
         """Centralized method to change current image index and reset state."""
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} _set_current_index: START index={index} dir={direction}")
+            print(
+                f"[DBGCACHE] {_t_start*1000:.3f} _set_current_index: START index={index} dir={direction}"
+            )
 
         if index < 0 or index >= len(self.image_files):
             return
@@ -1581,7 +1657,9 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_prefetch = time.perf_counter()
-            print(f"[DBGCACHE] {_t_prefetch*1000:.3f} _set_current_index: calling _do_prefetch")
+            print(
+                f"[DBGCACHE] {_t_prefetch*1000:.3f} _set_current_index: calling _do_prefetch"
+            )
 
         self._do_prefetch(
             self.current_index, is_navigation=is_navigation, direction=direction
@@ -1589,7 +1667,9 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_sync = time.perf_counter()
-            print(f"[DBGCACHE] {_t_sync*1000:.3f} _set_current_index: calling sync_ui_state (prefetch took {(_t_sync - _t_prefetch)*1000:.2f}ms)")
+            print(
+                f"[DBGCACHE] {_t_sync*1000:.3f} _set_current_index: calling sync_ui_state (prefetch took {(_t_sync - _t_prefetch)*1000:.2f}ms)"
+            )
 
         self.sync_ui_state()
 
@@ -1599,31 +1679,41 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(f"[DBGCACHE] {_t_end*1000:.3f} _set_current_index: DONE total={(_t_end - _t_start)*1000:.2f}ms")
+            print(
+                f"[DBGCACHE] {_t_end*1000:.3f} _set_current_index: DONE total={(_t_end - _t_start)*1000:.2f}ms"
+            )
 
     def next_image(self):
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} next_image: START from index={self.current_index}")
+            print(
+                f"[DBGCACHE] {_t_start*1000:.3f} next_image: START from index={self.current_index}"
+            )
 
         if self.current_index < len(self.image_files) - 1:
             self._set_current_index(self.current_index + 1, direction=1)
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(f"[DBGCACHE] {_t_end*1000:.3f} next_image: DONE total={(_t_end - _t_start)*1000:.2f}ms")
+            print(
+                f"[DBGCACHE] {_t_end*1000:.3f} next_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
+            )
 
     def prev_image(self):
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} prev_image: START from index={self.current_index}")
+            print(
+                f"[DBGCACHE] {_t_start*1000:.3f} prev_image: START from index={self.current_index}"
+            )
 
         if self.current_index > 0:
             self._set_current_index(self.current_index - 1, direction=-1)
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(f"[DBGCACHE] {_t_end*1000:.3f} prev_image: DONE total={(_t_end - _t_start)*1000:.2f}ms")
+            print(
+                f"[DBGCACHE] {_t_end*1000:.3f} prev_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
+            )
 
     @Slot(int)
     def jump_to_image(self, index: int):
@@ -1680,7 +1770,6 @@ class AppController(QObject):
         else:
             self.update_status_message("No uploaded images found in this folder")
 
-
     def show_jump_to_image_dialog(self):
         """Shows the jump to image dialog (called from keybinder)."""
         if self.main_window and hasattr(self.main_window, "show_jump_to_image_dialog"):
@@ -1732,7 +1821,7 @@ class AppController(QObject):
     @Slot()
     def refresh_grid(self):
         """Full manual refresh: Rescans the disk directory and rebuilds the grid view.
-        
+
         This is a heavy operation that clears caches and rescans the filesystem.
         Use this only when you need to pick up external changes that the watcher
         might have missed.
@@ -1763,13 +1852,15 @@ class AppController(QObject):
                 self._thumbnail_prefetcher.cancel_all()
 
             # Refresh the model if dirty or empty
-            needs_refresh = self._grid_model_dirty or self._thumbnail_model.rowCount() == 0
+            needs_refresh = (
+                self._grid_model_dirty or self._thumbnail_model.rowCount() == 0
+            )
             if needs_refresh:
                 self._grid_refreshes += 1
-                
+
                 # Always use controller's list, even if empty.
                 self._thumbnail_model.refresh_from_controller(self.image_files)
-                
+
                 # Update path resolver for the current directory
                 self._path_resolver.update_from_model(self._thumbnail_model)
                 self._grid_model_dirty = False
@@ -2188,11 +2279,26 @@ class AppController(QObject):
         filename = self.image_files[self.current_index].path.name
         if self.image_files[self.current_index].has_raw:
             # e.g. "image.JPG + ORF"
-            raw_ext = self.image_files[self.current_index].raw_path.suffix.lstrip(".").upper()
+            raw_ext = (
+                self.image_files[self.current_index].raw_path.suffix.lstrip(".").upper()
+            )
             filename += f" + {raw_ext}"
+
+        # EXIF brief: instant from cache, otherwise schedule deferred read.
+        # Always read EXIF from the variant group's main image (not backup/developed).
+        exif_key = self._exif_source_key(self.current_index)
+        exif_brief = self._exif_brief_cache.get(exif_key, None)
+        if exif_brief is None:
+            exif_brief = ""
+            # Only restart timer when the pending path actually changes,
+            # so repeated QML property evaluations don't keep resetting it.
+            if self._exif_pending_path != exif_key:
+                self._exif_pending_path = exif_key
+                self._exif_debounce_timer.start()
 
         self._metadata_cache = {
             "filename": filename,
+            "exif_brief": exif_brief,
             "stacked": meta.stacked,
             "stacked_date": meta.stacked_date or "",
             "uploaded": meta.uploaded,
@@ -2207,6 +2313,88 @@ class AppController(QObject):
         }
         self._metadata_cache_index = cache_key
         return self._metadata_cache
+
+    _EXIF_SUFFIXES = frozenset(
+        {".jpg", ".jpeg", ".jpe", ".tif", ".tiff", ".heif", ".heic"}
+    )
+
+    def _exif_source_key(self, index: int) -> str:
+        """Return a normalized cache key for the EXIF source of image at *index*.
+
+        Resolves to the variant group's main image path when available,
+        so backups/developed files use the same EXIF as the original.
+        Uses ``normalize_path_key`` for Windows case-insensitivity.
+        """
+        img = self.image_files[index]
+        source_path = img.path
+        key_cf = get_group_key_for_path(img.path, self._variant_map)
+        if key_cf is not None:
+            group = self._variant_map[key_cf]
+            if group.main_path is not None:
+                source_path = group.main_path
+        return normalize_path_key(source_path)
+
+    def _read_exif_deferred(self):
+        """Called after 150ms of no navigation. Submits EXIF read to background."""
+        if getattr(self, "_shutting_down", False):
+            return
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+        exif_key = self._exif_source_key(self.current_index)
+        if self._exif_pending_path is not None and self._exif_pending_path != exif_key:
+            self._exif_pending_path = None
+            return  # Different image path pending, or we aren't tracking this key.
+
+        if exif_key in self._exif_brief_cache:
+            self._exif_pending_path = None
+            return  # already cached
+        # Resolve the actual file path for the EXIF source
+        img = self.image_files[self.current_index]
+        source_path = img.path
+        key_cf = get_group_key_for_path(img.path, self._variant_map)
+        if key_cf is not None:
+            group = self._variant_map[key_cf]
+            if group.main_path is not None:
+                source_path = group.main_path
+        # Early return for formats without EXIF support
+        if source_path.suffix.lower() not in self._EXIF_SUFFIXES:
+            self._exif_brief_cache[exif_key] = ""
+            self._exif_pending_path = None
+            return
+        # Submit to dedicated EXIF executor to avoid blocking histograms
+        signal = self._exifBriefReady
+
+        def _worker(key=exif_key, p=str(source_path)):
+            from faststack.imaging.metadata import get_exif_brief
+
+            try:
+                brief = get_exif_brief(p)
+            except Exception as e:
+                log.error(f"Failed to get EXIF brief for {p}: {e}", exc_info=True)
+                brief = ""
+            signal.emit(key, brief)
+
+        try:
+            self._exif_executor.submit(_worker)
+        except RuntimeError:
+            pass  # executor shut down, ignore
+
+    def _on_exif_brief_ready(self, exif_key: str, brief: str):
+        """Slot called on main thread when background EXIF read completes."""
+        if getattr(self, "_shutting_down", False) or not self.ui_state:
+            return
+        self._exif_brief_cache[exif_key] = brief
+        if self._exif_pending_path == exif_key:
+            self._exif_pending_path = None
+        # Only refresh UI if we're still looking at this image
+        if (
+            self.image_files
+            and self.current_index < len(self.image_files)
+            and self._exif_source_key(self.current_index) == exif_key
+        ):
+            self._metadata_cache_index = (-1, -1)
+            if self.ui_state:
+                self.ui_state.metadataChanged.emit()
 
     def begin_new_stack(self):
         self.stack_start_index = self.current_index
@@ -2279,15 +2467,13 @@ class AppController(QObject):
         # Build path -> index map for the main image list
         # 1. Rebuild index mapping
         self._rebuild_path_to_index()
-        
+
         # 2. Find indices for selected paths
         indices_to_add = []
         for path in selected_paths:
             idx = self._path_to_index.get(self._key(path))
             if idx is not None:
                 indices_to_add.append(idx)
-
-
 
         if not indices_to_add:
             self.update_status_message("Selected images not found in current list.")
@@ -2403,7 +2589,11 @@ class AppController(QObject):
             meta = self.sidecar.get_metadata(img.path.stem)
             if not meta:
                 continue
-            uploaded = meta.get("uploaded", False) if isinstance(meta, dict) else getattr(meta, "uploaded", False)
+            uploaded = (
+                meta.get("uploaded", False)
+                if isinstance(meta, dict)
+                else getattr(meta, "uploaded", False)
+            )
             if uploaded:
                 indices_to_add.append(i)
 
@@ -2837,8 +3027,6 @@ class AppController(QObject):
             self._metadata_cache_index = (-1, -1)  # Invalidate cache
 
         return success
-
-
 
     def clear_all_stacks(self):
         log.info("Clearing all defined stacks.")
@@ -3311,6 +3499,8 @@ class AppController(QObject):
         self.display_generation += 1
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
+        self._exif_brief_cache.clear()
+        self._exif_pending_path = None
 
         # Clear batch indices cache (avoids stale batch membership checks)
         if hasattr(self, "_batch_indices_cache"):
@@ -3520,42 +3710,6 @@ class AppController(QObject):
             log.error("Failed to recycle %s: %s", src.name, e)
             return None
 
-    def _shutdown_executors(self) -> None:
-        """Shutdown thread pools and clean up pending jobs."""
-        log.info("Shutting down executors...")
-        self._shutting_down = True
-        
-        # Clear pending jobs and remove associated undo placeholders
-        if self._pending_delete_jobs:
-            log.info("Clearing %d pending delete jobs on shutdown", len(self._pending_delete_jobs))
-            pending_ids = set(self._pending_delete_jobs.keys())
-            self._pending_delete_jobs.clear()
-            self.undo_history = [
-                entry for entry in self.undo_history
-                if not (entry[0] == "pending_delete" and entry[1] in pending_ids)
-            ]
-
-        # Shutdown all known executors
-        # Use wait=False to avoid hanging UI shutdown on long operations
-        for executor in [
-            self._delete_executor,
-            self._hist_executor,
-            self._save_executor,
-            self._preview_executor
-        ]:
-            if executor:
-                executor.shutdown(wait=False, cancel_futures=True)
-
-        # Shutdown prefetchers (they own their own thread pools)
-        try:
-            self.prefetcher.shutdown()
-        except Exception:
-            pass
-        try:
-            if getattr(self, "_thumbnail_prefetcher", None):
-                self._thumbnail_prefetcher.shutdown()
-        except Exception:
-            pass
 
     @staticmethod
     def _perm_delete_worker(
@@ -3625,26 +3779,34 @@ class AppController(QObject):
             # images_to_delete MUST be List[Tuple[Path, Optional[Path]]]
             # If item is (0, (path, raw)), it's a nested structure from incorrect calling code.
             if not isinstance(item, (tuple, list)) or len(item) != 2:
-                log.error("CRITICAL: _delete_worker received invalid item format: %r", item)
-                failures.append({
-                    "jpg": None,
-                    "raw": None,
-                    "code": DeletionErrorCodes.INVALID_WORK_ITEM.value,
-                })
+                log.error(
+                    "CRITICAL: _delete_worker received invalid item format: %r", item
+                )
+                failures.append(
+                    {
+                        "jpg": None,
+                        "raw": None,
+                        "code": DeletionErrorCodes.INVALID_WORK_ITEM.value,
+                    }
+                )
                 continue
 
             jpg_path, raw_path = item
-            
+
             # Robustness: if raw_path is a tuple/list, we have a nested structure error.
             # This is a hard error — record failure and skip rather than silently recovering,
             # which would mask upstream bugs.
             if isinstance(raw_path, (tuple, list)):
-                log.error("CRITICAL: _delete_worker received nested tuple item: %r", item)
-                failures.append({
-                    "jpg": str(jpg_path) if jpg_path else None,
-                    "raw": None,
-                    "code": DeletionErrorCodes.INVALID_WORK_ITEM.value,
-                })
+                log.error(
+                    "CRITICAL: _delete_worker received nested tuple item: %r", item
+                )
+                failures.append(
+                    {
+                        "jpg": str(jpg_path) if jpg_path else None,
+                        "raw": None,
+                        "code": DeletionErrorCodes.INVALID_WORK_ITEM.value,
+                    }
+                )
                 continue
 
             processed_count += 1
@@ -3653,61 +3815,71 @@ class AppController(QObject):
             try:
                 recycled_jpg = AppController._move_to_recycle(jpg_path, created_bins)
                 if not recycled_jpg:
-                    failures.append({
-                        "jpg": jpg_path,
-                        "raw": raw_path,
-                        "code": DeletionErrorCodes.RECYCLE_FAILED.value
-                    })
+                    failures.append(
+                        {
+                            "jpg": jpg_path,
+                            "raw": raw_path,
+                            "code": DeletionErrorCodes.RECYCLE_FAILED.value,
+                        }
+                    )
                     continue
 
                 recycled_raw = None
                 if actual_raw_exists:
                     try:
-                        recycled_raw = AppController._move_to_recycle(raw_path, created_bins)
+                        recycled_raw = AppController._move_to_recycle(
+                            raw_path, created_bins
+                        )
                         if not recycled_raw:
                             raise OSError("RAW move failed")
                     except OSError as e:
                         log.warning("RAW recycle failed for %s: %s", raw_path.name, e)
-                        warnings.append({
-                            "jpg": jpg_path,
-                            "raw": raw_path,
-                            "message": str(e)
-                        })
-                
-                successes.append({
-                    "jpg": jpg_path,
-                    "recycled_jpg": recycled_jpg,
-                    "raw": raw_path,
-                    "recycled_raw": recycled_raw
-                })
+                        warnings.append(
+                            {"jpg": jpg_path, "raw": raw_path, "message": str(e)}
+                        )
+
+                successes.append(
+                    {
+                        "jpg": jpg_path,
+                        "recycled_jpg": recycled_jpg,
+                        "raw": raw_path,
+                        "recycled_raw": recycled_raw,
+                    }
+                )
 
             except PermissionError:
                 log.warning("Permission denied deleting %s", jpg_path.name)
-                failures.append({
-                    "jpg": jpg_path,
-                    "raw": raw_path,
-                    "code": DeletionErrorCodes.PERMISSION_DENIED.value
-                })
+                failures.append(
+                    {
+                        "jpg": jpg_path,
+                        "raw": raw_path,
+                        "code": DeletionErrorCodes.PERMISSION_DENIED.value,
+                    }
+                )
             except OSError as e:
                 # Check for "trash full" or similar OS errors if distinguishable,
                 # otherwise treat as generic recycle failure or unknown.
                 # Windows "trash full" is hard to detect reliably without win32 api,
                 # but we can at least capture the message.
                 log.warning("OSError deleting %s: %s", jpg_path.name, e)
-                failures.append({
-                    "jpg": jpg_path,
-                    "raw": raw_path,
-                    "code": DeletionErrorCodes.RECYCLE_FAILED.value,  # Fallback to recycle failed
-                    "message": str(e)
-                })
+                failures.append(
+                    {
+                        "jpg": jpg_path,
+                        "raw": raw_path,
+                        "code": DeletionErrorCodes.RECYCLE_FAILED.value,  # Fallback to recycle failed
+                        "message": str(e),
+                    }
+                )
             except Exception as e:
                 log.warning("Recycle exception for %s: %s", jpg_path.name, e)
-                failures.append({
-                    "jpg": jpg_path,
-                    "raw": raw_path,
-                    "code": DeletionErrorCodes.UNKNOWN.value,
-                    "message": str(e)
-                })
+                failures.append(
+                    {
+                        "jpg": jpg_path,
+                        "raw": raw_path,
+                        "code": DeletionErrorCodes.UNKNOWN.value,
+                        "message": str(e),
+                    }
+                )
 
         # Record unprocessed items (skipped due to cancellation)
         if did_cancel and cancel_index >= 0:
@@ -3716,13 +3888,15 @@ class AppController(QObject):
                 # Re-validate shape to prevent crashes on invalid items
                 if not isinstance(item, (tuple, list)) or len(item) != 2:
                     continue
-                
+
                 jpg_path, raw_path = item
-                failures.append({
-                    "jpg": jpg_path,
-                    "raw": raw_path,
-                    "code": DeletionErrorCodes.CANCELLED.value
-                })
+                failures.append(
+                    {
+                        "jpg": jpg_path,
+                        "raw": raw_path,
+                        "code": DeletionErrorCodes.CANCELLED.value,
+                    }
+                )
 
         # Convert all Path objects to str before crossing signal boundary.
         # _normalize_worker_results converts back to Path on the UI thread.
@@ -3759,21 +3933,25 @@ class AppController(QObject):
         if job:
             # Remove pending_delete placeholders from undo history
             self.undo_history = [
-                entry for entry in self.undo_history
+                entry
+                for entry in self.undo_history
                 if not (entry[0] == "pending_delete" and entry[1] == job.job_id)
             ]
         else:
             # Job might have been popped by undo_delete logic already?
             # Or this is a stray signal.
-            log.warning("Delete job %d completed but not found in pending jobs", result.job_id)
+            log.warning(
+                "Delete job %d completed but not found in pending jobs", result.job_id
+            )
             return
-
 
         # --- Phase 1.5: Handle Perm Delete Result ---
         if result.is_perm_result:
             if result.perm_success:
-                self.update_status_message(f"Permanently deleted {len(result.perm_success)} images")
-                
+                self.update_status_message(
+                    f"Permanently deleted {len(result.perm_success)} images"
+                )
+
                 # Update suppression for permanent deletes (prevent watcher re-scans)
                 ttl = 2.0
                 now = time.monotonic()
@@ -3783,7 +3961,7 @@ class AppController(QObject):
                             self._suppressed_paths[self._key(img.path)] = now + ttl
                         if img.raw_pair:
                             self._suppressed_paths[self._key(img.raw_pair)] = now + ttl
-            
+
             if result.perm_fail:
                 # Rollback failures (they have original indices)
                 # Note: job context is required for rollback (restores index/batches/focus)
@@ -3793,9 +3971,9 @@ class AppController(QObject):
             self.sync_ui_state()
             self._schedule_delete_refresh()
             return
-            
+
         # --- Phase 2: Apply Results ---
-        
+
         # 2a. Update suppression (prevent watcher loops for moved files)
         # Opportunistic cleanup of expired suppression entries
         ttl = 2.0
@@ -3817,25 +3995,28 @@ class AppController(QObject):
         # If user hit Undo while worker was running, we must restore any moved files immediately.
         if job.undo_requested:
             if result.successes:
-                log.info("Job %d was undone mid-flight; auto-restoring %d moved files", 
-                         job.job_id, len(result.successes))
+                log.info(
+                    "Job %d was undone mid-flight; auto-restoring %d moved files",
+                    job.job_id,
+                    len(result.successes),
+                )
                 self._auto_restore_moved_files(result.successes)
             # Do NOT record history.
             # Failures/Cancelled items are already handled by the undo_delete logic (restored to UI)
             # or simply ignored because they never moved.
-            
+
             # Update status
             self.update_status_message("Deletion cancelled (files restored)")
             self._schedule_delete_refresh()
             return
 
         # 2c. Normal Completion: Record History & Handle Failures
-        
+
         # Track recycle bins
         for s in result.successes:
             if s.recycled_jpg:
                 self.active_recycle_bins.add(s.recycled_jpg.parent)
-        
+
         # Log warnings
         for w in result.warnings:
             log.warning("Partial delete warning for %s: %s", w.jpg, w.message)
@@ -3853,7 +4034,7 @@ class AppController(QObject):
         self._handle_delete_failures(result, job)
 
         # --- Phase 3: Post Actions ---
-        
+
         # Status Message
         count = len(result.successes)
         if count > 0:
@@ -3864,7 +4045,9 @@ class AppController(QObject):
                 msg = "Image moved to recycle bin"
             self.update_status_message(msg)
         elif result.failures:
-            self.update_status_message("Deletion cancelled" if result.cancelled else "Delete failed")
+            self.update_status_message(
+                "Deletion cancelled" if result.cancelled else "Delete failed"
+            )
 
         self._schedule_delete_refresh()
 
@@ -3875,13 +4058,16 @@ class AppController(QObject):
             # Restore JPG
             if s.jpg and s.recycled_jpg:
                 ok, reason = self._restore_from_recycle_bin_safe(s.jpg, s.recycled_jpg)
-                if ok: restored += 1
-                else: log.error("Failed to auto-restore JPG %s: %s", s.jpg, reason)
-            
+                if ok:
+                    restored += 1
+                else:
+                    log.error("Failed to auto-restore JPG %s: %s", s.jpg, reason)
+
             # Restore RAW
             if s.raw and s.recycled_raw:
                 ok, reason = self._restore_from_recycle_bin_safe(s.raw, s.recycled_raw)
-                if not ok: log.error("Failed to auto-restore RAW %s: %s", s.raw, reason)
+                if not ok:
+                    log.error("Failed to auto-restore RAW %s: %s", s.raw, reason)
 
     def _handle_delete_failures(self, result: DeleteResult, job: DeleteJob) -> None:
         """Handle items that failed to delete. Rollback UI or prompt for perm delete."""
@@ -3891,7 +4077,7 @@ class AppController(QObject):
         # Identify which UI items failed (map back using paths)
         # Note: We use the _key() mapping to ensure we match robustly
         failed_keys = {self._key(f.jpg) for f in result.failures if f.jpg}
-        
+
         failed_indices_and_imgs = []
         for idx, img in job.removed_items:
             if self._key(img.path) in failed_keys:
@@ -3901,48 +4087,54 @@ class AppController(QObject):
             return
 
         # Check if we should offer permanent delete (recycle bin error)
-        perm_candidates = [] # List of (idx, img)
-        
+        perm_candidates = []  # List of (idx, img)
+
         # Helper to find if a specific failure code warrants perm delete
         recycle_codes = {
             DeletionErrorCodes.RECYCLE_FAILED.value,
             DeletionErrorCodes.PERMISSION_DENIED.value,
-            DeletionErrorCodes.TRASH_FULL.value
+            DeletionErrorCodes.TRASH_FULL.value,
         }
-        
+
         # Map failure code by key for easy lookup
         failure_map = {self._key(f.jpg): f for f in result.failures if f.jpg}
 
         for idx, img in failed_indices_and_imgs:
-             f = failure_map.get(self._key(img.path))
-             if f and f.code in recycle_codes:
-                 perm_candidates.append((idx, img))
+            f = failure_map.get(self._key(img.path))
+            if f and f.code in recycle_codes:
+                perm_candidates.append((idx, img))
 
         if perm_candidates:
             # Prompt user for permanent delete
-            
+
             # 1. Rollback non-candidates first
             candidate_keys = {self._key(img.path) for _, img in perm_candidates}
-            to_rollback = [(i, img) for i, img in failed_indices_and_imgs if self._key(img.path) not in candidate_keys]
-            
+            to_rollback = [
+                (i, img)
+                for i, img in failed_indices_and_imgs
+                if self._key(img.path) not in candidate_keys
+            ]
+
             if to_rollback:
                 self._rollback_ui_items(to_rollback, job)
 
             # 2. Ask user
             candidate_imgs = [img for _, img in perm_candidates]
-            
+
             reason = "Recycle bin failure"
             confirmed = False
             if len(candidate_imgs) == 1:
                 confirmed = confirm_permanent_delete(candidate_imgs[0], reason=reason)
             else:
-                confirmed = confirm_batch_permanent_delete(candidate_imgs, reason=reason)
+                confirmed = confirm_batch_permanent_delete(
+                    candidate_imgs, reason=reason
+                )
 
             if confirmed:
                 # ASYNC permanent delete
                 # Put job back in pending map so _on_delete_finished can find it again
                 self._pending_delete_jobs[job.job_id] = job
-                
+
                 # Define callback to bridge back to main thread
                 def _on_perm_done(future):
                     try:
@@ -3953,12 +4145,10 @@ class AppController(QObject):
                         log.error("Perm delete worker exception: %s", e)
 
                 fut = self._delete_executor.submit(
-                    self._perm_delete_worker,
-                    job.job_id,
-                    perm_candidates
+                    self._perm_delete_worker, job.job_id, perm_candidates
                 )
                 fut.add_done_callback(_on_perm_done)
-                
+
                 self.update_status_message("Permanently deleting files...")
                 # Return EARLY so we don't rebuild index/sync UI yet
                 return
@@ -3980,19 +4170,19 @@ class AppController(QObject):
         # Access attributes of DeleteJob
         for idx, img in sorted(items, key=lambda x: x[0], reverse=True):
             self.image_files.insert(min(idx, len(self.image_files)), img)
-        
+
         # Restore selection/focus (approximated)
         self.current_index = min(job.previous_index, len(self.image_files) - 1)
         self.display_generation += 1
 
         # Targeted cache invalidation instead of full clear
         if self.image_cache is not None:
-             paths_to_invalidate = []
-             for _, img in items:
-                 paths_to_invalidate.append(img.path)
-                 if img.raw_pair:
-                     paths_to_invalidate.append(img.raw_pair)
-             self.image_cache.evict_paths(paths_to_invalidate)
+            paths_to_invalidate = []
+            for _, img in items:
+                paths_to_invalidate.append(img.path)
+                if img.raw_pair:
+                    paths_to_invalidate.append(img.raw_pair)
+            self.image_cache.evict_paths(paths_to_invalidate)
 
         if self._thumbnail_model:
             # Restore model rows (simple refresh for correctness)
@@ -4007,16 +4197,13 @@ class AppController(QObject):
             self.batch_start_index = job.saved_batch_start_index
             self._invalidate_batch_cache()
 
-
-
-
-
     def _schedule_delete_refresh(self) -> None:
         """Debounce post-delete refresh: coalesce rapid deletes into one refresh."""
         if self._refresh_scheduled:
             return
         self._refresh_scheduled = True
         from PySide6.QtCore import QTimer
+
         QTimer.singleShot(200, self._fire_delete_refresh)
 
     def _fire_delete_refresh(self) -> None:
@@ -4026,27 +4213,29 @@ class AppController(QObject):
 
     def _do_delete_refresh(self) -> None:
         """Perform user-interface refresh (debounce ended).
-        
+
         Optimized: No longer performs a full disk scan (refresh_image_list).
         Relies on optimistic UI updates already performed in _delete_indices.
         Watcher events handle any true drift (external changes).
         """
         t_start = time.perf_counter()
-        
+
         # Coalesce with watcher: if we are doing a delete refresh, we don't
         # need a separate watcher refresh immediately after.
         self._watcher_debounce_timer.stop()
-        
+
         clear_raw_count_cache()
         self._rebuild_path_to_index()
 
         # Update the path resolver to reflect current model state
         if self._thumbnail_model and hasattr(self, "_path_resolver"):
             self._path_resolver.update_from_model(self._thumbnail_model)
-        
+
         dt = time.perf_counter() - t_start
         if _debug_mode:
-            log.info("delete_refresh took %.4fs for %d images", dt, len(self.image_files))
+            log.info(
+                "delete_refresh took %.4fs for %d images", dt, len(self.image_files)
+            )
 
     def _delete_indices(self, indices: List[int], action_type: str) -> dict:
         """Unified core deletion engine for FastStack.
@@ -4120,7 +4309,7 @@ class AppController(QObject):
                 paths_to_evict.append(img.path)
                 if img.raw_pair:
                     paths_to_evict.append(img.raw_pair)
-            
+
             # Use new targeted eviction with tombstones
             self.image_cache.evict_paths(paths_to_evict)
 
@@ -4136,28 +4325,30 @@ class AppController(QObject):
         if self._thumbnail_model:
             del_paths = [img.path for img in images_to_delete]
             self._thumbnail_model.remove_rows_by_path(del_paths)
-            
+
             # Diagnostic: check synchronization between controller and model
             if _debug_mode:
                 img_count = len(self.image_files)
                 model_rows = self._thumbnail_model.rowCount()
                 folder_count = getattr(self._thumbnail_model, "folder_count", 0)
-                
+
                 log.debug(
                     "Sync Check (delete): controller=%d, model=%d",
                     img_count,
-                    model_rows
+                    model_rows,
                 )
                 log.debug(
                     "Sync Breakdown: images=%d, folders=%d, model_rows=%d",
                     img_count,
                     folder_count,
-                    model_rows
+                    model_rows,
                 )
 
         # Pre-suppress watcher events for these soon-to-be-moved/deleted paths.
         # Must happen BEFORE the worker starts I/O, because watchdog events can arrive immediately.
-        ttl = 2.0  # seconds; plenty to cover os.replace/shutil.move and watchdog delivery
+        ttl = (
+            2.0  # seconds; plenty to cover os.replace/shutil.move and watchdog delivery
+        )
         now = time.monotonic()
         with self._suppressed_paths_lock:
             for img in images_to_delete:
@@ -4191,7 +4382,9 @@ class AppController(QObject):
 
         log.info(
             "Delete enqueued: job_id=%d, type='%s', count=%d",
-            job_id, action_type, len(images_to_delete),
+            job_id,
+            action_type,
+            len(images_to_delete),
         )
 
         # Submit to background executor
@@ -4202,18 +4395,27 @@ class AppController(QObject):
             except Exception as e:
                 log.error("Delete worker failed: %s", e)
                 # Emit a failure result so completion handler can rollback
-                self._deleteFinished.emit({
-                    "job_id": job_id,
-                    "successes": [],
-                    "failures": [
-                        {"jpg": str(p) if p else None, "raw": str(r) if r else None, "code": str(e)}
-                        for p, r in worker_items
-                    ],
-                    "cancelled": False,
-                })
+                self._deleteFinished.emit(
+                    {
+                        "job_id": job_id,
+                        "successes": [],
+                        "failures": [
+                            {
+                                "jpg": str(p) if p else None,
+                                "raw": str(r) if r else None,
+                                "code": str(e),
+                            }
+                            for p, r in worker_items
+                        ],
+                        "cancelled": False,
+                    }
+                )
 
         fut = self._delete_executor.submit(
-            self._delete_worker, job_id, worker_items, cancel_event,
+            self._delete_worker,
+            job_id,
+            worker_items,
+            cancel_event,
         )
         fut.add_done_callback(_on_worker_done)
 
@@ -4275,7 +4477,9 @@ class AppController(QObject):
         job_id = summary["job_id"]
         if job_id in self._pending_delete_jobs:
             self._pending_delete_jobs[job_id].saved_batches = saved_batches
-            self._pending_delete_jobs[job_id].saved_batch_start_index = saved_batch_start
+            self._pending_delete_jobs[job_id].saved_batch_start_index = (
+                saved_batch_start
+            )
 
         self.batches = []
         self.batch_start_index = None
@@ -4455,12 +4659,12 @@ class AppController(QObject):
                 self.display_generation += 1
                 # Targeted eviction instead of full clear
                 if self.image_cache is not None:
-                     paths_to_evict = []
-                     for _, img in removed_items:
-                         paths_to_evict.append(img.path)
-                         if img.raw_pair:
-                             paths_to_evict.append(img.raw_pair)
-                     self.image_cache.evict_paths(paths_to_evict)
+                    paths_to_evict = []
+                    for _, img in removed_items:
+                        paths_to_evict.append(img.path)
+                        if img.raw_pair:
+                            paths_to_evict.append(img.raw_pair)
+                    self.image_cache.evict_paths(paths_to_evict)
                 self.prefetcher.cancel_all()
                 if self.image_files:
                     self.prefetcher.update_prefetch(self.current_index)
@@ -4471,7 +4675,9 @@ class AppController(QObject):
                 self.update_status_message(
                     f"Cancel requested... restoring view ({count} item{'s' if count > 1 else ''})"
                 )
-                log.info("Undo cancelled pending delete job %d (%d items)", job_id, count)
+                log.info(
+                    "Undo cancelled pending delete job %d (%d items)", job_id, count
+                )
             else:
                 # Job already completed — find the corresponding "delete" entries
                 # in undo_history and undo the last one
@@ -4610,14 +4816,20 @@ class AppController(QObject):
     def shutdown_qt(self):
         """Shutdown Qt objects only - MUST run on main/Qt thread."""
         self._shutting_down = True  # set EARLY to make all slots no-op
+        self._exif_pending_path = None
         log.info("Application shutting down (Qt cleanup).")
 
         # Stop Qt timers
         try:
             self._metadata_debounce_timer.stop()
+            self._exif_debounce_timer.stop()
+            self._watcher_debounce_timer.stop()
+            self.histogram_timer.stop()
+            self.resize_timer.stop()
+            if hasattr(self, "_thumb_summary_timer"):
+                self._thumb_summary_timer.stop()
         except Exception:
             pass
-
 
         # Stop QFileSystemWatcher if it's Qt-based
         try:
@@ -4662,11 +4874,34 @@ class AppController(QObject):
         """Shutdown non-Qt resources - safe to run in background thread."""
         log.info("Shutting down background resources.")
 
+        self._shutting_down = True  # gate async callbacks during shutdown_nonqt too
+        self._exif_pending_path = None  # optional but consistent with shutdown_qt
+
+
+        # Clear pending delete jobs and remove associated undo placeholders
+        if self._pending_delete_jobs:
+            log.info(
+                "Clearing %d pending delete jobs on shutdown",
+                len(self._pending_delete_jobs),
+            )
+            pending_ids = set(self._pending_delete_jobs.keys())
+            self._pending_delete_jobs.clear()
+            self.undo_history = [
+                entry
+                for entry in self.undo_history
+                if not (entry[0] == "pending_delete" and entry[1] in pending_ids)
+            ]
+
         # Shutdown thread pool executors
         try:
             log.info("Shutting down background executors...")
             self._hist_executor.shutdown(wait=False, cancel_futures=True)
             self._preview_executor.shutdown(wait=False, cancel_futures=True)
+
+            exif_exec = getattr(self, "_exif_executor", None)
+            if exif_exec:
+                exif_exec.shutdown(wait=False, cancel_futures=True)
+
             # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
             self._save_executor.shutdown(wait=True, cancel_futures=False)
             self._delete_executor.shutdown(wait=True, cancel_futures=False)
@@ -4697,7 +4932,9 @@ class AppController(QObject):
 
         # Clean up temporary files (e.g. Helicon Focus lists)
         if self._temp_files_to_clean:
-            log.debug("Cleaning up %d temporary files...", len(self._temp_files_to_clean))
+            log.debug(
+                "Cleaning up %d temporary files...", len(self._temp_files_to_clean)
+            )
             for tmp_path in self._temp_files_to_clean:
                 try:
                     tmp_path.unlink(missing_ok=True)
@@ -4743,7 +4980,9 @@ class AppController(QObject):
             # 1. Record eviction timestamp / prune
             self._eviction_timestamps.append(now)
             cutoff = now - CACHE_THRASH_WINDOW_SECS
-            self._eviction_timestamps = [t for t in self._eviction_timestamps if t > cutoff]
+            self._eviction_timestamps = [
+                t for t in self._eviction_timestamps if t > cutoff
+            ]
 
             # 2. Check for thrashing (e.g., > threshold evictions in window)
             if len(self._eviction_timestamps) > CACHE_THRASH_THRESHOLD:
@@ -4755,8 +4994,17 @@ class AppController(QObject):
                     # UI update logic
                     used_gb = self.image_cache.currsize / (1024**3)
                     max_gb = self.image_cache.max_bytes / (1024**3)
-                    msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in {CACHE_THRASH_WINDOW_SECS}s. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
-                    
+
+                    # Include key/value summary to fix lint error and provide context
+                    val_summary = ""
+                    if hasattr(value, "width") and hasattr(value, "height"):
+                        val_summary = f" ({value.width}x{value.height})"
+                    elif hasattr(value, "__len__"):
+                        val_summary = f" (len={len(value)})"
+
+                    key_name = getattr(key, "name", str(key))
+                    msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in {CACHE_THRASH_WINDOW_SECS}s. Evicted {key_name}{val_summary}. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
+
                     # Schedule UI work safely on main thread
                     # QTimer.singleShot(0, ...) is thread-safe entry to main loop
                     QTimer.singleShot(0, lambda: self.update_status_message(msg))
@@ -6162,9 +6410,13 @@ class AppController(QObject):
 
         # Build detail message
         if p_high >= 255.0:
-            msg = f"Auto levels: highlights clipped; shadows only (blacks {blacks:+.1f})"
+            msg = (
+                f"Auto levels: highlights clipped; shadows only (blacks {blacks:+.1f})"
+            )
         elif p_low <= 0.0:
-            msg = f"Auto levels: shadows clipped; highlights only (whites {whites:+.1f})"
+            msg = (
+                f"Auto levels: shadows clipped; highlights only (whites {whites:+.1f})"
+            )
         else:
             gain = 255.0 / dynamic_range
             msg = (
@@ -6523,9 +6775,7 @@ class AppController(QObject):
                 int((t_list - t_save) * 1000),
                 total_ms,
             )
-            self.update_status_message(
-                f"{detail_msg} \u2014 saved ({total_ms} ms)"
-            )
+            self.update_status_message(f"{detail_msg} \u2014 saved ({total_ms} ms)")
             log.info("Quick auto white balance applied to %s", filepath)
         else:
             self.update_status_message("Failed to save image")
@@ -6647,11 +6897,17 @@ class AppController(QObject):
             h, w = img_arr.shape[:2]
             TARGET_PIXELS = 2_000_000
             stride = max(1, int(np.sqrt(h * w / TARGET_PIXELS)))
-            sub = np.ascontiguousarray(img_arr[::stride, ::stride])  # contiguous for cv2
+            sub = np.ascontiguousarray(
+                img_arr[::stride, ::stride]
+            )  # contiguous for cv2
             arr = (np.clip(sub, 0.0, 1.0) * 255).astype(np.uint8)
             log.debug(
                 "AWB: subsampled %dx%d -> %dx%d (stride %d)",
-                w, h, arr.shape[1], arr.shape[0], stride,
+                w,
+                h,
+                arr.shape[1],
+                arr.shape[0],
+                stride,
             )
         else:
             # Fallback: use original_image (full PIL Image)
@@ -6758,7 +7014,8 @@ class AppController(QObject):
             int((t_awb_mask - t_awb_subsample) * 1000),
             int((t_awb_end - t_awb_mask) * 1000),
             int((t_awb_end - t_awb_start) * 1000),
-            arr.shape[1], arr.shape[0],
+            arr.shape[1],
+            arr.shape[0],
         )
         self.update_status_message(msg)
         return msg
@@ -6905,9 +7162,10 @@ def main(
     debug_thumb_trace: bool = False,
 ):
     """FastStack Application Entry Point"""
-    global _debug_mode, _debug_thumb_timing
+    global _debug_mode, _debug_thumb_timing, _debug_thumb_trace
     _debug_mode = debug
     _debug_thumb_timing = debug_thumb_timing
+    _debug_thumb_trace = debug_thumb_trace
 
     t0 = time.perf_counter()
     setup_logging(debug)
@@ -6924,6 +7182,7 @@ def main(
 
     # Enable Ctrl-C to terminate the application
     import signal
+
     signal.signal(signal.SIGINT, lambda *args: app.quit())
     # Ensure Python's signal handler runs (Qt blocks main thread)
     timer = QTimer()
@@ -7013,7 +7272,10 @@ def main(
     # all of which can run after the first event loop iteration.
     QTimer.singleShot(0, controller.load)
     if debug:
-        log.info("Startup: controller.load() deferred to event loop (%.3fs to window)", time.perf_counter() - t0)
+        log.info(
+            "Startup: controller.load() deferred to event loop (%.3fs to window)",
+            time.perf_counter() - t0,
+        )
 
     # Graceful shutdown with timeout fallback
     import threading
@@ -7023,10 +7285,9 @@ def main(
         """Log non-daemon threads for debugging shutdown hangs."""
         threads = threading.enumerate()
         alive = [
-            t for t in threads
-            if t.is_alive()
-            and not t.daemon
-            and t.name != "MainThread"
+            t
+            for t in threads
+            if t.is_alive() and not t.daemon and t.name != "MainThread"
         ]
         if not alive:
             return
@@ -7057,11 +7318,11 @@ def main(
 
             # Run Qt cleanup on main thread
             controller.shutdown_qt()
-            
+
             # Consolidated shutdown for all thread pools and pending jobs
             # This replaces previous ad-hoc shutdown logic
             controller.shutdown_nonqt()
-            
+
             _log_live_threads("after shutdown_executors")
 
         finally:

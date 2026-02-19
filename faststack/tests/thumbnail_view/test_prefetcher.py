@@ -90,7 +90,9 @@ def _assert_ready_callback_called_once(callback: MagicMock):
     emit_calls = callback.emit.call_count if hasattr(callback, "emit") else 0
 
     total = direct_calls + emit_calls
-    assert total == 1, f"Expected callback delivery once; direct={direct_calls}, emit={emit_calls}"
+    assert (
+        total == 1
+    ), f"Expected callback delivery once; direct={direct_calls}, emit={emit_calls}"
 
     if direct_calls == 1:
         args, _kwargs = callback.call_args
@@ -210,7 +212,9 @@ class TestThumbnailPrefetcher:
         # Wait for job to complete (cache filled)
         path_hash = compute_path_hash(test_image)
         cache_key = f"200/{path_hash}/{mtime_ns}"
-        assert _wait_until(lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app)
+        assert _wait_until(
+            lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app
+        )
 
         assert cache.get(cache_key) is not None
 
@@ -250,7 +254,9 @@ class TestThumbnailPrefetcher:
         def _single_shot_immediate(_ms, fn):
             fn()
 
-        from PySide6.QtCore import QTimer  # import here so patch.object has the real type
+        from PySide6.QtCore import (
+            QTimer,
+        )  # import here so patch.object has the real type
 
         with patch.object(QTimer, "singleShot", side_effect=_single_shot_immediate):
             prefetcher = ThumbnailPrefetcher(
@@ -266,7 +272,11 @@ class TestThumbnailPrefetcher:
                 # Wait for decode completion (cache fill proves the worker finished)
                 path_hash = compute_path_hash(test_image)
                 cache_key = f"200/{path_hash}/{mtime_ns}"
-                assert _wait_until(lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app)
+                assert _wait_until(
+                    lambda: cache.get(cache_key) is not None,
+                    timeout_s=2.0,
+                    qt_app=qt_app,
+                )
 
                 delivered_key = _assert_ready_callback_called_once(callback)
                 assert "200/" in str(delivered_key)
@@ -314,7 +324,9 @@ class TestThumbnailDecode:
             # Wait for completion (cache filled)
             path_hash = compute_path_hash(img_path)
             cache_key = f"100/{path_hash}/{mtime_ns}"
-            assert _wait_until(lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app)
+            assert _wait_until(
+                lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app
+            )
 
             cached_bytes = cache.get(cache_key)
             assert cached_bytes is not None
@@ -342,7 +354,9 @@ class TestThumbnailDecode:
 
             path_hash = compute_path_hash(img_path)
             cache_key = f"200/{path_hash}/{mtime_ns}"
-            assert _wait_until(lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app)
+            assert _wait_until(
+                lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app
+            )
             assert cache.get(cache_key) is not None
         finally:
             prefetcher.shutdown()

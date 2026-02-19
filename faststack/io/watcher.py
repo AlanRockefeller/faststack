@@ -54,7 +54,11 @@ class ImageDirectoryEventHandler(FileSystemEventHandler):
     def on_moved(self, event):
         if _is_ignored_path(event.src_path) or _is_ignored_path(event.dest_path):
             return
-        log.info("Detected file move: %s -> %s. Requesting refresh.", event.src_path, event.dest_path)
+        log.info(
+            "Detected file move: %s -> %s. Requesting refresh.",
+            event.src_path,
+            event.dest_path,
+        )
         self.callback(event.src_path)
         self.callback(event.dest_path)
 

@@ -14,6 +14,7 @@ log = logging.getLogger(__name__)
 import weakref
 from concurrent.futures.thread import _worker, _threads_queues
 
+
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor whose worker threads are daemon threads.
 
@@ -42,13 +43,17 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
 
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
-            thread_name = '%s_%d' % (self._thread_name_prefix or self,
-                                     num_threads)
-            t = threading.Thread(name=thread_name, target=_worker,
-                                 args=(weakref.ref(self, weakref_cb),
-                                       self._work_queue,
-                                       self._initializer,
-                                       self._initargs))
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            t = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+            )
             t.daemon = True
             t.start()
             self._threads.add(t)
@@ -59,7 +64,7 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
 
 def create_daemon_threadpool_executor(
     max_workers: int, thread_name_prefix: str = ""
-) -> ThreadPoolExecutor:
+) -> DaemonThreadPoolExecutor:
     """
     Create a ThreadPoolExecutor whose worker threads are daemon threads.
     Returns a DaemonThreadPoolExecutor instance which is a subclass of ThreadPoolExecutor.
@@ -97,7 +102,9 @@ class PriorityExecutor:
     Workers are daemon threads.
     """
 
-    def __init__(self, max_workers: int, thread_name_prefix: str = "", maxsize: int = 0):
+    def __init__(
+        self, max_workers: int, thread_name_prefix: str = "", maxsize: int = 0
+    ):
         if max_workers < 1:
             raise ValueError("max_workers must be >= 1")
 
@@ -156,7 +163,9 @@ class PriorityExecutor:
                 except Exception:
                     pass
 
-    def submit(self, fn: Callable[..., Any], *args: Any, priority: int = 1, **kwargs: Any) -> Future:
+    def submit(
+        self, fn: Callable[..., Any], *args: Any, priority: int = 1, **kwargs: Any
+    ) -> Future:
         """Submit a task to the priority queue.
 
         Args:
@@ -194,7 +203,9 @@ class PriorityExecutor:
             # Cancel queued work so workers can exit once queue empties.
             while True:
                 try:
-                    _priority, _neg_seq, _fn, _args, _kwargs, fut = self._queue.get_nowait()
+                    _priority, _neg_seq, _fn, _args, _kwargs, fut = (
+                        self._queue.get_nowait()
+                    )
                 except queue.Empty:
                     break
                 try:

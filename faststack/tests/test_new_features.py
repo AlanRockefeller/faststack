@@ -43,7 +43,6 @@ def _to_gray_u8(result):
     )
 
 
-
 class TestNewFeatures(unittest.TestCase):
     def setUp(self):
         self.editor = ImageEditor()
@@ -120,7 +119,6 @@ class TestNewFeatures(unittest.TestCase):
         print(f"Highlights -1.0 on 128: {val_128}")
         # Allow small deviation due to float/int conversion
         self.assertTrue(abs(val_128 - 128) < 2)
-
 
     def test_straighten_angle(self):
         # Set straighten angle

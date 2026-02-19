@@ -9,25 +9,29 @@ import sys
 if not QApplication.instance():
     _qapp = QApplication(sys.argv)
 
+
 def test_app_init_only():
     """Verify AppController can be instantiated with mocks."""
-    with patch("faststack.app.ByteLRUCache"), \
-         patch("faststack.app.ThumbnailModel"), \
-         patch("faststack.app.Prefetcher"), \
-         patch("faststack.app.PathResolver"), \
-         patch("faststack.app.Watcher"), \
-         patch("faststack.app.uuid"), \
-         patch("faststack.app.QTimer"), \
-         patch("faststack.app.concurrent.futures.ThreadPoolExecutor"):
-        
+    with (
+        patch("faststack.app.ByteLRUCache"),
+        patch("faststack.app.ThumbnailModel"),
+        patch("faststack.app.Prefetcher"),
+        patch("faststack.app.PathResolver"),
+        patch("faststack.app.Watcher"),
+        patch("faststack.app.uuid"),
+        patch("faststack.app.QTimer"),
+        patch("faststack.app.concurrent.futures.ThreadPoolExecutor"),
+    ):
+
         # Create QApplication instance
         from PySide6.QtWidgets import QApplication
         import sys
+
         if not QApplication.instance():
-            qapp = QApplication(sys.argv)
+            _ = QApplication(sys.argv)
         else:
-            qapp = QApplication.instance()
-            
+            _ = QApplication.instance()
+
         mock_engine = MagicMock()
         try:
             app = AppController(Path("."), mock_engine)

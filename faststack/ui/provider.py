@@ -39,7 +39,8 @@ class ImageProvider(QQuickImageProvider):
     def requestImage(self, id: str, size: object, requestedSize: object) -> QImage:
         """Handles image requests from QML."""
         import time
-        _debug = getattr(self.app_controller, 'debug_cache', False)
+
+        _debug = getattr(self.app_controller, "debug_cache", False)
         if _debug:
             _t_start = time.perf_counter()
             print(f"[DBGCACHE] {_t_start*1000:.3f} requestImage: START id={id}")
@@ -83,7 +84,9 @@ class ImageProvider(QQuickImageProvider):
 
             if _debug:
                 _t_got = time.perf_counter()
-                print(f"[DBGCACHE] {_t_got*1000:.3f} requestImage: got image_data in {(_t_got - _t_get)*1000:.2f}ms")
+                print(
+                    f"[DBGCACHE] {_t_got*1000:.3f} requestImage: got image_data in {(_t_got - _t_get)*1000:.2f}ms"
+                )
 
             if image_data:
                 # Handle format being None (from prefetcher) or missing
@@ -133,7 +136,9 @@ class ImageProvider(QQuickImageProvider):
 
                 if _debug:
                     _t_end = time.perf_counter()
-                    print(f"[DBGCACHE] {_t_end*1000:.3f} requestImage: DONE id={id} total={(_t_end - _t_start)*1000:.2f}ms")
+                    print(
+                        f"[DBGCACHE] {_t_end*1000:.3f} requestImage: DONE id={id} total={(_t_end - _t_start)*1000:.2f}ms"
+                    )
 
                 # Buffer is now safe to release (handled by copy), but original_buffer ref in Python object stays
                 # We don't need to manually attach original_buffer to qimg anymore since we copied.
@@ -320,9 +325,11 @@ class UIState(QObject):
             self.app_controller.batchAutoLevelsFinished.connect(
                 self._on_batch_al_finished
             )
-        
+
         # Ensure image source updates when switching grid/loupe
-        self.isGridViewActiveChanged.connect(lambda _: self.currentImageSourceChanged.emit())
+        self.isGridViewActiveChanged.connect(
+            lambda _: self.currentImageSourceChanged.emit()
+        )
 
     def _on_batch_al_progress(self, current: int, total: int):
         self._batch_al_current = current
@@ -411,6 +418,12 @@ class UIState(QObject):
         if not self.app_controller.image_files:
             return ""
         return self.app_controller.get_current_metadata().get("filename", "")
+
+    @Property(str, notify=metadataChanged)
+    def exifBrief(self):
+        if not self.app_controller.image_files:
+            return ""
+        return self.app_controller.get_current_metadata().get("exif_brief", "")
 
     @Property(bool, notify=metadataChanged)
     def isStacked(self):
@@ -559,7 +572,9 @@ class UIState(QObject):
     @Property(str, notify=variantSaveHintChanged)
     def variantSaveHint(self):
         """Returns a hint message when saving from a variant."""
-        return self.app_controller.get_variant_save_hint()
+        if hasattr(self.app_controller, "get_variant_save_hint"):
+            return self.app_controller.get_variant_save_hint()
+        return ""
 
     @Property(str, notify=filterStringChanged)
     def filterString(self):
@@ -695,7 +710,6 @@ class UIState(QObject):
     @Slot()
     def jumpToLastUploaded(self):
         self.app_controller.jump_to_last_uploaded()
-
 
     @Slot(result=str)
     def get_helicon_path(self):
@@ -1513,7 +1527,10 @@ class UIState(QObject):
         # 2. Duplicate Suppression
         now = self._clock()
         current_req = (startIndex, endIndex, maxCount)
-        if current_req == self._last_prefetch_data and (now - self._last_prefetch_time) < 0.030:
+        if (
+            current_req == self._last_prefetch_data
+            and (now - self._last_prefetch_time) < 0.030
+        ):
             return
 
         self._last_prefetch_data = current_req
@@ -1522,14 +1539,16 @@ class UIState(QObject):
         # 3. Budgeting / Hard Cap
         HARD_LIMIT = 800
         budget = max(1, min(maxCount, HARD_LIMIT))
-        
+
         # Trim endIndex if the requested range exceeds the budget
         if (endIndex - startIndex + 1) > budget:
             endIndex = startIndex + budget - 1
 
         # Submit prefetch jobs for visible range
         # Defensive fallback if thumbnail_size is refactored away
-        size = getattr(model, "thumbnail_size", None) or getattr(prefetcher, "_target_size", None)
+        size = getattr(model, "thumbnail_size", None) or getattr(
+            prefetcher, "_target_size", None
+        )
         for i in range(startIndex, endIndex + 1):
             entry = model.get_entry(i)
             if entry and not entry.is_folder:

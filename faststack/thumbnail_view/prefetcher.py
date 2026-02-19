@@ -3,16 +3,20 @@
 import logging
 import os
 import time
+from collections import OrderedDict
 from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock
 import threading
 from typing import Dict, Optional, Set, Tuple, Callable, TYPE_CHECKING
+
 if TYPE_CHECKING:
     from faststack.imaging.cache import ByteLRUCache
 
 import numpy as np
+import io
 from PIL import Image
+from contextlib import nullcontext
 
 from faststack.util.executors import create_priority_executor
 from faststack.imaging.orientation import get_exif_orientation, apply_orientation_to_np
@@ -46,12 +50,6 @@ except ImportError:
     log.debug("TurboJPEG not available, using PIL for thumbnail decoding")
 
 
-
-
-
-
-
-
 class ThumbnailPrefetcher:
     """Background thumbnail decoder with ThreadPoolExecutor.
 
@@ -64,7 +62,7 @@ class ThumbnailPrefetcher:
 
     # Priority levels
     PRIO_HIGH = 0  # Visible items
-    PRIO_MED = 1   # Prefetch items
+    PRIO_MED = 1  # Prefetch items
 
     def __init__(
         self,
@@ -99,7 +97,9 @@ class ThumbnailPrefetcher:
         # Track in-flight jobs to avoid duplicates
         # Key: (size, path_hash, mtime_ns)
         # Value: (rid, ThumbTimer)
-        self._inflight: Dict[Tuple[int, str, int], Tuple[int, "thumb_debug.ThumbTimer"]] = {}
+        self._inflight: Dict[
+            Tuple[int, str, int], Tuple[int, Optional["thumb_debug.ThumbTimer"]]
+        ] = {}
         self._inflight_lock = Lock()
         self._debug_trace = debug_trace
 
@@ -112,8 +112,12 @@ class ThumbnailPrefetcher:
         if _HAS_QT and self._on_ready:
             try:
                 if QCoreApplication.instance() is not None:
-                    self._ready_emitter = _ReadyEmitter()  # created on constructing thread (should be Qt thread)
-                    self._ready_emitter.ready.connect(self._on_ready, Qt.QueuedConnection)
+                    self._ready_emitter = (
+                        _ReadyEmitter()
+                    )  # created on constructing thread (should be Qt thread)
+                    self._ready_emitter.ready.connect(
+                        self._on_ready, Qt.QueuedConnection
+                    )
             except Exception:
                 self._ready_emitter = None
 
@@ -128,9 +132,12 @@ class ThumbnailPrefetcher:
         )
 
     def submit(
-        self, path: Path, mtime_ns: int, size: int = None, 
+        self,
+        path: Path,
+        mtime_ns: int,
+        size: Optional[int] = None,
         priority: int = PRIO_MED,
-        timer: Optional["thumb_debug.ThumbTimer"] = None
+        timer: Optional["thumb_debug.ThumbTimer"] = None,
     ) -> bool:
         """Submit a thumbnail decode job.
 
@@ -169,40 +176,55 @@ class ThumbnailPrefetcher:
                 existing_rid, existing_timer = self._inflight[job_key]
                 if existing_timer:
                     # Capture where this request originated
-                    existing_timer.coalesced_from = timer.reason
+                    if timer:
+                        existing_timer.coalesced_from = timer.reason
                     # Update effective priority if this requested one is higher
-                    if existing_timer.prio_effective is not None and priority < existing_timer.prio_effective:
+                    if (
+                        existing_timer.prio_effective is not None
+                        and priority < existing_timer.prio_effective
+                    ):
                         existing_timer.prio_effective = priority
                         if timer:
-                            thumb_debug.log_trace("prio_bump", rid=existing_timer.rid, new_prio=priority, triggered_by_rid=timer.rid)
-                
+                            thumb_debug.log_trace(
+                                "prio_bump",
+                                rid=existing_timer.rid,
+                                new_prio=priority,
+                                triggered_by_rid=timer.rid,
+                            )
+
                 if timer:
                     thumb_debug.inc("decode_coalesced")
-                    thumb_debug.log_trace("coalesced", rid=timer.rid, existing_rid=existing_rid)
+                    thumb_debug.log_trace(
+                        "coalesced", rid=timer.rid, existing_rid=existing_rid
+                    )
                 return False
-            
+
             if timer:
                 timer.t_queued = time.perf_counter()
                 timer.prio_submitted = priority
                 timer.prio_effective = priority
                 thumb_debug.inc("decode_submitted")
-                thumb_debug.log_trace("queued", rid=timer.rid, prio=priority, qdepth=len(self._inflight)+1)
+                thumb_debug.log_trace(
+                    "queued",
+                    rid=timer.rid,
+                    prio=priority,
+                    qdepth=len(self._inflight) + 1,
+                )
 
             self._inflight[job_key] = (timer.rid if timer else 0, timer)
             thumb_debug.gauge("inflight", len(self._inflight))
-            thumb_debug.gauge("qdepth", len(self._inflight))
 
         # Submit decode job
         try:
             self._submit_count += 1
-            
+
             future = self._executor.submit(
                 self._decode_worker,
                 path,
                 path_hash,
                 mtime_ns,
                 size,
-                timer=timer,
+                timer,
                 priority=priority,
             )
 
@@ -240,7 +262,7 @@ class ThumbnailPrefetcher:
         path_hash: str,
         mtime_ns: int,
         size: int,
-        timer: "thumb_debug.ThumbTimer",
+        timer: Optional["thumb_debug.ThumbTimer"] = None,
     ) -> Optional[bytes]:
         """Worker function to decode a thumbnail.
 
@@ -250,52 +272,64 @@ class ThumbnailPrefetcher:
             timer.t_worker_start = time.perf_counter()
             timer.started = True
             thumb_debug.inc("decode_started")
-            thumb_debug.log_trace("worker_start", rid=timer.rid)
-        
+            thumb_debug.log_trace(
+                "worker_start",
+                rid=timer.rid,
+                prio=getattr(timer, "prio_effective", None),
+            )
+
         try:
             # Read and decode
             rgb_array = self._decode_image(path, size, timer=timer)
-            
+
             if rgb_array is None:
                 return None
 
             # Check cancellation early if possible
-            if timer.cancelled or self._stop_event.is_set():
-                thumb_debug.log_trace("cancel_honored", rid=timer.rid, stage="after_decode")
+            if (timer and timer.cancelled) or self._stop_event.is_set():
+                if timer:
+                    thumb_debug.log_trace(
+                        "cancel_honored", rid=timer.rid, stage="after_decode"
+                    )
                 return None
 
             # Get EXIF orientation and apply (single point of orientation)
-            with timer.stage("orientation"):
+            with timer.stage("orientation") if timer else nullcontext():
                 orientation = get_exif_orientation(path)
                 rgb_array = apply_orientation_to_np(rgb_array, orientation)
 
             # Check cancellation again
-            if timer.cancelled or self._stop_event.is_set():
-                thumb_debug.log_trace("cancel_honored", rid=timer.rid, stage="after_orientation")
+            if (timer and timer.cancelled) or self._stop_event.is_set():
+                if timer:
+                    thumb_debug.log_trace(
+                        "cancel_honored", rid=timer.rid, stage="after_orientation"
+                    )
                 return None
 
             # Encode to JPEG bytes for storage
-            with timer.stage("encode"):
+            with timer.stage("encode") if timer else nullcontext():
                 pil_image = Image.fromarray(rgb_array, mode="RGB")
-
-                # Use BytesIO to encode to JPEG
-                import io
-
                 buf = io.BytesIO()
                 pil_image.save(buf, format="JPEG", quality=85)
                 result = buf.getvalue()
-            
-            if timer.cancelled:
+
+            if timer and timer.cancelled:
                 thumb_debug.log_trace("cancel_too_late", rid=timer.rid)
-            
+
             return result
 
         except Exception as e:
-            thumb_debug.log_trace("worker_error", rid=timer.rid, error=str(e))
+            if timer:
+                thumb_debug.log_trace("worker_error", rid=timer.rid, error=str(e))
             log.debug("Failed to decode thumbnail for %s: %s", path, e)
             return None
 
-    def _decode_image(self, path: Path, target_size: int, timer: "thumb_debug.ThumbTimer") -> Optional[np.ndarray]:
+    def _decode_image(
+        self,
+        path: Path,
+        target_size: int,
+        timer: Optional["thumb_debug.ThumbTimer"] = None,
+    ) -> Optional[np.ndarray]:
         """Decode image to numpy array at target size.
 
         Uses TurboJPEG if available for faster decoding.
@@ -306,11 +340,11 @@ class ThumbnailPrefetcher:
         # Try TurboJPEG for JPEG files
         if HAS_TURBOJPEG and suffix in (".jpg", ".jpeg"):
             try:
-                with timer.stage("io"):
+                with timer.stage("io") if timer else nullcontext():
                     with open(path, "rb") as f:
                         jpeg_data = f.read()
 
-                with timer.stage("decode"):
+                with timer.stage("decode") if timer else nullcontext():
                     # Get dimensions first
                     width, height, _, _ = _tj.decode_header(jpeg_data)
 
@@ -332,7 +366,7 @@ class ThumbnailPrefetcher:
                 # Further resize with PIL if needed
                 h, w = rgb.shape[:2]
                 if w > target_size or h > target_size:
-                    with timer.stage("decode"):
+                    with timer.stage("resize") if timer else nullcontext():
                         pil_img = Image.fromarray(rgb)
                         pil_img.thumbnail(
                             (target_size, target_size), Image.Resampling.LANCZOS
@@ -348,29 +382,34 @@ class ThumbnailPrefetcher:
 
         # Fallback to PIL
         try:
-            with timer.stage("decode"):
-                pil_img = Image.open(path)
-                # Convert to RGB if needed
-                if pil_img.mode != "RGB":
-                    pil_img = pil_img.convert("RGB")
+            with timer.stage("decode") if timer else nullcontext():
+                with Image.open(path) as pil_img:
+                    # Convert to RGB if needed
+                    if pil_img.mode != "RGB":
+                        pil_img = pil_img.convert("RGB")
 
-                # Resize
-                pil_img.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
-                return np.array(pil_img)
+                    # Resize
+                    pil_img.thumbnail(
+                        (target_size, target_size), Image.Resampling.LANCZOS
+                    )
+                    return np.array(pil_img.copy())
 
         except Exception as e:
             log.debug("PIL decode failed for %s: %s", path, e)
             return None
 
     def _on_decode_done(
-        self, future: Future, job_key: Tuple[int, str, int], cache_key: str, timer: "thumb_debug.ThumbTimer"
+        self,
+        future: Future,
+        job_key: Tuple[int, str, int],
+        cache_key: str,
+        timer: Optional["thumb_debug.ThumbTimer"],
     ):
         """Callback when decode completes."""
         # Always remove bookkeeping first to avoid stranding entries
         with self._inflight_lock:
             self._inflight.pop(job_key, None)
             thumb_debug.gauge("inflight", len(self._inflight))
-            thumb_debug.gauge("qdepth", len(self._inflight))
             if self._futures.get(job_key) is future:
                 del self._futures[job_key]
 
@@ -389,7 +428,11 @@ class ThumbnailPrefetcher:
             if future.cancelled() or (timer and timer.cancelled):
                 if timer:
                     thumb_debug.inc("decode_cancelled")
-                    event = "cancelled_midflight" if timer.started else "cancelled_before_start"
+                    event = (
+                        "cancelled_midflight"
+                        if timer.started
+                        else "cancelled_before_start"
+                    )
                     thumb_debug.log_trace(event, rid=timer.rid)
                 return
 
@@ -397,7 +440,7 @@ class ThumbnailPrefetcher:
             if jpeg_bytes:
                 # Store in cache
                 self._cache.put(cache_key, jpeg_bytes)
-                
+
                 if timer:
                     thumb_debug.inc("decode_done_ok")
                     thumb_debug.log_trace("completed", rid=timer.rid)
@@ -427,8 +470,9 @@ class ThumbnailPrefetcher:
             thumb_debug.gauge("inflight", 0)
 
         for timer in inflight_timers:
-            timer.cancelled = True
-            thumb_debug.log_trace("cancel_requested", rid=timer.rid)
+            if timer is not None:
+                timer.cancelled = True
+                thumb_debug.log_trace("cancel_requested", rid=timer.rid)
 
         for f in futures:
             try:
@@ -456,8 +500,7 @@ class ThumbnailCache:
     def __init__(self, max_bytes: int = 256 * 1024 * 1024, max_items: int = 5000):
         self._max_bytes = max_bytes
         self._max_items = max_items
-        self._cache: Dict[str, bytes] = {}
-        self._order: list = []  # LRU order (oldest first)
+        self._cache: Dict[str, bytes] = OrderedDict()
         self._current_bytes = 0
         self._lock = Lock()
 
@@ -467,39 +510,47 @@ class ThumbnailCache:
             if key not in self._cache:
                 return None
             # Move to end (most recently used)
-            self._order.remove(key)
-            self._order.append(key)
+            self._cache.move_to_end(key, last=True)
             return self._cache[key]
 
     def put(self, key: str, value: bytes):
         """Put item in cache, evicting if necessary."""
         with self._lock:
-            # If already present, remove old entry first
+            # If already present, remove old entry logic by just updating (OrderedDict handles key existence)
+            # But we must update _current_bytes first if it exists
             if key in self._cache:
-                old_value = self._cache[key]
-                self._current_bytes -= len(old_value)
-                self._order.remove(key)
-
-            # Add new entry
+                self._current_bytes -= len(self._cache[key])
+                self._cache.move_to_end(key, last=True)
+            
             self._cache[key] = value
-            self._order.append(key)
             self._current_bytes += len(value)
 
             # Evict if over limits
             while (
                 self._current_bytes > self._max_bytes
                 or len(self._cache) > self._max_items
-            ) and self._order:
-                oldest = self._order.pop(0)
-                if oldest in self._cache:
-                    self._current_bytes -= len(self._cache[oldest])
-                    del self._cache[oldest]
+            ):
+                # Pop oldest (first item)
+                _, oldest_val = self._cache.popitem(last=False)
+                self._current_bytes -= len(oldest_val)
+
+    def discard(self, key: str) -> bool:
+        """Remove a single entry if present. No-op if missing.
+
+        Returns True if the key was present and removed, False otherwise.
+        """
+        with self._lock:
+            try:
+                val = self._cache.pop(key)
+            except KeyError:
+                return False
+            self._current_bytes -= len(val)
+            return True
 
     def clear(self):
         """Clear the cache."""
         with self._lock:
             self._cache.clear()
-            self._order.clear()
             self._current_bytes = 0
 
     @property

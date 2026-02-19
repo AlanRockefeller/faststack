@@ -36,6 +36,7 @@ def app_controller(tmp_path):
 
         # Mock the executor to return a real Future we can control
         from concurrent.futures import Future
+
         controller._delete_executor = MagicMock()
         controller._delete_executor.submit.side_effect = lambda *a, **kw: Future()
 
@@ -113,12 +114,14 @@ def test_async_delete_completion(app_controller):
     # 3. Resolve future
     result = {
         "job_id": job_id,
-        "successes": [{
-            "jpg": img_path,
-            "recycled_jpg": recycled_path,
-            "raw": None,
-            "recycled_raw": None
-        }],
+        "successes": [
+            {
+                "jpg": img_path,
+                "recycled_jpg": recycled_path,
+                "raw": None,
+                "recycled_raw": None,
+            }
+        ],
         "failures": [],
         "cancelled": False,
     }
@@ -160,11 +163,7 @@ def test_delete_rollback_on_cancel(app_controller):
     result = {
         "job_id": job_id,
         "successes": [],
-        "failures": [{
-            "jpg": img_path,
-            "raw": None,
-            "code": "cancelled"
-        }],
+        "failures": [{"jpg": img_path, "raw": None, "code": "cancelled"}],
         "cancelled": True,
     }
     app_controller._on_delete_finished(result)
@@ -231,12 +230,9 @@ def test_cancel_midlight_with_real_files(app_controller):
 
     result = {
         "job_id": job_id,
-        "successes": [{
-            "jpg": p1,
-            "recycled_jpg": recycled_a,
-            "raw": None,
-            "recycled_raw": None
-        }],
+        "successes": [
+            {"jpg": p1, "recycled_jpg": recycled_a, "raw": None, "recycled_raw": None}
+        ],
         "failures": [
             {"jpg": p2, "raw": None, "code": "cancelled"},
             {"jpg": p3, "raw": None, "code": "cancelled"},
@@ -279,12 +275,14 @@ def test_undo_midflight_auto_restores(app_controller, tmp_path):
     # Completion arrives (file was moved before cancel took effect)
     result = {
         "job_id": job_id,
-        "successes": [{
-            "jpg": p1,
-            "recycled_jpg": Path("recycle/test.jpg"),
-            "raw": None,
-            "recycled_raw": None
-        }],
+        "successes": [
+            {
+                "jpg": p1,
+                "recycled_jpg": Path("recycle/test.jpg"),
+                "raw": None,
+                "recycled_raw": None,
+            }
+        ],
         "failures": [],
         "cancelled": True,
     }
@@ -298,4 +296,6 @@ def test_undo_midflight_auto_restores(app_controller, tmp_path):
     assert len(app_controller.image_files) == 1
 
     # 3. Restore was attempted
-    app_controller._restore_from_recycle_bin_safe.assert_called_with(p1, Path("recycle/test.jpg"))
+    app_controller._restore_from_recycle_bin_safe.assert_called_with(
+        p1, Path("recycle/test.jpg")
+    )

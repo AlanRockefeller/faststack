@@ -9,6 +9,7 @@ from faststack.app import AppController
 @dataclass(frozen=True)
 class DummyImage:
     """Minimal stand-in for faststack.models.ImageFile."""
+
     path: Path
     raw_pair: Path | None = None
 
@@ -47,6 +48,7 @@ def mock_controller(tmp_path, qapp):
 
         # Prevent background jobs from actually running
         from concurrent.futures import Future
+
         controller._delete_executor = Mock()
         controller._delete_executor.submit.side_effect = lambda *a, **kw: Future()
 
@@ -81,7 +83,7 @@ def _assert_cache_cleanup(mock_controller, deleted_paths):
     if hasattr(cache, "evict_paths") and cache.evict_paths.call_count:
         args, _kwargs = cache.evict_paths.call_args
         assert args, "evict_paths should receive at least one arg"
-        arg0 = list(args[0]) if not isinstance(args[0], (list, tuple, set)) else list(args[0])
+        arg0 = list(args[0])
         deleted_strs = {str(p) for p in deleted_paths}
         arg0_strs = {str(p) for p in arg0}
         assert deleted_strs & arg0_strs, "evict_paths should include deleted path(s)"
@@ -148,12 +150,14 @@ def test_delete_async_completion(mock_controller, tmp_path):
 
     result = {
         "job_id": job_id,
-        "successes": [{
-            "jpg": img_path_resolved,
-            "recycled_jpg": recycled,
-            "raw": None,
-            "recycled_raw": None
-        }],
+        "successes": [
+            {
+                "jpg": img_path_resolved,
+                "recycled_jpg": recycled,
+                "raw": None,
+                "recycled_raw": None,
+            }
+        ],
         "failures": [],
         "cancelled": False,
     }
@@ -161,10 +165,14 @@ def test_delete_async_completion(mock_controller, tmp_path):
 
     delete_entries = [e for e in mock_controller.undo_history if e[0] == "delete"]
     assert len(delete_entries) == 1
-    pending_entries = [e for e in mock_controller.undo_history if e[0] == "pending_delete"]
+    pending_entries = [
+        e for e in mock_controller.undo_history if e[0] == "pending_delete"
+    ]
     assert len(pending_entries) == 0
 
-    mock_controller.update_status_message.assert_called_with("Image moved to recycle bin")
+    mock_controller.update_status_message.assert_called_with(
+        "Image moved to recycle bin"
+    )
 
 
 def test_delete_current_image_cancel(mock_controller):
@@ -212,16 +220,20 @@ def test_recycle_failure_restores_image_automatically(mock_controller):
     result = {
         "job_id": job_id,
         "successes": [],
-        "failures": [{
-            "jpg": img1.path.resolve(),
-            "raw": None,
-            "code": "recycle_failed",
-        }],
+        "failures": [
+            {
+                "jpg": img1.path.resolve(),
+                "raw": None,
+                "code": "recycle_failed",
+            }
+        ],
         "cancelled": False,
     }
 
     # User declines permanent delete -> expect rollback/restore
-    with patch("faststack.app.confirm_permanent_delete", return_value=False) as mock_confirm:
+    with patch(
+        "faststack.app.confirm_permanent_delete", return_value=False
+    ) as mock_confirm:
         mock_controller._on_delete_finished(result)
 
         mock_confirm.assert_called_once()

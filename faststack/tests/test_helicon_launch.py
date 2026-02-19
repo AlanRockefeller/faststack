@@ -12,6 +12,7 @@ from faststack.app import AppController
 @dataclass(frozen=True)
 class DummyImage:
     """Minimal stand-in for faststack.models.ImageFile used by launch_helicon()."""
+
     path: Path
     raw_pair: Path | None = None
 
@@ -21,22 +22,26 @@ def mock_controller():
     # Mock dependencies required by AppController init
     engine = MagicMock()
 
-    with patch("faststack.app.Watcher"), \
-         patch("faststack.app.SidecarManager"), \
-         patch("faststack.app.ImageEditor"), \
-         patch("faststack.app.ByteLRUCache"), \
-         patch("faststack.app.Prefetcher"), \
-         patch("faststack.app.ThumbnailCache"), \
-         patch("faststack.app.PathResolver"), \
-         patch("faststack.app.ThumbnailPrefetcher"), \
-         patch("faststack.app.ThumbnailModel"), \
-         patch("faststack.app.ThumbnailProvider"), \
-         patch("faststack.app.concurrent.futures.ThreadPoolExecutor"):
+    with (
+        patch("faststack.app.Watcher"),
+        patch("faststack.app.SidecarManager"),
+        patch("faststack.app.ImageEditor"),
+        patch("faststack.app.ByteLRUCache"),
+        patch("faststack.app.Prefetcher"),
+        patch("faststack.app.ThumbnailCache"),
+        patch("faststack.app.PathResolver"),
+        patch("faststack.app.ThumbnailPrefetcher"),
+        patch("faststack.app.ThumbnailModel"),
+        patch("faststack.app.ThumbnailProvider"),
+        patch("faststack.app.concurrent.futures.ThreadPoolExecutor"),
+    ):
 
         controller = AppController(image_dir=Path("c:/images"), engine=engine)
 
     # Provide image_files as simple objects with `.path` and `.raw_pair`
-    img1 = DummyImage(path=Path("c:/images/img1.jpg"), raw_pair=Path("c:/images/img1.CR2"))
+    img1 = DummyImage(
+        path=Path("c:/images/img1.jpg"), raw_pair=Path("c:/images/img1.CR2")
+    )
     img2 = DummyImage(path=Path("c:/images/img2.jpg"), raw_pair=None)  # No RAW fallback
     controller.image_files = [img1, img2]
 
@@ -108,4 +113,3 @@ def test_uistate_delegation(mock_controller):
     ui_state.launch_helicon(False)
     files = _called_file_list(mock_controller)
     assert files[0].suffix.lower() == ".jpg"
-

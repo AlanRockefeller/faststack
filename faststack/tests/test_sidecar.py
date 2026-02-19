@@ -147,4 +147,3 @@ def test_favorite_toggle_roundtrip(mock_sidecar_dir):
     sm2 = SidecarManager(d, None)
     meta2 = sm2.get_metadata("IMG_FAV")
     assert meta2.favorite is False
-

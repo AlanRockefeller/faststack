@@ -1,4 +1,3 @@
-
 import unittest
 from unittest.mock import MagicMock, patch
 import numpy as np
@@ -8,6 +7,7 @@ import sys
 # Ensure faststack is in path
 from faststack.imaging.editor import ImageEditor
 from PIL import Image
+
 
 class TestDebugError(unittest.TestCase):
     def test_debug_save_image(self):
@@ -19,7 +19,10 @@ class TestDebugError(unittest.TestCase):
         editor.original_image = MagicMock()
 
         # Patch create_backup_file to succeed
-        with patch("faststack.imaging.editor.create_backup_file", return_value=Path("backup.jpg")):
+        with patch(
+            "faststack.imaging.editor.create_backup_file",
+            return_value=Path("backup.jpg"),
+        ):
             # Patch Image.fromarray at the module level where it's used
             with patch("faststack.imaging.editor.Image.fromarray") as mock_fromarray:
                 # Configure the mock object returned by fromarray
@@ -36,15 +39,18 @@ class TestDebugError(unittest.TestCase):
         editor.float_image = None
         editor.current_filepath = Path("fake.jpg")
         editor.original_image = MagicMock()
-        
-        # Simulate race: _ensure_float_image "thinks" it succeeded (or was raced), 
+
+        # Simulate race: _ensure_float_image "thinks" it succeeded (or was raced),
         # but float_image is actually None when we enter the lock.
         # We achieve this by silencing _ensure_float_image so it doesn't populate float_image.
         editor._ensure_float_image = MagicMock()
 
         # Should raise RuntimeError explicitly now (instead of returning None)
-        with self.assertRaisesRegex(RuntimeError, "save_image called with no float_image"):
+        with self.assertRaisesRegex(
+            RuntimeError, "save_image called with no float_image"
+        ):
             editor.save_image()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -578,14 +578,17 @@ class ImageEditor:
                     float_image_orientation_applied = orientation > 1
                     log.warning(
                         "OpenCV loaded unexpected channel count, falling back to Pillow: %s",
-                        load_filepath
+                        load_filepath,
                     )
 
                 loaded_float_image = arr
                 if loaded_bit_depth == 16:
                     log.info("Loaded 16-bit image via OpenCV: %s", load_filepath)
                 else:
-                    log.info("Loaded 8-bit image via Pillow (OpenCV fallback): %s", load_filepath)
+                    log.info(
+                        "Loaded 8-bit image via Pillow (OpenCV fallback): %s",
+                        load_filepath,
+                    )
             else:
                 # Fallback to Pillow logic for 8-bit or if OpenCV failed/returned 8-bit
                 loaded_bit_depth = 8
@@ -609,12 +612,14 @@ class ImageEditor:
                 if float_image_orientation_applied:
                     log.debug(
                         "EXIF orientation %d already applied during PIL load: %s",
-                        orientation, load_filepath,
+                        orientation,
+                        load_filepath,
                     )
                 else:
                     log.info(
                         "Applying EXIF orientation %d to float buffer (CV2 path): %s",
-                        orientation, load_filepath,
+                        orientation,
+                        load_filepath,
                     )
                     loaded_original = ImageOps.exif_transpose(loaded_original)
                     if loaded_float_image is not None:
@@ -956,7 +961,9 @@ class ImageEditor:
                     # cv2.convertScaleAbs is very fast for saturation casting [0,1]*255 to uint8
                     srgb_u8_stride = cv2.convertScaleAbs(arr_stride, alpha=255.0)
                 else:
-                    srgb_u8_stride = (np.clip(arr_stride, 0.0, 1.0) * 255).astype(np.uint8)
+                    srgb_u8_stride = (np.clip(arr_stride, 0.0, 1.0) * 255).astype(
+                        np.uint8
+                    )
 
             arr = _srgb_to_linear(arr)
 
@@ -1300,7 +1307,9 @@ class ImageEditor:
         if _skip_linear:
             arr = np.clip(arr, 0.0, 1.0)
 
-        return arr  # May exceed 1.0 in preview/non-export; clipped for skip_linear export.
+        return (
+            arr  # May exceed 1.0 in preview/non-export; clipped for skip_linear export.
+        )
 
     def auto_levels(
         self, threshold_percent: float = 0.1
@@ -1418,7 +1427,8 @@ class ImageEditor:
                 int((t_u8 - t_arr) * 1000),
                 int((t_end - t_u8) * 1000),
                 int((t_end - t0) * 1000),
-                w, h,
+                w,
+                h,
                 "preview" if self.float_preview is not None else "full",
             )
         return blacks, whites, float(p_low), float(p_high)
@@ -1576,7 +1586,8 @@ class ImageEditor:
                     if abs(val_deg - rounded_deg) > 1.0:
                         log.warning(
                             "'rotation' received %s. Rounding to %d. Use 'straighten_angle' for free rotation.",
-                            value, final_val
+                            value,
+                            final_val,
                         )
 
                     self.current_edits[key] = final_val
@@ -1614,7 +1625,7 @@ class ImageEditor:
         shadows: float,
         *,
         srgb_u8_stride: Optional[np.ndarray] = None,
-        srgb_u8: Optional[np.ndarray] = None,
+        srgb_u8: Optional[np.ndarray] = None,  # Planned future alias for srgb_u8_stride
         analysis_state: Optional[Dict[str, float]] = None,
         edits: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
@@ -1634,7 +1645,7 @@ class ImageEditor:
             shadows: -1.0 to 1.0, positive lifts shadows, negative crushes
             srgb_u8_stride: Optional uint8 sRGB array (strided) for accurate JPEG clipping detection
                      (should be the image BEFORE linearization)
-            srgb_u8: Keyword-only alias for srgb_u8_stride (preferred if provided).
+            srgb_u8: Keyword-only alias for srgb_u8_stride (not yet active in call site).
             analysis_state: Optional pre-computed analysis state to avoid re-work.
 
         Returns:
@@ -1648,7 +1659,7 @@ class ImageEditor:
         state = analysis_state
         if state is None:
             # Re-compute locally if not provided
-            # We assume effective_srgb_u8 is ALREADY STRIDED if passed 
+            # We assume effective_srgb_u8 is ALREADY STRIDED if passed
             arr_stride = arr[::4, ::4, :]
             # If effective_srgb_u8 was passed, use it directly (it's already small).
             # If it wasn't passed, we can't easily recreate the source state here without the original source buffer.
@@ -1805,8 +1816,6 @@ class ImageEditor:
             self.current_edits["crop_box"] = crop_box
             self._edits_rev += 1
 
-
-
     def _write_tiff_16bit(self, path: Path, arr_float: np.ndarray):
         """
         Writes a float32 (0-1) numpy array as an uncompressed 16-bit RGB TIFF using OpenCV.
@@ -1890,7 +1899,7 @@ class ImageEditor:
             except Exception as e:
                 log.warning(
                     "Failed to serialize sanitized EXIF: %s. Dropping EXIF to prevent rotation issues.",
-                    e
+                    e,
                 )
                 return None
         except Exception as e:
@@ -1918,8 +1927,6 @@ class ImageEditor:
             if self.original_image is original_ref:
                 if self.float_image is None:
                     self.float_image = float_arr
-
-
 
     def save_image(
         self,
@@ -1951,10 +1958,7 @@ class ImageEditor:
             raise RuntimeError("No image loaded")
 
         # Ensure float master exists (preview_only loads may not have it)
-        try:
-            self._ensure_float_image()
-        except RuntimeError:
-            raise
+        self._ensure_float_image()
 
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
@@ -1966,11 +1970,13 @@ class ImageEditor:
             # Re-check float image existence under lock (though _ensure calls it too)
             # Previously returned None, now raising to be explicit about failure
             if self.float_image is None:
-                raise RuntimeError("save_image called with no float_image (race condition?)")
-            
+                raise RuntimeError(
+                    "save_image called with no float_image (race condition?)"
+                )
+
             # Determine if we can skip copy
             _safe_no_copy = self._edits_can_share_input(self.current_edits)
-            
+
             # Snapshot the source data
             # If safe to share (read-only), we just grab the reference
             # If not safe, we MUST copy it here while holding the lock
@@ -2015,9 +2021,7 @@ class ImageEditor:
             else:
                 # Check for geometric transforms
                 rotation = edits_snapshot.get("rotation", 0)
-                straighten_angle = float(
-                    edits_snapshot.get("straighten_angle", 0.0)
-                )
+                straighten_angle = float(edits_snapshot.get("straighten_angle", 0.0))
                 transforms_applied = (rotation != 0) or (abs(straighten_angle) > 0.001)
 
                 # Determine EXIF bytes to write
@@ -2059,9 +2063,7 @@ class ImageEditor:
 
                 # Check for geometric transforms (re-check not strictly needed but for clarity)
                 rotation = edits_snapshot.get("rotation", 0)
-                straighten_angle = float(
-                    edits_snapshot.get("straighten_angle", 0.0)
-                )
+                straighten_angle = float(edits_snapshot.get("straighten_angle", 0.0))
                 transforms_applied = (rotation != 0) or (abs(straighten_angle) > 0.001)
 
                 # Determine EXIF for sidecar - prefer source EXIF (from paired JPEG)
@@ -2103,7 +2105,8 @@ class ImageEditor:
                     int((t_backup - t_edits) * 1000),
                     int((t_write - t_backup) * 1000),
                     int((t_write - t0) * 1000),
-                    w, h,
+                    w,
+                    h,
                     original_path.name,
                 )
             return original_path, backup_path
@@ -2113,7 +2116,8 @@ class ImageEditor:
             raise RuntimeError("Save failed: %s" % str(e)) from e
 
     def save_image_uint8_levels(
-        self, save_target_path: Optional[Path] = None,
+        self,
+        save_target_path: Optional[Path] = None,
     ) -> Optional[Tuple[Path, Path]]:
         """Fast-path save using a uint8 LUT for levels-only edits.
 
@@ -2138,7 +2142,9 @@ class ImageEditor:
             return None
 
         # Only applicable when blacks/whites are the sole active edits
-        edits = self.current_edits
+        with self._lock:
+            edits = self.current_edits.copy()
+
         for key, default in self._initial_edits().items():
             if key in ("blacks", "whites"):
                 continue
@@ -2168,10 +2174,14 @@ class ImageEditor:
 
         # Build 768-entry LUT matching _apply_edits step 13 (cached by rounded key)
         cache_key = (round(blacks, 3), round(whites, 3))
-        cached = self._cached_u8_lut
-        if cached is not None and cached[0] == cache_key:
-            lut_rgb = cached[1]
-        else:
+        with self._lock:
+            cached = self._cached_u8_lut
+            if cached is not None and cached[0] == cache_key:
+                lut_rgb = cached[1]
+            else:
+                lut_rgb = None
+
+        if lut_rgb is None:
             bp = -blacks * 0.15
             wp = 1.0 - (whites * 0.15)
             if abs(wp - bp) < 0.0001:
@@ -2180,7 +2190,8 @@ class ImageEditor:
             lut = (lut - bp) / (wp - bp)
             lut = np.clip(lut, 0.0, 1.0)
             lut_rgb = (lut * 255.0).astype(np.uint8).tolist() * 3  # 768 entries
-            self._cached_u8_lut = (cache_key, lut_rgb)
+            with self._lock:
+                self._cached_u8_lut = (cache_key, lut_rgb)
 
         # Apply LUT via Pillow .point() — single C call, no large NumPy allocation
         rgb_img = self.original_image
@@ -2224,7 +2235,9 @@ class ImageEditor:
                 os.replace(tmp_path, original_path)
             except OSError as e:
                 # Windows: destination may be held open by another process
-                log.warning("Atomic replace failed (%s); falling back to direct save", e)
+                log.warning(
+                    "Atomic replace failed (%s); falling back to direct save", e
+                )
                 try:
                     img_u8.save(original_path, **save_kwargs)
                 except Exception:
@@ -2248,7 +2261,8 @@ class ImageEditor:
                 int((t_backup - t_lut) * 1000),
                 int((t_write - t_backup) * 1000),
                 int((t_write - t0) * 1000),
-                w, h,
+                w,
+                h,
                 original_path.name,
             )
         return original_path, backup_path

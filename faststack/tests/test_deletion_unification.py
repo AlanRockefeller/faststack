@@ -40,6 +40,7 @@ def mock_controller(tmp_path, qapp):
 
         # Mock the executor to prevent background jobs from running during tests
         from concurrent.futures import Future
+
         controller._delete_executor = Mock()
         controller._delete_executor.submit.side_effect = lambda *a, **kw: Future()
 
@@ -56,6 +57,7 @@ def mock_controller(tmp_path, qapp):
 
 
 # ── Optimistic UI tests ──────────────────────────────────────────────
+
 
 def test_delete_batch_optimistic_removal(mock_controller):
     """Test that batch deletion optimistically removes images from the list."""
@@ -214,6 +216,7 @@ def test_delete_schedules_refresh(mock_controller):
 
 # ── Undo tests ───────────────────────────────────────────────────────
 
+
 def test_undo_pending_delete_restores_items(mock_controller):
     """Test that undo during pending delete restores items without disk ops."""
     img1 = ImageFile(Path("test1.jpg"))
@@ -255,6 +258,7 @@ def test_undo_pending_batch_delete_restores_all(mock_controller):
 
 # ── Cancel mid-flight restores unprocessed items ──────────────────────
 
+
 def test_cancel_midlight_restores_unprocessed(mock_controller):
     """Cancel mid-flight: completion with partial success restores unprocessed items."""
     img1 = ImageFile(Path("img1.jpg"))
@@ -271,12 +275,14 @@ def test_cancel_midlight_restores_unprocessed(mock_controller):
     # Simulate worker result: 1 success, 2 cancelled (unprocessed)
     result = {
         "job_id": job_id,
-        "successes": [{
-            "jpg": img1.path.resolve(),
-            "recycled_jpg": Path("recycle/img1.jpg"),
-            "raw": None,
-            "recycled_raw": None
-        }],
+        "successes": [
+            {
+                "jpg": img1.path.resolve(),
+                "recycled_jpg": Path("recycle/img1.jpg"),
+                "raw": None,
+                "recycled_raw": None,
+            }
+        ],
         "failures": [
             {"jpg": img2.path.resolve(), "raw": None, "code": "cancelled"},
             {"jpg": img3.path.resolve(), "raw": None, "code": "cancelled"},
@@ -298,6 +304,7 @@ def test_cancel_midlight_restores_unprocessed(mock_controller):
 
 # ── Undo pending prevents later bookkeeping ──────────────────────────
 
+
 def test_undo_pending_auto_restores_moved_files(mock_controller):
     """Undo pending delete, then completion arrives: files are auto-restored (Policy 1)."""
     img1 = ImageFile(Path("img1.jpg"))
@@ -316,12 +323,14 @@ def test_undo_pending_auto_restores_moved_files(mock_controller):
     # Simulate completion arriving AFTER undo (some files already moved)
     result = {
         "job_id": job_id,
-        "successes": [{
-            "jpg": img1.path.resolve(),
-            "recycled_jpg": Path("recycle/img1.jpg"),
-            "raw": None,
-            "recycled_raw": None
-        }],
+        "successes": [
+            {
+                "jpg": img1.path.resolve(),
+                "recycled_jpg": Path("recycle/img1.jpg"),
+                "raw": None,
+                "recycled_raw": None,
+            }
+        ],
         "failures": [
             {"jpg": img2.path.resolve(), "raw": None, "code": "cancelled"},
         ],
@@ -336,19 +345,19 @@ def test_undo_pending_auto_restores_moved_files(mock_controller):
 
     # 2. UI list should still have both images
     assert len(mock_controller.image_files) == 2
-    
+
     # 3. Auto-restore should have been called for img1 (the success)
     mock_controller._restore_from_recycle_bin_safe.assert_called_with(
         img1.path.resolve(), Path("recycle/img1.jpg")
     )
 
     # 4. Status message should update
-    mock_controller.update_status_message.assert_called_with("Deletion cancelled (files restored)")
+    mock_controller.update_status_message.assert_called_with(
+        "Deletion cancelled (files restored)"
+    )
 
 
 # ── Permanent delete result handled ──────────────────────────────────
-
-
 
 
 def test_recycle_failure_prompts_perm_delete(mock_controller, tmp_path):
@@ -360,42 +369,42 @@ def test_recycle_failure_prompts_perm_delete(mock_controller, tmp_path):
 
     summary = mock_controller._delete_indices([0], "test")
     job_id = summary["job_id"]
-    
+
     # Simulate worker result: recycle failed
     result = {
         "job_id": job_id,
         "successes": [],
-        "failures": [{
-            "jpg": img_path.resolve(),
-            "raw": None,
-            "code": "recycle_failed"
-        }],
+        "failures": [
+            {"jpg": img_path.resolve(), "raw": None, "code": "recycle_failed"}
+        ],
         "cancelled": False,
     }
 
     # PATCH confirm_permanent_delete to say YES
-    with patch("faststack.app.confirm_permanent_delete", return_value=True) as mock_confirm:
-            mock_controller._on_delete_finished(result)
-            
-            # Should have prompted
-            mock_confirm.assert_called_once()
-            
-            # Should have submitted to executor (ASYNC)
-            # Called twice: 1. initial delete, 2. perm delete
-            assert mock_controller._delete_executor.submit.call_count == 2
-            
-            # Verify the last call was for _perm_delete_worker
-            args, _ = mock_controller._delete_executor.submit.call_args
-            assert args[0] == AppController._perm_delete_worker
+    with patch(
+        "faststack.app.confirm_permanent_delete", return_value=True
+    ) as mock_confirm:
+        mock_controller._on_delete_finished(result)
 
-            # Simulate async worker completion
-            perm_result = {
-                "job_id": job_id,
-                "_perm_result": True,
-                "perm_success": [(0, img)],
-                "perm_fail": []
-            }
-            mock_controller._on_delete_finished(perm_result)
+        # Should have prompted
+        mock_confirm.assert_called_once()
+
+        # Should have submitted to executor (ASYNC)
+        # Called twice: 1. initial delete, 2. perm delete
+        assert mock_controller._delete_executor.submit.call_count == 2
+
+        # Verify the last call was for _perm_delete_worker
+        args, _ = mock_controller._delete_executor.submit.call_args
+        assert args[0] == AppController._perm_delete_worker
+
+        # Simulate async worker completion
+        perm_result = {
+            "job_id": job_id,
+            "_perm_result": True,
+            "perm_success": [(0, img)],
+            "perm_fail": [],
+        }
+        mock_controller._on_delete_finished(perm_result)
 
     # Since it succeeded, item should be gone from UI (it was removed optimistically and confirmed)
     # Wait: optimistically removed -> failed -> perm prompt -> success.
@@ -404,6 +413,7 @@ def test_recycle_failure_prompts_perm_delete(mock_controller, tmp_path):
 
 
 # ── Batch/selection clearing tests ────────────────────────────────────
+
 
 # @pytest.mark.skip(reason="Flaky in mock environment - logic verified manually")
 def test_batch_restored_on_rollback(mock_controller):
@@ -432,7 +442,7 @@ def test_batch_restored_on_rollback(mock_controller):
         ],
         "cancelled": False,
     }
-    
+
     # Mock confirm_batch_permanent_delete to return False (User says NO)
     # We patch it where it is imported in app.py
     with patch("faststack.app.confirm_batch_permanent_delete", return_value=False):

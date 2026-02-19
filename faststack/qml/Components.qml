@@ -31,12 +31,6 @@ Item {
     }
     
     Keys.onEscapePressed: (event) => {
-        if (root.fullScreenLoupe) {
-            root.exitFullScreenLoupe()
-            event.accepted = true
-            return
-        }
-
         if (uiState && uiState.isCropping) {
             if (mainMouseArea.isRotating) {
                 // Revert rotation

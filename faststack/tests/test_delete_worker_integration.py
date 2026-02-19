@@ -140,4 +140,3 @@ def test_delete_worker_integration_rollback(temp_env, monkeypatch):
     assert not jpg_path.exists()
     # Verify RAW is still there (failed to move)
     assert raw_path.exists()
-

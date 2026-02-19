@@ -5,18 +5,15 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 import time
 import threading
-from cachetools import LRUCache
+from cachetools import Cache, LRUCache
 
 log = logging.getLogger(__name__)
 
 
 def get_decoded_image_size(item) -> int:
-    """Calculates the size of a DecodedImage object."""
-    # In this simplified example, we only store the buffer.
-    # In the full app, this would also account for the QImage/QTexture.
-    from faststack.models import DecodedImage
-
-    if isinstance(item, DecodedImage):
+    """Calculates the size of a DecodedImage object or similar buffer-holding object."""
+    # Use duck typing to support DecodedImage and similar objects (e.g. in tests)
+    if hasattr(item, "buffer"):
         # Handle both numpy arrays and memoryview buffers
         if hasattr(item.buffer, "nbytes"):
             return item.buffer.nbytes
@@ -24,8 +21,22 @@ def get_decoded_image_size(item) -> int:
             return len(item.buffer)
         else:
             # Fallback: estimate from dimensions (more accurate for image buffers than sys.getsizeof)
-            bytes_per_pixel = getattr(item, "channels", 4)  # Default to RGBA
-            return item.width * item.height * bytes_per_pixel
+            width = getattr(item, "width", 0)
+            height = getattr(item, "height", 0)
+            if width <= 0 or height <= 0:
+                return 1  # No usable dimensions
+
+            if hasattr(item, "bytes_per_line") and item.bytes_per_line > 0:
+                bytes_per_pixel = item.bytes_per_line // width
+            else:
+                bytes_per_pixel = 4  # Default to RGBA
+
+            # Guard against 0 (e.g. bytes_per_line=0) which would yield size 0
+            # and break cache accounting.  Don't clamp to 4 — that overcounts
+            # legitimate RGB (3 Bpp) buffers and causes premature evictions.
+            bytes_per_pixel = max(1, min(bytes_per_pixel, 16))
+
+            return width * height * bytes_per_pixel
 
     log.warning(
         f"Unexpected item type in cache: {type(item)}. Returning estimated size of 1."
@@ -81,7 +92,9 @@ class ByteLRUCache(LRUCache):
                 # Fast check: iterate tombstones (usually very few)
                 # Remove expired tombstones lazily
                 now = time.monotonic()
-                expired = [p for p, expiry in self._tombstone_expiry.items() if now > expiry]
+                expired = [
+                    p for p, expiry in self._tombstone_expiry.items() if now > expiry
+                ]
                 for p in expired:
                     self._tombstones.discard(p)
                     del self._tombstone_expiry[p]
@@ -91,18 +104,44 @@ class ByteLRUCache(LRUCache):
                         log.debug(f"Refusing to cache tombstoned key: {key}")
                         return
 
+            # Check if this is a replacement to handle its callback if __delitem__ isn't called.
+            _MISSING = object()
+            old_value = _MISSING
+            if self.on_evict and key in self:
+                try:
+                    # Cache.__getitem__ reads the value without updating LRU order,
+                    # avoiding a subtle issue where peeking could change which item
+                    # gets evicted when the subsequent __setitem__ triggers LRU eviction.
+                    old_value = Cache.__getitem__(self, key)
+                except KeyError:
+                    old_value = _MISSING
+
             # Before adding a new item, we might need to evict others
             # This is handled by the parent class, which will call popitem if needed.
-            # We override popitem to capture callbacks if they occur during this call.
+            # We wrap the call to super().__setitem__ to capture all eviction
+            # callbacks triggered by popitem() -> __delitem__().
             self._pending_callbacks = pending_callbacks
             self._pending_callbacks_owner = threading.get_ident()
             try:
                 super().__setitem__(key, value)
+
+                # If it was a replacement, we must ensure an eviction callback is added
+                # for the old value, because cachetools.__setitem__ for replacements
+                # does not call __delitem__ (it just overwrites the dict entry).
+                if old_value is not _MISSING and self.on_evict:
+
+                    def _replace_cb(k=key, v=old_value):
+                        if self.on_evict:
+                            self.on_evict(k, v)
+
+                    pending_callbacks.append(_replace_cb)
             finally:
                 self._pending_callbacks = None
                 self._pending_callbacks_owner = None
-            
-            log.debug(f"Cached item '{key}'. Cache size: {self.currsize / 1024**2:.2f} MB")
+
+            log.debug(
+                f"Cached item '{key}'. Cache size: {self.currsize / 1024**2:.2f} MB"
+            )
 
         # Execute all captured eviction callbacks OUTSIDE the lock
         for callback in pending_callbacks:
@@ -121,52 +160,50 @@ class ByteLRUCache(LRUCache):
         with self._lock:
             return super().__contains__(key)
 
-    def get(self, key, default=None):
-        """Thread-safe get."""
+    def __delitem__(self, key):
+        """Thread-safe delete with eviction callback."""
+        callback = None
         with self._lock:
-            return super().get(key, default)
+            # Peek at value before deletion for the callback.
+            # Use Cache.__getitem__ to avoid LRU order mutation (harmless since
+            # the key is about to be deleted, but avoids surprising side-effects
+            # on eviction order of remaining items).
+            try:
+                value = Cache.__getitem__(self, key)
+            except KeyError:
+                raise KeyError(key) from None
 
-    def popitem(self):
-        """Extend popitem to log eviction.
-
-        Lock note: acquires _lock, which is safe because _lock is an RLock.
-        When called from __setitem__ -> super().__setitem__() (LRU eviction),
-        the lock is already held by the same thread; RLock allows re-entry.
-        Eviction callbacks are deferred via _pending_callbacks when inside
-        __setitem__, and always execute OUTSIDE _lock.
-        """
-        with self._lock:
-            key, value = super().popitem()
+            super().__delitem__(key)
             log.debug(
-                f"Evicted item '{key}'. Cache size after eviction: {self.currsize / 1024**2:.2f} MB"
+                f"Removed item '{key}'. Cache size: {self.currsize / 1024**2:.2f} MB"
             )
-            
-            # Create a bound callback for this specific item
-            callback = None
+
             if self.on_evict:
-                # Capture key/value in closure
-                # We use a default arg to bind immediate values
+
                 def _callback_func(k=key, v=value):
                     if self.on_evict:
                         self.on_evict(k, v)
-                
-                # If we are inside a __setitem__ call on the SAME thread, defer the callback
-                if self._pending_callbacks is not None and threading.get_ident() == self._pending_callbacks_owner:
+
+                # If we are inside a call that defers callbacks (like __setitem__ or evict_paths),
+                # append to the shared list.
+                if (
+                    self._pending_callbacks is not None
+                    and threading.get_ident() == self._pending_callbacks_owner
+                ):
                     self._pending_callbacks.append(_callback_func)
-                    callback = None  # Already deferred
                 else:
                     callback = _callback_func
 
-        # Execute callback OUTSIDE the lock to avoid deadlocks/reentrancy
         if callback:
             try:
                 callback()
             except Exception:
                 log.exception("Error in eviction callback")
 
-        # In a real Qt app, `value` would be a tuple like (numpy_buffer, qtexture_id)
-        # and we would explicitly free the GPU texture here.
-        return key, value
+    def get(self, key, default=None):
+        """Thread-safe get."""
+        with self._lock:
+            return super().get(key, default)
 
     def clear(self):
         """Clear cache without triggering eviction callbacks."""
@@ -195,6 +232,7 @@ class ByteLRUCache(LRUCache):
             pass
 
         keys_to_remove = []
+        pending_callbacks = []
         with self._lock:
             # Use list(self.keys()) to avoid mutation during iteration
             for key in list(self.keys()):
@@ -206,8 +244,21 @@ class ByteLRUCache(LRUCache):
                         keys_to_remove.append(key)
                         break
 
-            for k in keys_to_remove:
-                self.pop(k, None)
+            self._pending_callbacks = pending_callbacks
+            self._pending_callbacks_owner = threading.get_ident()
+            try:
+                for k in keys_to_remove:
+                    self.pop(k, None)
+            finally:
+                self._pending_callbacks = None
+                self._pending_callbacks_owner = None
+
+        # Execute all captured eviction callbacks OUTSIDE the lock
+        for callback in pending_callbacks:
+            try:
+                callback()
+            except Exception:
+                log.exception("Error in eviction callback")
 
         if keys_to_remove:
             log.debug(
@@ -216,7 +267,7 @@ class ByteLRUCache(LRUCache):
 
     def evict_paths(self, paths: list[Union[Path, str]]):
         """Targeted eviction of all keys starting with given paths.
-        
+
         Args:
             paths: List of Path objects or strings.
         """
@@ -232,7 +283,7 @@ class ByteLRUCache(LRUCache):
             else:
                 # String might be Windows-style, normalize to forward slashes
                 prefix = str(p).replace("\\", "/")
-            
+
             # Append separator to ensure we match directory/file boundary
             # e.g. "foo.jpg" -> "foo.jpg::"
             prefixes.append(f"{prefix}::")
@@ -251,7 +302,7 @@ class ByteLRUCache(LRUCache):
             # 3. Optimistic scan: iterate keys once and collect matches
             # Convert prefixes to tuple for fast startswith check
             prefix_tuple = tuple(prefixes)
-            
+
             keys_to_remove = []
             for key in list(self.keys()):
                 # Keys are strings like "path/to/file.jpg::0"
@@ -260,15 +311,30 @@ class ByteLRUCache(LRUCache):
 
             # 4. Remove keys
             removed_bytes = 0
-            for k in keys_to_remove:
-                # Use super().pop to avoid re-acquiring our lock / calling our overridden pop logic.
-                val = super().pop(k, None)
-                if val is not None:
-                    try:
-                        size = get_decoded_image_size(val)
-                    except Exception:
-                        size = 0  # Fallback
-                    removed_bytes += size
+            pending_callbacks = []
+            self._pending_callbacks = pending_callbacks
+            self._pending_callbacks_owner = threading.get_ident()
+            try:
+                for k in keys_to_remove:
+                    # Use self.pop (which calls __delitem__) to trigger eviction callbacks.
+                    # It will re-acquire our RLock safely.
+                    val = self.pop(k, None)
+                    if val is not None:
+                        try:
+                            size = get_decoded_image_size(val)
+                        except Exception:
+                            size = 0  # Fallback
+                        removed_bytes += size
+            finally:
+                self._pending_callbacks = None
+                self._pending_callbacks_owner = None
+
+        # Execute all captured eviction callbacks OUTSIDE the lock
+        for callback in pending_callbacks:
+            try:
+                callback()
+            except Exception:
+                log.exception("Error in eviction callback")
 
         if keys_to_remove:
             log.info(

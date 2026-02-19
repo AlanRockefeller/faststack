@@ -1,6 +1,8 @@
 import logging
+import math
+from fractions import Fraction
 from pathlib import Path
-from typing import Dict, Any, Union
+from typing import Any, Dict, Optional, Union
 from PIL import Image, ExifTags
 
 log = logging.getLogger(__name__)
@@ -37,6 +39,168 @@ def clean_exif_value(value: Any) -> str:
     return str(value)
 
 
+# Camera-style 1/3-stop shutter speed labels (Nikon/Canon convention)
+_SHUTTER_TABLE = [
+    (30.0, "30s"), (25.0, "25s"), (20.0, "20s"), (15.0, "15s"), (13.0, "13s"),
+    (10.0, "10s"), (8.0, "8s"), (6.0, "6s"), (5.0, "5s"), (4.0, "4s"),
+    (3.2, "3.2s"), (2.5, "2.5s"), (2.0, "2s"), (1.6, "1.6s"), (1.3, "1.3s"),
+    (1.0, "1s"), (0.8, "0.8s"), (0.6, "0.6s"), (0.5, "0.5s"), (0.4, "0.4s"), (0.3, "0.3s"),
+    (1/4, "1/4s"), (1/5, "1/5s"), (1/6, "1/6s"), (1/8, "1/8s"),
+    (1/10, "1/10s"), (1/13, "1/13s"), (1/15, "1/15s"),
+    (1/20, "1/20s"), (1/25, "1/25s"), (1/30, "1/30s"),
+    (1/40, "1/40s"), (1/50, "1/50s"), (1/60, "1/60s"),
+    (1/80, "1/80s"), (1/100, "1/100s"), (1/125, "1/125s"),
+    (1/160, "1/160s"), (1/200, "1/200s"), (1/250, "1/250s"),
+    (1/320, "1/320s"), (1/400, "1/400s"), (1/500, "1/500s"),
+    (1/640, "1/640s"), (1/800, "1/800s"), (1/1000, "1/1000s"),
+    (1/1250, "1/1250s"), (1/1600, "1/1600s"), (1/2000, "1/2000s"),
+    (1/2500, "1/2500s"), (1/3200, "1/3200s"), (1/4000, "1/4000s"),
+    (1/5000, "1/5000s"), (1/6400, "1/6400s"), (1/8000, "1/8000s"),
+]
+_SHUTTER_SECONDS = [t for (t, _) in _SHUTTER_TABLE]
+_SHUTTER_LOG_SECONDS = [math.log(t) for t in _SHUTTER_SECONDS]
+
+
+def _exif_rational_to_seconds(x: Any) -> Optional[float]:
+    """Convert various EXIF rational-ish representations to seconds."""
+    if x is None:
+        return None
+    if hasattr(x, "numerator") and hasattr(x, "denominator"):
+        try:
+            n, d = int(x.numerator), int(x.denominator)
+            if d != 0:
+                return float(Fraction(n, d))
+        except Exception as e:
+            log.debug(
+                "_exif_rational_to_seconds failed for rational object %r (%s): %s",
+                x,
+                type(x).__name__,
+                e,
+            )
+    if isinstance(x, (tuple, list)) and len(x) == 2:
+        try:
+            n, d = int(x[0]), int(x[1])
+            if d != 0:
+                return float(Fraction(n, d))
+        except Exception as e:
+            log.debug(
+                "_exif_rational_to_seconds failed for tuple/list %r (%s): %s",
+                x,
+                type(x).__name__,
+                e,
+            )
+    try:
+        return float(x)
+    except Exception as e:
+        if x is not None:
+            log.debug(
+                "_exif_rational_to_seconds failed for value %r (%s): %s",
+                x,
+                type(x).__name__,
+                e,
+            )
+        return None
+
+
+def format_shutter_speed_camera_style(exposure_value: Any) -> str:
+    """Format ExposureTime like a camera UI (nearest standard 1/3-stop step)."""
+    sec = _exif_rational_to_seconds(exposure_value)
+    if sec is None or not math.isfinite(sec) or sec <= 0:
+        return ""
+    if sec >= _SHUTTER_SECONDS[0]:
+        return _SHUTTER_TABLE[0][1]
+    if sec <= _SHUTTER_SECONDS[-1]:
+        return _SHUTTER_TABLE[-1][1]
+    log_sec = math.log(sec)
+    best_i = 0
+    best_err = float("inf")
+    for i, log_t in enumerate(_SHUTTER_LOG_SECONDS):
+        err = abs(log_t - log_sec)
+        if err < best_err:
+            best_err = err
+            best_i = i
+    return _SHUTTER_TABLE[best_i][1]
+
+
+def get_exif_brief(path: Union[str, Path]) -> str:
+    """Return a compact EXIF summary for the status bar.
+
+    Opens only the image header (Pillow lazy-loads), extracts ISO, aperture,
+    shutter speed, and capture time.  Returns a pipe-separated string like
+    ``"ISO 800 | f/2.8 | 1/500s | 14:30:25"`` or ``""`` if no EXIF is found.
+
+    Supported formats: JPEG, TIFF, HEIF.
+    """
+    path = Path(path)
+    if path.suffix.lower() not in {".jpg", ".jpeg", ".jpe", ".tif", ".tiff", ".heif", ".heic"}:
+        return ""
+    if not path.exists():
+        return ""
+
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            # getexif() nests EXIF sub-IFD tags; merge them for flat access
+            # Read them while file is open to avoid "I/O on closed file"
+            exif_ifd = dict(exif.get_ifd(ExifTags.IFD.Exif) if hasattr(ExifTags, "IFD") else {})
+        
+        if not exif:
+            return ""
+    except Exception:
+        return ""
+
+    tags = dict(exif)
+    tags.update(exif_ifd)
+
+    parts: list[str] = []
+
+    # ISO (tag 0x8827 / ISOSpeedRatings)
+    iso = tags.get(0x8827)
+    if iso is not None:
+        # Some cameras return a list/tuple for ISO
+        if isinstance(iso, (list, tuple)) and len(iso) > 0:
+            iso = iso[0]
+        try:
+            parts.append(f"ISO {int(iso)}")
+        except (ValueError, TypeError):
+            parts.append(f"ISO {iso}")
+
+    # Aperture / FNumber (tag 0x829D)
+    f_number = tags.get(0x829D)
+    if f_number is not None:
+        try:
+            val = float(f_number)
+            parts.append(f"f/{val:.1f}")
+        except (ValueError, TypeError) as e:
+            log.debug(f"Failed to convert f_number {f_number!r}: {e}", exc_info=True)
+
+    # Shutter speed / ExposureTime (tag 0x829A)
+    # Note: Pillow's ExifTags maps 0x829A to ExposureTime.
+    exposure = tags.get(0x829A)
+    if exposure is not None:
+        try:
+            s = format_shutter_speed_camera_style(exposure)
+            if s:
+                parts.append(s)
+        except (ValueError, TypeError) as e:
+            log.debug(f"Failed to convert exposure {exposure!r}: {e}", exc_info=True)
+
+    # Capture time / DateTimeOriginal (tag 0x9003), fallback DateTime (tag 0x0132)
+    dt = tags.get(0x9003) or tags.get(0x0132)
+    if dt:
+        try:
+            cleaned = clean_exif_value(dt)
+            # Format is "YYYY:MM:DD HH:MM:SS" — extract time portion
+            if " " in cleaned:
+                parts.append(cleaned.split(" ", 1)[1])
+            else:
+                parts.append(cleaned)
+        except Exception as e:
+            log.error(f"Failed to parse EXIF datetime {dt!r}: {e}", exc_info=True)
+
+    return " | ".join(parts)
+
+
 def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     """
     Extracts EXIF data from an image file.
@@ -50,14 +214,22 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
         return {"summary": {}, "full": {}}
 
     try:
-        img = Image.open(path)
-        try:
-            exif = img._getexif()
-        finally:
-            img.close()
+        with Image.open(path) as img:
+            exif_obj = img.getexif()
+            if not exif_obj:
+                return {"summary": {}, "full": {}}
+            
+            # Merge sub-IFD tags (ISO, Lens, etc.)
+            exif_ifd = dict(exif_obj.get_ifd(ExifTags.IFD.Exif) if hasattr(ExifTags, "IFD") else {})
 
-        if not exif:
-            return {"summary": {}, "full": {}}
+            # Fetch GPS sub-IFD while image is still open (Pillow ≥8.2
+            # stores GPSInfo as an integer IFD offset, not a dict)
+            gps_ifd = dict(exif_obj.get_ifd(0x8825)) if hasattr(ExifTags, "IFD") else {}
+
+        # Normalize to a dict for consistency
+        exif = dict(exif_obj)
+        exif.update(exif_ifd)
+        
     except Exception as e:
         log.warning(f"Failed to extract EXIF from {path}: {e}")
         return {"summary": {}, "full": {}}
@@ -76,7 +248,10 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     # Date Taken
     date_taken = get_val("DateTimeOriginal") or get_val("DateTime")
     if date_taken:
-        summary["Date Taken"] = clean_exif_value(date_taken)
+        try:
+            summary["Date Taken"] = clean_exif_value(date_taken)
+        except Exception as e:
+            log.debug("failed parsing EXIF date %r: %s", date_taken, e)
 
     # Camera Model
     make = get_val("Make")
@@ -106,7 +281,12 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     # ISO
     iso = get_val("ISOSpeedRatings")
     if iso:
-        summary["ISO"] = clean_exif_value(iso)
+        if isinstance(iso, (list, tuple)) and len(iso) > 0:
+            iso = iso[0]
+        try:
+            summary["ISO"] = str(int(iso))
+        except (ValueError, TypeError):
+            summary["ISO"] = clean_exif_value(iso)
 
     # Aperture (FNumber)
     f_number = get_val("FNumber")
@@ -157,8 +337,10 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
         # We can just clean it for now.
         summary["Flash"] = clean_exif_value(flash)
 
-    # GPS
-    gps_info = get_val("GPSInfo")
+    # GPS — prefer the resolved sub-IFD dict; fall back to decoded tag only
+    # if it is already a mapping (older Pillow versions).
+    gps_raw = get_val("GPSInfo")
+    gps_info = gps_ifd if gps_ifd else (gps_raw if isinstance(gps_raw, dict) else None)
     if gps_info:
         try:
 
@@ -167,9 +349,6 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
                 m = float(value[1])
                 s = float(value[2])
                 return d + (m / 60.0) + (s / 3600.0)
-
-            lat = None
-            lon = None
 
             # GPSInfo keys are integers.
             # 1: GPSLatitudeRef, 2: GPSLatitude
@@ -187,10 +366,6 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
                 summary["GPS"] = f"{lat:.5f}, {lon:.5f}"
         except Exception as e:
             log.warning(f"Failed to parse GPS info: {e}")
-            # Fallback to cleaning the raw info if parsing fails
-            # But user specifically asked for decimal, so maybe just don't show if it fails or show raw?
-            # Let's show raw if parsing fails but cleaned
-            # summary["GPS"] = clean_exif_value(gps_info)
             pass
 
     # Convert all values in full dict to string to ensure JSON serializability for QML

@@ -51,7 +51,7 @@ class TestEditorLifecycleAndSafety(unittest.TestCase):
         self.qapp_patcher.stop()
 
         # Ensure we shutdown executors to avoid hanging tests
-        self.controller._shutdown_executors()
+        self.controller.shutdown_nonqt()
 
     def test_memory_cleanup_on_editor_close(self):
         """Verify that memory is cleared when the editor is closed."""

@@ -17,6 +17,7 @@ from faststack.io.variants import (
 
 # ── parse_variant_stem ──────────────────────────────────────────────────────
 
+
 class TestParseVariantStem:
     """Tests for parse_variant_stem()."""
 
@@ -65,7 +66,8 @@ class TestParseVariantStem:
 
     def test_backup_and_developed(self):
         """photo-backup2-developed → developed + backup 2.
-        Note: -developed token comes after -backup, but -backup is at end of stripped stem."""
+        Note: -developed token comes after -backup, but -backup is at end of stripped stem.
+        """
         key, dev, backup = parse_variant_stem("photo-backup2-developed")
         assert key == "photo"
         assert dev is True
@@ -110,6 +112,7 @@ class TestParseVariantStem:
 
 
 # ── build_variant_map ────────────────────────────────────────────────────────
+
 
 class TestBuildVariantMap:
     """Tests for build_variant_map()."""
@@ -205,6 +208,7 @@ class TestBuildVariantMap:
 
 # ── build_badge_list ─────────────────────────────────────────────────────────
 
+
 class TestBuildBadgeList:
     """Tests for build_badge_list()."""
 
@@ -247,6 +251,7 @@ class TestBuildBadgeList:
 
 
 # ── Integration: indexer find_images_with_variants ───────────────────────────
+
 
 class TestFindImagesWithVariants:
     """Tests for find_images_with_variants() filtering."""
@@ -331,11 +336,13 @@ class TestFindImagesWithVariants:
 
 # ── Thumbnail model roles ───────────────────────────────────────────────────
 
+
 class TestThumbnailModelVariantRoles:
     """Tests that ThumbnailModel propagates variant flags."""
 
     def test_entry_has_variant_fields(self):
         from faststack.thumbnail_view.model import ThumbnailEntry
+
         entry = ThumbnailEntry(
             path=Path("/dir/photo.jpg"),
             name="photo.jpg",
@@ -348,6 +355,7 @@ class TestThumbnailModelVariantRoles:
 
     def test_entry_defaults_false(self):
         from faststack.thumbnail_view.model import ThumbnailEntry
+
         entry = ThumbnailEntry(
             path=Path("/dir/photo.jpg"),
             name="photo.jpg",

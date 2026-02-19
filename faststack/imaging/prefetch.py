@@ -120,8 +120,6 @@ def get_monitor_profile() -> Optional[ImageCms.ImageCmsProfile]:
 # apply_orientation_to_np and apply_exif_orientation imported from orientation.py
 
 
-
-
 def apply_saturation_compensation(
     arr: np.ndarray,
     width: int,
@@ -181,7 +179,9 @@ class Prefetcher:
         self.debug = debug
         # Use CPU count for I/O-bound JPEG decoding
         # Rule of thumb: 2x CPU cores for I/O bound, 1x for CPU bound
-        optimal_workers = min((os.cpu_count() or 1) * 2, 8)  # Cap at 8 for fast navigation
+        optimal_workers = min(
+            (os.cpu_count() or 1) * 2, 8
+        )  # Cap at 8 for fast navigation
 
         self.executor = create_daemon_threadpool_executor(
             max_workers=optimal_workers,
@@ -226,7 +226,9 @@ class Prefetcher:
         """
         if self.debug:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} update_prefetch: START index={current_index} dir={direction}")
+            print(
+                f"[DBGCACHE] {_t_start*1000:.3f} update_prefetch: START index={current_index} dir={direction}"
+            )
 
         # NOTE: Generation is NOT incremented here. It only changes when display size,
         # zoom state, or color mode changes - events that actually invalidate cached images.
@@ -274,7 +276,8 @@ class Prefetcher:
 
         # Snapshoting and range computation inside lock
         with self._futures_lock:
-            n = len(self.image_files)
+            image_files = self.image_files
+            n = len(image_files)
             if n == 0:
                 return
             # Ensure current_index is clamped
@@ -305,13 +308,15 @@ class Prefetcher:
             # Cancel stale futures and remove from scheduled
             tasks_submitted = 0
             # Clean up old generation entries to prevent memory leak
-            old_generations = [g for g in list(self._scheduled.keys()) if g < self.generation]
+            old_generations = [
+                g for g in list(self._scheduled.keys()) if g < self.generation
+            ]
             for g in old_generations:
                 self._scheduled.pop(g, None)
 
             # Get scheduled set for current generation
             scheduled = self._scheduled.setdefault(self.generation, set())
-            
+
             for index, future in list(self.futures.items()):
                 if index < start or index >= end:
                     if future.cancel():
@@ -328,29 +333,39 @@ class Prefetcher:
 
         if self.debug:
             _t_end = time.perf_counter()
-            print(f"[DBGCACHE] {_t_end*1000:.3f} update_prefetch: DONE submitted={tasks_submitted} total={(_t_end - _t_start)*1000:.2f}ms")
+            print(
+                f"[DBGCACHE] {_t_end*1000:.3f} update_prefetch: DONE submitted={tasks_submitted} total={(_t_end - _t_start)*1000:.2f}ms"
+            )
 
     def submit_task(
-        self, index: int, generation: int, priority: bool = False, override_path: Optional[Path] = None
+        self,
+        index: int,
+        generation: int,
+        priority: bool = False,
+        override_path: Optional[Path] = None,
     ) -> Optional[Future]:
         """Submits a decoding task for a given index."""
         if self._stop_event.is_set():
             return None
 
-        # Capture list snapshot and check bounds before accessing path
-        image_files = self.image_files
-        if index < 0 or index >= len(image_files):
-            return None
-
-        requested_path = override_path if override_path is not None else image_files[index].path
-
         if self.debug and priority:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} submit_task: PRIORITY index={index} gen={generation} override={override_path}")
+            print(
+                f"[DBGCACHE] {_t_start*1000:.3f} submit_task: PRIORITY index={index} gen={generation} override={override_path}"
+            )
 
         with self._futures_lock:
-            # We track by index. If we already have a job for this index, 
-            # we must cancel it if the requested path is different 
+            # Bounds check must happen inside the lock to stay consistent
+            # with self.image_files (which set_image_files can replace under lock).
+            if index < 0 or index >= len(self.image_files):
+                return None
+
+            requested_path = (
+                override_path if override_path is not None else self.image_files[index].path
+            )
+
+            # We track by index. If we already have a job for this index,
+            # we must cancel it if the requested path is different
             # (e.g. switching between main and variants).
             if index in self.futures and not self.futures[index].done():
                 current_path = self.future_paths.get(index)
@@ -398,8 +413,6 @@ class Prefetcher:
             future.add_done_callback(lambda f, idx=index: self._cleanup_future(idx, f))
             return future
 
-
-
     def _decode_and_cache(
         self,
         image_file: ImageFile,
@@ -435,33 +448,56 @@ class Prefetcher:
             orientation = 1
             if color_mode == "icc":
                 monitor_profile = get_monitor_profile()
-                monitor_icc_path = config.get("color", "monitor_icc_path", fallback="").strip()
+                monitor_icc_path = config.get(
+                    "color", "monitor_icc_path", fallback=""
+                ).strip()
 
                 if monitor_profile is not None:
                     if is_jpeg:
                         try:
                             with open(target_path, "rb") as f:
-                                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                                with mmap.mmap(
+                                    f.fileno(), 0, access=mmap.ACCESS_READ
+                                ) as mmapped:
                                     if use_resized and should_resize:
-                                        buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                                        buffer = decode_jpeg_resized(
+                                            mmapped,
+                                            display_width,
+                                            display_height,
+                                            fast_dct=fast_dct,
+                                        )
                                     else:
-                                        buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
+                                        buffer = decode_jpeg_rgb(
+                                            mmapped, fast_dct=fast_dct
+                                        )
                                         if buffer is not None and should_resize:
                                             img = PILImage.fromarray(buffer)
-                                            img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                            img.thumbnail(
+                                                (display_width, display_height),
+                                                PILImage.Resampling.LANCZOS,
+                                            )
                                             buffer = np.array(img)
-                                    
+
                                     if buffer is not None:
                                         try:
                                             # Seek to beginning of mmapped file for PIL
                                             mmapped.seek(0)
                                             with PILImage.open(mmapped) as pil_img:
-                                                icc_bytes = pil_img.info.get("icc_profile")
-                                                orientation = pil_img.getexif().get(274, 1)
+                                                icc_bytes = pil_img.info.get(
+                                                    "icc_profile"
+                                                )
+                                                orientation = pil_img.getexif().get(
+                                                    274, 1
+                                                )
                                         except Exception:
-                                            pass
+                                            log.debug("Failed to read EXIF from mmap for %s", target_path, exc_info=True)
                         except Exception as e:
-                            log.warning("Decode failed (ICC path) index=%d path=%s: %s", index, target_path, e)
+                            log.warning(
+                                "Decode failed (ICC path) index=%d path=%s: %s",
+                                index,
+                                target_path,
+                                e,
+                            )
                             buffer = None
 
                     if buffer is None:
@@ -470,14 +506,22 @@ class Prefetcher:
                                 orientation = img.getexif().get(274, 1)
                                 img = img.convert("RGB")
                                 if should_resize:
-                                    img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                    img.thumbnail(
+                                        (display_width, display_height),
+                                        PILImage.Resampling.LANCZOS,
+                                    )
                                 buffer = np.array(img)
                         except Exception as e:
-                            log.warning("Decode failed (ICC fallback) index=%d path=%s: %s", index, target_path, e)
+                            log.warning(
+                                "Decode failed (ICC fallback) index=%d path=%s: %s",
+                                index,
+                                target_path,
+                                e,
+                            )
                             return None
 
                     img = PILImage.fromarray(buffer)
-                    
+
                     if icc_bytes is None:
                         try:
                             # Try to get ICC if we don't have it yet (but orientation should be set)
@@ -486,13 +530,17 @@ class Prefetcher:
                                 if orientation == 1:
                                     orientation = orig.getexif().get(274, 1)
                         except Exception as e:
-                            log.warning("Failed to read metadata from %s: %s", target_path, e)
+                            log.warning(
+                                "Failed to read metadata from %s: %s", target_path, e
+                            )
 
                     src_profile = None
                     src_profile_key = None
                     if icc_bytes:
                         try:
-                            src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+                            src_profile = ImageCms.ImageCmsProfile(
+                                io.BytesIO(icc_bytes)
+                            )
                             src_profile_key = hashlib.sha256(icc_bytes).hexdigest()
                         except Exception as e:
                             log.warning("Failed to parse ICC profile: %s", e)
@@ -502,26 +550,41 @@ class Prefetcher:
                         src_profile_key = "srgb_builtin"
 
                     try:
-                        transform = get_icc_transform(src_profile, monitor_profile, src_profile_key, monitor_icc_path)
+                        transform = get_icc_transform(
+                            src_profile,
+                            monitor_profile,
+                            src_profile_key,
+                            monitor_icc_path,
+                        )
                         ImageCms.applyTransform(img, transform, inPlace=True)
                         buffer = np.array(img, dtype=np.uint8)
                     except Exception as e:
                         log.warning("ICC conversion failed: %s", e)
-            
+
             if buffer is None:
                 if is_jpeg:
                     try:
                         with open(target_path, "rb") as f:
-                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                            with mmap.mmap(
+                                f.fileno(), 0, access=mmap.ACCESS_READ
+                            ) as mmapped:
                                 if use_resized and should_resize:
-                                    buffer = decode_jpeg_resized(mmapped, display_width, display_height, fast_dct=fast_dct)
+                                    buffer = decode_jpeg_resized(
+                                        mmapped,
+                                        display_width,
+                                        display_height,
+                                        fast_dct=fast_dct,
+                                    )
                                 else:
                                     buffer = decode_jpeg_rgb(mmapped, fast_dct=fast_dct)
                                     if buffer is not None and should_resize:
                                         img = PILImage.fromarray(buffer)
-                                        img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                        img.thumbnail(
+                                            (display_width, display_height),
+                                            PILImage.Resampling.LANCZOS,
+                                        )
                                         buffer = np.array(img)
-                                
+
                                 # Capture orientation if we have a buffer
                                 if buffer is not None:
                                     try:
@@ -529,7 +592,7 @@ class Prefetcher:
                                         with PILImage.open(mmapped) as pil_img:
                                             orientation = pil_img.getexif().get(274, 1)
                                     except Exception:
-                                        pass
+                                        log.debug("Failed to read EXIF from mmap for %s", target_path, exc_info=True)
                     except Exception:
                         buffer = None
 
@@ -539,10 +602,15 @@ class Prefetcher:
                             orientation = img.getexif().get(274, 1)
                             img = img.convert("RGB")
                             if should_resize:
-                                img.thumbnail((display_width, display_height), PILImage.Resampling.LANCZOS)
+                                img.thumbnail(
+                                    (display_width, display_height),
+                                    PILImage.Resampling.LANCZOS,
+                                )
                             buffer = np.array(img)
                     except Exception as e:
-                        log.warning("Decode failed index=%d path=%s: %s", index, target_path, e)
+                        log.warning(
+                            "Decode failed index=%d path=%s: %s", index, target_path, e
+                        )
                         return None
 
             if buffer is None:
@@ -564,7 +632,13 @@ class Prefetcher:
                 val = config.get("color", "saturation_factor", fallback="1.0")
                 saturation_factor = float(val) if val is not None else 1.0
                 if saturation_factor != 1.0:
-                    apply_saturation_compensation(buffer.ravel(), buffer.shape[1], buffer.shape[0], bytes_per_line, saturation_factor)
+                    apply_saturation_compensation(
+                        buffer.ravel(),
+                        buffer.shape[1],
+                        buffer.shape[0],
+                        bytes_per_line,
+                        saturation_factor,
+                    )
 
             mv = memoryview(buffer).cast("B")
             decoded = DecodedImage(
@@ -584,7 +658,7 @@ class Prefetcher:
 
         except Exception as e:
             # Downgraded from ERROR to prevent log noise on bad files
-            log.warning("Error in _decode_and_cache: %s", e)
+            log.warning("Error in _decode_and_cache: %s", e, exc_info=True)
             return None
 
     def _cleanup_future(self, index: int, future: Future):
@@ -613,7 +687,6 @@ class Prefetcher:
         """Cancels all pending prefetching tasks."""
         with self._futures_lock:
             self._cancel_all_locked()
-
 
     def shutdown(self):
         """Initiates a clean shutdown of the prefetcher."""

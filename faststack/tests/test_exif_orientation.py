@@ -13,7 +13,7 @@ class TestExifOrientation(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.editor = ImageEditor()
-        
+
         # Patch cv2 in the editor module if needed for some tests,
         # but ImageEditor logic mainly uses PIL/numpy unless specialized.
         # If we really need to mock cv2, we should do it on the imported module attribute.
@@ -160,7 +160,7 @@ class TestExifOrientation(unittest.TestCase):
 
         # If we ARE developing a RAW, we usually want to bake in the orientation
         # or at least ensure the output is correct.
-        
+
         # Current logic: We ALWAYS sanitize to 1 because we bake orientation on load.
         # This prevents "double rotation".
 

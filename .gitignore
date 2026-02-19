@@ -88,6 +88,8 @@ test_results.txt
 smoke_test_output.txt
 verify_result.txt
 *test_output.txt
+test_image*
+
 
 **/*fail*.txt
 **/*final*.txt

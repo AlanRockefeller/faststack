@@ -913,12 +913,6 @@ ApplicationWindow {
 
                 // Key bindings implemented in old Main.qml
                 Keys.onPressed: function(event) {
-                    if (root.fullScreenLoupe && event.key === Qt.Key_Escape) {
-                        root.exitFullScreenLoupe()
-                        event.accepted = true
-                        return
-                    }
-
                     if (!uiState || !controller) {
                         return
                     }
@@ -1001,37 +995,43 @@ ApplicationWindow {
             }
             Label {
                 text: (uiState && uiState.imageCount > 0)
-                      ? ` | File: ${uiState.currentFilename || 'N/A'}`
-                      : " | File: N/A"
+                      ? (uiState.currentFilename || "N/A")
+                      : "N/A"
                 color: root.currentTextColor
             }
             Label {
-                text: uiState ? ` | Stacked: ${uiState.stackedDate}` : ""
+                visible: (uiState && uiState.imageCount > 0 && uiState.exifBrief && uiState.exifBrief.length > 0)
+                text: uiState ? (uiState.exifBrief || "") : ""
+                color: root.currentTextColor
+            }
+            Item { Layout.fillWidth: true }
+            Label {
+                text: uiState ? ` Stacked: ${uiState.stackedDate}` : ""
                 color: "lightgreen"
                 visible: uiState ? (uiState.imageCount > 0 && uiState.isStacked) : false
             }
             Label {
-                text: uiState ? ` | Uploaded on ${uiState.uploadedDate}` : ""
+                text: uiState ? ` Uploaded on ${uiState.uploadedDate}` : ""
                 color: "lightgreen"
                 visible: uiState ? (uiState.imageCount > 0 && uiState.isUploaded) : false
             }
             Label {
-                text: uiState ? ` | Edited on ${uiState.editedDate}` : ""
+                text: uiState ? ` Edited on ${uiState.editedDate}` : ""
                 color: "lightgreen"
                 visible: uiState ? (uiState.imageCount > 0 && uiState.isEdited) : false
             }
             Label {
-                text: uiState ? ` | Restacked on ${uiState.restackedDate}` : ""
+                text: uiState ? ` Restacked on ${uiState.restackedDate}` : ""
                 color: "cyan"
                 visible: uiState ? (uiState.imageCount > 0 && uiState.isRestacked) : false
             }
             Label {
-                text: " | Favorite"
+                text: " Favorite"
                 color: "gold"
                 visible: uiState ? (uiState.imageCount > 0 && uiState.isFavorite) : false
             }
             Label {
-                text: uiState ? ` | Filter: "${uiState.filterString}"` : ""
+                text: uiState ? ` Filter: "${uiState.filterString}"` : ""
                 color: "yellow"
                 font.bold: true
                 visible: uiState ? (uiState.filterString !== "") : false

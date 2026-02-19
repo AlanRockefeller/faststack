@@ -49,6 +49,8 @@ Item {
     property color restackedColor: "#FF9800" // Orange for restacked (R)
     property color favoriteColor: "#FFD700"  // Gold for favorite (F)
     property color batchColor: "#2196F3"     // Blue for batch (B)
+    property color backupsColor: "#9C27B0"   // Purple for backups (Bk)
+    property color developedColor: "#009688" // Teal for developed (D)
     property color cursorColor: "#00BFFF"    // Cyan for keyboard cursor
     property color loadingColor: tile.isDarkTheme ? "#3c3c3c" : "#e0e0e0"
     property color counterUploadedCol: "#7BBF7F"   // Muted green
@@ -259,15 +261,36 @@ Item {
                 visible: !tile.tileIsFolder
                 layoutDirection: Qt.RightToLeft
 
+                // Backups badge (Bk) - Purple
                 Rectangle {
                     visible: tile.tileHasBackups
-                    width: 18; height: 18; radius: 3; color: "#9C27B0"
-                    Text { anchors.centerIn: parent; text: "Bk"; font.pixelSize: 9; font.bold: true; color: "white" }
+                    width: 18
+                    height: 18
+                    radius: 3
+                    color: backupsColor
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Bk"
+                        font.pixelSize: 9
+                        font.bold: true
+                        color: "white"
+                    }
                 }
+
+                // Developed badge (D) - Teal
                 Rectangle {
                     visible: tile.tileHasDeveloped
-                    width: 18; height: 18; radius: 3; color: "#009688"
-                    Text { anchors.centerIn: parent; text: "D"; font.pixelSize: 11; font.bold: true; color: "white" }
+                    width: 18
+                    height: 18
+                    radius: 3
+                    color: developedColor
+                    Text {
+                        anchors.centerIn: parent
+                        text: "D"
+                        font.pixelSize: 11
+                        font.bold: true
+                        color: "white"
+                    }
                 }
             }
 
@@ -500,7 +523,9 @@ Item {
     }
 
     Component.onCompleted: {
-        if (tile.tileIndex === 0 && uiState && uiState.debugThumbTiming)
+        // Use robust check for uiState which might not be defined in all contexts
+        var hasUiState = (typeof uiState !== 'undefined' && uiState !== null);
+        if (tile.tileIndex === 0 && hasUiState && uiState.debugThumbTiming)
             console.log("[THUMB-TIMING] first delegate created (index 0) t=" + Date.now() + "ms")
     }
 
