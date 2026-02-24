@@ -4299,6 +4299,39 @@ class AppController(QObject):
         else:
             self.current_index = min(previous_index, len(self.image_files) - 1)
 
+        # Adjust batch index ranges to account for removed entries.
+        # Deleting index d shifts every index > d down by one.  Without this,
+        # batches that sit above any deleted image reference the wrong files.
+        if self.batches:
+            deleted_set = set(sorted_indices)
+            deleted_ascending = sorted(sorted_indices)
+
+            def _shift(orig_idx: int) -> int:
+                return orig_idx - sum(1 for d in deleted_ascending if d < orig_idx)
+
+            new_batches = []
+            for b_start, b_end in self.batches:
+                # Anchor on the first and last *surviving* indices in the range.
+                # If every image in the batch was deleted, discard it entirely so
+                # it cannot migrate onto unrelated images.
+                first_ok = next(
+                    (i for i in range(b_start, b_end + 1) if i not in deleted_set),
+                    None,
+                )
+                if first_ok is None:
+                    continue  # whole batch deleted — drop it
+                last_ok = next(
+                    (i for i in range(b_end, b_start - 1, -1) if i not in deleted_set),
+                    None,
+                )
+                ns = _shift(first_ok)
+                ne = _shift(last_ok)
+                if ns <= ne:
+                    new_batches.append([ns, ne])
+            if new_batches != self.batches:
+                self.batches = new_batches
+                self._invalidate_batch_cache()
+
         # Update UI immediately - this is fast since it just reads from memory
         # Check for existence, not truthiness (empty cache is falsy)
         if self.image_cache is not None:
@@ -4870,6 +4903,16 @@ class AppController(QObject):
             log.info("Detaching QML engine.")
             self.engine = None
 
+    @staticmethod
+    def _safe_shutdown_executor(executor, name, *, wait=False, cancel_futures=True):
+        """Shut down a single executor, logging and swallowing any error."""
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+        except Exception as e:
+            log.warning("Error shutting down %s executor: %s", name, e, exc_info=True)
+
     def shutdown_nonqt(self):
         """Shutdown non-Qt resources - safe to run in background thread."""
         log.info("Shutting down background resources.")
@@ -4892,21 +4935,17 @@ class AppController(QObject):
                 if not (entry[0] == "pending_delete" and entry[1] in pending_ids)
             ]
 
-        # Shutdown thread pool executors
-        try:
-            log.info("Shutting down background executors...")
-            self._hist_executor.shutdown(wait=False, cancel_futures=True)
-            self._preview_executor.shutdown(wait=False, cancel_futures=True)
-
-            exif_exec = getattr(self, "_exif_executor", None)
-            if exif_exec:
-                exif_exec.shutdown(wait=False, cancel_futures=True)
-
-            # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
-            self._save_executor.shutdown(wait=True, cancel_futures=False)
-            self._delete_executor.shutdown(wait=True, cancel_futures=False)
-        except Exception as e:
-            log.warning("Error shutting down executors: %s", e)
+        # Shutdown thread pool executors — each isolated so one failure can't
+        # prevent the others (especially save/delete) from shutting down.
+        log.info("Shutting down background executors...")
+        self._safe_shutdown_executor(self._hist_executor, "histogram", wait=False)
+        self._safe_shutdown_executor(self._preview_executor, "preview", wait=False)
+        self._safe_shutdown_executor(
+            getattr(self, "_exif_executor", None), "exif", wait=False,
+        )
+        # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
+        self._safe_shutdown_executor(self._save_executor, "save", wait=True, cancel_futures=False)
+        self._safe_shutdown_executor(self._delete_executor, "delete", wait=True, cancel_futures=False)
 
         # Shutdown prefetcher
         try:

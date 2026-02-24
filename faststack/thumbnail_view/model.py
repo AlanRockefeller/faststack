@@ -260,7 +260,10 @@ class ThumbnailModel(QAbstractListModel):
         # We'll use the parent (AppController) to look this up
         parent = self.parent()
         if parent and hasattr(parent, "_path_to_index"):
-            return parent._path_to_index.get(entry.path.resolve())
+            # Must use the same key format as _rebuild_path_to_index (abspath,
+            # not realpath/resolve) so the lookup hits on Windows and Linux.
+            key = os.path.normcase(os.path.abspath(str(entry.path)))
+            return parent._path_to_index.get(key)
         return None
 
     def roleNames(self) -> Dict[int, bytes]:
