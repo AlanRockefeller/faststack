@@ -4294,16 +4294,21 @@ class AppController(QObject):
                 del self.image_files[idx]
 
         # Reposition current_index immediately (fast, in-memory only)
+        deleted_set = set(sorted_indices)
         if not self.image_files:
             self.current_index = 0
-        else:
+        elif previous_index in deleted_set:
+            # Current image was deleted → stay at same position (shows next image) or clamp
             self.current_index = min(previous_index, len(self.image_files) - 1)
+        else:
+            # Current image survived → shift index down for each deletion before it
+            shift = sum(1 for d in sorted_indices if d < previous_index)
+            self.current_index = max(0, min(previous_index - shift, len(self.image_files) - 1))
 
         # Adjust batch index ranges to account for removed entries.
         # Deleting index d shifts every index > d down by one.  Without this,
         # batches that sit above any deleted image reference the wrong files.
         if self.batches:
-            deleted_set = set(sorted_indices)
             deleted_ascending = sorted(sorted_indices)
 
             def _shift(orig_idx: int) -> int:
