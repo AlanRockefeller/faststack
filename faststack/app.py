@@ -4715,6 +4715,11 @@ class AppController(QObject):
                 if self.image_files:
                     self.prefetcher.update_prefetch(self.current_index)
                 self._rebuild_path_to_index()
+                # Restore batch state that was shifted during _delete_indices
+                if job.saved_batches and removed_items:
+                    self.batches = job.saved_batches
+                    self.batch_start_index = job.saved_batch_start_index
+                    self._invalidate_batch_cache()
                 self.sync_ui_state()
 
                 count = len(removed_items)

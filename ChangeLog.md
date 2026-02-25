@@ -11,6 +11,7 @@ Todo:   More testing Linux / Mac.   Create Windows .exe.   Write better document
 - Enhanced metadata display with camera-style shutter speed formatting.
 - Added new thumbnail badges for Backups (Bk) and Developed (D) variants.
 - Improved cache eviction handling and thread-safety for concurrent operations.
+- Fixed a bug where deleting an image could mess up the batch selection ranges if the delete was cancelled, failed, or undone.
 
 ## 1.5.8 (2026-02-13)
 
