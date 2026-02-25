@@ -4305,6 +4305,12 @@ class AppController(QObject):
             shift = sum(1 for d in sorted_indices if d < previous_index)
             self.current_index = max(0, min(previous_index - shift, len(self.image_files) - 1))
 
+        # Save batch state before mutation so _rollback_ui_items can restore it
+        # for any delete type (loupe, grid, batch).  batch delete_batch_images()
+        # will overwrite saved_batches with the same pre-mutation value anyway.
+        pre_batch_snapshot = [b[:] for b in self.batches] if self.batches else None
+        pre_batch_start_snapshot = self.batch_start_index if self.batches else None
+
         # Adjust batch index ranges to account for removed entries.
         # Deleting index d shifts every index > d down by one.  Without this,
         # batches that sit above any deleted image reference the wrong files.
@@ -4413,6 +4419,8 @@ class AppController(QObject):
             cancel_event=cancel_event,
             previous_index=previous_index,
             images_to_delete=images_to_delete,
+            saved_batches=pre_batch_snapshot,
+            saved_batch_start_index=pre_batch_start_snapshot,
         )
 
         # Add single placeholder undo entry per job
@@ -4501,7 +4509,7 @@ class AppController(QObject):
                     indices_to_delete.add(i)
 
         # 2. Save batch state for rollback, then clear optimistically
-        saved_batches = list(self.batches)
+        saved_batches = [b[:] for b in self.batches]
         saved_batch_start = self.batch_start_index
 
         # 3. Call unified engine
