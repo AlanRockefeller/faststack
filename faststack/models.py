@@ -72,6 +72,8 @@ class EntryMetadata:
     restacked: bool = False
     restacked_date: Optional[str] = None
     favorite: bool = False
+    todo: bool = False
+    todo_date: Optional[str] = None
 
 
 @dataclasses.dataclass

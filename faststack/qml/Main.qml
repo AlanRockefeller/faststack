@@ -1016,6 +1016,11 @@ ApplicationWindow {
                 visible: uiState ? (uiState.imageCount > 0 && uiState.isUploaded) : false
             }
             Label {
+                text: uiState ? ` Todo since ${uiState.todoDate}` : ""
+                color: "#64B5F6"
+                visible: uiState ? (uiState.imageCount > 0 && uiState.isTodo) : false
+            }
+            Label {
                 text: uiState ? ` Edited on ${uiState.editedDate}` : ""
                 color: "lightgreen"
                 visible: uiState ? (uiState.imageCount > 0 && uiState.isEdited) : false
@@ -1374,6 +1379,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;}: End current batch<br>" +
                           "&nbsp;&nbsp;\\: Clear all batches<br><br>" +
                           "<b>Flag Toggles:</b><br>" +
+                          "&nbsp;&nbsp;D: Toggle todo flag<br>" +
                           "&nbsp;&nbsp;F: Toggle favorite flag<br>" +
                           "&nbsp;&nbsp;U: Toggle uploaded flag<br>" +
                           "&nbsp;&nbsp;Ctrl+E: Toggle edited flag<br>" +

@@ -39,6 +39,7 @@ class Keybinder:
             # Toggle flags
             Qt.Key_U: "toggle_uploaded",
             Qt.Key_F: "toggle_favorite",
+            Qt.Key_D: "toggle_todo",
             Qt.Key_I: "show_exif_dialog",
             # Actions
             Qt.Key_Enter: "launch_helicon",

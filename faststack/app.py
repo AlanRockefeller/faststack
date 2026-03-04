@@ -2076,6 +2076,7 @@ class AppController(QObject):
                 "edited": getattr(meta, "edited", False),
                 "restacked": getattr(meta, "restacked", False),
                 "favorite": getattr(meta, "favorite", False),
+                "todo": getattr(meta, "todo", False),
             }
         except Exception as e:  # Broad catch for UI plumbing - don't crash grid view
             log.debug("Failed to get metadata for %s: %s", stem, e)
@@ -2085,6 +2086,7 @@ class AppController(QObject):
                 "edited": False,
                 "restacked": False,
                 "favorite": False,
+                "todo": False,
             }
 
     def _get_bulk_metadata_map(self) -> Dict[str, dict]:
@@ -2099,6 +2101,7 @@ class AppController(QObject):
                     "edited": getattr(meta, "edited", False),
                     "restacked": getattr(meta, "restacked", False),
                     "favorite": getattr(meta, "favorite", False),
+                    "todo": getattr(meta, "todo", False),
                 }
         except Exception as e:
             log.warning("Failed to build bulk metadata map: %s", e)
@@ -2161,6 +2164,31 @@ class AppController(QObject):
         status = "uploaded" if meta.uploaded else "not uploaded"
         self.update_status_message(f"Marked as {status}")
         log.info("Toggled uploaded flag to %s for %s", meta.uploaded, stem)
+
+    def toggle_todo(self):
+        """Toggle todo flag for current image."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+
+        from datetime import datetime
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        stem = self.image_files[self.current_index].path.stem
+        meta = self.sidecar.get_metadata(stem)
+
+        meta.todo = not getattr(meta, "todo", False)
+        if meta.todo:
+            meta.todo_date = today
+        else:
+            meta.todo_date = None
+
+        self.sidecar.save()
+        self._metadata_cache_index = (-1, -1)
+        self.dataChanged.emit()
+        self.sync_ui_state()
+        status = "todo" if meta.todo else "not todo"
+        self.update_status_message(f"Marked as {status}")
+        log.info("Toggled todo flag to %s for %s", meta.todo, stem)
 
     def toggle_edited(self):
         """Toggle edited flag for current image."""
@@ -2308,6 +2336,8 @@ class AppController(QObject):
             "restacked": meta.restacked,
             "restacked_date": meta.restacked_date or "",
             "favorite": meta.favorite,
+            "todo": getattr(meta, "todo", False),
+            "todo_date": getattr(meta, "todo_date", None) or "",
             "stack_info_text": stack_info,
             "batch_info_text": batch_info,
         }

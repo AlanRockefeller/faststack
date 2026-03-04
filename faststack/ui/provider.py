@@ -455,6 +455,18 @@ class UIState(QObject):
             return ""
         return self.app_controller.get_current_metadata().get("uploaded_date", "")
 
+    @Property(bool, notify=metadataChanged)
+    def isTodo(self):
+        if not self.app_controller.image_files:
+            return False
+        return self.app_controller.get_current_metadata().get("todo", False)
+
+    @Property(str, notify=metadataChanged)
+    def todoDate(self):
+        if not self.app_controller.image_files:
+            return ""
+        return self.app_controller.get_current_metadata().get("todo_date", "")
+
     @Property(str, notify=metadataChanged)
     def batchInfoText(self):
         if not self.app_controller.image_files:

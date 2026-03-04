@@ -111,6 +111,14 @@ Dialog {
                 onCheckedChanged: _collectFlags()
             }
             CheckBox {
+                id: cbTodo
+                text: "Todo"
+                checked: false
+                Material.foreground: filterDialog.textColor
+                Material.accent: "#64B5F6"
+                onCheckedChanged: _collectFlags()
+            }
+            CheckBox {
                 id: cbFavorite
                 text: "Favorite"
                 checked: false
@@ -136,6 +144,7 @@ Dialog {
         if (cbStacked.checked) flags.push("stacked")
         if (cbEdited.checked) flags.push("edited")
         if (cbRestacked.checked) flags.push("restacked")
+        if (cbTodo.checked) flags.push("todo")
         if (cbFavorite.checked) flags.push("favorite")
         filterDialog.filterFlags = flags
     }
@@ -156,6 +165,7 @@ Dialog {
         cbStacked.checked = currentFlags.indexOf("stacked") >= 0
         cbEdited.checked = currentFlags.indexOf("edited") >= 0
         cbRestacked.checked = currentFlags.indexOf("restacked") >= 0
+        cbTodo.checked = currentFlags.indexOf("todo") >= 0
         cbFavorite.checked = currentFlags.indexOf("favorite") >= 0
 
         filterField.forceActiveFocus()

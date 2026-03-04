@@ -16,6 +16,7 @@ Item {
     property bool tileIsEdited: false
     property bool tileIsRestacked: false
     property bool tileIsFavorite: false
+    property bool tileIsTodo: false
     property bool tileIsInBatch: false
     property bool tileIsCurrent: false
     property string tileThumbnailSource: ""
@@ -45,6 +46,7 @@ Item {
     // Flag colors for badges
     property color stackedColor: "#FF9800"   // Orange for stacked (S)
     property color uploadedColor: "#4CAF50"  // Green for uploaded (U)
+    property color todoColor: "#2196F3"     // Blue for todo (D)
     property color editedColor: "#FFEB3B"    // Yellow for edited (E)
     property color restackedColor: "#FF9800" // Orange for restacked (R)
     property color favoriteColor: "#FFD700"  // Gold for favorite (F)
@@ -197,6 +199,22 @@ Item {
                     Text {
                         anchors.centerIn: parent
                         text: "R"
+                        font.pixelSize: 11
+                        font.bold: true
+                        color: "white"
+                    }
+                }
+
+                // Todo badge (D) - Blue
+                Rectangle {
+                    visible: tile.tileIsTodo
+                    width: 18
+                    height: 18
+                    radius: 3
+                    color: todoColor
+                    Text {
+                        anchors.centerIn: parent
+                        text: "D"
                         font.pixelSize: 11
                         font.bold: true
                         color: "white"
@@ -429,7 +447,7 @@ Item {
                 property string numFont: "Consolas, Monaco, monospace"
                 property int numSize: 11
 
-                // Coverage sparkline (dual-channel: upload green, stack orange)
+                // Coverage sparkline (triple-channel: upload green, stack orange, todo red)
                 Row {
                     id: sparklineRow
                     anchors.horizontalCenter: parent.horizontalCenter
@@ -451,13 +469,21 @@ Item {
                                 color: tile.counterUploadedCol
                                 opacity: modelData[0] * 0.9 + 0.1  // 0.1 base opacity, up to 1.0
                             }
-                            // Stack bar (orange) - bottom
+                            // Stack bar (orange) - middle
                             Rectangle {
                                 width: 3
                                 height: 2
                                 radius: 0.5
                                 color: tile.counterStackedCol
                                 opacity: modelData[1] * 0.9 + 0.1  // 0.1 base opacity, up to 1.0
+                            }
+                            // Todo bar (red) - bottom
+                            Rectangle {
+                                width: 3
+                                height: 2
+                                radius: 0.5
+                                color: "#F44336"
+                                opacity: modelData[2] * 0.9 + 0.1  // 0.1 base opacity, up to 1.0
                             }
                         }
                     }

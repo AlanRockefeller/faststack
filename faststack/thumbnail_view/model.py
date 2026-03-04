@@ -80,6 +80,7 @@ class ThumbnailEntry:
     is_edited: bool = False
     is_restacked: bool = False
     is_favorite: bool = False
+    is_todo: bool = False
     folder_stats: Optional[FolderStats] = None
     has_backups: bool = False
     has_developed: bool = False
@@ -116,6 +117,7 @@ class ThumbnailModel(QAbstractListModel):
     IsFavoriteRole = Qt.ItemDataRole.UserRole + 17
     HasBackupsRole = Qt.ItemDataRole.UserRole + 18
     HasDevelopedRole = Qt.ItemDataRole.UserRole + 19
+    IsTodoRole = Qt.ItemDataRole.UserRole + 20
 
     # Signal emitted when a thumbnail is ready (id = "{size}/{path_hash}/{mtime_ns}")
     thumbnailReady = Signal(str)
@@ -232,6 +234,8 @@ class ThumbnailModel(QAbstractListModel):
             return entry.is_restacked
         elif role == self.IsFavoriteRole:
             return entry.is_favorite
+        elif role == self.IsTodoRole:
+            return entry.is_todo
         elif role == self.IsInBatchRole:
             # Check if this row's corresponding loupe index is in any batch
             if self._get_batch_indices and not entry.is_folder:
@@ -288,6 +292,7 @@ class ThumbnailModel(QAbstractListModel):
             self.IsFavoriteRole: b"isFavorite",
             self.HasBackupsRole: b"hasBackups",
             self.HasDevelopedRole: b"hasDeveloped",
+            self.IsTodoRole: b"isTodo",
         }
 
     def _get_thumbnail_source(
@@ -600,6 +605,7 @@ class ThumbnailModel(QAbstractListModel):
             is_edited = False
             is_restacked = False
             is_favorite = False
+            is_todo = False
 
             if metadata_map:
                 meta = metadata_map.get(img.path.stem, {})
@@ -608,6 +614,7 @@ class ThumbnailModel(QAbstractListModel):
                 is_edited = meta.get("edited", False)
                 is_restacked = meta.get("restacked", False)
                 is_favorite = meta.get("favorite", False)
+                is_todo = meta.get("todo", False)
             elif self._get_metadata:
                 try:
                     meta = self._get_metadata(img.path.stem)
@@ -617,6 +624,7 @@ class ThumbnailModel(QAbstractListModel):
                         is_edited = meta.get("edited", False)
                         is_restacked = meta.get("restacked", False)
                         is_favorite = meta.get("favorite", False)
+                        is_todo = meta.get("todo", False)
                     else:
                         log.debug(
                             "Metadata for %s is not a dict: %r", img.path.stem, meta
@@ -637,6 +645,7 @@ class ThumbnailModel(QAbstractListModel):
                     is_edited=is_edited,
                     is_restacked=is_restacked,
                     is_favorite=is_favorite,
+                    is_todo=is_todo,
                     has_backups=has_backups,
                     has_developed=has_developed,
                     mtime_ns=mtime_ns,

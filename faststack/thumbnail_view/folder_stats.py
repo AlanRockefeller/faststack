@@ -25,10 +25,10 @@ class FolderStats:
     # Named 'jpg_count' for historical reasons; displayed as "IMG" in UI
     jpg_count: int = 0
     raw_count: int = 0
-    # Coverage sparkline data: list of (upload_ratio, stack_ratio) tuples per bucket
+    # Coverage sparkline data: list of (upload_ratio, stack_ratio, todo_ratio) tuples per bucket
     # Each ratio is 0.0-1.0, representing the fraction of JPGs in that bucket
     # that have the flag set. Empty list if no faststack.json or no JPGs.
-    coverage_buckets: list[tuple[float, float]] = field(default_factory=list)
+    coverage_buckets: list[tuple[float, float, float]] = field(default_factory=list)
 
 
 # Cache by (folder_path, json_mtime_ns, folder_mtime_ns) to avoid re-parsing during scroll
@@ -216,9 +216,9 @@ def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
 def _compute_coverage_buckets(
     jpg_files: list, entries: Dict[str, dict], num_buckets: int = 40
 ) -> list:
-    """Compute coverage sparkline buckets for uploads and stacks.
+    """Compute coverage sparkline buckets for uploads, stacks, and todos.
 
-    Returns a list of (upload_ratio, stack_ratio) tuples, one per bucket.
+    Returns a list of (upload_ratio, stack_ratio, todo_ratio) tuples, one per bucket.
     Each ratio is 0.0-1.0, representing the fraction of JPGs in that bucket
     with the respective flag set.
 
@@ -228,7 +228,7 @@ def _compute_coverage_buckets(
         num_buckets: Number of buckets to divide files into (default 40)
 
     Returns:
-        List of (upload_ratio, stack_ratio) tuples, or empty list if no JPGs.
+        List of (upload_ratio, stack_ratio, todo_ratio) tuples, or empty list if no JPGs.
     """
     if not jpg_files:
         return []
@@ -238,8 +238,8 @@ def _compute_coverage_buckets(
         num_buckets = total_files
 
     # Single-pass accumulation into buckets to avoid redundant list processing
-    # Each entry is [uploaded_count, stacked_count, total_in_bucket]
-    accumulators = [[0, 0, 0] for _ in range(num_buckets)]
+    # Each entry is [uploaded_count, stacked_count, todo_count, total_in_bucket]
+    accumulators = [[0, 0, 0, 0] for _ in range(num_buckets)]
 
     for i, filename in enumerate(jpg_files):
         # Map file index to bucket index using floor division
@@ -254,16 +254,18 @@ def _compute_coverage_buckets(
                 accumulators[bucket_idx][0] += 1
             if meta.get("stacked", False):
                 accumulators[bucket_idx][1] += 1
+            if meta.get("todo", False):
+                accumulators[bucket_idx][2] += 1
 
-        accumulators[bucket_idx][2] += 1
+        accumulators[bucket_idx][3] += 1
 
     # Convert counts to ratios
     buckets = []
-    for uploaded, stacked, count in accumulators:
+    for uploaded, stacked, todo, count in accumulators:
         if count == 0:
-            buckets.append((0.0, 0.0))
+            buckets.append((0.0, 0.0, 0.0))
         else:
-            buckets.append((uploaded / count, stacked / count))
+            buckets.append((uploaded / count, stacked / count, todo / count))
 
     return buckets
 
