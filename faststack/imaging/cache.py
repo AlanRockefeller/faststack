@@ -1,6 +1,8 @@
 """Byte-aware LRU cache for storing decoded image data (CPU and GPU)."""
 
+import inspect
 import logging
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 import time
@@ -51,9 +53,10 @@ class ByteLRUCache(LRUCache):
         self,
         max_bytes: int,
         size_of: Callable[[Any], int] = get_decoded_image_size,
-        on_evict: Optional[Callable[[Any, Any], None]] = None,
+        on_evict: Optional[Callable[..., None]] = None,
     ):
         super().__init__(maxsize=max_bytes, getsizeof=size_of)
+        self._on_evict_arity = self._detect_arity(on_evict)
         self.on_evict = on_evict
         # RLock is required: __setitem__ holds _lock and calls super().__setitem__(),
         # which may call our overridden popitem() for LRU eviction.  A non-reentrant
@@ -66,6 +69,10 @@ class ByteLRUCache(LRUCache):
         self._tombstone_expiry: dict[str, float] = {}
         self._pending_callbacks: Optional[list[Callable[[], None]]] = None
         self._pending_callbacks_owner: Optional[int] = None
+        # Flag: True when __delitem__ is being called from __setitem__'s capacity
+        # eviction path (popitem), as opposed to targeted removal (pop_path, evict_paths).
+        self._pressure_eviction_active = False
+        self._pressure_eviction_owner: Optional[int] = None
         log.info(
             f"Initialized byte-aware LRU cache with {max_bytes / 1024**2:.2f} MB capacity."
         )
@@ -81,6 +88,47 @@ class ByteLRUCache(LRUCache):
         v = max(0, int(value))
         self.maxsize = v
         log.debug(f"Cache max_bytes updated to {v / 1024**2:.2f} MB")
+
+    @staticmethod
+    def _detect_arity(callback: Optional[Callable]) -> int:
+        """Detect whether callback accepts 2 args (key, value) or 3 (key, value, info)."""
+        if callback is None:
+            return 2
+        try:
+            sig = inspect.signature(callback)
+            # Count parameters that can accept positional args
+            positional = sum(
+                1
+                for p in sig.parameters.values()
+                if p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+                and p.default is inspect.Parameter.empty
+            )
+            return 3 if positional >= 3 else 2
+        except (ValueError, TypeError):
+            return 2
+
+    def _fire_evict(self, key: Any, value: Any, info: dict) -> None:
+        """Invoke on_evict, dispatching by detected arity."""
+        if not self.on_evict:
+            return
+        if self._on_evict_arity >= 3:
+            self.on_evict(key, value, info)
+        else:
+            self.on_evict(key, value)
+
+    def _build_eviction_info(self, reason: str, pre_usage: int) -> dict:
+        """Build eviction context dict captured at eviction time (inside lock)."""
+        return {
+            "reason": reason,
+            "usage_bytes": pre_usage,
+            "max_bytes": self.maxsize,
+            "entry_count": len(self),
+            "thread_id": threading.get_ident(),
+        }
 
     def __setitem__(self, key, value):
         pending_callbacks = []
@@ -122,6 +170,9 @@ class ByteLRUCache(LRUCache):
             # callbacks triggered by popitem() -> __delitem__().
             self._pending_callbacks = pending_callbacks
             self._pending_callbacks_owner = threading.get_ident()
+            # Mark that any __delitem__ calls from here are capacity-pressure evictions
+            self._pressure_eviction_active = True
+            self._pressure_eviction_owner = threading.get_ident()
             try:
                 super().__setitem__(key, value)
 
@@ -129,13 +180,16 @@ class ByteLRUCache(LRUCache):
                 # for the old value, because cachetools.__setitem__ for replacements
                 # does not call __delitem__ (it just overwrites the dict entry).
                 if old_value is not _MISSING and self.on_evict:
+                    info = self._build_eviction_info("replace", self.currsize)
+                    info["inserting_key"] = str(key)
 
-                    def _replace_cb(k=key, v=old_value):
-                        if self.on_evict:
-                            self.on_evict(k, v)
+                    def _replace_cb(k=key, v=old_value, _info=info):
+                        self._fire_evict(k, v, _info)
 
                     pending_callbacks.append(_replace_cb)
             finally:
+                self._pressure_eviction_active = False
+                self._pressure_eviction_owner = None
                 self._pending_callbacks = None
                 self._pending_callbacks_owner = None
 
@@ -173,16 +227,34 @@ class ByteLRUCache(LRUCache):
             except KeyError:
                 raise KeyError(key) from None
 
+            # Capture usage BEFORE deletion for accurate thrashing detection.
+            # After super().__delitem__, currsize will already be decremented.
+            pre_usage = self.currsize
+
+            # Determine eviction reason based on calling context.
+            # This is a heuristic: _pressure_eviction_active is only True when
+            # __setitem__ is executing super().__setitem__(), which calls
+            # popitem() when currsize + new_size > maxsize (cachetools LRU).
+            # Any other path into __delitem__ — pop_path(), direct del,
+            # popitem() from manual cache resize — is classified as "manual"
+            # by design, since those are intentional removals, not capacity
+            # pressure indicating the cache is too small.
+            is_pressure = (
+                self._pressure_eviction_active
+                and threading.get_ident() == self._pressure_eviction_owner
+            )
+            reason = "pressure" if is_pressure else "manual"
+
             super().__delitem__(key)
             log.debug(
                 f"Removed item '{key}'. Cache size: {self.currsize / 1024**2:.2f} MB"
             )
 
             if self.on_evict:
+                info = self._build_eviction_info(reason, pre_usage)
 
-                def _callback_func(k=key, v=value):
-                    if self.on_evict:
-                        self.on_evict(k, v)
+                def _callback_func(k=key, v=value, _info=info):
+                    self._fire_evict(k, v, _info)
 
                 # If we are inside a call that defers callbacks (like __setitem__ or evict_paths),
                 # append to the shared list.
@@ -206,15 +278,21 @@ class ByteLRUCache(LRUCache):
             return super().get(key, default)
 
     def clear(self):
-        """Clear cache without triggering eviction callbacks."""
-        # Temporarily disable callback to prevent "thrashing" warnings during mass clear
+        """Clear cache without triggering eviction callbacks.
+
+        Uses _pending_callbacks discard pattern (same as evict_paths) rather
+        than setting on_evict=None, which would race with closures that read
+        on_evict outside the lock on other threads.
+        """
         with self._lock:
-            saved_callback = self.on_evict
-            self.on_evict = None
+            _discard: list[Callable[[], None]] = []
+            self._pending_callbacks = _discard
+            self._pending_callbacks_owner = threading.get_ident()
             try:
                 super().clear()
             finally:
-                self.on_evict = saved_callback
+                self._pending_callbacks = None
+                self._pending_callbacks_owner = None
 
     def pop_path(self, path: Union[Path, str]):
         """Targeted invalidation of all generations for a given path.

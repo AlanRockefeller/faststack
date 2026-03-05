@@ -16,6 +16,7 @@ import shutil
 import uuid
 import bisect
 import functools
+from collections import deque
 
 # Must set before importing PySide6
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime.warning=false"
@@ -268,7 +269,7 @@ class AppController(QObject):
         # Cache Warning State
         self._last_cache_warning_time = 0
         self._eviction_lock = threading.Lock()
-        self._eviction_timestamps = []  # List of eviction timestamps for rate detection
+        self._eviction_timestamps: deque[float] = deque()  # Rolling window for rate detection
         self.display_ready = False  # Track if display size has been reported
         self.pending_prefetch_index: Optional[int] = None  # Deferred prefetch index
 
@@ -5106,17 +5107,55 @@ class AppController(QObject):
         clear_raw_count_cache()
         log.info("Emptied recycle bins and cleared delete history")
 
-    def _on_cache_evict(self, key, value):
-        """Callback for when the image cache evicts an item."""
+    def _on_cache_evict(self, key, value, info=None):
+        """Callback for when the image cache evicts an item.
+
+        Args:
+            key: Cache key that was evicted.
+            value: Cached value that was evicted.
+            info: Optional dict with eviction context captured at eviction time:
+                  reason ("pressure"|"replace"|"manual"), usage_bytes, max_bytes,
+                  entry_count, thread_id.
+        """
+        reason = info.get("reason", "unknown") if info else "unknown"
+
+        # Only count capacity-pressure evictions toward thrashing detection.
+        # Replacements and manual removals (pop_path, popitem resize) are not
+        # indicators of cache size being too small.
+        if reason != "pressure":
+            if self.debug_cache:
+                log.debug(
+                    "Cache evict (skipped for thrash): reason=%s key=%s",
+                    reason,
+                    key,
+                )
+            return
+
+        # Use usage captured at eviction time (inside the lock), not current
+        # currsize which may be stale if clear()/evict_paths() ran between
+        # the eviction and this callback executing outside the lock.
+        eviction_usage = info.get("usage_bytes", 0) if info else 0
+        eviction_max = info.get("max_bytes", 1) if info else 1
+
+        if self.debug_cache:
+            log.debug(
+                "Cache evict (pressure): key=%s usage=%.2fMB/%.2fMB "
+                "entries=%d thread=%s",
+                key,
+                eviction_usage / (1024**2),
+                eviction_max / (1024**2),
+                info.get("entry_count", -1) if info else -1,
+                info.get("thread_id", "?") if info else "?",
+            )
+
         now = time.time()
 
         with self._eviction_lock:
-            # 1. Record eviction timestamp / prune
+            # 1. Record eviction timestamp / prune oldest outside window
             self._eviction_timestamps.append(now)
             cutoff = now - CACHE_THRASH_WINDOW_SECS
-            self._eviction_timestamps = [
-                t for t in self._eviction_timestamps if t > cutoff
-            ]
+            while self._eviction_timestamps and self._eviction_timestamps[0] <= cutoff:
+                self._eviction_timestamps.popleft()
 
             # 2. Check for thrashing (e.g., > threshold evictions in window)
             if len(self._eviction_timestamps) > CACHE_THRASH_THRESHOLD:
@@ -5125,11 +5164,11 @@ class AppController(QObject):
                     self._last_cache_warning_time = now
                     self._has_warned_cache_full = True
 
-                    # UI update logic
-                    used_gb = self.image_cache.currsize / (1024**3)
-                    max_gb = self.image_cache.max_bytes / (1024**3)
+                    # Use captured usage from eviction time for accurate reporting
+                    used_gb = eviction_usage / (1024**3)
+                    max_gb = eviction_max / (1024**3)
 
-                    # Include key/value summary to fix lint error and provide context
+                    # Include key/value summary for context
                     val_summary = ""
                     if hasattr(value, "width") and hasattr(value, "height"):
                         val_summary = f" ({value.width}x{value.height})"
