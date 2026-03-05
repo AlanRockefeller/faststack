@@ -1641,7 +1641,9 @@ ApplicationWindow {
                         wrapMode: Text.WrapAnywhere
                         readOnly: true
                         selectByMouse: true
-                        background: null
+                        background: Rectangle {
+                            color: "transparent"
+                        }
                     }
                 }
             }

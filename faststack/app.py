@@ -4392,7 +4392,7 @@ class AppController(QObject):
         # Deleting index d shifts every index > d down by one.  Without this,
         # batches that sit above any deleted image reference the wrong files.
         if self.batches:
-            deleted_ascending = sorted(sorted_indices)
+            deleted_ascending = sorted(validated_sorted)
 
             def _shift(orig_idx: int) -> int:
                 return orig_idx - sum(1 for d in deleted_ascending if d < orig_idx)
@@ -6438,7 +6438,7 @@ class AppController(QObject):
     @Slot()
     def auto_levels(self):
         """Calculates and applies auto levels (preview only). Returns False if skipped."""
-        if not self.image_files:
+        if not self.image_files or self.current_index >= len(self.image_files):
             self.update_status_message("No image to adjust")
             return False
 

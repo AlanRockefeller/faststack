@@ -309,15 +309,17 @@ class ByteLRUCache(LRUCache):
                 if str(key).startswith(prefix_tuple):
                     keys_to_remove.append(key)
 
-            # 4. Remove keys
+            # 4. Remove keys — capture eviction callbacks but discard them,
+            #    since these are intentional removals, not LRU pressure.
+            #    We use _pending_callbacks to collect (and then drop) rather than
+            #    setting on_evict=None, which would race with closures that read
+            #    on_evict outside the lock.
             removed_bytes = 0
-            pending_callbacks = []
-            self._pending_callbacks = pending_callbacks
+            _discard = []
+            self._pending_callbacks = _discard
             self._pending_callbacks_owner = threading.get_ident()
             try:
                 for k in keys_to_remove:
-                    # Use self.pop (which calls __delitem__) to trigger eviction callbacks.
-                    # It will re-acquire our RLock safely.
                     val = self.pop(k, None)
                     if val is not None:
                         try:
@@ -328,13 +330,7 @@ class ByteLRUCache(LRUCache):
             finally:
                 self._pending_callbacks = None
                 self._pending_callbacks_owner = None
-
-        # Execute all captured eviction callbacks OUTSIDE the lock
-        for callback in pending_callbacks:
-            try:
-                callback()
-            except Exception:
-                log.exception("Error in eviction callback")
+            # _discard is intentionally not executed
 
         if keys_to_remove:
             log.info(

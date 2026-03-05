@@ -158,8 +158,8 @@ def test_on_evict_fires_for_both_overflow_and_replacement():
 # ── evict_paths + tombstones ────────────────────────────────────────
 
 
-def test_evict_paths_fires_callbacks():
-    """evict_paths() should trigger on_evict for each removed key."""
+def test_evict_paths_suppresses_callbacks():
+    """evict_paths() should NOT trigger on_evict (intentional removal, not LRU)."""
     evicted = []
     cache = _make_cache(10_000, lambda k, v: evicted.append((k, v)))
 
@@ -171,10 +171,13 @@ def test_evict_paths_fires_callbacks():
 
     cache.evict_paths([Path("photo.jpg")])
 
-    evicted_keys = {k for k, _ in evicted}
-    assert "photo.jpg::0" in evicted_keys
-    assert "photo.jpg::1" in evicted_keys
-    assert "other.jpg::0" not in evicted_keys
+    # Keys should be removed from cache
+    assert "photo.jpg::0" not in cache
+    assert "photo.jpg::1" not in cache
+    assert "other.jpg::0" in cache
+
+    # But on_evict should NOT have been called (intentional removal)
+    assert len(evicted) == 0
 
 
 def test_evict_paths_tombstone_blocks_reinsert():
