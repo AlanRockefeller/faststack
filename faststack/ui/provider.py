@@ -1617,6 +1617,13 @@ class UIState(QObject):
         return len(stats) > 0
 
     @Slot()
+    def refreshRecycleBinStats(self):
+        """Notify QML that recycle-bin properties should be re-read."""
+        self.recycleBinStatsTextChanged.emit()
+        self.recycleBinDetailedTextChanged.emit()
+        self.hasRecycleBinItemsChanged.emit()
+
+    @Slot()
     def cleanupRecycleBins(self):
         """Deletes all tracked recycle bins."""
         self.app_controller.cleanup_recycle_bins()

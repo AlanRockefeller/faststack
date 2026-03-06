@@ -68,6 +68,7 @@ ApplicationWindow {
         }
         if (uiState && uiState.hasRecycleBinItems) {
             close.accepted = false
+            uiState.refreshRecycleBinStats()
             recycleBinCleanupDialog.open()
         } else {
             close.accepted = true
@@ -1626,13 +1627,14 @@ ApplicationWindow {
                 Behavior on height { NumberAnimation { duration: 250; easing.type: Easing.OutCubic } }
                 
                 ScrollView {
+                    id: detailsScrollView
                     anchors.fill: parent
                     anchors.margins: 8
 
-                    
+
                     TextArea {
                         id: detailsText
-                        width: parent.width
+                        width: detailsScrollView.availableWidth
                         text: uiState ? uiState.recycleBinDetailedText : ""
                         color: root.isDarkTheme ? "#efefef" : "#333333"
                         font.family: "Consolas, 'Courier New', monospace"
