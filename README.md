@@ -1,6 +1,6 @@
 # FastStack
 
-# Version 1.5.9 - February 16, 2026
+# Version 1.6.0 - March 6, 2026
 # By Alan Rockefeller
 
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW or JPG files for focus stacking and website upload.
@@ -76,7 +76,8 @@ faststack
 - `S`: Toggle current image in/out of stack
 - `X`: Remove current image from batch/stack
 - `B`: Toggle current image in/out of batch
-- `[`: Begin new stack group
+- `D`: Toggle todo flag - shows up red on the sparkline so you can see if you have flagged images to work on later
+- `[`: Begin new stack group 
 - `]`: End current stack group
 - `C`: Clear all stacks
 - `{`: Begin new drag & drop batch

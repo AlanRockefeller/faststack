@@ -2,6 +2,12 @@
 
 Todo:   More testing Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   Fix raw image support.
 
+## 1.6.0 (2026-03-06) 
+
+- Added a "Todo" flag: toggle with D, filterable in Filter dialog, shown on thumbnails (badge, tile visuals, red on sparkline), and displayed as "Todo since {date}" in the UI.
+- Fixed batch range alignment after deletions to prevent stale/misaligned UI state.
+- Improved cross‑platform thumbnail path matching, more robust shutdown/teardown, and reduced eviction-related UI races.
+
 ## 1.5.9 (2026-02-16)
 
 - Full-Screen Mode: Press F11 to toggle fullscreen in loupe view 
