@@ -20,7 +20,7 @@ from PySide6.QtCore import (
 )
 
 from faststack.models import ImageFile
-from faststack.io.utils import compute_path_hash
+from faststack.io.utils import compute_path_hash, normalize_path_key
 from faststack.io.indexer import find_images
 from faststack.thumbnail_view.folder_stats import (
     FolderStats,
@@ -668,9 +668,7 @@ class ThumbnailModel(QAbstractListModel):
                 tid = self._make_thumbnail_id(e)
                 self._id_to_row[tid] = i
                 # Normalized key for O(1) find_image_index() lookups
-                self._path_to_row[
-                    os.path.normcase(os.path.abspath(str(e.path)))
-                ] = i
+                self._path_to_row[normalize_path_key(e.path)] = i
 
     def _make_thumbnail_id(self, entry: ThumbnailEntry) -> str:
         """Create thumbnail ID without query params."""
@@ -861,5 +859,5 @@ class ThumbnailModel(QAbstractListModel):
         Returns -1 if not found.
         Uses O(1) dict lookup instead of O(n) linear scan with .resolve().
         """
-        key = os.path.normcase(os.path.abspath(str(path)))
+        key = normalize_path_key(path)
         return self._path_to_row.get(key, -1)

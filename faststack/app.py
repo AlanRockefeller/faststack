@@ -985,6 +985,9 @@ class AppController(QObject):
 
         self.refresh_image_list()
 
+        # Bust decode cache so modified-on-disk files are re-decoded
+        self._bump_display_generation()
+
         # Re-select the same image if it still exists, otherwise clamp
         if self.image_files and preserved_path:
             target_key = self._key(preserved_path)
@@ -992,10 +995,14 @@ class AppController(QObject):
             if new_idx is not None:
                 self.current_index = new_idx
             else:
+                # Image gone — clear stale variant override
+                self._clear_variant_override()
                 self.current_index = min(
                     self.current_index, len(self.image_files) - 1
                 )
         else:
+            # List empty or no preserved path — clear stale variant override
+            self._clear_variant_override()
             self.current_index = max(0, min(
                 self.current_index, len(self.image_files) - 1
             )) if self.image_files else 0
