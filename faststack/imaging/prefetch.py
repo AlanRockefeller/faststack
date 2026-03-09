@@ -265,10 +265,10 @@ class Prefetcher:
         # Calculate asymmetric range based on direction
         if self._last_navigation_direction > 0:  # Moving forward
             behind = max(1, int(effective_radius * (1 - self._direction_bias)))
-            ahead = effective_radius - behind + 1
+            ahead = effective_radius - behind
         else:  # Moving backward
             ahead = max(1, int(effective_radius * (1 - self._direction_bias)))
-            behind = effective_radius - ahead + 1
+            behind = effective_radius - ahead
 
         # Invariant: All reads/writes of self.futures, self._scheduled, self.generation,
         # and self.image_files that participate in scheduling or cancellation MUST

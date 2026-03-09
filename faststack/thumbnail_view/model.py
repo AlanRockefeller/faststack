@@ -154,6 +154,8 @@ class ThumbnailModel(QAbstractListModel):
         # Mapping from thumbnail_id (without query params) to row index
         # id format: "{size}/{path_hash}/{mtime_ns}"
         self._id_to_row: Dict[str, int] = {}
+        # Normalized-path → row index for O(1) find_image_index() lookups
+        self._path_to_row: Dict[str, int] = {}
 
         # Connect our own signal to handle thumbnail ready events
         self.thumbnailReady.connect(self._on_thumbnail_ready)
@@ -383,6 +385,7 @@ class ThumbnailModel(QAbstractListModel):
         try:
             self._entries.clear()
             self._id_to_row.clear()
+            self._path_to_row.clear()
             self._selected_indices.clear()
             self._last_selected_index = None
 
@@ -527,6 +530,7 @@ class ThumbnailModel(QAbstractListModel):
         try:
             self._entries.clear()
             self._id_to_row.clear()
+            self._path_to_row.clear()
             self._selected_indices.clear()
             self._last_selected_index = None
 
@@ -655,6 +659,7 @@ class ThumbnailModel(QAbstractListModel):
     def _rebuild_id_mapping(self):
         """Rebuilds the path/stack_id -> row mapping."""
         self._id_to_row.clear()
+        self._path_to_row.clear()
 
         # Key must match the thumbnail_id format emitted by the prefetcher:
         # "{size}/{path_hash}/{mtime_ns}" — same as _make_thumbnail_id()
@@ -662,6 +667,10 @@ class ThumbnailModel(QAbstractListModel):
             if not e.is_folder:
                 tid = self._make_thumbnail_id(e)
                 self._id_to_row[tid] = i
+                # Normalized key for O(1) find_image_index() lookups
+                self._path_to_row[
+                    os.path.normcase(os.path.abspath(str(e.path)))
+                ] = i
 
     def _make_thumbnail_id(self, entry: ThumbnailEntry) -> str:
         """Create thumbnail ID without query params."""
@@ -850,9 +859,7 @@ class ThumbnailModel(QAbstractListModel):
         """Find the row index of an image by path.
 
         Returns -1 if not found.
+        Uses O(1) dict lookup instead of O(n) linear scan with .resolve().
         """
-        resolved = path.resolve()
-        for i, entry in enumerate(self._entries):
-            if not entry.is_folder and entry.path.resolve() == resolved:
-                return i
-        return -1
+        key = os.path.normcase(os.path.abspath(str(path)))
+        return self._path_to_row.get(key, -1)

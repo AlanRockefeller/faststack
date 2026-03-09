@@ -46,6 +46,8 @@ class DeleteJob:
     undo_requested: bool = False  # Policy 1: auto-restore files on completion
     saved_batches: Optional[list] = None
     saved_batch_start_index: Optional[int] = None
+    saved_stacks: Optional[list] = None
+    saved_stack_start_index: Optional[int] = None
 
 
 @dataclass

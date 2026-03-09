@@ -264,6 +264,7 @@ class AppController(QObject):
         self.display_width = 0
         self.display_height = 0
         self.display_generation = 0
+        self._display_lock = threading.Lock()
         self._is_decoding = False
 
         # Cache Warning State
@@ -436,7 +437,7 @@ class AppController(QObject):
         self._watcher_debounce_timer = QTimer(self)
         self._watcher_debounce_timer.setSingleShot(True)
         self._watcher_debounce_timer.setInterval(200)  # 200ms debounce
-        self._watcher_debounce_timer.timeout.connect(self.refresh_image_list)
+        self._watcher_debounce_timer.timeout.connect(self._on_watcher_refresh)
 
         # Periodic summary for thumbnail debug logging
         if self.debug_thumb_timing or self.debug_thumb_trace:
@@ -569,9 +570,7 @@ class AppController(QObject):
         self._filter_flags = flags
         self._filter_enabled = True
         self._apply_filter_to_cached_list()  # Fast in-memory filtering
-        self.display_generation += (
-            1  # Invalidate cache keys to prevent showing stale images
-        )
+        self._bump_display_generation()
         self.dataChanged.emit()
         self.ui_state.filterStringChanged.emit()  # Notify UI of filter change
 
@@ -619,9 +618,7 @@ class AppController(QObject):
         self._filter_string = ""
         self._filter_flags = []
         self._apply_filter_to_cached_list()  # Fast in-memory filtering
-        self.display_generation += (
-            1  # Invalidate cache keys to prevent showing stale images
-        )
+        self._bump_display_generation()
         self.dataChanged.emit()
         self.ui_state.filterStringChanged.emit()  # Notify UI of filter change
 
@@ -647,10 +644,15 @@ class AppController(QObject):
         self._do_prefetch(self.current_index)
 
     def get_display_info(self):
-        if self.is_zoomed:
-            return 0, 0, self.display_generation
+        with self._display_lock:
+            if self.is_zoomed:
+                return 0, 0, self.display_generation
+            return self.display_width, self.display_height, self.display_generation
 
-        return self.display_width, self.display_height, self.display_generation
+    def _bump_display_generation(self):
+        """Increment display_generation under _display_lock."""
+        with self._display_lock:
+            self.display_generation += 1
 
     def on_display_size_changed(self, width: int, height: int):
         """Debounces display size change events to prevent spamming resizes."""
@@ -673,9 +675,10 @@ class AppController(QObject):
             self.pending_width,
             self.pending_height,
         )
-        self.display_width = self.pending_width
-        self.display_height = self.pending_height
-        self.display_generation += 1  # Invalidates old entries via cache key
+        with self._display_lock:
+            self.display_width = self.pending_width
+            self.display_height = self.pending_height
+            self.display_generation += 1  # Invalidates old entries via cache key
 
         # Mark display as ready after first size report
         is_first_resize = not self.display_ready
@@ -697,17 +700,24 @@ class AppController(QObject):
 
     @Slot(bool)
     def set_zoomed(self, zoomed: bool):
-        if self.is_zoomed != zoomed:
+        with self._display_lock:
+            if self.is_zoomed == zoomed:
+                return  # No-op: avoid unnecessary cache invalidation
             if _debug_mode:
                 log.info(f"AppController.set_zoomed: {self.is_zoomed} -> {zoomed}")
             self.is_zoomed = zoomed
-            self.is_zoomed_changed.emit(zoomed)
+            self.display_generation += 1  # Invalidates old entries via cache key
+        self.is_zoomed_changed.emit(zoomed)
         log.info("Zoom state changed to: %s", zoomed)
-        self.display_generation += 1  # Invalidates old entries via cache key
 
-        # Invalidate current image to force reload with new resolution logic
+        # Cancel stale prefetch tasks and restart at the new resolution,
+        # mirroring what _handle_resize() does.
+        self.prefetcher.cancel_all()
+        if self._loupe_decode_allowed():
+            self.prefetcher.update_prefetch(self.current_index)
+
+        # Force QML to reload the image at the new resolution
         if self.image_files and self.main_window:
-            # Force QML to reload the image by updating the URL generation
             self.ui_refresh_generation += 1
             self.ui_state.currentImageSourceChanged.emit()
             self.main_window.update()  # Force repaint
@@ -959,6 +969,39 @@ class AppController(QObject):
             self._thumbnail_model.refresh_from_controller(self.image_files)
             self._path_resolver.update_from_model(self._thumbnail_model)
             self._grid_model_dirty = False
+
+    @Slot()
+    def _on_watcher_refresh(self):
+        """Watcher debounce handler: rescan disk and keep UI consistent.
+
+        Unlike bare refresh_image_list(), this clamps current_index,
+        updates the prefetcher, and syncs the UI so the display never
+        references an out-of-bounds index.
+        """
+        # Remember which image we were viewing so we can stay on it
+        preserved_path = None
+        if self.image_files and 0 <= self.current_index < len(self.image_files):
+            preserved_path = self.image_files[self.current_index].path
+
+        self.refresh_image_list()
+
+        # Re-select the same image if it still exists, otherwise clamp
+        if self.image_files and preserved_path:
+            target_key = self._key(preserved_path)
+            new_idx = self._path_to_index.get(target_key)
+            if new_idx is not None:
+                self.current_index = new_idx
+            else:
+                self.current_index = min(
+                    self.current_index, len(self.image_files) - 1
+                )
+        else:
+            self.current_index = max(0, min(
+                self.current_index, len(self.image_files) - 1
+            )) if self.image_files else 0
+
+        self._do_prefetch(self.current_index)
+        self.sync_ui_state()
 
     def _apply_filter_to_cached_list(self):
         """Applies current filter to cached image list without disk I/O."""
@@ -3201,7 +3244,7 @@ class AppController(QObject):
         # Clear cache and restart prefetcher to apply new color mode
         self.image_cache.clear()
         self.prefetcher.cancel_all()
-        self.display_generation += 1
+        self._bump_display_generation()
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
 
@@ -3233,7 +3276,7 @@ class AppController(QObject):
         if self.get_color_mode() == "saturation":
             self.image_cache.clear()
             self.prefetcher.cancel_all()
-            self.display_generation += 1
+            self._bump_display_generation()
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
 
@@ -3262,7 +3305,7 @@ class AppController(QObject):
         if self.get_color_mode() in ["saturation", "icc"]:
             self.image_cache.clear()
             self.prefetcher.cancel_all()
-            self.display_generation += 1
+            self._bump_display_generation()
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
 
@@ -3527,7 +3570,7 @@ class AppController(QObject):
             self.last_displayed_image = None
         self.image_cache.clear()
         self.prefetcher.cancel_all()
-        self.display_generation += 1
+        self._bump_display_generation()
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
         self._exif_brief_cache.clear()
@@ -4230,16 +4273,27 @@ class AppController(QObject):
                 new_batches.append([ns, ne])
         return new_batches
 
+    @staticmethod
+    def _shift_start_index(
+        saved_start: Optional[int], still_deleted: List[int]
+    ) -> Optional[int]:
+        """Shift a saved start index past still-deleted positions."""
+        if saved_start is None:
+            return None
+        if saved_start in still_deleted:
+            return None
+        return saved_start - sum(1 for d in still_deleted if d < saved_start)
+
     def _rollback_ui_items(self, items: List[Tuple[int, Any]], job: DeleteJob) -> None:
         """Restore items to the UI list in correct order."""
-        # Sort reverse by index to insert correctly
-        # Access attributes of DeleteJob
-        for idx, img in sorted(items, key=lambda x: x[0], reverse=True):
+        # Insert in ascending index order so each insertion shifts subsequent
+        # indices correctly, restoring the original list positions.
+        for idx, img in sorted(items, key=lambda x: x[0]):
             self.image_files.insert(min(idx, len(self.image_files)), img)
 
         # Restore selection/focus (approximated)
         self.current_index = min(job.previous_index, len(self.image_files) - 1)
-        self.display_generation += 1
+        self._bump_display_generation()
 
         # Targeted cache invalidation instead of full clear
         if self.image_cache is not None:
@@ -4258,7 +4312,7 @@ class AppController(QObject):
             self.prefetcher.update_prefetch(self.current_index)
 
         # Restore saved batch state if present
-        if job.saved_batches and items:
+        if job.saved_batches is not None and items:
             original = {idx for idx, _ in job.removed_items}
             restored = {idx for idx, _ in items}
             if restored == original:
@@ -4271,7 +4325,28 @@ class AppController(QObject):
                 self.batches = self._recompute_batches_after_deletions(
                     job.saved_batches, still_deleted
                 )
+                self.batch_start_index = self._shift_start_index(
+                    job.saved_batch_start_index, still_deleted
+                )
             self._invalidate_batch_cache()
+
+        # Restore saved stack state if present
+        if job.saved_stacks is not None and items:
+            original = {idx for idx, _ in job.removed_items}
+            restored = {idx for idx, _ in items}
+            if restored == original:
+                self.stacks = [s[:] for s in job.saved_stacks]
+                self.stack_start_index = job.saved_stack_start_index
+            else:
+                still_deleted = sorted(original - restored)
+                self.stacks = self._recompute_batches_after_deletions(
+                    job.saved_stacks, still_deleted
+                )
+                self.stack_start_index = self._shift_start_index(
+                    job.saved_stack_start_index, still_deleted
+                )
+            self.sidecar.data.stacks = self.stacks
+            self._metadata_cache_index = (-1, -1)
 
     def _schedule_delete_refresh(self) -> None:
         """Debounce post-delete refresh: coalesce rapid deletes into one refresh."""
@@ -4383,21 +4458,22 @@ class AppController(QObject):
             shift = sum(1 for d in validated_sorted if d < previous_index)
             self.current_index = max(0, min(previous_index - shift, len(self.image_files) - 1))
 
-        # Save batch state before mutation so _rollback_ui_items can restore it
-        # for any delete type (loupe, grid, batch).  batch delete_batch_images()
-        # will overwrite saved_batches with the same pre-mutation value anyway.
-        pre_batch_snapshot = [b[:] for b in self.batches] if self.batches else None
-        pre_batch_start_snapshot = self.batch_start_index if self.batches else None
+        # Save batch/stack state before mutation so rollback can restore it.
+        pre_batch_snapshot = [b[:] for b in self.batches]
+        pre_batch_start_snapshot = self.batch_start_index
+        pre_stack_snapshot = [s[:] for s in self.stacks]
+        pre_stack_start_snapshot = self.stack_start_index
+
+        # Shared helper: compute post-deletion index for a surviving index.
+        deleted_ascending = sorted(validated_sorted)
+
+        def _shift(orig_idx: int) -> int:
+            return orig_idx - sum(1 for d in deleted_ascending if d < orig_idx)
 
         # Adjust batch index ranges to account for removed entries.
         # Deleting index d shifts every index > d down by one.  Without this,
         # batches that sit above any deleted image reference the wrong files.
         if self.batches:
-            deleted_ascending = sorted(validated_sorted)
-
-            def _shift(orig_idx: int) -> int:
-                return orig_idx - sum(1 for d in deleted_ascending if d < orig_idx)
-
             new_batches = []
             for b_start, b_end in self.batches:
                 # Anchor on the first and last *surviving* indices in the range.
@@ -4430,6 +4506,36 @@ class AppController(QObject):
                     if shifted != self.batch_start_index:
                         self.batch_start_index = shifted
                         self._invalidate_batch_cache()
+
+        # Adjust stack index ranges (same algorithm as batches).
+        if self.stacks:
+            new_stacks = []
+            for s_start, s_end in self.stacks:
+                first_ok = next(
+                    (i for i in range(s_start, s_end + 1) if i not in deleted_set),
+                    None,
+                )
+                if first_ok is None:
+                    continue  # whole stack deleted — drop it
+                last_ok = next(
+                    (i for i in range(s_end, s_start - 1, -1) if i not in deleted_set),
+                    None,
+                )
+                ns = _shift(first_ok)
+                ne = _shift(last_ok)
+                if ns <= ne:
+                    new_stacks.append([ns, ne])
+            if new_stacks != self.stacks:
+                self.stacks = new_stacks
+                self.sidecar.data.stacks = self.stacks
+                self._metadata_cache_index = (-1, -1)
+
+        # Adjust stack_start_index for removed entries
+        if pre_stack_start_snapshot is not None:
+            if pre_stack_start_snapshot in deleted_set:
+                self.stack_start_index = None
+            else:
+                self.stack_start_index = _shift(pre_stack_start_snapshot)
 
         # Update UI immediately - this is fast since it just reads from memory
         # Check for existence, not truthiness (empty cache is falsy)
@@ -4509,6 +4615,8 @@ class AppController(QObject):
             images_to_delete=images_to_delete,
             saved_batches=pre_batch_snapshot,
             saved_batch_start_index=pre_batch_start_snapshot,
+            saved_stacks=pre_stack_snapshot,
+            saved_stack_start_index=pre_stack_start_snapshot,
         )
 
         # Add single placeholder undo entry per job
@@ -4749,7 +4857,7 @@ class AppController(QObject):
             except OSError:
                 continue
 
-        self.display_generation += 1
+        self._bump_display_generation()
         self.image_cache.clear()
         self.prefetcher.cancel_all()
         self.prefetcher.update_prefetch(self.current_index)
@@ -4784,13 +4892,14 @@ class AppController(QObject):
                 removed_items = job.removed_items
                 previous_index = job.previous_index
 
-                # Re-insert in descending order to preserve correct indices
-                for idx, img in sorted(removed_items, key=lambda x: x[0], reverse=True):
+                # Re-insert in ascending index order so each insertion shifts
+                # subsequent indices correctly, restoring original positions.
+                for idx, img in sorted(removed_items, key=lambda x: x[0]):
                     insert_idx = min(idx, len(self.image_files))
                     self.image_files.insert(insert_idx, img)
 
                 self.current_index = min(previous_index, len(self.image_files) - 1)
-                self.display_generation += 1
+                self._bump_display_generation()
                 # Targeted eviction instead of full clear
                 if self.image_cache is not None:
                     paths_to_evict = []
@@ -4804,10 +4913,16 @@ class AppController(QObject):
                     self.prefetcher.update_prefetch(self.current_index)
                 self._rebuild_path_to_index()
                 # Restore batch state that was shifted during _delete_indices
-                if job.saved_batches and removed_items:
+                if job.saved_batches is not None and removed_items:
                     self.batches = job.saved_batches
                     self.batch_start_index = job.saved_batch_start_index
                     self._invalidate_batch_cache()
+                # Restore stack state that was shifted during _delete_indices
+                if job.saved_stacks is not None and removed_items:
+                    self.stacks = job.saved_stacks
+                    self.stack_start_index = job.saved_stack_start_index
+                    self.sidecar.data.stacks = self.stacks
+                    self._metadata_cache_index = (-1, -1)
                 self.sync_ui_state()
 
                 count = len(removed_items)
@@ -6462,7 +6577,7 @@ class AppController(QObject):
                     break
 
             # Invalidate cache and refresh display
-            self.display_generation += 1
+            self._bump_display_generation()
             self.image_cache.pop_path(saved_path)
             self.prefetcher.cancel_all()
             self.prefetcher.update_prefetch(self.current_index)
@@ -6697,7 +6812,7 @@ class AppController(QObject):
             self._reindex_after_save(saved_path)
             t_list = time.perf_counter()
 
-            self.display_generation += 1
+            self._bump_display_generation()
             self.image_cache.pop_path(saved_path)
             self.prefetcher.cancel_all()
             self.prefetcher.update_prefetch(self.current_index)
@@ -6846,7 +6961,7 @@ class AppController(QObject):
         elapsed_ms = int((time.perf_counter() - self._batch_al_t_start) * 1000)
 
         # Refresh display
-        self.display_generation += 1
+        self._bump_display_generation()
         self.prefetcher.cancel_all()
         self.prefetcher.update_prefetch(self.current_index)
         self._metadata_cache_index = (-1, -1)
@@ -6938,7 +7053,7 @@ class AppController(QObject):
             t_list = time.perf_counter()
 
             # Invalidate cache for the edited image so it's reloaded from disk
-            self.display_generation += 1
+            self._bump_display_generation()
             self.image_cache.pop_path(saved_path)
             self.prefetcher.cancel_all()
             self.prefetcher.update_prefetch(self.current_index)
