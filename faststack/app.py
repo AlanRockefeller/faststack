@@ -1795,7 +1795,7 @@ class AppController(QObject):
             # Dynamic look-up of self.sidecar as requested (important for mocks in tests)
             meta = self.sidecar.get_metadata(img.path.stem, create=False)
 
-            uploaded = meta.uploaded
+            uploaded = meta.uploaded if meta else False
 
             if uploaded is True:
                 last_uploaded_index = idx
@@ -2115,13 +2115,22 @@ class AppController(QObject):
         """Get metadata for a file stem as a dict for thumbnail model."""
         try:
             meta = self.sidecar.get_metadata(stem, create=False)
+            if meta is None:
+                return {
+                    "stacked": False,
+                    "uploaded": False,
+                    "edited": False,
+                    "restacked": False,
+                    "favorite": False,
+                    "todo": False,
+                }
             return {
-                "stacked": getattr(meta, "stacked", False),
-                "uploaded": getattr(meta, "uploaded", False),
-                "edited": getattr(meta, "edited", False),
-                "restacked": getattr(meta, "restacked", False),
-                "favorite": getattr(meta, "favorite", False),
-                "todo": getattr(meta, "todo", False),
+                "stacked": meta.stacked,
+                "uploaded": meta.uploaded,
+                "edited": meta.edited,
+                "restacked": meta.restacked,
+                "favorite": meta.favorite,
+                "todo": meta.todo,
             }
         except Exception as e:  # Broad catch for UI plumbing - don't crash grid view
             log.debug("Failed to get metadata for %s: %s", stem, e)
@@ -2372,17 +2381,17 @@ class AppController(QObject):
         self._metadata_cache = {
             "filename": filename,
             "exif_brief": exif_brief,
-            "stacked": meta.stacked,
-            "stacked_date": meta.stacked_date or "",
-            "uploaded": meta.uploaded,
-            "uploaded_date": meta.uploaded_date or "",
-            "edited": meta.edited,
-            "edited_date": meta.edited_date or "",
-            "restacked": meta.restacked,
-            "restacked_date": meta.restacked_date or "",
-            "favorite": meta.favorite,
-            "todo": getattr(meta, "todo", False),
-            "todo_date": getattr(meta, "todo_date", "") or "",
+            "stacked": meta.stacked if meta else False,
+            "stacked_date": (meta.stacked_date or "") if meta else "",
+            "uploaded": meta.uploaded if meta else False,
+            "uploaded_date": (meta.uploaded_date or "") if meta else "",
+            "edited": meta.edited if meta else False,
+            "edited_date": (meta.edited_date or "") if meta else "",
+            "restacked": meta.restacked if meta else False,
+            "restacked_date": (meta.restacked_date or "") if meta else "",
+            "favorite": meta.favorite if meta else False,
+            "todo": meta.todo if meta else False,
+            "todo_date": (meta.todo_date or "") if meta else "",
             "stack_info_text": stack_info,
             "batch_info_text": batch_info,
         }
@@ -2607,7 +2616,7 @@ class AppController(QObject):
         indices_to_add = []
         for i, img in enumerate(self.image_files):
             meta = self.sidecar.get_metadata(img.path.stem, create=False)
-            if meta.favorite:
+            if meta and meta.favorite:
                 indices_to_add.append(i)
 
         if not indices_to_add:
@@ -2662,7 +2671,7 @@ class AppController(QObject):
         indices_to_add = []
         for i, img in enumerate(self.image_files):
             meta = self.sidecar.get_metadata(img.path.stem, create=False)
-            if meta.uploaded:
+            if meta and meta.uploaded:
                 indices_to_add.append(i)
 
         if not indices_to_add:
@@ -7362,7 +7371,7 @@ class AppController(QObject):
             return False
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem, create=False)
-        return meta.stacked
+        return meta.stacked if meta else False
 
     def _update_cache_stats(self):
         if self.debug_cache:
