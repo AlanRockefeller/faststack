@@ -1793,15 +1793,9 @@ class AppController(QObject):
         for idx in range(len(self.image_files) - 1, -1, -1):
             img = self.image_files[idx]
             # Dynamic look-up of self.sidecar as requested (important for mocks in tests)
-            meta = self.sidecar.get_metadata(img.path.stem)
+            meta = self.sidecar.get_metadata(img.path.stem, create=False)
 
-            # Robust extraction of 'uploaded' flag: handle both object and dict formats.
-            # Mock-safety: must evaluate False if it's a MagicMock (test requirement).
-            # We explicitly check for boolean True.
-            if isinstance(meta, dict):
-                uploaded = meta.get("uploaded")
-            else:
-                uploaded = getattr(meta, "uploaded", None)
+            uploaded = meta.uploaded
 
             if uploaded is True:
                 last_uploaded_index = idx
@@ -2120,7 +2114,7 @@ class AppController(QObject):
     def _get_metadata_dict(self, stem: str) -> dict:
         """Get metadata for a file stem as a dict for thumbnail model."""
         try:
-            meta = self.sidecar.get_metadata(stem)
+            meta = self.sidecar.get_metadata(stem, create=False)
             return {
                 "stacked": getattr(meta, "stacked", False),
                 "uploaded": getattr(meta, "uploaded", False),
@@ -2351,7 +2345,7 @@ class AppController(QObject):
 
         # Compute and cache
         stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
+        meta = self.sidecar.get_metadata(stem, create=False)
         stack_info = self._get_stack_info(self.current_index)
         batch_info = self._get_batch_info(self.current_index)
 
@@ -2388,7 +2382,7 @@ class AppController(QObject):
             "restacked_date": meta.restacked_date or "",
             "favorite": meta.favorite,
             "todo": getattr(meta, "todo", False),
-            "todo_date": getattr(meta, "todo_date", None) or "",
+            "todo_date": getattr(meta, "todo_date", "") or "",
             "stack_info_text": stack_info,
             "batch_info_text": batch_info,
         }
@@ -2612,7 +2606,7 @@ class AppController(QObject):
         # Find indices of all favorited images
         indices_to_add = []
         for i, img in enumerate(self.image_files):
-            meta = self.sidecar.get_metadata(img.path.stem)
+            meta = self.sidecar.get_metadata(img.path.stem, create=False)
             if meta.favorite:
                 indices_to_add.append(i)
 
@@ -2667,15 +2661,8 @@ class AppController(QObject):
         # Find indices of all uploaded images
         indices_to_add = []
         for i, img in enumerate(self.image_files):
-            meta = self.sidecar.get_metadata(img.path.stem)
-            if not meta:
-                continue
-            uploaded = (
-                meta.get("uploaded", False)
-                if isinstance(meta, dict)
-                else getattr(meta, "uploaded", False)
-            )
-            if uploaded:
+            meta = self.sidecar.get_metadata(img.path.stem, create=False)
+            if meta.uploaded:
                 indices_to_add.append(i)
 
         if not indices_to_add:
@@ -7374,7 +7361,7 @@ class AppController(QObject):
         if not self.image_files or self.current_index >= len(self.image_files):
             return False
         stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
+        meta = self.sidecar.get_metadata(stem, create=False)
         return meta.stacked
 
     def _update_cache_stats(self):

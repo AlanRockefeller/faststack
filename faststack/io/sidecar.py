@@ -118,9 +118,13 @@ class SidecarManager:
             if was_watcher_running:
                 self.start_watcher()
 
-    def get_metadata(self, image_stem: str) -> EntryMetadata:
-        """Gets metadata for an image, creating it if it doesn't exist."""
-        return self.data.entries.setdefault(image_stem, EntryMetadata())
+    def get_metadata(self, image_stem: str, *, create: bool = True) -> EntryMetadata:
+        """Get metadata for an image, optionally creating a persistent entry."""
+        meta = self.data.entries.get(image_stem)
+        if meta is None and create:
+            meta = EntryMetadata()
+            self.data.entries[image_stem] = meta
+        return meta if meta is not None else EntryMetadata()
 
     def set_last_index(self, index: int):
         self.data.last_index = index
