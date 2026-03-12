@@ -66,7 +66,7 @@ def test_jump_to_last_uploaded_success(mock_controller):
     meta2 = EntryMetadata(uploaded=False)
     meta3 = EntryMetadata(uploaded=True)
 
-    def side_effect(stem):
+    def side_effect(stem, **kwargs):
         return {"img1": meta1, "img2": meta2, "img3": meta3}.get(stem, EntryMetadata())
 
     mock_controller.sidecar.get_metadata.side_effect = side_effect
@@ -137,7 +137,7 @@ def test_jump_to_last_uploaded_one(mock_controller):
     mock_controller.image_files = [img1, img2, img3]
     mock_controller.current_index = 0
 
-    def side_effect(stem):
+    def side_effect(stem, **kwargs):
         return {"img1": meta1, "img2": meta2, "img3": meta3}.get(stem, EntryMetadata())
 
     mock_controller.sidecar.get_metadata.side_effect = side_effect

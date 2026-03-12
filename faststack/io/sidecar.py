@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from typing import Literal, Optional, overload
 
 from faststack.models import Sidecar, EntryMetadata
 
@@ -118,13 +119,27 @@ class SidecarManager:
             if was_watcher_running:
                 self.start_watcher()
 
-    def get_metadata(self, image_stem: str, *, create: bool = True) -> EntryMetadata:
-        """Get metadata for an image, optionally creating a persistent entry."""
+    @overload
+    def get_metadata(self, image_stem: str, *, create: Literal[True] = True) -> EntryMetadata: ...
+
+    @overload
+    def get_metadata(self, image_stem: str, *, create: Literal[False]) -> Optional[EntryMetadata]: ...
+
+    @overload
+    def get_metadata(self, image_stem: str, *, create: bool) -> Optional[EntryMetadata]: ...
+
+    def get_metadata(self, image_stem: str, *, create: bool = True) -> Optional[EntryMetadata]:
+        """Get metadata for an image, optionally creating a persistent entry.
+
+        When create=True (default), always returns an EntryMetadata (creating
+        and storing one if it doesn't exist).  When create=False, returns None
+        if no entry exists — callers must handle the None case explicitly.
+        """
         meta = self.data.entries.get(image_stem)
         if meta is None and create:
             meta = EntryMetadata()
             self.data.entries[image_stem] = meta
-        return meta if meta is not None else EntryMetadata()
+        return meta
 
     def set_last_index(self, index: int):
         self.data.last_index = index
