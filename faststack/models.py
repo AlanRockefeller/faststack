@@ -2,7 +2,7 @@
 
 import dataclasses
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 
 
 @dataclasses.dataclass
@@ -33,6 +33,7 @@ class ImageFile:
 
     @property
     def has_raw(self) -> bool:
+        """Returns True if a RAW file is associated with this image."""
         return self.raw_pair is not None
 
     @property
@@ -42,6 +43,7 @@ class ImageFile:
 
     @property
     def has_working_tif(self) -> bool:
+        """Returns True if a valid working TIFF file exists on disk."""
         try:
             return (
                 self.working_tif_path.exists()
@@ -58,9 +60,10 @@ class ImageFile:
         return self.path.with_name(f"{self.path.stem}-developed.jpg")
 
 
+# pylint: disable=too-many-instance-attributes
 @dataclasses.dataclass
 class EntryMetadata:
-    """Sidecar metadata for a single image entry."""
+    """Flat sidecar metadata for a single image entry (mirrors JSON schema)."""
 
     stack_id: Optional[int] = None
     stacked: bool = False
@@ -94,7 +97,8 @@ class DecodedImage:
     width: int
     height: int
     bytes_per_line: int
-    format: object  # QImage.Format
+    format: Any  # QImage.Format
 
     def __sizeof__(self) -> int:
+        """Returns the size of the image buffer in bytes."""
         return self.buffer.nbytes

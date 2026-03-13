@@ -2,7 +2,6 @@
 
 import inspect
 import logging
-from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 import time
@@ -19,29 +18,29 @@ def get_decoded_image_size(item) -> int:
         # Handle both numpy arrays and memoryview buffers
         if hasattr(item.buffer, "nbytes"):
             return item.buffer.nbytes
-        elif isinstance(item.buffer, (bytes, bytearray)):
+        if isinstance(item.buffer, (bytes, bytearray)):
             return len(item.buffer)
+        # Fallback: estimate from dimensions (more accurate for image buffers than sys.getsizeof)
+        width = getattr(item, "width", 0)
+        height = getattr(item, "height", 0)
+        if width <= 0 or height <= 0:
+            return 1  # No usable dimensions
+
+        if hasattr(item, "bytes_per_line") and item.bytes_per_line > 0:
+            bytes_per_pixel = item.bytes_per_line // width
         else:
-            # Fallback: estimate from dimensions (more accurate for image buffers than sys.getsizeof)
-            width = getattr(item, "width", 0)
-            height = getattr(item, "height", 0)
-            if width <= 0 or height <= 0:
-                return 1  # No usable dimensions
+            bytes_per_pixel = 4  # Default to RGBA
 
-            if hasattr(item, "bytes_per_line") and item.bytes_per_line > 0:
-                bytes_per_pixel = item.bytes_per_line // width
-            else:
-                bytes_per_pixel = 4  # Default to RGBA
+        # Guard against 0 (e.g. bytes_per_line=0) which would yield size 0
+        # and break cache accounting.  Don't clamp to 4 — that overcounts
+        # legitimate RGB (3 Bpp) buffers and causes premature evictions.
+        bytes_per_pixel = max(1, min(bytes_per_pixel, 16))
 
-            # Guard against 0 (e.g. bytes_per_line=0) which would yield size 0
-            # and break cache accounting.  Don't clamp to 4 — that overcounts
-            # legitimate RGB (3 Bpp) buffers and causes premature evictions.
-            bytes_per_pixel = max(1, min(bytes_per_pixel, 16))
-
-            return width * height * bytes_per_pixel
+        return width * height * bytes_per_pixel
 
     log.warning(
-        f"Unexpected item type in cache: {type(item)}. Returning estimated size of 1."
+        "Unexpected item type in cache: %s. Returning estimated size of 1.",
+        type(item),
     )
     return 1  # Should not happen
 
@@ -74,7 +73,8 @@ class ByteLRUCache(LRUCache):
         self._pressure_eviction_active = False
         self._pressure_eviction_owner: Optional[int] = None
         log.info(
-            f"Initialized byte-aware LRU cache with {max_bytes / 1024**2:.2f} MB capacity."
+            "Initialized byte-aware LRU cache with %.2f MB capacity.",
+            max_bytes / 1024**2,
         )
 
     @property
@@ -87,7 +87,7 @@ class ByteLRUCache(LRUCache):
         """Set the maximum cache size in bytes."""
         v = max(0, int(value))
         self.maxsize = v
-        log.debug(f"Cache max_bytes updated to {v / 1024**2:.2f} MB")
+        log.debug("Cache max_bytes updated to %.2f MB", v / 1024**2)
 
     @staticmethod
     def _detect_arity(callback: Optional[Callable]) -> int:
@@ -111,10 +111,12 @@ class ByteLRUCache(LRUCache):
         except (ValueError, TypeError):
             return 2
 
-    def _fire_evict(self, key: Any, value: Any, info: dict) -> None:
+    def _fire_evict(self, key: Any, value: Any, info: Optional[dict] = None) -> None:
         """Invoke on_evict, dispatching by detected arity."""
         if not self.on_evict:
             return
+        if info is None:
+            info = {}
         if self._on_evict_arity >= 3:
             self.on_evict(key, value, info)
         else:
@@ -130,7 +132,7 @@ class ByteLRUCache(LRUCache):
             "thread_id": threading.get_ident(),
         }
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key, value):  # pylint: disable=signature-differs
         pending_callbacks = []
         with self._lock:
             # Check tombstones - prevent caching if key starts with a tombstoned prefix
@@ -149,11 +151,11 @@ class ByteLRUCache(LRUCache):
 
                 for prefix in self._tombstones:
                     if key_str.startswith(prefix):
-                        log.debug(f"Refusing to cache tombstoned key: {key}")
+                        log.debug("Refusing to cache tombstoned key: %s", key)
                         return
 
             # Check if this is a replacement to handle its callback if __delitem__ isn't called.
-            _MISSING = object()
+            _MISSING = object()  # pylint: disable=invalid-name
             old_value = _MISSING
             if self.on_evict and key in self:
                 try:
@@ -194,17 +196,17 @@ class ByteLRUCache(LRUCache):
                 self._pending_callbacks_owner = None
 
             log.debug(
-                f"Cached item '{key}'. Cache size: {self.currsize / 1024**2:.2f} MB"
+                "Cached item '%s'. Cache size: %.2f MB", key, self.currsize / 1024**2
             )
 
         # Execute all captured eviction callbacks OUTSIDE the lock
         for callback in pending_callbacks:
             try:
                 callback()
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 log.exception("Error in eviction callback")
 
-    def __getitem__(self, key):
+    def __getitem__(self, key):  # pylint: disable=signature-differs
         """Thread-safe access (updates LRU order)."""
         with self._lock:
             return super().__getitem__(key)
@@ -214,7 +216,7 @@ class ByteLRUCache(LRUCache):
         with self._lock:
             return super().__contains__(key)
 
-    def __delitem__(self, key):
+    def __delitem__(self, key):  # pylint: disable=signature-differs
         """Thread-safe delete with eviction callback."""
         callback = None
         with self._lock:
@@ -247,7 +249,7 @@ class ByteLRUCache(LRUCache):
 
             super().__delitem__(key)
             log.debug(
-                f"Removed item '{key}'. Cache size: {self.currsize / 1024**2:.2f} MB"
+                "Removed item '%s'. Cache size: %.2f MB", key, self.currsize / 1024**2
             )
 
             if self.on_evict:
@@ -269,7 +271,7 @@ class ByteLRUCache(LRUCache):
         if callback:
             try:
                 callback()
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 log.exception("Error in eviction callback")
 
     def get(self, key, default=None):
@@ -335,12 +337,12 @@ class ByteLRUCache(LRUCache):
         for callback in pending_callbacks:
             try:
                 callback()
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 log.exception("Error in eviction callback")
 
         if keys_to_remove:
             log.debug(
-                f"Invalidated {len(keys_to_remove)} cache entries for path: {path}"
+                "Invalidated %d cache entries for path: %s", len(keys_to_remove), path
             )
 
     def evict_paths(self, paths: list[Union[Path, str]]):
@@ -402,7 +404,7 @@ class ByteLRUCache(LRUCache):
                     if val is not None:
                         try:
                             size = get_decoded_image_size(val)
-                        except Exception:
+                        except Exception:  # pylint: disable=broad-exception-caught
                             size = 0  # Fallback
                         removed_bytes += size
             finally:
@@ -412,7 +414,10 @@ class ByteLRUCache(LRUCache):
 
         if keys_to_remove:
             log.info(
-                f"Evicted {len(keys_to_remove)} entries ({removed_bytes / 1024**2:.2f} MB) for {len(paths)} paths"
+                "Evicted %d entries (%.2f MB) for %d paths",
+                len(keys_to_remove),
+                removed_bytes / 1024**2,
+                len(paths),
             )
 
 

@@ -46,8 +46,8 @@ def detect_rawtherapee_path():
         # 5.10 > 5.9
         matches.sort(key=version_sort_key, reverse=True)
         return matches[0]
-    except Exception as e:
-        log.warning(f"Error detecting RawTherapee path: {e}")
+    except (OSError, RuntimeError) as e:
+        log.warning("Error detecting RawTherapee path: %s", e)
         return None
 
 
@@ -127,6 +127,8 @@ DEFAULT_CONFIG = {
 
 
 class AppConfig:
+    """Manages application configuration backed by an INI file."""
+
     def __init__(self):
         self.config_path = get_app_data_dir() / "faststack.ini"
         self.config = configparser.ConfigParser()
@@ -135,11 +137,11 @@ class AppConfig:
     def load(self):
         """Loads the config, creating it with defaults if it doesn't exist."""
         if not self.config_path.exists():
-            log.info(f"Creating default config at {self.config_path}")
+            log.info("Creating default config at %s", self.config_path)
             self.config.read_dict(DEFAULT_CONFIG)
             self.save()
         else:
-            log.info(f"Loading config from {self.config_path}")
+            log.info("Loading config from %s", self.config_path)
             self.config.read(self.config_path)
             # Ensure all sections and keys exist
             for section, keys in DEFAULT_CONFIG.items():
@@ -155,11 +157,12 @@ class AppConfig:
                 current_rt_path = self.get("rawtherapee", "exe")
                 if not os.path.exists(current_rt_path):
                     log.warning(
-                        f"Configured RawTherapee path not found: {current_rt_path}. Attempting re-detection..."
+                        "Configured RawTherapee path not found: %s. Attempting re-detection...",
+                        current_rt_path,
                     )
                     new_path = detect_rawtherapee_path()
                     if new_path and new_path != current_rt_path:
-                        log.info(f"Found new RawTherapee path: {new_path}")
+                        log.info("Found new RawTherapee path: %s", new_path)
                         self.set("rawtherapee", "exe", new_path)
                         self.save()
 
@@ -169,23 +172,28 @@ class AppConfig:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
             with self.config_path.open("w") as f:
                 self.config.write(f)
-            log.info(f"Saved config to {self.config_path}")
+            log.info("Saved config to %s", self.config_path)
         except IOError as e:
-            log.error(f"Failed to save config to {self.config_path}: {e}")
+            log.error("Failed to save config to %s: %s", self.config_path, e)
 
     def get(self, section, key, fallback=None):
+        """Return a config value as a string."""
         return self.config.get(section, key, fallback=fallback)
 
     def getint(self, section, key, fallback=None):
+        """Return a config value as an integer."""
         return self.config.getint(section, key, fallback=fallback)
 
     def getfloat(self, section, key, fallback=None):
+        """Return a config value as a float."""
         return self.config.getfloat(section, key, fallback=fallback)
 
     def getboolean(self, section, key, fallback=None):
+        """Return a config value as a boolean."""
         return self.config.getboolean(section, key, fallback=fallback)
 
     def set(self, section, key, value):
+        """Set a config value, creating the section if needed."""
         if not self.config.has_section(section):
             self.config.add_section(section)
         self.config.set(section, key, str(value))

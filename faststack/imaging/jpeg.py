@@ -1,6 +1,7 @@
 """High-performance JPEG decoding using PyTurboJPEG with a Pillow fallback."""
 
 import logging
+from io import BytesIO
 from typing import Optional, Tuple
 
 import numpy as np
@@ -13,14 +14,14 @@ log = logging.getLogger(__name__)
 try:
     from turbojpeg import TurboJPEG, TJPF_RGB
 except ImportError:
-    jpeg_decoder = None
+    JPEG_DECODER = None
     TURBO_AVAILABLE = False
     log.warning("PyTurboJPEG not found. Falling back to Pillow for JPEG decoding.")
 else:
     try:
-        jpeg_decoder = TurboJPEG()
+        JPEG_DECODER = TurboJPEG()
     except Exception:
-        jpeg_decoder = None
+        JPEG_DECODER = None
         TURBO_AVAILABLE = False
         log.exception("PyTurboJPEG initialization failed. Falling back to Pillow.")
     else:
@@ -30,7 +31,7 @@ else:
 
 def decode_jpeg_rgb(jpeg_bytes: bytes, fast_dct: bool = False) -> Optional[np.ndarray]:
     """Decodes JPEG bytes into an RGB numpy array."""
-    if TURBO_AVAILABLE and jpeg_decoder:
+    if TURBO_AVAILABLE and JPEG_DECODER:
         try:
             # Decode with proper color space handling (no TJFLAG_FASTDCT)
             # This ensures proper YCbCr->RGB conversion with correct gamma
@@ -38,19 +39,17 @@ def decode_jpeg_rgb(jpeg_bytes: bytes, fast_dct: bool = False) -> Optional[np.nd
             if fast_dct:
                 # TJFLAG_FASTDCT = 2048
                 flags |= 2048
-            return jpeg_decoder.decode(jpeg_bytes, pixel_format=TJPF_RGB, flags=flags)
+            return JPEG_DECODER.decode(jpeg_bytes, pixel_format=TJPF_RGB, flags=flags)
         except Exception as e:
-            log.exception(f"PyTurboJPEG failed to decode image: {e}. Trying Pillow.")
+            log.exception("PyTurboJPEG failed to decode image: %s. Trying Pillow.", e)
             # Fall through to Pillow fallback
 
     # Fallback to Pillow
     try:
-        from io import BytesIO
-
         img = Image.open(BytesIO(jpeg_bytes)).convert("RGB")
         return np.array(img)
     except Exception as e:
-        log.exception(f"Pillow also failed to decode image: {e}")
+        log.exception("Pillow also failed to decode image: %s", e)
         return None
 
 
@@ -58,15 +57,15 @@ def decode_jpeg_thumb_rgb(
     jpeg_bytes: bytes, max_dim: int = 256
 ) -> Optional[np.ndarray]:
     """Decodes a JPEG into a thumbnail-sized RGB numpy array."""
-    if TURBO_AVAILABLE and jpeg_decoder:
+    if TURBO_AVAILABLE and JPEG_DECODER:
         try:
             # Get image header to determine dimensions
-            width, height, _, _ = jpeg_decoder.decode_header(jpeg_bytes)
+            width, height, _, _ = JPEG_DECODER.decode_header(jpeg_bytes)
 
             # Find the best scaling factor
             scaling_factor = _get_turbojpeg_scaling_factor(width, height, max_dim)
 
-            decoded = jpeg_decoder.decode(
+            decoded = JPEG_DECODER.decode(
                 jpeg_bytes,
                 scaling_factor=scaling_factor,
                 pixel_format=TJPF_RGB,
@@ -79,18 +78,16 @@ def decode_jpeg_thumb_rgb(
             return decoded
         except Exception as e:
             log.exception(
-                f"PyTurboJPEG failed to decode thumbnail: {e}. Trying Pillow."
+                "PyTurboJPEG failed to decode thumbnail: %s. Trying Pillow.", e
             )
 
     # Fallback to Pillow
     try:
-        from io import BytesIO
-
         img = Image.open(BytesIO(jpeg_bytes))
         img.thumbnail((max_dim, max_dim))
         return np.array(img.convert("RGB"))
     except Exception as e:
-        log.exception(f"Pillow also failed to decode thumbnail: {e}")
+        log.exception("Pillow also failed to decode thumbnail: %s", e)
         return None
 
 
@@ -98,12 +95,12 @@ def _get_turbojpeg_scaling_factor(
     width: int, height: int, max_dim: int
 ) -> Optional[Tuple[int, int]]:
     """Finds the best libjpeg-turbo scaling factor to get a thumbnail <= max_dim."""
-    if not TURBO_AVAILABLE or not jpeg_decoder:
+    if not TURBO_AVAILABLE or not JPEG_DECODER:
         return None
 
     # PyTurboJPEG provides a set of supported scaling factors
     supported_factors = sorted(
-        jpeg_decoder.scaling_factors,
+        JPEG_DECODER.scaling_factors,
         key=lambda x: x[0] / x[1],
         reverse=True,
     )
@@ -123,10 +120,10 @@ def decode_jpeg_resized(
     if width <= 0 or height <= 0:
         return decode_jpeg_rgb(jpeg_bytes, fast_dct=fast_dct)
 
-    if TURBO_AVAILABLE and jpeg_decoder:
+    if TURBO_AVAILABLE and JPEG_DECODER:
         try:
             # Get image header to determine dimensions
-            img_width, img_height, _, _ = jpeg_decoder.decode_header(jpeg_bytes)
+            img_width, img_height, _, _ = JPEG_DECODER.decode_header(jpeg_bytes)
 
             # Determine which dimension is the limiting factor
             if img_width * height > img_height * width:
@@ -144,7 +141,7 @@ def decode_jpeg_resized(
                     # TJFLAG_FASTDCT = 2048
                     flags |= 2048
 
-                decoded = jpeg_decoder.decode(
+                decoded = JPEG_DECODER.decode(
                     jpeg_bytes,
                     scaling_factor=scale_factor,
                     pixel_format=TJPF_RGB,
@@ -153,20 +150,16 @@ def decode_jpeg_resized(
 
                 # Only use Pillow for final resize if needed
                 if decoded.shape[0] > height or decoded.shape[1] > width:
-                    from io import BytesIO
-
                     img = Image.fromarray(decoded)
                     # Use BILINEAR for speed
                     img.thumbnail((width, height), Image.Resampling.BILINEAR)
                     return np.array(img)
                 return decoded
         except Exception as e:
-            log.exception(f"PyTurboJPEG failed: {e}")
+            log.exception("PyTurboJPEG failed: %s", e)
 
     # Fallback to Pillow (existing code)
     try:
-        from io import BytesIO
-
         img = Image.open(BytesIO(jpeg_bytes))
 
         if width <= 0 or height <= 0:
@@ -185,5 +178,5 @@ def decode_jpeg_resized(
         img.thumbnail((width, height), resampling)
         return np.array(img.convert("RGB"))
     except Exception as e:
-        log.exception(f"Pillow failed to decode and resize image: {e}")
+        log.exception("Pillow failed to decode and resize image: %s", e)
         return None
