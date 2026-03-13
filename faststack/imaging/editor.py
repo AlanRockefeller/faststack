@@ -1,15 +1,18 @@
+"""Non-destructive image editor: crop, rotate, exposure, contrast, WB, sharpness."""
+
 import logging
-import os
-import shutil
-import re
 import math
+import os
+import re
+import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
+
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps, ExifTags
-
 
 from faststack.models import DecodedImage
 from faststack.imaging.math_utils import (
@@ -30,8 +33,6 @@ except ImportError:
     QImage = None
 
 from faststack.imaging.optional_deps import cv2
-
-import threading
 
 
 log = logging.getLogger(__name__)
@@ -142,7 +143,7 @@ def _gaussian_blur_float(arr: np.ndarray, radius: float) -> np.ndarray:
         # Fallback: Use Pillow's GaussianBlur in 'F' mode (float32) per channel
         # This preserves values > 1.0 (headroom) which is critical for highlight recovery.
         try:
-            h, w, c = arr.shape
+            c = arr.shape[2]
             blurred_channels = []
 
             # Process each channel independently
@@ -708,7 +709,7 @@ class ImageEditor:
         if abs(angle_deg) < 0.01:
             return img_arr
 
-        h, w, c = img_arr.shape
+        c = img_arr.shape[2]
         channels = []
         for i in range(c):
             # Convert channel to PIL Float image
@@ -722,11 +723,8 @@ class ImageEditor:
             )
             channels.append(rot_c)
 
-        # Merge back
-        # Assume all channels rotated to same size
-        nw, nh = channels[0].size
-        new_arr = np.stack([np.array(ch) for ch in channels], axis=-1)
-        return new_arr
+        # Merge back (all channels rotated to same size)
+        return np.stack([np.array(ch) for ch in channels], axis=-1)
 
     def _apply_edits(
         self,
@@ -741,7 +739,6 @@ class ImageEditor:
         if edits is None:
             edits = self.current_edits
 
-        is_export = for_export
         # Alias
         arr = img_arr
 
@@ -761,7 +758,7 @@ class ImageEditor:
                 if arr.size > 0:
                     sample = arr.reshape(-1)[:2000]
                     s_max = sample.max()
-                    if s_max > 1.0 and s_max <= 255.0:
+                    if 1.0 < s_max <= 255.0:
                         arr /= 255.0
                     elif s_max <= 1.0:
                         # Double check full array only if sample was small or ambiguous
@@ -1329,12 +1326,7 @@ class ImageEditor:
 
         if img_arr is None:
             # Fallback for tests or cases where float data isn't initialized yet
-            if hasattr(self, "_preview_image") and self._preview_image is not None:
-                img_arr = (
-                    np.array(self._preview_image.convert("RGB")).astype(np.float32)
-                    / 255.0
-                )
-            elif self.original_image is not None:
+            if self.original_image is not None:
                 img_arr = (
                     np.array(self.original_image.convert("RGB")).astype(np.float32)
                     / 255.0
@@ -1852,8 +1844,6 @@ class ImageEditor:
             bytes object of EXIF data, or None if sanitization/serialization failed.
         """
         try:
-            from PIL import Image, ExifTags
-
             exif = None
 
             # 1. Try to build an Exif object from raw bytes (best: preserves all tags)
@@ -2019,11 +2009,6 @@ class ImageEditor:
                 # Save as 16-bit TIFF using custom writer
                 self._write_tiff_16bit(original_path, final_float)
             else:
-                # Check for geometric transforms
-                rotation = edits_snapshot.get("rotation", 0)
-                straighten_angle = float(edits_snapshot.get("straighten_angle", 0.0))
-                transforms_applied = (rotation != 0) or (abs(straighten_angle) > 0.001)
-
                 # Determine EXIF bytes to write
                 exif_bytes = None
                 if self.original_image:
@@ -2113,7 +2098,7 @@ class ImageEditor:
 
         except Exception as e:
             log.exception("Failed to save %s: %s", self.current_filepath, e)
-            raise RuntimeError("Save failed: %s" % str(e)) from e
+            raise RuntimeError(f"Save failed: {e}") from e
 
     def save_image_uint8_levels(
         self,

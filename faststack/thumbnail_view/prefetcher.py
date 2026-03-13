@@ -521,7 +521,7 @@ class ThumbnailCache:
             if key in self._cache:
                 self._current_bytes -= len(self._cache[key])
                 self._cache.move_to_end(key, last=True)
-            
+
             self._cache[key] = value
             self._current_bytes += len(value)
 

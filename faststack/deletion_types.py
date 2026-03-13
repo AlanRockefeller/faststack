@@ -5,7 +5,6 @@ and self-documenting field names.
 """
 
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -29,6 +28,16 @@ class DeletionErrorCodes(str, Enum):
 
 
 @dataclass
+class UIStateRestoration:
+    """Saved UI grouping state for rollback after an undo or cancel."""
+
+    saved_batches: Optional[list] = None
+    saved_batch_start_index: Optional[int] = None
+    saved_stacks: Optional[list] = None
+    saved_stack_start_index: Optional[int] = None
+
+
+@dataclass
 class DeleteJob:
     """In-flight delete job tracked in _pending_delete_jobs.
 
@@ -44,10 +53,7 @@ class DeleteJob:
     images_to_delete: List[Any]  # List[ImageFile] objects removed from UI
     user_undone: bool = False
     undo_requested: bool = False  # Policy 1: auto-restore files on completion
-    saved_batches: Optional[list] = None
-    saved_batch_start_index: Optional[int] = None
-    saved_stacks: Optional[list] = None
-    saved_stack_start_index: Optional[int] = None
+    ui_state: Optional[UIStateRestoration] = None
 
 
 @dataclass
@@ -80,7 +86,7 @@ class DeleteFailure:
 
 
 @dataclass
-class DeleteResult:
+class DeleteResult:  # pylint: disable=too-many-instance-attributes
     """Parsed worker result, used on the UI thread side only.
 
     The worker still returns a plain dict over the Qt signal boundary.

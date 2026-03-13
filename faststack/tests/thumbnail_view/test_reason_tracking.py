@@ -98,7 +98,7 @@ def test_refresh_sets_deferred_clear(model):
     from faststack.models import ImageFile
 
     with patch("faststack.thumbnail_view.model.find_images") as mock_find:
-        # Note: This only verifies model._next_source_reason is preserved synchronously 
+        # Note: This only verifies model._next_source_reason is preserved synchronously
         # after refresh() returns; the deferred clearing via QTimer is not tested here.
         mock_find.return_value = [
             ImageFile(path=Path("/fake/dir/img1.jpg")),

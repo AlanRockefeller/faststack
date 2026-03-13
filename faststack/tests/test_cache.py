@@ -108,9 +108,7 @@ def test_get_decoded_image_size_fallback_default():
 
     buffer = MockBuffer()
     # Use SimpleNamespace to build a minimal object that lacks bytes_per_line
-    item = SimpleNamespace(
-        buffer=buffer, width=10, height=10
-    )
+    item = SimpleNamespace(buffer=buffer, width=10, height=10)
 
     # size = 10 * 10 * 4 = 400
     assert get_decoded_image_size(item) == 400

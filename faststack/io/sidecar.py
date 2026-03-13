@@ -120,15 +120,23 @@ class SidecarManager:
                 self.start_watcher()
 
     @overload
-    def get_metadata(self, image_stem: str, *, create: Literal[True] = True) -> EntryMetadata: ...
+    def get_metadata(
+        self, image_stem: str, *, create: Literal[True] = True
+    ) -> EntryMetadata: ...
 
     @overload
-    def get_metadata(self, image_stem: str, *, create: Literal[False]) -> Optional[EntryMetadata]: ...
+    def get_metadata(
+        self, image_stem: str, *, create: Literal[False]
+    ) -> Optional[EntryMetadata]: ...
 
     @overload
-    def get_metadata(self, image_stem: str, *, create: bool) -> Optional[EntryMetadata]: ...
+    def get_metadata(
+        self, image_stem: str, *, create: bool
+    ) -> Optional[EntryMetadata]: ...
 
-    def get_metadata(self, image_stem: str, *, create: bool = True) -> Optional[EntryMetadata]:
+    def get_metadata(
+        self, image_stem: str, *, create: bool = True
+    ) -> Optional[EntryMetadata]:
         """Get metadata for an image, optionally creating a persistent entry.
 
         When create=True (default), always returns an EntryMetadata (creating

@@ -50,9 +50,7 @@ def test_delete_uses_targeted_eviction(mock_app):
     app = mock_app
 
     # Setup data
-    img1 = ImageFile(
-        Path("c:/images/img1.jpg"), raw_pair=Path("c:/images/img1.CR2")
-    )
+    img1 = ImageFile(Path("c:/images/img1.jpg"), raw_pair=Path("c:/images/img1.CR2"))
     img2 = ImageFile(Path("c:/images/img2.jpg"))
     app.image_files = [img1, img2]
 

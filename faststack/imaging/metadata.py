@@ -41,21 +41,61 @@ def clean_exif_value(value: Any) -> str:
 
 # Camera-style 1/3-stop shutter speed labels (Nikon/Canon convention)
 _SHUTTER_TABLE = [
-    (30.0, "30s"), (25.0, "25s"), (20.0, "20s"), (15.0, "15s"), (13.0, "13s"),
-    (10.0, "10s"), (8.0, "8s"), (6.0, "6s"), (5.0, "5s"), (4.0, "4s"),
-    (3.2, "3.2s"), (2.5, "2.5s"), (2.0, "2s"), (1.6, "1.6s"), (1.3, "1.3s"),
-    (1.0, "1s"), (0.8, "0.8s"), (0.6, "0.6s"), (0.5, "0.5s"), (0.4, "0.4s"), (0.3, "0.3s"),
-    (1/4, "1/4s"), (1/5, "1/5s"), (1/6, "1/6s"), (1/8, "1/8s"),
-    (1/10, "1/10s"), (1/13, "1/13s"), (1/15, "1/15s"),
-    (1/20, "1/20s"), (1/25, "1/25s"), (1/30, "1/30s"),
-    (1/40, "1/40s"), (1/50, "1/50s"), (1/60, "1/60s"),
-    (1/80, "1/80s"), (1/100, "1/100s"), (1/125, "1/125s"),
-    (1/160, "1/160s"), (1/200, "1/200s"), (1/250, "1/250s"),
-    (1/320, "1/320s"), (1/400, "1/400s"), (1/500, "1/500s"),
-    (1/640, "1/640s"), (1/800, "1/800s"), (1/1000, "1/1000s"),
-    (1/1250, "1/1250s"), (1/1600, "1/1600s"), (1/2000, "1/2000s"),
-    (1/2500, "1/2500s"), (1/3200, "1/3200s"), (1/4000, "1/4000s"),
-    (1/5000, "1/5000s"), (1/6400, "1/6400s"), (1/8000, "1/8000s"),
+    (30.0, "30s"),
+    (25.0, "25s"),
+    (20.0, "20s"),
+    (15.0, "15s"),
+    (13.0, "13s"),
+    (10.0, "10s"),
+    (8.0, "8s"),
+    (6.0, "6s"),
+    (5.0, "5s"),
+    (4.0, "4s"),
+    (3.2, "3.2s"),
+    (2.5, "2.5s"),
+    (2.0, "2s"),
+    (1.6, "1.6s"),
+    (1.3, "1.3s"),
+    (1.0, "1s"),
+    (0.8, "0.8s"),
+    (0.6, "0.6s"),
+    (0.5, "0.5s"),
+    (0.4, "0.4s"),
+    (0.3, "0.3s"),
+    (1 / 4, "1/4s"),
+    (1 / 5, "1/5s"),
+    (1 / 6, "1/6s"),
+    (1 / 8, "1/8s"),
+    (1 / 10, "1/10s"),
+    (1 / 13, "1/13s"),
+    (1 / 15, "1/15s"),
+    (1 / 20, "1/20s"),
+    (1 / 25, "1/25s"),
+    (1 / 30, "1/30s"),
+    (1 / 40, "1/40s"),
+    (1 / 50, "1/50s"),
+    (1 / 60, "1/60s"),
+    (1 / 80, "1/80s"),
+    (1 / 100, "1/100s"),
+    (1 / 125, "1/125s"),
+    (1 / 160, "1/160s"),
+    (1 / 200, "1/200s"),
+    (1 / 250, "1/250s"),
+    (1 / 320, "1/320s"),
+    (1 / 400, "1/400s"),
+    (1 / 500, "1/500s"),
+    (1 / 640, "1/640s"),
+    (1 / 800, "1/800s"),
+    (1 / 1000, "1/1000s"),
+    (1 / 1250, "1/1250s"),
+    (1 / 1600, "1/1600s"),
+    (1 / 2000, "1/2000s"),
+    (1 / 2500, "1/2500s"),
+    (1 / 3200, "1/3200s"),
+    (1 / 4000, "1/4000s"),
+    (1 / 5000, "1/5000s"),
+    (1 / 6400, "1/6400s"),
+    (1 / 8000, "1/8000s"),
 ]
 _SHUTTER_SECONDS = [t for (t, _) in _SHUTTER_TABLE]
 _SHUTTER_LOG_SECONDS = [math.log(t) for t in _SHUTTER_SECONDS]
@@ -132,7 +172,15 @@ def get_exif_brief(path: Union[str, Path]) -> str:
     Supported formats: JPEG, TIFF, HEIF.
     """
     path = Path(path)
-    if path.suffix.lower() not in {".jpg", ".jpeg", ".jpe", ".tif", ".tiff", ".heif", ".heic"}:
+    if path.suffix.lower() not in {
+        ".jpg",
+        ".jpeg",
+        ".jpe",
+        ".tif",
+        ".tiff",
+        ".heif",
+        ".heic",
+    }:
         return ""
     if not path.exists():
         return ""
@@ -142,8 +190,10 @@ def get_exif_brief(path: Union[str, Path]) -> str:
             exif = img.getexif()
             # getexif() nests EXIF sub-IFD tags; merge them for flat access
             # Read them while file is open to avoid "I/O on closed file"
-            exif_ifd = dict(exif.get_ifd(ExifTags.IFD.Exif) if hasattr(ExifTags, "IFD") else {})
-        
+            exif_ifd = dict(
+                exif.get_ifd(ExifTags.IFD.Exif) if hasattr(ExifTags, "IFD") else {}
+            )
+
         if not exif:
             return ""
     except Exception:
@@ -218,9 +268,11 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
             exif_obj = img.getexif()
             if not exif_obj:
                 return {"summary": {}, "full": {}}
-            
+
             # Merge sub-IFD tags (ISO, Lens, etc.)
-            exif_ifd = dict(exif_obj.get_ifd(ExifTags.IFD.Exif) if hasattr(ExifTags, "IFD") else {})
+            exif_ifd = dict(
+                exif_obj.get_ifd(ExifTags.IFD.Exif) if hasattr(ExifTags, "IFD") else {}
+            )
 
             # Fetch GPS sub-IFD while image is still open (Pillow ≥8.2
             # stores GPSInfo as an integer IFD offset, not a dict)
@@ -229,7 +281,7 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
         # Normalize to a dict for consistency
         exif = dict(exif_obj)
         exif.update(exif_ifd)
-        
+
     except Exception as e:
         log.warning(f"Failed to extract EXIF from {path}: {e}")
         return {"summary": {}, "full": {}}

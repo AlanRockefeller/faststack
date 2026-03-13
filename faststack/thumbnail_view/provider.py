@@ -173,12 +173,17 @@ class ThumbnailProvider(QQuickImageProvider):
                 path_hash = parts[1]
                 mtime_ns = int(parts[2])
             return ParsedId(
-                id_clean, parts, thumb_size, path_hash, mtime_ns, reason, is_folder, True
+                id_clean,
+                parts,
+                thumb_size,
+                path_hash,
+                mtime_ns,
+                reason,
+                is_folder,
+                True,
             )
         except (ValueError, IndexError):
-            return ParsedId(
-                id_clean, parts, None, None, None, reason, is_folder, False
-            )
+            return ParsedId(id_clean, parts, None, None, None, reason, is_folder, False)
 
     def requestImage(self, id_str: str, size: QSize, _requestedSize: QSize) -> QImage:
         """Request an image for the given ID.
@@ -214,7 +219,7 @@ class ThumbnailProvider(QQuickImageProvider):
         # Deferred logging setup
         timer = None
         cache_key = parsed.id_clean
-        
+
         # Resolve path - we already have path_hash and mtime_ns
         path = self._path_resolver(parsed.path_hash) if self._path_resolver else None
 

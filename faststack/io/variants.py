@@ -240,5 +240,3 @@ def build_badge_list(group: VariantGroup) -> List[Dict]:
         )
 
     return badges
-
-

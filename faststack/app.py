@@ -14,7 +14,6 @@ import os
 import re
 import shutil
 import uuid
-import bisect
 import functools
 from collections import deque
 
@@ -53,7 +52,7 @@ Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 from faststack.config import config
 from faststack.logging_setup import setup_logging
 from faststack.models import ImageFile, DecodedImage
-from faststack.io.indexer import find_images, find_images_with_variants, image_sort_key
+from faststack.io.indexer import find_images, find_images_with_variants
 from faststack.io.variants import (
     VariantGroup,
     build_badge_list,
@@ -86,7 +85,7 @@ from faststack.thumbnail_view.folder_stats import (
     get_file_counts_by_extension,
 )
 import numpy as np
-from faststack.io.indexer import RAW_EXTENSIONS
+from faststack.io.indexer import RAW_EXTENSIONS, JPG_EXTENSIONS
 from faststack.io.deletion import (
     confirm_permanent_delete,
     confirm_batch_permanent_delete,
@@ -96,9 +95,8 @@ from faststack.deletion_types import (
     DeleteJob,
     DeleteResult,
     DeleteRecord,
-    DeleteWarning,
-    DeleteFailure,
     DeletionErrorCodes,
+    UIStateRestoration,
 )
 
 
@@ -242,6 +240,20 @@ class AppController(QObject):
             ""  # Detail message from last auto_levels() call
         )
 
+        # Deferred-init state: set to safe defaults, populated later by their methods
+        self._save_initiated_path: Optional[str] = None
+        self._batch_indices_cache: set = set()
+        self._batch_indices_cache_key: Optional[tuple] = None
+        self.recycle_bin_dir: Optional[Path] = None
+        self.reporter: Optional[AppController.ProgressReporter] = None
+        self._last_rendered_preview_index: int = -1
+        self._last_rendered_preview_gen: int = -1
+        self._batch_al_indices: list = []
+        self._batch_al_pos: int = 0
+        self._batch_al_processed: int = 0
+        self._batch_al_cancelled: bool = False
+        self._batch_al_t_start: float = 0.0
+
         # Variant state
         self._variant_map: Dict[str, VariantGroup] = {}
         self.view_override_path: Optional[str] = None  # normalized absolute string
@@ -270,7 +282,9 @@ class AppController(QObject):
         # Cache Warning State
         self._last_cache_warning_time = 0
         self._eviction_lock = threading.Lock()
-        self._eviction_timestamps: deque[float] = deque()  # Rolling window for rate detection
+        self._eviction_timestamps: deque[float] = (
+            deque()
+        )  # Rolling window for rate detection
         self.display_ready = False  # Track if display size has been reported
         self.pending_prefetch_index: Optional[int] = None  # Deferred prefetch index
 
@@ -395,7 +409,9 @@ class AppController(QObject):
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
         self._exif_brief_cache: dict = {}  # normalized path key → formatted EXIF string
-        self._exif_pending_path: Optional[str] = None  # path currently awaiting EXIF read
+        self._exif_pending_path: Optional[str] = (
+            None  # path currently awaiting EXIF read
+        )
         with self._last_image_lock:
             self.last_displayed_image = None
         self._logged_empty_metadata = False
@@ -535,8 +551,6 @@ class AppController(QObject):
         # ImageFile.path is the main file. ImageFile.raw_pair is the sidecar RAW.
         # If raw_pair is None but path is a RAW extension, it's RAW-only.
         is_raw_only = False
-        from faststack.io.indexer import RAW_EXTENSIONS
-
         if img.raw_pair is None and img.path.suffix.lower() in RAW_EXTENSIONS:
             is_raw_only = True
 
@@ -657,7 +671,11 @@ class AppController(QObject):
     def on_display_size_changed(self, width: int, height: int):
         """Debounces display size change events to prevent spamming resizes."""
         log.debug(
-            f"on_display_size_changed called with {width}x{height}. Current: {self.display_width}x{self.display_height}"
+            "on_display_size_changed called with %dx%d. Current: %dx%d",
+            width,
+            height,
+            self.display_width,
+            self.display_height,
         )
         if width <= 0 or height <= 0:
             log.debug("Ignoring invalid resize event")
@@ -704,7 +722,7 @@ class AppController(QObject):
             if self.is_zoomed == zoomed:
                 return  # No-op: avoid unnecessary cache invalidation
             if _debug_mode:
-                log.info(f"AppController.set_zoomed: {self.is_zoomed} -> {zoomed}")
+                log.info("AppController.set_zoomed: %s -> %s", self.is_zoomed, zoomed)
             self.is_zoomed = zoomed
             self.display_generation += 1  # Invalidates old entries via cache key
         self.is_zoomed_changed.emit(zoomed)
@@ -921,9 +939,8 @@ class AppController(QObject):
                                 path,
                             )
                         return
-                    else:
-                        # Cleanup expired entry
-                        del self._suppressed_paths[key]
+                    # Cleanup expired entry
+                    del self._suppressed_paths[key]
 
         try:
             QMetaObject.invokeMethod(
@@ -997,15 +1014,15 @@ class AppController(QObject):
             else:
                 # Image gone — clear stale variant override
                 self._clear_variant_override()
-                self.current_index = min(
-                    self.current_index, len(self.image_files) - 1
-                )
+                self.current_index = min(self.current_index, len(self.image_files) - 1)
         else:
             # List empty or no preserved path — clear stale variant override
             self._clear_variant_override()
-            self.current_index = max(0, min(
-                self.current_index, len(self.image_files) - 1
-            )) if self.image_files else 0
+            self.current_index = (
+                max(0, min(self.current_index, len(self.image_files) - 1))
+                if self.image_files
+                else 0
+            )
 
         self._do_prefetch(self.current_index)
         self.sync_ui_state()
@@ -1172,7 +1189,7 @@ class AppController(QObject):
 
         # Log reason for debugging
         if _debug_mode and reason:
-            log.debug(f"Triggering decode: {reason}")
+            log.debug("Triggering decode: %s", reason)
 
         # Trigger prefetch/decode for current index
         self._do_prefetch(self.current_index, override_path=override_path)
@@ -1411,11 +1428,13 @@ class AppController(QObject):
                 try:
                     result = future.result(timeout=5.0)
                 except concurrent.futures.TimeoutError:
-                    log.warning(f"Timeout decoding image at index {index} (background)")
+                    log.warning(
+                        "Timeout decoding image at index %d (background)", index
+                    )
                     return None
                 except concurrent.futures.CancelledError:
                     log.debug(
-                        f"Decode cancelled for image at index {index} (background)"
+                        "Decode cancelled for image at index %d (background)", index
                     )
                     return None
 
@@ -1570,7 +1589,7 @@ class AppController(QObject):
             except RuntimeError as e:
                 return {"success": False, "error": str(e)}
             except Exception as e:
-                log.exception(f"Unexpected error during save: {e}")
+                log.exception("Unexpected error during save: %s", e)
                 return {"success": False, "error": "Failed to save image"}
 
         def on_done(future):
@@ -1687,8 +1706,6 @@ class AppController(QObject):
         # (This implements the "Default state on navigation" requirement)
         img = self.image_files[index]
         is_raw_only = False
-        from faststack.io.indexer import RAW_EXTENSIONS, JPG_EXTENSIONS
-
         # Robust RAW-only check: Main path is RAW and it's not a JPEG
         is_jpeg_main = img.path.suffix.lower() in JPG_EXTENSIONS
         is_raw_main = img.path.suffix.lower() in RAW_EXTENSIONS
@@ -1916,8 +1933,6 @@ class AppController(QObject):
                 grid_index = self._thumbnail_model.find_image_index(current_path)
                 if grid_index >= 0:
                     # Emit after isGridViewActiveChanged so QML has created the view
-                    from PySide6.QtCore import QTimer
-
                     QTimer.singleShot(
                         0, lambda: self.ui_state.gridScrollToIndex.emit(grid_index)
                     )
@@ -2163,9 +2178,8 @@ class AppController(QObject):
 
     def _invalidate_batch_cache(self):
         """Clear the batch indices cache. Call after mutating self.batches."""
-        if hasattr(self, "_batch_indices_cache"):
-            self._batch_indices_cache = set()
-            self._batch_indices_cache_key = None
+        self._batch_indices_cache = set()
+        self._batch_indices_cache_key = None
 
     def _get_batch_indices(self) -> Set[int]:
         """Get set of all indices that are in any batch (for thumbnail model).
@@ -2199,8 +2213,6 @@ class AppController(QObject):
         if not self.image_files or self.current_index >= len(self.image_files):
             return
 
-        from datetime import datetime
-
         today = datetime.now().strftime("%Y-%m-%d")
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem)
@@ -2223,8 +2235,6 @@ class AppController(QObject):
         """Toggle todo flag for current image."""
         if not self.image_files or self.current_index >= len(self.image_files):
             return
-
-        from datetime import datetime
 
         today = datetime.now().strftime("%Y-%m-%d")
         stem = self.image_files[self.current_index].path.stem
@@ -2249,8 +2259,6 @@ class AppController(QObject):
         if not self.image_files or self.current_index >= len(self.image_files):
             return
 
-        from datetime import datetime
-
         today = datetime.now().strftime("%Y-%m-%d")
         stem = self.image_files[self.current_index].path.stem
         meta = self.sidecar.get_metadata(stem)
@@ -2273,8 +2281,6 @@ class AppController(QObject):
         """Toggle restacked flag for current image."""
         if not self.image_files or self.current_index >= len(self.image_files):
             return
-
-        from datetime import datetime
 
         today = datetime.now().strftime("%Y-%m-%d")
         stem = self.image_files[self.current_index].path.stem
@@ -2316,8 +2322,6 @@ class AppController(QObject):
         """Toggle stacked flag for current image."""
         if not self.image_files or self.current_index >= len(self.image_files):
             return
-
-        from datetime import datetime
 
         today = datetime.now().strftime("%Y-%m-%d")
         stem = self.image_files[self.current_index].path.stem
@@ -2454,7 +2458,7 @@ class AppController(QObject):
             try:
                 brief = get_exif_brief(p)
             except Exception as e:
-                log.error(f"Failed to get EXIF brief for {p}: {e}", exc_info=True)
+                log.error("Failed to get EXIF brief for %s: %s", p, e, exc_info=True)
                 brief = ""
             signal.emit(key, brief)
 
@@ -3374,8 +3378,7 @@ class AppController(QObject):
                     if bottom > 1000:
                         top -= bottom - 1000  # shift up
                         bottom = 1000
-                        if top < 0:
-                            top = 0  # double clamp
+                        top = max(0, top)  # double clamp
 
                     # Recenter width (if changed)
                     cx = (left + right) / 2
@@ -3389,13 +3392,12 @@ class AppController(QObject):
                     if right > 1000:
                         left -= right - 1000
                         right = 1000
-                        if left < 0:
-                            left = 0
+                        left = max(0, left)
 
                     self.ui_state.currentCropBox = (left, top, right, bottom)
                     self.image_editor.set_crop_box((left, top, right, bottom))
 
-        log.debug(f"AppController.set_straighten_angle: {angle}")
+        log.debug("AppController.set_straighten_angle: %s", angle)
         # Pass the angle as-is (degrees CW).
         # QML rotation is CW-positive.
         # ImageEditor expects CW-positive and handles the inversion for PIL internally.
@@ -3786,7 +3788,6 @@ class AppController(QObject):
         except OSError as e:
             log.error("Failed to recycle %s: %s", src.name, e)
             return None
-
 
     @staticmethod
     def _perm_delete_worker(
@@ -4315,38 +4316,39 @@ class AppController(QObject):
             self.prefetcher.update_prefetch(self.current_index)
 
         # Restore saved batch state if present
-        if job.saved_batches is not None and items:
+        ui = job.ui_state
+        if ui is not None and ui.saved_batches is not None and items:
             original = {idx for idx, _ in job.removed_items}
             restored = {idx for idx, _ in items}
             if restored == original:
                 # Full rollback: restore pre-delete snapshot directly
-                self.batches = [b[:] for b in job.saved_batches]
-                self.batch_start_index = job.saved_batch_start_index
+                self.batches = [b[:] for b in ui.saved_batches]
+                self.batch_start_index = ui.saved_batch_start_index
             else:
                 # Partial rollback: re-apply the deletions that were not reversed
                 still_deleted = sorted(original - restored)
                 self.batches = self._recompute_batches_after_deletions(
-                    job.saved_batches, still_deleted
+                    ui.saved_batches, still_deleted
                 )
                 self.batch_start_index = self._shift_start_index(
-                    job.saved_batch_start_index, still_deleted
+                    ui.saved_batch_start_index, still_deleted
                 )
             self._invalidate_batch_cache()
 
         # Restore saved stack state if present
-        if job.saved_stacks is not None and items:
+        if ui is not None and ui.saved_stacks is not None and items:
             original = {idx for idx, _ in job.removed_items}
             restored = {idx for idx, _ in items}
             if restored == original:
-                self.stacks = [s[:] for s in job.saved_stacks]
-                self.stack_start_index = job.saved_stack_start_index
+                self.stacks = [s[:] for s in ui.saved_stacks]
+                self.stack_start_index = ui.saved_stack_start_index
             else:
                 still_deleted = sorted(original - restored)
                 self.stacks = self._recompute_batches_after_deletions(
-                    job.saved_stacks, still_deleted
+                    ui.saved_stacks, still_deleted
                 )
                 self.stack_start_index = self._shift_start_index(
-                    job.saved_stack_start_index, still_deleted
+                    ui.saved_stack_start_index, still_deleted
                 )
             self.sidecar.data.stacks = self.stacks
             self._metadata_cache_index = (-1, -1)
@@ -4356,8 +4358,6 @@ class AppController(QObject):
         if self._refresh_scheduled:
             return
         self._refresh_scheduled = True
-        from PySide6.QtCore import QTimer
-
         QTimer.singleShot(200, self._fire_delete_refresh)
 
     def _fire_delete_refresh(self) -> None:
@@ -4459,7 +4459,9 @@ class AppController(QObject):
         else:
             # Current image survived → shift index down for each deletion before it
             shift = sum(1 for d in validated_sorted if d < previous_index)
-            self.current_index = max(0, min(previous_index - shift, len(self.image_files) - 1))
+            self.current_index = max(
+                0, min(previous_index - shift, len(self.image_files) - 1)
+            )
 
         # Save batch/stack state before mutation so rollback can restore it.
         pre_batch_snapshot = [b[:] for b in self.batches]
@@ -4616,10 +4618,12 @@ class AppController(QObject):
             cancel_event=cancel_event,
             previous_index=previous_index,
             images_to_delete=images_to_delete,
-            saved_batches=pre_batch_snapshot,
-            saved_batch_start_index=pre_batch_start_snapshot,
-            saved_stacks=pre_stack_snapshot,
-            saved_stack_start_index=pre_stack_start_snapshot,
+            ui_state=UIStateRestoration(
+                saved_batches=pre_batch_snapshot,
+                saved_batch_start_index=pre_batch_start_snapshot,
+                saved_stacks=pre_stack_snapshot,
+                saved_stack_start_index=pre_stack_start_snapshot,
+            ),
         )
 
         # Add single placeholder undo entry per job
@@ -4721,10 +4725,11 @@ class AppController(QObject):
         # 4. Clear batches optimistically; save state in job for rollback
         job_id = summary["job_id"]
         if job_id in self._pending_delete_jobs:
-            self._pending_delete_jobs[job_id].saved_batches = saved_batches
-            self._pending_delete_jobs[job_id].saved_batch_start_index = (
-                saved_batch_start
-            )
+            job = self._pending_delete_jobs[job_id]
+            if job.ui_state is None:
+                job.ui_state = UIStateRestoration()
+            job.ui_state.saved_batches = saved_batches
+            job.ui_state.saved_batch_start_index = saved_batch_start
 
         self.batches = []
         self.batch_start_index = None
@@ -4776,7 +4781,7 @@ class AppController(QObject):
 
                     if not temp_path.exists():
                         log.error("Temp file %s not found after move!", temp_path)
-                        raise OSError(f"Failed to create temp file {temp_path}")
+                        raise OSError(f"Failed to create temp file {temp_path}") from pe
 
                     # Try to force-move the temp file over the target (replace)
                     try:
@@ -4841,7 +4846,7 @@ class AppController(QObject):
             else:
                 return False, "move_failed"
         except OSError as e:
-            log.error(f"Failed to restore {bin_path.name}: {e}")
+            log.error("Failed to restore %s: %s", bin_path.name, e)
             return False, "move_failed"
 
     def _post_undo_refresh_and_select(
@@ -4916,14 +4921,15 @@ class AppController(QObject):
                     self.prefetcher.update_prefetch(self.current_index)
                 self._rebuild_path_to_index()
                 # Restore batch state that was shifted during _delete_indices
-                if job.saved_batches is not None and removed_items:
-                    self.batches = job.saved_batches
-                    self.batch_start_index = job.saved_batch_start_index
+                ui = job.ui_state
+                if ui is not None and ui.saved_batches is not None and removed_items:
+                    self.batches = ui.saved_batches
+                    self.batch_start_index = ui.saved_batch_start_index
                     self._invalidate_batch_cache()
                 # Restore stack state that was shifted during _delete_indices
-                if job.saved_stacks is not None and removed_items:
-                    self.stacks = job.saved_stacks
-                    self.stack_start_index = job.saved_stack_start_index
+                if ui is not None and ui.saved_stacks is not None and removed_items:
+                    self.stacks = ui.saved_stacks
+                    self.stack_start_index = ui.saved_stack_start_index
                     self.sidecar.data.stacks = self.stacks
                     self._metadata_cache_index = (-1, -1)
                 self.sync_ui_state()
@@ -5144,7 +5150,6 @@ class AppController(QObject):
         self._shutting_down = True  # gate async callbacks during shutdown_nonqt too
         self._exif_pending_path = None  # optional but consistent with shutdown_qt
 
-
         # Clear pending delete jobs and remove associated undo placeholders
         if self._pending_delete_jobs:
             log.info(
@@ -5165,11 +5170,17 @@ class AppController(QObject):
         self._safe_shutdown_executor(self._hist_executor, "histogram", wait=False)
         self._safe_shutdown_executor(self._preview_executor, "preview", wait=False)
         self._safe_shutdown_executor(
-            getattr(self, "_exif_executor", None), "exif", wait=False,
+            getattr(self, "_exif_executor", None),
+            "exif",
+            wait=False,
         )
         # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
-        self._safe_shutdown_executor(self._save_executor, "save", wait=True, cancel_futures=False)
-        self._safe_shutdown_executor(self._delete_executor, "delete", wait=True, cancel_futures=False)
+        self._safe_shutdown_executor(
+            self._save_executor, "save", wait=True, cancel_futures=False
+        )
+        self._safe_shutdown_executor(
+            self._delete_executor, "delete", wait=True, cancel_futures=False
+        )
 
         # Shutdown prefetcher
         try:
@@ -5569,8 +5580,6 @@ class AppController(QObject):
 
         # Mark all dragged files as uploaded if drag was successful
         if result in (Qt.CopyAction, Qt.MoveAction):
-            from datetime import datetime
-
             today = datetime.now().strftime("%Y-%m-%d")
 
             for idx in existing_indices:
@@ -5681,7 +5690,7 @@ class AppController(QObject):
                 run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
             try:
-                result = subprocess.run(cmd, **run_kwargs)
+                result = subprocess.run(cmd, check=False, **run_kwargs)
 
                 if result.returncode == 0:
                     if tif_path.exists() and tif_path.stat().st_size > 0:
@@ -5691,12 +5700,11 @@ class AppController(QObject):
                             0, functools.partial(self._on_develop_finished, True, None)
                         )
                         return  # Success path
-                    else:
-                        msg = f"RawTherapee exited successfully but output file is missing or empty.\nCommand: {cmd_str}"
-                        log.error(msg)
-                        QTimer.singleShot(
-                            0, functools.partial(self._on_develop_finished, False, msg)
-                        )
+                    msg = f"RawTherapee exited successfully but output file is missing or empty.\nCommand: {cmd_str}"
+                    log.error(msg)
+                    QTimer.singleShot(
+                        0, functools.partial(self._on_develop_finished, False, msg)
+                    )
                 else:
                     stderr = result.stderr.strip() if result.stderr else "(no stderr)"
                     stdout = result.stdout.strip() if result.stdout else "(no stdout)"
@@ -5780,7 +5788,7 @@ class AppController(QObject):
                             source_exif = src_im.info.get("exif")
                     except Exception as e:
                         log.warning(
-                            f"Failed to capture source EXIF from {jpeg_path}: {e}"
+                            "Failed to capture source EXIF from %s: %s", jpeg_path, e
                         )
 
             # Load into editor
@@ -5813,9 +5821,6 @@ class AppController(QObject):
 
         # Reset visual components
         if hasattr(self.ui_state, "aspectRatioNames"):
-            # This requires IMPORTs? No, just pass list.
-            from faststack.imaging.editor import ASPECT_RATIOS
-
             self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
             self.ui_state.currentAspectRatioIndex = 0
             self.ui_state.currentCropBox = (0, 0, 1000, 1000)
@@ -5882,8 +5887,6 @@ class AppController(QObject):
     @Slot(int, int, int, int)
     def set_crop_box(self, left: int, top: int, right: int, bottom: int):
         """Sets the normalized crop box (0-1000) in the editor."""
-        from typing import Tuple
-
         crop_box: Tuple[int, int, int, int] = (left, top, right, bottom)
         self.image_editor.set_crop_box(crop_box)
         self.ui_state.currentCropBox = crop_box  # Update QML visual (if implemented)
@@ -6025,7 +6028,7 @@ class AppController(QObject):
             )
             fut.add_done_callback(self._on_histogram_done)
         except Exception as e:
-            log.error(f"Histogram executor failed to submit task: {e}")
+            log.error("Histogram executor failed to submit task: %s", e)
             with self._hist_lock:
                 self._hist_inflight = False
 
@@ -6284,7 +6287,7 @@ class AppController(QObject):
                         match = str(editor_path) == str(filepath)
 
                 if not match:
-                    log.debug(f"toggle_crop_mode: Loading {filepath} into editor")
+                    log.debug("toggle_crop_mode: Loading %s into editor", filepath)
                     # Use cached preview if available to speed up using get_decoded_image(self.current_index)
                     # note: get_decoded_image verifies index bounds
                     cached_preview = self.get_decoded_image(self.current_index)
@@ -6452,8 +6455,6 @@ class AppController(QObject):
 
         if success:
             # Mark as restacked on success
-            from datetime import datetime
-
             today = datetime.now().strftime("%Y-%m-%d")
             stem = self.image_files[self.current_index].path.stem
             meta = self.sidecar.get_metadata(stem)
@@ -6550,11 +6551,11 @@ class AppController(QObject):
         try:
             save_result = self.image_editor.save_image()
         except RuntimeError as e:
-            log.warning(f"execute_crop: Save failed: {e}")
+            log.warning("execute_crop: Save failed: %s", e)
             self.update_status_message(f"Failed to save cropped image: {e}")
             return
         except Exception as e:
-            log.exception(f"execute_crop: Unexpected error during save: {e}")
+            log.exception("execute_crop: Unexpected error during save: %s", e)
             self.update_status_message("Failed to save cropped image")
             return
 
@@ -6792,11 +6793,11 @@ class AppController(QObject):
                     save_target_path=save_target_path
                 )
         except RuntimeError as e:
-            log.warning(f"quick_auto_levels: Save failed: {e}")
+            log.warning("quick_auto_levels: Save failed: %s", e)
             self.update_status_message(f"Failed to save image: {e}")
             return
         except Exception as e:
-            log.exception(f"quick_auto_levels: Unexpected error during save: {e}")
+            log.exception("quick_auto_levels: Unexpected error during save: %s", e)
             self.update_status_message("Failed to save image")
             return
         t_save = time.perf_counter()
@@ -7029,12 +7030,12 @@ class AppController(QObject):
         try:
             save_result = self.image_editor.save_image()
         except RuntimeError as e:
-            log.warning(f"quick_auto_white_balance: Save failed: {e}")
+            log.warning("quick_auto_white_balance: Save failed: %s", e)
             self.update_status_message(f"Failed to save image: {e}")
             return
         except Exception as e:
             log.exception(
-                f"quick_auto_white_balance: Unexpected error during save: {e}"
+                "quick_auto_white_balance: Unexpected error during save: %s", e
             )
             self.update_status_message("Failed to save image")
             return
@@ -7096,7 +7097,7 @@ class AppController(QObject):
         elif mode == "rgb":
             return self.auto_white_balance_legacy()
         else:
-            log.error(f"Unknown AWB mode: {mode}")
+            log.error("Unknown AWB mode: %s", mode)
             self.update_status_message(f"Error: Unknown AWB mode '{mode}'")
             return None
 
@@ -7109,13 +7110,6 @@ class AppController(QObject):
         """
         if not self.image_editor.original_image:
             log.warning("No image loaded in editor for auto white balance")
-            return None
-
-        try:
-            import numpy as np
-        except ImportError:
-            log.error("NumPy not found. Please install with: pip install numpy")
-            self.update_status_message("Error: NumPy not installed")
             return None
 
         log.info("Applying legacy (RGB Grey World) Auto White Balance")
@@ -7285,7 +7279,7 @@ class AppController(QObject):
         by_value = float(np.clip(by_value, -1.0, 1.0))
         mg_value = float(np.clip(mg_value, -1.0, 1.0))
 
-        log.info(f"Auto white balance values: B/Y={by_value:.3f}, M/G={mg_value:.3f}")
+        log.info("Auto white balance values: B/Y=%.3f, M/G=%.3f", by_value, mg_value)
 
         # No-change detection — see _AWB_NOOP_EPS definition for rationale
         if abs(by_value) < _AWB_NOOP_EPS and abs(mg_value) < _AWB_NOOP_EPS:

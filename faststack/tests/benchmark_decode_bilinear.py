@@ -6,7 +6,7 @@ from faststack.imaging.jpeg import (
     decode_jpeg_rgb,
     _get_turbojpeg_scaling_factor,
     TURBO_AVAILABLE,
-    jpeg_decoder,
+    JPEG_DECODER,
     TJPF_RGB,
 )
 
@@ -16,10 +16,10 @@ def decode_jpeg_resized_bilinear(jpeg_bytes: bytes, width: int, height: int):
     if width == 0 or height == 0:
         return decode_jpeg_rgb(jpeg_bytes)
 
-    if TURBO_AVAILABLE and jpeg_decoder:
+    if TURBO_AVAILABLE and JPEG_DECODER:
         try:
             # Get image header to determine dimensions
-            img_width, img_height, _, _ = jpeg_decoder.decode_header(jpeg_bytes)
+            img_width, img_height, _, _ = JPEG_DECODER.decode_header(jpeg_bytes)
 
             # Determine which dimension is the limiting factor
             if img_width * height > img_height * width:
@@ -30,7 +30,7 @@ def decode_jpeg_resized_bilinear(jpeg_bytes: bytes, width: int, height: int):
             scale_factor = _get_turbojpeg_scaling_factor(img_width, img_height, max_dim)
 
             if scale_factor:
-                decoded = jpeg_decoder.decode(
+                decoded = JPEG_DECODER.decode(
                     jpeg_bytes,
                     scaling_factor=scale_factor,
                     pixel_format=TJPF_RGB,

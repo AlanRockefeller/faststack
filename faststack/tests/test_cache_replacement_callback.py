@@ -36,6 +36,7 @@ def test_replacement_plus_lru_eviction():
     cache["a"] = 70
 
     from collections import defaultdict
+
     evicted_map = defaultdict(list)
     for k, v in evicted:
         evicted_map[k].append(v)

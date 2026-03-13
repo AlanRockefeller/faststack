@@ -118,20 +118,24 @@ class TestMetadata(unittest.TestCase):
     def test_get_exif_brief_failure(self, mock_open, mock_log, mock_exists):
         # Setup mock image
         mock_img = MagicMock()
-        
+
         # Use MockExif similar to other tests
         class MockExif(dict):
-            def get_ifd(self, tag): return {}
-            
+            def get_ifd(self, tag):
+                return {}
+
         # 36867 is DateTimeOriginal (0x9003)
         mock_img.getexif.return_value = MockExif({36867: "2023:01:01 12:00:00"})
-        
+
         mock_open.return_value.__enter__.return_value = mock_img
-        
+
         # Patch clean_exif_value to raise Exception
-        with patch("faststack.imaging.metadata.clean_exif_value", side_effect=ValueError("Forced Error")):
+        with patch(
+            "faststack.imaging.metadata.clean_exif_value",
+            side_effect=ValueError("Forced Error"),
+        ):
             get_exif_brief(Path("dummy.jpg"))
-            
+
         # Verify log.error was called
         mock_log.error.assert_called()
         call_args = mock_log.error.call_args[0]

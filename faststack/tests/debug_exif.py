@@ -31,7 +31,7 @@ class TestDebugExif(unittest.TestCase):
         try:
             tmp_path = Path(tmp_dir)
             img_path = tmp_path / "test_exif_workflow.jpg"
-            
+
             # 1. Create source file with EXIF Orientation 6
             img = Image.new("RGB", (100, 50), color="blue")
             exif = img.getexif()
@@ -41,21 +41,21 @@ class TestDebugExif(unittest.TestCase):
             # 2. Load into editor
             editor = ImageEditor()
             self.assertTrue(editor.load_image(str(img_path)))
-            
+
             # 3. Verify editor state
             self.assertIsNotNone(editor.float_image)
-            # ImageEditor.load_image bakes orientation, so original (100x50) [WxH] orient 6 [90 CW] 
+            # ImageEditor.load_image bakes orientation, so original (100x50) [WxH] orient 6 [90 CW]
             # becomes (50x100) [WxH]. In NumPy (H, W, C), this is (100, 50, 3).
-            self.assertEqual(editor.float_image.shape[0], 100) # Height
+            self.assertEqual(editor.float_image.shape[0], 100)  # Height
             self.assertEqual(editor.float_image.shape[1], 50)  # Width
-            
+
             # 4. Apply edit and save
             editor.set_edit_param("brightness", 0.5)
             # This triggers backup and save
             saved = editor.save_image()
             self.assertIsNotNone(saved)
             saved_path, _ = saved
-            
+
             # 5. Verify saved file has sterilized orientation
             with Image.open(saved_path) as out_img:
                 out_exif = out_img.getexif()

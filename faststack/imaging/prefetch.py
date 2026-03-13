@@ -368,7 +368,9 @@ class Prefetcher:
                 return None
 
             requested_path = (
-                override_path if override_path is not None else self.image_files[index].path
+                override_path
+                if override_path is not None
+                else self.image_files[index].path
             )
 
             # We track by index. If we already have a job for this index,
@@ -497,7 +499,11 @@ class Prefetcher:
                                                     274, 1
                                                 )
                                         except Exception:
-                                            log.debug("Failed to read EXIF from mmap for %s", target_path, exc_info=True)
+                                            log.debug(
+                                                "Failed to read EXIF from mmap for %s",
+                                                target_path,
+                                                exc_info=True,
+                                            )
                         except Exception as e:
                             log.warning(
                                 "Decode failed (ICC path) index=%d path=%s: %s",
@@ -599,7 +605,11 @@ class Prefetcher:
                                         with PILImage.open(mmapped) as pil_img:
                                             orientation = pil_img.getexif().get(274, 1)
                                     except Exception:
-                                        log.debug("Failed to read EXIF from mmap for %s", target_path, exc_info=True)
+                                        log.debug(
+                                            "Failed to read EXIF from mmap for %s",
+                                            target_path,
+                                            exc_info=True,
+                                        )
                     except Exception:
                         buffer = None
 

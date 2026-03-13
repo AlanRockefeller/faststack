@@ -4,7 +4,11 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from faststack.thumbnail_view.provider import ThumbnailProvider, PLACEHOLDER_COLOR, ERROR_COLOR
+from faststack.thumbnail_view.provider import (
+    ThumbnailProvider,
+    PLACEHOLDER_COLOR,
+    ERROR_COLOR,
+)
 from faststack.thumbnail_view.prefetcher import ThumbnailCache
 from PySide6.QtCore import QSize
 
