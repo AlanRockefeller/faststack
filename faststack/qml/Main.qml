@@ -13,7 +13,8 @@ ApplicationWindow {
     height: 800
     minimumWidth: 800
     minimumHeight: 500
-    title: "FastStack - " + (uiState ? uiState.currentDirectory : "Loading...")
+    flags: Qt.FramelessWindowHint | Qt.Window | Qt.WindowMinMaxButtonsHint
+    title: "FastStack"
 
     property bool allowCloseWithRecycleBins: false
     property bool fullScreenLoupe: false
@@ -82,6 +83,12 @@ ApplicationWindow {
     Material.theme: (uiState && uiState.theme === 0) ? Material.Dark : Material.Light
     Material.accent: "#4fb360"
 
+    // Frameless windows on Windows report FullScreen instead of Maximized
+    // after showMaximized(). Treat both as "maximized" unless we are in the
+    // app's own fullscreen loupe mode (which is the real FullScreen).
+    property bool isMaximized: root.visibility === Window.Maximized
+                               || (root.visibility === Window.FullScreen
+                                   && !root.fullScreenLoupe)
     property bool isDarkTheme: uiState ? uiState.theme === 0 : true
     property color currentBackgroundColor: isDarkTheme ? "#000000" : "#ffffff"
     property color currentTextColor: isDarkTheme ? "white" : "black"
@@ -103,67 +110,80 @@ ApplicationWindow {
     }
 
 
-    // -------- FLOATING MENU BAR (overlays content) --------
+    // -------- CUSTOM TITLE BAR --------
+    property int titleBarHeight: 36
+
     Rectangle {
-        id: floatingMenuBar
+        id: customTitleBar
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
-        height: 40
-        color: "transparent"
-        z: 100  // Ensure it's above the content
+        height: root.titleBarHeight
+        color: root.isDarkTheme ? "#1a1a1a" : "#f5f5f5"
+        z: 200
         visible: !root.fullScreenLoupe
 
-        // Unified "menu active" flag to avoid flashing
-        property bool menuActive: menuBarMouseArea.containsMouse
+        // Subtle bottom separator
+        Rectangle {
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: 1
+            color: root.isDarkTheme ? "#333333" : "#dddddd"
+        }
+
+        // Menu-active flag: hovered over title bar or any menu is open
+        property bool titleBarHovered: titleBarHoverArea.containsMouse
+        property bool anyMenuOpen: fileMenu.visible || viewMenu.visible
+                                   || actionsMenu.visible || helpMenu.visible
+        property bool menuActive: titleBarHovered
                                   || fileMouseArea.containsMouse
                                   || viewMouseArea.containsMouse
                                   || actionsMouseArea.containsMouse
                                   || helpMouseArea.containsMouse
-                                  || fileMenu.visible
-                                  || viewMenu.visible
-                                  || actionsMenu.visible
-                                  || helpMenu.visible
+                                  || anyMenuOpen
 
-        // Semi-transparent background that appears on hover
-        Rectangle {
+        // Hover detection for the entire title bar
+        MouseArea {
+            id: titleBarHoverArea
             anchors.fill: parent
-            color: root.isDarkTheme ? "#333333" : "#f0f0f0"
-            opacity: floatingMenuBar.menuActive ? 0.9 : 0.0
+            hoverEnabled: true
+            acceptedButtons: Qt.NoButton
+        }
+
+        // -- Left: App title --
+        Text {
+            id: appTitleLabel
+            anchors.left: parent.left
+            anchors.leftMargin: 12
+            anchors.verticalCenter: parent.verticalCenter
+            text: "FastStack"
+            color: root.currentTextColor
+            font.pixelSize: 13
+            font.weight: Font.DemiBold
+            font.family: "Segoe UI Variable"
+        }
+
+        // -- Left-center: hover-revealed menu buttons --
+        Row {
+            id: menuButtonRow
+            anchors.left: appTitleLabel.right
+            anchors.leftMargin: 16
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 2
+            opacity: customTitleBar.menuActive ? 1.0 : 0.0
+            visible: opacity > 0
 
             Behavior on opacity {
                 NumberAnimation { duration: 150 }
             }
-        }
-
-        MouseArea {
-            id: menuBarMouseArea
-            anchors.fill: parent
-            hoverEnabled: true
-            propagateComposedEvents: true
-
-            // Don't block clicks - let them pass through to children
-            onClicked: function(mouse) { mouse.accepted = false }
-            onPressed: function(mouse) { mouse.accepted = false }
-            onReleased: function(mouse) { mouse.accepted = false }
-        }
-
-        Row {
-            id: menuButtonRow
-            anchors.left: parent.left
-            anchors.leftMargin: 8
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: 4
-
-            // Show whenever any menu is hovered or open
-            visible: floatingMenuBar.menuActive
 
             // FILE MENU BUTTON
             Rectangle {
                 id: fileBtn
-                width: fileLabel.width + 20
-                height: 30
-                color: fileMouseArea.containsMouse ? hoverColor : "transparent"
+                width: fileLabel.width + 16
+                height: 26
+                color: fileMouseArea.containsMouse ? root.hoverColor : "transparent"
                 radius: 4
 
                 Text {
@@ -171,7 +191,8 @@ ApplicationWindow {
                     anchors.centerIn: parent
                     text: "File"
                     color: root.currentTextColor
-                    font.pixelSize: 14
+                    font.pixelSize: 12
+                    font.family: "Segoe UI Variable"
                 }
 
                 MouseArea {
@@ -188,9 +209,9 @@ ApplicationWindow {
             // VIEW MENU BUTTON
             Rectangle {
                 id: viewBtn
-                width: viewLabel.width + 20
-                height: 30
-                color: viewMouseArea.containsMouse ? hoverColor : "transparent"
+                width: viewLabel.width + 16
+                height: 26
+                color: viewMouseArea.containsMouse ? root.hoverColor : "transparent"
                 radius: 4
 
                 Text {
@@ -198,7 +219,8 @@ ApplicationWindow {
                     anchors.centerIn: parent
                     text: "View"
                     color: root.currentTextColor
-                    font.pixelSize: 14
+                    font.pixelSize: 12
+                    font.family: "Segoe UI Variable"
                 }
 
                 MouseArea {
@@ -215,9 +237,9 @@ ApplicationWindow {
             // ACTIONS MENU BUTTON
             Rectangle {
                 id: actionsBtn
-                width: actionsLabel.width + 20
-                height: 30
-                color: actionsMouseArea.containsMouse ? hoverColor : "transparent"
+                width: actionsLabel.width + 16
+                height: 26
+                color: actionsMouseArea.containsMouse ? root.hoverColor : "transparent"
                 radius: 4
 
                 Text {
@@ -225,7 +247,8 @@ ApplicationWindow {
                     anchors.centerIn: parent
                     text: "Actions"
                     color: root.currentTextColor
-                    font.pixelSize: 14
+                    font.pixelSize: 12
+                    font.family: "Segoe UI Variable"
                 }
 
                 MouseArea {
@@ -242,9 +265,9 @@ ApplicationWindow {
             // HELP MENU BUTTON
             Rectangle {
                 id: helpBtn
-                width: helpLabel.width + 20
-                height: 30
-                color: helpMouseArea.containsMouse ? hoverColor : "transparent"
+                width: helpLabel.width + 16
+                height: 26
+                color: helpMouseArea.containsMouse ? root.hoverColor : "transparent"
                 radius: 4
 
                 Text {
@@ -252,7 +275,8 @@ ApplicationWindow {
                     anchors.centerIn: parent
                     text: "Help"
                     color: root.currentTextColor
-                    font.pixelSize: 14
+                    font.pixelSize: 12
+                    font.family: "Segoe UI Variable"
                 }
 
                 MouseArea {
@@ -266,6 +290,247 @@ ApplicationWindow {
                 }
             }
         }
+
+        // -- Center: draggable space --
+        // Uses separate TapHandler (double-click) and DragHandler (window move)
+        // so that startSystemMove() never interferes with double-click recognition.
+        Item {
+            id: titleBarDragArea
+            anchors.left: menuButtonRow.right
+            anchors.leftMargin: 8
+            anchors.right: zoomLabel.left
+            anchors.rightMargin: 8
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+
+            TapHandler {
+                onDoubleTapped: {
+                    if (uiState && uiState.debugMode)
+                        console.log("[TitleBar] double-tap: visibility =", root.visibility,
+                                    "isMaximized =", root.isMaximized,
+                                    "fullScreenLoupe =", root.fullScreenLoupe)
+                    if (root.isMaximized) {
+                        root.showNormal()
+                    } else {
+                        root.showMaximized()
+                    }
+                    if (uiState && uiState.debugMode)
+                        console.log("[TitleBar] double-tap: after visibility =", root.visibility,
+                                    "isMaximized =", root.isMaximized)
+                }
+            }
+
+            DragHandler {
+                id: titleBarDragHandler
+                target: null  // we move the window, not this item
+                onActiveChanged: {
+                    if (active) {
+                        if (uiState && uiState.debugMode)
+                            console.log("[TitleBar] drag-start: starting system move")
+                        root.startSystemMove()
+                    }
+                }
+            }
+        }
+
+        // -- Right-center: subtle zoom label --
+        Text {
+            id: zoomLabel
+            anchors.right: windowControls.left
+            anchors.rightMargin: 16
+            anchors.verticalCenter: parent.verticalCenter
+            color: root.isDarkTheme ? "#777777" : "#999999"
+            font.pixelSize: 11
+            font.family: "Segoe UI Variable"
+            visible: text !== ""
+
+            property var loupe: mainViewLoader.item
+            property real zs: loupe ? loupe.currentZoomScale : 0
+            property real fs: loupe ? loupe.currentFitScale : 0
+
+            text: {
+                if (!loupe || fs <= 0 || zs <= 0) return ""
+                if (uiState && uiState.isGridViewActive) return ""
+                var ratio = zs / fs
+                if (Math.abs(ratio - 1.0) < 0.03) return "Fit to window"
+                return Math.round(ratio * 100) + "%"
+            }
+        }
+
+        // -- Far right: window controls --
+        Row {
+            id: windowControls
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+
+            // Minimize
+            Rectangle {
+                width: 46
+                height: parent.height
+                color: minimizeArea.containsMouse
+                       ? (root.isDarkTheme ? "#333333" : "#e0e0e0") : "transparent"
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "\u2013"  // en-dash as minimize icon
+                    color: root.currentTextColor
+                    font.pixelSize: 14
+                    font.family: "Segoe UI Variable"
+                }
+
+                MouseArea {
+                    id: minimizeArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    onClicked: root.showMinimized()
+                }
+            }
+
+            // Maximize / Restore
+            Rectangle {
+                width: 46
+                height: parent.height
+                color: maximizeArea.containsMouse
+                       ? (root.isDarkTheme ? "#333333" : "#e0e0e0") : "transparent"
+
+                Text {
+                    anchors.centerIn: parent
+                    text: root.isMaximized ? "\u2752" : "\u25A1"
+                    color: root.currentTextColor
+                    font.pixelSize: root.isMaximized ? 12 : 14
+                    font.family: "Segoe UI Variable"
+                }
+
+                MouseArea {
+                    id: maximizeArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    onClicked: {
+                        if (root.isMaximized)
+                            root.showNormal()
+                        else
+                            root.showMaximized()
+                    }
+                }
+            }
+
+            // Close
+            Rectangle {
+                width: 46
+                height: parent.height
+                color: closeArea.containsMouse ? "#c42b1c" : "transparent"
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "\u2715"
+                    color: closeArea.containsMouse ? "white" : root.currentTextColor
+                    font.pixelSize: 13
+                    font.family: "Segoe UI Variable"
+                }
+
+                MouseArea {
+                    id: closeArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    onClicked: root.close()
+                }
+            }
+        }
+    }
+
+    // -------- RESIZE HANDLES (frameless window) --------
+    // Only active when not maximized/fullscreen
+    property int resizeMargin: 5
+    property bool resizeHandlesEnabled: root.visibility === Window.Windowed
+
+    // Top edge
+    MouseArea {
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: root.resizeMargin
+        cursorShape: Qt.SizeVerCursor
+        visible: root.resizeHandlesEnabled
+        z: 300
+        onPressed: root.startSystemResize(Qt.TopEdge)
+    }
+    // Bottom edge
+    MouseArea {
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: root.resizeMargin
+        cursorShape: Qt.SizeVerCursor
+        visible: root.resizeHandlesEnabled
+        z: 300
+        onPressed: root.startSystemResize(Qt.BottomEdge)
+    }
+    // Left edge
+    MouseArea {
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        width: root.resizeMargin
+        cursorShape: Qt.SizeHorCursor
+        visible: root.resizeHandlesEnabled
+        z: 300
+        onPressed: root.startSystemResize(Qt.LeftEdge)
+    }
+    // Right edge
+    MouseArea {
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        width: root.resizeMargin
+        cursorShape: Qt.SizeHorCursor
+        visible: root.resizeHandlesEnabled
+        z: 300
+        onPressed: root.startSystemResize(Qt.RightEdge)
+    }
+    // Top-left corner
+    MouseArea {
+        anchors.top: parent.top
+        anchors.left: parent.left
+        width: root.resizeMargin * 2
+        height: root.resizeMargin * 2
+        cursorShape: Qt.SizeFDiagCursor
+        visible: root.resizeHandlesEnabled
+        z: 301
+        onPressed: root.startSystemResize(Qt.TopEdge | Qt.LeftEdge)
+    }
+    // Top-right corner
+    MouseArea {
+        anchors.top: parent.top
+        anchors.right: parent.right
+        width: root.resizeMargin * 2
+        height: root.resizeMargin * 2
+        cursorShape: Qt.SizeBDiagCursor
+        visible: root.resizeHandlesEnabled
+        z: 301
+        onPressed: root.startSystemResize(Qt.TopEdge | Qt.RightEdge)
+    }
+    // Bottom-left corner
+    MouseArea {
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        width: root.resizeMargin * 2
+        height: root.resizeMargin * 2
+        cursorShape: Qt.SizeBDiagCursor
+        visible: root.resizeHandlesEnabled
+        z: 301
+        onPressed: root.startSystemResize(Qt.BottomEdge | Qt.LeftEdge)
+    }
+    // Bottom-right corner
+    MouseArea {
+        anchors.bottom: parent.bottom
+        anchors.right: parent.right
+        width: root.resizeMargin * 2
+        height: root.resizeMargin * 2
+        cursorShape: Qt.SizeFDiagCursor
+        visible: root.resizeHandlesEnabled
+        z: 301
+        onPressed: root.startSystemResize(Qt.BottomEdge | Qt.RightEdge)
     }
 
     // -------- MENU POPUPS --------
@@ -896,7 +1161,10 @@ ApplicationWindow {
     // StackLayout to switch between loupe and grid view
     StackLayout {
         id: contentArea
-        anchors.fill: parent
+        anchors.top: customTitleBar.visible ? customTitleBar.bottom : parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
         currentIndex: uiState && uiState.isGridViewActive ? 1 : 0
 
         // Index 0: Loupe View (single image)
@@ -1004,6 +1272,26 @@ ApplicationWindow {
                 visible: (uiState && uiState.imageCount > 0 && uiState.exifBrief && uiState.exifBrief.length > 0)
                 text: uiState ? (uiState.exifBrief || "") : ""
                 color: root.currentTextColor
+            }
+            Label {
+                id: directoryPathLabel
+                visible: uiState && uiState.currentDirectory !== ""
+                text: uiState ? uiState.currentDirectory : ""
+                color: root.isDarkTheme ? "#888888" : "#777777"
+                font.pixelSize: 11
+                elide: Text.ElideMiddle
+                Layout.maximumWidth: 300
+
+                ToolTip.visible: directoryPathMouse.containsMouse && text !== ""
+                ToolTip.text: uiState ? uiState.currentDirectory : ""
+                ToolTip.delay: 500
+
+                MouseArea {
+                    id: directoryPathMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.NoButton
+                }
             }
             Item { Layout.fillWidth: true }
             Label {

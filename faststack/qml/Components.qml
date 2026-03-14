@@ -11,6 +11,10 @@ Item {
     
     // Height of the status bar footer in Main.qml
     property int footerHeight: 60
+
+    // Expose zoom state to parent (Main.qml title bar)
+    readonly property real currentZoomScale: imageRotator.zoomScale
+    readonly property real currentFitScale: imageRotator.fitScale
     
     Connections {
         target: uiState

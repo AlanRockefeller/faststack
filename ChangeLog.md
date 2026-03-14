@@ -2,6 +2,15 @@
 
 Todo:   More testing Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   Fix raw image support.
 
+## 1.6.1 (2026-03-13)
+
+- Added a slim custom title bar with hover-revealed menus.
+- Added custom minimize, maximize, and close buttons for the frameless window.
+- Added a zoom indicator in the title bar and the current directory path in the status bar.
+- Moved menu activation from hovering over the image to hovering over the title bar.
+- Expand the default prefetch window from a radius of 4 to 12 images.
+- Introduce directional awareness to task cancellation logic, making the prefetcher a lot faster.
+
 ## 1.6.0 (2026-03-06) 
 
 - Added a "Todo" flag: toggle with D, filterable in Filter dialog, shown on thumbnails (badge, tile visuals, red on sparkline), and displayed as "Todo since {date}" in the UI.
