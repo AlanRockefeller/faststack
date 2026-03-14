@@ -389,14 +389,22 @@ class Prefetcher:
             if priority:
                 cancelled_count = 0
                 safe_radius = 2
+                direction = self._last_navigation_direction
 
                 for task_index, future in list(self.futures.items()):
                     if task_index == index or abs(task_index - index) <= safe_radius:
                         continue
 
+                    # Don't cancel tasks ahead of travel direction — we'll need them
+                    if direction > 0 and task_index > index:
+                        continue
+                    if direction < 0 and task_index < index:
+                        continue
+
                     if not future.done() and future.cancel():
                         cancelled_count += 1
                         self.futures.pop(task_index, None)
+                        self.future_paths.pop(task_index, None)
                 if cancelled_count > 0:
                     log.debug(
                         "Cancelled %d pending prefetch tasks to prioritize index %d",

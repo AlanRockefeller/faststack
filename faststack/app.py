@@ -317,7 +317,7 @@ class AppController(QObject):
         self.prefetcher = Prefetcher(
             image_files=self.image_files,
             cache_put=self.image_cache.__setitem__,
-            prefetch_radius=config.getint("core", "prefetch_radius", 4),
+            prefetch_radius=config.getint("core", "prefetch_radius", 12),
             get_display_info=self.get_display_info,
             debug=_debug_mode,
         )
