@@ -18,6 +18,7 @@ import io
 from PIL import Image
 from contextlib import nullcontext
 
+from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
 from faststack.util.executors import create_priority_executor
 from faststack.imaging.orientation import get_exif_orientation, apply_orientation_to_np
 from faststack.io.utils import compute_path_hash
@@ -38,16 +39,10 @@ except Exception:
     _HAS_QT = False
     QCoreApplication = None
 
-# Try to import turbojpeg for faster JPEG decoding
-try:
-    from turbojpeg import TurboJPEG, TJPF_RGB
-
-    _tj = TurboJPEG()
-    HAS_TURBOJPEG = True
-except ImportError:
-    _tj = None
-    HAS_TURBOJPEG = False
-    log.debug("TurboJPEG not available, using PIL for thumbnail decoding")
+# Try to initialize turbojpeg with shared discovery logic.
+_tj, HAS_TURBOJPEG = create_turbojpeg()
+if not HAS_TURBOJPEG:
+    log.debug("TurboJPEG unavailable, using PIL for thumbnail decoding")
 
 
 class ThumbnailPrefetcher:

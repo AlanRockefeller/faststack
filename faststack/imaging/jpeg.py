@@ -5,27 +5,16 @@ from typing import Optional, Tuple
 
 import numpy as np
 from PIL import Image
+from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
 
 log = logging.getLogger(__name__)
 
-# Attempt to import PyTurboJPEG
-
-try:
-    from turbojpeg import TurboJPEG, TJPF_RGB
-except ImportError:
-    jpeg_decoder = None
-    TURBO_AVAILABLE = False
-    log.warning("PyTurboJPEG not found. Falling back to Pillow for JPEG decoding.")
+# Attempt to initialize PyTurboJPEG with explicit native library discovery.
+jpeg_decoder, TURBO_AVAILABLE = create_turbojpeg()
+if TURBO_AVAILABLE:
+    log.info("PyTurboJPEG is available. Using it for JPEG decoding.")
 else:
-    try:
-        jpeg_decoder = TurboJPEG()
-    except Exception:
-        jpeg_decoder = None
-        TURBO_AVAILABLE = False
-        log.exception("PyTurboJPEG initialization failed. Falling back to Pillow.")
-    else:
-        TURBO_AVAILABLE = True
-        log.info("PyTurboJPEG is available. Using it for JPEG decoding.")
+    log.warning("PyTurboJPEG unavailable. Falling back to Pillow for JPEG decoding.")
 
 
 def decode_jpeg_rgb(jpeg_bytes: bytes, fast_dct: bool = False) -> Optional[np.ndarray]:
