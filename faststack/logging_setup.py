@@ -68,21 +68,22 @@ def setup_logging(debug: bool = False):
         debug: If True, sets log level to DEBUG. Otherwise, sets to WARNING to reduce noise.
     """
     log_dir = get_app_data_dir() / "logs"
+    log_file = None
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         log_dir = Path(tempfile.gettempdir()) / "faststack" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "app.log"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log_dir = None
 
-    # File handler
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file, maxBytes=10 * 1024 * 1024, backupCount=5
-    )
+    if log_dir is not None:
+        log_file = log_dir / "app.log"
+
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    file_handler.setFormatter(formatter)
 
     # Console handler (for seeing logs in terminal)
     console_handler = logging.StreamHandler()
@@ -92,8 +93,14 @@ def setup_logging(debug: bool = False):
     # Set log level based on debug flag
     root_logger.setLevel(logging.DEBUG if debug else logging.WARNING)
     root_logger.handlers.clear()
-    root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
+
+    if log_file is not None:
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=10 * 1024 * 1024, backupCount=5
+        )
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
 
     # Configure logging for key modules
     if debug:
