@@ -268,6 +268,26 @@ def test_empty_string_create_true_raises(mock_sidecar_dir):
     assert "" not in sm.data.entries
 
 
+def test_empty_path_create_false_returns_none(mock_sidecar_dir):
+    """Path('') should be treated the same as an empty string."""
+    d = mock_sidecar_dir()
+    sm = SidecarManager(d, None)
+
+    assert sm.get_metadata(Path(""), create=False) is None
+    assert "" not in sm.data.entries
+
+
+def test_empty_path_create_true_raises(mock_sidecar_dir):
+    """Path('') should fail fast when asked to create metadata."""
+    d = mock_sidecar_dir()
+    sm = SidecarManager(d, None)
+
+    with pytest.raises(ValueError, match="image_ref must not be empty"):
+        sm.get_metadata(Path(""), create=True)
+
+    assert "" not in sm.data.entries
+
+
 def test_metadata_key_for_path_normalizes_case_on_windows(mock_sidecar_dir):
     """Windows path casing should not create duplicate stable keys."""
     d = mock_sidecar_dir()

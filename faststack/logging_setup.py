@@ -6,6 +6,8 @@ import os
 import tempfile
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 
 def _is_writable_dir(path: Path) -> bool:
     """Return True when an existing directory accepts file writes."""
@@ -58,7 +60,13 @@ def get_app_data_dir() -> Path:
             return candidate
 
     # Final fallback: system temp is the most reliable writable location.
-    return Path(tempfile.gettempdir()) / "faststack"
+    fallback = Path(tempfile.gettempdir()) / "faststack"
+    log.warning(
+        "No writable app-data directory found; falling back to temp directory %s. "
+        "Configuration and logs may not persist across restarts.",
+        fallback,
+    )
+    return fallback
 
 
 def setup_logging(debug: bool = False):
