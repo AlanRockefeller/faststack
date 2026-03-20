@@ -23,8 +23,7 @@ def _candidate_library_paths() -> list[Optional[str]]:
     explicit = os.getenv("FASTSTACK_TURBOJPEG_LIB") or os.getenv("TURBOJPEG_LIB")
     if explicit:
         candidates.append(explicit)
-    else:
-        candidates.append(None)
+    candidates.append(None)
 
     if os.name == "nt":
         common_roots = [
@@ -60,9 +59,6 @@ def _candidate_library_paths() -> list[Optional[str]]:
         for path_dir in os.getenv("PATH", "").split(os.pathsep):
             if path_dir:
                 candidates.append(str(Path(path_dir) / "turbojpeg.dll"))
-
-        if explicit:
-            candidates.append(None)
 
     unique: list[Optional[str]] = []
     seen: set[str] = set()

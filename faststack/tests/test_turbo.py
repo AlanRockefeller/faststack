@@ -26,6 +26,31 @@ def test_create_turbojpeg_prefers_explicit_env_path(monkeypatch):
     assert calls == ["C:/turbo/bin/turbojpeg.dll"]
 
 
+def test_create_turbojpeg_retries_default_loader_after_bad_env_override(monkeypatch):
+    turbo = importlib.import_module("faststack.imaging.turbo")
+
+    calls = []
+
+    def fake_decoder(path=None):
+        calls.append(path)
+        if path == "/bad/turbojpeg.so":
+            raise RuntimeError("bad override")
+        if path is None:
+            return SimpleNamespace(source="default")
+        raise RuntimeError(f"unexpected path:{path}")
+
+    monkeypatch.setattr(turbo, "TurboJPEG", fake_decoder)
+    monkeypatch.setattr(turbo.os, "name", "posix")
+    monkeypatch.setenv("FASTSTACK_TURBOJPEG_LIB", "/bad/turbojpeg.so")
+    monkeypatch.delenv("TURBOJPEG_LIB", raising=False)
+
+    decoder, available = turbo.create_turbojpeg()
+
+    assert available is True
+    assert decoder.source == "default"
+    assert calls == ["/bad/turbojpeg.so", None]
+
+
 def test_create_turbojpeg_logs_failed_candidates(monkeypatch, caplog):
     turbo = importlib.import_module("faststack.imaging.turbo")
 
