@@ -6,42 +6,19 @@ from typing import Optional, Tuple
 
 import numpy as np
 from PIL import Image
+
 from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
 
 log = logging.getLogger(__name__)
 
-# Attempt to initialize PyTurboJPEG with explicit native library discovery.
-jpeg_decoder, TURBO_AVAILABLE = create_turbojpeg()
-if TURBO_AVAILABLE:
-    log.info("PyTurboJPEG is available. Using it for JPEG decoding.")
-else:
-    log.warning("PyTurboJPEG unavailable. Falling back to Pillow for JPEG decoding.")
-# Attempt to import PyTurboJPEG
-
-try:
-    from turbojpeg import TurboJPEG, TJPF_RGB
-except ImportError:
-    JPEG_DECODER = None
-    TURBO_AVAILABLE = False
-    log.warning("PyTurboJPEG not found. Falling back to Pillow for JPEG decoding.")
-else:
-    try:
-        JPEG_DECODER = TurboJPEG()
-    except Exception:
-        JPEG_DECODER = None
-        TURBO_AVAILABLE = False
-        log.exception("PyTurboJPEG initialization failed. Falling back to Pillow.")
-    else:
-        TURBO_AVAILABLE = True
-        log.info("PyTurboJPEG is available. Using it for JPEG decoding.")
+JPEG_DECODER, TURBO_AVAILABLE = create_turbojpeg()
 
 
 def decode_jpeg_rgb(jpeg_bytes: bytes, fast_dct: bool = False) -> Optional[np.ndarray]:
     """Decodes JPEG bytes into an RGB numpy array."""
     if TURBO_AVAILABLE and JPEG_DECODER:
         try:
-            # Decode with proper color space handling (no TJFLAG_FASTDCT)
-            # This ensures proper YCbCr->RGB conversion with correct gamma
+            # Decode with proper color space handling (no TJFLAG_FASTDCT).
             flags = 0
             if fast_dct:
                 # TJFLAG_FASTDCT = 2048
@@ -49,9 +26,7 @@ def decode_jpeg_rgb(jpeg_bytes: bytes, fast_dct: bool = False) -> Optional[np.nd
             return JPEG_DECODER.decode(jpeg_bytes, pixel_format=TJPF_RGB, flags=flags)
         except Exception as e:
             log.exception("PyTurboJPEG failed to decode image: %s. Trying Pillow.", e)
-            # Fall through to Pillow fallback
 
-    # Fallback to Pillow
     try:
         img = Image.open(BytesIO(jpeg_bytes)).convert("RGB")
         return np.array(img)
@@ -66,17 +41,14 @@ def decode_jpeg_thumb_rgb(
     """Decodes a JPEG into a thumbnail-sized RGB numpy array."""
     if TURBO_AVAILABLE and JPEG_DECODER:
         try:
-            # Get image header to determine dimensions
             width, height, _, _ = JPEG_DECODER.decode_header(jpeg_bytes)
-
-            # Find the best scaling factor
             scaling_factor = _get_turbojpeg_scaling_factor(width, height, max_dim)
 
             decoded = JPEG_DECODER.decode(
                 jpeg_bytes,
                 scaling_factor=scaling_factor,
                 pixel_format=TJPF_RGB,
-                flags=0,  # Proper color space handling
+                flags=0,
             )
             if decoded.shape[0] > max_dim or decoded.shape[1] > max_dim:
                 img = Image.fromarray(decoded)
@@ -88,7 +60,6 @@ def decode_jpeg_thumb_rgb(
                 "PyTurboJPEG failed to decode thumbnail: %s. Trying Pillow.", e
             )
 
-    # Fallback to Pillow
     try:
         img = Image.open(BytesIO(jpeg_bytes))
         img.thumbnail((max_dim, max_dim))
@@ -105,7 +76,6 @@ def _get_turbojpeg_scaling_factor(
     if not TURBO_AVAILABLE or not JPEG_DECODER:
         return None
 
-    # PyTurboJPEG provides a set of supported scaling factors
     supported_factors = sorted(
         JPEG_DECODER.scaling_factors,
         key=lambda x: x[0] / x[1],
@@ -116,7 +86,6 @@ def _get_turbojpeg_scaling_factor(
         if (width * num / den) <= max_dim and (height * num / den) <= max_dim:
             return (num, den)
 
-    # If no suitable factor is found, return the smallest one
     return supported_factors[-1] if supported_factors else None
 
 
@@ -129,15 +98,11 @@ def decode_jpeg_resized(
 
     if TURBO_AVAILABLE and JPEG_DECODER:
         try:
-            # Get image header to determine dimensions
             img_width, img_height, _, _ = JPEG_DECODER.decode_header(jpeg_bytes)
 
-            # Determine which dimension is the limiting factor
             if img_width * height > img_height * width:
-                # Image is wider relative to target box; width is the constraint
                 max_dim = width
             else:
-                # Image is taller relative to target box; height is the constraint
                 max_dim = height
 
             scale_factor = _get_turbojpeg_scaling_factor(img_width, img_height, max_dim)
@@ -145,27 +110,23 @@ def decode_jpeg_resized(
             if scale_factor:
                 flags = 0
                 if fast_dct:
-                    # TJFLAG_FASTDCT = 2048
                     flags |= 2048
 
                 decoded = JPEG_DECODER.decode(
                     jpeg_bytes,
                     scaling_factor=scale_factor,
                     pixel_format=TJPF_RGB,
-                    flags=flags,  # Proper color space handling
+                    flags=flags,
                 )
 
-                # Only use Pillow for final resize if needed
                 if decoded.shape[0] > height or decoded.shape[1] > width:
                     img = Image.fromarray(decoded)
-                    # Use BILINEAR for speed
                     img.thumbnail((width, height), Image.Resampling.BILINEAR)
                     return np.array(img)
                 return decoded
         except Exception as e:
             log.exception("PyTurboJPEG failed: %s", e)
 
-    # Fallback to Pillow (existing code)
     try:
         img = Image.open(BytesIO(jpeg_bytes))
 
@@ -174,13 +135,10 @@ def decode_jpeg_resized(
 
         scale_factor_ratio = min(img.width / width, img.height / height)
 
-        # Use faster BILINEAR for large downscales, LANCZOS for smaller
         if scale_factor_ratio > 4:
-            resampling = Image.Resampling.BILINEAR  # Much faster
+            resampling = Image.Resampling.BILINEAR
         else:
-            resampling = (
-                Image.Resampling.LANCZOS
-            )  # Higher quality for smaller downscales
+            resampling = Image.Resampling.LANCZOS
 
         img.thumbnail((width, height), resampling)
         return np.array(img.convert("RGB"))

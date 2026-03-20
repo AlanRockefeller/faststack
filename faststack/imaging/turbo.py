@@ -1,4 +1,4 @@
-"""Helpers for optional libjpeg-turbo discovery and initialization."""
+"""TurboJPEG discovery helpers with Windows DLL fallbacks."""
 
 from __future__ import annotations
 
@@ -11,41 +11,63 @@ log = logging.getLogger(__name__)
 
 try:
     from turbojpeg import TurboJPEG, TJPF_RGB
-except ImportError:
+except ImportError:  # pragma: no cover - exercised via create_turbojpeg
     TurboJPEG = None
     TJPF_RGB = None
 
 
-def _candidate_library_paths() -> list[Path]:
-    """Return likely native library locations for libjpeg-turbo on Windows."""
-    candidates: list[Path] = []
+def _candidate_library_paths() -> list[Optional[str]]:
+    """Return candidate libjpeg-turbo library paths to try in priority order."""
+    candidates: list[Optional[str]] = []
 
-    for env_name in ("FASTSTACK_TURBOJPEG_LIB", "TURBOJPEG_LIB"):
-        value = os.getenv(env_name)
-        if value:
-            candidates.append(Path(value))
+    explicit = os.getenv("FASTSTACK_TURBOJPEG_LIB") or os.getenv("TURBOJPEG_LIB")
+    if explicit:
+        candidates.append(explicit)
+    else:
+        candidates.append(None)
 
     if os.name == "nt":
-        candidates.extend(
-            [
-                Path(r"C:\libjpeg-turbo64\bin\turbojpeg.dll"),
-                Path(r"C:\libjpeg-turbo\bin\turbojpeg.dll"),
-                Path(r"C:\Program Files\libjpeg-turbo\bin\turbojpeg.dll"),
-                Path(r"C:\Program Files\libjpeg-turbo64\bin\turbojpeg.dll"),
-                Path(r"C:\Program Files (x86)\libjpeg-turbo\bin\turbojpeg.dll"),
-                Path(r"C:\Program Files (x86)\libjpeg-turbo64\bin\turbojpeg.dll"),
-            ]
-        )
+        common_roots = [
+            os.getenv("FASTSTACK_TURBOJPEG_ROOT"),
+            os.getenv("ProgramFiles"),
+            os.getenv("ProgramFiles(x86)"),
+        ]
+        suffixes = [
+            ("libjpeg-turbo", "bin", "turbojpeg.dll"),
+            ("libjpeg-turbo64", "bin", "turbojpeg.dll"),
+            ("libjpeg-turbo-gcc64", "bin", "turbojpeg.dll"),
+            ("TurboJPEG", "bin", "turbojpeg.dll"),
+            ("bin", "turbojpeg.dll"),
+        ]
+        for root in common_roots:
+            if not root:
+                continue
+            for suffix in suffixes:
+                candidates.append(str(Path(root).joinpath(*suffix)))
+
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(
+                str(
+                    Path(local_app_data)
+                    / "Programs"
+                    / "libjpeg-turbo"
+                    / "bin"
+                    / "turbojpeg.dll"
+                )
+            )
 
         for path_dir in os.getenv("PATH", "").split(os.pathsep):
             if path_dir:
-                candidates.append(Path(path_dir) / "turbojpeg.dll")
+                candidates.append(str(Path(path_dir) / "turbojpeg.dll"))
 
-    # Preserve order while removing duplicates.
-    unique: list[Path] = []
+        if explicit:
+            candidates.append(None)
+
+    unique: list[Optional[str]] = []
     seen: set[str] = set()
     for candidate in candidates:
-        key = os.path.normcase(str(candidate))
+        key = "__default__" if candidate is None else os.path.normcase(candidate)
         if key in seen:
             continue
         seen.add(key)
@@ -54,24 +76,30 @@ def _candidate_library_paths() -> list[Path]:
 
 
 def create_turbojpeg() -> Tuple[Optional["TurboJPEG"], bool]:
-    """Create a TurboJPEG decoder if both wrapper and native library exist."""
+    """Create a TurboJPEG decoder if possible."""
     if TurboJPEG is None:
-        log.debug("PyTurboJPEG Python package not available")
+        log.warning("PyTurboJPEG not found. Falling back to Pillow for JPEG decoding.")
         return None, False
 
-    try:
-        return TurboJPEG(), True
-    except Exception:
-        log.debug("TurboJPEG auto-discovery failed; trying explicit library paths")
-
+    failures: list[str] = []
     for candidate in _candidate_library_paths():
-        if not candidate.exists():
-            continue
         try:
-            decoder = TurboJPEG(lib_path=str(candidate))
-            log.info("Using libjpeg-turbo at %s", candidate)
-            return decoder, True
-        except Exception:
-            log.debug("Failed to initialize turbojpeg from %s", candidate)
+            decoder = TurboJPEG() if candidate is None else TurboJPEG(candidate)
+        except Exception as exc:
+            source = "default loader" if candidate is None else candidate
+            failures.append(f"{source}: {exc}")
+            continue
 
+        if candidate is None:
+            log.info("PyTurboJPEG is available. Using it for JPEG decoding.")
+        else:
+            log.info("Loaded TurboJPEG library from %s", candidate)
+        return decoder, True
+
+    for failure in failures:
+        log.warning("TurboJPEG load attempt failed: %s", failure)
+    log.warning(
+        "TurboJPEG initialization failed for all attempted locations. "
+        "Falling back to Pillow."
+    )
     return None, False
