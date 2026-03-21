@@ -150,22 +150,35 @@ def test_is_writable_directory_does_not_create_missing_dir(tmp_path):
     assert missing.exists() is False
 
 
-def test_setup_logging_keeps_console_handler_when_file_logging_fails(monkeypatch):
+def test_setup_logging_keeps_console_handler_when_file_logging_fails(monkeypatch, tmp_path):
     logging_setup = importlib.import_module("faststack.logging_setup")
 
-    monkeypatch.setattr(logging_setup, "get_app_data_dir", lambda: Path("/bad-path"))
+    monkeypatch.setattr(logging_setup, "get_app_data_dir", lambda: tmp_path / "appdata")
+    rotating_file_handler = Mock(side_effect=OSError("disk full"))
     monkeypatch.setattr(
         logging_setup.logging.handlers,
         "RotatingFileHandler",
-        Mock(side_effect=OSError("disk full")),
+        rotating_file_handler,
     )
 
     root_logger = logging.getLogger()
     original_handlers = list(root_logger.handlers)
+    original_root_level = root_logger.level
+    cache_logger = logging.getLogger("faststack.imaging.cache")
+    prefetch_logger = logging.getLogger("faststack.imaging.prefetch")
+    pil_logger = logging.getLogger("PIL")
+    original_cache_level = cache_logger.level
+    original_prefetch_level = prefetch_logger.level
+    original_pil_level = pil_logger.level
     try:
         logging_setup.setup_logging(debug=True)
+        rotating_file_handler.assert_called_once()
         assert any(
             isinstance(handler, logging.StreamHandler) for handler in root_logger.handlers
         )
     finally:
         root_logger.handlers = original_handlers
+        root_logger.setLevel(original_root_level)
+        cache_logger.setLevel(original_cache_level)
+        prefetch_logger.setLevel(original_prefetch_level)
+        pil_logger.setLevel(original_pil_level)
