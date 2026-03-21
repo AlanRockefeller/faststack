@@ -157,6 +157,23 @@ def test_get_app_data_dir_uses_appdata_even_if_home_resolution_fails(monkeypatch
     assert logging_setup.get_app_data_dir() == expected
 
 
+def test_get_app_data_dir_prefers_cwd_before_tempdir(monkeypatch, tmp_path):
+    logging_setup = importlib.import_module("faststack.logging_setup")
+
+    cwd_path = tmp_path / "project"
+    cwd_path.mkdir()
+    expected = cwd_path / "var" / "appdata"
+
+    monkeypatch.delenv("FASTSTACK_APPDATA", raising=False)
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: (_ for _ in ()).throw(RuntimeError("no home")))
+    monkeypatch.setattr(logging_setup, "gettempdir", lambda: str(tmp_path / "tmp"))
+    monkeypatch.setattr(Path, "cwd", lambda: cwd_path)
+
+    assert logging_setup.get_app_data_dir() == expected
+
+
 def test_is_writable_directory_does_not_create_missing_dir(tmp_path):
     logging_setup = importlib.import_module("faststack.logging_setup")
 

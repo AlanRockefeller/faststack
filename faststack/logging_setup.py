@@ -45,8 +45,8 @@ def _iter_app_data_candidates():
 
     deferred_candidates = (
         lambda: Path.home() / ".faststack",
-        lambda: Path(gettempdir()) / "faststack",
         lambda: Path.cwd() / "var" / "appdata",
+        lambda: Path(gettempdir()) / "faststack",
     )
     for factory in deferred_candidates:
         try:
@@ -61,6 +61,10 @@ def get_app_data_dir() -> Path:
         if _is_writable_directory(candidate) or _can_create_directory(candidate):
             return candidate
 
+    try:
+        return Path.cwd() / "var" / "appdata"
+    except OSError:
+        pass
     return Path(gettempdir()) / "faststack"
 
 
