@@ -29,31 +29,39 @@ def _can_create_directory(path: Path) -> bool:
     return _is_writable_directory(parent)
 
 
-def get_app_data_dir() -> Path:
-    """Return a writable application data directory path."""
-    candidates = []
-
+def _iter_app_data_candidates():
+    """Yield app-data candidates in priority order, resolving expensive paths lazily."""
     override = os.getenv("FASTSTACK_APPDATA")
     if override:
-        candidates.append(Path(override))
+        yield Path(override)
 
     app_data = os.getenv("APPDATA")
     if app_data:
-        candidates.append(Path(app_data) / "faststack")
+        yield Path(app_data) / "faststack"
 
     local_app_data = os.getenv("LOCALAPPDATA")
     if local_app_data:
-        candidates.append(Path(local_app_data) / "faststack")
+        yield Path(local_app_data) / "faststack"
 
-    candidates.append(Path.home() / ".faststack")
-    candidates.append(Path(gettempdir()) / "faststack")
-    candidates.append(Path.cwd() / "var" / "appdata")
+    deferred_candidates = (
+        lambda: Path.home() / ".faststack",
+        lambda: Path(gettempdir()) / "faststack",
+        lambda: Path.cwd() / "var" / "appdata",
+    )
+    for factory in deferred_candidates:
+        try:
+            yield factory()
+        except (OSError, RuntimeError):
+            continue
 
-    for candidate in candidates:
+
+def get_app_data_dir() -> Path:
+    """Return a writable application data directory path."""
+    for candidate in _iter_app_data_candidates():
         if _is_writable_directory(candidate) or _can_create_directory(candidate):
             return candidate
 
-    return Path.cwd() / "var" / "appdata"
+    return Path(gettempdir()) / "faststack"
 
 
 def setup_logging(debug: bool = False):
