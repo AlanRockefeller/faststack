@@ -78,6 +78,7 @@ def test_create_turbojpeg_logs_failed_candidates(monkeypatch, caplog):
 def test_get_app_data_dir_falls_back_when_appdata_is_not_creatable(monkeypatch, tmp_path):
     logging_setup = importlib.import_module("faststack.logging_setup")
 
+    monkeypatch.delenv("FASTSTACK_APPDATA", raising=False)
     home_dir = tmp_path / "home"
     home_dir.mkdir()
     fallback_dir = home_dir / ".faststack"
