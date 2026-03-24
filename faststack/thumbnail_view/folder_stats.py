@@ -247,7 +247,9 @@ def _compute_coverage_buckets(
 
         # Efficient stem extraction and metadata lookup
         stem, _ = os.path.splitext(filename)
-        meta = entries.get(stem)
+        meta = entries.get(filename)
+        if meta is None:
+            meta = entries.get(stem)
 
         if isinstance(meta, dict):
             if meta.get("uploaded", False):

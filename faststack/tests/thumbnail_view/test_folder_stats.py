@@ -344,6 +344,18 @@ class TestComputeCoverageBuckets:
         # With 2 files and default 40 buckets, should have 2 buckets
         assert len(stats.coverage_buckets) == 2
 
+    def test_coverage_buckets_support_path_keys(self, temp_folder):
+        """Path-aware sidecar keys should still contribute to sparkline coverage."""
+        (temp_folder / "a.jpg").touch()
+        json_path = temp_folder / "faststack.json"
+        data = {"entries": {"a.jpg": {"uploaded": True}}}
+        json_path.write_text(json.dumps(data))
+
+        stats = read_folder_stats(temp_folder)
+
+        assert stats is not None
+        assert stats.coverage_buckets == [(1.0, 0.0, 0.0)]
+
 
 class TestCountImagesInFolder:
     """Tests for count_images_in_folder function."""

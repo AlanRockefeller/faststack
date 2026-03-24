@@ -357,6 +357,7 @@ class AppController(QObject):
             get_metadata_callback=self._get_metadata_dict,
             get_batch_indices_callback=self._get_batch_indices,
             get_current_index_callback=self._get_current_loupe_index,
+            metadata_key_fn=lambda p: self.sidecar.metadata_key_for_path(p),
             thumbnail_size=200,
             parent=self,  # Ensure proper Qt ownership to prevent GC issues
         )
@@ -1040,13 +1041,9 @@ class AppController(QObject):
         # Apply flag-based filtering (AND logic: image must have ALL checked flags)
         if self._filter_enabled and self._filter_flags:
             flags = self._filter_flags
-            # Optimize: access sidecar entries directly to avoid get_metadata overhead
-            entries = self.sidecar.data.entries
             result = []
             for img in filtered:
-                # Direct dict lookup is faster than get_metadata() which might create objects
-                stem = img.path.stem
-                meta = entries.get(stem)
+                meta = self.sidecar.get_metadata(img.path, create=False)
                 if not meta:
                     continue
 
@@ -1810,7 +1807,7 @@ class AppController(QObject):
         for idx in range(len(self.image_files) - 1, -1, -1):
             img = self.image_files[idx]
             # Dynamic look-up of self.sidecar as requested (important for mocks in tests)
-            meta = self.sidecar.get_metadata(img.path.stem, create=False)
+            meta = self.sidecar.get_metadata(img.path, create=False)
 
             uploaded = meta.uploaded if meta else False
 
@@ -2126,10 +2123,10 @@ class AppController(QObject):
         if self._thumbnail_model:
             self._thumbnail_model.thumbnailReady.emit(thumbnail_id)
 
-    def _get_metadata_dict(self, stem: str) -> dict:
-        """Get metadata for a file stem as a dict for thumbnail model."""
+    def _get_metadata_dict(self, image_path: Path | str) -> dict:
+        """Get metadata for an image path as a dict for thumbnail model."""
         try:
-            meta = self.sidecar.get_metadata(stem, create=False)
+            meta = self.sidecar.get_metadata(image_path, create=False)
             if meta is None:
                 return {
                     "stacked": False,
@@ -2148,7 +2145,7 @@ class AppController(QObject):
                 "todo": meta.todo,
             }
         except Exception as e:  # Broad catch for UI plumbing - don't crash grid view
-            log.debug("Failed to get metadata for %s: %s", stem, e)
+            log.debug("Failed to get metadata for %s: %s", image_path, e)
             return {
                 "stacked": False,
                 "uploaded": False,
@@ -2162,9 +2159,12 @@ class AppController(QObject):
         """Get flattened metadata map for all images (for efficient grid refresh)."""
         bulk_map = {}
         try:
-            # sidecar.data.entries is a dict of stem -> EntryMetadata
-            for stem, meta in self.sidecar.data.entries.items():
-                bulk_map[stem] = {
+            for img in self.image_files:
+                key = self.sidecar.metadata_key_for_path(img.path)
+                meta = self.sidecar.get_metadata(img.path, create=False)
+                if meta is None:
+                    continue
+                bulk_map[key] = {
                     "stacked": getattr(meta, "stacked", False),
                     "uploaded": getattr(meta, "uploaded", False),
                     "edited": getattr(meta, "edited", False),
@@ -2214,8 +2214,8 @@ class AppController(QObject):
             return
 
         today = datetime.now().strftime("%Y-%m-%d")
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
+        image_path = self.image_files[self.current_index].path
+        meta = self.sidecar.get_metadata(image_path)
 
         meta.uploaded = not meta.uploaded
         if meta.uploaded:
@@ -2229,7 +2229,7 @@ class AppController(QObject):
         self.sync_ui_state()
         status = "uploaded" if meta.uploaded else "not uploaded"
         self.update_status_message(f"Marked as {status}")
-        log.info("Toggled uploaded flag to %s for %s", meta.uploaded, stem)
+        log.info("Toggled uploaded flag to %s for %s", meta.uploaded, image_path)
 
     def toggle_todo(self):
         """Toggle todo flag for current image."""
@@ -2237,8 +2237,8 @@ class AppController(QObject):
             return
 
         today = datetime.now().strftime("%Y-%m-%d")
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
+        image_path = self.image_files[self.current_index].path
+        meta = self.sidecar.get_metadata(image_path)
 
         meta.todo = not getattr(meta, "todo", False)
         if meta.todo:
@@ -2252,7 +2252,7 @@ class AppController(QObject):
         self.sync_ui_state()
         status = "todo" if meta.todo else "not todo"
         self.update_status_message(f"Marked as {status}")
-        log.info("Toggled todo flag to %s for %s", meta.todo, stem)
+        log.info("Toggled todo flag to %s for %s", meta.todo, image_path)
 
     def toggle_edited(self):
         """Toggle edited flag for current image."""
@@ -2260,8 +2260,8 @@ class AppController(QObject):
             return
 
         today = datetime.now().strftime("%Y-%m-%d")
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
+        image_path = self.image_files[self.current_index].path
+        meta = self.sidecar.get_metadata(image_path)
 
         meta.edited = not meta.edited
         if meta.edited:
@@ -2275,7 +2275,7 @@ class AppController(QObject):
         self.sync_ui_state()
         status = "edited" if meta.edited else "not edited"
         self.update_status_message(f"Marked as {status}")
-        log.info("Toggled edited flag to %s for %s", meta.edited, stem)
+        log.info("Toggled edited flag to %s for %s", meta.edited, image_path)
 
     def toggle_restacked(self):
         """Toggle restacked flag for current image."""
@@ -2283,8 +2283,8 @@ class AppController(QObject):
             return
 
         today = datetime.now().strftime("%Y-%m-%d")
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
+        image_path = self.image_files[self.current_index].path
+        meta = self.sidecar.get_metadata(image_path)
 
         meta.restacked = not meta.restacked
         if meta.restacked:
@@ -2298,15 +2298,15 @@ class AppController(QObject):
         self.sync_ui_state()
         status = "restacked" if meta.restacked else "not restacked"
         self.update_status_message(f"Marked as {status}")
-        log.info("Toggled restacked flag to %s for %s", meta.restacked, stem)
+        log.info("Toggled restacked flag to %s for %s", meta.restacked, image_path)
 
     def toggle_favorite(self):
         """Toggle favorite flag for current image."""
         if not self.image_files or self.current_index >= len(self.image_files):
             return
 
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
+        image_path = self.image_files[self.current_index].path
+        meta = self.sidecar.get_metadata(image_path)
 
         meta.favorite = not meta.favorite
 
@@ -2316,7 +2316,7 @@ class AppController(QObject):
         self.sync_ui_state()
         status = "Favorited" if meta.favorite else "Unfavorited"
         self.update_status_message(status)
-        log.info("Toggled favorite flag to %s for %s", meta.favorite, stem)
+        log.info("Toggled favorite flag to %s for %s", meta.favorite, image_path)
 
     def toggle_stacked(self):
         """Toggle stacked flag for current image."""
@@ -2324,8 +2324,8 @@ class AppController(QObject):
             return
 
         today = datetime.now().strftime("%Y-%m-%d")
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem)
+        image_path = self.image_files[self.current_index].path
+        meta = self.sidecar.get_metadata(image_path)
 
         meta.stacked = not meta.stacked
         if meta.stacked:
@@ -2339,7 +2339,7 @@ class AppController(QObject):
         self.sync_ui_state()
         status = "stacked" if meta.stacked else "not stacked"
         self.update_status_message(f"Marked as {status}")
-        log.info("Toggled stacked flag to %s for %s", meta.stacked, stem)
+        log.info("Toggled stacked flag to %s for %s", meta.stacked, image_path)
 
     def get_current_metadata(self) -> Dict:
         if not self.image_files or self.current_index >= len(self.image_files):
@@ -2357,8 +2357,8 @@ class AppController(QObject):
             return self._metadata_cache
 
         # Compute and cache
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem, create=False)
+        image_path = self.image_files[self.current_index].path
+        meta = self.sidecar.get_metadata(image_path, create=False)
         stack_info = self._get_stack_info(self.current_index)
         batch_info = self._get_batch_info(self.current_index)
 
@@ -2619,7 +2619,7 @@ class AppController(QObject):
         # Find indices of all favorited images
         indices_to_add = []
         for i, img in enumerate(self.image_files):
-            meta = self.sidecar.get_metadata(img.path.stem, create=False)
+            meta = self.sidecar.get_metadata(img.path, create=False)
             if meta and meta.favorite:
                 indices_to_add.append(i)
 
@@ -2674,7 +2674,7 @@ class AppController(QObject):
         # Find indices of all uploaded images
         indices_to_add = []
         for i, img in enumerate(self.image_files):
-            meta = self.sidecar.get_metadata(img.path.stem, create=False)
+            meta = self.sidecar.get_metadata(img.path, create=False)
             if meta and meta.uploaded:
                 indices_to_add.append(i)
 
@@ -3099,8 +3099,7 @@ class AppController(QObject):
                 for img_file in self.image_files:
                     # Match by either RAW pair or JPG path
                     if img_file.raw_pair == file_path or img_file.path == file_path:
-                        stem = img_file.path.stem
-                        meta = self.sidecar.get_metadata(stem)
+                        meta = self.sidecar.get_metadata(img_file.path)
                         meta.stacked = True
                         meta.stacked_date = today
                         break
@@ -5448,8 +5447,7 @@ class AppController(QObject):
 
             # Mark as edited on successful launch
             today = datetime.now().strftime("%Y-%m-%d")
-            stem = image_file.path.stem
-            meta = self.sidecar.get_metadata(stem)
+            meta = self.sidecar.get_metadata(image_file.path)
             meta.edited = True
             meta.edited_date = today
             self.sidecar.save()
@@ -5583,8 +5581,7 @@ class AppController(QObject):
             today = datetime.now().strftime("%Y-%m-%d")
 
             for idx in existing_indices:
-                stem = self.image_files[idx].path.stem
-                meta = self.sidecar.get_metadata(stem)
+                meta = self.sidecar.get_metadata(self.image_files[idx].path)
                 meta.uploaded = True
                 meta.uploaded_date = today
 
@@ -6456,8 +6453,7 @@ class AppController(QObject):
         if success:
             # Mark as restacked on success
             today = datetime.now().strftime("%Y-%m-%d")
-            stem = self.image_files[self.current_index].path.stem
-            meta = self.sidecar.get_metadata(stem)
+            meta = self.sidecar.get_metadata(self.image_files[self.current_index].path)
             meta.restacked = True
             meta.restacked_date = today
             self.sidecar.save()
@@ -7363,8 +7359,9 @@ class AppController(QObject):
     def is_stacked(self) -> bool:
         if not self.image_files or self.current_index >= len(self.image_files):
             return False
-        stem = self.image_files[self.current_index].path.stem
-        meta = self.sidecar.get_metadata(stem, create=False)
+        meta = self.sidecar.get_metadata(
+            self.image_files[self.current_index].path, create=False
+        )
         return meta.stacked if meta else False
 
     def _update_cache_stats(self):

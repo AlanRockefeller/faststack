@@ -20,7 +20,7 @@ def normalize_path_key(path: Union[Path, str]) -> str:
     # os.path.normcase on Linux: returns as-is
     # os.path.abspath: ensures absolute path and collapses ..
     # Note: abspath does NOT resolve symlinks (that's realpath).
-    return os.path.normcase(os.path.abspath(p_str))
+    return os.path.normcase(os.path.abspath(p_str)).replace("\\", "/")
 
 
 def compute_path_hash(path: Union[Path, str]) -> str:

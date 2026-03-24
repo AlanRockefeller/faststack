@@ -2,13 +2,16 @@
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
-from typing import Literal, Optional, overload
+from typing import Literal, Optional, Union, overload
 
+from faststack.io.indexer import JPG_EXTENSIONS, RAW_EXTENSIONS
 from faststack.models import Sidecar, EntryMetadata
 
 log = logging.getLogger(__name__)
+KNOWN_IMAGE_EXTENSIONS = frozenset(ext.lower() for ext in JPG_EXTENSIONS | RAW_EXTENSIONS)
 
 
 def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
@@ -37,6 +40,7 @@ def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
 
 class SidecarManager:
     def __init__(self, directory: Path, watcher, debug: bool = False):
+        self.directory = directory
         self.path = directory / "faststack.json"
         self.watcher = watcher
         self.debug = debug
@@ -71,8 +75,8 @@ class SidecarManager:
 
             # Reconstruct nested objects
             entries = {
-                stem: _entrymetadata_from_json(meta)
-                for stem, meta in data.get("entries", {}).items()
+                key: _entrymetadata_from_json(meta)
+                for key, meta in data.get("entries", {}).items()
             }
             return Sidecar(
                 version=data.get("version", 2),
@@ -103,7 +107,7 @@ class SidecarManager:
                     "version": self.data.version,
                     "last_index": self.data.last_index,
                     "entries": {
-                        stem: meta.__dict__ for stem, meta in self.data.entries.items()
+                        key: meta.__dict__ for key, meta in self.data.entries.items()
                     },
                     "stacks": self.data.stacks,
                 }
@@ -121,21 +125,21 @@ class SidecarManager:
 
     @overload
     def get_metadata(
-        self, image_stem: str, *, create: Literal[True] = True
+        self, image_ref: Union[str, Path], *, create: Literal[True] = True
     ) -> EntryMetadata: ...
 
     @overload
     def get_metadata(
-        self, image_stem: str, *, create: Literal[False]
+        self, image_ref: Union[str, Path], *, create: Literal[False]
     ) -> Optional[EntryMetadata]: ...
 
     @overload
     def get_metadata(
-        self, image_stem: str, *, create: bool
+        self, image_ref: Union[str, Path], *, create: bool
     ) -> Optional[EntryMetadata]: ...
 
     def get_metadata(
-        self, image_stem: str, *, create: bool = True
+        self, image_ref: Union[str, Path], *, create: bool = True
     ) -> Optional[EntryMetadata]:
         """Get metadata for an image, optionally creating a persistent entry.
 
@@ -143,11 +147,124 @@ class SidecarManager:
         and storing one if it doesn't exist).  When create=False, returns None
         if no entry exists — callers must handle the None case explicitly.
         """
-        meta = self.data.entries.get(image_stem)
+        stable_key, candidate_keys = self._lookup_keys(image_ref)
+        if not stable_key:
+            if create:
+                raise ValueError(f"image_ref must not be empty: {image_ref!r}")
+            return None
+
+        meta = self.data.entries.get(stable_key)
+        if meta is None:
+            for candidate_key in candidate_keys:
+                if candidate_key == stable_key:
+                    continue
+                candidate_meta = self.data.entries.get(candidate_key)
+                if candidate_meta is None:
+                    continue
+                meta = candidate_meta
+                if stable_key not in self.data.entries:
+                    self.data.entries[stable_key] = candidate_meta
+                if candidate_key in self.data.entries and candidate_key != stable_key:
+                    del self.data.entries[candidate_key]
+                break
+        if meta is None:
+            for existing_key, existing_meta in list(self.data.entries.items()):
+                if existing_key == stable_key:
+                    continue
+                if self._stable_key_from_key(existing_key, check_fs=True) != stable_key:
+                    continue
+                meta = existing_meta
+                self.data.entries[stable_key] = existing_meta
+                del self.data.entries[existing_key]
+                break
+
         if meta is None and create:
             meta = EntryMetadata()
-            self.data.entries[image_stem] = meta
+            self.data.entries[stable_key] = meta
         return meta
+
+    def metadata_key_for_path(self, image_path: Union[str, Path]) -> str:
+        """Return the stable sidecar key for a concrete image path."""
+        path = Path(image_path)
+        if not path.name:
+            return ""
+        if not path.is_absolute():
+            path = self.directory / path
+        base_dir = Path(os.path.normcase(os.path.abspath(str(self.directory))))
+        abs_path = Path(os.path.normcase(os.path.abspath(str(path))))
+
+        try:
+            relative = abs_path.relative_to(base_dir)
+            stable_path = relative.parent / relative.stem
+            return str(stable_path).replace("\\", "/")
+        except ValueError:
+            stable_path = abs_path.parent / abs_path.stem
+            return str(stable_path).replace("\\", "/")
+
+    def _lookup_keys(self, image_ref: Union[str, Path]) -> tuple[str, list[str]]:
+        """Return (stable_key, migration_candidate_keys) for a metadata lookup."""
+        if isinstance(image_ref, Path):
+            if not image_ref.name:
+                return "", []
+            stable_key = self.metadata_key_for_path(image_ref)
+            full_name_key = self._metadata_filename_key(image_ref)
+            return stable_key, [full_name_key, image_ref.stem]
+
+        value = str(image_ref)
+        if not value:
+            return "", []
+
+        # Only treat string as a path if it contains explicit path separators.
+        # Dotted strings (even with image extensions like "photo.CR2") are
+        # treated as exact keys — migration of legacy filename keys is handled
+        # by the _stable_key_from_key scan in get_metadata.
+        if os.path.sep in value or "/" in value or "\\" in value:
+            path = Path(value)
+            stable_key = self.metadata_key_for_path(path)
+            full_name_key = self._metadata_filename_key(path)
+            return stable_key, [full_name_key, path.stem]
+
+        return value, [value]
+
+    def _metadata_filename_key(self, image_path: Union[str, Path]) -> str:
+        """Return the extension-preserving key used by the regressed patch."""
+        path = Path(image_path)
+        if not path.name:
+            return ""
+        if not path.is_absolute():
+            path = self.directory / path
+        base_dir = Path(os.path.normcase(os.path.abspath(str(self.directory))))
+        abs_path = Path(os.path.normcase(os.path.abspath(str(path))))
+
+        try:
+            relative = abs_path.relative_to(base_dir)
+            return str(relative).replace("\\", "/")
+        except ValueError:
+            return str(abs_path).replace("\\", "/")
+
+    def _stable_key_from_key(self, key: str, check_fs: bool = False) -> str:
+        """Convert any historical sidecar key form into today's stable key.
+
+        Args:
+            key: The sidecar key to normalize.
+            check_fs: If True, check the filesystem for bare-stem keys that
+                match an existing file. Set to True during one-time migration
+                scans; leave False on hot paths to avoid filesystem I/O.
+        """
+        if not key:
+            return ""
+        if (
+            os.path.sep in key
+            or "/" in key
+            or "\\" in key
+            or Path(key).suffix.lower() in KNOWN_IMAGE_EXTENSIONS
+        ):
+            return self.metadata_key_for_path(Path(key))
+        if check_fs:
+            candidate_path = self.directory / key
+            if candidate_path.exists():
+                return self.metadata_key_for_path(candidate_path)
+        return key
 
     def set_last_index(self, index: int):
         self.data.last_index = index
