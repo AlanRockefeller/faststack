@@ -357,7 +357,7 @@ class AppController(QObject):
             get_metadata_callback=self._get_metadata_dict,
             get_batch_indices_callback=self._get_batch_indices,
             get_current_index_callback=self._get_current_loupe_index,
-            metadata_key_fn=self.sidecar.metadata_key_for_path,
+            metadata_key_fn=lambda p: self.sidecar.metadata_key_for_path(p),
             thumbnail_size=200,
             parent=self,  # Ensure proper Qt ownership to prevent GC issues
         )
@@ -1041,11 +1041,9 @@ class AppController(QObject):
         # Apply flag-based filtering (AND logic: image must have ALL checked flags)
         if self._filter_enabled and self._filter_flags:
             flags = self._filter_flags
-            entries = self.sidecar.data.entries
             result = []
             for img in filtered:
-                key = self.sidecar.metadata_key_for_path(img.path)
-                meta = entries.get(key)
+                meta = self.sidecar.get_metadata(img.path, create=False)
                 if not meta:
                     continue
 
@@ -2160,11 +2158,10 @@ class AppController(QObject):
     def _get_bulk_metadata_map(self) -> Dict[str, dict]:
         """Get flattened metadata map for all images (for efficient grid refresh)."""
         bulk_map = {}
-        entries = self.sidecar.data.entries
         try:
             for img in self.image_files:
                 key = self.sidecar.metadata_key_for_path(img.path)
-                meta = entries.get(key)
+                meta = self.sidecar.get_metadata(img.path, create=False)
                 if meta is None:
                     continue
                 bulk_map[key] = {
@@ -2620,11 +2617,9 @@ class AppController(QObject):
             return
 
         # Find indices of all favorited images
-        entries = self.sidecar.data.entries
         indices_to_add = []
         for i, img in enumerate(self.image_files):
-            key = self.sidecar.metadata_key_for_path(img.path)
-            meta = entries.get(key)
+            meta = self.sidecar.get_metadata(img.path, create=False)
             if meta and meta.favorite:
                 indices_to_add.append(i)
 
@@ -2677,11 +2672,9 @@ class AppController(QObject):
             return
 
         # Find indices of all uploaded images
-        entries = self.sidecar.data.entries
         indices_to_add = []
         for i, img in enumerate(self.image_files):
-            key = self.sidecar.metadata_key_for_path(img.path)
-            meta = entries.get(key)
+            meta = self.sidecar.get_metadata(img.path, create=False)
             if meta and meta.uploaded:
                 indices_to_add.append(i)
 

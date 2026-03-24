@@ -34,7 +34,7 @@ def _can_create_dir(path: Path) -> bool:
             return False
         parent = next_parent
 
-    return parent.is_dir()
+    return _is_writable_dir(parent)
 
 
 def get_app_data_dir() -> Path:

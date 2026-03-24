@@ -154,27 +154,81 @@ def test_favorite_toggle_roundtrip(mock_sidecar_dir):
 
 
 def test_legacy_stem_entry_migrates_to_path_key(mock_sidecar_dir):
-    """Legacy stem-keyed entries should migrate on first concrete path lookup."""
+    """Legacy filename-keyed entries should migrate on first concrete path lookup."""
+    # Use a legacy key ("IMG_0001.jpg") that differs from the stable key
+    # returned by metadata_key_for_path (which strips the extension), so that
+    # get_metadata must actually perform migration.
+    legacy_key = "IMG_0001.jpg"
     content = {
         "version": 2,
         "entries": {
-            "IMG_0001": {"uploaded": True},
+            legacy_key: {"uploaded": True},
         },
     }
     d = mock_sidecar_dir(content)
     sm = SidecarManager(d, None)
 
-    meta = sm.get_metadata(Path("IMG_0001.jpg"), create=False)
     expected_key = sm.metadata_key_for_path(Path("IMG_0001.jpg"))
+    assert expected_key != legacy_key, "legacy key must differ from stable key"
+
+    meta = sm.get_metadata(Path("IMG_0001.jpg"), create=False)
 
     assert meta is not None
     assert meta.uploaded is True
+    # Entry now lives under the stable key
     assert expected_key in sm.data.entries
+    # Legacy key was removed during migration
+    assert legacy_key not in sm.data.entries
+
+
+def test_bulk_iteration_finds_legacy_keyed_entries(mock_sidecar_dir):
+    """Bulk get_metadata(path, create=False) must find and migrate legacy keys.
+
+    Regression test: hot paths like flag filtering and batch selection iterate
+    over all images calling get_metadata(path, create=False).  If they bypassed
+    migration (e.g. via direct entries dict access), legacy-keyed entries would
+    be silently missed.
+    """
+    content = {
+        "version": 2,
+        "entries": {
+            # Legacy filename-keyed entry (has extension — differs from stable key)
+            "IMG_0001.jpg": {"favorite": True},
+            # Already-stable entry (bare stem, matches metadata_key_for_path)
+            "IMG_0002": {"uploaded": True},
+            # Another legacy filename-keyed entry
+            "IMG_0003.jpg": {"favorite": True, "uploaded": True},
+        },
+    }
+    d = mock_sidecar_dir(content)
+    sm = SidecarManager(d, None)
+
+    # Simulate the bulk iteration pattern used by _apply_filter_to_cached_list,
+    # _get_bulk_metadata_map, _batch_add_favorites, _batch_add_uploaded
+    image_paths = [Path("IMG_0001.jpg"), Path("IMG_0002.jpg"), Path("IMG_0003.jpg")]
+    found = {}
+    for p in image_paths:
+        meta = sm.get_metadata(p, create=False)
+        if meta is not None:
+            found[p.stem] = meta
+
+    # All three entries must be found — none silently dropped
+    assert "IMG_0001" in found, "legacy filename-keyed entry must be found"
+    assert "IMG_0002" in found, "already-stable entry must be found"
+    assert "IMG_0003" in found, "legacy filename-keyed entry must be found"
+
+    assert found["IMG_0001"].favorite is True
+    assert found["IMG_0002"].uploaded is True
+    assert found["IMG_0003"].favorite is True
+    assert found["IMG_0003"].uploaded is True
+
+    # Legacy keys should have been migrated to stable keys
+    stable_1 = sm.metadata_key_for_path(Path("IMG_0001.jpg"))
+    stable_3 = sm.metadata_key_for_path(Path("IMG_0003.jpg"))
+    assert stable_1 in sm.data.entries
+    assert stable_3 in sm.data.entries
     assert "IMG_0001.jpg" not in sm.data.entries
-    if os.name == "nt":
-        assert expected_key == "img_0001"
-    else:
-        assert expected_key == "IMG_0001"
+    assert "IMG_0003.jpg" not in sm.data.entries
 
 
 def test_raw_only_entry_survives_transition_to_visible_jpg(mock_sidecar_dir):
