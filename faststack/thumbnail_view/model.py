@@ -268,9 +268,9 @@ class ThumbnailModel(QAbstractListModel):
         # We'll use the parent (AppController) to look this up
         parent = self.parent()
         if parent and hasattr(parent, "_path_to_index"):
-            # Must use the same key format as _rebuild_path_to_index (abspath,
-            # not realpath/resolve) so the lookup hits on Windows and Linux.
-            key = os.path.normcase(os.path.abspath(str(entry.path)))
+            # Must use the same key format as _rebuild_path_to_index
+            # (normalize_path_key) so the lookup hits on Windows and Linux.
+            key = normalize_path_key(entry.path)
             return parent._path_to_index.get(key)
         return None
 
@@ -454,10 +454,10 @@ class ThumbnailModel(QAbstractListModel):
             return
 
         # 1. Map paths to rows (normalized for Windows case/separator consistency)
-        path_keys = {os.path.normcase(os.path.abspath(str(p))) for p in paths}
+        path_keys = {normalize_path_key(p) for p in paths}
         indices_to_remove = []
         for i, entry in enumerate(self._entries):
-            if os.path.normcase(os.path.abspath(str(entry.path))) in path_keys:
+            if normalize_path_key(entry.path) in path_keys:
                 indices_to_remove.append(i)
 
         if not indices_to_remove:
