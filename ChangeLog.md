@@ -10,6 +10,9 @@ Todo:   More testing Linux / Mac.   Create Windows .exe.   Write better document
 - Moved menu activation from hovering over the image to hovering over the title bar.
 - Expand the default prefetch window from a radius of 4 to 12 images.
 - Introduce directional awareness to task cancellation logic, making the prefetcher a lot faster.
+- Improved TurboJPEG setup on Windows by using shared library detection logic in JPEG decoding and thumbnail prefetching.  Thanks to Andy Arijs for the PR!
+- Added Windows documentation for installing turbojpeg.dll, using FASTSTACK_TURBOJPEG_LIB, and understanding fallback behavior.  Thanks to Andy Arijs!
+- FastStack now more clearly explains when it falls back to Pillow for JPEG decoding and thumbnails.  Thanks to Andy Arijs!
 
 ## 1.6.0 (2026-03-06) 
 

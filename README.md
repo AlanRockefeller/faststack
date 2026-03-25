@@ -66,6 +66,50 @@ pip install .
 faststack
 ```
 
+### Windows Performance Note
+On Windows, `PyTurboJPEG` also needs the native `libjpeg-turbo` library (`turbojpeg.dll`).
+
+- If `turbojpeg.dll` is installed, FastStack uses it automatically for faster JPEG decode and thumbnail generation.
+- If it is missing, FastStack still runs, but falls back to Pillow and may feel slower on large folders.
+
+Recommended install location:
+
+- `C:\libjpeg-turbo64\bin\turbojpeg.dll`
+
+FastStack also checks these optional environment variables if you installed it elsewhere:
+
+- `FASTSTACK_TURBOJPEG_LIB`
+- `TURBOJPEG_LIB`
+
+Example:
+
+```cmd
+set FASTSTACK_TURBOJPEG_LIB=C:\path\to\turbojpeg.dll
+venv\Scripts\python.exe -m faststack.app "C:\path\to\photos"
+```
+
+### Troubleshooting on Windows
+If startup logs mention:
+
+```text
+TurboJPEG initialization failed (N location(s) tried). Falling back to Pillow for JPEG decoding.
+```
+
+that means the Python package is installed but FastStack could not initialize TurboJPEG from any discovered location and is using Pillow instead.
+
+Fastest fixes:
+
+1. Install `libjpeg-turbo` for Windows x64 so that this file exists:
+   `C:\libjpeg-turbo64\bin\turbojpeg.dll`
+2. Or point FastStack to the dll explicitly:
+
+```cmd
+set FASTSTACK_TURBOJPEG_LIB=C:\path\to\turbojpeg.dll
+venv\Scripts\python.exe -m faststack.app "C:\path\to\photos"
+```
+
+If you do nothing, FastStack will still run, but JPEG decoding and thumbnail generation will use Pillow instead of `libjpeg-turbo`, which is slower.
+
 ## Keyboard Shortcuts
 
 - `J` / `Right Arrow`: Next Image
