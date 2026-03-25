@@ -28,6 +28,7 @@ def _candidate_library_paths() -> list[Optional[str]]:
     if os.name == "nt":
         common_roots = [
             os.getenv("FASTSTACK_TURBOJPEG_ROOT"),
+            os.getenv("SystemDrive", "C:") + os.sep,
             os.getenv("ProgramFiles"),
             os.getenv("ProgramFiles(x86)"),
         ]

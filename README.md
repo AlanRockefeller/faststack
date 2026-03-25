@@ -92,11 +92,10 @@ venv\Scripts\python.exe -m faststack.app "C:\path\to\photos"
 If startup logs mention:
 
 ```text
-Unable to locate turbojpeg library automatically.
-You may specify the turbojpeg library path manually.
+TurboJPEG initialization failed (N location(s) tried). Falling back to Pillow for JPEG decoding.
 ```
 
-that means the Python package is installed but the native `turbojpeg.dll` is not available in a location that `PyTurboJPEG` can find.
+that means the Python package is installed but FastStack could not initialize TurboJPEG from any discovered location and is using Pillow instead.
 
 Fastest fixes:
 
