@@ -3780,7 +3780,7 @@ class AppController(QObject):
         # in the recycle bin and find_images() can re-pair them.
         if unique_tag is None:
             unique_tag = uuid.uuid4().hex[:8]
-        dest = recycle_bin / f"{src.stem}.{unique_tag}{src.suffix}"
+        dest = recycle_bin / f"{src.stem}._fs_{unique_tag}{src.suffix}"
 
         try:
             # Fast path: rename within same filesystem (no data copy)
@@ -4570,8 +4570,9 @@ class AppController(QObject):
             # Use new targeted eviction with tombstones
             self.image_cache.evict_paths(paths_to_evict)
 
-        # Cancel any pending prefetch tasks (crucial to stop re-caching deleted items)
+        # Sync prefetcher's image list and cancel pending tasks
         if self.prefetcher:
+            self.prefetcher.set_image_files(self.image_files)
             self.prefetcher.cancel_all()
 
         # Update ID mapping (now fast due to string hashing)
@@ -4930,6 +4931,7 @@ class AppController(QObject):
                         if img.raw_pair:
                             paths_to_evict.append(img.raw_pair)
                     self.image_cache.evict_paths(paths_to_evict)
+                self.prefetcher.set_image_files(self.image_files)
                 self.prefetcher.cancel_all()
                 if self.image_files:
                     self.prefetcher.update_prefetch(self.current_index)
@@ -7420,30 +7422,51 @@ class AppController(QObject):
         clear_raw_count_cache()
 
     # ---- regex for reversing UUID-suffixed recycle bin names ----
-    _RECYCLE_UUID_RE = re.compile(r"^(.+)\.[0-9a-f]{8}$", re.IGNORECASE)
+    # Current format uses ``._fs_`` marker: ``{stem}._fs_{8hex}{suffix}``
+    _RECYCLE_FS_RE = re.compile(r"^(.+)\._fs_[0-9a-f]{8}$", re.IGNORECASE)
 
     @staticmethod
     def _original_name_from_recycled(recycled_path: Path) -> Optional[str]:
         """Derive the original filename from a recycled file's UUID-suffixed name.
 
-        Recycle format: ``{original_stem}.{8-hex-uuid}{original_suffix}``
-        e.g. ``IMG_001.a7c3f2e1.jpg`` → ``IMG_001.jpg``
+        Current format: ``{original_stem}._fs_{8-hex-uuid}{original_suffix}``
+        e.g. ``IMG_001._fs_a7c3f2e1.jpg`` → ``IMG_001.jpg``
+
+        Only matches the ``._fs_`` marker to avoid false positives on
+        legitimate filenames that happen to end with a dot-8hex segment
+        (e.g. ``photo.a1b2c3d4.jpg``).
 
         Returns:
             The original filename, or None if the name doesn't match the pattern.
         """
-        m = AppController._RECYCLE_UUID_RE.match(recycled_path.stem)
+        m = AppController._RECYCLE_FS_RE.match(recycled_path.stem)
         if m:
             return m.group(1) + recycled_path.suffix
         return None
 
     def _collect_active_bins(self) -> set:
-        """Return the set of existing recycle bin directories (tracked + local)."""
+        """Return the set of existing recycle bin directories (tracked + local).
+
+        Excludes any bin that still has outstanding pending-delete jobs so that
+        the restore UI cannot act on a bin the worker is still writing to.
+        """
+        # Build set of bin dirs that have in-flight delete jobs.
+        pending_bins: set = set()
+        for job in self._pending_delete_jobs.values():
+            for img in job.images_to_delete:
+                pending_bins.add(img.path.parent / "image recycle bin")
+
         active = {
-            p for p in self.active_recycle_bins if p.exists() and p.is_dir()
+            p
+            for p in self.active_recycle_bins
+            if p.exists() and p.is_dir() and p not in pending_bins
         }
         local_bin = self.image_dir / "image recycle bin"
-        if local_bin.exists() and local_bin.is_dir():
+        if (
+            local_bin.exists()
+            and local_bin.is_dir()
+            and local_bin not in pending_bins
+        ):
             active.add(local_bin)
         return active
 
@@ -7554,44 +7577,53 @@ class AppController(QObject):
         restored_paths: Set[Path] = set()  # recycled paths successfully moved
 
         try:
-            for p in bin_path.iterdir():
-                if not p.is_file():
-                    continue
-                original_name = self._original_name_from_recycled(p)
-                if original_name is None:
-                    result["legacy_remaining_count"] += 1
-                    continue
-                dest = dest_dir / original_name
-                if dest.exists():
-                    log.warning(
-                        "Skipping restore of %s — %s already exists",
-                        p.name,
-                        dest.name,
-                    )
-                    result["skipped_count"] += 1
-                    continue
-                try:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(p), str(dest))
-                    log.info("Restored %s → %s", p.name, dest.name)
-                    result["restored_count"] += 1
-                    restored_paths.add(p)
-                except OSError as e:
-                    log.error("Failed to restore %s: %s", p.name, e)
-                    result["skipped_count"] += 1
+            # Snapshot the listing so moves during iteration can't skip entries.
+            entries = list(bin_path.iterdir())
         except OSError:
             log.exception("Failed to iterate recycle bin %s", bin_path)
+            entries = []
+
+        for p in entries:
+            if not p.is_file():
+                continue
+            original_name = self._original_name_from_recycled(p)
+            if original_name is None:
+                result["legacy_remaining_count"] += 1
+                continue
+            dest = dest_dir / original_name
+            if dest.exists():
+                log.warning(
+                    "Skipping restore of %s — %s already exists",
+                    p.name,
+                    dest.name,
+                )
+                result["skipped_count"] += 1
+                continue
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(p), str(dest))
+                log.info("Restored %s → %s", p.name, dest.name)
+                result["restored_count"] += 1
+                restored_paths.add(p)
+            except OSError as e:
+                log.error("Failed to restore %s: %s", p.name, e)
+                result["skipped_count"] += 1
 
         # Prune delete_history and undo_history entries whose recycled
         # paths were just restored, so Ctrl+Z doesn't try to restore
         # files that are already back in place.
         if restored_paths:
+            # Resolve all restored paths so comparison works even when
+            # delete_history contains relative paths (e.g. app started
+            # with a relative image directory).
+            resolved_restored = {p.resolve() for p in restored_paths}
+
             def _record_stale(record: DeleteRecord) -> bool:
                 """True if any recycled path in this record was restored."""
                 (_, jpg_bin), (_, raw_bin) = record
                 return (
-                    (jpg_bin is not None and jpg_bin in restored_paths)
-                    or (raw_bin is not None and raw_bin in restored_paths)
+                    (jpg_bin is not None and jpg_bin.resolve() in resolved_restored)
+                    or (raw_bin is not None and raw_bin.resolve() in resolved_restored)
                 )
 
             self.delete_history = [
