@@ -13,6 +13,10 @@ Todo:   More testing Linux / Mac.   Create Windows .exe.   Write better document
 - Improved TurboJPEG setup on Windows by using shared library detection logic in JPEG decoding and thumbnail prefetching.  Thanks to Andy Arijs for the PR!
 - Added Windows documentation for installing turbojpeg.dll, using FASTSTACK_TURBOJPEG_LIB, and understanding fallback behavior.  Thanks to Andy Arijs!
 - FastStack now more clearly explains when it falls back to Pillow for JPEG decoding and thumbnails.  Thanks to Andy Arijs!
+- Recycle bin restore is now per-directory: each bin shows its destination, file counts, and an independent Restore button
+- Bins with legacy files that cannot be auto-restored are clearly labeled instead of silently ignored
+- Restore feedback reports skipped files and legacy remainders
+- RAW decode failures now show a distinct "Preview unavailable" placeholder instead of a plain dark image
 
 ## 1.6.0 (2026-03-06) 
 

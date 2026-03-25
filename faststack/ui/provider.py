@@ -1570,25 +1570,26 @@ class UIState(QObject):
 
     @Property(str, notify=recycleBinStatsTextChanged)
     def recycleBinStatsText(self):
-        """Returns a formatted string of recycle bin stats summary."""
-        stats = self.app_controller.get_recycle_bin_stats()
-        if not stats:
+        """Returns a formatted summary of recycle bin contents."""
+        info = self.app_controller.get_per_bin_restore_info()
+        if not info:
             return ""
 
-        summary = "The following recycle bins contain items:\n"
-        for item in stats:
-            counts = []
-            if item.get("jpg_count", 0) > 0:
-                counts.append(f"{item['jpg_count']} JPG")
-            if item.get("raw_count", 0) > 0:
-                counts.append(f"{item['raw_count']} RAW")
-            if item.get("other_count", 0) > 0:
-                counts.append(f"{item['other_count']} other")
+        total_files = sum(b["total_files"] for b in info)
+        n_bins = len(info)
+        unavailable = [b for b in info if b["status"] == "unavailable"]
 
-            count_str = f" ({', '.join(counts)})" if counts else ""
-            summary += f"\n• {item['path']}:\n  {item['count']} files{count_str}\n"
-
-        summary += "\nDo you want to permanently delete them before quitting?"
+        summary = (
+            f"{total_files} file{'s' if total_files != 1 else ''} "
+            f"in {n_bins} recycle bin{'s' if n_bins != 1 else ''}."
+        )
+        if unavailable:
+            n_un = len(unavailable)
+            summary += (
+                f"\n{n_un} bin{'s' if n_un != 1 else ''} "
+                f"contain{'s' if n_un == 1 else ''} only legacy files "
+                f"and cannot be restored automatically."
+            )
         return summary
 
     @Property(str, notify=recycleBinDetailedTextChanged)
@@ -1628,3 +1629,50 @@ class UIState(QObject):
         """Deletes all tracked recycle bins."""
         self.app_controller.cleanup_recycle_bins()
         self.refreshRecycleBinStats()
+
+    @Slot(result="QVariantList")
+    def getPerBinRestoreInfo(self):
+        """Returns per-bin restore info as a list of JS-compatible dicts.
+
+        Each entry has: bin_id, bin_path, dest_dir, label, status,
+        jpg_count, raw_count, other_count, total_restorable,
+        total_files, legacy_count.
+        """
+        return self.app_controller.get_per_bin_restore_info()
+
+    @Slot(str, result=str)
+    def restoreSingleBin(self, bin_path: str) -> str:
+        """Restore files from a single recycle bin.
+
+        Returns a user-facing status message string.
+        """
+        result = self.app_controller.restore_single_bin(bin_path)
+        self.refreshRecycleBinStats()
+
+        restored = result["restored_count"]
+        skipped = result["skipped_count"]
+        legacy = result["legacy_remaining_count"]
+        dest = result["dest_dir"]
+
+        # Build context-aware feedback message
+        parts = []
+        if restored > 0:
+            parts.append(
+                f"Restored {restored} file{'s' if restored != 1 else ''} to {dest}"
+            )
+        if skipped > 0:
+            parts.append(
+                f"{skipped} skipped (already exist{'s' if skipped == 1 else ''})"
+            )
+
+        msg = ", ".join(parts) if parts else "Nothing to restore"
+
+        if legacy > 0:
+            msg += (
+                f"; {legacy} legacy file{'s' if legacy != 1 else ''} "
+                f"remain{'s' if legacy == 1 else ''} in recycle bin"
+            )
+
+        log.info("Restore result: %s", msg)
+        self.app_controller.update_status_message(msg, timeout=5000)
+        return msg

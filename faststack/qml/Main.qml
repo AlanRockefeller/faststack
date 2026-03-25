@@ -1813,7 +1813,19 @@ ApplicationWindow {
         width: Math.min(600, parent.width * 0.9)
         modal: true
         standardButtons: Dialog.NoButton
-        
+
+        // Single source of truth for per-bin restore info.
+        // Populated on open and after each restore action.
+        property var binInfo: []
+
+        function refreshBinInfo() {
+            if (uiState) {
+                binInfo = uiState.getPerBinRestoreInfo()
+            }
+        }
+
+        onOpened: refreshBinInfo()
+
         // Ensure the dialog is fully opaque and has a solid background
         background: Rectangle {
             color: root.isDarkTheme ? "#1e1e1e" : "#fdfdfd"
@@ -1821,7 +1833,7 @@ ApplicationWindow {
             border.width: 1
             radius: 12
         }
-        
+
         header: Rectangle {
             implicitHeight: 60
             color: root.isDarkTheme ? "#252525" : "#f2f2f2"
@@ -1845,30 +1857,163 @@ ApplicationWindow {
         contentItem: Column {
             id: dialogContent
             width: recycleBinCleanupDialog.width
-            spacing: 20
+            spacing: 16
             topPadding: 10
             bottomPadding: 10
             leftPadding: 20
             rightPadding: 20
-            
+
+            // Summary line
             Label {
                 width: dialogContent.width - 40
                 text: uiState ? uiState.recycleBinStatsText : "Loading..."
                 color: root.isDarkTheme ? "#efefef" : "#333333"
                 wrapMode: Text.WordWrap
-                font.pixelSize: 16
+                font.pixelSize: 15
                 lineHeight: 1.3
             }
 
+            // ---- Per-bin restore rows (restorable bins only) ----
+            Repeater {
+                id: restorableRepeater
+                model: recycleBinCleanupDialog.binInfo.filter(function(b) { return b.status === "restorable" })
+
+                delegate: Rectangle {
+                    width: dialogContent.width - 40
+                    height: binRowLayout.implicitHeight + 20
+                    radius: 8
+                    color: root.isDarkTheme ? "#252525" : "#f2f2f2"
+                    border.color: root.isDarkTheme ? "#333333" : "#e0e0e0"
+                    border.width: 1
+
+                    RowLayout {
+                        id: binRowLayout
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.margins: 12
+                        spacing: 12
+
+                        Column {
+                            Layout.fillWidth: true
+                            spacing: 2
+
+                            Label {
+                                text: modelData.label
+                                color: root.isDarkTheme ? "#efefef" : "#333333"
+                                font.pixelSize: 14
+                                font.bold: true
+                                elide: Text.ElideMiddle
+                                width: parent.width
+                            }
+                            Label {
+                                text: modelData.dest_dir
+                                color: root.isDarkTheme ? "#888888" : "#999999"
+                                font.pixelSize: 11
+                                elide: Text.ElideMiddle
+                                width: parent.width
+                            }
+                            Label {
+                                text: {
+                                    var parts = []
+                                    if (modelData.jpg_count > 0) parts.push(modelData.jpg_count + " JPG")
+                                    if (modelData.raw_count > 0) parts.push(modelData.raw_count + " RAW")
+                                    if (modelData.other_count > 0) parts.push(modelData.other_count + " other")
+                                    var s = parts.join(", ")
+                                    if (modelData.legacy_count > 0)
+                                        s += " + " + modelData.legacy_count + " legacy"
+                                    return s + " \u2014 " + modelData.total_restorable + " restorable"
+                                }
+                                color: root.isDarkTheme ? "#aaaaaa" : "#666666"
+                                font.pixelSize: 13
+                            }
+                        }
+
+                        // Per-bin Restore button
+                        Rectangle {
+                            width: restoreBinBtnText.implicitWidth + 30
+                            height: 34
+                            radius: 17
+                            color: "#4fb360"
+                            Layout.alignment: Qt.AlignVCenter
+
+                            Text {
+                                id: restoreBinBtnText
+                                anchors.centerIn: parent
+                                text: "Restore"
+                                color: "white"
+                                font.pixelSize: 13
+                                font.bold: true
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    if (uiState) {
+                                        uiState.restoreSingleBin(modelData.bin_path)
+                                        recycleBinCleanupDialog.refreshBinInfo()
+                                        // Auto-close if nothing left
+                                        if (recycleBinCleanupDialog.binInfo.length === 0) {
+                                            recycleBinCleanupDialog.close()
+                                        }
+                                    }
+                                }
+                                onEntered: parent.color = "#5cc46d"
+                                onExited: parent.color = "#4fb360"
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Unavailable bins section ----
+            Column {
+                width: dialogContent.width - 40
+                spacing: 6
+                visible: {
+                    var items = recycleBinCleanupDialog.binInfo.filter(function(b) { return b.status === "unavailable" })
+                    return items.length > 0
+                }
+
+                Label {
+                    text: "Not auto-restorable (legacy format)"
+                    color: root.isDarkTheme ? "#ff8a65" : "#bf360c"
+                    font.pixelSize: 14
+                    font.bold: true
+                }
+                Label {
+                    width: parent.width
+                    text: "These bins contain files from an older version without restore metadata. They can only be deleted."
+                    color: root.isDarkTheme ? "#999999" : "#777777"
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                }
+
+                Repeater {
+                    model: recycleBinCleanupDialog.binInfo.filter(function(b) { return b.status === "unavailable" })
+
+                    delegate: Label {
+                        width: dialogContent.width - 40
+                        text: modelData.dest_dir + " \u2014 " + modelData.total_files + " file" + (modelData.total_files !== 1 ? "s" : "")
+                        color: root.isDarkTheme ? "#aaaaaa" : "#666666"
+                        font.pixelSize: 13
+                        elide: Text.ElideMiddle
+                        topPadding: 2
+                    }
+                }
+            }
+
+            // ---- Expandable details section ----
             property bool detailsExpanded: false
 
             Row {
                 width: dialogContent.width - 40
                 spacing: 12
-                
+
                 Label {
-                    text: "Files to be removed:"
-                    color: "#81C784" // Soft green
+                    text: "All files in recycle bins:"
+                    color: "#81C784"
                     font.pixelSize: 15
                     font.bold: true
                     anchors.verticalCenter: parent.verticalCenter
@@ -1911,14 +2056,13 @@ ApplicationWindow {
                 border.width: 1
                 radius: 8
                 clip: true
-                
+
                 Behavior on height { NumberAnimation { duration: 250; easing.type: Easing.OutCubic } }
-                
+
                 ScrollView {
                     id: detailsScrollView
                     anchors.fill: parent
                     anchors.margins: 8
-
 
                     TextArea {
                         id: detailsText
@@ -1937,13 +2081,13 @@ ApplicationWindow {
                     }
                 }
             }
-            
-            // Premium Pill Buttons
+
+            // ---- Action buttons ----
             Row {
                 anchors.horizontalCenter: parent.horizontalCenter
                 spacing: 15
                 topPadding: 10
-                
+
                 // Cancel Button
                 Rectangle {
                     width: cancelBtnText.implicitWidth + 40
@@ -1952,7 +2096,7 @@ ApplicationWindow {
                     color: "transparent"
                     border.color: root.isDarkTheme ? "#555555" : "#cccccc"
                     border.width: 1
-                    
+
                     Text {
                         id: cancelBtnText
                         anchors.centerIn: parent
@@ -1977,7 +2121,7 @@ ApplicationWindow {
                     height: 44
                     radius: 22
                     color: root.isDarkTheme ? "#333333" : "#e0e0e0"
-                    
+
                     Text {
                         id: keepBtnText
                         anchors.centerIn: parent
@@ -2005,8 +2149,8 @@ ApplicationWindow {
                     width: deleteBtnText.implicitWidth + 40
                     height: 44
                     radius: 22
-                    color: "#ef5350" // Premium Red
-                    
+                    color: "#ef5350"
+
                     Text {
                         id: deleteBtnText
                         anchors.centerIn: parent

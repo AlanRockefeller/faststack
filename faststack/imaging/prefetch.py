@@ -31,6 +31,78 @@ from faststack.util.executors import create_daemon_threadpool_executor
 
 log = logging.getLogger(__name__)
 
+# RAW extensions that Pillow typically cannot decode (no embedded JPEG preview).
+# When decode fails for these, we generate a placeholder instead of returning None.
+_RAW_EXTENSIONS = frozenset(
+    {".orf", ".rw2", ".cr2", ".cr3", ".arw", ".nef", ".raf", ".dng"}
+)
+
+
+def _make_raw_placeholder(width: int, height: int) -> np.ndarray:
+    """Generate a themed 'Preview unavailable' placeholder for undecodable RAW files.
+
+    Draws a circle-with-slash icon and centered text so the placeholder is
+    visually distinct from actual image content.  Theme-aware via config.
+    """
+    if width <= 0 or height <= 0:
+        width, height = 256, 256
+
+    # Theme-aware palette
+    theme = config.get("core", "theme", fallback="dark")
+    if theme == "dark":
+        bg_color = (30, 30, 30)
+        text_color = (120, 120, 120)
+        icon_color = (80, 80, 80)
+    else:
+        bg_color = (240, 240, 240)
+        text_color = (140, 140, 140)
+        icon_color = (180, 180, 180)
+
+    from PIL import ImageDraw, ImageFont
+
+    img = PILImage.new("RGB", (width, height), bg_color)
+    draw = ImageDraw.Draw(img)
+
+    cx, cy = width // 2, height // 2
+    short = min(width, height)
+    icon_r = max(10, short // 8)
+
+    # Circle-with-slash "no preview" icon
+    if icon_r >= 10:
+        stroke = max(2, icon_r // 10)
+        icon_cy = cy - icon_r  # icon above center
+        draw.ellipse(
+            [cx - icon_r, icon_cy - icon_r, cx + icon_r, icon_cy + icon_r],
+            outline=icon_color,
+            width=stroke,
+        )
+        draw.line(
+            [cx - icon_r, icon_cy + icon_r, cx + icon_r, icon_cy - icon_r],
+            fill=icon_color,
+            width=stroke,
+        )
+
+    # "Preview unavailable" text below icon
+    text = "Preview unavailable"
+    font_size = max(12, short // 20)
+    try:
+        font = ImageFont.load_default(size=font_size)
+    except TypeError:
+        # Older Pillow without size= parameter
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    text_y = cy + (icon_r // 2 if icon_r >= 10 else 0)
+    draw.text(
+        ((width - tw) // 2, text_y),
+        text,
+        fill=text_color,
+        font=font,
+    )
+
+    return np.array(img)
+
 # ---- Option C: ICC Color Management Setup ----
 SRGB_PROFILE = ImageCms.createProfile("sRGB")
 
@@ -539,7 +611,12 @@ class Prefetcher:
                                 target_path,
                                 e,
                             )
-                            return None
+                            if target_path.suffix.lower() in _RAW_EXTENSIONS:
+                                buffer = _make_raw_placeholder(
+                                    display_width, display_height
+                                )
+                            else:
+                                return None
 
                     img = PILImage.fromarray(buffer)
 
@@ -636,7 +713,12 @@ class Prefetcher:
                         log.warning(
                             "Decode failed index=%d path=%s: %s", index, target_path, e
                         )
-                        return None
+                        if target_path.suffix.lower() in _RAW_EXTENSIONS:
+                            buffer = _make_raw_placeholder(
+                                display_width, display_height
+                            )
+                        else:
+                            return None
 
             if buffer is None:
                 return None
