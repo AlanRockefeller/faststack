@@ -21,6 +21,10 @@ Window {
             if (event.key === Qt.Key_H && controller) {
                 controller.toggle_histogram()
                 event.accepted = true
+            } else if (controller) {
+                // Forward unhandled keys (e.g. arrow keys) to controller
+                controller.handle_key_from_histogram(event.key, event.modifiers)
+                event.accepted = true
             }
         }
     }

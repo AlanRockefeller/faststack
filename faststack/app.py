@@ -198,8 +198,9 @@ class AppController(QObject):
             max_workers=1, thread_name_prefix="Histogram"
         )
         self._hist_inflight = False
-        self._hist_inflight_since: float = 0.0  # monotonic time when inflight was set
+        self._hist_inflight_since: float = 0.0  # monotonic time when worker started
         self._hist_inflight_token: int = 0  # token of the currently inflight job
+        self._hist_inflight_future: Optional[concurrent.futures.Future] = None
         self._hist_pending = None
         self._hist_token = 0
         self._hist_null_retries: int = 0  # consecutive None-result retries
@@ -773,6 +774,14 @@ class AppController(QObject):
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
         self.ui_state.isZoomedChanged.emit()
+
+    @Slot(int, int)
+    def handle_key_from_histogram(self, key: int, modifiers: int):
+        """Forward key presses from the histogram window to the keybinder."""
+        from PySide6.QtGui import QKeyEvent
+
+        event = QKeyEvent(QKeyEvent.Type.KeyPress, key, Qt.KeyboardModifier(modifiers))
+        self.keybinder.handle_key_press(event)
 
     def eventFilter(self, watched, event) -> bool:
         # Don't handle key events when a dialog is open
@@ -5490,15 +5499,18 @@ class AppController(QObject):
         if not self.image_files or self.current_index >= len(self.image_files):
             return
 
-        # Collect all files: current + any in defined batches
+        # Collect files to drag: batch files if any batches exist, otherwise current image
         files_to_drag = set()
-        files_to_drag.add(self.current_index)
 
         # Add all files from defined batches
         for start, end in self.batches:
             for idx in range(start, end + 1):
                 if 0 <= idx < len(self.image_files):
                     files_to_drag.add(idx)
+
+        # Only include current image if no batch files were selected
+        if not files_to_drag:
+            files_to_drag.add(self.current_index)
 
         # Convert to sorted list and get only existing paths
         file_indices = sorted(files_to_drag)
@@ -5957,13 +5969,22 @@ class AppController(QObject):
                 # Safety: if inflight has been stuck for >10s, force-reset it.
                 # This is a defensive fallback against unforeseen edge cases
                 # where the done-callback or signal delivery fails to clear it.
+                if self._hist_inflight_since == 0.0:
+                    return  # Job is queued but hasn't started yet
                 elapsed = time.monotonic() - self._hist_inflight_since
                 if elapsed < 10.0:
                     return
+                # Only force-reset if the Future is actually done (callback was
+                # lost).  If the worker is still running, resetting would just
+                # queue a duplicate behind it on the single-worker executor.
+                fut = self._hist_inflight_future
+                if fut is not None and not fut.done():
+                    return  # Worker is genuinely still running, not lost
                 log.warning(
                     "Histogram inflight stuck for %.1fs, force-resetting", elapsed
                 )
                 self._hist_inflight = False
+                self._hist_inflight_future = None
             if self._hist_pending is None:
                 return
 
@@ -5976,7 +5997,7 @@ class AppController(QObject):
             # Mark as inflight while holding the lock to prevent others from entering
             self._hist_inflight = True
             self._hist_inflight_token = token
-            self._hist_inflight_since = time.monotonic()
+            self._hist_inflight_since = 0.0  # Set when worker actually starts
 
         # Snap the currently known preview data to avoid racing with the editor.
         # Only use cached preview if it matches the current image to prevent stale histograms.
@@ -6024,6 +6045,7 @@ class AppController(QObject):
                 self,
                 target_index,
             )
+            self._hist_inflight_future = fut
             fut.add_done_callback(
                 functools.partial(self._on_histogram_done, submitted_token=token)
             )
@@ -6031,12 +6053,18 @@ class AppController(QObject):
             log.error("Histogram executor failed to submit task: %s", e)
             with self._hist_lock:
                 self._hist_inflight = False
+                self._hist_inflight_future = None
 
     @staticmethod
     def _compute_histogram_worker(
         token, args, decoded, controller=None, target_index=-1
     ):
         # IMPORTANT: do not touch QObjects here except thread-safe plain data
+        # Record when the worker actually starts executing (not when it was queued)
+        if controller:
+            with controller._hist_lock:
+                controller._hist_inflight_since = time.monotonic()
+
         zoom, pan_x, pan_y, image_scale = args
 
         # If data wasn't provided, try to fetch it safely using the controller
@@ -6148,6 +6176,7 @@ class AppController(QObject):
             # must not clear inflight for a newer job that is already running.
             if token == self._hist_inflight_token:
                 self._hist_inflight = False
+                self._hist_inflight_future = None
 
             if hist is not None:
                 if token == self._hist_token:
