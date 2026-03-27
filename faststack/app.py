@@ -198,8 +198,13 @@ class AppController(QObject):
             max_workers=1, thread_name_prefix="Histogram"
         )
         self._hist_inflight = False
+        self._hist_inflight_since: float = 0.0  # monotonic time when worker started
+        self._hist_inflight_token: int = 0  # token of the currently inflight job
+        self._hist_inflight_future: Optional[concurrent.futures.Future] = None
         self._hist_pending = None
         self._hist_token = 0
+        self._hist_null_retries: int = 0  # consecutive None-result retries
+        self._hist_last_args = (1.0, 0.0, 0.0, 1.0)  # last zoom/pan/scale args used
         self._hist_lock = threading.Lock()
         self.histogramReady.connect(self._apply_histogram_result)
         self.previewReady.connect(self._apply_preview_result)
@@ -769,6 +774,16 @@ class AppController(QObject):
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
         self.ui_state.isZoomedChanged.emit()
+
+    @Slot(int, int, str)
+    def handle_key_from_histogram(self, key: int, modifiers: int, text: str):
+        """Forward key presses from the histogram window through eventFilter."""
+        from PySide6.QtGui import QKeyEvent
+
+        event = QKeyEvent(
+            QKeyEvent.Type.KeyPress, key, Qt.KeyboardModifier(modifiers), text
+        )
+        self.eventFilter(self.main_window, event)
 
     def eventFilter(self, watched, event) -> bool:
         # Don't handle key events when a dialog is open
@@ -5486,15 +5501,18 @@ class AppController(QObject):
         if not self.image_files or self.current_index >= len(self.image_files):
             return
 
-        # Collect all files: current + any in defined batches
+        # Collect files to drag: batch files if any batches exist, otherwise current image
         files_to_drag = set()
-        files_to_drag.add(self.current_index)
 
         # Add all files from defined batches
         for start, end in self.batches:
             for idx in range(start, end + 1):
                 if 0 <= idx < len(self.image_files):
                     files_to_drag.add(idx)
+
+        # Only include current image if no batch files were selected
+        if not files_to_drag:
+            files_to_drag.add(self.current_index)
 
         # Convert to sorted list and get only existing paths
         file_indices = sorted(files_to_drag)
@@ -5938,6 +5956,7 @@ class AppController(QObject):
 
         with self._hist_lock:
             self._hist_pending = (zoom, pan_x, pan_y, image_scale)
+            self._hist_null_retries = 0  # Fresh request resets retry counter
             inflight = self._hist_inflight
 
         if not self.histogram_timer.isActive() and not inflight:
@@ -5949,20 +5968,44 @@ class AppController(QObject):
 
         with self._hist_lock:
             if self._hist_inflight:
-                return
+                # Safety: if inflight has been stuck for >10s, force-reset it.
+                # This is a defensive fallback against unforeseen edge cases
+                # where the done-callback or signal delivery fails to clear it.
+                if self._hist_inflight_since == 0.0:
+                    return  # Job is queued but hasn't started yet
+                elapsed = time.monotonic() - self._hist_inflight_since
+                if elapsed < 10.0:
+                    return
+                # Only force-reset if the Future is actually done (callback was
+                # lost).  If the worker is still running, resetting would just
+                # queue a duplicate behind it on the single-worker executor.
+                fut = self._hist_inflight_future
+                if fut is not None and not fut.done():
+                    return  # Worker is genuinely still running, not lost
+                log.warning(
+                    "Histogram inflight stuck for %.1fs, force-resetting", elapsed
+                )
+                self._hist_inflight = False
+                self._hist_inflight_future = None
             if self._hist_pending is None:
                 return
 
             args = self._hist_pending
             self._hist_pending = None
+            self._hist_last_args = args  # Preserve for retry on None result
 
             self._hist_token += 1
             token = self._hist_token
             # Mark as inflight while holding the lock to prevent others from entering
             self._hist_inflight = True
+            self._hist_inflight_token = token
+            self._hist_inflight_since = 0.0  # Set when worker actually starts
 
-        # Snap the currently known preview data to avoid racing with the editor
+        # Snap the currently known preview data to avoid racing with the editor.
+        # Only use cached preview if it matches the current image to prevent stale histograms.
         preview_data = self._last_rendered_preview
+        if preview_data and self._last_rendered_preview_index != self.current_index:
+            preview_data = None
         if not preview_data:
             # Fallback for initial load if no edit preview yet (could use get_decoded_image?)
             # But histogram is mostly for edits. If preview_data is None, we likely can't compute anyway.
@@ -6004,17 +6047,26 @@ class AppController(QObject):
                 self,
                 target_index,
             )
-            fut.add_done_callback(self._on_histogram_done)
+            self._hist_inflight_future = fut
+            fut.add_done_callback(
+                functools.partial(self._on_histogram_done, submitted_token=token)
+            )
         except Exception as e:
             log.error("Histogram executor failed to submit task: %s", e)
             with self._hist_lock:
                 self._hist_inflight = False
+                self._hist_inflight_future = None
 
     @staticmethod
     def _compute_histogram_worker(
         token, args, decoded, controller=None, target_index=-1
     ):
         # IMPORTANT: do not touch QObjects here except thread-safe plain data
+        # Record when the worker actually starts executing (not when it was queued)
+        if controller:
+            with controller._hist_lock:
+                controller._hist_inflight_since = time.monotonic()
+
         zoom, pan_x, pan_y, image_scale = args
 
         # If data wasn't provided, try to fetch it safely using the controller
@@ -6099,14 +6151,16 @@ class AppController(QObject):
         except Exception:
             return token, None
 
-    def _on_histogram_done(self, fut):
+    def _on_histogram_done(self, fut, submitted_token):
         if getattr(self, "_shutting_down", False):
             return
 
         try:
             token, hist = fut.result()
         except Exception:
-            token, hist = None, None
+            # Use the submitted_token so _apply_histogram_result can still
+            # match this completion to the correct inflight job.
+            token, hist = submitted_token, None
 
         # bounce back to UI thread via signal
         self.histogramReady.emit((token, hist))
@@ -6119,15 +6173,35 @@ class AppController(QObject):
         token, hist = payload
 
         with self._hist_lock:
-            self._hist_inflight = False
+            # Only clear inflight if this result is from the current job.
+            # After a force-reset in _kick_histogram_worker, a stale completion
+            # must not clear inflight for a newer job that is already running.
+            if token == self._hist_inflight_token:
+                self._hist_inflight = False
+                self._hist_inflight_future = None
 
             if hist is not None:
                 if token == self._hist_token:
                     self.ui_state.histogramData = hist
                     self.ui_state.highlightStateChanged.emit()
+                    self._hist_null_retries = 0
 
-            # If more updates arrived while we computed, run again soon
+            # If more updates arrived while we computed, run again soon.
+            # Also retry (up to 3 times) if the computation returned None
+            # (image may not have been cached yet after the 50ms timer).
+            # Only retry for the current token — stale completions should not
+            # trigger retries or consume the retry budget.
             pending = self._hist_pending is not None
+            if (
+                not pending
+                and hist is None
+                and token == self._hist_token
+                and self._hist_null_retries < 3
+                and (self.ui_state.isHistogramVisible or self.ui_state.isEditorOpen)
+            ):
+                self._hist_null_retries += 1
+                self._hist_pending = self._hist_last_args
+                pending = True
 
         if pending:
             self.histogram_timer.start()
