@@ -775,13 +775,15 @@ class AppController(QObject):
         self.sync_ui_state()
         self.ui_state.isZoomedChanged.emit()
 
-    @Slot(int, int)
-    def handle_key_from_histogram(self, key: int, modifiers: int):
-        """Forward key presses from the histogram window to the keybinder."""
+    @Slot(int, int, str)
+    def handle_key_from_histogram(self, key: int, modifiers: int, text: str):
+        """Forward key presses from the histogram window through eventFilter."""
         from PySide6.QtGui import QKeyEvent
 
-        event = QKeyEvent(QKeyEvent.Type.KeyPress, key, Qt.KeyboardModifier(modifiers))
-        self.keybinder.handle_key_press(event)
+        event = QKeyEvent(
+            QKeyEvent.Type.KeyPress, key, Qt.KeyboardModifier(modifiers), text
+        )
+        self.eventFilter(self.main_window, event)
 
     def eventFilter(self, watched, event) -> bool:
         # Don't handle key events when a dialog is open
@@ -6187,9 +6189,15 @@ class AppController(QObject):
             # If more updates arrived while we computed, run again soon.
             # Also retry (up to 3 times) if the computation returned None
             # (image may not have been cached yet after the 50ms timer).
+            # Only retry for the current token — stale completions should not
+            # trigger retries or consume the retry budget.
             pending = self._hist_pending is not None
-            if not pending and hist is None and self._hist_null_retries < 3 and (
-                self.ui_state.isHistogramVisible or self.ui_state.isEditorOpen
+            if (
+                not pending
+                and hist is None
+                and token == self._hist_token
+                and self._hist_null_retries < 3
+                and (self.ui_state.isHistogramVisible or self.ui_state.isEditorOpen)
             ):
                 self._hist_null_retries += 1
                 self._hist_pending = self._hist_last_args
