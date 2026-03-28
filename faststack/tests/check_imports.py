@@ -22,8 +22,9 @@ def check_import(module_name: str) -> bool:
 
 
 def main() -> None:
-    # Add current directory to path
-    sys.path.append(os.getcwd())
+    # Add project root directory to path deterministically
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    sys.path.insert(0, project_root)
 
     failures = []
     for module in ["faststack.app", "faststack.tests.test_raw_pipeline"]:
