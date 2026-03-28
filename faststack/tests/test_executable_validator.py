@@ -126,3 +126,46 @@ def test_wrong_executable_name_for_type():
             # Should still pass, but with a warning logged
             is_valid, error = validate_executable_path(wrong_exe, app_type="photoshop")
             assert is_valid  # Name mismatch is warning, not failure
+
+
+def test_strict_mode_allows_double_dot_in_segment_name():
+    """Strict mode should allow '..' inside a normal segment name."""
+    safe_versioned = r"C:\Program Files\Vendor\v1..2\Photoshop.exe"
+
+    with patch("faststack.io.executable_validator.Path") as mock_path:
+        mock_path_instance = MagicMock()
+        mock_path.return_value.resolve.return_value = mock_path_instance
+        mock_path_instance.exists.return_value = True
+        mock_path_instance.is_file.return_value = True
+        mock_path_instance.suffix.lower.return_value = ".exe"
+        mock_path_instance.name = "Photoshop.exe"
+        mock_path_instance.__str__ = lambda self: safe_versioned
+
+        with patch("faststack.io.executable_validator._is_subpath", return_value=True):
+            is_valid, error = validate_executable_path(
+                safe_versioned, app_type="photoshop", allow_custom_paths=False
+            )
+            assert is_valid
+            assert error is None
+
+
+def test_strict_mode_rejects_parent_traversal_segment():
+    """Strict mode should reject '..' as a standalone path segment."""
+    suspicious_path = r"C:\Program Files\..\Windows\System32\malware.exe"
+
+    with patch("faststack.io.executable_validator.Path") as mock_path:
+        mock_path_instance = MagicMock()
+        mock_path.return_value.resolve.return_value = mock_path_instance
+        mock_path_instance.exists.return_value = True
+        mock_path_instance.is_file.return_value = True
+        mock_path_instance.suffix.lower.return_value = ".exe"
+        mock_path_instance.name = "malware.exe"
+        mock_path_instance.__str__ = lambda self: r"C:\Windows\System32\malware.exe"
+
+        with patch("faststack.io.executable_validator._is_subpath", return_value=True):
+            is_valid, error = validate_executable_path(
+                suspicious_path, allow_custom_paths=False
+            )
+            assert not is_valid
+            assert error is not None
+            assert "suspicious path" in error.lower()

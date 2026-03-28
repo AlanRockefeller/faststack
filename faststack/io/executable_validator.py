@@ -2,7 +2,7 @@
 
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -81,10 +81,17 @@ def validate_executable_path(
                 f"Proceeding with caution."
             )
 
-    # Check for suspicious paths (potential directory traversal, etc.)
+    # Check for suspicious paths (explicit parent traversal segments).
+    # Do not reject valid segment names that merely contain ".." (e.g. "v1..2").
     try:
-        normalized = os.path.normpath(exe_path)
-        if ".." in normalized or normalized != str(path):
+        # Parse Windows-style paths with PureWindowsPath so ".." detection
+        # remains correct even when running on non-Windows hosts.
+        if "\\" in exe_path or ":" in exe_path:
+            parts = PureWindowsPath(exe_path).parts
+        else:
+            parts = Path(exe_path).parts
+        has_parent_traversal = ".." in parts
+        if has_parent_traversal:
             log.warning(f"Suspicious path detected: {exe_path}")
             if not allow_custom_paths:
                 return False, f"Suspicious path detected: {exe_path}"
