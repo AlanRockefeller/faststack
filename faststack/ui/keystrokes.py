@@ -1,5 +1,6 @@
 # faststack/ui/keystrokes.py
 import logging
+
 from PySide6.QtCore import Qt
 
 log = logging.getLogger(__name__)

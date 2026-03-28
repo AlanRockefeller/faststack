@@ -1,5 +1,7 @@
 import unittest
+
 import numpy as np
+
 from faststack.imaging.editor import ImageEditor
 
 

@@ -9,23 +9,23 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps, ExifTags
+from PIL import ExifTags, Image, ImageFilter, ImageOps
 
-from faststack.models import DecodedImage
 from faststack.imaging.math_utils import (
-    _srgb_to_linear,
+    _analyze_highlight_state,
+    _apply_headroom_shoulder,
+    _highlight_boost_linear,
+    _highlight_recover_linear,
+    _lerp,
     _linear_to_srgb,
     _smoothstep01,
-    _apply_headroom_shoulder,
-    _analyze_highlight_state,
-    _lerp,
-    _highlight_recover_linear,
-    _highlight_boost_linear,
+    _srgb_to_linear,
 )
-from faststack.imaging.orientation import get_exif_orientation, apply_orientation_to_np
+from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
+from faststack.models import DecodedImage
 
 try:
     from PySide6.QtGui import QImage
@@ -33,7 +33,6 @@ except ImportError:
     QImage = None
 
 from faststack.imaging.optional_deps import cv2
-
 
 log = logging.getLogger(__name__)
 

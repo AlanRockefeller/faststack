@@ -1,12 +1,14 @@
-import pytest
-from unittest.mock import MagicMock, patch
 import shutil
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 # Create a dummy fixture for AppController that uses the real class but mocks dependencies
 @pytest.fixture
 def app_controller(tmp_path):
     from PySide6.QtCore import QCoreApplication
+
     from faststack.app import AppController
 
     # Ensure QCoreApplication exists

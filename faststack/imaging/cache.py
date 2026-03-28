@@ -2,10 +2,11 @@
 
 import inspect
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
-import time
-import threading
+
 from cachetools import Cache, LRUCache
 
 log = logging.getLogger(__name__)

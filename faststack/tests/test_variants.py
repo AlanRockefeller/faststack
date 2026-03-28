@@ -3,12 +3,11 @@
 from pathlib import Path
 
 from faststack.io.variants import (
-    parse_variant_stem,
-    build_variant_map,
     build_badge_list,
+    build_variant_map,
     norm_path,
+    parse_variant_stem,
 )
-
 
 # ── parse_variant_stem ──────────────────────────────────────────────────────
 

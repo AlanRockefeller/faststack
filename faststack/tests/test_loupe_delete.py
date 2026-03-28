@@ -1,7 +1,8 @@
-import pytest
-from unittest.mock import Mock, patch
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import pytest
 
 from faststack.app import AppController
 

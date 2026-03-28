@@ -1,7 +1,7 @@
-import unittest
-from unittest.mock import MagicMock
-from concurrent.futures import Future
 import sys
+import unittest
+from concurrent.futures import Future
+from unittest.mock import MagicMock
 
 # Mock config before importing prefetcher
 sys.modules["faststack.config"] = MagicMock()

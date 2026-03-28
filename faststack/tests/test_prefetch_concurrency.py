@@ -1,7 +1,8 @@
 import threading
 import time
-import pytest
 from pathlib import Path
+
+import pytest
 
 from faststack.imaging.prefetch import Prefetcher
 

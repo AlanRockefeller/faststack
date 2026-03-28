@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 from typing import Optional
+
 import numpy as np
 from PIL import Image
 

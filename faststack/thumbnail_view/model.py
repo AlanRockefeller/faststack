@@ -6,20 +6,20 @@ import time
 from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Callable
+from typing import Callable, Dict, List, Optional, Set
 
 from PySide6.QtCore import (
     QAbstractListModel,
     QModelIndex,
+    Qt,
     QThread,
     QTimer,
-    Qt,
     Signal,
     Slot,
 )
 
-from faststack.io.utils import compute_path_hash, normalize_path_key
 from faststack.io.indexer import find_images
+from faststack.io.utils import compute_path_hash, normalize_path_key
 from faststack.thumbnail_view.folder_stats import (
     FolderStats,
     count_images_in_folder,

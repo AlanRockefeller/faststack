@@ -1,6 +1,8 @@
 import unittest
+
 import numpy as np
 from PIL import Image
+
 from faststack.imaging.editor import ImageEditor
 
 

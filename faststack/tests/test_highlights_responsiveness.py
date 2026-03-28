@@ -1,8 +1,9 @@
-import unittest
-import numpy as np
-import sys
 import os
+import sys
+import unittest
 from unittest.mock import MagicMock
+
+import numpy as np
 
 # Mock dependencies
 sys.modules["cv2"] = MagicMock()

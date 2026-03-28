@@ -1,5 +1,5 @@
-import sys
 import os
+import sys
 from unittest.mock import MagicMock
 
 # Add parent directory to path for standalone execution
@@ -10,6 +10,7 @@ sys.modules["cv2"] = MagicMock()
 
 import unittest
 from unittest.mock import patch
+
 from PIL import Image
 
 from faststack.imaging.editor import ImageEditor

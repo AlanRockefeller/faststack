@@ -1,12 +1,15 @@
-import pytest
-from unittest.mock import MagicMock, patch, Mock
 from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
 from faststack.models import ImageFile
 
 
 @pytest.fixture
 def app_controller(tmp_path):
     from PySide6.QtCore import QCoreApplication
+
     from faststack.app import AppController
 
     app = QCoreApplication.instance()

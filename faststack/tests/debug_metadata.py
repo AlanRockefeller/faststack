@@ -1,8 +1,9 @@
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
 from PIL import ExifTags
-import json
 
 # Add parent directory to path to import faststack
 sys.path.append(str(Path(__file__).parent.parent))

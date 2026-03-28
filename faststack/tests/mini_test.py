@@ -1,7 +1,7 @@
-import sys
-from unittest.mock import MagicMock, patch
 import os
+import sys
 import tempfile
+from unittest.mock import MagicMock, patch
 
 print("START_TEST")
 try:

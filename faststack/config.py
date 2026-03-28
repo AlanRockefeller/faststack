@@ -1,11 +1,11 @@
 """Manages application configuration via an INI file."""
 
 import configparser
-import logging
-import sys
 import glob
+import logging
 import os
 import re
+import sys
 from pathlib import PureWindowsPath
 
 from faststack.logging_setup import get_app_data_dir

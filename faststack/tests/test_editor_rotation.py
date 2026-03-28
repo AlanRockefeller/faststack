@@ -1,11 +1,13 @@
-import pytest
 import math
+
 import numpy as np
+import pytest
 from PIL import Image
+
 from faststack.imaging.editor import (
+    ImageEditor,
     _rotated_rect_with_max_area,
     rotate_autocrop_rgb,
-    ImageEditor,
 )
 
 

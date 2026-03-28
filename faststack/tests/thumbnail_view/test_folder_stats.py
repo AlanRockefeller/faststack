@@ -1,17 +1,19 @@
 """Tests for folder_stats module."""
 
 import json
+
 import pytest
+
 from faststack.thumbnail_view.folder_stats import (
     FolderStats,
-    read_folder_stats,
-    clear_stats_cache,
-    clear_raw_count_cache,
-    _stats_cache,
-    _scan_folder_files,
     _compute_coverage_buckets,
+    _scan_folder_files,
+    _stats_cache,
+    clear_raw_count_cache,
+    clear_stats_cache,
     count_images_in_folder,
     get_file_counts_by_extension,
+    read_folder_stats,
 )
 
 

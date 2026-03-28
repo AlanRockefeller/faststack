@@ -100,8 +100,9 @@ def test_get_decoded_image_size_fallback_metadata():
 
 def test_get_decoded_image_size_fallback_default():
     """Tests fallback when metadata is missing (should default to 4)."""
-    from faststack.imaging.cache import get_decoded_image_size
     from types import SimpleNamespace
+
+    from faststack.imaging.cache import get_decoded_image_size
 
     class MockBuffer:
         pass

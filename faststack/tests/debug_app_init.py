@@ -1,8 +1,10 @@
-from unittest.mock import MagicMock, patch
-from pathlib import Path
-from faststack.app import AppController
-from PySide6.QtWidgets import QApplication
 import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from PySide6.QtWidgets import QApplication
+
+from faststack.app import AppController
 
 # Ensure QApplication exists before AppController is imported/used
 if not QApplication.instance():
@@ -23,8 +25,9 @@ def test_app_init_only():
     ):
 
         # Create QApplication instance
-        from PySide6.QtWidgets import QApplication
         import sys
+
+        from PySide6.QtWidgets import QApplication
 
         if not QApplication.instance():
             _ = QApplication(sys.argv)

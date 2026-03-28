@@ -1,13 +1,15 @@
-import time
 import io
+import time
+
 import numpy as np
 from PIL import Image
+
 from faststack.imaging.jpeg import (
-    decode_jpeg_rgb,
-    _get_turbojpeg_scaling_factor,
-    TURBO_AVAILABLE,
     JPEG_DECODER,
     TJPF_RGB,
+    TURBO_AVAILABLE,
+    _get_turbojpeg_scaling_factor,
+    decode_jpeg_rgb,
 )
 
 

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from faststack.io.indexer import find_images, _find_raw_pair
+from faststack.io.indexer import _find_raw_pair, find_images
 
 
 @pytest.fixture

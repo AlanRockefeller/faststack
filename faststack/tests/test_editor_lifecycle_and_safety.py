@@ -1,7 +1,7 @@
-import unittest
-from unittest.mock import MagicMock, patch
-from pathlib import Path
 import sys
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 # Ensure we can import faststack
 sys.path.append(str(Path(__file__).parents[2]))

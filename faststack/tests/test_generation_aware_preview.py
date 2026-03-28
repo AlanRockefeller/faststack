@@ -1,11 +1,12 @@
-import unittest
-from unittest.mock import MagicMock
-from PySide6.QtGui import QImage
+import os
 
 # Import the class to test (assuming it's importable)
 # We might need to mock imports if they depend on full Qt app structure
 import sys
-import os
+import unittest
+from unittest.mock import MagicMock
+
+from PySide6.QtGui import QImage
 
 # Adjust path to allow imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))

@@ -2,33 +2,34 @@
 
 import logging
 import os
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock
-import threading
-from typing import Dict, Optional, Tuple, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from faststack.imaging.cache import ByteLRUCache
 
-import numpy as np
 import io
-from PIL import Image
 from contextlib import nullcontext
 
-from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
-from faststack.util.executors import create_priority_executor
-from faststack.imaging.orientation import get_exif_orientation, apply_orientation_to_np
-from faststack.io.utils import compute_path_hash
+import numpy as np
+from PIL import Image
+
 import faststack.util.thumb_debug as thumb_debug
+from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
+from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
+from faststack.io.utils import compute_path_hash
+from faststack.util.executors import create_priority_executor
 
 log = logging.getLogger(__name__)
 
 # Optional Qt dispatch so callbacks always run on Qt thread when available
 try:
-    from PySide6.QtCore import QObject, Signal, Qt, QCoreApplication
+    from PySide6.QtCore import QCoreApplication, QObject, Qt, Signal
 
     class _ReadyEmitter(QObject):
         ready = Signal(str)

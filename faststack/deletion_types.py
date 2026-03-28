@@ -6,11 +6,9 @@ and self-documenting field names.
 
 import threading
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
-
-
-from enum import Enum
 
 
 class DeletionErrorCodes(str, Enum):

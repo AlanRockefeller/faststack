@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal, Optional, Union, overload
 
 from faststack.io.indexer import JPG_EXTENSIONS, RAW_EXTENSIONS
-from faststack.models import Sidecar, EntryMetadata
+from faststack.models import EntryMetadata, Sidecar
 
 log = logging.getLogger(__name__)
 KNOWN_IMAGE_EXTENSIONS = frozenset(

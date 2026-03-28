@@ -1,10 +1,11 @@
-import unittest
-import numpy as np
+import os
 
 # Adjust import path if necessary, but faststack is likely installed or in pythonpath
 import sys
-import os
+import unittest
 from unittest.mock import MagicMock
+
+import numpy as np
 
 # Mock cv2 before importing faststack modules that depend on it
 sys.modules["cv2"] = MagicMock()
@@ -84,8 +85,8 @@ class TestHighlightsV2(unittest.TestCase):
             # The hot pixel should be compressed but not NaN
             self.assertLess(out[50, 50, 0], 1000.0)
         except Exception:
-            import traceback
             import sys
+            import traceback
 
             traceback.print_exc(file=sys.__stderr__)
             raise

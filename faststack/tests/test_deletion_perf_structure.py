@@ -1,12 +1,12 @@
-import pytest
-from unittest.mock import MagicMock, patch
+import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+from PySide6.QtWidgets import QApplication
 
 from faststack.app import AppController
 from faststack.models import ImageFile
-
-from PySide6.QtWidgets import QApplication
-import sys
 
 # Ensure QApplication exists before AppController is imported/used in tests
 if not QApplication.instance():

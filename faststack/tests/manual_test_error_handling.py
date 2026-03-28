@@ -1,8 +1,9 @@
-import sys
-from unittest.mock import MagicMock, patch
-import numpy as np
-from pathlib import Path
 import logging
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 # Configure logging to swallow output
 logging.basicConfig(level=logging.CRITICAL)

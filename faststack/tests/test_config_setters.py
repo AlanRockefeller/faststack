@@ -3,7 +3,6 @@ from unittest.mock import MagicMock, patch
 
 # Important: Do NOT mock sys.modules at the top level.
 # This causes pollution that breaks other tests (like test_cache_invalidation.py).
-
 from faststack.app import AppController
 
 

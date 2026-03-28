@@ -1,6 +1,7 @@
 import unittest
-import numpy as np
 from unittest.mock import patch
+
+import numpy as np
 
 # Import the functionality to test
 from faststack.imaging import editor

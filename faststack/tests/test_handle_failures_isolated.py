@@ -1,10 +1,11 @@
-from unittest.mock import MagicMock, patch
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
 from faststack.deletion_types import (
-    DeletionErrorCodes,
-    DeleteResult,
     DeleteFailure,
     DeleteJob,
+    DeleteResult,
+    DeletionErrorCodes,
 )
 
 # Mocks for global functions that might be called

@@ -1,7 +1,8 @@
 import unittest
-from unittest.mock import MagicMock, patch
-import numpy as np
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 # Ensure faststack is in path
 from faststack.imaging.editor import ImageEditor

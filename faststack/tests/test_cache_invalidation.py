@@ -1,8 +1,9 @@
-import sys
 import os
-import time
 import shutil
+import sys
+import time
 from pathlib import Path
+
 import numpy as np
 from PIL import Image
 

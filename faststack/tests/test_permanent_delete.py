@@ -5,8 +5,8 @@ from unittest.mock import Mock, patch
 
 # Import the standalone module, avoiding heavy app imports
 from faststack.io.deletion import (
-    ensure_recycle_bin_dir,
     confirm_permanent_delete,
+    ensure_recycle_bin_dir,
     permanently_delete_image_files,
 )
 

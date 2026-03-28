@@ -1,5 +1,6 @@
 import os
 import unittest
+
 from PIL import Image
 
 try:
@@ -25,9 +26,9 @@ from faststack.imaging.editor import ImageEditor
 
 class TestEditor(unittest.TestCase):
     def test_save_image_preserves_mtime(self):
+        import shutil
         import tempfile
         from pathlib import Path
-        import shutil
 
         tmp_dir = tempfile.mkdtemp()
         try:
@@ -58,9 +59,9 @@ class TestEditor(unittest.TestCase):
 
     def test_texture_edit(self):
         editor = ImageEditor()
+        import shutil
         import tempfile
         from pathlib import Path
-        import shutil
 
         try:
             import cv2

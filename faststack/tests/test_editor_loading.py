@@ -6,12 +6,13 @@ Note: cv2 is imported INSIDE the load_image() function, so we need to
 patch sys.modules['cv2'] before the import happens.
 """
 
+import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+
 import numpy as np
-import tempfile
-import os
 
 
 class TestImageLoadingFallback(unittest.TestCase):

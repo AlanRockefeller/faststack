@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
 from faststack.io.utils import normalize_path_key as norm_path
 
 # Token-boundary regex: match `-developed` as a real dash-delimited token.

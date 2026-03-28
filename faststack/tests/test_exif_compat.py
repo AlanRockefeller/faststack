@@ -1,9 +1,10 @@
-import unittest
-from unittest.mock import MagicMock, patch
 import sys
+import unittest
 from pathlib import Path
-from PIL import Image, ExifTags
+from unittest.mock import MagicMock, patch
+
 import numpy as np
+from PIL import ExifTags, Image
 
 # Ensure project root is in sys.path
 project_root = str(Path(__file__).parents[1])

@@ -1,6 +1,7 @@
 """Tests for ByteLRUCache eviction callbacks."""
 
 import threading
+
 from faststack.imaging.cache import ByteLRUCache
 
 

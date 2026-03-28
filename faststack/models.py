@@ -2,7 +2,7 @@
 
 import dataclasses
 from pathlib import Path
-from typing import Any, Optional, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclasses.dataclass

@@ -1,8 +1,8 @@
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-import pytest
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 # We mock AppController dependencies here

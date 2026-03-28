@@ -21,7 +21,7 @@ def qapp():
 @pytest.fixture
 def thumbnail_model(qapp):
     """Create a ThumbnailModel with fake entries for testing."""
-    from faststack.thumbnail_view.model import ThumbnailModel, ThumbnailEntry
+    from faststack.thumbnail_view.model import ThumbnailEntry, ThumbnailModel
 
     model = ThumbnailModel(
         base_directory=Path("/fake/dir"),

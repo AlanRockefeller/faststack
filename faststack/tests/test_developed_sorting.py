@@ -1,4 +1,5 @@
 import os
+
 from faststack.io.indexer import find_images
 
 

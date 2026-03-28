@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 
 import weakref
-from concurrent.futures.thread import _worker, _threads_queues
+from concurrent.futures.thread import _threads_queues, _worker
 
 
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
