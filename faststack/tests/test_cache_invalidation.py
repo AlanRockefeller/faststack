@@ -68,7 +68,7 @@ def test_cache_stability():
     # Cleanup
     try:
         shutil.rmtree(test_dir)
-    except:
+    except OSError:
         pass
 
 
