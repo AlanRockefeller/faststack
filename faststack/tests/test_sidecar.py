@@ -334,7 +334,7 @@ def test_string_with_path_separator_is_path_normalized(mock_sidecar_dir):
     d = mock_sidecar_dir()
     sm = SidecarManager(d, None)
 
-    meta = sm.get_metadata("subdir/photo.CR2")
+    sm.get_metadata("subdir/photo.CR2")
     expected_key = sm.metadata_key_for_path(Path("subdir/photo.CR2"))
 
     assert expected_key in sm.data.entries

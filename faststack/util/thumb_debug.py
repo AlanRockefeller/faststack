@@ -1,12 +1,12 @@
 """Thumbnail pipeline debug logging and performance tracing."""
 
-import logging
-import time
-import threading
 import itertools
+import logging
+import threading
+import time
 from contextlib import contextmanager
-from typing import Dict, Optional, Any
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 log = logging.getLogger(__name__)
 

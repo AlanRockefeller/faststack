@@ -5,15 +5,15 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 
-from faststack.models import ImageFile
 from faststack.io.variants import (
     VariantGroup,
     build_variant_map,
     norm_path,
     parse_variant_stem,
 )
+from faststack.models import ImageFile
 
 log = logging.getLogger(__name__)
 

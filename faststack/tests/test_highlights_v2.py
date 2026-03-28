@@ -1,10 +1,11 @@
-import unittest
-import numpy as np
+import os
 
 # Adjust import path if necessary, but faststack is likely installed or in pythonpath
 import sys
-import os
+import unittest
 from unittest.mock import MagicMock
+
+import numpy as np
 
 # Mock cv2 before importing faststack modules that depend on it
 sys.modules["cv2"] = MagicMock()
@@ -42,7 +43,7 @@ class TestHighlightsV2(unittest.TestCase):
         # Create a linear image with some headroom
         linear = np.ones((100, 100, 3), dtype=np.float32) * 1.2
         # sRGB mock indicating some clipping (e.g. 255)
-        srgb = np.ones((100, 100, 3), dtype=np.uint8) * 255
+        _srgb = np.ones((100, 100, 3), dtype=np.uint8) * 255
 
         # Setup editor state to simulate the image being loaded
         # We need this because _apply_edits works on self.float_image/preview logic usually,
@@ -84,8 +85,8 @@ class TestHighlightsV2(unittest.TestCase):
             # The hot pixel should be compressed but not NaN
             self.assertLess(out[50, 50, 0], 1000.0)
         except Exception:
-            import traceback
             import sys
+            import traceback
 
             traceback.print_exc(file=sys.__stderr__)
             raise

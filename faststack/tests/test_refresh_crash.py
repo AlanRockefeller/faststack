@@ -1,6 +1,7 @@
-import pytest
-from pathlib import Path
 from unittest.mock import Mock, patch
+
+import pytest
+
 from faststack.thumbnail_view import ThumbnailModel
 
 

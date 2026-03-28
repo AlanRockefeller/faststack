@@ -1,5 +1,6 @@
-import numpy as np
 from typing import Optional
+
+import numpy as np
 
 # ----------------------------
 # sRGB ↔ Linear Conversion Helpers
@@ -199,10 +200,6 @@ def _highlight_recover_linear(
 
     # Use max-channel as brightness metric - handles saturated highlights better than luminance
     brightness = rgb_linear.max(axis=2)
-
-    # Build smooth highlight mask: 0 below pivot, 1 in highlights
-    # Use headroom_ceiling instead of 1.0 for the normalization range
-    mask = _smoothstep01((brightness - pivot) / (headroom_ceiling - pivot + eps))
 
     # Highlights recovery: we want to pull down highlights to reveal detail.
     # Rational compression formula: y = x / (1 + kx).

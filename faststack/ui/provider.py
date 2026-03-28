@@ -1,15 +1,16 @@
 """QML Image Provider and application state bridge."""
 
-import logging
 import collections
+import logging
 import threading
-from PySide6.QtCore import QObject, Signal, Property, Slot, Qt
+from pathlib import Path
+
+from PySide6.QtCore import Property, QObject, Qt, Signal, Slot
 from PySide6.QtGui import QImage
 from PySide6.QtQuick import QQuickImageProvider
 
 from faststack.config import config
 from faststack.imaging.optional_deps import HAS_OPENCV
-from pathlib import Path
 
 # Try to import QColorSpace if available (Qt 6+)
 try:

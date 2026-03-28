@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "faststack"
 version = "1.6.1"
 authors = [
-    { name="Alan Rockefeller"},
+    { name = "Alan Rockefeller" },
 ]
 description = "Ultra-fast JPG Viewer for Focus Stacking Selection"
 readme = "README.md"
@@ -25,13 +25,15 @@ dependencies = [
     "cachetools>=5.0,<6.0",
     "watchdog>=4.0,<5.0",
     "Pillow>=10.0,<11.0",
-    # CRITICAL FIX: OpenCV 4.10+ is required for NumPy 2.0 binary compatibility
+    # OpenCV 4.10+ might be required for NumPy 2.0 binary compatibility
     "opencv-python>=4.10.0,<5.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0,<9.0",
+    "ruff>=0.13,<0.14",
+    "black>=25.0,<26.0",
     "build",
     "twine",
 ]
@@ -54,8 +56,34 @@ minversion = "8.0"
 testpaths = ["faststack/tests"]
 python_files = ["test_*.py"]
 
-# FIX: Add import-mode=importlib to fix resolution errors
+# Use importlib mode to avoid test import-path resolution issues
 addopts = "--import-mode=importlib -p no:cacheprovider -p no:doctest --basetemp=./var/pytest-temp"
 
 norecursedirs = ["var", ".venv", "cache", "faststack.egg-info", "__pycache__"]
 pythonpath = ["."]
+
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"faststack/app.py" = ["E402", "I001", "F401"]
+"faststack/tests/run_loading_tests.py" = ["E402"]
+"faststack/tests/repro_futures_cleanup.py" = ["E402"]
+"faststack/tests/reproduce_exif_bug.py" = ["E402"]
+"faststack/tests/test_exif_compat.py" = ["E402"]
+"faststack/tests/test_headroom_semantics.py" = ["E402"]
+"faststack/tests/test_highlights_responsiveness.py" = ["E402"]
+"faststack/tests/test_highlights_v2.py" = ["E402"]
+"faststack/tests/test_prefetch_logic.py" = ["E402"]
+"faststack/util/executors.py" = ["E402"]
+"faststack/tests/test_highlight_recovery.py" = ["F401"]

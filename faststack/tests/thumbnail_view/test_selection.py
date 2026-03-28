@@ -2,7 +2,7 @@
 
 import pytest
 
-from faststack.thumbnail_view.model import ThumbnailModel, ThumbnailEntry
+from faststack.thumbnail_view.model import ThumbnailEntry, ThumbnailModel
 
 
 @pytest.fixture

@@ -1,4 +1,5 @@
 import unittest
+
 import numpy as np
 
 # We check for modules that might be missing and mock them if needed

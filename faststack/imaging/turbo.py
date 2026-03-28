@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 log = logging.getLogger(__name__)
 
 try:
-    from turbojpeg import TurboJPEG, TJPF_RGB
+    from turbojpeg import TJPF_RGB, TurboJPEG
 except ImportError:  # pragma: no cover - exercised via create_turbojpeg
     TurboJPEG = None
     TJPF_RGB = None

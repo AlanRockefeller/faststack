@@ -1,11 +1,12 @@
-import time
-import threading
 import concurrent.futures
+import threading
+import time
+
 import pytest
+
 from faststack.util.executors import (
-    create_priority_executor,
     create_daemon_threadpool_executor,
-    PriorityExecutor,
+    create_priority_executor,
 )
 
 

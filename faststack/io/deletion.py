@@ -2,8 +2,8 @@
 
 import logging
 from pathlib import Path
-from PySide6.QtWidgets import QMessageBox
 
+from PySide6.QtWidgets import QMessageBox
 
 log = logging.getLogger(__name__)
 

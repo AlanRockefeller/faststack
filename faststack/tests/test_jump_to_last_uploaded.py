@@ -1,8 +1,10 @@
-import pytest
-from unittest.mock import Mock, patch
 from pathlib import Path
+from unittest.mock import Mock, patch
+
+import pytest
+
 from faststack.app import AppController
-from faststack.models import ImageFile, EntryMetadata
+from faststack.models import EntryMetadata, ImageFile
 
 
 @pytest.fixture(scope="session")

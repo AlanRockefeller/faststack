@@ -1,34 +1,39 @@
-import sys
+import importlib
 import os
+import sys
 import traceback
 
-# Add current directory to path
-sys.path.append(os.getcwd())
 
-try:
-    print("Importing faststack.app...")
-    import faststack.app
+def check_import(module_name: str) -> bool:
+    """Try importing a module and print the result."""
+    try:
+        print(f"Importing {module_name}...")
+        importlib.import_module(module_name)
+        print(f"Success {module_name}")
+        return True
+    except ImportError as e:
+        print(f"ImportError {module_name}: {e}")
+        traceback.print_exc()
+        return False
+    except Exception as e:
+        print(f"Non-ImportError during import of {module_name}: {e}")
+        traceback.print_exc()
+        return False
 
-    print("Success faststack.app")
-except ImportError as e:
-    print(f"ImportError faststack.app: {e}")
 
-    traceback.print_exc()
-except Exception as e:
-    print(f"Non-ImportError during import of faststack.app: {e}")
+def main() -> None:
+    # Add current directory to path
+    sys.path.append(os.getcwd())
 
-    traceback.print_exc()
+    failures = []
+    for module in ["faststack.app", "faststack.tests.test_raw_pipeline"]:
+        if not check_import(module):
+            failures.append(module)
 
-try:
-    print("Importing faststack.tests.test_raw_pipeline...")
-    import faststack.tests.test_raw_pipeline
+    if failures:
+        print(f"\nFailed imports: {', '.join(failures)}")
+        sys.exit(1)
 
-    print("Success test_raw_pipeline")
-except ImportError as e:
-    print(f"ImportError test_raw_pipeline: {e}")
 
-    traceback.print_exc()
-except Exception as e:
-    print(f"Non-ImportError during import of test_raw_pipeline: {e}")
-
-    traceback.print_exc()
+if __name__ == "__main__":
+    main()

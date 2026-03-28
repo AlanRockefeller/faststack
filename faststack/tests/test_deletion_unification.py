@@ -1,9 +1,11 @@
-import pytest
-from unittest.mock import Mock, patch
 from pathlib import Path
+from unittest.mock import Mock, patch
+
+import pytest
+
 from faststack.app import AppController
-from faststack.models import ImageFile
 from faststack.deletion_types import DeletionErrorCodes
+from faststack.models import ImageFile
 
 
 @pytest.fixture(scope="session")

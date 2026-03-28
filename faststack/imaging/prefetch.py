@@ -1,19 +1,19 @@
 """Handles prefetching and decoding of adjacent images in a background thread pool."""
 
-import logging
-import os
-import io
 import hashlib
+import io
+import logging
 import mmap
-from pathlib import Path
-from concurrent.futures import Future
-from typing import List, Dict, Optional, Callable
+import os
 import threading
 import time
-
+from concurrent.futures import Future
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
-from PIL import Image as PILImage, ImageCms
+from PIL import Image as PILImage
+from PIL import ImageCms
 
 try:
     from PySide6.QtCore import QTimer
@@ -22,11 +22,11 @@ except ImportError:
     QTimer = None
     QImage = None
 
-from faststack.models import ImageFile, DecodedImage
-from faststack.imaging.jpeg import decode_jpeg_rgb, decode_jpeg_resized
-from faststack.imaging.cache import build_cache_key
-from faststack.imaging.orientation import apply_orientation_to_np
 from faststack.config import config
+from faststack.imaging.cache import build_cache_key
+from faststack.imaging.jpeg import decode_jpeg_resized, decode_jpeg_rgb
+from faststack.imaging.orientation import apply_orientation_to_np
+from faststack.models import DecodedImage, ImageFile
 from faststack.util.executors import create_daemon_threadpool_executor
 
 log = logging.getLogger(__name__)
@@ -102,6 +102,7 @@ def _make_raw_placeholder(width: int, height: int) -> np.ndarray:
     )
 
     return np.array(img)
+
 
 # ---- Option C: ICC Color Management Setup ----
 SRGB_PROFILE = ImageCms.createProfile("sRGB")

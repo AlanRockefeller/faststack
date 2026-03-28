@@ -3,7 +3,8 @@ import math
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
-from PIL import Image, ExifTags
+
+from PIL import ExifTags, Image
 
 log = logging.getLogger(__name__)
 

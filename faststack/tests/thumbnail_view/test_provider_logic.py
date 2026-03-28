@@ -1,16 +1,17 @@
 """Tests for _parse_id logic and cache-hit decode recovery in ThumbnailProvider."""
 
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from faststack.thumbnail_view.provider import (
-    ThumbnailProvider,
-    PLACEHOLDER_COLOR,
-    ERROR_COLOR,
-)
-from faststack.thumbnail_view.prefetcher import ThumbnailCache
+import pytest
 from PySide6.QtCore import QSize
+
+from faststack.thumbnail_view.prefetcher import ThumbnailCache
+from faststack.thumbnail_view.provider import (
+    ERROR_COLOR,
+    PLACEHOLDER_COLOR,
+    ThumbnailProvider,
+)
 
 
 class TestProviderLogic:

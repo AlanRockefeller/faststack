@@ -1,13 +1,12 @@
-import pytest
-import os
-from unittest.mock import MagicMock, call, patch
+import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+from PySide6.QtWidgets import QApplication
 
 from faststack.app import AppController
 from faststack.models import ImageFile
-
-from PySide6.QtWidgets import QApplication
-import sys
 
 # Ensure QApplication exists before AppController is imported/used in tests
 if not QApplication.instance():
@@ -121,9 +120,7 @@ def test_evict_paths_windows_handling():
 
 def test_model_hashing_no_resolve():
     """Verify PathResolver and ThumbnailModel do NOT call resolve()."""
-    from faststack.thumbnail_view.model import ThumbnailModel
     from faststack.thumbnail_view.provider import PathResolver
-    from faststack.models import ImageFile as ModelImageFile
 
     # Mock Path.resolve to raise exception
     with patch(

@@ -1,10 +1,8 @@
-import unittest
-from unittest.mock import MagicMock
-from concurrent.futures import Future, ThreadPoolExecutor
-import threading
-import time
 import sys
+import unittest
+from concurrent.futures import Future
 from pathlib import Path
+from unittest.mock import MagicMock
 
 # Mock config
 sys.modules["faststack.config"] = MagicMock()

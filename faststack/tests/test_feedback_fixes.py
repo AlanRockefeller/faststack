@@ -1,11 +1,13 @@
-import pytest
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+import pytest
+
 from faststack.imaging.cache import ByteLRUCache
-from faststack.models import DecodedImage
 from faststack.imaging.editor import ImageEditor
-from faststack.io.variants import build_variant_map, norm_path
 from faststack.io.indexer import find_images_with_variants
+from faststack.io.variants import build_variant_map, norm_path
+from faststack.models import DecodedImage
 
 
 def test_cache_evict_callback_payload():

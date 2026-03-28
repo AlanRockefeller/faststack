@@ -20,10 +20,6 @@ from collections import deque
 # Must set before importing PySide6
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime.warning=false"
 
-# Type Aliases for readability
-DeletePair = Tuple[Optional[Path], Optional[Path]]  # (src_path, recycle_bin_path)
-DeleteRecord = Tuple[DeletePair, DeletePair]  # (jpg_pair, raw_pair)
-
 import concurrent.futures
 import threading
 import subprocess
@@ -41,7 +37,7 @@ from PySide6.QtCore import (
     QMimeData,
     Qt,
     QPoint,
-    QCoreApplication,
+    QCoreApplication,  # noqa: F401 — patched by tests
 )
 from PySide6.QtWidgets import QApplication, QFileDialog
 from PySide6.QtQml import QQmlApplicationEngine
@@ -52,7 +48,10 @@ Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 from faststack.config import config
 from faststack.logging_setup import setup_logging
 from faststack.models import ImageFile, DecodedImage
-from faststack.io.indexer import find_images, find_images_with_variants
+from faststack.io.indexer import (
+    find_images,
+    find_images_with_variants,
+)  # noqa: F401 — find_images patched by tests
 from faststack.io.variants import (
     VariantGroup,
     build_badge_list,
@@ -6554,10 +6553,15 @@ class AppController(QObject):
                 )
 
             # Coerce elements to int and clamp to [0, 1000]
-            l, t, r, b = [max(0, min(1000, int(x))) for x in crop_box_raw]
+            left, top, right, bottom = [max(0, min(1000, int(x))) for x in crop_box_raw]
 
             # Ensure correct order (left <= right, top <= bottom)
-            crop_box_raw = (min(l, r), min(t, b), max(l, r), max(t, b))
+            crop_box_raw = (
+                min(left, right),
+                min(top, bottom),
+                max(left, right),
+                max(top, bottom),
+            )
 
         except (ValueError, TypeError, AttributeError) as e:
             log.warning("Invalid crop box format: %s", e)
@@ -7536,11 +7540,7 @@ class AppController(QObject):
             if p.exists() and p.is_dir() and p not in pending_bins
         }
         local_bin = self.image_dir / "image recycle bin"
-        if (
-            local_bin.exists()
-            and local_bin.is_dir()
-            and local_bin not in pending_bins
-        ):
+        if local_bin.exists() and local_bin.is_dir() and local_bin not in pending_bins:
             active.add(local_bin)
         return active
 
@@ -7696,9 +7696,8 @@ class AppController(QObject):
                 """True if any recycled path in this record was restored."""
                 (_, jpg_bin), (_, raw_bin) = record
                 return (
-                    (jpg_bin is not None and jpg_bin.resolve() in resolved_restored)
-                    or (raw_bin is not None and raw_bin.resolve() in resolved_restored)
-                )
+                    jpg_bin is not None and jpg_bin.resolve() in resolved_restored
+                ) or (raw_bin is not None and raw_bin.resolve() in resolved_restored)
 
             self.delete_history = [
                 r for r in self.delete_history if not _record_stale(r)

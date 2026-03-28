@@ -69,9 +69,7 @@ def test_all_candidates_fail_emits_one_warning(monkeypatch, caplog):
     assert decoder is None
     assert available is False
 
-    warning_records = [
-        r for r in caplog.records if r.levelno == logging.WARNING
-    ]
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warning_records) == 1
     assert "Falling back to Pillow" in warning_records[0].message
     assert "3 location(s) tried" in warning_records[0].message
@@ -94,9 +92,7 @@ def test_all_candidates_fail_details_at_debug(monkeypatch, caplog):
     with caplog.at_level(logging.DEBUG):
         turbo.create_turbojpeg()
 
-    debug_records = [
-        r for r in caplog.records if r.levelno == logging.DEBUG
-    ]
+    debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
     debug_text = " ".join(r.message for r in debug_records)
     assert "default loader" in debug_text
     assert "C:/one/turbojpeg.dll" in debug_text
@@ -114,9 +110,7 @@ def test_missing_turbojpeg_package_emits_one_warning(monkeypatch, caplog):
     assert decoder is None
     assert available is False
 
-    warning_records = [
-        r for r in caplog.records if r.levelno == logging.WARNING
-    ]
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warning_records) == 1
     assert "PyTurboJPEG not found" in warning_records[0].message
     assert "Pillow" in warning_records[0].message

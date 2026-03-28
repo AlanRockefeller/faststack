@@ -6,10 +6,10 @@ from unittest.mock import MagicMock, patch
 from PySide6.QtWidgets import QApplication
 
 from faststack.deletion_types import (
-    DeletionErrorCodes,
     DeleteFailure,
     DeleteJob,
     DeleteResult,
+    DeletionErrorCodes,
 )
 
 # Ensure QApplication exists before importing/using Qt classes

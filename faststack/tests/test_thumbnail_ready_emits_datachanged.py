@@ -1,12 +1,12 @@
 """Test that _on_thumbnail_ready correctly emits dataChanged for the matching row."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 # Minimal Qt imports needed for the model
-from PySide6.QtCore import Qt, QModelIndex, QCoreApplication
+from PySide6.QtCore import QCoreApplication
 
 
 @pytest.fixture(scope="session")
@@ -21,7 +21,7 @@ def qapp():
 @pytest.fixture
 def thumbnail_model(qapp):
     """Create a ThumbnailModel with fake entries for testing."""
-    from faststack.thumbnail_view.model import ThumbnailModel, ThumbnailEntry
+    from faststack.thumbnail_view.model import ThumbnailEntry, ThumbnailModel
 
     model = ThumbnailModel(
         base_directory=Path("/fake/dir"),

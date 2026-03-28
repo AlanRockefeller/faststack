@@ -1,8 +1,9 @@
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
-import numpy as np
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 # We need to mock cv2 before importing editor if it's not already imported,
 # but since tests run in the same process, we just rely on patching.

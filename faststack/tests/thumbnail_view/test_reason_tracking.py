@@ -1,9 +1,10 @@
 """Tests for thumbnail source reason tracking in ThumbnailModel."""
 
 from pathlib import Path
+
 import pytest
-from PySide6.QtCore import Qt, QModelIndex
-from faststack.thumbnail_view.model import ThumbnailModel, ThumbnailEntry
+
+from faststack.thumbnail_view.model import ThumbnailEntry, ThumbnailModel
 
 
 @pytest.fixture
@@ -95,6 +96,7 @@ def test_clear_next_source_reason_method(model):
 def test_refresh_sets_deferred_clear(model):
     """refresh() should NOT synchronously clear reason."""
     from unittest.mock import patch
+
     from faststack.models import ImageFile
 
     with patch("faststack.thumbnail_view.model.find_images") as mock_find:

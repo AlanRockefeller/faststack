@@ -1,12 +1,12 @@
 """Tests for executable path validation."""
 
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 from faststack.io.executable_validator import (
-    validate_executable_path,
     _is_executable,
     _is_subpath,
+    validate_executable_path,
 )
 
 

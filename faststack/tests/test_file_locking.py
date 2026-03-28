@@ -1,10 +1,10 @@
 """Tests for file locking handling in undo operations."""
 
-import unittest
-from unittest.mock import MagicMock, patch
-from pathlib import Path
-import tempfile
 import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 class TestRestoreBackupSafe(unittest.TestCase):

@@ -1,8 +1,9 @@
-import sys
 import os
-import time
 import shutil
+import sys
+import time
 from pathlib import Path
+
 import numpy as np
 from PIL import Image
 
@@ -68,7 +69,7 @@ def test_cache_stability():
     # Cleanup
     try:
         shutil.rmtree(test_dir)
-    except:
+    except OSError:
         pass
 
 

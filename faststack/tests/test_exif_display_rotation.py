@@ -1,13 +1,13 @@
 """Tests for EXIF orientation correction during display."""
 
-import sys
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ExifTags
+from PIL import ExifTags, Image
 
 # Adjust path to import faststack
 sys.path.insert(0, str(Path(__file__).parents[1]))

@@ -1,11 +1,9 @@
 """Test that _on_thumbnail_ready only fires for matching size IDs."""
 
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-
 from PySide6.QtCore import QCoreApplication
 
 from faststack.io.utils import compute_path_hash

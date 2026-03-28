@@ -1,11 +1,12 @@
-import unittest
-from unittest.mock import MagicMock
-from PySide6.QtGui import QImage
+import os
 
 # Import the class to test (assuming it's importable)
 # We might need to mock imports if they depend on full Qt app structure
 import sys
-import os
+import unittest
+from unittest.mock import MagicMock
+
+from PySide6.QtGui import QImage
 
 # Adjust path to allow imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -49,7 +50,7 @@ class TestGenerationAwarePreview(unittest.TestCase):
         self.mock_controller._last_rendered_preview_gen = 5
 
         # Request with matching generation
-        img = self.provider.requestImage("0/5", None, None)
+        _img = self.provider.requestImage("0/5", None, None)
 
         # Should be the preview (dark gray placeholder if fails, but here we mocked QImage creation?)
         # Wait, requestImage creates a QImage from the buffer.

@@ -1,13 +1,14 @@
-import unittest
-from unittest.mock import MagicMock, patch
-from pathlib import Path
-import tempfile
+import logging
 import shutil
 import subprocess
+import tempfile
+import unittest
+from dataclasses import dataclass
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 from PIL import Image
-from dataclasses import dataclass
-import logging
 
 from faststack.app import AppController
 from faststack.imaging.editor import ImageEditor

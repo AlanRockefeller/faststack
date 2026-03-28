@@ -1,27 +1,25 @@
 """ThumbnailModel for QML GridView with file/folder entries."""
 
-import hashlib
 import logging
 import os
 import time
 from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Callable
+from typing import Callable, Dict, List, Optional, Set
 
 from PySide6.QtCore import (
     QAbstractListModel,
     QModelIndex,
+    Qt,
     QThread,
     QTimer,
-    Qt,
     Signal,
     Slot,
 )
 
-from faststack.models import ImageFile
-from faststack.io.utils import compute_path_hash, normalize_path_key
 from faststack.io.indexer import find_images
+from faststack.io.utils import compute_path_hash, normalize_path_key
 from faststack.thumbnail_view.folder_stats import (
     FolderStats,
     count_images_in_folder,
@@ -411,7 +409,9 @@ class ThumbnailModel(QAbstractListModel):
                         meta = self._get_metadata(img.path)
                         if not isinstance(meta, dict):
                             # Ensure it's a dict before .get()
-                            log.debug("Metadata for %s is not a dict: %r", img.path, meta)
+                            log.debug(
+                                "Metadata for %s is not a dict: %r", img.path, meta
+                            )
                             continue
 
                         if all(meta.get(flag, False) for flag in flags):
@@ -630,9 +630,7 @@ class ThumbnailModel(QAbstractListModel):
                         is_favorite = meta.get("favorite", False)
                         is_todo = meta.get("todo", False)
                     else:
-                        log.debug(
-                            "Metadata for %s is not a dict: %r", img.path, meta
-                        )
+                        log.debug("Metadata for %s is not a dict: %r", img.path, meta)
                 except Exception as e:
                     log.debug("Error getting metadata for %s: %s", img.path, e)
 

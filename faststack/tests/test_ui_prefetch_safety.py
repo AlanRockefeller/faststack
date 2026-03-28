@@ -1,6 +1,7 @@
 import unittest
-from unittest.mock import MagicMock, patch
 from pathlib import Path
+from unittest.mock import MagicMock
+
 from faststack.ui.provider import UIState
 
 

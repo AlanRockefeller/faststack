@@ -1,8 +1,10 @@
 import unittest
-from unittest.mock import MagicMock, patch
 from pathlib import Path
-from faststack.imaging.metadata import get_exif_data, clean_exif_value, get_exif_brief
+from unittest.mock import MagicMock, patch
+
 from PIL import ExifTags
+
+from faststack.imaging.metadata import clean_exif_value, get_exif_brief, get_exif_data
 
 
 class TestMetadata(unittest.TestCase):

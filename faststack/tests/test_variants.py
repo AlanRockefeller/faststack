@@ -1,19 +1,13 @@
 """Tests for variant (backup + developed) parsing, grouping, and integration."""
 
-import os
-import pytest
 from pathlib import Path
-from unittest.mock import MagicMock
 
 from faststack.io.variants import (
-    parse_variant_stem,
-    build_variant_map,
     build_badge_list,
+    build_variant_map,
     norm_path,
-    VariantInfo,
-    VariantGroup,
+    parse_variant_stem,
 )
-
 
 # ── parse_variant_stem ──────────────────────────────────────────────────────
 

@@ -1,9 +1,8 @@
 # faststack/thumbnail_view/model.py
 from __future__ import annotations
 
-import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -242,7 +241,6 @@ class ThumbnailModel(QAbstractListModel):
         Rebuild the entries list based on filesystem + filters.
         """
         cur = self.current_directory.resolve()
-        base = self.base_directory.resolve()
 
         folders: list[ThumbnailEntry] = []
         files: list[ThumbnailEntry] = []

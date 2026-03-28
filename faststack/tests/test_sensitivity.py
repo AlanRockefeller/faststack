@@ -1,6 +1,7 @@
-import numpy as np
-import sys
 import os
+import sys
+
+import numpy as np
 
 # Add parent directory to sys.path to allow importing faststack
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))

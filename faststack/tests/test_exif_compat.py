@@ -1,9 +1,10 @@
-import unittest
-from unittest.mock import MagicMock, patch
 import sys
+import unittest
 from pathlib import Path
-from PIL import Image, ExifTags
+from unittest.mock import MagicMock, patch
+
 import numpy as np
+from PIL import ExifTags, Image
 
 # Ensure project root is in sys.path
 project_root = str(Path(__file__).parents[1])
@@ -137,7 +138,7 @@ class TestExifCompat(unittest.TestCase):
                 return_value=Path("test-backup.jpg"),
             ),
             patch("PIL.Image.fromarray") as mock_fromarray,
-            patch.object(self.editor, "_write_tiff_16bit") as mock_tiff,
+            patch.object(self.editor, "_write_tiff_16bit") as _mock_tiff,
         ):
             mock_img = MagicMock()
             mock_fromarray.return_value = mock_img

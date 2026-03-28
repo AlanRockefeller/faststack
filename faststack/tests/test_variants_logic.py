@@ -1,7 +1,8 @@
-import unittest
 import os
+import unittest
 from pathlib import Path
-from faststack.io.variants import build_variant_map, VariantGroup, norm_path
+
+from faststack.io.variants import build_variant_map, norm_path
 
 
 class TestVariantsLogic(unittest.TestCase):

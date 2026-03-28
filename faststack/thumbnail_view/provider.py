@@ -2,21 +2,20 @@
 
 import logging
 import time
-from urllib.parse import unquote
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, NamedTuple
-
-import faststack.util.thumb_debug as thumb_debug
+from typing import TYPE_CHECKING, NamedTuple, Optional
+from urllib.parse import unquote
 
 from PySide6.QtCore import QSize
-from PySide6.QtGui import QImage, QColor
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtQuick import QQuickImageProvider
 
+import faststack.util.thumb_debug as thumb_debug
 from faststack.io.utils import compute_path_hash
 
 if TYPE_CHECKING:
     from faststack.thumbnail_view.model import ThumbnailModel
-    from faststack.thumbnail_view.prefetcher import ThumbnailPrefetcher, ThumbnailCache
+    from faststack.thumbnail_view.prefetcher import ThumbnailCache, ThumbnailPrefetcher
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +99,7 @@ class ThumbnailProvider(QQuickImageProvider):
 
     def _create_folder_placeholder(self, size: int) -> QImage:
         """Create a folder icon placeholder."""
-        from PySide6.QtGui import QPainter, QPen, QBrush
+        from PySide6.QtGui import QBrush, QPainter, QPen
 
         image = QImage(size, size, QImage.Format.Format_RGB888)
         image.fill(FOLDER_COLOR)

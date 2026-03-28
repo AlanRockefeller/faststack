@@ -1,8 +1,10 @@
-import time
 import io
+import time
+
 import numpy as np
 from PIL import Image
-from faststack.imaging.jpeg import decode_jpeg_resized, TURBO_AVAILABLE
+
+from faststack.imaging.jpeg import TURBO_AVAILABLE, decode_jpeg_resized
 
 
 def create_test_jpeg(width=6000, height=4000):

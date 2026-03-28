@@ -1,7 +1,7 @@
 import hashlib
-import numpy as np
-from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 from faststack.imaging.editor import ImageEditor
 

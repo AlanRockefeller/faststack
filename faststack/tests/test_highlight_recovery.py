@@ -6,8 +6,8 @@ Tests the new brightness-based highlight recovery that:
 - Handles both 16-bit (headroom) and 8-bit (JPEG) sources
 """
 
-import sys
 import os
+import sys
 
 # Add parent directory to path for standalone execution
 sys.path.insert(
@@ -22,14 +22,15 @@ except ImportError:
 
     sys.modules["cv2"] = mock.MagicMock()
 
-import numpy as np
 import time
 
+import numpy as np
+
 from faststack.imaging.math_utils import (
-    _highlight_recover_linear,
-    _highlight_boost_linear,
-    _apply_headroom_shoulder,
     _analyze_highlight_state,
+    _apply_headroom_shoulder,
+    _highlight_boost_linear,
+    _highlight_recover_linear,
 )
 
 

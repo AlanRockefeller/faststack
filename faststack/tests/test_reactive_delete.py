@@ -1,13 +1,15 @@
-import pytest
-import time
-from unittest.mock import MagicMock, patch, Mock
 from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
 from faststack.models import ImageFile
 
 
 @pytest.fixture
 def app_controller(tmp_path):
     from PySide6.QtCore import QCoreApplication
+
     from faststack.app import AppController
 
     app = QCoreApplication.instance()
@@ -101,7 +103,7 @@ def test_async_delete_completion(app_controller):
 
     # 1. Enqueue
     app_controller.delete_current_image()
-    future = app_controller._delete_executor.submit.return_value
+    _future = app_controller._delete_executor.submit.return_value
 
     # 2. Simulate worker side-effects
     recycle_bin = (app_controller.image_dir / "image recycle bin").resolve()
