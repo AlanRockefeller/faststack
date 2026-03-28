@@ -81,10 +81,11 @@ def validate_executable_path(
                 f"Proceeding with caution."
             )
 
-    # Check for suspicious paths (potential directory traversal, etc.)
+    # Check for suspicious paths (explicit parent traversal segments).
+    # Do not reject valid segment names that merely contain ".." (e.g. "v1..2").
     try:
-        normalized = os.path.normpath(exe_path)
-        if ".." in normalized or normalized != str(path):
+        has_parent_traversal = ".." in Path(exe_path).parts
+        if has_parent_traversal:
             log.warning(f"Suspicious path detected: {exe_path}")
             if not allow_custom_paths:
                 return False, f"Suspicious path detected: {exe_path}"
