@@ -353,7 +353,7 @@ ApplicationWindow {
                 if (uiState && uiState.isGridViewActive) return ""
                 var ratio = zs / fs
                 if (Math.abs(ratio - 1.0) < 0.03) return "Zoom: Fit to window (" + Math.round(zs * 100) + "%)"
-                return "Zoom: " + Math.round(ratio * 100) + "%"
+                return "Zoom: " + Math.round(zs * 100) + "%"
             }
         }
 
