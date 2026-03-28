@@ -1,8 +1,6 @@
 import unittest
 from unittest.mock import MagicMock
-from concurrent.futures import Future, ThreadPoolExecutor
-import threading
-import time
+from concurrent.futures import Future
 import sys
 from pathlib import Path
 

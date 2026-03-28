@@ -38,7 +38,7 @@ class TestEditorLifecycleAndSafety(unittest.TestCase):
         self.mock_qapp.instance.return_value.aboutToQuit.connect = MagicMock()
 
         # Instantiate AppController
-        with patch("faststack.app.ImageEditor") as mock_editor_cls:
+        with patch("faststack.app.ImageEditor") as _mock_editor_cls:
             self.controller = AppController(Path("."), self.mock_engine)
             self.mock_editor_instance = self.controller.image_editor
 

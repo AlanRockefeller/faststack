@@ -103,6 +103,7 @@ def _make_raw_placeholder(width: int, height: int) -> np.ndarray:
 
     return np.array(img)
 
+
 # ---- Option C: ICC Color Management Setup ----
 SRGB_PROFILE = ImageCms.createProfile("sRGB")
 

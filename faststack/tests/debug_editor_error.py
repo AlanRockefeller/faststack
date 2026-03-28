@@ -2,11 +2,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 import numpy as np
 from pathlib import Path
-import sys
 
 # Ensure faststack is in path
 from faststack.imaging.editor import ImageEditor
-from PIL import Image
 
 
 class TestDebugError(unittest.TestCase):

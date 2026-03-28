@@ -2,7 +2,6 @@
 
 from pathlib import Path
 import pytest
-from PySide6.QtCore import Qt, QModelIndex
 from faststack.thumbnail_view.model import ThumbnailModel, ThumbnailEntry
 
 

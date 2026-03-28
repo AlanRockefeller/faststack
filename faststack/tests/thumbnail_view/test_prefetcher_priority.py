@@ -1,5 +1,5 @@
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 import pytest
 from pathlib import Path
 from faststack.thumbnail_view.prefetcher import ThumbnailCache, ThumbnailPrefetcher

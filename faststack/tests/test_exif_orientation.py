@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 from PIL import Image, ExifTags
 from unittest.mock import MagicMock, patch
-import sys
 
 from faststack.imaging.editor import ImageEditor
 
@@ -164,7 +163,7 @@ class TestExifOrientation(unittest.TestCase):
         # Current logic: We ALWAYS sanitize to 1 because we bake orientation on load.
         # This prevents "double rotation".
 
-        res = self.editor.save_image(write_developed_jpg=True)
+        self.editor.save_image(write_developed_jpg=True)
         developed_path = Path(self.test_dir) / "working_source-developed.jpg"
 
         with Image.open(developed_path) as dev:

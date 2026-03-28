@@ -8,7 +8,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock
 import threading
-from typing import Dict, Optional, Set, Tuple, Callable, TYPE_CHECKING
+from typing import Dict, Optional, Tuple, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from faststack.imaging.cache import ByteLRUCache

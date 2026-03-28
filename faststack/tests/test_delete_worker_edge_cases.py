@@ -1,6 +1,5 @@
 import threading
-from unittest.mock import MagicMock, patch
-import pytest
+from unittest.mock import patch
 from pathlib import Path
 from faststack.app import AppController
 from faststack.deletion_types import DeletionErrorCodes

@@ -42,7 +42,7 @@ class TestHighlightsV2(unittest.TestCase):
         # Create a linear image with some headroom
         linear = np.ones((100, 100, 3), dtype=np.float32) * 1.2
         # sRGB mock indicating some clipping (e.g. 255)
-        srgb = np.ones((100, 100, 3), dtype=np.uint8) * 255
+        _srgb = np.ones((100, 100, 3), dtype=np.uint8) * 255
 
         # Setup editor state to simulate the image being loaded
         # We need this because _apply_edits works on self.float_image/preview logic usually,

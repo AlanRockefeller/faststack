@@ -49,7 +49,7 @@ class TestGenerationAwarePreview(unittest.TestCase):
         self.mock_controller._last_rendered_preview_gen = 5
 
         # Request with matching generation
-        img = self.provider.requestImage("0/5", None, None)
+        _img = self.provider.requestImage("0/5", None, None)
 
         # Should be the preview (dark gray placeholder if fails, but here we mocked QImage creation?)
         # Wait, requestImage creates a QImage from the buffer.

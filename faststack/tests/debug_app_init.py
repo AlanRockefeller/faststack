@@ -1,4 +1,3 @@
-import pytest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 from faststack.app import AppController
@@ -34,7 +33,7 @@ def test_app_init_only():
 
         mock_engine = MagicMock()
         try:
-            app = AppController(Path("."), mock_engine)
+            _app = AppController(Path("."), mock_engine)
             print("AppController instantiated successfully")
         except Exception as e:
             print(f"AppController instantiation failed: {e}")

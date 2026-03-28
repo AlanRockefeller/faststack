@@ -1,6 +1,5 @@
 import unittest
 from unittest.mock import MagicMock, patch
-import sys
 
 # Important: Do NOT mock sys.modules at the top level.
 # This causes pollution that breaks other tests (like test_cache_invalidation.py).

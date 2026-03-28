@@ -137,7 +137,7 @@ class TestExifCompat(unittest.TestCase):
                 return_value=Path("test-backup.jpg"),
             ),
             patch("PIL.Image.fromarray") as mock_fromarray,
-            patch.object(self.editor, "_write_tiff_16bit") as mock_tiff,
+            patch.object(self.editor, "_write_tiff_16bit") as _mock_tiff,
         ):
             mock_img = MagicMock()
             mock_fromarray.return_value = mock_img

@@ -1,5 +1,4 @@
 import pytest
-import time
 from unittest.mock import MagicMock, patch, Mock
 from pathlib import Path
 from faststack.models import ImageFile
@@ -101,7 +100,7 @@ def test_async_delete_completion(app_controller):
 
     # 1. Enqueue
     app_controller.delete_current_image()
-    future = app_controller._delete_executor.submit.return_value
+    _future = app_controller._delete_executor.submit.return_value
 
     # 2. Simulate worker side-effects
     recycle_bin = (app_controller.image_dir / "image recycle bin").resolve()

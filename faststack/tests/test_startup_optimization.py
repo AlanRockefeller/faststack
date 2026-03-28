@@ -1,5 +1,4 @@
 import sys
-import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
@@ -13,7 +12,7 @@ from PySide6.QtWidgets import QApplication
 @pytest.fixture(scope="session", autouse=True)
 def qapplication():
     if not QApplication.instance():
-        app = QApplication(sys.argv)
+        _app = QApplication(sys.argv)
     yield QApplication.instance()
 
 
