@@ -27,14 +27,14 @@ Window {
     color: backgroundColor
 
     onClosing: (close) => {
-        if (uiState) uiState.isDarkening = false
+        if (controller) controller.toggle_darken_mode()
     }
 
     Shortcut {
         sequence: "Escape"
         context: Qt.WindowShortcut
         onActivated: {
-            if (uiState) uiState.isDarkening = false
+            if (controller) controller.toggle_darken_mode()
         }
     }
 
@@ -395,7 +395,13 @@ Window {
             id: dSlider
             Layout.fillWidth: true
             from: minVal; to: maxVal; stepSize: 1
-            value: parent.value
+
+            // Use Binding so the link to parent.value is re-established
+            // after user interaction (plain "value:" breaks on drag).
+            Binding on value {
+                value: parent.value
+                when: !dSlider.pressed
+            }
 
             property real _pendingValue: 0
             property real _lastSentValue: 0

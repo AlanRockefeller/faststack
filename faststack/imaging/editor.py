@@ -2017,16 +2017,27 @@ class ImageEditor:
             edits_snapshot = self.current_edits.copy()
 
             # --- Deep-snapshot mutable darken state ---
-            ds = edits_snapshot.get("darken_settings")
-            if ds is not None and getattr(ds, "enabled", False):
-                import copy
+            # Always deepcopy DarkenSettings when present so the background
+            # thread never reads the live object (which the main thread can
+            # mutate, e.g. enabling/disabling or changing params).
+            import copy
 
+            ds = edits_snapshot.get("darken_settings")
+            if ds is not None:
                 edits_snapshot["darken_settings"] = copy.deepcopy(ds)
-                live_mask = self._mask_assets.get(ds.mask_id)
-                mask_snapshot = (
-                    copy.deepcopy(live_mask) if live_mask is not None else None
-                )
-                export_cache = MaskRasterCache()
+                if getattr(ds, "enabled", False):
+                    live_mask = self._mask_assets.get(ds.mask_id)
+                    mask_snapshot = (
+                        copy.deepcopy(live_mask)
+                        if live_mask is not None
+                        else None
+                    )
+                    export_cache = MaskRasterCache()
+                else:
+                    # Darken disabled — record the absence explicitly so
+                    # save_from_snapshot does not fall back to live assets.
+                    mask_snapshot = None
+                    export_cache = None
             else:
                 mask_snapshot = None
                 export_cache = None
@@ -2038,13 +2049,18 @@ class ImageEditor:
             main_exif = self._get_sanitized_exif_bytes()
             source_exif = self._source_exif_bytes
 
-        # Build mask override dict
+        # Build mask override dict.  When darken is present but disabled (or
+        # has no mask), provide an empty dict so _apply_edits uses it instead
+        # of falling back to the live self._mask_assets.
         ds_snap = edits_snapshot.get("darken_settings")
-        mask_override = (
-            {ds_snap.mask_id: mask_snapshot}
-            if mask_snapshot is not None and ds_snap is not None
-            else None
-        )
+        if ds_snap is not None:
+            mask_override = (
+                {ds_snap.mask_id: mask_snapshot}
+                if mask_snapshot is not None
+                else {}
+            )
+        else:
+            mask_override = None
 
         original_path = save_target_path if save_target_path else filepath_snapshot
 

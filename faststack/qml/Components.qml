@@ -607,8 +607,13 @@ Item {
             // Darken painting mode
             if (uiState && uiState.isDarkening && !uiState.isCropping && controller) {
                 var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+                var sx = Math.max(0, Math.min(1, imgCoords.x))
+                var sy = Math.max(0, Math.min(1, imgCoords.y))
+                if (imgCoords.x < 0 || imgCoords.x > 1 || imgCoords.y < 0 || imgCoords.y > 1) {
+                    return  // click outside image bounds
+                }
                 var strokeType = (mouse.button === Qt.RightButton) ? "protect" : "add"
-                controller.start_darken_stroke(imgCoords.x, imgCoords.y, strokeType)
+                controller.start_darken_stroke(sx, sy, strokeType)
                 isDarkenPainting = true
                 return
             }
@@ -761,10 +766,12 @@ Item {
             return {x: p.x / mainImage.width, y: p.y / mainImage.height}
         }
         onPositionChanged: function(mouse) {
-            // Darken painting drag
+            // Darken painting drag — clamp to image bounds
             if (isDarkenPainting && controller) {
                 var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
-                controller.continue_darken_stroke(imgCoords.x, imgCoords.y)
+                var cx = Math.max(0, Math.min(1, imgCoords.x))
+                var cy = Math.max(0, Math.min(1, imgCoords.y))
+                controller.continue_darken_stroke(cx, cy)
                 return
             }
 

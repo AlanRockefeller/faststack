@@ -118,9 +118,10 @@ class TestCoordinateTransforms(unittest.TestCase):
     def test_round_trip_no_geometry(self):
         edits = {"rotation": 0, "straighten_angle": 0.0, "crop_box": None}
         xn, yn = 0.3, 0.7
-        px, py = forward_transform(xn, yn, edits, (100, 200))
-        # inverse
-        xr, yr = inverse_transform(xn, yn, edits, (100, 200))
+        shape = (100, 200)  # (H, W)
+        px, py = forward_transform(xn, yn, edits, shape)
+        # Normalise pixel coords back to [0,1] for inverse_transform
+        xr, yr = inverse_transform(px / shape[1], py / shape[0], edits, shape)
         self.assertAlmostEqual(xr, xn, places=5)
         self.assertAlmostEqual(yr, yn, places=5)
 
@@ -364,15 +365,21 @@ class TestMaskRasterCache(unittest.TestCase):
         cache = MaskRasterCache()
         mask = np.zeros((10, 10), dtype=np.float32)
         params = (0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0, "assisted")
-        cache.put_resolved(1, (10, 10), 42, params, mask)
+        img_key = 12345
+        cache.put_resolved(1, (10, 10), 42, params, img_key, mask)
 
-        result = cache.get_resolved(1, (10, 10), 42, params)
+        result = cache.get_resolved(1, (10, 10), 42, params, img_key)
         self.assertIsNotNone(result)
 
         # Different params = miss
         params2 = (0.7, 0.5, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0, "assisted")
-        result2 = cache.get_resolved(1, (10, 10), 42, params2)
+        result2 = cache.get_resolved(1, (10, 10), 42, params2, img_key)
         self.assertIsNone(result2)
+
+        # Different image content = miss
+        img_key2 = 99999
+        result3 = cache.get_resolved(1, (10, 10), 42, params, img_key2)
+        self.assertIsNone(result3)
 
     def test_clear(self):
         cache = MaskRasterCache()
@@ -688,7 +695,7 @@ class TestEditorIntegration(unittest.TestCase):
             # save_from_snapshot uses _apply_edits which still needs `self` for non-darken steps,
             # but the critical darken data comes from the snapshot
             self.assertIsNotNone(result)
-        except Exception:
+        except (OSError, IOError):
             # File ops may fail in test env, but the point is that it doesn't crash
             # trying to read cleared editor state for darken data
             pass

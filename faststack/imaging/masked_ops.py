@@ -75,7 +75,12 @@ def apply_masked_darken(
                     restore = detail[..., np.newaxis] * mask3 * edge_protection * 0.5
                     arr += restore
         except Exception:
-            pass  # fall through — skip edge detail if cv2 is unavailable
+            log.debug(
+                "Edge detail preservation skipped: arr=%s mask3=%s",
+                getattr(arr, "dtype", "?"),
+                getattr(mask3, "dtype", "?"),
+                exc_info=True,
+            )
 
     # Safety clamp — keep in valid range
     np.clip(arr, 0.0, 1.0, out=arr)

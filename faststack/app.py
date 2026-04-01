@@ -247,8 +247,7 @@ class AppController(QObject):
         )
 
         # Deferred-init state: set to safe defaults, populated later by their methods
-        self._save_initiated_path: Optional[str] = None
-        self._saves_in_flight: set = set()  # target paths currently being saved
+        self._saves_in_flight: set = set()  # canonical target paths currently being saved
         self._batch_indices_cache: set = set()
         self._batch_indices_cache_key: Optional[tuple] = None
         self.recycle_bin_dir: Optional[Path] = None
@@ -1572,9 +1571,13 @@ class AppController(QObject):
         if not self.image_editor.original_image:
             return
 
-        # Determine the actual target path for duplicate-save protection
+        # Determine the actual target path for duplicate-save protection.
+        # Normalize to a canonical string so Path vs str never causes a miss.
         save_target_path = self._get_save_target_path_for_current_view()
-        effective_target = save_target_path or self.image_editor.current_filepath
+        raw_target = save_target_path or self.image_editor.current_filepath
+        effective_target = (
+            str(Path(raw_target).resolve()) if raw_target else None
+        )
         if effective_target and effective_target in self._saves_in_flight:
             self.update_status_message("Already saving this image...")
             return
@@ -1598,9 +1601,15 @@ class AppController(QObject):
             self.update_status_message(str(e))
             return
 
-        # Store save token for post-save cleanup decisions
-        self._save_initiated_path = self.image_editor.current_filepath
-        self._save_editor_was_open = self.ui_state.isEditorOpen
+        # Capture save context NOW — these are frozen into the result dict so
+        # _on_save_finished can make cleanup decisions without reading mutable
+        # controller/editor fields that may change during the background save.
+        editor_was_open = self.ui_state.isEditorOpen
+        save_image_key = (
+            self._key(self.image_files[self.current_index].path)
+            if 0 <= self.current_index < len(self.image_files)
+            else None
+        )
 
         # Track in-flight save by target path
         if effective_target:
@@ -1615,20 +1624,27 @@ class AppController(QObject):
         if self.ui_state.isEditorOpen:
             self.ui_state.isEditorOpen = False
 
+        # Build the base context that every result dict carries
+        _ctx = {
+            "target": effective_target,
+            "editor_was_open": editor_was_open,
+            "save_image_key": save_image_key,
+        }
+
         # Submit save work to background thread — operates only on the snapshot
         def do_save():
             """Worker function that runs in background thread."""
             try:
                 result = self.image_editor.save_from_snapshot(export_snapshot)
-                return {"success": True, "result": result, "target": effective_target}
+                return {"success": True, "result": result, **_ctx}
             except RuntimeError as e:
-                return {"success": False, "error": str(e), "target": effective_target}
+                return {"success": False, "error": str(e), **_ctx}
             except Exception as e:
                 log.exception("Unexpected error during save: %s", e)
                 return {
                     "success": False,
                     "error": "Failed to save image",
-                    "target": effective_target,
+                    **_ctx,
                 }
 
         def on_done(future):
@@ -1638,7 +1654,7 @@ class AppController(QObject):
             try:
                 result = future.result()
             except Exception as e:
-                result = {"success": False, "error": str(e), "target": effective_target}
+                result = {"success": False, "error": str(e), **_ctx}
             self._saveFinished.emit(result)
 
         future = self._save_executor.submit(do_save)
@@ -1651,11 +1667,13 @@ class AppController(QObject):
         if self._shutting_down:
             return
 
-        # Always clear saving indicator and in-flight tracking
-        self.ui_state.isSaving = False
+        # Remove completed target from in-flight set, then clear the saving
+        # indicator only when no exports remain in progress.
         target = save_result.get("target")
         if target:
             self._saves_in_flight.discard(target)
+        if not self._saves_in_flight:
+            self.ui_state.isSaving = False
 
         if not save_result.get("success"):
             error_msg = save_result.get("error", "Save failed")
@@ -1668,15 +1686,23 @@ class AppController(QObject):
 
             # --- Post-Save Cleanup ---
 
-            # Full refresh runs whenever we're still viewing the saved image,
-            # regardless of whether the save came from the editor dialog or
-            # another path (e.g. darken workflow).
-            initiated_path = getattr(self, "_save_initiated_path", None)
-            editor_was_open = getattr(self, "_save_editor_was_open", False)
+            # Read frozen save context — these were captured at save-initiation
+            # time and are immune to editor/navigation changes during the save.
+            editor_was_open = save_result.get("editor_was_open", False)
+            save_image_key = save_result.get("save_image_key")
+
+            # Check whether the user is still viewing the image they saved.
+            # Compare via _key() (normalised path) rather than reading
+            # image_editor.current_filepath which may have been cleared.
+            current_image_key = (
+                self._key(self.image_files[self.current_index].path)
+                if 0 <= self.current_index < len(self.image_files)
+                else None
+            )
             still_on_same_image = (
-                self.image_editor.current_filepath
-                and initiated_path
-                and self.image_editor.current_filepath == initiated_path
+                save_image_key is not None
+                and current_image_key is not None
+                and current_image_key == save_image_key
             )
 
             if still_on_same_image:
@@ -5970,15 +5996,28 @@ class AppController(QObject):
         panel open.  The image is silently loaded for editing if it hasn't
         been already.
         """
-        # Ensure the image is loaded for editing (needed for darken processing)
-        # but do NOT open the editor sidebar — the darken panel is independent.
-        if (
+        # Ensure the correct image is loaded for editing (needed for darken
+        # processing).  A stale editor (e.g. user navigated to a different
+        # image after closing the editor) must be reloaded.
+        needs_load = (
             self.image_editor.float_image is None
             or self.image_editor.current_filepath is None
-        ):
-            self.load_image_for_editing()
+        )
+        if not needs_load:
+            try:
+                active = str(self.get_active_edit_path(self.current_index))
+                if str(self.image_editor.current_filepath) != active:
+                    needs_load = True
+            except (IndexError, TypeError):
+                needs_load = True
+        if needs_load:
+            if not self.load_image_for_editing():
+                return  # load failed — abort rather than darken stale data
+            self._reset_darken_on_navigation()
         self._ensure_darken_state()
         self.ui_state.isDarkening = True
+        self._kick_preview_worker()
+        self._update_darken_overlay()
 
     @Slot()
     def toggle_darken_mode(self):
@@ -5997,6 +6036,8 @@ class AppController(QObject):
         else:
             self._ensure_darken_state()
             self.ui_state.isDarkening = True
+            self._kick_preview_worker()
+            self._update_darken_overlay()
 
     def _ensure_darken_state(self):
         """Ensure MaskData and DarkenSettings exist for the darken tool."""

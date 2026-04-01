@@ -356,6 +356,31 @@ def _edge_magnitude(image_arr: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Image-content in-process cache key for cache keying
+# ---------------------------------------------------------------------------
+
+
+def _image_content_key(image_arr: np.ndarray) -> int:
+    """Fast in-process cache key for resolved-mask cache invalidation.
+
+    Priors (dark, neutral, edge) depend on image content, so the cache must
+    be invalidated when edits change the image (exposure, WB, levels, etc.).
+
+    Samples a 4×4 spatial grid across all channels and hashes the raw bytes.
+    This catches both global adjustments and localised edits far more
+    reliably than a handful of single-channel pixel reads.
+    """
+    h, w = image_arr.shape[:2]
+    # 4 evenly-spaced row/col indices (always includes first and last)
+    rows = [0, h // 3, 2 * h // 3, h - 1]
+    cols = [0, w // 3, 2 * w // 3, w - 1]
+    samples = b"".join(
+        image_arr[r, c].tobytes() for r in rows for c in cols
+    )
+    return hash(samples)
+
+
+# ---------------------------------------------------------------------------
 # Mask resolution pipeline
 # ---------------------------------------------------------------------------
 
@@ -377,10 +402,13 @@ def resolve_mask(
     """
     geo_hash = _geometry_hash(edits)
     params_key = settings.params_tuple()
+    img_key = _image_content_key(image_arr)
 
     # --- Try cache ---
     if cache is not None:
-        cached = cache.get_resolved(mask_data.revision, shape, geo_hash, params_key)
+        cached = cache.get_resolved(
+            mask_data.revision, shape, geo_hash, params_key, img_key
+        )
         if cached is not None:
             return cached
 
@@ -463,7 +491,9 @@ def resolve_mask(
     result = np.clip(raw_bg, 0.0, 1.0)
 
     if cache is not None:
-        cache.put_resolved(mask_data.revision, shape, geo_hash, params_key, result)
+        cache.put_resolved(
+            mask_data.revision, shape, geo_hash, params_key, img_key, result
+        )
 
     return result
 
@@ -525,8 +555,9 @@ class MaskRasterCache:
         shape: Tuple[int, int],
         geo_hash: int,
         params_key: tuple,
+        img_key: int = 0,
     ) -> Optional[np.ndarray]:
-        key = (revision, shape, geo_hash, params_key)
+        key = (revision, shape, geo_hash, params_key, img_key)
         if self._resolved_key == key:
             return self._resolved_mask
         return None
@@ -537,7 +568,8 @@ class MaskRasterCache:
         shape: Tuple[int, int],
         geo_hash: int,
         params_key: tuple,
+        img_key: int,
         mask: np.ndarray,
     ) -> None:
-        self._resolved_key = (revision, shape, geo_hash, params_key)
+        self._resolved_key = (revision, shape, geo_hash, params_key, img_key)
         self._resolved_mask = mask

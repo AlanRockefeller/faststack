@@ -114,8 +114,9 @@ If you do nothing, FastStack will still run, but JPEG decoding and thumbnail gen
 
 ## Keyboard Shortcuts
 
-- `J` / `Right Arrow`: Next Image
-- `K` / `Left Arrow`: Previous Image
+- `Right Arrow`: Next Image
+- `Left Arrow`: Previous Image
+- `K`: Mask-based background darkening (smart edge detection, subject protection, multiple modes)
 - `G`: Jump to Image Number
 - `I`: Show EXIF Data
 - `F11`: Toggle Fullscreen (Loupe View)
@@ -133,7 +134,7 @@ If you do nothing, FastStack will still run, but JPEG decoding and thumbnail gen
 - `Ctrl+E`: Toggle edited flag
 - `Ctrl+S`: Toggle stacked flag
 - `Enter`: Launch Helicon Focus with selected RAWs
-- `P`: Edit in Photoshop (uses RAW file if available)
+- `P`: Edit in Photoshop or Gimp (uses RAW file when available)
 - `O` (or Right-Click): Toggle crop mode (Enter to execute, Esc to cancel)
 - `Delete` / `Backspace`: Move image to recycle bin
 - `Ctrl+Z`: Undo last action (delete, auto white balance, or crop)
