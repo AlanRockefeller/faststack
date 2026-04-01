@@ -30,6 +30,9 @@ class ImageProvider(QQuickImageProvider):
         self._app_controller = app_controller  # Backward compatibility alias
         self.placeholder = QImage(256, 256, QImage.Format.Format_RGB888)
         self.placeholder.fill(Qt.GlobalColor.darkGray)
+        # Transparent 1x1 fallback for mask overlays (prevents grey-screen bug)
+        self._transparent = QImage(1, 1, QImage.Format.Format_ARGB32)
+        self._transparent.fill(Qt.GlobalColor.transparent)
         # Keepalive queue to prevent GC of buffers currently in use by QImage
         # Increased to 128 to prevent crashes during rapid scrolling/thrashing where
         # QML might hold onto textures slightly longer than the Python GC expects.
@@ -50,6 +53,15 @@ class ImageProvider(QQuickImageProvider):
             return self.placeholder
 
         try:
+            # Handle mask overlay requests
+            if id.startswith("mask_overlay/"):
+                overlay = getattr(
+                    self.app_controller.ui_state, "_darken_overlay_image", None
+                )
+                if overlay is not None:
+                    return overlay
+                return self._transparent
+
             # Parse index and optional generation
             parts = id.split("/")
             index = int(parts[0])
@@ -226,6 +238,21 @@ class UIState(QObject):
     clarity_changed = Signal(float)
     texture_changed = Signal(float)
 
+    # Background Darkening Signals
+    is_darkening_changed = Signal(bool)
+    darken_overlay_generation_changed = Signal()
+    darken_overlay_visible_changed = Signal(bool)
+    darken_amount_changed = Signal(float)
+    darken_edge_protection_changed = Signal(float)
+    darken_subject_protection_changed = Signal(float)
+    darken_feather_changed = Signal(float)
+    darken_dark_range_changed = Signal(float)
+    darken_neutrality_changed = Signal(float)
+    darken_expand_contract_changed = Signal(float)
+    darken_auto_edges_changed = Signal(float)
+    darken_mode_changed = Signal(str)
+    darken_brush_radius_changed = Signal(float)
+
     # Debug Cache Signals
     debugCacheChanged = Signal(bool)
     cacheStatsChanged = Signal(str)
@@ -289,6 +316,22 @@ class UIState(QObject):
         self._whites = 0.0
         self._clarity = 0.0
         self._texture = 0.0
+
+        # Background Darkening State
+        self._is_darkening = False
+        self._darken_overlay_visible = True
+        self._darken_overlay_generation = 0
+        self._darken_overlay_image = None  # QImage for mask overlay
+        self._darken_amount = 0.5
+        self._darken_edge_protection = 0.5
+        self._darken_subject_protection = 0.5
+        self._darken_feather = 0.5
+        self._darken_dark_range = 0.5
+        self._darken_neutrality = 0.5
+        self._darken_expand_contract = 0.0
+        self._darken_auto_edges = 0.0
+        self._darken_mode = "assisted"
+        self._darken_brush_radius = 0.03
 
         # Debug Cache State
         self._debug_cache = False
@@ -996,6 +1039,19 @@ class UIState(QObject):
         self.cropRotation = 0.0
         self.currentCropBox = (0, 0, 1000, 1000)
         self.currentAspectRatioIndex = 0
+        # Darken tool — use property setters so QML bindings update
+        self.isDarkening = False
+        self.darkenOverlayVisible = True
+        self.darkenAmount = 0.5
+        self.darkenEdgeProtection = 0.5
+        self.darkenSubjectProtection = 0.5
+        self.darkenFeather = 0.5
+        self.darkenDarkRange = 0.5
+        self.darkenNeutrality = 0.5
+        self.darkenExpandContract = 0.0
+        self.darkenAutoEdges = 0.0
+        self.darkenMode = "assisted"
+        self.darkenBrushRadius = 0.03
 
     @Property("QVariant", notify=histogram_data_changed)
     def histogramData(self):
@@ -1295,6 +1351,132 @@ class UIState(QObject):
         if self._texture != new_value:
             self._texture = new_value
             self.texture_changed.emit(new_value)
+
+    # --- Background Darkening Properties ---
+
+    @Property(bool, notify=is_darkening_changed)
+    def isDarkening(self) -> bool:
+        return self._is_darkening
+
+    @isDarkening.setter
+    def isDarkening(self, new_value: bool):
+        if self._is_darkening != new_value:
+            self._is_darkening = new_value
+            self.is_darkening_changed.emit(new_value)
+
+    @Property(bool, notify=darken_overlay_visible_changed)
+    def darkenOverlayVisible(self) -> bool:
+        return self._darken_overlay_visible
+
+    @darkenOverlayVisible.setter
+    def darkenOverlayVisible(self, new_value: bool):
+        if self._darken_overlay_visible != new_value:
+            self._darken_overlay_visible = new_value
+            self.darken_overlay_visible_changed.emit(new_value)
+
+    @Property(int, notify=darken_overlay_generation_changed)
+    def darkenOverlayGeneration(self) -> int:
+        return self._darken_overlay_generation
+
+    @Property(float, notify=darken_amount_changed)
+    def darkenAmount(self) -> float:
+        return self._darken_amount
+
+    @darkenAmount.setter
+    def darkenAmount(self, new_value: float):
+        if self._darken_amount != new_value:
+            self._darken_amount = new_value
+            self.darken_amount_changed.emit(new_value)
+
+    @Property(float, notify=darken_edge_protection_changed)
+    def darkenEdgeProtection(self) -> float:
+        return self._darken_edge_protection
+
+    @darkenEdgeProtection.setter
+    def darkenEdgeProtection(self, new_value: float):
+        if self._darken_edge_protection != new_value:
+            self._darken_edge_protection = new_value
+            self.darken_edge_protection_changed.emit(new_value)
+
+    @Property(float, notify=darken_subject_protection_changed)
+    def darkenSubjectProtection(self) -> float:
+        return self._darken_subject_protection
+
+    @darkenSubjectProtection.setter
+    def darkenSubjectProtection(self, new_value: float):
+        if self._darken_subject_protection != new_value:
+            self._darken_subject_protection = new_value
+            self.darken_subject_protection_changed.emit(new_value)
+
+    @Property(float, notify=darken_feather_changed)
+    def darkenFeather(self) -> float:
+        return self._darken_feather
+
+    @darkenFeather.setter
+    def darkenFeather(self, new_value: float):
+        if self._darken_feather != new_value:
+            self._darken_feather = new_value
+            self.darken_feather_changed.emit(new_value)
+
+    @Property(float, notify=darken_dark_range_changed)
+    def darkenDarkRange(self) -> float:
+        return self._darken_dark_range
+
+    @darkenDarkRange.setter
+    def darkenDarkRange(self, new_value: float):
+        if self._darken_dark_range != new_value:
+            self._darken_dark_range = new_value
+            self.darken_dark_range_changed.emit(new_value)
+
+    @Property(float, notify=darken_neutrality_changed)
+    def darkenNeutrality(self) -> float:
+        return self._darken_neutrality
+
+    @darkenNeutrality.setter
+    def darkenNeutrality(self, new_value: float):
+        if self._darken_neutrality != new_value:
+            self._darken_neutrality = new_value
+            self.darken_neutrality_changed.emit(new_value)
+
+    @Property(float, notify=darken_expand_contract_changed)
+    def darkenExpandContract(self) -> float:
+        return self._darken_expand_contract
+
+    @darkenExpandContract.setter
+    def darkenExpandContract(self, new_value: float):
+        if self._darken_expand_contract != new_value:
+            self._darken_expand_contract = new_value
+            self.darken_expand_contract_changed.emit(new_value)
+
+    @Property(float, notify=darken_auto_edges_changed)
+    def darkenAutoEdges(self) -> float:
+        return self._darken_auto_edges
+
+    @darkenAutoEdges.setter
+    def darkenAutoEdges(self, new_value: float):
+        if self._darken_auto_edges != new_value:
+            self._darken_auto_edges = new_value
+            self.darken_auto_edges_changed.emit(new_value)
+
+    @Property(str, notify=darken_mode_changed)
+    def darkenMode(self) -> str:
+        return self._darken_mode
+
+    @darkenMode.setter
+    def darkenMode(self, new_value: str):
+        if self._darken_mode != new_value:
+            self._darken_mode = new_value
+            self.darken_mode_changed.emit(new_value)
+
+    @Property(float, notify=darken_brush_radius_changed)
+    def darkenBrushRadius(self) -> float:
+        return self._darken_brush_radius
+
+    @darkenBrushRadius.setter
+    def darkenBrushRadius(self, new_value: float):
+        if self._darken_brush_radius != new_value:
+            self._darken_brush_radius = new_value
+            self.darken_brush_radius_changed.emit(new_value)
 
     # --- Debug Cache Properties ---
 

@@ -1110,6 +1110,21 @@ ApplicationWindow {
         }
     }
 
+    // Background Darkening Tool (K) — independent of the editor sidebar
+    Shortcut {
+        sequence: "K"
+        context: Qt.ApplicationShortcut
+        enabled: uiState ? !uiState.isDialogOpen && !uiState.isCropping : false
+        onActivated: {
+            if (!uiState || !controller) return
+            if (uiState.isDarkening) {
+                controller.toggle_darken_mode()
+            } else {
+                controller.open_darken_tool()
+            }
+        }
+    }
+
     // Grid View Toggle (T for Thumbnails)
     Shortcut {
         sequence: "T"
@@ -1471,7 +1486,9 @@ ApplicationWindow {
             Label {
                 id: statusMessageLabel
                 text: uiState ? uiState.statusMessage : ""
-                color: root.currentTextColor
+                color: (uiState && uiState.isSaving) ? "#4CAF50" : root.currentTextColor
+                font.bold: (uiState && uiState.isSaving) ? true : false
+                font.pixelSize: (uiState && uiState.isSaving) ? 14 : 12
                 visible: uiState ? (uiState.statusMessage !== "") : false
                 Layout.rightMargin: 10
             }
@@ -1625,8 +1642,8 @@ ApplicationWindow {
                     width: 450
                     text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
                           "<b>Navigation:</b><br>" +
-                          "&nbsp;&nbsp;J / Right Arrow: Next Image<br>" +
-                          "&nbsp;&nbsp;K / Left Arrow: Previous Image<br>" +
+                          "&nbsp;&nbsp;Right Arrow: Next Image<br>" +
+                          "&nbsp;&nbsp;Left Arrow: Previous Image<br>" +
                           "&nbsp;&nbsp;G: Jump to Image Number<br>" +
                           "&nbsp;&nbsp;Alt+U: Jump to Last Uploaded<br>" +
                           "&nbsp;&nbsp;I: Show EXIF Data<br>" +
@@ -1681,6 +1698,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;Ctrl+S (in editor): Save edited image<br>" +
                           "&nbsp;&nbsp;A: Quick auto white balance<br>" +
                           "&nbsp;&nbsp;L: Quick auto levels<br>" +
+                          "&nbsp;&nbsp;K: Background Darkening Tool<br>" +
                           "&nbsp;&nbsp;O (or right-click): Toggle crop mode<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;1/2/3/4: Set aspect ratio (1:1, 4:3, 3:2, 16:9)<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;Enter: Execute crop<br>" +
@@ -1763,6 +1781,10 @@ ApplicationWindow {
                 mainViewLoader.forceActiveFocus()
             }
         }
+    }
+
+    DarkenToolPanel {
+        id: darkenToolPanel
     }
 
     function show_jump_to_image_dialog() {

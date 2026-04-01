@@ -2,6 +2,21 @@
 
 Todo:   More testing Linux / Mac.   Create Windows .exe.   Write better documentation / help.   Add splash screen / icon.   Fix raw image support.
 
+## 1.6.2 (2026-03-28)
+
+- Added a reusable soft-mask subsystem for local adjustments (mask model, mask engine, masked operations).
+- Added a Background Darkening tool (K key) as the first consumer of the mask system.
+  - Paint rough background hints (left-click) and subject protection (right-click).
+  - Strokes act as smart hints combined with image analysis, not hard mattes.
+  - Modes: Assisted, Paint Only, Strong Subject Protection, Border-Connected Auto.
+  - Controls: darken amount, edge protection, subject protection, feather, dark range, neutrality, expand/contract, auto from edges.
+  - Configurable mask overlay (blue default, selectable colours, toggle visibility).
+  - Darkening uses pedestal subtraction + multiplicative darkening for natural results.
+  - Mask data stored in normalised coordinates, survives rotate/straighten/crop changes.
+- Added "Darken Background (K)" button in the Image Editor effects section.
+- J and K keys no longer navigate to next/previous image. Use arrow keys instead.
+- K key now opens the Background Darkening tool (works from loupe view or inside the editor).
+
 ## 1.6.1 (2026-03-13)
 
 - Added a slim custom title bar with hover-revealed menus.

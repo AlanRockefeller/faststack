@@ -73,6 +73,13 @@ Window {
             // Note: Editor closes automatically via _on_save_finished callback
         }
     }
+    Shortcut {
+        sequence: "K"
+        context: Qt.WindowShortcut
+        onActivated: {
+            if (controller) controller.toggle_darken_mode()
+        }
+    }
 
     // Component for Section Separator
     Component {
@@ -318,6 +325,27 @@ Window {
                     ListElement { name: "Vignette"; key: "vignette"; min: 0; max: 100 }
                 }
                 Repeater { model: effectsModel; delegate: editSlider }
+
+                Button {
+                    text: "Darken Background (K)"
+                    Layout.fillWidth: true
+                    font.pixelSize: 12
+                    onClicked: {
+                        if (controller) controller.toggle_darken_mode()
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        font: parent.font
+                        color: (uiState && uiState.isDarkening) ? "white" : imageEditorDialog.textColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        color: (uiState && uiState.isDarkening) ? imageEditorDialog.accentColor : (parent.pressed ? "#40ffffff" : "#20ffffff")
+                        radius: 4
+                        border.color: parent.hovered ? "#60ffffff" : "transparent"
+                    }
+                }
 
                 Loader { sourceComponent: sectionSeparator }
 

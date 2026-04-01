@@ -27,6 +27,10 @@ from faststack.imaging.math_utils import (
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.models import DecodedImage
 
+# Mask subsystem (lazy imports avoided — lightweight dataclasses)
+from faststack.imaging.mask import DarkenSettings, MaskData
+from faststack.imaging.mask_engine import MaskRasterCache
+
 try:
     from PySide6.QtGui import QImage
 except ImportError:
@@ -358,6 +362,10 @@ class ImageEditor:
         # keyed on (round(blacks, 3), round(whites, 3)).
         self._cached_u8_lut: Optional[Tuple[Tuple[float, float], List[int]]] = None
 
+        # Mask subsystem — generic mask assets keyed by tool id
+        self._mask_assets: Dict[str, MaskData] = {}
+        self._mask_raster_cache = MaskRasterCache()
+
     def clear(self):
         """Clear all editor state so the next edit starts from a clean slate."""
         with self._lock:
@@ -374,6 +382,8 @@ class ImageEditor:
             self._cached_highlight_analysis = None
             self._cached_detail_bands = None
             self._cached_u8_lut = None
+            self._mask_assets.clear()
+            self._mask_raster_cache.clear()
         # Optionally also reset edits if that matches your mental model:
         # self.current_edits = self._initial_edits()
 
@@ -411,6 +421,7 @@ class ImageEditor:
             "clarity": 0.0,
             "texture": 0.0,
             "straighten_angle": 0.0,
+            "darken_settings": None,  # DarkenSettings or None
         }
 
     @staticmethod
@@ -458,12 +469,16 @@ class ImageEditor:
             except (ValueError, TypeError):
                 return 1.0  # Safe default: treat as "active" to skip optimization
 
+        darken = edits.get("darken_settings")
+        darken_active = darken is not None and getattr(darken, "enabled", False)
+
         return (
             ImageEditor._edits_skip_linear(edits)
             and abs(_get_f("vignette")) <= 0.001
             and edits.get("rotation", 0) == 0
             and abs(_get_f("straighten_angle")) <= 0.001
             and not edits.get("crop_box")
+            and not darken_active
         )
 
     def load_image(
@@ -509,6 +524,9 @@ class ImageEditor:
             # Clear previous cached EXIF and set new one if provided
             self.current_mtime = new_mtime
             self._source_exif_bytes = source_exif
+            # Clear mask state from previous image
+            self._mask_assets.clear()
+            self._mask_raster_cache.clear()
 
         try:
             # We must load and close the original file handle immediately
@@ -731,6 +749,8 @@ class ImageEditor:
         edits: Optional[Dict[str, Any]] = None,
         *,
         for_export: bool = False,
+        mask_assets_override: Optional[Dict[str, "MaskData"]] = None,
+        cache_override: Optional["MaskRasterCache"] = None,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
         Returns float32 array (H, W, 3).
@@ -1280,6 +1300,32 @@ class ImageEditor:
             if abs(wp - bp) < 0.0001:
                 wp = bp + 0.0001
             arr = (arr - bp) / (wp - bp)
+
+        # 13.5. Background Darkening (masked, after levels, before vignette)
+        darken = edits.get("darken_settings")
+        if darken is not None and getattr(darken, "enabled", False):
+            # Use override assets/cache if provided (export snapshot), else live state
+            _assets = mask_assets_override if mask_assets_override is not None else self._mask_assets
+            _cache = cache_override if cache_override is not None else self._mask_raster_cache
+            mask_data = _assets.get(darken.mask_id)
+            if mask_data is not None and mask_data.has_strokes():
+                from faststack.imaging.mask_engine import resolve_mask
+                from faststack.imaging.masked_ops import apply_masked_darken
+
+                resolved = resolve_mask(
+                    mask_data,
+                    darken,
+                    arr,
+                    arr.shape[:2],
+                    edits,
+                    cache=_cache,
+                )
+                arr = apply_masked_darken(
+                    arr,
+                    resolved,
+                    darken_amount=darken.darken_amount,
+                    edge_protection=darken.edge_protection,
+                )
 
         # 14. Vignette
         vignette = edits.get("vignette", 0.0)
@@ -1917,29 +1963,23 @@ class ImageEditor:
                 if self.float_image is None:
                     self.float_image = float_arr
 
-    def save_image(
+    def snapshot_for_export(
         self,
         write_developed_jpg: bool = False,
         developed_path: Optional[Path] = None,
         save_target_path: Optional[Path] = None,
-    ) -> Optional[Tuple[Path, Path]]:
-        """Saves the edited image, backing up the original.
+    ) -> Dict[str, Any]:
+        """Capture an immutable export snapshot on the calling thread.
 
-        Args:
-            write_developed_jpg: If True, also create a `-developed.jpg` sidecar file.
-                                 This should be True only when editing RAW files.
-            developed_path: Optional explicit path for the developed JPG.
-                            If not provided, it's derived from current_filepath.
-            save_target_path: Optional override for the output path. When saving
-                              from a variant (backup/developed), this should be
-                              the Main file's path. Backup is created for Main,
-                              the variant source file is left untouched.
+        Must be called on the main thread BEFORE submitting to a background
+        executor.  The returned dict contains everything needed to produce the
+        final output — no live ``ImageEditor`` state is required afterwards.
 
         Returns:
-            A tuple of (saved_path, backup_path) on success, otherwise None.
+            A dict with all export-critical data.
 
         Raises:
-            RuntimeError: If preconditions are not met (no path, no image) or if saving fails.
+            RuntimeError: If preconditions are not met (no path, no image).
         """
         if self.current_filepath is None:
             raise RuntimeError("No file path set")
@@ -1949,51 +1989,119 @@ class ImageEditor:
         # Ensure float master exists (preview_only loads may not have it)
         self._ensure_float_image()
 
+        with self._lock:
+            if self.float_image is None:
+                raise RuntimeError(
+                    "snapshot_for_export called with no float_image"
+                )
+
+            # --- Source image ---
+            _safe_no_copy = self._edits_can_share_input(self.current_edits)
+            if _safe_no_copy:
+                source_arr = self.float_image
+                log.debug("snapshot_for_export: skipping float_image.copy() (safe no-copy path)")
+            else:
+                source_arr = self.float_image.copy()
+
+            source_shape = self.float_image.shape[:2]  # for debug logging
+
+            # --- Edits (shallow dict copy) ---
+            edits_snapshot = self.current_edits.copy()
+
+            # --- Deep-snapshot mutable darken state ---
+            ds = edits_snapshot.get("darken_settings")
+            if ds is not None and getattr(ds, "enabled", False):
+                import copy
+
+                edits_snapshot["darken_settings"] = copy.deepcopy(ds)
+                live_mask = self._mask_assets.get(ds.mask_id)
+                mask_snapshot = copy.deepcopy(live_mask) if live_mask is not None else None
+                export_cache = MaskRasterCache()
+            else:
+                mask_snapshot = None
+                export_cache = None
+
+            # --- Paths ---
+            filepath_snapshot = self.current_filepath
+
+            # --- EXIF (may read original_image and _source_exif_bytes) ---
+            main_exif = self._get_sanitized_exif_bytes()
+            source_exif = self._source_exif_bytes
+
+        # Build mask override dict
+        ds_snap = edits_snapshot.get("darken_settings")
+        mask_override = (
+            {ds_snap.mask_id: mask_snapshot}
+            if mask_snapshot is not None and ds_snap is not None
+            else None
+        )
+
+        original_path = save_target_path if save_target_path else filepath_snapshot
+
+        return {
+            "source_arr": source_arr,
+            "source_shape": source_shape,
+            "edits": edits_snapshot,
+            "mask_override": mask_override,
+            "export_cache": export_cache,
+            "original_path": original_path,
+            "filepath_snapshot": filepath_snapshot,
+            "main_exif": main_exif,
+            "source_exif": source_exif,
+            "write_developed_jpg": write_developed_jpg,
+            "developed_path": developed_path,
+        }
+
+    def save_from_snapshot(
+        self, snapshot: Dict[str, Any]
+    ) -> Optional[Tuple[Path, Path]]:
+        """Run the full-resolution export from a pre-captured snapshot.
+
+        This method is safe to call from a background thread — it does NOT
+        read any live ``ImageEditor`` state for export-critical data.
+        All mutable state comes from the *snapshot* dict produced by
+        ``snapshot_for_export()``.
+
+        Returns:
+            A tuple of (saved_path, backup_path) on success, otherwise None.
+
+        Raises:
+            RuntimeError: If saving fails.
+        """
+        source_arr = snapshot["source_arr"]
+        edits_snapshot = snapshot["edits"]
+        mask_override = snapshot["mask_override"]
+        export_cache = snapshot["export_cache"]
+        original_path = snapshot["original_path"]
+        main_exif = snapshot["main_exif"]
+        source_exif = snapshot["source_exif"]
+        write_developed_jpg = snapshot["write_developed_jpg"]
+        developed_path = snapshot["developed_path"]
+        source_shape = snapshot["source_shape"]
+
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
 
-        # 1. Apply Edits to Full Resolution
-        # Snapshot state under lock to avoid races
-        with self._lock:
-            # Re-check float image existence under lock (though _ensure calls it too)
-            # Previously returned None, now raising to be explicit about failure
-            if self.float_image is None:
-                raise RuntimeError(
-                    "save_image called with no float_image (race condition?)"
-                )
-
-            # Determine if we can skip copy
-            _safe_no_copy = self._edits_can_share_input(self.current_edits)
-
-            # Snapshot the source data
-            # If safe to share (read-only), we just grab the reference
-            # If not safe, we MUST copy it here while holding the lock
-            if _safe_no_copy:
-                source_arr = self.float_image
-                log.debug("save_image: skipping float_image.copy() (safe no-copy path)")
-            else:
-                source_arr = self.float_image.copy()
-
-            # Snapshot edits
-            edits_snapshot = self.current_edits.copy()
-
-        # Expensive computation runs WITHOUT the lock
+        # 1. Apply edits to full resolution — uses only snapshot data
         final_float = self._apply_edits(
-            source_arr, edits=edits_snapshot, for_export=True
+            source_arr,
+            edits=edits_snapshot,
+            for_export=True,
+            mask_assets_override=mask_override,
+            cache_override=export_cache,
         )  # (H,W,3) float32
 
         if _debug:
             t_edits = time.perf_counter()
 
-        original_path = save_target_path if save_target_path else self.current_filepath
         try:
             original_stat = original_path.stat()
         except OSError as e:
             log.warning("Unable to read timestamps for %s: %s", original_path, e)
             original_stat = None
 
-        # 2. Backup (always backs up original_path, which is Main when save_target_path is set)
+        # 2. Backup
         backup_path = create_backup_file(original_path)
         if backup_path is None:
             return None
@@ -2005,39 +2113,24 @@ class ImageEditor:
             is_tiff = original_path.suffix.lower() in [".tif", ".tiff"]
 
             if is_tiff:
-                # Save as 16-bit TIFF using custom writer
                 self._write_tiff_16bit(original_path, final_float)
             else:
-                # Determine EXIF bytes to write
-                exif_bytes = None
-                if self.original_image:
-                    # We NO LONGER check transforms_applied here because we ALWAYS
-                    # bake orientation into the pixel buffer on load for consistency.
-                    # Thus, we ALWAYS sanitize the Orientation tag to 1 to prevent "double rotation".
-                    exif_bytes = self._get_sanitized_exif_bytes()
-
-                # Save as standard format (Likely JPG) using Pillow
-                # Convert to uint8
-                # Legacy soft shoulder moved to linear space (_apply_headroom_shoulder)
-                # converted via _linear_to_srgb in _apply_edits, so final_float is already sRGB.
-                # Just clip to valid range.
                 arr_u8 = (np.clip(final_float, 0.0, 1.0) * 255).astype(np.uint8)
                 img_u8 = Image.fromarray(arr_u8, mode="RGB")
 
                 save_kwargs = {"quality": 95}
-                if exif_bytes:
-                    save_kwargs["exif"] = exif_bytes
+                if main_exif:
+                    save_kwargs["exif"] = main_exif
 
                 try:
                     img_u8.save(original_path, **save_kwargs)
                 except Exception:
-                    # Fallback without EXIF
                     img_u8.save(original_path)
 
             if original_stat is not None:
                 self._restore_file_times(original_path, original_stat)
 
-            # 4. Save Sidecar JPG (-developed.jpg) - only when explicitly requested
+            # 4. Save Sidecar JPG (-developed.jpg) — only when explicitly requested
             if write_developed_jpg:
                 if developed_path is None:
                     stem = original_path.stem
@@ -2045,29 +2138,16 @@ class ImageEditor:
                         stem = stem[:-8]
                     developed_path = original_path.with_name(f"{stem}-developed.jpg")
 
-                # Check for geometric transforms (re-check not strictly needed but for clarity)
                 rotation = edits_snapshot.get("rotation", 0)
                 straighten_angle = float(edits_snapshot.get("straighten_angle", 0.0))
                 transforms_applied = (rotation != 0) or (abs(straighten_angle) > 0.001)
 
-                # Determine EXIF for sidecar - prefer source EXIF (from paired JPEG)
                 exif_bytes = None
                 if transforms_applied:
-                    # Use sanitized EXIF (orientation reset to 1)
-                    exif_bytes = self._get_sanitized_exif_bytes()
-                elif self._source_exif_bytes:
-                    # Use cached source EXIF from paired JPEG
-                    # Must sanitize orientation because we baked it on load!
-                    exif_bytes = sanitize_exif_orientation(self._source_exif_bytes)
-                elif self.original_image:
-                    # Fallback to current image's EXIF (may be empty for TIFFs)
-                    # Must sanitize orientation because we baked it on load!
-                    exif_bytes = sanitize_exif_orientation(
-                        self.original_image.info.get("exif")
-                    )
+                    exif_bytes = main_exif
+                elif source_exif:
+                    exif_bytes = sanitize_exif_orientation(source_exif)
 
-                # Use the same uint8 data
-                # Legacy soft shoulder moved to linear space
                 arr_u8 = (np.clip(final_float, 0.0, 1.0) * 255).astype(np.uint8)
                 img_u8 = Image.fromarray(arr_u8)
 
@@ -2082,7 +2162,7 @@ class ImageEditor:
 
             if _debug:
                 t_write = time.perf_counter()
-                h, w = self.float_image.shape[:2]
+                h, w = source_shape
                 log.debug(
                     "[SAVE_IMAGE] apply_edits=%dms backup=%dms write=%dms total=%dms  (%dx%d, %s)",
                     int((t_edits - t0) * 1000),
@@ -2096,8 +2176,38 @@ class ImageEditor:
             return original_path, backup_path
 
         except Exception as e:
-            log.exception("Failed to save %s: %s", self.current_filepath, e)
+            log.exception("Failed to save %s: %s", original_path, e)
             raise RuntimeError(f"Save failed: {e}") from e
+
+    def save_image(
+        self,
+        write_developed_jpg: bool = False,
+        developed_path: Optional[Path] = None,
+        save_target_path: Optional[Path] = None,
+    ) -> Optional[Tuple[Path, Path]]:
+        """Saves the edited image, backing up the original.
+
+        Convenience wrapper that calls ``snapshot_for_export()`` then
+        ``save_from_snapshot()`` in sequence.  Kept for backward compatibility
+        and direct (non-background) save paths.
+
+        Args:
+            write_developed_jpg: If True, also create a `-developed.jpg` sidecar file.
+            developed_path: Optional explicit path for the developed JPG.
+            save_target_path: Optional override for the output path.
+
+        Returns:
+            A tuple of (saved_path, backup_path) on success, otherwise None.
+
+        Raises:
+            RuntimeError: If preconditions are not met or saving fails.
+        """
+        snapshot = self.snapshot_for_export(
+            write_developed_jpg=write_developed_jpg,
+            developed_path=developed_path,
+            save_target_path=save_target_path,
+        )
+        return self.save_from_snapshot(snapshot)
 
     def save_image_uint8_levels(
         self,

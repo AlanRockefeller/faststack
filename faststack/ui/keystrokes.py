@@ -21,9 +21,7 @@ class Keybinder:
             # View switching
             Qt.Key_Escape: "switch_to_grid_view",
             # Navigation
-            Qt.Key_J: "next_image",
             Qt.Key_Right: "next_image",
-            Qt.Key_K: "prev_image",
             Qt.Key_Left: "prev_image",
             Qt.Key_G: "show_jump_to_image_dialog",
             # Stacking

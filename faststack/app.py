@@ -71,6 +71,8 @@ from faststack.imaging.cache import (
 from faststack.imaging.prefetch import Prefetcher, clear_icc_caches
 from faststack.ui.keystrokes import Keybinder
 from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS
+from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
+from faststack.imaging.mask_engine import inverse_transform
 from faststack.imaging.metadata import get_exif_data
 from faststack.thumbnail_view import (
     ThumbnailModel,
@@ -246,6 +248,7 @@ class AppController(QObject):
 
         # Deferred-init state: set to safe defaults, populated later by their methods
         self._save_initiated_path: Optional[str] = None
+        self._saves_in_flight: set = set()  # target paths currently being saved
         self._batch_indices_cache: set = set()
         self._batch_indices_cache_key: Optional[tuple] = None
         self.recycle_bin_dir: Optional[Path] = None
@@ -1561,14 +1564,19 @@ class AppController(QObject):
     def save_edited_image(self):
         """Saves the edited image in a background thread to keep UI responsive.
 
-        Sets isSaving=True, spawns background worker, returns immediately.
-        On completion, _on_save_finished is called via signal to perform cleanup.
+        All export-critical state is captured as an immutable snapshot on the
+        main thread BEFORE the editor is closed or the background worker starts.
+        The background worker operates only on the snapshot — it never reads
+        live editor state for export data.
         """
         if not self.image_editor.original_image:
             return
 
-        # Prevent double-saves
-        if self.ui_state.isSaving:
+        # Determine the actual target path for duplicate-save protection
+        save_target_path = self._get_save_target_path_for_current_view()
+        effective_target = save_target_path or self.image_editor.current_filepath
+        if effective_target and effective_target in self._saves_in_flight:
+            self.update_status_message("Already saving this image...")
             return
 
         # Capture state needed for save before we start
@@ -1577,42 +1585,56 @@ class AppController(QObject):
         if write_sidecar and 0 <= self.current_index < len(self.image_files):
             dev_path = self.image_files[self.current_index].developed_jpg_path
 
-        # Determine save_target_path for variant saves
-        save_target_path = self._get_save_target_path_for_current_view()
+        # --- CRITICAL: Snapshot export state BEFORE closing editor or submitting ---
+        # This runs on the main thread and captures an immutable copy of everything
+        # needed for the export: source image, edits, darken settings, mask data, EXIF.
+        try:
+            export_snapshot = self.image_editor.snapshot_for_export(
+                write_developed_jpg=write_sidecar,
+                developed_path=dev_path,
+                save_target_path=save_target_path,
+            )
+        except RuntimeError as e:
+            self.update_status_message(str(e))
+            return
 
-        # Store save token to prevent "surprise close" if user navigates away during save
+        # Store save token for post-save cleanup decisions
         self._save_initiated_path = self.image_editor.current_filepath
+        self._save_editor_was_open = self.ui_state.isEditorOpen
 
-        # Show saving indicator
+        # Track in-flight save by target path
+        if effective_target:
+            self._saves_in_flight.add(effective_target)
+
+        # Show saving indicator (stays until save finishes — no auto-clear timeout)
         self.ui_state.isSaving = True
-        self.update_status_message("Saving...")
+        self.ui_state.statusMessage = "Saving..."
 
-        # Submit save work to background thread
+        # Close editor immediately — the snapshot is already captured, so the
+        # user doesn't need to keep the editor open during the export.
+        if self.ui_state.isEditorOpen:
+            self.ui_state.isEditorOpen = False
+
+        # Submit save work to background thread — operates only on the snapshot
         def do_save():
             """Worker function that runs in background thread."""
             try:
-                result = self.image_editor.save_image(
-                    write_developed_jpg=write_sidecar,
-                    developed_path=dev_path,
-                    save_target_path=save_target_path,
-                )
-                return {"success": True, "result": result}
+                result = self.image_editor.save_from_snapshot(export_snapshot)
+                return {"success": True, "result": result, "target": effective_target}
             except RuntimeError as e:
-                return {"success": False, "error": str(e)}
+                return {"success": False, "error": str(e), "target": effective_target}
             except Exception as e:
                 log.exception("Unexpected error during save: %s", e)
-                return {"success": False, "error": "Failed to save image"}
+                return {"success": False, "error": "Failed to save image", "target": effective_target}
 
         def on_done(future):
             """Callback when background save completes - emits signal to hop to main thread."""
-            # Guard emit during shutdown to prevent signal to deleted QObject
             if self._shutting_down:
                 return
             try:
                 result = future.result()
             except Exception as e:
-                result = {"success": False, "error": str(e)}
-            # Emit signal to process result on main thread
+                result = {"success": False, "error": str(e), "target": effective_target}
             self._saveFinished.emit(result)
 
         future = self._save_executor.submit(do_save)
@@ -1625,52 +1647,47 @@ class AppController(QObject):
         if self._shutting_down:
             return
 
-        # Always clear saving indicator
+        # Always clear saving indicator and in-flight tracking
         self.ui_state.isSaving = False
+        target = save_result.get("target")
+        if target:
+            self._saves_in_flight.discard(target)
 
         if not save_result.get("success"):
-            self.update_status_message(save_result.get("error", "Save failed"))
+            error_msg = save_result.get("error", "Save failed")
+            self.update_status_message(f"Save failed: {error_msg}", timeout=5000)
             return
 
         result = save_result.get("result")
-        if result:
+        if isinstance(result, tuple) and len(result) >= 2:
             saved_path, _ = result  # backup_path unused
 
             # --- Post-Save Cleanup ---
 
-            # Only auto-close editor if still on the same image that initiated the save
-            # Prevents "surprise close" if user navigated away during save
+            # Full refresh runs whenever we're still viewing the saved image,
+            # regardless of whether the save came from the editor dialog or
+            # another path (e.g. darken workflow).
             initiated_path = getattr(self, "_save_initiated_path", None)
-            editor_still_on_same_image = (
-                self.ui_state.isEditorOpen
-                and self.image_editor.current_filepath
+            editor_was_open = getattr(self, "_save_editor_was_open", False)
+            still_on_same_image = (
+                self.image_editor.current_filepath
                 and initiated_path
                 and self.image_editor.current_filepath == initiated_path
             )
 
-            # 1. Close Editor UI (only if still on same image)
-            if editor_still_on_same_image:
-                self.ui_state.isEditorOpen = False
+            if still_on_same_image:
+                # Clear Editor State (release memory) — only when the
+                # editor dialog was actually open for this save.
+                if editor_was_open:
+                    self.image_editor.clear()
+                    self._clear_variant_override()
 
-            # 2. Clear Editor State (release memory) - only if still on same image
-            if editor_still_on_same_image:
-                self.image_editor.clear()
-
-            # 2b. Clear variant override (save always targets Main)
-            if editor_still_on_same_image:
-                self._clear_variant_override()
-
-            # 3. Refresh List and Handle Selection
-            if editor_still_on_same_image:
-                # Full refresh to see new file or updated timestamp
+                # Refresh list to pick up new backup files and update variant map
                 self.refresh_image_list()
 
-                # 4. Find and re-select the saved image
-                new_index = (
-                    self.current_index
-                )  # Default to keeping selection if not found
+                # Find and re-select the saved image
+                new_index = self.current_index
 
-                # Try to find by exact path match
                 if saved_path:
                     target_key = self._key(saved_path)
                     for i, img in enumerate(self.image_files):
@@ -1680,19 +1697,19 @@ class AppController(QObject):
 
                 self.current_index = new_index
 
-                # 5. Force UI Sync / Prefetch
-                self.image_cache.clear()  # Clear cache to ensure we reload valid image
+                # Force UI Sync / Prefetch
+                self.image_cache.clear()
                 self.prefetcher.cancel_all()
                 self.prefetcher.update_prefetch(self.current_index)
                 self.sync_ui_state()
-                # Refresh variant badges (backup was created)
-                if self.ui_state:
-                    self.ui_state.variantBadgesChanged.emit()
             else:
-                # User navigated away - skip full refresh to preserve their selection
-                # Just clear stale cache entry for the saved image
+                # User navigated away — clear stale cache entry
                 if saved_path:
                     self.image_cache.pop_path(saved_path)
+
+            # Always emit badge update — backup file was created
+            if self.ui_state:
+                self.ui_state.variantBadgesChanged.emit()
 
             self.update_status_message("Image saved")
         else:
@@ -1733,6 +1750,7 @@ class AppController(QObject):
         self._clear_variant_override()
 
         self._reset_crop_settings()
+        self._reset_darken_on_navigation()
 
         if self.debug_cache:
             _t_prefetch = time.perf_counter()
@@ -5902,6 +5920,268 @@ class AppController(QObject):
         if self.ui_state.isHistogramVisible:
             self.update_histogram()
 
+    # ---- Background Darkening Tool ----
+
+    def _reset_darken_on_navigation(self):
+        """Reset all darken-specific state on image switch.
+
+        Called from _set_current_index() to ensure a clean slate.
+        Clears both editor-level mask data AND UI-side panel values,
+        because navigation while the editor is open does NOT call
+        editor.load_image().
+        """
+        # Editor-level: clear mask assets, raster cache, and darken settings
+        self.image_editor._mask_assets.clear()
+        self.image_editor._mask_raster_cache.clear()
+        if self.image_editor.current_edits.get("darken_settings") is not None:
+            self.image_editor.current_edits["darken_settings"] = None
+            self.image_editor._edits_rev += 1
+        # In-progress stroke
+        self._current_darken_stroke = None
+        # Tool mode
+        self.ui_state.isDarkening = False
+        # Overlay image
+        self.ui_state._darken_overlay_image = None
+        self.ui_state._darken_overlay_generation += 1
+        self.ui_state.darken_overlay_generation_changed.emit()
+        # Reset slider / panel values via property setters so QML bindings update
+        self.ui_state.darkenOverlayVisible = True
+        self.ui_state.darkenAmount = 0.5
+        self.ui_state.darkenEdgeProtection = 0.5
+        self.ui_state.darkenSubjectProtection = 0.5
+        self.ui_state.darkenFeather = 0.5
+        self.ui_state.darkenDarkRange = 0.5
+        self.ui_state.darkenNeutrality = 0.5
+        self.ui_state.darkenExpandContract = 0.0
+        self.ui_state.darkenAutoEdges = 0.0
+        self.ui_state.darkenMode = "assisted"
+        self.ui_state.darkenBrushRadius = 0.03
+
+    @Slot()
+    def open_darken_tool(self):
+        """Activate the darkening tool, loading the image if needed.
+
+        The darken panel is independent of the editor sidebar — pressing K
+        in loupe view opens the darken panel without forcing the editor
+        panel open.  The image is silently loaded for editing if it hasn't
+        been already.
+        """
+        # Ensure the image is loaded for editing (needed for darken processing)
+        # but do NOT open the editor sidebar — the darken panel is independent.
+        if self.image_editor.float_image is None or self.image_editor.current_filepath is None:
+            self.load_image_for_editing()
+        self._ensure_darken_state()
+        self.ui_state.isDarkening = True
+
+    @Slot()
+    def toggle_darken_mode(self):
+        """Toggle the background darkening tool on/off.
+
+        Turning off also disables the darkening effect so the preview
+        reverts to the un-darkened image.
+        """
+        if self.ui_state.isDarkening:
+            self.ui_state.isDarkening = False
+            ds = self.image_editor.current_edits.get("darken_settings")
+            if ds is not None:
+                ds.enabled = False
+                self.image_editor._edits_rev += 1
+                self._kick_preview_worker()
+        else:
+            self._ensure_darken_state()
+            self.ui_state.isDarkening = True
+
+    def _ensure_darken_state(self):
+        """Ensure MaskData and DarkenSettings exist for the darken tool."""
+        if "darken" not in self.image_editor._mask_assets:
+            self.image_editor._mask_assets["darken"] = MaskData()
+        if self.image_editor.current_edits.get("darken_settings") is None:
+            ds = DarkenSettings(enabled=True)
+            self.image_editor.current_edits["darken_settings"] = ds
+            self.image_editor._edits_rev += 1
+        else:
+            ds = self.image_editor.current_edits["darken_settings"]
+            if not ds.enabled:
+                ds.enabled = True
+                self.image_editor._edits_rev += 1
+
+    @Slot(float, float, str)
+    def start_darken_stroke(self, x_norm: float, y_norm: float, stroke_type: str):
+        """Begin a new brush stroke. Coords are normalised [0,1] relative to the
+        displayed (post-crop, post-straighten) image."""
+        edits = self.image_editor.current_edits
+        x_base, y_base = inverse_transform(
+            x_norm, y_norm, edits, (1, 1),  # display_shape unused for normalised
+        )
+        brush_r = self.ui_state._darken_brush_radius
+        self._current_darken_stroke = {
+            "points": [(x_base, y_base)],
+            "radius": brush_r,
+            "stroke_type": stroke_type,
+        }
+
+    @Slot(float, float)
+    def continue_darken_stroke(self, x_norm: float, y_norm: float):
+        """Add a point to the current brush stroke."""
+        stroke = getattr(self, "_current_darken_stroke", None)
+        if stroke is None:
+            return
+        edits = self.image_editor.current_edits
+        x_base, y_base = inverse_transform(x_norm, y_norm, edits, (1, 1))
+        stroke["points"].append((x_base, y_base))
+
+    @Slot()
+    def finish_darken_stroke(self):
+        """Commit the current stroke to MaskData."""
+        stroke = getattr(self, "_current_darken_stroke", None)
+        if stroke is None or not stroke["points"]:
+            return
+        self._current_darken_stroke = None
+
+        mask_data = self.image_editor._mask_assets.get("darken")
+        if mask_data is None:
+            return
+
+        ms = MaskStroke(
+            points=stroke["points"],
+            radius=stroke["radius"],
+            stroke_type=stroke["stroke_type"],
+        )
+        mask_data.add_stroke(ms)
+
+        # Bump editor revision and refresh preview
+        self.image_editor._edits_rev += 1
+        self._kick_preview_worker()
+        self._update_darken_overlay()
+
+    @Slot()
+    def undo_darken_stroke(self):
+        """Remove the last brush stroke."""
+        mask_data = self.image_editor._mask_assets.get("darken")
+        if mask_data is None or not mask_data.has_strokes():
+            return
+        mask_data.undo_last_stroke()
+        self.image_editor._edits_rev += 1
+        self._kick_preview_worker()
+        self._update_darken_overlay()
+
+    @Slot()
+    def clear_darken_strokes(self):
+        """Clear all brush strokes."""
+        mask_data = self.image_editor._mask_assets.get("darken")
+        if mask_data is None or not mask_data.has_strokes():
+            return
+        mask_data.clear_strokes()
+        self.image_editor._edits_rev += 1
+        self._kick_preview_worker()
+        self._update_darken_overlay()
+
+    @Slot(str, float)
+    def set_darken_param(self, key: str, value: float):
+        """Update a DarkenSettings scalar and refresh."""
+        ds = self.image_editor.current_edits.get("darken_settings")
+        if ds is None:
+            return
+        if not hasattr(ds, key):
+            log.warning("Unknown darken param: %s", key)
+            return
+        setattr(ds, key, value)
+        # Sync UIState — map DarkenSettings field name → UIState property name
+        prop_map = {
+            "darken_amount": "darkenAmount",
+            "edge_protection": "darkenEdgeProtection",
+            "subject_protection": "darkenSubjectProtection",
+            "feather": "darkenFeather",
+            "dark_range": "darkenDarkRange",
+            "neutrality_sensitivity": "darkenNeutrality",
+            "expand_contract": "darkenExpandContract",
+            "auto_from_edges": "darkenAutoEdges",
+            "brush_radius": "darkenBrushRadius",
+        }
+        ui_prop = prop_map.get(key)
+        if ui_prop and hasattr(self.ui_state, ui_prop):
+            setattr(self.ui_state, ui_prop, value)
+
+        self.image_editor._edits_rev += 1
+        self._kick_preview_worker()
+        self._update_darken_overlay()
+
+    @Slot(str)
+    def set_darken_mode(self, mode: str):
+        """Set the darkening mode."""
+        ds = self.image_editor.current_edits.get("darken_settings")
+        if ds is None:
+            return
+        ds.mode = mode
+        self.ui_state.darkenMode = mode
+        self.image_editor._edits_rev += 1
+        self._kick_preview_worker()
+        self._update_darken_overlay()
+
+    @Slot(bool)
+    def set_darken_overlay_visible(self, visible: bool):
+        """Toggle mask overlay visibility."""
+        self.ui_state.darkenOverlayVisible = visible
+
+    @Slot(int, int, int)
+    def set_darken_overlay_color(self, r: int, g: int, b: int):
+        """Set the overlay colour."""
+        mask_data = self.image_editor._mask_assets.get("darken")
+        if mask_data is not None:
+            mask_data.overlay_color = (r, g, b)
+        self._update_darken_overlay()
+
+    def _update_darken_overlay(self):
+        """Generate the mask overlay QImage for display in QML."""
+        try:
+            from PySide6.QtGui import QImage
+
+            mask_data = self.image_editor._mask_assets.get("darken")
+            ds = self.image_editor.current_edits.get("darken_settings")
+            if mask_data is None or ds is None or not mask_data.has_strokes():
+                self.ui_state._darken_overlay_image = None
+                self.ui_state._darken_overlay_generation += 1
+                self.ui_state.darken_overlay_generation_changed.emit()
+                return
+
+            # Resolve mask at preview resolution
+            preview = self.image_editor.float_preview
+            if preview is None:
+                return
+
+            from faststack.imaging.mask_engine import resolve_mask
+
+            edits = dict(self.image_editor.current_edits)
+            resolved = resolve_mask(
+                mask_data, ds, preview, preview.shape[:2], edits,
+                cache=self.image_editor._mask_raster_cache,
+            )
+
+            # Build ARGB32 overlay
+            h, w = resolved.shape
+            r, g, b = mask_data.overlay_color
+            alpha = int(mask_data.overlay_opacity * 255)
+
+            # Create ARGB buffer: (H, W, 4) uint8
+            overlay = np.zeros((h, w, 4), dtype=np.uint8)
+            mask_u8 = (np.clip(resolved, 0.0, 1.0) * alpha).astype(np.uint8)
+            overlay[:, :, 0] = b  # QImage ARGB32 is BGRA in memory on little-endian
+            overlay[:, :, 1] = g
+            overlay[:, :, 2] = r
+            overlay[:, :, 3] = mask_u8
+
+            buf = overlay.tobytes()
+            qimg = QImage(buf, w, h, w * 4, QImage.Format.Format_ARGB32)
+            # Must keep a reference to buf or QImage will crash
+            qimg._buffer_ref = buf
+
+            self.ui_state._darken_overlay_image = qimg
+            self.ui_state._darken_overlay_generation += 1
+            self.ui_state.darken_overlay_generation_changed.emit()
+
+        except Exception:
+            log.exception("Failed to update darken overlay")
+
     @Slot()
     def rotate_image_cw(self):
         """Rotate the edited image 90 degrees clockwise."""
@@ -6291,6 +6571,9 @@ class AppController(QObject):
             self.ui_state.currentImageSourceChanged.emit()
             self.ui_state.highlightStateChanged.emit()
             self.update_histogram()
+            # Keep mask overlay in sync with the preview whenever it changes
+            if self.ui_state._is_darkening:
+                self._update_darken_overlay()
 
         # Call directly (not via singleShot) since we're on the UI thread.
         # This prevents race where a new slider event could interleave between

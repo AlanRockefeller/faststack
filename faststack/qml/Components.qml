@@ -281,6 +281,20 @@ Item {
                 
                 rotation: mainMouseArea.cropRotation
                 
+                // Darken mask overlay - anchored to mainImage, rotates/scales with it
+                Image {
+                    id: darkenOverlay
+                    anchors.fill: parent
+                    z: 90
+                    visible: uiState && uiState.isDarkening && uiState.darkenOverlayVisible
+                    source: (uiState && uiState.isDarkening && uiState.darkenOverlayVisible)
+                            ? "image://provider/mask_overlay/" + uiState.darkenOverlayGeneration
+                            : ""
+                    fillMode: Image.Stretch
+                    cache: false
+                    opacity: 1.0  // Opacity is baked into the ARGB32 image
+                }
+
                 // Crop overlay - anchored to mainImage to rotate with it
                 Item {
                     id: cropOverlay
@@ -518,11 +532,13 @@ Item {
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             hoverEnabled: true
             cursorShape: {
+                if (uiState && uiState.isDarkening) return Qt.CrossCursor
                 if (!uiState || !uiState.isCropping) return Qt.ArrowCursor
-                // Use a simple cross cursor for crop mode - edge detection would require tracking mouse position
-                // which is complex in QML. The edge dragging will still work based on click position.
                 return Qt.CrossCursor
             }
+
+        // Darken painting state
+        property bool isDarkenPainting: false
         
         // Drag-to-pan with drag-and-drop when dragging outside window
         property real lastX: 0
@@ -587,7 +603,16 @@ Item {
             startX = mouse.x
             startY = mouse.y
             isDraggingOutside = false
-            
+
+            // Darken painting mode
+            if (uiState && uiState.isDarkening && !uiState.isCropping && controller) {
+                var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+                var strokeType = (mouse.button === Qt.RightButton) ? "protect" : "add"
+                controller.start_darken_stroke(imgCoords.x, imgCoords.y, strokeType)
+                isDarkenPainting = true
+                return
+            }
+
             if (mouse.button === Qt.RightButton) {
                 if (uiState && uiState.isCropping) {
                     // Cancel crop mode if already active
@@ -736,6 +761,13 @@ Item {
             return {x: p.x / mainImage.width, y: p.y / mainImage.height}
         }
         onPositionChanged: function(mouse) {
+            // Darken painting drag
+            if (isDarkenPainting && controller) {
+                var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+                controller.continue_darken_stroke(imgCoords.x, imgCoords.y)
+                return
+            }
+
             if (uiState && uiState.isCropping && isCropDragging) {
                 if (cropDragMode === "new") {
                     // Update crop rectangle while dragging
@@ -840,6 +872,13 @@ Item {
         }
         
         onReleased: function(mouse) {
+            // Darken painting release
+            if (isDarkenPainting) {
+                isDarkenPainting = false
+                if (controller) controller.finish_darken_stroke()
+                return
+            }
+
             isDraggingOutside = false
             if (uiState && uiState.isCropping && isCropDragging) {
                 // Fix: Prevent accidental tiny crops with Right Click
