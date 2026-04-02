@@ -1,0 +1,47 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.4.2, pluggy-1.6.0
+rootdir: C:\code\faststack
+configfile: pyproject.toml
+collected 9 items
+
+tests\test_editor_reopening.py .......F.                                 [100%]
+
+================================== FAILURES ===================================
+____ TestEditorReopening.test_save_closes_ui_immediately_but_keeps_memory _____
+
+self = <faststack.tests.test_editor_reopening.TestEditorReopening testMethod=test_save_closes_ui_immediately_but_keeps_memory>
+
+    def test_save_closes_ui_immediately_but_keeps_memory(self):
+        # 1. Setup
+        target = Path("test.jpg")
+        target_abs = str(target.resolve())
+        self.controller.ui_state.isEditorOpen = True
+        self.controller.image_editor.current_filepath = target
+        self.controller.image_editor.session_id = "sess-1"
+        self.controller.image_editor.current_mtime = 123.4
+    
+        # Mock snapshot
+        self.controller.image_editor.get_export_snapshot.return_value = MagicMock()
+    
+        with patch.object(self.controller, "_save_executor") as mock_executor:
+            # 2. CALL SAVE
+            self.controller.save_edited_image()
+    
+            # VERIFY: UI closed immediately in controller state
+            self.assertFalse(self.controller.ui_state.isEditorOpen)
+    
+            # 3. SIMULATE SIGNAL TRIGGERED BY UI CLOSURE
+            # In the real app, setting isEditorOpen=False emits signal -> calls _on_editor_open_changed(False)
+            self.controller._on_editor_open_changed(False)
+    
+            # VERIFY: Clear was NOT called (because save is in flight for this key)
+            self.controller.image_editor.clear.assert_not_called()
+    
+            # VERIFY: Save in-flight markers are present
+>           self.assertIn(target_abs, self.controller._saving_keys)
+E           AssertionError: 'C:\\code\\faststack\\faststack\\test.jpg' not found in {'c:/code/faststack/faststack/test.jpg'}
+
+tests\test_editor_reopening.py:202: AssertionError
+=========================== short test summary info ===========================
+FAILED tests\test_editor_reopening.py::TestEditorReopening::test_save_closes_ui_immediately_but_keeps_memory
+========================= 1 failed, 8 passed in 0.96s =========================

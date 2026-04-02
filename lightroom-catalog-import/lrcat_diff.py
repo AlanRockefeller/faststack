@@ -235,7 +235,7 @@ def compare_table(
         if diffs:
             changed.append(
                 {
-                    "pk": dict(zip(pk_cols, key)),
+                    "pk": dict(zip(pk_cols, key, strict=True)),
                     "diffs": diffs,
                 }
             )
@@ -246,13 +246,13 @@ def compare_table(
     for key in inserted_keys:
         row = after_rows[key]
         if row_matches(row, match):
-            inserted.append({"pk": dict(zip(pk_cols, key)), "row": row})
+            inserted.append({"pk": dict(zip(pk_cols, key, strict=True)), "row": row})
 
     deleted = []
     for key in deleted_keys:
         row = before_rows[key]
         if row_matches(row, match):
-            deleted.append({"pk": dict(zip(pk_cols, key)), "row": row})
+            deleted.append({"pk": dict(zip(pk_cols, key, strict=True)), "row": row})
 
     return {
         "table": table,

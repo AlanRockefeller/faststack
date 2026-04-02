@@ -164,7 +164,7 @@ def main() -> int:
         else:
             filename = base_name
 
-        full_path = abs_root + path_from_root + filename
+        full_path = os.path.normpath(abs_root + path_from_root + filename)
         print(f"\nfull_path_guess = {full_path!r}")
 
         # Show what each component contributed, for debugging.

@@ -172,5 +172,54 @@ class TestEditorReopening(unittest.TestCase):
             self.assertFalse(result)
 
 
+    def test_save_closes_ui_immediately_but_keeps_memory(self):
+        # 1. Setup
+        target = Path("test.jpg")
+        target_abs = self.controller._key(target)
+        self.controller.ui_state.isEditorOpen = True
+        self.controller.image_editor.current_filepath = target
+        self.controller.image_editor.session_id = "sess-1"
+        self.controller.image_editor.current_mtime = 123.4
+
+        # Mock snapshot
+        self.controller.image_editor.snapshot_for_export.return_value = MagicMock()
+
+        with patch.object(self.controller, "_save_executor") as mock_executor:
+            # 2. CALL SAVE
+            self.controller.save_edited_image()
+
+            # VERIFY: UI closed immediately in controller state
+            self.assertFalse(self.controller.ui_state.isEditorOpen)
+
+            # 3. SIMULATE SIGNAL TRIGGERED BY UI CLOSURE
+            # In the real app, setting isEditorOpen=False emits signal -> calls _on_editor_open_changed(False)
+            self.controller._on_editor_open_changed(False)
+
+            # VERIFY: Clear was NOT called (because save is in flight for this key)
+            self.controller.image_editor.clear.assert_not_called()
+
+            # VERIFY: Save in-flight markers are present
+            self.assertIn(target_abs, self.controller._saving_keys)
+
+            # 4. RE-OPEN (Simulation)
+            # Should be REUSED since memory wasn't cleared
+            with patch("pathlib.Path.resolve", return_value=target.absolute()):
+                with patch("pathlib.Path.stat") as mock_stat:
+                    mock_stat.return_value.st_mtime = 123.4
+                    res = self.controller.load_image_for_editing()
+                    self.assertEqual(res, AppController._REUSED)
+                    self.controller.image_editor.load_image.assert_not_called()
+
+    def test_editor_close_clears_memory_if_no_save_active(self):
+        # 1. Setup
+        self.controller.image_editor.current_filepath = Path("no_save.jpg")
+
+        # 2. Simulate closure via signal while NO save is in flight
+        self.controller._on_editor_open_changed(False)
+
+        # VERIFY: Clear IS called because no save active for this file
+        self.controller.image_editor.clear.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

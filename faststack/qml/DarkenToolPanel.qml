@@ -62,12 +62,17 @@ Window {
                 id: modeCombo
                 Layout.fillWidth: true
                 model: ["Assisted", "Paint Only", "Strong Subject", "Border Auto"]
-                currentIndex: {
-                    var m = uiState ? uiState.darkenMode : "assisted"
-                    if (m === "paint_only") return 1
-                    if (m === "strong_subject") return 2
-                    if (m === "border_auto") return 3
-                    return 0
+                
+                Binding {
+                    target: modeCombo
+                    property: "currentIndex"
+                    value: {
+                        var m = uiState ? uiState.darkenMode : "assisted"
+                        if (m === "paint_only") return 1
+                        if (m === "strong_subject") return 2
+                        if (m === "border_auto") return 3
+                        return 0
+                    }
                 }
                 onActivated: (index) => {
                     var modes = ["assisted", "paint_only", "strong_subject", "border_auto"]
@@ -266,8 +271,15 @@ Window {
                 Layout.fillWidth: true
                 spacing: 10
                 CheckBox {
+                    id: overlayCheck
                     text: "Show Overlay"
-                    checked: uiState ? uiState.darkenOverlayVisible : true
+                    
+                    Binding {
+                        target: overlayCheck
+                        property: "checked"
+                        value: uiState ? uiState.darkenOverlayVisible : true
+                    }
+                    
                     onToggled: {
                         if (controller) controller.set_darken_overlay_visible(checked)
                     }
@@ -305,13 +317,31 @@ Window {
                     Rectangle {
                         width: 24; height: 24; radius: 4
                         color: Qt.rgba(modelData.r / 255, modelData.g / 255, modelData.b / 255, 1.0)
-                        border.color: "white"
-                        border.width: 1
+                        border.color: activeFocus ? "white" : "transparent"
+                        border.width: 2
+                        focus: true
+                        
+                        Accessible.name: modelData.name
+                        Accessible.role: Accessible.Button
+                        
+                        ToolTip.visible: swatchMA.containsMouse
+                        ToolTip.delay: 500
+                        ToolTip.text: modelData.name
+
                         MouseArea {
+                            id: swatchMA
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
+                            hoverEnabled: true
                             onClicked: {
                                 if (controller) controller.set_darken_overlay_color(modelData.r, modelData.g, modelData.b)
+                            }
+                        }
+                        
+                        Keys.onPressed: (event) => {
+                            if (event.key === Qt.Key_Enter || event.key === Qt.Key_Return || event.key === Qt.Key_Space) {
+                                if (controller) controller.set_darken_overlay_color(modelData.r, modelData.g, modelData.b)
+                                event.accepted = true
                             }
                         }
                     }
@@ -378,6 +408,7 @@ Window {
 
     // --- Darken Slider Component ---
     component DarkenSlider: RowLayout {
+        id: sliderRoot
         property string label: ""
         property string paramKey: ""
         property real value: 0
@@ -389,27 +420,29 @@ Window {
         spacing: 10
 
         Label {
-            text: label
+            text: sliderRoot.label
             color: darkenPanel.textColor
             font.pixelSize: 13
             Layout.preferredWidth: 110
             elide: Text.ElideRight
 
-            ToolTip.visible: sliderLabelMA.containsMouse && tooltip !== ""
+            ToolTip.visible: sliderLabelMA.containsMouse && sliderRoot.tooltip !== ""
             ToolTip.delay: 500
-            ToolTip.text: tooltip
+            ToolTip.text: sliderRoot.tooltip
             MouseArea { id: sliderLabelMA; anchors.fill: parent; hoverEnabled: true }
         }
 
         Slider {
             id: dSlider
             Layout.fillWidth: true
-            from: minVal; to: maxVal; stepSize: 1
+            from: sliderRoot.minVal; to: sliderRoot.maxVal; stepSize: 1
 
-            // Use Binding so the link to parent.value is re-established
-            // after user interaction (plain "value:" breaks on drag).
+            // Bind to sliderRoot.value (the component's own property) so
+            // `parent` ambiguity inside an inline component is avoided.
+            // Previously `parent.value` resolved to RowLayout.value → 0,
+            // causing the slider to snap back to the minimum on every frame.
             Binding on value {
-                value: parent.value
+                value: sliderRoot.value
                 when: !dSlider.pressed
             }
 
@@ -421,7 +454,7 @@ Window {
                 repeat: true
                 onTriggered: {
                     if (Math.abs(dSlider._pendingValue - dSlider._lastSentValue) > 0.001) {
-                        if (controller) controller.set_darken_param(paramKey, dSlider._pendingValue / maxVal)
+                        if (controller) controller.set_darken_param(sliderRoot.paramKey, dSlider._pendingValue / sliderRoot.maxVal)
                         dSlider._lastSentValue = dSlider._pendingValue
                     }
                 }
@@ -434,7 +467,7 @@ Window {
                     if (!dsendTimer.running) dsendTimer.start()
                 } else {
                     dsendTimer.stop()
-                    if (controller) controller.set_darken_param(paramKey, value / maxVal)
+                    if (controller) controller.set_darken_param(sliderRoot.paramKey, value / sliderRoot.maxVal)
                 }
             }
             onMoved: {

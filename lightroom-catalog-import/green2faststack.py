@@ -510,12 +510,17 @@ def next_backup_path(json_path: Path) -> Path:
     if not first.exists():
         return first
 
+    MAX_BACKUP_ATTEMPTS = 1000
     index = 1
-    while True:
+    while index <= MAX_BACKUP_ATTEMPTS:
         candidate = json_path.with_name(json_path.name + f".bak{index}")
         if not candidate.exists():
             return candidate
         index += 1
+    raise RuntimeError(
+        f"Could not find an available backup path for {json_path.name} "
+        f"within {MAX_BACKUP_ATTEMPTS} attempts."
+    )
 
 
 def ensure_faststack_entry_shape(entry: dict) -> dict:

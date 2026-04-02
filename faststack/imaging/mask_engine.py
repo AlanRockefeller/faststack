@@ -57,7 +57,7 @@ def forward_transform(
     has_crop = (
         crop_box is not None
         and len(crop_box) == 4
-        and any(v != d for v, d in zip(crop_box, (0, 0, 1000, 1000)))
+        and any(v != d for v, d in zip(crop_box, (0, 0, 1000, 1000), strict=True))
     )
 
     # Start in oriented-base-image space [0, 1]
@@ -119,7 +119,7 @@ def inverse_transform(
     has_crop = (
         crop_box is not None
         and len(crop_box) == 4
-        and any(v != d for v, d in zip(crop_box, (0, 0, 1000, 1000)))
+        and any(v != d for v, d in zip(crop_box, (0, 0, 1000, 1000), strict=True))
     )
 
     x, y = x_disp, y_disp
@@ -217,7 +217,7 @@ def _draw_stroke_numpy(
 def _draw_stroke_cv2(
     canvas: np.ndarray,
     points: list,
-    radius_px: int,
+    radius_px: float,
 ) -> None:
     """Draw a stroke onto *canvas* using cv2.circle (faster)."""
     r = max(1, int(round(radius_px)))
@@ -287,7 +287,6 @@ def _gaussian_blur(arr: np.ndarray, sigma: float) -> np.ndarray:
     kernel = np.exp(-0.5 * (x / sigma) ** 2)
     kernel /= kernel.sum()
     # Pad + convolve rows then columns
-    from numpy import convolve as _conv1d
 
     out = arr.copy()
     for row in range(out.shape[0]):
@@ -402,7 +401,6 @@ def resolve_mask(
     params_key = settings.params_tuple()
     img_key = _image_content_key(image_arr)
 
-    # --- Try cache ---
     if cache is not None:
         cached = cache.get_resolved(
             mask_data.revision, shape, geo_hash, params_key, img_key
@@ -564,7 +562,7 @@ class MaskRasterCache:
         shape: Tuple[int, int],
         geo_hash: int,
         params_key: tuple,
-        img_key: int = 0,
+        img_key: int,
     ) -> Optional[np.ndarray]:
         key = (revision, shape, geo_hash, params_key, img_key)
         if self._resolved_key == key:

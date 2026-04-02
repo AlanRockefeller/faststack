@@ -523,8 +523,21 @@ class AppController(QObject):
         else:
             # Cleanup large memory buffers when editor closes
             if self.image_editor:
-                log.debug("Editor closed, clearing editor memory buffers")
-                self.image_editor.clear()
+                # If a save is active for this session, preserve the memory
+                # so the user can re-open/retry if the background task fails.
+                current_key = (
+                    self._key(self.image_editor.current_filepath)
+                    if self.image_editor.current_filepath
+                    else None
+                )
+                if current_key and current_key in self._saving_keys:
+                    log.debug(
+                        "Editor closed but save in progress for %s; keeping session memory",
+                        current_key,
+                    )
+                else:
+                    log.debug("Editor closed, clearing editor memory buffers")
+                    self.image_editor.clear()
 
             # Also clear the cached preview rendering
             with self._preview_lock:
@@ -1475,7 +1488,7 @@ class AppController(QObject):
         if self.debug_cache:
             _t_start = time.perf_counter()
             print(
-                f"[DBGCACHE] {_t_start*1000:.3f} sync_ui_state: START gen={self.ui_refresh_generation + 1}"
+                f"[CROPDBG] sync_ui_state: START gen={self.ui_refresh_generation + 1} isCropping={self.ui_state.isCropping} cropBox={self.ui_state.currentCropBox}"
             )
 
         self.ui_refresh_generation += 1
@@ -1680,9 +1693,13 @@ class AppController(QObject):
         future = self._save_executor.submit(do_save)
         future.add_done_callback(on_done)
 
-        # Leave editor open during background save so the user doesn't lose state
-        # if the save fails. Closure is deferred until _on_save_finished() success path.
-        pass
+        # Close editor UI immediately to allow the user to continue working.
+        # The background worker uses the frozen export_snapshot, so it doesn't
+        # need the live editor UI to remain open.
+        # If the save fails later, memory is preserved due to the guard in
+        # _on_editor_open_changed, allowing the same session to be re-opened.
+        if self.ui_state.isEditorOpen:
+            self.ui_state.isEditorOpen = False
 
     @Slot(object)
     def _on_save_finished(self, save_result: dict):
@@ -5980,6 +5997,7 @@ class AppController(QObject):
             # Pull crop box specifically; use default if None
             crop_box = edits.get("crop_box")
             if crop_box:
+                log.info("CROPDBG _sync_editor_state_from_session internal: crop_box=%r", crop_box)
                 self.ui_state.currentCropBox = crop_box
             else:
                 self.ui_state.currentAspectRatioIndex = 0
@@ -6361,9 +6379,8 @@ class AppController(QObject):
             overlay[:, :, 3] = mask_u8
 
             buf = overlay.tobytes()
+            self._darken_overlay_buffer = buf
             qimg = QImage(buf, w, h, w * 4, QImage.Format.Format_ARGB32)
-            # Must keep a reference to buf or QImage will crash
-            qimg._buffer_ref = buf
 
             self.ui_state._darken_overlay_image = qimg
             self.ui_state._darken_overlay_generation += 1
@@ -6774,6 +6791,7 @@ class AppController(QObject):
     @Slot()
     def cancel_crop_mode(self):
         """Cancel crop mode without applying changes."""
+        log.info("CROPDBG cancel_crop_mode before isCropping=%r cropBox=%r", self.ui_state.isCropping, self.ui_state.currentCropBox)
         if self.ui_state.isCropping:
             self.ui_state.isCropping = False
             self.ui_state.currentCropBox = [0, 0, 1000, 1000]
@@ -6783,52 +6801,38 @@ class AppController(QObject):
             self.ui_refresh_generation += 1
             self.ui_state.currentImageSourceChanged.emit()
             self.update_status_message("Crop cancelled")
-            log.info("Crop mode cancelled")
+            log.info("CROPDBG cancel_crop_mode after isCropping=%r cropBox=%r", self.ui_state.isCropping, self.ui_state.currentCropBox)
 
     @Slot()
-    def toggle_crop_mode(self):
-        """Toggle crop mode on/off."""
-        self.ui_state.isCropping = not self.ui_state.isCropping
+    @Slot(bool)
+    @Slot(bool, bool)
+    def toggle_crop_mode(self, force_state=None, reset_box=True):
+        """Toggle crop mode on/off, or force a specific state."""
+        if force_state is not None:
+            self.ui_state.isCropping = force_state
+        else:
+            self.ui_state.isCropping = not self.ui_state.isCropping
+
         if self.ui_state.isCropping:
-            # Reset crop box when entering crop mode
-            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
-            # Set aspect ratios for QML dropdown
-            self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
-            self.ui_state.currentAspectRatioIndex = 0
+            if reset_box:
+                # Reset crop box when entering crop mode
+                self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+                # Set aspect ratios for QML dropdown
+                self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
+                self.ui_state.currentAspectRatioIndex = 0
 
-            # Pre-load image into editor to ensure smooth rotation
-            if self.image_files and self.current_index < len(self.image_files):
-                image_file = self.image_files[self.current_index]
-                filepath = image_file.path
-                editor_path = self.image_editor.current_filepath
-
-                # Robust comparison
-                match = False
-                if editor_path:
-                    try:
-                        match = Path(editor_path).resolve() == Path(filepath).resolve()
-                    except (OSError, ValueError):
-                        match = str(editor_path) == str(filepath)
-
-                if not match:
-                    log.debug("toggle_crop_mode: Loading %s into editor", filepath)
-                    # Use cached preview if available to speed up using get_decoded_image(self.current_index)
-                    # note: get_decoded_image verifies index bounds
-                    cached_preview = self.get_decoded_image(self.current_index)
-                    self.image_editor.load_image(
-                        str(filepath), cached_preview=cached_preview
-                    )
-
-            # Reset rotation to 0 when starting fresh crop mode
-            self.image_editor.set_edit_param("straighten_angle", 0.0)
+                # Reset rotation to 0 when starting fresh crop mode
+                self.image_editor.set_edit_param("straighten_angle", 0.0)
 
             self.update_status_message("Crop mode: Drag to select area, Enter to crop")
-            log.info("Crop mode enabled")
         else:  # Exiting crop mode
             self.ui_state.isCropping = False
             self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            # Ensure preview rotation is cleared when exiting
+            self.image_editor.set_edit_param("straighten_angle", 0.0)
             self.update_status_message("Crop cancelled")
-            log.info("Crop mode disabled")
+        
+        log.info("CROPDBG toggle_crop_mode(force_state=%r, reset_box=%r) -> isCropping=%r cropBox=%r", force_state, reset_box, self.ui_state.isCropping, self.ui_state.currentCropBox)
 
     @Slot()
     def stack_source_raws(self):
@@ -6995,6 +6999,7 @@ class AppController(QObject):
     @Slot()
     def execute_crop(self):
         """Execute the crop operation: crop image, save, backup, and refresh."""
+        log.info("CROPDBG execute_crop start isCropping=%r cropBox=%r", self.ui_state.isCropping, self.ui_state.currentCropBox)
         if not self.image_files or self.current_index >= len(self.image_files):
             self.update_status_message("No image to crop")
             return
