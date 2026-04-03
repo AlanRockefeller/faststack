@@ -7036,9 +7036,17 @@ class AppController(QObject):
             self.update_status_message("No crop area selected")
             return
 
-        # Ensure image is loaded in editor
-        image_file = self.image_files[self.current_index]
-        filepath = image_file.path
+        # Restoration means viewing a backup; crop should target the main image.
+        # We must resolve this BEFORE potentially reloading or saving.
+        save_target_path = self._get_save_target_path_for_current_view()
+        is_restoring = save_target_path is not None
+
+        # Ensure image is loaded in editor.
+        # For crop, we use the CURRENTLY VIEWED file (which might be a variant).
+        if self.view_override_path:
+            filepath = Path(self.view_override_path)
+        else:
+            filepath = self.get_active_edit_path(self.current_index)
 
         # Robust path comparison
         editor_path = self.image_editor.current_filepath
@@ -7053,6 +7061,7 @@ class AppController(QObject):
             log.debug(
                 f"execute_crop reloading image due to path mismatch. Editor: {editor_path}, File: {filepath}"
             )
+            # get_decoded_image() honors variants/overrides.
             cached_preview = self.get_decoded_image(self.current_index)
             if not self.image_editor.load_image(
                 str(filepath), cached_preview=cached_preview
@@ -7066,9 +7075,9 @@ class AppController(QObject):
         # This handles cases where we reloaded the image (resetting edits) or where UI state sync was flaky.
         self.image_editor.set_edit_param("straighten_angle", current_rotation)
 
-        # Save via ImageEditor (handles rotation + crop correctly)
+        # Save via ImageEditor (passing the resolved target for variant-save policy)
         try:
-            save_result = self.image_editor.save_image()
+            save_result = self.image_editor.save_image(save_target_path=save_target_path)
         except RuntimeError as e:
             log.warning("execute_crop: Save failed: %s", e)
             self.update_status_message(f"Failed to save cropped image: {e}")
@@ -7080,6 +7089,10 @@ class AppController(QObject):
 
         if save_result:
             saved_path, backup_path = save_result
+
+            # IF we were restoring from a variant, clear the override now that it's "the truth"
+            if is_restoring:
+                self._clear_variant_override()
 
             timestamp = time.time()
             self.undo_history.append(
