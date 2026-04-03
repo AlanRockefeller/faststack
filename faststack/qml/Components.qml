@@ -108,10 +108,6 @@ Item {
             panTransform.y = 0
         }
         function onAbsoluteZoomRequested(scale) {
-             if (uiState && uiState.debugMode) {
-                 console.log("QML: Absolute zoom requested: " + scale)
-             }
-             
              imageRotator.zoomScale = scale
              
              // If we need to switch to high-res, flag this scale as the target 
@@ -336,10 +332,6 @@ Item {
                         cropRect.y = localTop
                         cropRect.width = localRight - localLeft
                         cropRect.height = localBottom - localTop
-                        
-                        if (uiState.debugMode) {
-                            console.log("CROPDBG updateCropRect box=[" + box + "] rect=(x=" + Math.round(cropRect.x) + ", y=" + Math.round(cropRect.y) + ", w=" + Math.round(cropRect.width) + ", h=" + Math.round(cropRect.height) + ")")
-                        }
                     }
                     
                     // Dimmer Rectangles — only render when a real crop is active/being drawn
@@ -405,13 +397,6 @@ Item {
 
                     // Force fit recompute so fitScale / zoom logic stabilizes immediately
                     imageRotator.recomputeFitScale(true)
-
-                    if (uiState && uiState.debugMode) {
-                        console.log("sourceSize changed:", mainImage.sourceSize.width, mainImage.sourceSize.height,
-                                    "dpr:", dpr,
-                                    "base:", imageRotator.baseW, imageRotator.baseH,
-                                    "zoomScale:", imageRotator.zoomScale)
-                    }
                 }
 
                 onSourceSizeChanged: { handleSourceSizeChange() }
@@ -612,10 +597,6 @@ Item {
             startY = mouse.y
             isDraggingOutside = false
 
-            if (uiState && uiState.debugMode) {
-                console.log("CROPDBG onPressed button=" + mouse.button + " isCropping=" + uiState.isCropping + " box=[" + uiState.currentCropBox + "]")
-            }
-
             // Darken painting mode
             if (uiState && uiState.isDarkening && !uiState.isCropping && controller) {
                 var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
@@ -631,9 +612,29 @@ Item {
             }
 
             if (mouse.button === Qt.RightButton) {
-                if (controller) controller.toggle_crop_mode()
+                if (!uiState.isCropping && controller) {
+                    controller.toggle_crop_mode() // Ensure mode is ON
+                }
+                
                 // Ensure loupeView has active focus so Escape key works
                 loupeView.forceActiveFocus()
+                
+                // Start a NEW crop rectangle immediately from the clicked point
+                // This fulfills the "right-click drag crops immediately" requirement
+                var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+                var mx = coords.x * 1000
+                var my = coords.y * 1000
+                
+                cropDragMode = "new"
+                cropStartX = mouse.x
+                cropStartY = mouse.y
+                cropBoxStartLeft = mx
+                cropBoxStartTop = my
+                cropBoxStartRight = mx
+                cropBoxStartBottom = my
+                
+                uiState.currentCropBox = [Math.round(mx), Math.round(my), Math.round(mx), Math.round(my)]
+                isCropDragging = true
                 return
             }
             
@@ -658,11 +659,6 @@ Item {
 
                 var inside = mx >= box[0] && mx <= box[2] && my >= box[1] && my <= box[3]
                 
-                if (uiState.debugMode) {
-                    console.log("CROPDBG coords mapped=(x=" + coords.x.toFixed(3) + ", y=" + coords.y.toFixed(3) + ") mx=" + Math.round(mx) + " my=" + Math.round(my) + " isFullImage=" + isFullImage + " inside=" + inside)
-                }
-                
-                // --- Hit test for rotation handle (robust: uses actual knob transform) ---
                 if (mainMouseArea.isRotating && cropOverlay.visible && rotateKnob.visible) {
                     // knob center in mainMouseArea coords (includes cropRect rotation)
                     // Note: rotateKnob is now inside mainImage -> cropOverlay -> cropRect
@@ -679,7 +675,6 @@ Item {
                     var distk = Math.sqrt(dxk*dxk + dyk*dyk)
 
                     if (distk < 22 * Screen.devicePixelRatio) { // a little forgiving
-                        if (uiState.debugMode) console.log("CROPDBG branch=rotate")
                         cropDragMode = "rotate"
 
                         // crop center in mainMouseArea coords -> Changed to IMAGE center to avoid feedback loop
@@ -712,7 +707,6 @@ Item {
                 
                 // If crop box is full image, always start a new crop
                 else if (isFullImage) {
-                    if (uiState.debugMode) console.log("CROPDBG branch=new-from-full")
                     // Start a new crop rectangle from the clicked point
                     cropDragMode = "new"
                     cropStartX = mouse.x
@@ -741,15 +735,12 @@ Item {
                     else if (nearBottom) cropDragMode = "bottom"
                     else cropDragMode = "move"
                     
-                    if (uiState.debugMode) console.log("CROPDBG branch=" + cropDragMode)
-                    
                     // Store initial crop box
                     cropBoxStartLeft = box[0]
                     cropBoxStartTop = box[1]
                     cropBoxStartRight = box[2]
                     cropBoxStartBottom = box[3]
                 } else {
-                    if (uiState.debugMode) console.log("CROPDBG branch=new-outside")
                     // Start new crop rectangle
                     cropDragMode = "new"
                     cropStartX = mouse.x
@@ -771,32 +762,11 @@ Item {
         function mapToImageCoordinates(screenPoint) {
             if (!mainImage || mainImage.width <= 0) return {x:0, y:0}
             
-            // 1. Point relative to imageViewport center (where imageRotator is centered)
-            var vx = screenPoint.x - (imageViewport.width / 2)
-            var vy = screenPoint.y - (imageViewport.height / 2)
+            // Simplified: Use Qt-native mapping to handle scale, pan, and rotation
+            var p = mainImage.mapFromItem(mainMouseArea, screenPoint.x, screenPoint.y)
             
-            // 2. Adjust for Pan (in screen pixels)
-            var rawX = vx - panTransform.x
-            var rawY = vy - panTransform.y
-            
-            // 3. Un-scale (zoomScale is applied at center)
-            var unscaledX = rawX / imageRotator.zoomScale
-            var unscaledY = rawY / imageRotator.zoomScale
-            
-            // 4. Un-rotate (to map back to the 'upright' image space)
-            var rad = -mainMouseArea.cropRotation * (Math.PI / 180.0)
-            var cosR = Math.cos(rad)
-            var sinR = Math.sin(rad)
-            
-            var rotatedX = unscaledX * cosR - unscaledY * sinR
-            var rotatedY = unscaledX * sinR + unscaledY * cosR
-            
-            // 5. Offset by image center (logical size)
-            var finalX = rotatedX + (mainImage.width / 2)
-            var finalY = rotatedY + (mainImage.height / 2)
-            
-            // 6. Normalize (0-1)
-            return { x: finalX / mainImage.width, y: finalY / mainImage.height }
+            // Normalize (0-1)
+            return { x: p.x / mainImage.width, y: p.y / mainImage.height }
         }
         onPositionChanged: function(mouse) {
             // Darken painting drag — clamp to image bounds
@@ -809,12 +779,7 @@ Item {
             }
 
             if (uiState && uiState.isCropping && isCropDragging) {
-                if (uiState.debugMode) {
-                    console.log("CROPDBG drag mode=" + cropDragMode + " mouse=(" + Math.round(mouse.x) + "," + Math.round(mouse.y) + ")")
-                }
-                
                 if (cropDragMode === "new") {
-                    if (uiState.debugMode) console.log("CROPDBG drag-new start=(" + Math.round(cropStartX) + "," + Math.round(cropStartY) + ") current=(" + Math.round(mouse.x) + "," + Math.round(mouse.y) + ")")
                     // Update crop rectangle while dragging
                     updateCropBox(cropStartX, cropStartY, mouse.x, mouse.y, true)
                 } else if (cropDragMode === "rotate") {
@@ -844,10 +809,6 @@ Item {
                 } else {
                     // Handle move/resize (edge dragging)
                     var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
-                    
-                    if (uiState.debugMode) {
-                        console.log("CROPDBG drag-edit mouseX=" + Math.round(coords.x * 1000) + " mouseY=" + Math.round(coords.y * 1000))
-                    }
 
                     // Clamp to image bounds and convert to 0-1000 range
                     var mouseX = Math.max(0, Math.min(1, coords.x)) * 1000
@@ -926,10 +887,6 @@ Item {
                 isDarkenPainting = false
                 if (controller) controller.finish_darken_stroke()
                 return
-            }
-
-            if (uiState && uiState.debugMode) {
-                console.log("CROPDBG onReleased button=" + mouse.button + " isCropDragging=" + isCropDragging + " mode=" + cropDragMode + " box=[" + uiState.currentCropBox + "]")
             }
 
             isDraggingOutside = false
@@ -1023,10 +980,6 @@ Item {
             var right = Math.max(imgCoordX1, imgCoordX2) * 1000
             var top = Math.min(imgCoordY1, imgCoordY2) * 1000
             var bottom = Math.max(imgCoordY1, imgCoordY2) * 1000
-            
-            if (uiState.debugMode) {
-                console.log("CROPDBG updateCropBox screen=(" + Math.round(x1) + "," + Math.round(y1) + ") to (" + Math.round(x2) + "," + Math.round(y2) + ") norm1=(" + imgCoord1.x.toFixed(3) + "," + imgCoord1.y.toFixed(3) + ") norm2=(" + imgCoord2.x.toFixed(3) + "," + imgCoord2.y.toFixed(3) + ") result=[" + Math.round(left) + "," + Math.round(top) + "," + Math.round(right) + "," + Math.round(bottom) + "]")
-            }
             
             // Determine primary drag direction for "new" mode (from anchor x1,y1 to mouse x2,y2)
             // We need to know which corner is the anchor to apply aspect ratio correctly

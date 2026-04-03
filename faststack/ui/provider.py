@@ -1222,7 +1222,6 @@ class UIState(QObject):
             )
             return
         if self._current_crop_box != new_value:
-            log.info("CROPDBG set_crop_box(%r) -> old_box=%r", new_value, self._current_crop_box)
             self._current_crop_box = new_value
             self.current_crop_box_changed.emit(new_value)
             # Sync with ImageEditor

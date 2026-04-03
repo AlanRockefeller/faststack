@@ -87,7 +87,7 @@ Example:
 
 ```cmd
 set FASTSTACK_TURBOJPEG_LIB=C:\path\to\turbojpeg.dll
-venv\Scripts\python.exe -m faststack.app "C:\path\to\photos"
+faststack "C:\path\to\photos"
 ```
 
 ### Troubleshooting on Windows
@@ -107,7 +107,7 @@ Fastest fixes:
 
 ```cmd
 set FASTSTACK_TURBOJPEG_LIB=C:\path\to\turbojpeg.dll
-venv\Scripts\python.exe -m faststack.app "C:\path\to\photos"
+faststack "C:\path\to\photos"
 ```
 
 If you do nothing, FastStack will still run, but JPEG decoding and thumbnail generation will use Pillow instead of `libjpeg-turbo`, which is slower.

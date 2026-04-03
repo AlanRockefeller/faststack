@@ -1488,7 +1488,7 @@ class AppController(QObject):
         if self.debug_cache:
             _t_start = time.perf_counter()
             print(
-                f"[CROPDBG] sync_ui_state: START gen={self.ui_refresh_generation + 1} isCropping={self.ui_state.isCropping} cropBox={self.ui_state.currentCropBox}"
+                f"[DBGCACHE] {_t_start*1000:.3f} sync_ui_state: START gen={self.ui_refresh_generation + 1}"
             )
 
         self.ui_refresh_generation += 1
@@ -5997,7 +5997,6 @@ class AppController(QObject):
             # Pull crop box specifically; use default if None
             crop_box = edits.get("crop_box")
             if crop_box:
-                log.info("CROPDBG _sync_editor_state_from_session internal: crop_box=%r", crop_box)
                 self.ui_state.currentCropBox = crop_box
             else:
                 self.ui_state.currentAspectRatioIndex = 0
@@ -6791,7 +6790,6 @@ class AppController(QObject):
     @Slot()
     def cancel_crop_mode(self):
         """Cancel crop mode without applying changes."""
-        log.info("CROPDBG cancel_crop_mode before isCropping=%r cropBox=%r", self.ui_state.isCropping, self.ui_state.currentCropBox)
         if self.ui_state.isCropping:
             self.ui_state.isCropping = False
             self.ui_state.currentCropBox = [0, 0, 1000, 1000]
@@ -6801,38 +6799,27 @@ class AppController(QObject):
             self.ui_refresh_generation += 1
             self.ui_state.currentImageSourceChanged.emit()
             self.update_status_message("Crop cancelled")
-            log.info("CROPDBG cancel_crop_mode after isCropping=%r cropBox=%r", self.ui_state.isCropping, self.ui_state.currentCropBox)
 
     @Slot()
-    @Slot(bool)
-    @Slot(bool, bool)
-    def toggle_crop_mode(self, force_state=None, reset_box=True):
-        """Toggle crop mode on/off, or force a specific state."""
-        if force_state is not None:
-            self.ui_state.isCropping = force_state
-        else:
-            self.ui_state.isCropping = not self.ui_state.isCropping
+    def toggle_crop_mode(self):
+        """Toggle crop mode on/off."""
+        self.ui_state.isCropping = not self.ui_state.isCropping
 
         if self.ui_state.isCropping:
-            if reset_box:
-                # Reset crop box when entering crop mode
-                self.ui_state.currentCropBox = (0, 0, 1000, 1000)
-                # Set aspect ratios for QML dropdown
-                self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
-                self.ui_state.currentAspectRatioIndex = 0
+            # Entering crop mode: reset to full image defaults
+            self.ui_state.currentCropBox = (0, 0, 1000, 1000)
+            self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
+            self.ui_state.currentAspectRatioIndex = 0
 
-                # Reset rotation to 0 when starting fresh crop mode
-                self.image_editor.set_edit_param("straighten_angle", 0.0)
-
+            # Reset rotation to 0 when starting fresh crop mode
+            self.image_editor.set_edit_param("straighten_angle", 0.0)
             self.update_status_message("Crop mode: Drag to select area, Enter to crop")
-        else:  # Exiting crop mode
-            self.ui_state.isCropping = False
+        else:
+            # Exiting crop mode: cleanup
             self.ui_state.currentCropBox = (0, 0, 1000, 1000)
             # Ensure preview rotation is cleared when exiting
             self.image_editor.set_edit_param("straighten_angle", 0.0)
             self.update_status_message("Crop cancelled")
-        
-        log.info("CROPDBG toggle_crop_mode(force_state=%r, reset_box=%r) -> isCropping=%r cropBox=%r", force_state, reset_box, self.ui_state.isCropping, self.ui_state.currentCropBox)
 
     @Slot()
     def stack_source_raws(self):
@@ -6999,7 +6986,6 @@ class AppController(QObject):
     @Slot()
     def execute_crop(self):
         """Execute the crop operation: crop image, save, backup, and refresh."""
-        log.info("CROPDBG execute_crop start isCropping=%r cropBox=%r", self.ui_state.isCropping, self.ui_state.currentCropBox)
         if not self.image_files or self.current_index >= len(self.image_files):
             self.update_status_message("No image to crop")
             return
