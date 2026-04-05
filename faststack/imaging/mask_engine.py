@@ -429,7 +429,9 @@ def resolve_mask(
 
     # Pre-compute edges if needed by either auto priors or final edge protection.
     edges = None
-    if (mode != "paint_only" and settings.auto_from_edges > 0.01) or settings.edge_protection > 0.01:
+    if (
+        mode != "paint_only" and settings.auto_from_edges > 0.01
+    ) or settings.edge_protection > 0.01:
         edges = _edge_magnitude(image_arr)
 
     if mode != "paint_only":

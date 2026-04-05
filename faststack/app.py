@@ -1719,7 +1719,9 @@ class AppController(QObject):
                 concurrent.futures.wait([fut])
                 on_done(fut)
 
-            t = threading.Thread(target=_fallback_watcher, daemon=True, name="SaveCallbackFallback")
+            t = threading.Thread(
+                target=_fallback_watcher, daemon=True, name="SaveCallbackFallback"
+            )
             t.start()
 
         # Close editor UI immediately to allow the user to continue working.
