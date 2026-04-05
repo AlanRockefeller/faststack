@@ -1630,6 +1630,9 @@ class AppController(QObject):
             save_image_key,
             getattr(self, "view_override_kind", None),
             self.image_editor.session_id if self.image_editor else None,
+            getattr(self.image_editor, "_edits_rev", None)
+            if self.image_editor
+            else None,
         )
 
         if save_image_key and save_image_key in self._saving_keys:
@@ -1690,8 +1693,19 @@ class AppController(QObject):
                 result = {"success": False, "error": str(e), **_ctx}
             self._saveFinished.emit(result)
 
-        future = self._save_executor.submit(do_save)
-        future.add_done_callback(on_done)
+        try:
+            future = self._save_executor.submit(do_save)
+            future.add_done_callback(on_done)
+        except Exception as e:
+            # Roll back save-tracking state if submission itself fails
+            if effective_target:
+                self._saves_in_flight.discard(effective_target)
+            if save_image_key:
+                self._saving_keys.discard(save_image_key)
+            if not self._saves_in_flight:
+                self.ui_state.isSaving = False
+            self.update_status_message(f"Save failed: {e}", timeout=5000)
+            return
 
         # Close editor UI immediately to allow the user to continue working.
         # The background worker uses the frozen export_snapshot, so it doesn't
@@ -1747,6 +1761,9 @@ class AppController(QObject):
                 current_image_key,
                 getattr(self, "view_override_kind", None),
                 self.image_editor.session_id if self.image_editor else None,
+                getattr(self.image_editor, "_edits_rev", None)
+                if self.image_editor
+                else None,
             )
 
             still_on_same_image = (
@@ -5926,6 +5943,15 @@ class AppController(QObject):
                     pass
 
             if match:
+                # Reuse only when the editor has the full master buffer.
+                # Some callers (darken/crop) require float_image, not preview-only state.
+                if self.image_editor.float_image is None:
+                    match = False
+                    log.debug(
+                        "load_image_for_editing: Session matched path/mtime but missing float_image; forcing reload"
+                    )
+
+            if match:
                 log.debug(
                     "load_image_for_editing: Reusing existing session for %s", filepath
                 )
@@ -6803,9 +6829,20 @@ class AppController(QObject):
     @Slot()
     def toggle_crop_mode(self):
         """Toggle crop mode on/off."""
-        self.ui_state.isCropping = not self.ui_state.isCropping
+        if not self.ui_state.isCropping:
+            if not self.image_files or self.current_index >= len(self.image_files):
+                self.update_status_message("No image to crop")
+                return
 
-        if self.ui_state.isCropping:
+            if self._block_if_saving(self.image_files[self.current_index].path):
+                return
+
+            load_result = self.load_image_for_editing()
+            if load_result is False:
+                self.update_status_message("Failed to load image for cropping")
+                return
+
+            self.ui_state.isCropping = True
             # Entering crop mode: reset to full image defaults
             self.ui_state.currentCropBox = (0, 0, 1000, 1000)
             self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
@@ -6815,6 +6852,7 @@ class AppController(QObject):
             self.image_editor.set_edit_param("straighten_angle", 0.0)
             self.update_status_message("Crop mode: Drag to select area, Enter to crop")
         else:
+            self.ui_state.isCropping = False
             # Exiting crop mode: cleanup
             self.ui_state.currentCropBox = (0, 0, 1000, 1000)
             # Ensure preview rotation is cleared when exiting

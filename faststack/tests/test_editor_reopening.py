@@ -70,6 +70,7 @@ class TestEditorReopening(unittest.TestCase):
         target = Path("test.jpg")
         self.controller.image_editor.current_filepath = target
         self.controller.image_editor.current_mtime = 123.4
+        self.controller.image_editor.float_image = MagicMock()
 
         with patch("pathlib.Path.resolve", return_value=target.absolute()):
             with patch("pathlib.Path.stat") as mock_stat:
@@ -112,6 +113,7 @@ class TestEditorReopening(unittest.TestCase):
         self.controller.image_editor.current_filepath = target
         self.controller.image_editor.current_mtime = 123.4
         self.controller.image_editor.current_edits = {}
+        self.controller.image_editor.float_image = MagicMock()
 
         with patch("pathlib.Path.resolve", return_value=target.absolute()):
             with patch("pathlib.Path.stat") as mock_stat:
@@ -125,6 +127,21 @@ class TestEditorReopening(unittest.TestCase):
                 # _prepare_darken_image_state correctly skips darken reset)
                 self.assertIsNot(res, True)
                 self.assertEqual(res, AppController._REUSED)
+
+    def test_matching_path_without_float_image_forces_reload(self):
+        target = Path("test.jpg")
+        self.controller.image_editor.current_filepath = target
+        self.controller.image_editor.current_mtime = 123.4
+        self.controller.image_editor.float_image = None
+        self.controller.image_editor.load_image.return_value = True
+
+        with patch("pathlib.Path.resolve", return_value=target.absolute()):
+            with patch("pathlib.Path.stat") as mock_stat:
+                mock_stat.return_value.st_mtime = 123.4
+
+                res = self.controller.load_image_for_editing()
+                self.assertIs(res, True)
+                self.controller.image_editor.load_image.assert_called_once()
 
     def test_prepare_darken_skips_reset_on_reuse(self):
         """_prepare_darken_image_state must NOT call _reset_darken_on_navigation
@@ -178,7 +195,9 @@ class TestEditorReopening(unittest.TestCase):
         self.controller.ui_state.isEditorOpen = True
         self.controller.image_editor.current_filepath = target
         self.controller.image_editor.session_id = "sess-1"
+        self.controller.image_editor._edits_rev = 1
         self.controller.image_editor.current_mtime = 123.4
+        self.controller.image_editor.float_image = MagicMock()
 
         # Mock snapshot
         self.controller.image_editor.snapshot_for_export.return_value = MagicMock()
@@ -208,6 +227,75 @@ class TestEditorReopening(unittest.TestCase):
                     res = self.controller.load_image_for_editing()
                     self.assertEqual(res, AppController._REUSED)
                     self.controller.image_editor.load_image.assert_not_called()
+
+    def test_save_submit_failure_rolls_back_saving_state(self):
+        self.controller.ui_state.isEditorOpen = True
+        self.controller.ui_state.isSaving = False
+        self.controller.image_editor.original_image = MagicMock()
+        self.controller.image_editor.snapshot_for_export.return_value = MagicMock()
+        self.controller.image_editor.current_filepath = Path("test.jpg")
+        self.controller.image_editor.session_id = "sess-1"
+        self.controller.image_editor._edits_rev = 1
+
+        mock_executor = MagicMock()
+        mock_executor.submit.side_effect = RuntimeError("executor down")
+        self.controller._save_executor = mock_executor
+
+        self.controller.save_edited_image()
+
+        self.assertFalse(self.controller.ui_state.isSaving)
+        self.assertEqual(len(self.controller._saves_in_flight), 0)
+        self.assertEqual(len(self.controller._saving_keys), 0)
+        self.assertTrue(
+            str(self.controller.ui_state.statusMessage).startswith("Save failed:")
+        )
+
+    def test_on_save_finished_does_not_clear_when_edits_revision_changed(self):
+        self.controller.ui_state.isEditorOpen = True
+        self.controller.image_editor.session_id = "sess-1"
+        self.controller.image_editor._edits_rev = 2
+        self.controller.image_editor.clear.reset_mock()
+
+        save_result = {
+            "success": True,
+            "result": (Path("test.jpg"), None),
+            "save_image_key": self.controller._key(Path("test.jpg")),
+            "session_token": (
+                self.controller._key(Path("test.jpg")),
+                None,
+                "sess-1",
+                1,
+            ),
+            "editor_was_open": True,
+            "started_from_restore_override": False,
+        }
+
+        with patch.object(self.controller, "refresh_image_list"):
+            self.controller._on_save_finished(save_result)
+
+        self.controller.image_editor.clear.assert_not_called()
+
+    def test_toggle_crop_mode_blocks_when_image_is_saving(self):
+        self.controller.ui_state.isCropping = False
+        self.controller.image_editor.set_edit_param.reset_mock()
+
+        with patch.object(self.controller, "_block_if_saving", return_value=True):
+            with patch.object(self.controller, "load_image_for_editing") as load_mock:
+                self.controller.toggle_crop_mode()
+                load_mock.assert_not_called()
+                self.assertFalse(self.controller.ui_state.isCropping)
+
+    def test_toggle_crop_mode_requires_editor_load_success(self):
+        self.controller.ui_state.isCropping = False
+        self.controller.image_editor.set_edit_param.reset_mock()
+
+        with patch.object(self.controller, "_block_if_saving", return_value=False):
+            with patch.object(
+                self.controller, "load_image_for_editing", return_value=False
+            ):
+                self.controller.toggle_crop_mode()
+                self.assertFalse(self.controller.ui_state.isCropping)
+                self.controller.image_editor.set_edit_param.assert_not_called()
 
     def test_editor_close_clears_memory_if_no_save_active(self):
         # 1. Setup
