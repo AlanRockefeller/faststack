@@ -6852,6 +6852,7 @@ class AppController(QObject):
             # Ensure backend crop state and preview rotation are cleared when exiting
             self.image_editor.set_crop_box(None)
             self.image_editor.set_edit_param("straighten_angle", 0.0)
+            self._kick_preview_worker()
             self.update_status_message("Crop cancelled")
         else:
             # Entering crop mode requires a loaded image with a valid float buffer.
@@ -6878,6 +6879,7 @@ class AppController(QObject):
 
             # Reset rotation to 0 when starting fresh crop mode
             self.image_editor.set_edit_param("straighten_angle", 0.0)
+            self._kick_preview_worker()
             self.update_status_message("Crop mode: Drag to select area, Enter to crop")
 
     @Slot()
