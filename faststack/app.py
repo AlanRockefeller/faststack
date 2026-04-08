@@ -1809,7 +1809,7 @@ class AppController(QObject):
                         # Closing triggers _on_editor_open_changed -> image_editor.clear()
                         # but we call it explicitly here just in case they closed it manually.
                         self.image_editor.clear()
-                    
+
                     # Also clear variant override if we started from one
                     if save_result.get("started_from_restore_override"):
                         self._clear_variant_override()
