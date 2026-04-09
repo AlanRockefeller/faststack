@@ -6877,7 +6877,7 @@ class AppController(QObject):
             self._reset_crop_settings()
             # Restore isCropping after helper might have cleared it (if it was somehow already True)
             self.ui_state.isCropping = True
-            
+
             self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
             self.ui_state.currentAspectRatioIndex = 0
 
