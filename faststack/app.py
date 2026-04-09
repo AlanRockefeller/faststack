@@ -3178,31 +3178,28 @@ class AppController(QObject):
         self.sync_ui_state()
 
     def _reset_crop_only(self):
-        """Resets crop settings (crop box) to default and exits crop mode, PRESERVING rotation."""
+        """Resets crop settings (crop box and straighten) to default and exits crop mode, PRESERVING 90-deg rotation."""
         if self.ui_state.isCropping:
             self.ui_state.isCropping = False
             self.update_status_message("Crop mode exited")
         self.ui_state.currentCropBox = (0, 0, 1000, 1000)
         # Also clear any editor-side crop box in case it's not fully synced yet
         self.image_editor.set_crop_box((0, 0, 1000, 1000))
+        # Reset straighten angle since it is considered a crop-specific state
+        self.image_editor.set_edit_param("straighten_angle", 0.0)
+        if hasattr(self.ui_state, "cropRotation"):
+            self.ui_state.cropRotation = 0.0
+        if "straighten_angle" in self.image_editor.current_edits:
+            self.image_editor.current_edits["straighten_angle"] = 0.0
 
     def _reset_crop_settings(self):
-        """Resets crop settings (using _reset_crop_only) AND resets rotation."""
+        """Resets crop settings (using _reset_crop_only) AND resets 90-degree rotation."""
         self._reset_crop_only()
-        # Reset rotation and straighten angle
+        # Reset 90-degree rotation
         self.image_editor.set_edit_param("rotation", 0)
-        self.image_editor.set_edit_param("straighten_angle", 0.0)
         # Also update UI state for rotation values if they are exposed
         if hasattr(self.ui_state, "rotation"):
             self.ui_state.rotation = 0
-        if hasattr(
-            self.ui_state, "cropRotation"
-        ):  # This is used by Components.qml for the overlay
-            self.ui_state.cropRotation = 0.0
-
-        # Also reset the straighten angle in current_edits since it affects rotation logic
-        if "straighten_angle" in self.image_editor.current_edits:
-            self.image_editor.current_edits["straighten_angle"] = 0.0
 
     @Slot()
     def launch_helicon_default(self):
@@ -6876,10 +6873,9 @@ class AppController(QObject):
             if not self.load_image_for_editing():
                 return
 
-            self.ui_state.isCropping = True
             # Reset to full image defaults (UI and Backend)
             self._reset_crop_only()
-            # Restore isCropping after helper might have cleared it (if it was somehow already True)
+            # Set isCropping to True now that reset is done
             self.ui_state.isCropping = True
 
             self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
