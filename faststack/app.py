@@ -3177,14 +3177,18 @@ class AppController(QObject):
         self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
 
-    def _reset_crop_settings(self):
-        """Resets crop settings to default (full image) and exits crop mode, and resets rotation."""
+    def _reset_crop_only(self):
+        """Resets crop settings (crop box) to default and exits crop mode, PRESERVING rotation."""
         if self.ui_state.isCropping:
             self.ui_state.isCropping = False
             self.update_status_message("Crop mode exited")
         self.ui_state.currentCropBox = (0, 0, 1000, 1000)
         # Also clear any editor-side crop box in case it's not fully synced yet
         self.image_editor.set_crop_box((0, 0, 1000, 1000))
+
+    def _reset_crop_settings(self):
+        """Resets crop settings (using _reset_crop_only) AND resets rotation."""
+        self._reset_crop_only()
         # Reset rotation and straighten angle
         self.image_editor.set_edit_param("rotation", 0)
         self.image_editor.set_edit_param("straighten_angle", 0.0)
@@ -6844,7 +6848,7 @@ class AppController(QObject):
     def cancel_crop_mode(self):
         """Cancel crop mode without applying changes."""
         if self.ui_state.isCropping:
-            self._reset_crop_settings()
+            self._reset_crop_only()
             # Notify UI and kick fresh render
             self.ui_refresh_generation += 1
             self._kick_preview_worker()
@@ -6874,7 +6878,7 @@ class AppController(QObject):
 
             self.ui_state.isCropping = True
             # Reset to full image defaults (UI and Backend)
-            self._reset_crop_settings()
+            self._reset_crop_only()
             # Restore isCropping after helper might have cleared it (if it was somehow already True)
             self.ui_state.isCropping = True
 
