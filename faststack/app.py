@@ -415,6 +415,7 @@ class AppController(QObject):
             []
         )  # Active flag filters (e.g. ["uploaded", "stacked"])
         self._filter_enabled: bool = False
+        self.sort_mode: str = "default"
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
@@ -679,6 +680,54 @@ class AppController(QObject):
         self.current_index = min(self.current_index, max(0, len(self.image_files) - 1))
         self.sync_ui_state()
         self._do_prefetch(self.current_index)
+
+    @Slot(result=str)
+    def get_sort_mode(self):
+        return self.sort_mode
+
+    @Slot(str)
+    def set_sort_mode(self, mode: str):
+        if mode not in ("default", "filename", "date"):
+            return
+        if self.sort_mode == mode:
+            return
+        self.sort_mode = mode
+
+        preserved_path = None
+        if self.image_files and 0 <= self.current_index < len(self.image_files):
+            preserved_path = self.image_files[self.current_index].path
+
+        self._apply_filter_to_cached_list()
+        self._bump_display_generation()
+
+        if self.image_files and preserved_path:
+            target_key = self._key(preserved_path)
+            new_idx = self._path_to_index.get(target_key)
+            if new_idx is not None:
+                self.current_index = new_idx
+            else:
+                self._clear_variant_override()
+                self.current_index = 0
+        else:
+            self._clear_variant_override()
+            self.current_index = 0
+
+        if self._is_grid_view_active:
+            self._thumbnail_prefetcher.cancel_all()
+
+        if self._is_grid_view_active and self._thumbnail_model:
+            self._grid_refreshes += 1
+            self._thumbnail_model.refresh_from_controller(self.image_files)
+            self._path_resolver.update_from_model(self._thumbnail_model)
+            self._grid_model_dirty = False
+        else:
+            self._grid_model_dirty = True
+
+        self.sync_ui_state()
+        self._do_prefetch(self.current_index)
+        self.dataChanged.emit()
+        if hasattr(self, "ui_state") and self.ui_state:
+            self.ui_state.sortModeChanged.emit()
 
     def get_display_info(self):
         with self._display_lock:
@@ -1084,6 +1133,16 @@ class AppController(QObject):
                 if all(getattr(meta, flag, False) for flag in flags):
                     result.append(img)
             filtered = result
+
+        if self.sort_mode == "filename":
+            filtered.sort(key=lambda img: img.path.name.lower())
+        elif self.sort_mode == "date":
+            # Use the timestamp captured at scan time (ImageFile.timestamp)
+            # so we avoid live filesystem calls during sort.  Tiebreak on
+            # lowercase filename for determinism when mtimes are equal.
+            filtered.sort(
+                key=lambda img: (-img.timestamp, img.path.name.lower())
+            )
 
         self.image_files = filtered
         self._rebuild_path_to_index()

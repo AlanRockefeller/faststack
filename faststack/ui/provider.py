@@ -189,6 +189,7 @@ class UIState(QObject):
     stackSummaryChanged = Signal()  # Signal for stack summary updates
     filterStringChanged = Signal()  # Signal for filter string updates
     colorModeChanged = Signal()  # Signal for color mode updates
+    sortModeChanged = Signal()  # Signal for sort mode updates
     saturationFactorChanged = Signal()  # Signal for saturation factor updates
     awbModeChanged = Signal()
     awbStrengthChanged = Signal()
@@ -641,6 +642,11 @@ class UIState(QObject):
     def colorMode(self):
         """Returns the current color mode."""
         return self.app_controller.get_color_mode()
+
+    @Property(str, notify=sortModeChanged)
+    def sortMode(self):
+        """Returns the current sort mode."""
+        return self.app_controller.get_sort_mode()
 
     @Property(float, notify=saturationFactorChanged)
     def saturationFactor(self):
