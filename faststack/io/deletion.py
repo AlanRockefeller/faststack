@@ -66,7 +66,7 @@ def confirm_permanent_delete(image_file, reason: str = "") -> bool:
     file_list = "\n".join(f"  • {f}" for f in files_to_delete)
 
     msg_box = QMessageBox()
-    msg_box.setIcon(QMessageBox.Warning)
+    msg_box.setIcon(QMessageBox.Icon.Warning)
     msg_box.setWindowTitle("Permanent Deletion")
 
     if reason:
@@ -78,8 +78,10 @@ def confirm_permanent_delete(image_file, reason: str = "") -> bool:
         f"The following files will be permanently deleted:\n{file_list}"
     )
 
-    delete_btn = msg_box.addButton("Delete Permanently", QMessageBox.DestructiveRole)
-    cancel_btn = msg_box.addButton("Cancel", QMessageBox.RejectRole)
+    delete_btn = msg_box.addButton(
+        "Delete Permanently", QMessageBox.ButtonRole.DestructiveRole
+    )
+    cancel_btn = msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
     msg_box.setDefaultButton(cancel_btn)
 
     msg_box.exec()
@@ -107,7 +109,7 @@ def confirm_batch_permanent_delete(images: list, reason: str = "") -> bool:
             total_files += 1
 
     msg_box = QMessageBox()
-    msg_box.setIcon(QMessageBox.Warning)
+    msg_box.setIcon(QMessageBox.Icon.Warning)
     msg_box.setWindowTitle("Permanent Deletion")
 
     if reason:
@@ -132,9 +134,9 @@ def confirm_batch_permanent_delete(images: list, reason: str = "") -> bool:
         )
 
     delete_btn = msg_box.addButton(
-        f"Delete {len(images)} Images", QMessageBox.DestructiveRole
+        f"Delete {len(images)} Images", QMessageBox.ButtonRole.DestructiveRole
     )
-    cancel_btn = msg_box.addButton("Cancel", QMessageBox.RejectRole)
+    cancel_btn = msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
     msg_box.setDefaultButton(cancel_btn)
 
     msg_box.exec()

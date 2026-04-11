@@ -8,6 +8,7 @@ from typing import Optional
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
+from watchdog.observers.api import BaseObserver
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ class Watcher:
     """Manages the filesystem observer."""
 
     def __init__(self, directory: Path, callback):
-        self.observer: Optional[Observer] = None  # Initialize to None
+        self.observer: Optional[BaseObserver] = None  # Initialize to None
         self.event_handler = ImageDirectoryEventHandler(callback)
         self.directory = directory
         self.callback = callback
@@ -87,9 +88,10 @@ class Watcher:
             return  # Already running
 
         # Create a new observer instance every time, as it cannot be restarted
-        self.observer = Observer()
-        self.observer.schedule(self.event_handler, str(self.directory), recursive=False)
-        self.observer.start()
+        obs = Observer()
+        obs.schedule(self.event_handler, str(self.directory), recursive=False)
+        obs.start()
+        self.observer = obs
         log.info(f"Started watching directory: {self.directory}")
 
     def stop(self):

@@ -90,6 +90,3 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
     except (OSError, subprocess.SubprocessError) as e:
         log.exception(f"Failed to launch Helicon Focus: {e}")
         return False, None
-    except (IOError, PermissionError) as e:
-        log.exception(f"Failed to create temporary file for Helicon Focus: {e}")
-        return False, None

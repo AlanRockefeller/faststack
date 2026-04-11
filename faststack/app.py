@@ -16,6 +16,7 @@ import shutil
 import uuid
 import functools
 from collections import deque
+from itertools import pairwise
 
 # Must set before importing PySide6
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime.warning=false"
@@ -39,7 +40,7 @@ from PySide6.QtCore import (
     QPoint,
     QCoreApplication,  # noqa: F401 — patched by tests
 )
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from PySide6.QtQml import QQmlApplicationEngine
 from PIL import Image
 
@@ -415,6 +416,7 @@ class AppController(QObject):
             []
         )  # Active flag filters (e.g. ["uploaded", "stacked"])
         self._filter_enabled: bool = False
+        self.sort_mode: str = "default"
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
@@ -679,6 +681,197 @@ class AppController(QObject):
         self.current_index = min(self.current_index, max(0, len(self.image_files) - 1))
         self.sync_ui_state()
         self._do_prefetch(self.current_index)
+
+    @Slot(result=str)
+    def get_sort_mode(self):
+        return self.sort_mode
+
+    @Slot(str)
+    def set_sort_mode(self, mode: str):
+        if mode not in ("default", "filename", "date"):
+            return
+        if self.sort_mode == mode:
+            return
+
+        # --- Preflight: simulate the new order WITHOUT mutating state ---
+        have_stacks = bool(self.stacks)
+        clear_stacks = False
+
+        if have_stacks:
+            new_order = self._simulate_sorted_list(mode)
+            new_path_to_idx = {
+                self._key(img.path): i for i, img in enumerate(new_order)
+            }
+            if not self._stacks_stay_contiguous(new_path_to_idx):
+                if not self._confirm_clear_stacks_for_sort():
+                    return  # user cancelled — no state changed
+                clear_stacks = True
+
+        # --- Past this point we are committed to the sort ---
+        self.sort_mode = mode
+
+        preserved_path = None
+        if self.image_files and 0 <= self.current_index < len(self.image_files):
+            preserved_path = self.image_files[self.current_index].path
+
+        # Snapshot paths referenced by batches (and stacks if preserving)
+        old_batch_paths = self._resolve_ranges_to_paths(self.batches)
+        old_stack_paths = (
+            self._resolve_ranges_to_paths(self.stacks) if not clear_stacks else []
+        )
+        old_stack_start_path = (
+            self.image_files[self.stack_start_index].path
+            if not clear_stacks
+            and self.stack_start_index is not None
+            and 0 <= self.stack_start_index < len(self.image_files)
+            else None
+        )
+        old_batch_start_path = (
+            self.image_files[self.batch_start_index].path
+            if self.batch_start_index is not None
+            and 0 <= self.batch_start_index < len(self.image_files)
+            else None
+        )
+
+        self._apply_filter_to_cached_list()
+        self._bump_display_generation()
+
+        # Remap batches (splitting is acceptable)
+        self.batches = self._rebuild_ranges_from_paths(old_batch_paths)
+        self._invalidate_batch_cache()
+        if old_batch_start_path:
+            key = self._key(old_batch_start_path)
+            self.batch_start_index = self._path_to_index.get(key)
+
+        # Handle stacks
+        if clear_stacks:
+            self.stacks = []
+            self.stack_start_index = None
+            self.sidecar.data.stacks = []
+            self.sidecar.save()
+        elif have_stacks:
+            self.stacks = self._rebuild_ranges_from_paths(old_stack_paths)
+            # Only persist to sidecar when no filter is active — filtered
+            # image_files may hide stack members, producing incomplete ranges.
+            if not self._filter_enabled:
+                self.sidecar.data.stacks = self.stacks
+                self.sidecar.save()
+
+        # Remap pending stack start marker (even when no completed stacks exist)
+        if not clear_stacks and old_stack_start_path:
+            key = self._key(old_stack_start_path)
+            self.stack_start_index = self._path_to_index.get(key)
+
+        if self.image_files and preserved_path:
+            target_key = self._key(preserved_path)
+            new_idx = self._path_to_index.get(target_key)
+            if new_idx is not None:
+                self.current_index = new_idx
+            else:
+                self._clear_variant_override()
+                self.current_index = 0
+        else:
+            self._clear_variant_override()
+            self.current_index = 0
+
+        if self._is_grid_view_active:
+            self._thumbnail_prefetcher.cancel_all()
+
+        if self._is_grid_view_active and self._thumbnail_model:
+            self._grid_refreshes += 1
+            self._thumbnail_model.refresh_from_controller(self.image_files)
+            self._path_resolver.update_from_model(self._thumbnail_model)
+            self._grid_model_dirty = False
+        else:
+            self._grid_model_dirty = True
+
+        self.sync_ui_state()
+        self._do_prefetch(self.current_index)
+        self.dataChanged.emit()
+        if hasattr(self, "ui_state") and self.ui_state:
+            self.ui_state.sortModeChanged.emit()
+
+    def _filtered_sorted_copy(self, mode: str) -> list:
+        """Return a filtered and sorted copy of ``_all_images``.
+
+        Shared implementation for ``_simulate_sorted_list`` (read-only preview)
+        and ``_apply_filter_to_cached_list`` (mutating).
+        """
+        if self._filter_enabled and self._filter_string:
+            needle = self._filter_string.lower()
+            result = [
+                img for img in self._all_images if needle in img.path.stem.lower()
+            ]
+        else:
+            result = list(self._all_images)
+
+        # Apply flag-based filtering (AND logic: image must have ALL checked flags)
+        if self._filter_enabled and self._filter_flags:
+            flags = self._filter_flags
+            result = [
+                img
+                for img in result
+                if (
+                    (meta := self.sidecar.get_metadata(img.path, create=False))
+                    and all(getattr(meta, f, False) for f in flags)
+                )
+            ]
+
+        if mode == "filename":
+            result.sort(key=lambda img: img.path.name.lower())
+        elif mode == "date":
+            # Use the timestamp captured at scan time (ImageFile.timestamp)
+            # so we avoid live filesystem calls during sort.  Tiebreak on
+            # lowercase filename for determinism when mtimes are equal.
+            result.sort(key=lambda img: (-img.timestamp, img.path.name.lower()))
+        return result
+
+    def _simulate_sorted_list(self, mode: str) -> list:
+        """Return the image list as it would appear under *mode*, without
+        mutating any controller state.
+        """
+        return self._filtered_sorted_copy(mode)
+
+    def _stacks_stay_contiguous(self, new_path_to_idx: dict) -> bool:
+        """Return True if every current stack would be contiguous under the
+        index mapping *new_path_to_idx* (keyed by ``_key(path)``).
+        """
+        n = len(self.image_files)
+        for start, end in self.stacks:
+            indices = []
+            for i in range(start, min(end, n - 1) + 1):
+                path = self.image_files[i].path
+                new_idx = new_path_to_idx.get(self._key(path))
+                if new_idx is not None:
+                    indices.append(new_idx)
+            if len(indices) <= 1:
+                continue
+            indices.sort()
+            for a, b in pairwise(indices):
+                if b != a + 1:
+                    return False
+        return True
+
+    def _confirm_clear_stacks_for_sort(self) -> bool:
+        """Show a dialog asking whether to clear stacks to allow resorting.
+        Returns True if the user chose to clear and continue.
+        """
+        msg_box = QMessageBox()
+        msg_box.setIcon(QMessageBox.Icon.Warning)
+        msg_box.setWindowTitle("Stacks Must Be Cleared")
+        msg_box.setText(
+            "The new sort order would break existing focus stacks.\n\n"
+            "Stacks are defined by contiguous image ranges. Resorting "
+            "would scatter stack members, so stacks must be cleared "
+            "before changing the sort order."
+        )
+        clear_btn = msg_box.addButton(
+            "Clear Stacks and Resort", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel_btn = msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg_box.setDefaultButton(cancel_btn)
+        msg_box.exec()
+        return msg_box.clickedButton() == clear_btn
 
     def get_display_info(self):
         with self._display_lock:
@@ -1062,30 +1255,7 @@ class AppController(QObject):
 
     def _apply_filter_to_cached_list(self):
         """Applies current filter to cached image list without disk I/O."""
-        if self._filter_enabled and self._filter_string:
-            needle = self._filter_string.lower()
-            filtered = [
-                img for img in self._all_images if needle in img.path.stem.lower()
-            ]
-        else:
-            filtered = list(self._all_images)
-
-        # Apply flag-based filtering (AND logic: image must have ALL checked flags)
-        if self._filter_enabled and self._filter_flags:
-            flags = self._filter_flags
-            result = []
-            for img in filtered:
-                meta = self.sidecar.get_metadata(img.path, create=False)
-                if not meta:
-                    continue
-
-                # Check if all flags are present
-                # EntryMetadata is a simple object, getattr is fast
-                if all(getattr(meta, flag, False) for flag in flags):
-                    result.append(img)
-            filtered = result
-
-        self.image_files = filtered
+        self.image_files = self._filtered_sorted_copy(self.sort_mode)
         self._rebuild_path_to_index()
         self.prefetcher.set_image_files(self.image_files)
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
@@ -1099,6 +1269,44 @@ class AppController(QObject):
         self._path_to_index = {
             self._key(img.path): i for i, img in enumerate(self.image_files)
         }
+
+    def _resolve_ranges_to_paths(self, ranges: List[List[int]]) -> List[List[Path]]:
+        """Convert index ranges to lists of paths for remap across reorder."""
+        result = []
+        n = len(self.image_files)
+        for start, end in ranges:
+            paths = []
+            for i in range(start, min(end, n - 1) + 1):
+                paths.append(self.image_files[i].path)
+            if paths:
+                result.append(paths)
+        return result
+
+    def _rebuild_ranges_from_paths(self, groups: List[List[Path]]) -> List[List[int]]:
+        """Rebuild index ranges from path groups after reorder."""
+        ranges = []
+        for paths in groups:
+            indices = []
+            for p in paths:
+                idx = self._path_to_index.get(self._key(p))
+                if idx is not None:
+                    indices.append(idx)
+            if not indices:
+                continue
+            indices.sort()
+            # Merge into contiguous runs
+            run_start = indices[0]
+            run_end = indices[0]
+            for idx in indices[1:]:
+                if idx == run_end + 1:
+                    run_end = idx
+                else:
+                    ranges.append([run_start, run_end])
+                    run_start = idx
+                    run_end = idx
+            ranges.append([run_start, run_end])
+        ranges.sort()
+        return ranges
 
     def _reindex_after_save(self, saved_path: str) -> bool:
         """Re-derive current_index to point at *saved_path* after a save.

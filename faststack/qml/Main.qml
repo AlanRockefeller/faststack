@@ -901,6 +901,80 @@ ApplicationWindow {
                 }
             }
 
+            // Separator before Sort options
+            Rectangle {
+                width: 220
+                height: 1
+                color: root.isDarkTheme ? "#666666" : "#cccccc"
+            }
+
+            ItemDelegate {
+                width: 220
+                height: 36
+                text: "Sort: Default"
+                onClicked: {
+                    if (controller) controller.set_sort_mode("default")
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0")
+                                          : ((uiState && uiState.sortMode === "default")
+                                             ? (root.isDarkTheme ? "#505050" : "#d0ffd0")
+                                             : "transparent")
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    font.bold: uiState && uiState.sortMode === "default"
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
+            ItemDelegate {
+                width: 220
+                height: 36
+                text: "Sort: By Filename"
+                onClicked: {
+                    if (controller) controller.set_sort_mode("filename")
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0")
+                                          : ((uiState && uiState.sortMode === "filename")
+                                             ? (root.isDarkTheme ? "#505050" : "#d0ffd0")
+                                             : "transparent")
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    font.bold: uiState && uiState.sortMode === "filename"
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
+            ItemDelegate {
+                width: 220
+                height: 36
+                text: "Sort: By Date (Newest)"
+                onClicked: {
+                    if (controller) controller.set_sort_mode("date")
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0")
+                                          : ((uiState && uiState.sortMode === "date")
+                                             ? (root.isDarkTheme ? "#505050" : "#d0ffd0")
+                                             : "transparent")
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    font.bold: uiState && uiState.sortMode === "date"
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
+
             // Clear Filename Filter (from old Main.qml)
             ItemDelegate {
                 width: 220
