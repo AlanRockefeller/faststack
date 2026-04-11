@@ -107,8 +107,8 @@ Item {
             Image {
                 id: thumbnailImage
                 anchors.centerIn: parent
-                width: tile.tileIsFolder ? 120 : Math.min(thumbnailSize, parent.width)
-                height: tile.tileIsFolder ? 120 : Math.min(thumbnailSize, parent.height)
+                width: tile.tileIsFolder ? Math.min(120, parent.width) : Math.min(thumbnailSize, parent.width)
+                height: tile.tileIsFolder ? Math.min(120, parent.height) : Math.min(thumbnailSize, parent.height)
                 fillMode: Image.PreserveAspectFit
                 source: tile.tileThumbnailSource
                 asynchronous: true
@@ -463,7 +463,7 @@ Item {
                             spacing: 1
                             // Upload bar (green) - top
                             Rectangle {
-                                width: 4
+                                width: 3
                                 height: 3
                                 radius: 0.5
                                 color: tile.counterUploadedCol
@@ -471,7 +471,7 @@ Item {
                             }
                             // Stack bar (orange) - middle
                             Rectangle {
-                                width: 4
+                                width: 3
                                 height: 3
                                 radius: 0.5
                                 color: tile.counterStackedCol
@@ -479,7 +479,7 @@ Item {
                             }
                             // Todo bar (red) - bottom
                             Rectangle {
-                                width: 4
+                                width: 3
                                 height: 3
                                 radius: 0.5
                                 color: "#FF5252"  // Brighter red
