@@ -81,14 +81,12 @@ def connect_ro(path: str) -> sqlite3.Connection:
 
 def get_tables(conn: sqlite3.Connection) -> set[str]:
     """Return all user table names in the database."""
-    rows = conn.execute(
-        """
+    rows = conn.execute("""
         SELECT name
         FROM sqlite_master
         WHERE type = 'table'
           AND name NOT LIKE 'sqlite_%'
-        """
-    ).fetchall()
+        """).fetchall()
     return {row["name"] for row in rows}
 
 

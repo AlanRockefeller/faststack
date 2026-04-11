@@ -101,7 +101,6 @@ from faststack.deletion_types import (
     UIStateRestoration,
 )
 
-
 # AWB thresholds on the -1..+1 normalised slider range.
 # NOOP: skip applying correction entirely (≈ 0.64 Lab units — below perceptible).
 # LABEL: below this the direction word becomes "neutral" in the status message.
@@ -5347,9 +5346,9 @@ class AppController(QObject):
 
         if action_type == "delete":
             try:
-                (jpg_pair, raw_pair) = action_data
-                (jpg_src, jpg_bin) = jpg_pair
-                (raw_src, raw_bin) = raw_pair
+                jpg_pair, raw_pair = action_data
+                jpg_src, jpg_bin = jpg_pair
+                raw_src, raw_bin = raw_pair
             except Exception:
                 self.update_status_message("Undo failed: unexpected undo record format")
                 log.exception("Unexpected undo record format: %r", action_data)
