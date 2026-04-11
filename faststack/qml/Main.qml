@@ -909,69 +909,37 @@ ApplicationWindow {
             }
 
             ItemDelegate {
+                id: sortPhotosLauncher
                 width: 220
                 height: 36
-                text: "Sort: Default"
-                onClicked: {
-                    if (controller) controller.set_sort_mode("default")
-                    actionsMenu.close()
-                }
+                hoverEnabled: true
                 background: Rectangle {
-                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0")
-                                          : ((uiState && uiState.sortMode === "default")
-                                             ? (root.isDarkTheme ? "#505050" : "#d0ffd0")
-                                             : "transparent")
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0") : "transparent"
                 }
-                contentItem: Text {
-                    text: parent.text
-                    color: root.currentTextColor
-                    font.bold: uiState && uiState.sortMode === "default"
-                    verticalAlignment: Text.AlignVCenter
-                    leftPadding: 10
+                contentItem: Item {
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Sort Photos"
+                        color: root.currentTextColor
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    Text {
+                        anchors.right: parent.right
+                        anchors.rightMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "\u25B6" // Right-pointing triangle
+                        font.pixelSize: 10
+                        color: root.currentTextColor
+                        opacity: 0.6
+                        verticalAlignment: Text.AlignVCenter
+                    }
                 }
-            }
-            ItemDelegate {
-                width: 220
-                height: 36
-                text: "Sort: By Filename"
-                onClicked: {
-                    if (controller) controller.set_sort_mode("filename")
-                    actionsMenu.close()
-                }
-                background: Rectangle {
-                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0")
-                                          : ((uiState && uiState.sortMode === "filename")
-                                             ? (root.isDarkTheme ? "#505050" : "#d0ffd0")
-                                             : "transparent")
-                }
-                contentItem: Text {
-                    text: parent.text
-                    color: root.currentTextColor
-                    font.bold: uiState && uiState.sortMode === "filename"
-                    verticalAlignment: Text.AlignVCenter
-                    leftPadding: 10
-                }
-            }
-            ItemDelegate {
-                width: 220
-                height: 36
-                text: "Sort: By Date (Newest)"
-                onClicked: {
-                    if (controller) controller.set_sort_mode("date")
-                    actionsMenu.close()
-                }
-                background: Rectangle {
-                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0")
-                                          : ((uiState && uiState.sortMode === "date")
-                                             ? (root.isDarkTheme ? "#505050" : "#d0ffd0")
-                                             : "transparent")
-                }
-                contentItem: Text {
-                    text: parent.text
-                    color: root.currentTextColor
-                    font.bold: uiState && uiState.sortMode === "date"
-                    verticalAlignment: Text.AlignVCenter
-                    leftPadding: 10
+                onHoveredChanged: {
+                    if (hovered) {
+                        sortSubMenu.popup(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
+                    }
                 }
             }
 
@@ -1108,6 +1076,94 @@ ApplicationWindow {
                 contentItem: Text {
                     text: parent.text
                     color: root.currentTextColor
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
+        }
+    }
+
+    Menu {
+        id: sortSubMenu
+        parent: Overlay.overlay
+        implicitWidth: 180
+
+        background: Rectangle {
+            implicitWidth: 180
+            implicitHeight: sortSubMenuColumn.implicitHeight
+            color: root.currentBackgroundColor
+            border.color: root.isDarkTheme ? "#666666" : "#cccccc"
+            radius: 4
+        }
+
+        contentItem: Column {
+            id: sortSubMenuColumn
+
+            ItemDelegate {
+                width: 180
+                height: 36
+                text: "Default"
+                onClicked: {
+                    if (controller) controller.set_sort_mode("default")
+                    sortSubMenu.close()
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0")
+                                          : ((uiState && uiState.sortMode === "default")
+                                             ? (root.isDarkTheme ? "#505050" : "#d0ffd0")
+                                             : "transparent")
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    font.bold: uiState && uiState.sortMode === "default"
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
+            ItemDelegate {
+                width: 180
+                height: 36
+                text: "By Filename"
+                onClicked: {
+                    if (controller) controller.set_sort_mode("filename")
+                    sortSubMenu.close()
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0")
+                                          : ((uiState && uiState.sortMode === "filename")
+                                             ? (root.isDarkTheme ? "#505050" : "#d0ffd0")
+                                             : "transparent")
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    font.bold: uiState && uiState.sortMode === "filename"
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: 10
+                }
+            }
+            ItemDelegate {
+                width: 180
+                height: 36
+                text: "By Date"
+                onClicked: {
+                    if (controller) controller.set_sort_mode("date")
+                    sortSubMenu.close()
+                    actionsMenu.close()
+                }
+                background: Rectangle {
+                    color: parent.hovered ? (root.isDarkTheme ? "#555555" : "#e0e0e0")
+                                          : ((uiState && uiState.sortMode === "date")
+                                             ? (root.isDarkTheme ? "#505050" : "#d0ffd0")
+                                             : "transparent")
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: root.currentTextColor
+                    font.bold: uiState && uiState.sortMode === "date"
                     verticalAlignment: Text.AlignVCenter
                     leftPadding: 10
                 }
