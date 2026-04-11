@@ -55,9 +55,9 @@ Item {
     property color developedColor: "#009688" // Teal for developed (D)
     property color cursorColor: "#00BFFF"    // Cyan for keyboard cursor
     property color loadingColor: tile.isDarkTheme ? "#3c3c3c" : "#e0e0e0"
-    property color counterUploadedCol: "#7BBF7F"   // Muted green
-    property color counterStackedCol: "#E8A64C"    // Muted orange
-    property color counterEditedCol: "#E8D44C"     // Muted yellow
+    property color counterUploadedCol: "#4CAF50"   // Bright green (matches badge)
+    property color counterStackedCol: "#FF9800"    // Bright orange (matches badge)
+    property color counterEditedCol: "#FFEB3B"     // Bright yellow (matches badge)
     property color emptyTextColor: tile.isDarkTheme ? "#888888" : "#666666"
 
     // Background
@@ -107,8 +107,8 @@ Item {
             Image {
                 id: thumbnailImage
                 anchors.centerIn: parent
-                width: Math.min(thumbnailSize, parent.width)
-                height: Math.min(thumbnailSize, parent.height)
+                width: tile.tileIsFolder ? 120 : Math.min(thumbnailSize, parent.width)
+                height: tile.tileIsFolder ? 120 : Math.min(thumbnailSize, parent.height)
                 fillMode: Image.PreserveAspectFit
                 source: tile.tileThumbnailSource
                 asynchronous: true
@@ -135,8 +135,8 @@ Item {
                 anchors.centerIn: parent
                 visible: tile.tileIsFolder && !tile.tileIsParentFolder
                 text: "\uD83D\uDDC2"  // File cabinet / open folder emoji (cleaner look)
-                font.pixelSize: 44
-                opacity: 0.7
+                font.pixelSize: 52
+                opacity: 0.85
             }
 
             // Parent folder indicator
@@ -430,16 +430,16 @@ Item {
                 anchors.bottom: parent.bottom
                 anchors.left: parent.left
                 anchors.right: parent.right
-                height: 38
+                height: 34
                 visible: tile.tileIsFolder && tile.tileFolderStats && tile.tileFolderStats.total_images > 0
 
-                // Subtle 3-stop gradient scrim (starts at ~80%)
+                // Subtle 3-stop gradient scrim (starts at ~70%)
                 Rectangle {
                     anchors.fill: parent
                     gradient: Gradient {
                         GradientStop { position: 0.0; color: Qt.rgba(0, 0, 0, 0.0) }
-                        GradientStop { position: 0.4; color: Qt.rgba(0, 0, 0, 0.20) }
-                        GradientStop { position: 1.0; color: Qt.rgba(0, 0, 0, 0.55) }
+                        GradientStop { position: 0.5; color: Qt.rgba(0, 0, 0, 0.15) }
+                        GradientStop { position: 1.0; color: Qt.rgba(0, 0, 0, 0.45) }
                     }
                 }
 
@@ -463,27 +463,27 @@ Item {
                             spacing: 1
                             // Upload bar (green) - top
                             Rectangle {
-                                width: 3
-                                height: 2
+                                width: 4
+                                height: 3
                                 radius: 0.5
                                 color: tile.counterUploadedCol
-                                opacity: modelData[0] * 0.9 + 0.1  // 0.1 base opacity, up to 1.0
+                                opacity: modelData[0] * 0.7 + 0.3  // 0.3 base opacity, up to 1.0
                             }
                             // Stack bar (orange) - middle
                             Rectangle {
-                                width: 3
-                                height: 2
+                                width: 4
+                                height: 3
                                 radius: 0.5
                                 color: tile.counterStackedCol
-                                opacity: modelData[1] * 0.9 + 0.1  // 0.1 base opacity, up to 1.0
+                                opacity: modelData[1] * 0.7 + 0.3
                             }
                             // Todo bar (red) - bottom
                             Rectangle {
-                                width: 3
-                                height: 2
+                                width: 4
+                                height: 3
                                 radius: 0.5
-                                color: "#F44336"
-                                opacity: modelData[2] * 0.9 + 0.1  // 0.1 base opacity, up to 1.0
+                                color: "#FF5252"  // Brighter red
+                                opacity: modelData[2] * 0.7 + 0.3
                             }
                         }
                     }
