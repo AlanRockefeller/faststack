@@ -539,7 +539,9 @@ class TestEditorReopening(unittest.TestCase):
         self.controller.image_editor.current_filepath = main_path
         self.controller.image_editor.load_image.return_value = True
 
-        with patch.object(self.controller, "get_decoded_image", return_value=MagicMock()):
+        with patch.object(
+            self.controller, "get_decoded_image", return_value=MagicMock()
+        ):
             with patch.object(self.controller, "auto_white_balance", return_value=None):
                 self.controller.quick_auto_white_balance()
 
