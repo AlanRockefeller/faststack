@@ -362,6 +362,7 @@ class ImageEditor:
         # Cached 768-entry LUT list for save_image_uint8_levels (R+G+B tables),
         # keyed on (round(blacks, 3), round(whites, 3)).
         self._cached_u8_lut: Optional[Tuple[Tuple[float, float], List[int]]] = None
+        self._cached_u8_wb_lut: Optional[Tuple[Tuple[float, float], List[int]]] = None
 
         # Mask subsystem — generic mask assets keyed by tool id
         self._mask_assets: Dict[str, MaskData] = {}
@@ -384,6 +385,7 @@ class ImageEditor:
             self._cached_highlight_analysis = None
             self._cached_detail_bands = None
             self._cached_u8_lut = None
+            self._cached_u8_wb_lut = None
             self._mask_assets.clear()
             self._mask_raster_cache.clear()
         # Optionally also reset edits if that matches your mental model:
@@ -1438,24 +1440,18 @@ class ImageEditor:
 
         for c in range(3):
             chan = rgb[:, :, c]
+            hist = np.bincount(chan.reshape(-1), minlength=256)
             # Treat near-white/near-black as clipped (JPEG artifacts often land on 254/1)
             clipped_low_pct.append(
-                100.0 * float(np.count_nonzero(chan <= 1)) / float(total)
+                100.0 * float(hist[0] + hist[1]) / float(total)
             )
             clipped_high_pct.append(
-                100.0 * float(np.count_nonzero(chan >= 254)) / float(total)
+                100.0 * float(hist[254] + hist[255]) / float(total)
             )
-
-            # Use discrete selection methods to avoid interpolation surprises on uint8.
-            # Fallback for older numpy (<1.22) that doesn't support method=.
-            try:
-                p_lows.append(float(np.percentile(chan, low_p, method="lower")))
-                p_highs.append(float(np.percentile(chan, high_p, method="higher")))
-            except TypeError:
-                p_lows.append(float(np.percentile(chan, low_p, interpolation="lower")))
-                p_highs.append(
-                    float(np.percentile(chan, high_p, interpolation="higher"))
-                )
+            p_lows.append(self._u8_percentile_from_hist(hist, low_p, method="lower"))
+            p_highs.append(
+                self._u8_percentile_from_hist(hist, high_p, method="higher")
+            )
 
         # Conservative anchors to avoid new channel clipping
         p_low = min(p_lows)
@@ -1502,6 +1498,157 @@ class ImageEditor:
                 "preview" if self.float_preview is not None else "full",
             )
         return blacks, whites, float(p_low), float(p_high)
+
+    @staticmethod
+    def _u8_percentile_from_hist(
+        hist: np.ndarray, percentile: float, method: str = "lower"
+    ) -> float:
+        """Return a discrete uint8 percentile directly from histogram counts."""
+        total = int(hist.sum())
+        if total <= 0:
+            return 0.0
+
+        q = max(0.0, min(100.0, float(percentile))) / 100.0
+        rank = (total - 1) * q
+        if method == "higher":
+            target_index = int(math.ceil(rank))
+        else:
+            target_index = int(math.floor(rank))
+
+        cdf = np.cumsum(hist)
+        value = int(np.searchsorted(cdf, target_index + 1, side="left"))
+        return float(max(0, min(255, value)))
+
+    def estimate_auto_white_balance(
+        self,
+        *,
+        strength: float = 0.7,
+        warm_bias: int = 6,
+        tint_bias: int = 0,
+        luma_lower_bound: int = 30,
+        luma_upper_bound: int = 220,
+        rgb_lower_bound: int = 5,
+        rgb_upper_bound: int = 250,
+        target_pixels: int = 600_000,
+    ) -> Optional[Dict[str, float]]:
+        """Estimate white-balance sliders from a robust preview-sized sample."""
+        _debug = log.isEnabledFor(logging.DEBUG)
+        if _debug:
+            t0 = time.perf_counter()
+
+        img_arr = (
+            self.float_preview if self.float_preview is not None else self.float_image
+        )
+        if img_arr is None:
+            if self.original_image is None:
+                return None
+            img_arr = (
+                np.asarray(self.original_image.convert("RGB"), dtype=np.float32)
+                / 255.0
+            )
+
+        h, w = img_arr.shape[:2]
+        total_pixels = max(1, h * w)
+        stride = max(1, int(math.sqrt(total_pixels / max(1, target_pixels))))
+        srgb = np.ascontiguousarray(np.clip(img_arr[::stride, ::stride], 0.0, 1.0))
+
+        rgb_low = max(0.0, min(255.0, float(rgb_lower_bound))) / 255.0
+        rgb_high = max(0.0, min(255.0, float(rgb_upper_bound))) / 255.0
+        luma_low = max(0.0, min(255.0, float(luma_lower_bound))) / 255.0
+        luma_high = max(0.0, min(255.0, float(luma_upper_bound))) / 255.0
+
+        mask = np.all(srgb > rgb_low, axis=2) & np.all(srgb < rgb_high, axis=2)
+        luma = (
+            0.2126 * srgb[:, :, 0]
+            + 0.7152 * srgb[:, :, 1]
+            + 0.0722 * srgb[:, :, 2]
+        )
+        mask &= (luma > luma_low) & (luma < luma_high)
+
+        if not np.any(mask):
+            return None
+
+        spread = np.max(srgb, axis=2) - np.min(srgb, axis=2)
+        chroma_ratio = spread / np.maximum(luma, 1.0 / 255.0)
+        valid_ratio = chroma_ratio[mask]
+
+        neutrality_limit = 0.18
+        if valid_ratio.size >= 128:
+            try:
+                neutrality_limit = float(
+                    np.percentile(valid_ratio, 35.0, method="linear")
+                )
+            except TypeError:
+                neutrality_limit = float(
+                    np.percentile(valid_ratio, 35.0, interpolation="linear")
+                )
+            neutrality_limit = float(np.clip(neutrality_limit, 0.03, 0.18))
+
+            neutral_mask = mask & (chroma_ratio <= neutrality_limit)
+            if np.count_nonzero(neutral_mask) >= 128:
+                mask = neutral_mask
+
+        midtone_weight = 1.0 - np.abs(luma - 0.5) / 0.5
+        midtone_weight = np.clip(midtone_weight, 0.1, 1.0)
+        weights = midtone_weight / np.maximum(chroma_ratio + 0.02, 0.02)
+        weights = np.clip(weights, 0.0, 20.0)
+
+        selected = mask & np.isfinite(weights)
+        selected_count = int(np.count_nonzero(selected))
+        if selected_count == 0:
+            return None
+
+        sample_srgb = srgb[selected]
+        sample_weights = weights[selected].astype(np.float32, copy=False)
+        sample_linear = _srgb_to_linear(sample_srgb).astype(np.float32, copy=False)
+        if not np.isfinite(sample_linear).all():
+            return None
+
+        r_mean = float(np.average(sample_linear[:, 0], weights=sample_weights))
+        g_mean = float(np.average(sample_linear[:, 1], weights=sample_weights))
+        b_mean = float(np.average(sample_linear[:, 2], weights=sample_weights))
+
+        eps = 1e-6
+        ratio_rb = b_mean / max(r_mean, eps)
+        by_raw = 2.0 * (ratio_rb - 1.0) / max(ratio_rb + 1.0, eps)
+
+        rb_target = 2.0 * r_mean * b_mean / max(r_mean + b_mean, eps)
+        g_gain_target = rb_target / max(g_mean, eps)
+        mg_raw = 2.0 * (1.0 - g_gain_target)
+
+        by_value = (by_raw + (float(warm_bias) / 128.0)) * float(strength)
+        mg_value = (mg_raw + (float(tint_bias) / 128.0)) * float(strength)
+
+        by_value = float(np.clip(by_value, -1.0, 1.0))
+        mg_value = float(np.clip(mg_value, -1.0, 1.0))
+
+        if _debug:
+            t_end = time.perf_counter()
+            log.debug(
+                "[AUTO_WB_EST] total=%dms sample=%dx%d stride=%d selected=%d neutral<=%.3f means=(%.4f, %.4f, %.4f) wb=(%.4f, %.4f)",
+                int((t_end - t0) * 1000),
+                srgb.shape[1],
+                srgb.shape[0],
+                stride,
+                selected_count,
+                neutrality_limit,
+                r_mean,
+                g_mean,
+                b_mean,
+                by_value,
+                mg_value,
+            )
+
+        return {
+            "by_value": by_value,
+            "mg_value": mg_value,
+            "r_mean": r_mean,
+            "g_mean": g_mean,
+            "b_mean": b_mean,
+            "selected_pixels": float(selected_count),
+            "stride": float(stride),
+            "neutrality_limit": neutrality_limit,
+        }
 
     def _get_upstream_edits_hash(self, edits: Dict[str, Any]) -> int:
         """Returns a hash of edit parameters that affect the input to highlight recovery."""
@@ -2268,6 +2415,55 @@ class ImageEditor:
         )
         return self.save_from_snapshot(snapshot)
 
+    def _save_u8_pil_image(
+        self, img_u8: Image.Image, original_path: Path, log_prefix: str
+    ) -> Optional[Tuple[Path, Path]]:
+        """Save a prepared uint8 RGB image with backup, EXIF, and best-effort atomic replace."""
+        try:
+            original_stat = original_path.stat()
+        except OSError:
+            original_stat = None
+
+        backup_path = create_backup_file(original_path)
+        if backup_path is None:
+            return None
+
+        exif_bytes = self._get_sanitized_exif_bytes()
+        save_kwargs = {"quality": 95}
+        if exif_bytes:
+            save_kwargs["exif"] = exif_bytes
+
+        tmp_path = original_path.with_name(
+            f"{original_path.stem}.__faststack_tmp__{uuid.uuid4().hex}{original_path.suffix}"
+        )
+        try:
+            try:
+                img_u8.save(tmp_path, **save_kwargs)
+            except Exception:
+                img_u8.save(tmp_path, quality=95)
+            try:
+                os.replace(tmp_path, original_path)
+            except OSError as e:
+                log.warning(
+                    "Atomic replace failed (%s); falling back to direct save", e
+                )
+                try:
+                    img_u8.save(original_path, **save_kwargs)
+                except Exception:
+                    img_u8.save(original_path, quality=95)
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+        if original_stat is not None:
+            self._restore_file_times(original_path, original_stat)
+
+        log.debug("%s saved via uint8 fast path: %s", log_prefix, original_path.name)
+        return original_path, backup_path
+
     def save_image_uint8_levels(
         self,
         save_target_path: Optional[Path] = None,
@@ -2355,70 +2551,122 @@ class ImageEditor:
         if _debug:
             t_lut = time.perf_counter()
 
-        try:
-            original_stat = original_path.stat()
-        except OSError:
-            original_stat = None
-
-        # Backup
-        backup_path = create_backup_file(original_path)
-        if backup_path is None:
-            return None
-
-        if _debug:
-            t_backup = time.perf_counter()
-
-        # EXIF
-        exif_bytes = self._get_sanitized_exif_bytes()
-        save_kwargs = {"quality": 95}
-        if exif_bytes:
-            save_kwargs["exif"] = exif_bytes
-
-        # Atomic write: temp file + os.replace() to prevent partial-write visibility
-        tmp_path = original_path.with_name(
-            f"{original_path.stem}.__faststack_tmp__{uuid.uuid4().hex}{original_path.suffix}"
+        save_result = self._save_u8_pil_image(
+            img_u8, original_path, log_prefix="[SAVE_IMAGE_U8_LEVELS]"
         )
-        try:
-            try:
-                img_u8.save(tmp_path, **save_kwargs)
-            except Exception:
-                # Fallback without EXIF, keep quality
-                img_u8.save(tmp_path, quality=95)
-            try:
-                os.replace(tmp_path, original_path)
-            except OSError as e:
-                # Windows: destination may be held open by another process
-                log.warning(
-                    "Atomic replace failed (%s); falling back to direct save", e
-                )
-                try:
-                    img_u8.save(original_path, **save_kwargs)
-                except Exception:
-                    img_u8.save(original_path, quality=95)
-        finally:
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except OSError:
-                pass
-
-        if original_stat is not None:
-            self._restore_file_times(original_path, original_stat)
+        if save_result is None:
+            return None
 
         if _debug:
             t_write = time.perf_counter()
             w, h = img_u8.size
             log.debug(
-                "[SAVE_IMAGE_U8] lut+apply=%dms backup=%dms write=%dms total=%dms  (%dx%d, %s)",
+                "[SAVE_IMAGE_U8] lut+apply=%dms save+write=%dms total=%dms  (%dx%d, %s)",
                 int((t_lut - t0) * 1000),
-                int((t_backup - t_lut) * 1000),
-                int((t_write - t_backup) * 1000),
+                int((t_write - t_lut) * 1000),
                 int((t_write - t0) * 1000),
                 w,
                 h,
                 original_path.name,
             )
-        return original_path, backup_path
+        return save_result
+
+    def save_image_uint8_white_balance(
+        self,
+        save_target_path: Optional[Path] = None,
+    ) -> Optional[Tuple[Path, Path]]:
+        """Fast-path save using per-channel LUTs for white-balance-only edits."""
+        if self.original_image is None or self.current_filepath is None:
+            return None
+
+        original_path = save_target_path if save_target_path else self.current_filepath
+        if original_path.suffix.lower() in (".tif", ".tiff"):
+            return None
+
+        with self._lock:
+            edits = self.current_edits.copy()
+
+        for key, default in self._initial_edits().items():
+            if key in ("white_balance_by", "white_balance_mg"):
+                continue
+            val = edits.get(key, default)
+            if isinstance(default, float):
+                try:
+                    if abs(float(val) - float(default)) > 0.001:
+                        return None
+                except (TypeError, ValueError):
+                    return None
+            elif val != default:
+                return None
+
+        try:
+            by = float(edits.get("white_balance_by", 0.0))
+            mg = float(edits.get("white_balance_mg", 0.0))
+        except (TypeError, ValueError):
+            return None
+
+        if abs(by) <= 0.001 and abs(mg) <= 0.001:
+            return None
+
+        _debug = log.isEnabledFor(logging.DEBUG)
+        if _debug:
+            t0 = time.perf_counter()
+
+        cache_key = (round(by, 3), round(mg, 3))
+        with self._lock:
+            cached = self._cached_u8_wb_lut
+            if cached is not None and cached[0] == cache_key:
+                lut_rgb = cached[1]
+            else:
+                lut_rgb = None
+
+        if lut_rgb is None:
+            by_scaled = by * 0.5
+            mg_scaled = mg * 0.5
+            r_gain = max(0.0, 1.0 + by_scaled)
+            g_gain = max(0.0, 1.0 - mg_scaled)
+            b_gain = max(0.0, 1.0 - by_scaled)
+
+            lut = np.arange(256, dtype=np.float32) / 255.0
+            lut_linear = _srgb_to_linear(lut)
+            lut_r = np.clip(_linear_to_srgb(lut_linear * r_gain), 0.0, 1.0)
+            lut_g = np.clip(_linear_to_srgb(lut_linear * g_gain), 0.0, 1.0)
+            lut_b = np.clip(_linear_to_srgb(lut_linear * b_gain), 0.0, 1.0)
+            lut_rgb = (
+                np.rint(lut_r * 255.0).astype(np.uint8).tolist()
+                + np.rint(lut_g * 255.0).astype(np.uint8).tolist()
+                + np.rint(lut_b * 255.0).astype(np.uint8).tolist()
+            )
+            with self._lock:
+                self._cached_u8_wb_lut = (cache_key, lut_rgb)
+
+        rgb_img = self.original_image
+        if rgb_img.mode != "RGB":
+            rgb_img = rgb_img.convert("RGB")
+        img_u8 = rgb_img.point(lut_rgb)
+
+        if _debug:
+            t_lut = time.perf_counter()
+
+        save_result = self._save_u8_pil_image(
+            img_u8, original_path, log_prefix="[SAVE_IMAGE_U8_WB]"
+        )
+        if save_result is None:
+            return None
+
+        if _debug:
+            t_write = time.perf_counter()
+            w, h = img_u8.size
+            log.debug(
+                "[SAVE_IMAGE_U8_WB] lut+apply=%dms write=%dms total=%dms  (%dx%d, %s)",
+                int((t_lut - t0) * 1000),
+                int((t_write - t_lut) * 1000),
+                int((t_write - t0) * 1000),
+                w,
+                h,
+                original_path.name,
+            )
+        return save_result
 
     def _restore_file_times(self, path: Path, original_stat: os.stat_result) -> None:
         """Best-effort restoration of access/modify timestamps after saving."""

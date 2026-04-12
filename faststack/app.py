@@ -101,8 +101,8 @@ from faststack.deletion_types import (
     UIStateRestoration,
 )
 
-# AWB thresholds on the -1..+1 normalised slider range.
-# NOOP: skip applying correction entirely (≈ 0.64 Lab units — below perceptible).
+# AWB thresholds on the -1..+1 normalized slider range.
+# NOOP: skip corrections that are effectively imperceptible in the current gain model.
 # LABEL: below this the direction word becomes "neutral" in the status message.
 _AWB_NOOP_EPS = 0.005
 _AWB_LABEL_EPS = 0.002
@@ -7829,7 +7829,7 @@ class AppController(QObject):
         ):
             cached_preview = self.get_decoded_image(self.current_index)
             if not self.image_editor.load_image(
-                filepath, cached_preview=cached_preview
+                filepath, cached_preview=cached_preview, preview_only=True
             ):
                 self.update_status_message("Failed to load image")
                 return
@@ -7847,7 +7847,14 @@ class AppController(QObject):
 
         # Save the edited image (this creates a backup automatically)
         try:
-            save_result = self.image_editor.save_image()
+            save_target_path = self._get_save_target_path_for_current_view()
+            save_result = self.image_editor.save_image_uint8_white_balance(
+                save_target_path=save_target_path
+            )
+            if save_result is None:
+                save_result = self.image_editor.save_image(
+                    save_target_path=save_target_path
+                )
         except RuntimeError as e:
             log.warning("quick_auto_white_balance: Save failed: %s", e)
             self.update_status_message(f"Failed to save image: {e}")
@@ -7972,8 +7979,10 @@ class AppController(QObject):
         self.ui_state.white_balance_by = by_value
         self.ui_state.white_balance_mg = mg_value
 
-        self.ui_refresh_generation += 1
         self.ui_state.currentImageSourceChanged.emit()
+        if self.ui_state.isHistogramVisible:
+            self.update_histogram()
+        self._kick_preview_worker()
 
         by_dir = _awb_direction(by_value, "warming", "cooling")
         mg_dir = _awb_direction(mg_value, "magenta", "greener")
@@ -7988,8 +7997,8 @@ class AppController(QObject):
 
     def auto_white_balance_lab(self) -> Optional[str]:
         """
-        Calculates and applies auto white balance using the Lab color space,
-        filtering out clipped and saturated pixels for a more robust result.
+        Calculates and applies auto white balance using a robust preview-sized
+        neutral-pixel estimate aligned to the editor's slider model.
 
         Returns the detail message string if a correction was applied, or None.
         """
@@ -7997,114 +8006,30 @@ class AppController(QObject):
             log.warning("No image loaded in editor for auto white balance")
             return None
 
-        try:
-            import cv2  # numpy is already imported at module level (line 79)
-        except ImportError:
-            log.error(
-                "OpenCV not found. Please install with: pip install opencv-python"
-            )
-            self.update_status_message("Error: OpenCV not installed")
-            return None
-
         t_awb_start = time.perf_counter()
-
-        # Subsample from float_image for speed.  float_image is the authoritative
-        # display-referred sRGB float32 buffer (editor.py:504-505 does
-        # np.array(rgb) / 255.0 from Pillow sRGB), same colour space as the
-        # old PIL-based path, so the AWB result is identical (within subsampling noise).
-        img_arr = self.image_editor.float_image
-        if img_arr is not None:
-            h, w = img_arr.shape[:2]
-            TARGET_PIXELS = 2_000_000
-            stride = max(1, int(np.sqrt(h * w / TARGET_PIXELS)))
-            sub = np.ascontiguousarray(
-                img_arr[::stride, ::stride]
-            )  # contiguous for cv2
-            arr = (np.clip(sub, 0.0, 1.0) * 255).astype(np.uint8)
-            log.debug(
-                "AWB: subsampled %dx%d -> %dx%d (stride %d)",
-                w,
-                h,
-                arr.shape[1],
-                arr.shape[0],
-                stride,
-            )
-        else:
-            # Fallback: use original_image (full PIL Image)
-            img = self.image_editor.original_image
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            arr = np.array(img, dtype=np.uint8)
-
-        t_awb_subsample = time.perf_counter()
-
-        # --- Tunable Constants for Auto White Balance (from config) ---
-        _LOWER_BOUND_RGB = config.getint("awb", "rgb_lower_bound", 5)
-        _UPPER_BOUND_RGB = config.getint("awb", "rgb_upper_bound", 250)
-        _LUMA_LOWER_BOUND = config.getint("awb", "luma_lower_bound", 30)
-        _LUMA_UPPER_BOUND = config.getint("awb", "luma_upper_bound", 220)
+        strength = config.getfloat("awb", "strength", 0.7)
         warm_bias = config.getint("awb", "warm_bias", 6)
         tint_bias = config.getint("awb", "tint_bias", 0)
-        _TARGET_A_LAB = 128.0 + tint_bias
-        _TARGET_B_LAB = 128.0 + warm_bias
-        _SCALING_FACTOR_LAB_TO_SLIDER = 128.0
-        _CORRECTION_STRENGTH = config.getfloat("awb", "strength", 0.7)
+        rgb_lower_bound = config.getint("awb", "rgb_lower_bound", 5)
+        rgb_upper_bound = config.getint("awb", "rgb_upper_bound", 250)
+        luma_lower_bound = config.getint("awb", "luma_lower_bound", 30)
+        luma_upper_bound = config.getint("awb", "luma_upper_bound", 220)
 
-        # --- 1. Reject clipped channels and use a luma midtone mask ---
-        mask = (
-            (arr[:, :, 0] > _LOWER_BOUND_RGB)
-            & (arr[:, :, 0] < _UPPER_BOUND_RGB)
-            & (arr[:, :, 1] > _LOWER_BOUND_RGB)
-            & (arr[:, :, 1] < _UPPER_BOUND_RGB)
-            & (arr[:, :, 2] > _LOWER_BOUND_RGB)
-            & (arr[:, :, 2] < _UPPER_BOUND_RGB)
+        estimate = self.image_editor.estimate_auto_white_balance(
+            strength=strength,
+            warm_bias=warm_bias,
+            tint_bias=tint_bias,
+            rgb_lower_bound=rgb_lower_bound,
+            rgb_upper_bound=rgb_upper_bound,
+            luma_lower_bound=luma_lower_bound,
+            luma_upper_bound=luma_upper_bound,
         )
-
-        luma = 0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2]
-        mask &= (luma > _LUMA_LOWER_BOUND) & (luma < _LUMA_UPPER_BOUND)
-
-        if not np.any(mask):
-            log.warning(
-                "Auto white balance: No pixels found after clipping and luma filter. Aborting."
-            )
-            self.update_status_message("AWB failed: no valid pixels found")
+        if not estimate:
+            self.update_status_message("AWB failed: no valid neutral pixels found")
             return None
 
-        t_awb_mask = time.perf_counter()
-
-        # --- 2. Work in Lab color space ---
-        lab_image = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
-
-        a_channel = lab_image[:, :, 1]
-        b_channel = lab_image[:, :, 2]
-
-        masked_a = a_channel[mask]
-        masked_b = b_channel[mask]
-
-        a_mean = masked_a.mean()
-        b_mean = masked_b.mean()
-
-        a_shift = _TARGET_A_LAB - a_mean
-        b_shift = _TARGET_B_LAB - b_mean
-
-        log.info(
-            "Auto WB (Lab) - means: a*=%.1f, b*=%.1f; targets: a*=%.1f, b*=%.1f; shifts: a*=%.1f, b*=%.1f",
-            a_mean,
-            b_mean,
-            _TARGET_A_LAB,
-            _TARGET_B_LAB,
-            a_shift,
-            b_shift,
-        )
-
-        # --- 3. Convert Lab shift to our slider values with strength factor ---
-        by_value = (b_shift / _SCALING_FACTOR_LAB_TO_SLIDER) * _CORRECTION_STRENGTH
-        mg_value = (a_shift / _SCALING_FACTOR_LAB_TO_SLIDER) * _CORRECTION_STRENGTH
-
-        by_value = float(np.clip(by_value, -1.0, 1.0))
-        mg_value = float(np.clip(mg_value, -1.0, 1.0))
-
-        log.info("Auto white balance values: B/Y=%.3f, M/G=%.3f", by_value, mg_value)
+        by_value = estimate["by_value"]
+        mg_value = estimate["mg_value"]
 
         # No-change detection — see _AWB_NOOP_EPS definition for rationale
         if abs(by_value) < _AWB_NOOP_EPS and abs(mg_value) < _AWB_NOOP_EPS:
@@ -8117,25 +8042,25 @@ class AppController(QObject):
         self.ui_state.white_balance_by = by_value
         self.ui_state.white_balance_mg = mg_value
 
-        self.ui_refresh_generation += 1
         self.ui_state.currentImageSourceChanged.emit()
+        if self.ui_state.isHistogramVisible:
+            self.update_histogram()
+        self._kick_preview_worker()
 
         by_dir = _awb_direction(by_value, "warming", "cooling")
         mg_dir = _awb_direction(mg_value, "magenta", "greener")
         msg = (
             f"AWB: B/Y {by_value:+.2f} ({by_dir}), M/G {mg_value:+.2f} ({mg_dir})"
-            f" \u2014 a*={a_mean:.0f}\u2192{_TARGET_A_LAB:.0f},"
-            f" b*={b_mean:.0f}\u2192{_TARGET_B_LAB:.0f}"
+            f" \u2014 neutral RGB {estimate['r_mean']:.3f}/"
+            f"{estimate['g_mean']:.3f}/{estimate['b_mean']:.3f}"
         )
         t_awb_end = time.perf_counter()
         log.debug(
-            "[AUTO_COLOR] subsample=%dms mask=%dms lab+calc=%dms total=%dms  (%dx%d)",
-            int((t_awb_subsample - t_awb_start) * 1000),
-            int((t_awb_mask - t_awb_subsample) * 1000),
-            int((t_awb_end - t_awb_mask) * 1000),
+            "[AUTO_COLOR] total=%dms  (selected=%d stride=%d neutral<=%.3f)",
             int((t_awb_end - t_awb_start) * 1000),
-            arr.shape[1],
-            arr.shape[0],
+            int(estimate["selected_pixels"]),
+            int(estimate["stride"]),
+            estimate["neutrality_limit"],
         )
         self.update_status_message(msg)
         return msg
