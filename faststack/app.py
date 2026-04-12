@@ -5980,20 +5980,30 @@ class AppController(QObject):
     def _restore_metadata_snapshot(
         self, sidecar: SidecarManager, image_path: Path, snapshot: Optional[dict]
     ) -> None:
-        """Restore sidecar metadata from a previously captured snapshot."""
-        sidecar.get_metadata(image_path, create=False)
+        """Restore only the metadata fields owned by edit-save actions."""
         stable_key = sidecar.metadata_key_for_path(image_path)
+        current_meta = sidecar.data.entries.get(stable_key)
+        restored_edited = bool(snapshot.get("edited", False)) if snapshot else False
+        restored_edited_date = snapshot.get("edited_date") if snapshot else None
         changed = False
 
+        if current_meta is None:
+            if not restored_edited and restored_edited_date is None:
+                return
+            current_meta = sidecar.get_metadata(image_path, create=True)
+            changed = True
+
+        if current_meta.edited != restored_edited:
+            current_meta.edited = restored_edited
+            changed = True
+        if current_meta.edited_date != restored_edited_date:
+            current_meta.edited_date = restored_edited_date
+            changed = True
+
         if snapshot is None:
-            if stable_key in sidecar.data.entries:
+            default_meta = EntryMetadata()
+            if current_meta.__dict__ == default_meta.__dict__:
                 del sidecar.data.entries[stable_key]
-                changed = True
-        else:
-            restored_meta = EntryMetadata(**snapshot)
-            current_meta = sidecar.data.entries.get(stable_key)
-            if current_meta is None or current_meta.__dict__ != snapshot:
-                sidecar.data.entries[stable_key] = restored_meta
                 changed = True
 
         if changed:
@@ -7991,13 +8001,22 @@ class AppController(QObject):
         t_start = time.perf_counter()
 
         image_file = self.image_files[self.current_index]
-        filepath = str(image_file.path)
+        if self.view_override_path:
+            active_path = Path(self.view_override_path)
+        else:
+            active_path = self.get_active_edit_path(self.current_index)
+        filepath = str(active_path)
 
         # Ensure image is loaded in editor (skip if already loaded)
-        if (
-            not self.image_editor.current_filepath
-            or str(self.image_editor.current_filepath) != filepath
-        ):
+        editor_path = self.image_editor.current_filepath
+        paths_match = False
+        if editor_path:
+            try:
+                paths_match = Path(editor_path).resolve() == active_path.resolve()
+            except (OSError, ValueError):
+                paths_match = str(editor_path) == filepath
+
+        if not paths_match:
             cached_preview = self.get_decoded_image(self.current_index)
             if not self.image_editor.load_image(
                 filepath, cached_preview=cached_preview, preview_only=True

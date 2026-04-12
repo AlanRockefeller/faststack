@@ -456,12 +456,18 @@ class TestEditorReopening(unittest.TestCase):
             "Save finished, but the result payload was malformed.", timeout=5000
         )
 
-    def test_undo_save_edit_restores_metadata_using_metadata_path(self):
+    def test_undo_save_edit_restores_only_owned_metadata_fields(self):
         main_path = Path("/folder-a/test.jpg")
         saved_path = Path("/folder-a/test-developed.jpg")
         backup_path = Path("/folder-a/test-developed-backup.jpg")
         metadata_sidecar = MagicMock()
-        metadata_sidecar.data.entries = {}
+        metadata_sidecar.data.entries = {
+            "test": EntryMetadata(
+                favorite=True,
+                edited=True,
+                edited_date="2026-04-12T12:34:56",
+            )
+        }
         metadata_sidecar.metadata_key_for_path.return_value = "test"
 
         self.controller.undo_history = [
@@ -471,7 +477,7 @@ class TestEditorReopening(unittest.TestCase):
                     "saved_path": str(saved_path),
                     "backup_path": str(backup_path),
                     "metadata_path": str(main_path),
-                    "metadata_before": {"favorite": True},
+                    "metadata_before": {"edited": False, "edited_date": None},
                     "sidecar": metadata_sidecar,
                 },
                 123.0,
@@ -483,7 +489,63 @@ class TestEditorReopening(unittest.TestCase):
                 self.controller.undo_delete()
 
         metadata_sidecar.metadata_key_for_path.assert_called_once_with(main_path)
-        self.assertTrue(metadata_sidecar.data.entries["test"].favorite)
+        restored_meta = metadata_sidecar.data.entries["test"]
+        self.assertTrue(restored_meta.favorite)
+        self.assertFalse(restored_meta.edited)
+        self.assertIsNone(restored_meta.edited_date)
+        metadata_sidecar.save.assert_called_once()
+
+    def test_undo_save_edit_deletes_default_only_edit_metadata_entry(self):
+        main_path = Path("/folder-a/test.jpg")
+        saved_path = Path("/folder-a/test-developed.jpg")
+        backup_path = Path("/folder-a/test-developed-backup.jpg")
+        metadata_sidecar = MagicMock()
+        metadata_sidecar.data.entries = {
+            "test": EntryMetadata(
+                edited=True,
+                edited_date="2026-04-12T12:34:56",
+            )
+        }
+        metadata_sidecar.metadata_key_for_path.return_value = "test"
+
+        self.controller.undo_history = [
+            (
+                "save_edit",
+                {
+                    "saved_path": str(saved_path),
+                    "backup_path": str(backup_path),
+                    "metadata_path": str(main_path),
+                    "metadata_before": None,
+                    "sidecar": metadata_sidecar,
+                },
+                123.0,
+            )
+        ]
+
+        with patch.object(self.controller, "_restore_backup_safe", return_value=True):
+            with patch.object(self.controller, "_post_undo_refresh_and_select"):
+                self.controller.undo_delete()
+
+        metadata_sidecar.metadata_key_for_path.assert_called_once_with(main_path)
+        self.assertNotIn("test", metadata_sidecar.data.entries)
+        metadata_sidecar.save.assert_called_once()
+
+    def test_quick_awb_loads_viewed_developed_variant(self):
+        main_path = Path("/folder-a/test.jpg")
+        developed_path = Path("/folder-a/test-developed.jpg")
+        self.controller.image_files[0].path = main_path
+        self.controller.view_override_path = str(developed_path)
+        self.controller.view_override_kind = "developed"
+        self.controller.image_editor.current_filepath = main_path
+        self.controller.image_editor.load_image.return_value = True
+
+        with patch.object(self.controller, "get_decoded_image", return_value=MagicMock()):
+            with patch.object(self.controller, "auto_white_balance", return_value=None):
+                self.controller.quick_auto_white_balance()
+
+        self.controller.image_editor.load_image.assert_called_once_with(
+            str(developed_path), cached_preview=unittest.mock.ANY, preview_only=True
+        )
 
 
 if __name__ == "__main__":
