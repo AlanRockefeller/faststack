@@ -270,3 +270,18 @@ class SidecarManager:
 
     def set_last_index(self, index: int):
         self.data.last_index = index
+
+    def update_metadata(self, image_ref: Union[str, Path], updates: dict):
+        """Update multiple metadata fields for an image and save if changed."""
+        meta = self.get_metadata(image_ref, create=True)
+        changed = False
+        for key, value in updates.items():
+            if hasattr(meta, key):
+                if getattr(meta, key) != value:
+                    setattr(meta, key, value)
+                    changed = True
+            else:
+                log.warning(f"Unknown metadata key: {key}")
+
+        if changed:
+            self.save()

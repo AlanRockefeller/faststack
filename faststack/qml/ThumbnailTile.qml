@@ -73,6 +73,9 @@ Item {
             } else if (tileMouseArea.containsMouse) {
                 return hoverColor
             }
+            if (tile.tileIsFolder) {
+                return tile.isDarkTheme ? "#181818" : "#f0f0f0"
+            }
             return backgroundColor
         }
         radius: 4
@@ -107,10 +110,11 @@ Item {
             Image {
                 id: thumbnailImage
                 anchors.centerIn: parent
-                width: tile.tileIsFolder ? Math.min(120, parent.width) : Math.min(thumbnailSize, parent.width)
-                height: tile.tileIsFolder ? Math.min(120, parent.height) : Math.min(thumbnailSize, parent.height)
+                visible: !tile.tileIsFolder
+                width: Math.min(thumbnailSize, parent.width)
+                height: Math.min(thumbnailSize, parent.height)
                 fillMode: Image.PreserveAspectFit
-                source: tile.tileThumbnailSource
+                source: tile.tileIsFolder ? "" : tile.tileThumbnailSource
                 asynchronous: true
                 cache: false
                 smooth: true
@@ -447,43 +451,72 @@ Item {
                 property string numFont: "Consolas, Monaco, monospace"
                 property int numSize: 11
 
-                // Coverage sparkline (triple-channel: upload green, stack orange, todo red)
-                Row {
-                    id: sparklineRow
+                // Coverage sparkline (4 separate lanes: green, yellow, orange, blue)
+                Column {
+                    id: sparklineStack
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.bottom: countsRow.top
                     anchors.bottomMargin: 4
-                    spacing: 1
+                    spacing: 0  // No gap between lanes
                     visible: tile.tileFolderStats && tile.tileFolderStats.coverage_buckets && tile.tileFolderStats.coverage_buckets.length > 0
 
-                    Repeater {
-                        model: tile.tileFolderStats && tile.tileFolderStats.coverage_buckets ? tile.tileFolderStats.coverage_buckets : []
-
-                        delegate: Column {
-                            spacing: 1
-                            // Upload bar (green) - top
-                            Rectangle {
+                    // Lane 1: Uploaded (Green)
+                    Row {
+                        spacing: 1
+                        Repeater {
+                            model: tile.tileFolderStats ? tile.tileFolderStats.coverage_buckets : []
+                            delegate: Rectangle {
                                 width: 3
                                 height: 3
                                 radius: 0.5
                                 color: tile.counterUploadedCol
-                                opacity: modelData[0] * 0.7 + 0.3  // 0.3 base opacity, up to 1.0
+                                // Use non-zero threshold to jump-start visibility
+                                opacity: modelData[0] > 0 ? Math.max(0.5, modelData[0]) : 0
                             }
-                            // Stack bar (orange) - middle
-                            Rectangle {
+                        }
+                    }
+
+                    // Lane 2: Edited (Yellow)
+                    Row {
+                        spacing: 1
+                        Repeater {
+                            model: tile.tileFolderStats ? tile.tileFolderStats.coverage_buckets : []
+                            delegate: Rectangle {
+                                width: 3
+                                height: 3
+                                radius: 0.5
+                                color: tile.counterEditedCol
+                                opacity: modelData[1] > 0 ? Math.max(0.5, modelData[1]) : 0
+                            }
+                        }
+                    }
+
+                    // Lane 3: Stacked (Orange)
+                    Row {
+                        spacing: 1
+                        Repeater {
+                            model: tile.tileFolderStats ? tile.tileFolderStats.coverage_buckets : []
+                            delegate: Rectangle {
                                 width: 3
                                 height: 3
                                 radius: 0.5
                                 color: tile.counterStackedCol
-                                opacity: modelData[1] * 0.7 + 0.3
+                                opacity: modelData[2] > 0 ? Math.max(0.5, modelData[2]) : 0
                             }
-                            // Todo bar (red) - bottom
-                            Rectangle {
+                        }
+                    }
+
+                    // Lane 4: Todo (Blue)
+                    Row {
+                        spacing: 1
+                        Repeater {
+                            model: tile.tileFolderStats ? tile.tileFolderStats.coverage_buckets : []
+                            delegate: Rectangle {
                                 width: 3
                                 height: 3
                                 radius: 0.5
-                                color: "#FF5252"  // Brighter red
-                                opacity: modelData[2] * 0.7 + 0.3
+                                color: tile.todoColor
+                                opacity: modelData[3] > 0 ? Math.max(0.5, modelData[3]) : 0
                             }
                         }
                     }

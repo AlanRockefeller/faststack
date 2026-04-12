@@ -2021,39 +2021,39 @@ class AppController(QObject):
                     if save_result.get("started_from_restore_override"):
                         self._clear_variant_override()
 
-                # 2. Update variants and re-select index
-                # Refresh list to pick up new backup files and update variant map
-                self.refresh_image_list()
+            # Record current path to stay on it after refresh (since index may shift)
+            preserved_path = None
+            if 0 <= self.current_index < len(self.image_files):
+                preserved_path = self.image_files[self.current_index].path
 
-                # Find and re-select the saved image
-                new_index = self.current_index
+            # 1. Update sidecar metadata FIRST so all following refreshes see it
+            if saved_path:
+                self.sidecar.update_metadata(saved_path, {"edited": True})
 
-                if saved_path:
-                    target_key = self._key(saved_path)
-                    for i, img in enumerate(self.image_files):
-                        if self._key(img.path) == target_key:
-                            new_index = i
-                            break
-
-                self.current_index = new_index
-
-                # Force UI Sync / Prefetch
+            # 2. Update variants and re-select index
+            self.refresh_image_list()
+            
+            if still_on_same_session:
+                # Still viewing the saved image — pin index and force sync
+                self._reindex_after_save(saved_path)
                 self.image_cache.clear()
                 self.prefetcher.cancel_all()
                 self.prefetcher.update_prefetch(self.current_index)
                 self.sync_ui_state()
             else:
-                # User navigated away — clear stale cache entry
+                # User navigated away — re-find new index for preserved_path and drop stale cache
+                if preserved_path:
+                    self._reindex_after_save(preserved_path)
                 if saved_path:
                     self.image_cache.pop_path(saved_path)
 
-            # Always emit badge update — backup file was created
             if self.ui_state:
                 self.ui_state.variantBadgesChanged.emit()
 
             self.update_status_message("Image saved")
         else:
-            self.update_status_message("Failed to save image")
+            # Success reported but result shape unexpected
+            log.warning("Save finished with unexpected result shape: %r", result)
 
     # --- Actions ---
 
@@ -7373,6 +7373,9 @@ class AppController(QObject):
                 ("crop", (str(saved_path), str(backup_path)), timestamp)
             )
 
+            # Mark as edited in sidecar
+            self.sidecar.update_metadata(saved_path, {"edited": True})
+
             # Exit crop mode
             self.ui_state.isCropping = False
             self.ui_state.currentCropBox = (0, 0, 1000, 1000)
@@ -7615,6 +7618,12 @@ class AppController(QObject):
                 ("auto_levels", (saved_path, backup_path), timestamp)
             )
 
+            # 1. Update sidecar metadata FIRST so all following refreshes see it
+            self.sidecar.update_metadata(saved_path, {"edited": True})
+
+            # 2. Update list and model to pick up changes
+            self.refresh_image_list()
+
             # Force reload to ensure disk consistency
             self.image_editor.clear()
 
@@ -7704,6 +7713,10 @@ class AppController(QObject):
             if save_result:
                 saved_path, backup_path = save_result
                 timestamp = time.time()
+
+                # Mark as edited in sidecar
+                self.sidecar.update_metadata(saved_path, {"edited": True})
+
                 self.undo_history.append(
                     ("auto_levels", (saved_path, backup_path), timestamp)
                 )
@@ -7849,8 +7862,16 @@ class AppController(QObject):
 
         if save_result:
             saved_path, backup_path = save_result
-            # Track this action for undo
             timestamp = time.time()
+            # 1. Update sidecar metadata FIRST so all following refreshes see it
+            self.sidecar.update_metadata(saved_path, {"edited": True})
+
+            # 2. Update list and model to pick up changes
+            self.refresh_image_list()
+
+            # Re-derive current_index
+            self._reindex_after_save(saved_path)
+
             self.undo_history.append(
                 ("auto_white_balance", (saved_path, backup_path), timestamp)
             )
@@ -7858,8 +7879,6 @@ class AppController(QObject):
             # Force the image editor to clear its current state so it reloads fresh
             self.image_editor.clear()
 
-            # Re-derive current_index (backup is excluded from visible list)
-            self._reindex_after_save(saved_path)
             t_list = time.perf_counter()
 
             # Invalidate cache for the edited image so it's reloaded from disk
