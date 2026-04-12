@@ -59,7 +59,7 @@ python_files = ["test_*.py"]
 # Use importlib mode to avoid test import-path resolution issues
 addopts = "--import-mode=importlib -p no:cacheprovider -p no:doctest --basetemp=./tmp/pytest-temp"
 
-norecursedirs = ["var", ".venv", "cache", "faststack.egg-info", "__pycache__"]
+norecursedirs = ["var", "tmp", ".venv", "cache", "faststack.egg-info", "__pycache__"]
 pythonpath = ["."]
 
 
