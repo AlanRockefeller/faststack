@@ -28,7 +28,9 @@ class FolderStats:
     # Coverage sparkline data: list of (upload_ratio, edited_ratio, stack_ratio, todo_ratio) tuples per bucket
     # Each ratio is 0.0-1.0, representing the fraction of JPGs in that bucket
     # that have the flag set. Empty list if no faststack.json or no JPGs.
-    coverage_buckets: list[tuple[float, float, float, float]] = field(default_factory=list)
+    coverage_buckets: list[tuple[float, float, float, float]] = field(
+        default_factory=list
+    )
 
 
 # Cache by (folder_path, json_mtime_ns, folder_mtime_ns) to avoid re-parsing during scroll
@@ -250,15 +252,17 @@ def _compute_coverage_buckets(
 
         # Efficient stem extraction and metadata lookup
         stem, _ = os.path.splitext(filename)
-        
+
         # Priority: 1. Exact filename, 2. Stem, 3. Case-insensitive filename, 4. Case-insensitive stem
         meta = entries.get(filename)
         if meta is None:
             meta = entries.get(stem)
-        
+
         if meta is None and entries:
             if entries_lower is None:
-                entries_lower = {k.lower(): v for k, v in entries.items() if isinstance(k, str)}
+                entries_lower = {
+                    k.lower(): v for k, v in entries.items() if isinstance(k, str)
+                }
             meta = entries_lower.get(filename.lower())
             if meta is None:
                 meta = entries_lower.get(stem.lower())
@@ -281,12 +285,9 @@ def _compute_coverage_buckets(
         if count == 0:
             buckets.append((0.0, 0.0, 0.0, 0.0))
         else:
-            buckets.append((
-                uploaded / count,
-                edited / count,
-                stacked / count,
-                todo / count
-            ))
+            buckets.append(
+                (uploaded / count, edited / count, stacked / count, todo / count)
+            )
 
     return buckets
 

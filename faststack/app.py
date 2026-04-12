@@ -2032,7 +2032,7 @@ class AppController(QObject):
 
             # 2. Update variants and re-select index
             self.refresh_image_list()
-            
+
             if still_on_same_session:
                 # Still viewing the saved image — pin index and force sync
                 self._reindex_after_save(saved_path)
