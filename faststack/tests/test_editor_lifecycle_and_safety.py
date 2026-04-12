@@ -104,6 +104,19 @@ class TestEditorLifecycleAndSafety(unittest.TestCase):
         # This is acceptable behavior: drop the failed frame, wait for next update.
         self.assertIsNone(self.controller._hist_pending)
 
+    def test_switch_to_directory_rebinds_sidecar_instance(self):
+        """Directory navigation must replace self.sidecar with a new manager."""
+        original_sidecar = self.controller.sidecar
+        next_sidecar = MagicMock()
+        self.mock_sidecar.side_effect = [next_sidecar]
+
+        with patch.object(self.controller, "load") as mock_load:
+            self.controller._switch_to_directory(Path("other-folder"))
+
+        self.assertIsNot(self.controller.sidecar, original_sidecar)
+        self.assertIs(self.controller.sidecar, next_sidecar)
+        mock_load.assert_called_once_with(skip_thumbnail_refresh=True)
+
 
 if __name__ == "__main__":
     unittest.main()

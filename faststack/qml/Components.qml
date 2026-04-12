@@ -52,6 +52,12 @@ Item {
             if (uiState && uiState.isCropping) {
                 loupeView.freezeCropImageSource()
             } else {
+                if (mainMouseArea) {
+                    mainMouseArea.clearPendingRotation(0)
+                    mainMouseArea.endCropInteraction()
+                    mainMouseArea.isRotating = false
+                    mainMouseArea.cropRotation = 0
+                }
                 loupeView.releaseCropImageSource()
             }
         }
@@ -62,15 +68,18 @@ Item {
             if (mainMouseArea.isRotating) {
                 // Revert rotation
                 mainMouseArea.cropRotation = mainMouseArea.cropStartRotation
+                mainMouseArea.clearPendingRotation(mainMouseArea.cropRotation)
                 if (controller) controller.set_straighten_angle(mainMouseArea.cropRotation, -1)
 
                 mainMouseArea.endCropInteraction()
                 mainMouseArea.isRotating = false
                 event.accepted = true
             } else if (controller) {
+                mainMouseArea.clearPendingRotation(0)
                 mainMouseArea.endCropInteraction()
                 controller.cancel_crop_mode()
                 mainMouseArea.cropRotation = 0 // Reset local rotation
+                mainMouseArea.isRotating = false
                 event.accepted = true
             }
         }
@@ -643,6 +652,12 @@ Item {
             }
         }
 
+        function clearPendingRotation(targetRotation) {
+            rotationThrottleTimer.stop()
+            pendingRotation = (targetRotation === undefined) ? 0 : targetRotation
+            pendingAspect = -1
+        }
+
         function setCropBoxStart(left, top, right, bottom) {
             cropBoxStartLeft = left
             cropBoxStartTop = top
@@ -656,11 +671,13 @@ Item {
         }
 
         function beginNewCrop(mouseX, mouseY, mx, my) {
+            var clampedMx = Math.max(0, Math.min(1000, mx))
+            var clampedMy = Math.max(0, Math.min(1000, my))
             cropDragMode = "new"
             cropStartX = mouseX
             cropStartY = mouseY
-            setCropBoxStart(mx, my, mx, my)
-            uiState.currentCropBox = [Math.round(mx), Math.round(my), Math.round(mx), Math.round(my)]
+            setCropBoxStart(clampedMx, clampedMy, clampedMx, clampedMy)
+            uiState.currentCropBox = [Math.round(clampedMx), Math.round(clampedMy), Math.round(clampedMx), Math.round(clampedMy)]
         }
 
         function beginCropInteraction() {

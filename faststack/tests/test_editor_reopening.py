@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 sys.path.append(str(Path(__file__).parents[2]))
 
 from faststack.app import AppController
+from faststack.models import EntryMetadata
 
 
 class TestEditorReopening(unittest.TestCase):
@@ -339,6 +340,85 @@ class TestEditorReopening(unittest.TestCase):
 
         # Tokens equal → still_on_same_image is True → editor_was_open → clear called
         self.controller.image_editor.clear.assert_called_once()
+
+    def test_save_finished_updates_origin_sidecar_after_navigation(self):
+        """Metadata must be written to the sidecar captured at save start, not
+        whichever folder is current when the background save completes."""
+        saved_path = Path("/folder-a/test.jpg")
+        backup_path = Path("/folder-a/test-backup.jpg")
+        origin_sidecar = MagicMock()
+        replacement_sidecar = MagicMock()
+        origin_sidecar.get_metadata.return_value = EntryMetadata(favorite=True)
+
+        # Simulate the controller having navigated to another folder before the
+        # save callback fires.
+        self.controller.sidecar = replacement_sidecar
+
+        save_result = {
+            "success": True,
+            "result": (saved_path, backup_path),
+            "target": self.controller._key(saved_path),
+            "save_image_key": self.controller._key(Path("test.jpg")),
+            "editor_was_open": False,
+            "started_from_restore_override": False,
+            "save_sidecar": origin_sidecar,
+        }
+
+        with patch.object(self.controller, "refresh_image_list"):
+            with patch.object(self.controller, "_reindex_after_save"):
+                self.controller._on_save_finished(save_result)
+
+        origin_sidecar.update_metadata.assert_called_once()
+        update_path, update_data = origin_sidecar.update_metadata.call_args.args
+        self.assertEqual(update_path, saved_path)
+        self.assertTrue(update_data["edited"])
+        self.assertTrue(update_data["edited_date"])
+        self.assertTrue(update_data["favorite"])
+        replacement_sidecar.update_metadata.assert_not_called()
+
+        action_type, action_data, _ = self.controller.undo_history[-1]
+        self.assertEqual(action_type, "save_edit")
+        self.assertEqual(action_data["saved_path"], str(saved_path))
+        self.assertEqual(action_data["backup_path"], str(backup_path))
+        self.assertEqual(
+            action_data["metadata_before"],
+            {
+                "stack_id": None,
+                "stacked": False,
+                "stacked_date": None,
+                "uploaded": False,
+                "uploaded_date": None,
+                "edited": False,
+                "edited_date": None,
+                "restacked": False,
+                "restacked_date": None,
+                "favorite": True,
+                "todo": False,
+                "todo_date": None,
+            },
+        )
+        self.assertIs(action_data["sidecar"], origin_sidecar)
+
+    def test_save_finished_malformed_result_clears_saving_status_message(self):
+        target = self.controller._key(Path("test.jpg"))
+        self.controller._saves_in_flight = {target}
+        self.controller._saving_keys = {target}
+        self.controller.ui_state.isSaving = True
+
+        with patch.object(self.controller, "update_status_message") as mock_status:
+            self.controller._on_save_finished(
+                {
+                    "success": True,
+                    "result": "bad-payload",
+                    "target": target,
+                    "save_image_key": target,
+                }
+            )
+
+        self.assertFalse(self.controller.ui_state.isSaving)
+        mock_status.assert_called_once_with(
+            "Save finished, but the result payload was malformed.", timeout=5000
+        )
 
 
 if __name__ == "__main__":

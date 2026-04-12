@@ -48,7 +48,7 @@ Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 # ⬇️ these are the ones that went missing
 from faststack.config import config
 from faststack.logging_setup import setup_logging
-from faststack.models import ImageFile, DecodedImage
+from faststack.models import ImageFile, DecodedImage, EntryMetadata
 from faststack.io.indexer import (
     find_images,
     find_images_with_variants,
@@ -1872,6 +1872,10 @@ class AppController(QObject):
             "save_image_key": save_image_key,
             "session_token": session_token,
             "started_from_restore_override": started_from_restore_override,
+            # Keep metadata writes bound to the sidecar that owned the save
+            # request. The user can navigate to another folder before the
+            # background save completes, and self.sidecar may change.
+            "save_sidecar": self.sidecar,
         }
 
         # Submit save work to background thread — operates only on the snapshot
@@ -1968,7 +1972,7 @@ class AppController(QObject):
 
         result = save_result.get("result")
         if isinstance(result, tuple) and len(result) >= 2:
-            saved_path, _ = result  # backup_path unused
+            saved_path, backup_path = result
 
             # --- Post-Save Cleanup ---
 
@@ -2028,7 +2032,23 @@ class AppController(QObject):
 
             # 1. Update sidecar metadata FIRST so all following refreshes see it
             if saved_path:
-                self.sidecar.update_metadata(saved_path, {"edited": True})
+                save_sidecar = save_result.get("save_sidecar") or self.sidecar
+                metadata_before = self._mark_image_edited_in_sidecar(
+                    save_sidecar, saved_path
+                )
+                if backup_path:
+                    self.undo_history.append(
+                        (
+                            "save_edit",
+                            self._build_edit_undo_data(
+                                saved_path,
+                                backup_path,
+                                metadata_before=metadata_before,
+                                sidecar=save_sidecar,
+                            ),
+                            time.time(),
+                        )
+                    )
 
             # 2. Update variants and re-select index
             self.refresh_image_list()
@@ -2054,6 +2074,9 @@ class AppController(QObject):
         else:
             # Success reported but result shape unexpected
             log.warning("Save finished with unexpected result shape: %r", result)
+            self.update_status_message(
+                "Save finished, but the result payload was malformed.", timeout=5000
+            )
 
     # --- Actions ---
 
@@ -5427,46 +5450,42 @@ class AppController(QObject):
             if self._thumbnail_model and self._is_grid_view_active:
                 self._thumbnail_model.refresh()
 
-        elif action_type == "auto_white_balance":
-            saved_path, backup_path = action_data
+        elif action_type in {
+            "save_edit",
+            "auto_white_balance",
+            "auto_levels",
+            "crop",
+        }:
             try:
-                if self._restore_backup_safe(saved_path, backup_path):
-                    self._post_undo_refresh_and_select(
-                        Path(saved_path), update_hist=True
-                    )
-                    self.update_status_message("Undid auto white balance")
-            except Exception as e:
+                saved_path, backup_path, metadata_before, metadata_sidecar = (
+                    self._parse_edit_undo_data(action_data)
+                )
+            except ValueError as e:
                 self.update_status_message(f"Undo failed: {e}")
-                if Path(backup_path).exists():
-                    self.undo_history.append(
-                        ("auto_white_balance", action_data, timestamp)
-                    )
+                return
 
-        elif action_type == "auto_levels":
-            saved_path, backup_path = action_data
             try:
                 if self._restore_backup_safe(saved_path, backup_path):
-                    self._post_undo_refresh_and_select(
-                        Path(saved_path), update_hist=True
+                    restore_sidecar = metadata_sidecar or self.sidecar
+                    self._restore_metadata_snapshot(
+                        restore_sidecar, Path(saved_path), metadata_before
                     )
-                    self.update_status_message("Undid auto levels")
+                    self._post_undo_refresh_and_select(
+                        Path(saved_path),
+                        update_hist=action_type != "crop",
+                    )
+                    if action_type == "save_edit":
+                        self.update_status_message("Undid saved edit")
+                    elif action_type == "auto_white_balance":
+                        self.update_status_message("Undid auto white balance")
+                    elif action_type == "auto_levels":
+                        self.update_status_message("Undid auto levels")
+                    else:
+                        self.update_status_message("Undid crop")
             except Exception as e:
                 self.update_status_message(f"Undo failed: {e}")
                 if Path(backup_path).exists():
-                    self.undo_history.append(("auto_levels", action_data, timestamp))
-
-        elif action_type == "crop":
-            saved_path, backup_path = action_data
-            try:
-                if self._restore_backup_safe(saved_path, backup_path):
-                    self._post_undo_refresh_and_select(
-                        Path(saved_path), update_hist=False
-                    )
-                    self.update_status_message("Undid crop")
-            except Exception as e:
-                self.update_status_message(f"Undo failed: {e}")
-                if Path(backup_path).exists():
-                    self.undo_history.append(("crop", action_data, timestamp))
+                    self.undo_history.append((action_type, action_data, timestamp))
 
     def shutdown_qt(self):
         """Shutdown Qt objects only - MUST run on main/Qt thread."""
@@ -5860,6 +5879,85 @@ class AppController(QObject):
 
         self.ui_state.statusMessage = message
         QTimer.singleShot(timeout, clear_message)
+
+    def _capture_metadata_snapshot(
+        self, sidecar: SidecarManager, image_path: Path
+    ) -> Optional[dict]:
+        """Capture the current sidecar metadata for undo/restore."""
+        meta = sidecar.get_metadata(image_path, create=False)
+        if meta is None:
+            return None
+        return {
+            field_name: getattr(meta, field_name)
+            for field_name in EntryMetadata.__dataclass_fields__
+        }
+
+    def _mark_image_edited_in_sidecar(
+        self, sidecar: SidecarManager, image_path: Path
+    ) -> Optional[dict]:
+        """Mark an image as edited and return the pre-save metadata snapshot."""
+        old_meta = self._capture_metadata_snapshot(sidecar, image_path)
+        new_meta = dict(old_meta or {})
+        new_meta["edited"] = True
+        new_meta["edited_date"] = datetime.now().strftime("%Y-%m-%d")
+        sidecar.update_metadata(image_path, new_meta)
+        return old_meta
+
+    @staticmethod
+    def _build_edit_undo_data(
+        saved_path: Path,
+        backup_path: Path,
+        *,
+        metadata_before: Optional[dict] = None,
+        sidecar: Optional[SidecarManager] = None,
+    ) -> dict:
+        """Build a backward-compatible undo payload for saved edit operations."""
+        return {
+            "saved_path": str(saved_path),
+            "backup_path": str(backup_path),
+            "metadata_before": metadata_before,
+            "sidecar": sidecar,
+        }
+
+    @staticmethod
+    def _parse_edit_undo_data(action_data: Any) -> tuple[str, str, Optional[dict], Any]:
+        """Read both legacy tuple undo payloads and new dict payloads."""
+        if isinstance(action_data, dict):
+            saved_path = action_data.get("saved_path")
+            backup_path = action_data.get("backup_path")
+            if saved_path and backup_path:
+                return (
+                    str(saved_path),
+                    str(backup_path),
+                    action_data.get("metadata_before"),
+                    action_data.get("sidecar"),
+                )
+        elif isinstance(action_data, (tuple, list)) and len(action_data) >= 2:
+            return str(action_data[0]), str(action_data[1]), None, None
+
+        raise ValueError(f"Unexpected edit undo payload: {action_data!r}")
+
+    def _restore_metadata_snapshot(
+        self, sidecar: SidecarManager, image_path: Path, snapshot: Optional[dict]
+    ) -> None:
+        """Restore sidecar metadata from a previously captured snapshot."""
+        sidecar.get_metadata(image_path, create=False)
+        stable_key = sidecar.metadata_key_for_path(image_path)
+        changed = False
+
+        if snapshot is None:
+            if stable_key in sidecar.data.entries:
+                del sidecar.data.entries[stable_key]
+                changed = True
+        else:
+            restored_meta = EntryMetadata(**snapshot)
+            current_meta = sidecar.data.entries.get(stable_key)
+            if current_meta is None or current_meta.__dict__ != snapshot:
+                sidecar.data.entries[stable_key] = restored_meta
+                changed = True
+
+        if changed:
+            sidecar.save()
 
     def _is_image_saving(self, file_path_str: str) -> bool:
         if not file_path_str or not hasattr(self, "_saving_keys"):
@@ -7363,6 +7461,9 @@ class AppController(QObject):
 
         if save_result:
             saved_path, backup_path = save_result
+            metadata_before = self._mark_image_edited_in_sidecar(
+                self.sidecar, saved_path
+            )
 
             # IF we were restoring from a variant, clear the override now that it's "the truth"
             if is_restoring:
@@ -7370,11 +7471,17 @@ class AppController(QObject):
 
             timestamp = time.time()
             self.undo_history.append(
-                ("crop", (str(saved_path), str(backup_path)), timestamp)
+                (
+                    "crop",
+                    self._build_edit_undo_data(
+                        saved_path,
+                        backup_path,
+                        metadata_before=metadata_before,
+                        sidecar=self.sidecar,
+                    ),
+                    timestamp,
+                )
             )
-
-            # Mark as edited in sidecar
-            self.sidecar.update_metadata(saved_path, {"edited": True})
 
             # Exit crop mode
             self.ui_state.isCropping = False
@@ -7613,13 +7720,22 @@ class AppController(QObject):
 
         if save_result:
             saved_path, backup_path = save_result
+            metadata_before = self._mark_image_edited_in_sidecar(
+                self.sidecar, saved_path
+            )
             timestamp = time.time()
             self.undo_history.append(
-                ("auto_levels", (saved_path, backup_path), timestamp)
+                (
+                    "auto_levels",
+                    self._build_edit_undo_data(
+                        saved_path,
+                        backup_path,
+                        metadata_before=metadata_before,
+                        sidecar=self.sidecar,
+                    ),
+                    timestamp,
+                )
             )
-
-            # 1. Update sidecar metadata FIRST so all following refreshes see it
-            self.sidecar.update_metadata(saved_path, {"edited": True})
 
             # 2. Update list and model to pick up changes
             self.refresh_image_list()
@@ -7713,12 +7829,21 @@ class AppController(QObject):
             if save_result:
                 saved_path, backup_path = save_result
                 timestamp = time.time()
-
-                # Mark as edited in sidecar
-                self.sidecar.update_metadata(saved_path, {"edited": True})
+                metadata_before = self._mark_image_edited_in_sidecar(
+                    self.sidecar, saved_path
+                )
 
                 self.undo_history.append(
-                    ("auto_levels", (saved_path, backup_path), timestamp)
+                    (
+                        "auto_levels",
+                        self._build_edit_undo_data(
+                            saved_path,
+                            backup_path,
+                            metadata_before=metadata_before,
+                            sidecar=self.sidecar,
+                        ),
+                        timestamp,
+                    )
                 )
                 self.image_editor.clear()
                 self.image_cache.pop_path(saved_path)
@@ -7870,8 +7995,9 @@ class AppController(QObject):
         if save_result:
             saved_path, backup_path = save_result
             timestamp = time.time()
-            # 1. Update sidecar metadata FIRST so all following refreshes see it
-            self.sidecar.update_metadata(saved_path, {"edited": True})
+            metadata_before = self._mark_image_edited_in_sidecar(
+                self.sidecar, saved_path
+            )
 
             # 2. Update list and model to pick up changes
             self.refresh_image_list()
@@ -7880,7 +8006,16 @@ class AppController(QObject):
             self._reindex_after_save(saved_path)
 
             self.undo_history.append(
-                ("auto_white_balance", (saved_path, backup_path), timestamp)
+                (
+                    "auto_white_balance",
+                    self._build_edit_undo_data(
+                        saved_path,
+                        backup_path,
+                        metadata_before=metadata_before,
+                        sidecar=self.sidecar,
+                    ),
+                    timestamp,
+                )
             )
 
             # Force the image editor to clear its current state so it reloads fresh

@@ -1442,16 +1442,10 @@ class ImageEditor:
             chan = rgb[:, :, c]
             hist = np.bincount(chan.reshape(-1), minlength=256)
             # Treat near-white/near-black as clipped (JPEG artifacts often land on 254/1)
-            clipped_low_pct.append(
-                100.0 * float(hist[0] + hist[1]) / float(total)
-            )
-            clipped_high_pct.append(
-                100.0 * float(hist[254] + hist[255]) / float(total)
-            )
+            clipped_low_pct.append(100.0 * float(hist[0] + hist[1]) / float(total))
+            clipped_high_pct.append(100.0 * float(hist[254] + hist[255]) / float(total))
             p_lows.append(self._u8_percentile_from_hist(hist, low_p, method="lower"))
-            p_highs.append(
-                self._u8_percentile_from_hist(hist, high_p, method="higher")
-            )
+            p_highs.append(self._u8_percentile_from_hist(hist, high_p, method="higher"))
 
         # Conservative anchors to avoid new channel clipping
         p_low = min(p_lows)
@@ -1543,8 +1537,7 @@ class ImageEditor:
             if self.original_image is None:
                 return None
             img_arr = (
-                np.asarray(self.original_image.convert("RGB"), dtype=np.float32)
-                / 255.0
+                np.asarray(self.original_image.convert("RGB"), dtype=np.float32) / 255.0
             )
 
         h, w = img_arr.shape[:2]
@@ -1558,11 +1551,7 @@ class ImageEditor:
         luma_high = max(0.0, min(255.0, float(luma_upper_bound))) / 255.0
 
         mask = np.all(srgb > rgb_low, axis=2) & np.all(srgb < rgb_high, axis=2)
-        luma = (
-            0.2126 * srgb[:, :, 0]
-            + 0.7152 * srgb[:, :, 1]
-            + 0.0722 * srgb[:, :, 2]
-        )
+        luma = 0.2126 * srgb[:, :, 0] + 0.7152 * srgb[:, :, 1] + 0.0722 * srgb[:, :, 2]
         mask &= (luma > luma_low) & (luma < luma_high)
 
         if not np.any(mask):
