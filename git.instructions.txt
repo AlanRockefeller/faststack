@@ -1,0 +1,18 @@
+Your normal pattern should now be:
+
+syncmain
+newpr pr/my-change
+# work, test, commit
+git push -u origin pr/my-change
+# open PR
+# merge on GitHub
+syncmain
+synctest
+
+If you ever want to check whether things are drifting:
+
+branchstate
+
+So the short version is:
+
+branch from main, work on pr/..., merge to main, then resync main and test.

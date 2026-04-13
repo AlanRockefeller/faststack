@@ -32,7 +32,7 @@ They were written in that order of discovery:
 - first, identify which Lightroom fields change when a photo is marked Green
 - second, inspect one known photo and discover how it connects to file-path tables
 - third, test the exact join needed to reconstruct file paths
-- fourth, build a practical export-and-import tool for FastStack
+- fourth, build a practical export-and-import tool for FastStack that can update a `faststack.json` by file path or directory path and create it if needed
 
 The first three scripts are best understood as **reverse-engineering helpers**.
 The fourth script, `green2faststack.py`, is the **main end-user tool**.
@@ -84,7 +84,7 @@ FastStack stores metadata in `faststack.json`, with image entries keyed by lower
 
 - `P3270037.JPG` becomes `p3270037`
 
-That means once a Lightroom-exported path is known, it can be converted into a lowercase stem and matched against existing FastStack JSON entries.
+That means once a Lightroom-exported path is known, it can be converted into a lowercase stem and matched against FastStack JSON entries, or added as a new entry when needed.
 
 This is helpful for RAW/JPG pairs too. If Lightroom recorded a RAW file like `foo.ORF` and FastStack has an entry keyed as `foo`, the stem still matches.
 
@@ -216,7 +216,9 @@ That was sufficient to reconstruct full paths for green-labeled files.
 It supports two modes:
 
 1. **Export mode**: read a Lightroom Classic `.lrcat` file and write all Green-labeled paths to a text file
-2. **JSON mode**: read that exported text file and update one existing `faststack.json`
+2. **JSON mode**: read that exported text file and update one `faststack.json`
+
+In JSON mode, `--json` can point either at a `faststack.json` path or at the directory that should contain it. If the file is missing, the script creates it.
 
 ### Why it is designed this way
 
@@ -245,13 +247,15 @@ This writes one Lightroom path per line.
 ### JSON mode example
 
 ```bash
-/usr/bin/python3 green2faststack.py --paths green.txt --json /path/to/faststack.json
+/usr/bin/python3 green2faststack.py --paths green.txt --json /path/to/photo-directory
 ```
+
+That updates `/path/to/photo-directory/faststack.json`, creating it if needed.
 
 ### Dry-run example
 
 ```bash
-/usr/bin/python3 green2faststack.py --paths green.txt --json /path/to/faststack.json --dry-run --verbose
+/usr/bin/python3 green2faststack.py --paths green.txt --json /path/to/photo-directory --dry-run --verbose
 ```
 
 ### What JSON mode does
@@ -259,29 +263,39 @@ This writes one Lightroom path per line.
 In JSON mode, the script:
 
 1. reads all exported Lightroom paths from the text file
-2. derives lowercase filename stems from those paths
-3. loads one existing `faststack.json`
-4. finds matching `entries` keys in the JSON
-5. marks matching entries as uploaded
-6. preserves existing `uploaded_date` values when already present
-7. creates an automatic backup before writing
+2. filters those paths down to the ones that belong to the target `--json` directory
+3. derives exact lowercase filename stems from those in-directory paths
+4. loads the target `faststack.json`, or creates it if it does not exist
+5. marks matching existing entries as uploaded
+6. creates new uploaded entries for green-labeled files in that directory that are not yet tracked in the JSON
+7. after processing the direct green-labeled files, propagates uploaded state to sibling originals in the same directory when an original stem is a prefix of a green stem followed by a space
+8. preserves existing `uploaded_date` values when already present and creates an automatic backup before overwriting an existing JSON file
 
 ### Matching strategy
 
-Matching is **stem-based**, not extension-based.
+Matching is **stem-based**, not extension-based, but the script now preserves each file's exact lowercase stem instead of collapsing descriptive exports back to a shorter original stem.
 
 That means:
 
-- `foo.jpg`
-- `foo.JPG`
-- `foo.ORF`
-- `foo.NEF`
+- `IMG_1234.ORF` becomes `img_1234`
+- `IMG_1234.JPG` becomes `img_1234`
+- `IMG_1234 Description.JPG` becomes `img_1234 description`
 
-all map to the same stem key:
+The first two still share the same stem key because the filename stem itself is the same:
 
-- `foo`
+- `img_1234`
 
-This is intentional and is what makes the tool useful for Lightroom catalogs that may reference RAW files while FastStack tracks same-stem JPGs.
+The third gets its own separate FastStack entry because it is a different file with a different stem.
+
+This is intentional and is what makes the tool useful both for RAW/JPG pairs and for Lightroom exports that append descriptive text to the filename.
+
+### Sibling propagation
+
+If `IMG_1234 Description.JPG` is Green in Lightroom, FastStack keeps that export as its own entry under `img_1234 description`.
+
+After that, the script scans sibling image files in the target directory and also marks `img_1234` as uploaded when it finds an original whose stem is a prefix of the green stem followed by a space. That is how a green-labeled derived export can mark its original as uploaded without merging the two entries into one.
+
+For sibling detection, the current code scans common image extensions such as `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, `.bmp`, `.orf`, `.cr2`, `.cr3`, `.nef`, `.arw`, `.dng`, `.raf`, `.rw2`, `.pef`, `.srw`, and `.x3f`; see the `IMAGE_EXTENSIONS` set in `green2faststack.py` for the authoritative list.
 
 ### Uploaded date behavior
 
@@ -295,7 +309,7 @@ This project intentionally did **not** assume Lightroom preserved a trustworthy 
 
 ### Backup behavior
 
-Before modifying a JSON file, the script creates a backup such as:
+Before overwriting an existing JSON file, the script creates a backup such as:
 
 - `faststack.json.bak`
 - `faststack.json.bak1`
@@ -376,19 +390,21 @@ Once you are confident the schema matches, export all Green-labeled paths:
 
 ### 5. Update FastStack directories one at a time
 
-Use the exported path list to update one `faststack.json` at a time.
+Use the exported path list to update one FastStack directory at a time. The `--json` argument can point either at an existing `faststack.json` or at a directory that does not yet contain one.
 
 Dry run first:
 
 ```bash
-/usr/bin/python3 green2faststack.py --paths green.txt --json /path/to/faststack.json --dry-run --verbose
+/usr/bin/python3 green2faststack.py --paths green.txt --json /path/to/photo-directory --dry-run --verbose
 ```
 
 Then real run:
 
 ```bash
-/usr/bin/python3 green2faststack.py --paths green.txt --json /path/to/faststack.json
+/usr/bin/python3 green2faststack.py --paths green.txt --json /path/to/photo-directory
 ```
+
+That real run will create `/path/to/photo-directory/faststack.json` if it is missing.
 
 ### 6. Repeat for other directories as needed
 
@@ -435,6 +451,7 @@ The scripts assume FastStack JSON behavior based on observed sample files, espec
 - lowercase stem keys
 - `entries` dictionary
 - `uploaded` and `uploaded_date` fields
+- when creating a missing `faststack.json`, an empty file shape of `{"version": 2, "last_index": 0, "entries": {}, "stacks": []}`
 
 If FastStack changes its JSON structure in the future, the migration script may need to be updated.
 

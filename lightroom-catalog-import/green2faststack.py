@@ -4,26 +4,35 @@ green2faststack.py — Migrate Lightroom Classic green labels into FastStack
 
 PURPOSE:
   Export Lightroom Classic green-labeled image paths from a .lrcat catalog,
-  and optionally update an existing FastStack faststack.json using the exported
-  paths file.
+  and update FastStack faststack.json files using the exported paths.
 
   This is the main user-facing migration tool.
 
 DESIGN GOALS:
   - Read the Lightroom catalog once and export all green-labeled paths to a text file.
   - Later, read that text file as many times as desired to update FastStack JSON files.
-  - Match FastStack entries by lowercase stem only, so RAW/JPG pairs naturally align.
-  - Never create new JSON files implicitly.
+  - Match FastStack entries by exact lowercase stem.
+  - Create new FastStack entries (and the JSON itself) for green-labeled files not yet
+    tracked. Each green-labeled file gets its own entry under its own exact stem — a
+    Lightroom export like "IMG_1234 Description.JPG" is a distinct file from the
+    original "IMG_1234.ORF" and is tracked separately.
+  - Propagate uploaded state to sibling originals: if an exported file's stem starts
+    with a shorter-stemmed original's name (e.g. "img_1234 description" starts with
+    "img_1234"), the original is also marked uploaded, because the processed version
+    was derived from it and uploading the export means the original no longer needs
+    to be worked on.
   - Be safe by default: dry-run support, automatic backups, verbose help, and summaries.
 
 WORKFLOW:
   Step 1 — Export green-labeled paths from the catalog:
     python green2faststack.py -i catalog.lrcat -o green.txt
 
-  Step 2 — Update an existing FastStack JSON from the exported paths:
-    python green2faststack.py --paths green.txt --json /path/to/faststack.json
+  Step 2 — Update a FastStack JSON from the exported paths:
+    python green2faststack.py --paths green.txt --json /path/to/dir-or-faststack.json
 
-  You can repeat step 2 for different faststack.json files as needed.
+  The --json argument accepts a faststack.json path or its parent directory.
+  If no faststack.json exists, one is created. You can repeat step 2 for
+  different directories as needed.
 
 OBSERVED SCHEMA:
   The Lightroom catalog join chain for path reconstruction:
@@ -106,10 +115,13 @@ This tool has two modes:
      {PROGRAM_NAME} -i catalog.lrcat -o green.txt
 
 2) JSON mode
-   Read a previously exported text file of green-labeled paths and update one
-   existing FastStack faststack.json file by matching entries on lowercase stem.
-   This is intended for cases where Lightroom is no longer part of the workflow,
-   and you want to apply the exported upload knowledge to FastStack as needed.
+   Read a previously exported text file of green-labeled paths and update a
+   FastStack faststack.json file by matching entries on lowercase stem. Green-
+   labeled files in the target directory that are not yet tracked in the JSON
+   get new entries created with uploaded=True. If no faststack.json exists,
+   one is created. This is intended for cases where Lightroom is no longer
+   part of the workflow, and you want to apply the exported upload knowledge
+   to FastStack as needed.
 
    Example:
      {PROGRAM_NAME} --paths green.txt --json /path/to/faststack.json
@@ -118,15 +130,23 @@ What this tool hopes to accomplish:
 - Preserve historical "uploaded" decisions you made in Lightroom Classic.
 - Let FastStack reflect those decisions without needing to reopen Lightroom.
 - Work naturally with RAW/JPG pairs by matching same-stem entries.
+- Handle Lightroom exports that have descriptions appended to the original
+  filename (e.g. "IMG_1234 Trip Name stacked.JPG" derived from "IMG_1234.ORF").
+  The export is tracked as its own FastStack entry, and the original is also
+  marked uploaded since it no longer needs to be worked on.
 
 Important limitations and behavior:
 - Export mode reads the Lightroom catalog only; it does not require the image files
   to be mounted or present on disk.
 - JSON mode reads only from the exported text file, not from the .lrcat.
-- JSON mode updates only one existing faststack.json at a time.
-- This tool does not create a new faststack.json. The JSON must already exist.
-- Matching is stem-based only. For example, IMG_0001.ORF and IMG_0001.JPG both map
-  to the same FastStack key img_0001 if that is how FastStack tracks the entry.
+- JSON mode updates one faststack.json at a time. If none exists, one is created.
+- Matching is by exact lowercase stem. IMG_0001.ORF and IMG_0001.JPG both map to
+  the same FastStack key "img_0001". But "IMG_0001 Description.JPG" is a different
+  file with its own key "img_0001 description" — it gets its own FastStack entry.
+- After processing green-listed files, the tool scans the target directory for
+  sibling originals whose stem is a prefix of a green stem (separated by a space).
+  Those originals are also marked uploaded, since the exported version was derived
+  from them. This is upload-state propagation, not stem remapping.
 - JSON mode sanity-checks whether the exported file paths currently exist on disk
   and includes those counts in the summary. These existence checks are best-effort
   and do not affect the stem-based matching.
@@ -146,8 +166,17 @@ Important limitations and behavior:
 
 Cross-platform path resolution:
   Lightroom catalogs store Windows-style paths (e.g. C:/Users/...). When running
-  in WSL or other environments, these paths may not exist at their stored location.
-  The existence check tries several strategies:
+  in WSL or other environments, those stored paths may not exist at their original
+  location. Both the file existence checks and the directory-matching logic convert
+  Windows drive paths to /mnt/<drive>/... form (and vice versa) for comparison.
+
+  The target directory for matching is determined by resolving the --json path's
+  parent directory with Path.resolve(), which follows symlinks. For example, if
+  ~/pictures is a symlink to /mnt/c/Users/alanr/Pictures, the resolved path is
+  /mnt/c/Users/alanr/Pictures/..., which correctly matches green-list entries
+  stored as C:/Users/alanr/Pictures/....
+
+  Strategies tried for file existence checks:
     1. The path exactly as stored in the catalog.
     2. On WSL/Linux: if the path looks like a Windows drive letter (C:/... or C:\\...),
        try /mnt/c/... (lowercase drive letter).
@@ -202,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--json",
-        help="Path to an existing FastStack faststack.json to update in JSON mode.",
+        help="Path to a FastStack faststack.json (or its parent directory) to update. Created if missing.",
     )
     parser.add_argument(
         "--uploaded-date",
@@ -275,10 +304,17 @@ def normalize_catalog_path(
 
 
 def stem_key_from_path(path_str: str) -> str:
-    """Extract the lowercase stem (filename without extension) for matching.
+    """Extract the exact lowercase stem (filename without extension) as a FastStack key.
 
-    FastStack uses lowercase stems as entry keys, so IMG_0001.ORF and
-    IMG_0001.JPG both map to 'img_0001'.
+    Each distinct filename stem becomes its own FastStack entry. For example:
+      IMG_0001.ORF            -> 'img_0001'
+      IMG_0001.JPG            -> 'img_0001'       (same key — RAW/JPG pair)
+      IMG_0001 Description.JPG -> 'img_0001 description'  (different key — separate file)
+
+    This function does NOT strip descriptions or map exports back to original
+    stems. Lightroom exports with appended text are distinct files that get
+    their own entries. Upload-state propagation to related originals is handled
+    separately by the sibling-matching logic in update_faststack_json().
     """
     return Path(path_str).stem.lower()
 
@@ -460,11 +496,14 @@ class JsonUpdateSummary:
     existing_files: int = 0
     missing_files: int = 0
     existence_check_note: str = ""
+    green_in_this_dir: int = 0
     json_entries_total: int = 0
     matching_entries_found: int = 0
     newly_marked_uploaded: int = 0
     already_uploaded: int = 0
-    stems_not_present_in_json: int = 0
+    newly_created_entries: int = 0
+    sibling_originals_marked: int = 0
+    json_created: bool = False
     backup_path: str | None = None
     json_written: bool = False
 
@@ -549,20 +588,24 @@ def human_summary(summary: JsonUpdateSummary, json_path: str) -> str:
     """Format the update summary as a human-readable string."""
     lines = [
         f"Summary for {json_path}",
-        f"  Paths read: {summary.paths_read}",
-        f"  Unique stems in paths file: {summary.unique_stems_in_paths}",
+        f"  Paths read from green list: {summary.paths_read}",
+        f"  Unique stems in green list: {summary.unique_stems_in_paths}",
+        f"  Green-labeled paths in this directory: {summary.green_in_this_dir}",
         f"  Exported image paths that currently exist on disk: {summary.existing_files}",
         f"  Exported image paths missing on disk: {summary.missing_files}",
     ]
     if summary.existence_check_note:
         lines.append(f"  Note: {summary.existence_check_note}")
+    if summary.json_created:
+        lines.append("  FastStack JSON created (was missing)")
     lines.extend(
         [
-            f"  FastStack entries present in JSON: {summary.json_entries_total}",
-            f"  Matching FastStack entries found: {summary.matching_entries_found}",
-            f"  Newly marked uploaded: {summary.newly_marked_uploaded}",
+            f"  FastStack entries in JSON before update: {summary.json_entries_total}",
+            f"  Existing entries matched to green list: {summary.matching_entries_found}",
+            f"  Newly marked uploaded (existing entries): {summary.newly_marked_uploaded}",
             f"  Already uploaded: {summary.already_uploaded}",
-            f"  Exported stems not present in this JSON: {summary.stems_not_present_in_json}",
+            f"  New entries created and marked uploaded: {summary.newly_created_entries}",
+            f"  Sibling originals also marked uploaded: {summary.sibling_originals_marked}",
         ]
     )
     if summary.backup_path:
@@ -574,6 +617,55 @@ def human_summary(summary: JsonUpdateSummary, json_path: str) -> str:
     return "\n".join(lines)
 
 
+def _normalize_dir_for_comparison(path_str: str) -> str:
+    """Normalize a directory path to lowercase /mnt/<drive>/... form for comparison.
+
+    The caller is expected to pass a resolved path (symlinks followed via
+    Path.resolve()). For example, if ~/pictures -> /mnt/c/Users/alanr/Pictures,
+    the caller passes the resolved /mnt/c/Users/alanr/Pictures/... form.
+
+    This function then handles the remaining conversion: Windows drive paths
+    (C:/...) become /mnt/c/..., and everything is lowercased. The result can
+    be compared against green-list paths normalized by _path_is_in_dir().
+
+    Returns the normalized path with trailing slash.
+    """
+    normalized = path_str.replace("\\", "/").rstrip("/") + "/"
+    # Convert Windows drive paths to /mnt/ style for comparison.
+    drive_match = _WINDOWS_DRIVE_RE.match(normalized)
+    if drive_match:
+        drive_letter = drive_match.group(1).lower()
+        rest = normalized[2:]  # strip "C:", keep leading "/"
+        normalized = f"/mnt/{drive_letter}{rest}"
+    return normalized.lower()
+
+
+def _path_is_in_dir(path_str: str, dir_normalized: str) -> bool:
+    """Check if a green-list path belongs to the target directory.
+
+    Normalizes the green-list path the same way _normalize_dir_for_comparison
+    normalizes the target: Windows C:/... becomes /mnt/c/..., then lowercase.
+    Compares the file's parent directory against dir_normalized.
+    """
+    normalized = path_str.replace("\\", "/").lower()
+    drive_match = _WINDOWS_DRIVE_RE.match(normalized)
+    if drive_match:
+        drive_letter = drive_match.group(1).lower()
+        rest = normalized[2:]
+        normalized = f"/mnt/{drive_letter}{rest}"
+    # Check that the file's parent directory matches.
+    parent = normalized.rsplit("/", 1)[0] + "/"
+    return parent == dir_normalized
+
+
+EMPTY_FASTSTACK_JSON = {
+    "version": 2,
+    "last_index": 0,
+    "entries": {},
+    "stacks": [],
+}
+
+
 def update_faststack_json(
     paths_file: str,
     json_path_str: str,
@@ -583,14 +675,22 @@ def update_faststack_json(
 ) -> JsonUpdateSummary:
     """Update a FastStack JSON file based on a previously exported paths file.
 
-    Matches exported paths to FastStack entries by lowercase stem. Sets
-    uploaded=True on matching entries that are not already marked.
+    Each green-labeled file in the target directory is matched or created as
+    its own FastStack entry under its exact lowercase stem. A Lightroom export
+    like "IMG_1234 Description.JPG" is a distinct file from the original
+    "IMG_1234.ORF" and gets its own entry — this is not stem remapping.
+
+    After processing green-listed files, the tool propagates uploaded state to
+    sibling originals: if a file in the target directory has a stem that is a
+    prefix of a green stem (e.g. "img_1234" is a prefix of "img_1234 description"),
+    that original is also marked uploaded, because the processed/exported version
+    was derived from it and the original no longer needs to be worked on.
+
+    Creates the JSON file if it does not exist.
     """
     json_path = Path(json_path_str)
-    if not json_path.exists():
-        raise FileNotFoundError(
-            f"FastStack JSON not found: {json_path}. This tool does not create new JSON files."
-        )
+    if json_path.is_dir():
+        json_path = json_path / "faststack.json"
 
     path_lines = load_paths_file(paths_file, logger)
     summary = JsonUpdateSummary(paths_read=len(path_lines))
@@ -603,8 +703,6 @@ def update_faststack_json(
         stem_to_paths.setdefault(stem, []).append(path_str)
 
         # Best-effort existence check using cross-platform path resolution.
-        # This is for informational summary only — matching is stem-based
-        # and does not depend on whether the file is found on disk.
         if check_file_exists(path_str, logger):
             summary.existing_files += 1
         else:
@@ -612,7 +710,6 @@ def update_faststack_json(
 
     summary.unique_stems_in_paths = len(stem_to_paths)
 
-    # Add a note explaining the existence check strategy.
     if summary.missing_files > 0 and _RUNNING_IN_WSL:
         summary.existence_check_note = (
             "Existence checks tried both catalog paths and WSL /mnt/ paths. "
@@ -624,8 +721,37 @@ def update_faststack_json(
             "files are on unmounted drives, external storage, or a different OS."
         )
 
-    logger.verbose(f"Opening FastStack JSON: {json_path}")
-    data = load_json(json_path)
+    # Filter green paths to only those in the target directory.
+    # resolve() follows symlinks, so ~/pictures -> /mnt/c/Users/alanr/Pictures
+    # yields the real /mnt/c/... path, which can then be compared against
+    # green-list entries stored as C:/Users/alanr/Pictures/... after both
+    # sides are normalized to /mnt/<drive>/... form.
+    target_dir = json_path.parent.resolve()
+    target_dir_normalized = _normalize_dir_for_comparison(str(target_dir))
+    logger.debug(f"Target directory (normalized): {target_dir_normalized}")
+
+    dir_stems: dict[str, list[str]] = {}
+    for path_str in path_lines:
+        if _path_is_in_dir(path_str, target_dir_normalized):
+            stem = stem_key_from_path(path_str)
+            dir_stems.setdefault(stem, []).append(path_str)
+
+    summary.green_in_this_dir = len(dir_stems)
+    logger.verbose(
+        f"Green-labeled paths in target directory: {len(dir_stems)} unique stems"
+    )
+
+    # Load or create the JSON.
+    if json_path.exists():
+        logger.verbose(f"Opening FastStack JSON: {json_path}")
+        if json_path_str != str(json_path):
+            logger.verbose(f"  (resolved directory to {json_path})")
+        data = load_json(json_path)
+    else:
+        logger.verbose(f"FastStack JSON not found, will create: {json_path}")
+        data = json.loads(json.dumps(EMPTY_FASTSTACK_JSON))  # deep copy
+        summary.json_created = True
+
     entries = data.get("entries")
     if not isinstance(entries, dict):
         raise ValueError(f"FastStack JSON missing an 'entries' dictionary: {json_path}")
@@ -633,43 +759,130 @@ def update_faststack_json(
     summary.json_entries_total = len(entries)
     changed = False
 
-    json_stems = set(entries.keys())
-    exported_stems = set(stem_to_paths.keys())
-    summary.stems_not_present_in_json = len(exported_stems - json_stems)
+    # Process green stems that are in this directory. Each green-labeled file
+    # gets its own entry under its exact stem — an export with an appended
+    # description is a separate file and a separate entry from the original.
+    for stem in sorted(dir_stems.keys()):
+        source_paths = dir_stems[stem]
 
-    for stem in sorted(exported_stems & json_stems):
-        summary.matching_entries_found += 1
-        entry = entries[stem]
-        if not isinstance(entry, dict):
-            logger.warn(
-                f"Skipping malformed FastStack entry for stem {stem!r}: not an object"
-            )
+        if stem in entries:
+            # Existing entry — mark uploaded if not already.
+            summary.matching_entries_found += 1
+            entry = entries[stem]
+            if not isinstance(entry, dict):
+                logger.warn(
+                    f"Skipping malformed FastStack entry for stem {stem!r}: not an object"
+                )
+                continue
+
+            ensure_faststack_entry_shape(entry)
+            logger.debug(f"Existing entry {stem!r}, source paths: {source_paths}")
+
+            if entry.get("uploaded") is True:
+                summary.already_uploaded += 1
+                logger.verbose(f"Already uploaded: {stem}")
+                continue
+
+            entry["uploaded"] = True
+            if not entry.get("uploaded_date"):
+                entry["uploaded_date"] = uploaded_date
+            summary.newly_marked_uploaded += 1
+            changed = True
+            logger.verbose(f"Marking uploaded: {stem}")
+        else:
+            # New entry — create it with uploaded=True.
+            new_entry = dict(DEFAULT_FASTSTACK_ENTRY_SHAPE)
+            new_entry["uploaded"] = True
+            new_entry["uploaded_date"] = uploaded_date
+            entries[stem] = new_entry
+            summary.newly_created_entries += 1
+            changed = True
+            logger.verbose(f"Creating new entry: {stem}")
+
+    # Propagate uploaded state to sibling originals. A green-labeled export
+    # like "20250705-P7058257 Costa Rica Amal stacked.JPG" is a processed
+    # version of the original capture "20250705-P7058257.ORF" (or .JPG).
+    # Both files may coexist in the same directory as distinct files with
+    # distinct stems. The export already got its own entry above. Here we
+    # also mark the shorter-stemmed original as uploaded, because once the
+    # processed version has been uploaded the original capture no longer
+    # needs to be worked on again.
+    #
+    # Detection: scan the target directory for image files whose stem is a
+    # prefix of a green stem followed by a space. The space delimiter avoids
+    # false matches between unrelated files that happen to share a prefix.
+    IMAGE_EXTENSIONS = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".tif",
+        ".tiff",
+        ".bmp",
+        ".orf",
+        ".cr2",
+        ".cr3",
+        ".nef",
+        ".arw",
+        ".dng",
+        ".raf",
+        ".rw2",
+        ".pef",
+        ".srw",
+        ".x3f",
+    }
+    dir_file_stems: set[str] = set()
+    if target_dir.is_dir():
+        for child in target_dir.iterdir():
+            if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS:
+                dir_file_stems.add(child.stem.lower())
+
+    green_stem_set = set(dir_stems.keys())
+    for file_stem in sorted(dir_file_stems):
+        # Check if any green stem starts with this file stem + space.
+        # e.g. file_stem "20250705-p7058257" matches green stem
+        # "20250705-p7058257 costa rica amal stacked"
+        is_original_of_green = any(
+            gs.startswith(file_stem + " ") for gs in green_stem_set
+        )
+        if not is_original_of_green:
+            continue
+        if file_stem in green_stem_set:
+            # Already handled directly as a green stem.
             continue
 
-        ensure_faststack_entry_shape(entry)
-        source_paths = stem_to_paths[stem]
-        logger.debug(f"Matching stem {stem!r} with source paths: {source_paths}")
+        if file_stem in entries:
+            entry = entries[file_stem]
+            if not isinstance(entry, dict):
+                continue
+            ensure_faststack_entry_shape(entry)
+            if entry.get("uploaded") is True:
+                continue
+            entry["uploaded"] = True
+            if not entry.get("uploaded_date"):
+                entry["uploaded_date"] = uploaded_date
+            summary.sibling_originals_marked += 1
+            changed = True
+            logger.verbose(f"Marking sibling original uploaded: {file_stem}")
+        else:
+            new_entry = dict(DEFAULT_FASTSTACK_ENTRY_SHAPE)
+            new_entry["uploaded"] = True
+            new_entry["uploaded_date"] = uploaded_date
+            entries[file_stem] = new_entry
+            summary.sibling_originals_marked += 1
+            changed = True
+            logger.verbose(f"Creating sibling original entry: {file_stem}")
 
-        if entry.get("uploaded") is True:
-            summary.already_uploaded += 1
-            logger.verbose(f"Already uploaded: {stem}")
-            continue
+    should_write_json = changed or summary.json_created
 
-        entry["uploaded"] = True
-        if not entry.get("uploaded_date"):
-            entry["uploaded_date"] = uploaded_date
-        summary.newly_marked_uploaded += 1
-        changed = True
-        logger.verbose(f"Marking uploaded: {stem}")
-
-    if changed and not dry_run:
-        backup_path = next_backup_path(json_path)
-        shutil.copy2(json_path, backup_path)
-        summary.backup_path = str(backup_path)
+    if should_write_json and not dry_run:
+        if json_path.exists():
+            backup_path = next_backup_path(json_path)
+            shutil.copy2(json_path, backup_path)
+            summary.backup_path = str(backup_path)
         save_json(json_path, data)
         summary.json_written = True
-    elif changed and dry_run:
-        logger.info("[dry-run] Changes detected; JSON was not written.")
+    elif should_write_json and dry_run:
+        logger.info("[dry-run] JSON would be created or updated; file was not written.")
     else:
         logger.info("No JSON changes were needed.")
 
