@@ -1567,13 +1567,14 @@ class UIState(QObject):
     gridSelectedCountChanged = Signal()  # No args - QML property notify pattern
     gridScrollToIndex = Signal(int)  # Scroll grid view to show this index
     gridCanGoBackChanged = Signal()  # Emitted when back history changes
-    isFolderLoadedChanged = Signal()  # Emitted after first model refresh
+    isFolderLoadedChanged = Signal()  # Emitted when the current folder finishes loading
 
     @Property(bool, notify=isFolderLoadedChanged)
     def isFolderLoaded(self) -> bool:
-        """Returns True after the folder has been scanned at least once.
+        """Returns True after the current folder scan has completed.
 
-        Used by QML to avoid showing 'No images' message during initial load.
+        Used by QML to avoid treating a directory switch as an empty folder
+        before the new folder has finished loading.
         """
         return getattr(self.app_controller, "_folder_loaded", False)
 

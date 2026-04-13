@@ -19,6 +19,84 @@ Item {
 
     // Selection count for keyboard handler (use gridSelectedCount for efficiency)
     property int selectedCount: gridViewRoot.uiStateRef ? gridViewRoot.uiStateRef.gridSelectedCount : 0
+    // Preserve per-directory view state so returning from a child folder restores the scroll position.
+    property var directoryViewState: ({})
+    property string trackedDirectory: gridViewRoot.uiStateRef ? gridViewRoot.uiStateRef.gridDirectory : ""
+    property bool pendingDirectoryRestore: false
+
+    function clampIndex(index) {
+        // For an empty model, keep 0 as a safe default index instead of using -1.
+        if (thumbnailGrid.count <= 0) return 0
+        return Math.max(0, Math.min(index, thumbnailGrid.count - 1))
+    }
+
+    function clampContentY(value) {
+        var maxY = Math.max(0, thumbnailGrid.contentHeight - thumbnailGrid.height)
+        return Math.max(0, Math.min(value, maxY))
+    }
+
+    function resetViewToTop() {
+        thumbnailGrid.currentIndex = 0
+        thumbnailGrid.contentY = 0
+    }
+
+    function isDirectoryLoadComplete() {
+        return !gridViewRoot.uiStateRef || gridViewRoot.uiStateRef.isFolderLoaded
+    }
+
+    function saveDirectoryViewState(directory) {
+        // `!directory` intentionally covers null/undefined and the empty-string default
+        // used when no uiStateRef/gridDirectory is available yet.
+        if (!directory || gridViewRoot.pendingDirectoryRestore) return
+        // During a directory switch, GridView can briefly emit top-of-list updates before
+        // trackedDirectory catches up. Ignore those transition events so we don't overwrite
+        // the previous directory's saved position with a transient reset-to-top state.
+        if (gridViewRoot.uiStateRef && gridViewRoot.uiStateRef.gridDirectory !== directory) return
+
+        gridViewRoot.directoryViewState[directory] = {
+            contentY: gridViewRoot.clampContentY(thumbnailGrid.contentY),
+            currentIndex: gridViewRoot.clampIndex(thumbnailGrid.currentIndex)
+        }
+    }
+
+    function applyDirectoryViewState(directory) {
+        if (thumbnailGrid.count <= 0) {
+            if (!gridViewRoot.isDirectoryLoadComplete()) return false
+
+            gridViewRoot.pendingDirectoryRestore = false
+            gridViewRoot.resetViewToTop()
+            return true
+        }
+
+        var state = gridViewRoot.directoryViewState[directory]
+        gridViewRoot.pendingDirectoryRestore = false
+        if (!state) {
+            gridViewRoot.resetViewToTop()
+            return true
+        }
+
+        thumbnailGrid.currentIndex = gridViewRoot.clampIndex(state.currentIndex)
+        thumbnailGrid.contentY = gridViewRoot.clampContentY(state.contentY)
+        return true
+    }
+
+    function retryPendingDirectoryRestore(directory) {
+        Qt.callLater(function() {
+            if (!gridViewRoot.pendingDirectoryRestore || gridViewRoot.trackedDirectory !== directory) return
+
+            // Later retries are driven by onCountChanged and onIsFolderLoadedChanged.
+            if (!gridViewRoot.applyDirectoryViewState(directory)) return
+
+            if (thumbnailGrid.prefetchEnabled) prefetchTimer.restart()
+        })
+    }
+
+    function queueDirectoryRestore(directory) {
+        gridViewRoot.trackedDirectory = directory
+        gridViewRoot.pendingDirectoryRestore = true
+
+        gridViewRoot.retryPendingDirectoryRestore(directory)
+    }
 
     // Wrapper to expose function to Loader
     function setPrefetchEnabled(enabled) {
@@ -84,7 +162,12 @@ Item {
         }
 
         onContentYChanged: {
+            gridViewRoot.saveDirectoryViewState(gridViewRoot.trackedDirectory)
             if (prefetchEnabled && !prefetchTimer.running) prefetchTimer.start()  // Throttle
+        }
+
+        onCurrentIndexChanged: {
+            gridViewRoot.saveDirectoryViewState(gridViewRoot.trackedDirectory)
         }
 
         Timer {
@@ -140,11 +223,18 @@ Item {
         // Trigger prefetch when model count changes (initial load)
         onCountChanged: {
             if (count <= 0) {
-                currentIndex = 0
+                gridViewRoot.resetViewToTop()
                 return
             }
             if (currentIndex >= count) {
                 currentIndex = count - 1
+            }
+            if (gridViewRoot.pendingDirectoryRestore) {
+                // Defensive fallback: if model population ever becomes async and races
+                // with gridDirectoryChanged, restore again after the new count lands.
+                // Keep retrying while the folder is still loading so a transient
+                // zero-count state doesn't get treated as a definitive empty folder.
+                gridViewRoot.retryPendingDirectoryRestore(gridViewRoot.trackedDirectory)
             }
             if (prefetchEnabled) prefetchTimer.restart()
         }
@@ -237,11 +327,22 @@ Item {
             thumbnailGrid.currentIndex = gridViewRoot.uiStateRef.currentIndex
             thumbnailGrid.positionViewAtIndex(thumbnailGrid.currentIndex, GridView.Center)
         }
+
+        gridViewRoot.trackedDirectory = gridViewRoot.uiStateRef ? gridViewRoot.uiStateRef.gridDirectory : ""
+        gridViewRoot.saveDirectoryViewState(gridViewRoot.trackedDirectory)
     }
 
 
     Connections {
         target: gridViewRoot.uiStateRef
+        function onGridDirectoryChanged(directory) {
+            gridViewRoot.queueDirectoryRestore(directory)
+        }
+        function onIsFolderLoadedChanged() {
+            if (gridViewRoot.pendingDirectoryRestore && gridViewRoot.uiStateRef && gridViewRoot.uiStateRef.isFolderLoaded) {
+                gridViewRoot.retryPendingDirectoryRestore(gridViewRoot.trackedDirectory)
+            }
+        }
         function onIsGridViewActiveChanged() {
             if (gridViewRoot.uiStateRef.isGridViewActive) {
                 // Prefetch triggering is now handled by Main.qml via setPrefetchEnabled

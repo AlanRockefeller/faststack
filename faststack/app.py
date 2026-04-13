@@ -19,7 +19,9 @@ from collections import deque
 from itertools import pairwise
 
 # Must set before importing PySide6
-os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime.warning=false"
+os.environ["QT_LOGGING_RULES"] = (
+    "qt.qpa.mime.warning=false;" "qt.qpa.fonts.warning=false"
+)
 
 import concurrent.futures
 import threading
@@ -347,7 +349,7 @@ class AppController(QObject):
         self._scan_count_variant = 0
         self._grid_refreshes = 0
         self._grid_model_dirty = True  # Start dirty to ensure initial load
-        self._folder_loaded = False  # Track if initial scan is complete
+        self._folder_loaded = False  # Track whether the current folder scan is complete
         self._thumbnail_cache = ThumbnailCache(
             max_bytes=256 * 1024 * 1024,  # 256 MB
             max_items=5000,
@@ -1118,10 +1120,6 @@ class AppController(QObject):
         # Defer initial UI sync until after images are loaded
         self.sync_ui_state()
 
-        # Mark folder as loaded for UI
-        self._folder_loaded = True
-        self.ui_state.isFolderLoadedChanged.emit()
-
         if self._is_grid_view_active and not skip_thumbnail_refresh:
 
             # Ensure grid model is populated if starting in grid mode
@@ -1134,6 +1132,8 @@ class AppController(QObject):
                 self._thumbnail_model.refresh_from_controller(self.image_files)
                 self._path_resolver.update_from_model(self._thumbnail_model)
                 self._grid_model_dirty = False
+
+        self._set_folder_loaded(True)
 
         log.info(
             "Load summary: scans=variant:%d grid_refreshes:%d",
@@ -4016,6 +4016,8 @@ class AppController(QObject):
         if self._thumbnail_cache:
             self._thumbnail_cache.clear()
 
+        self._set_folder_loaded(False)
+
         # Update thumbnail view infrastructure
         if self._thumbnail_model:
             if update_base_directory:
@@ -4032,6 +4034,16 @@ class AppController(QObject):
 
         # Load images from new directory (thumbnail model already refreshed above)
         self.load(skip_thumbnail_refresh=True)
+
+    def _set_folder_loaded(self, loaded: bool) -> None:
+        """Update the current-folder load state and notify QML when it changes."""
+        if self._folder_loaded == loaded:
+            return
+
+        self._folder_loaded = loaded
+        # Defensive for initialization and tests that may not have bound UIState yet.
+        if hasattr(self, "ui_state") and self.ui_state:
+            self.ui_state.isFolderLoadedChanged.emit()
 
     @Slot()
     def open_folder(self):
