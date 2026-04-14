@@ -7,6 +7,7 @@ def test_main_qml_coerces_runtime_values_before_array_operations():
     qml_text = qml_path.read_text(encoding="utf-8")
 
     assert "function toArray(value)" in qml_text
+    assert "function stringOrEmpty(value)" in qml_text
     assert "function itemsWithStatus(items, status)" in qml_text
     assert "value === null || value === undefined" in qml_text
     assert "if (!value)" not in qml_text
