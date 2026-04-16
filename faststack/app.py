@@ -637,7 +637,7 @@ class AppController(QObject):
             self._grid_refreshes += 1
             self._thumbnail_model.refresh_from_controller(
                 self.image_files,
-                metadata_map=self._get_bulk_metadata_map(self.image_files),
+                metadata_map_fn=self._get_bulk_metadata_map,
             )
             self._path_resolver.update_from_model(self._thumbnail_model)
             self._grid_model_dirty = False
@@ -688,7 +688,7 @@ class AppController(QObject):
             self._grid_refreshes += 1
             self._thumbnail_model.refresh_from_controller(
                 self.image_files,
-                metadata_map=self._get_bulk_metadata_map(self.image_files),
+                metadata_map_fn=self._get_bulk_metadata_map,
             )
             self._path_resolver.update_from_model(self._thumbnail_model)
             self._grid_model_dirty = False
@@ -798,7 +798,7 @@ class AppController(QObject):
             self._grid_refreshes += 1
             self._thumbnail_model.refresh_from_controller(
                 self.image_files,
-                metadata_map=self._get_bulk_metadata_map(self.image_files),
+                metadata_map_fn=self._get_bulk_metadata_map,
             )
             self._path_resolver.update_from_model(self._thumbnail_model)
             self._grid_model_dirty = False
@@ -1150,7 +1150,7 @@ class AppController(QObject):
                 self._grid_refreshes += 1
                 self._thumbnail_model.refresh_from_controller(
                     self.image_files,
-                    metadata_map=self._get_bulk_metadata_map(self.image_files),
+                    metadata_map_fn=self._get_bulk_metadata_map,
                 )
                 self._path_resolver.update_from_model(self._thumbnail_model)
                 self._grid_model_dirty = False
@@ -1232,7 +1232,7 @@ class AppController(QObject):
             self._grid_refreshes += 1
             self._thumbnail_model.refresh_from_controller(
                 self.image_files,
-                metadata_map=self._get_bulk_metadata_map(self.image_files),
+                metadata_map_fn=self._get_bulk_metadata_map,
             )
             self._path_resolver.update_from_model(self._thumbnail_model)
             self._grid_model_dirty = False
@@ -2368,7 +2368,7 @@ class AppController(QObject):
                 # Always use controller's list, even if empty.
                 self._thumbnail_model.refresh_from_controller(
                     self.image_files,
-                    metadata_map=self._get_bulk_metadata_map(self.image_files),
+                    metadata_map_fn=self._get_bulk_metadata_map,
                 )
 
                 # Update path resolver for the current directory
