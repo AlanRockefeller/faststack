@@ -635,7 +635,10 @@ class AppController(QObject):
 
         if self._is_grid_view_active and self._thumbnail_model:
             self._grid_refreshes += 1
-            self._thumbnail_model.refresh_from_controller(self.image_files)
+            self._thumbnail_model.refresh_from_controller(
+                self.image_files,
+                metadata_map_fn=self._get_bulk_metadata_map,
+            )
             self._path_resolver.update_from_model(self._thumbnail_model)
             self._grid_model_dirty = False
         else:
@@ -683,7 +686,10 @@ class AppController(QObject):
 
         if self._is_grid_view_active and self._thumbnail_model:
             self._grid_refreshes += 1
-            self._thumbnail_model.refresh_from_controller(self.image_files)
+            self._thumbnail_model.refresh_from_controller(
+                self.image_files,
+                metadata_map_fn=self._get_bulk_metadata_map,
+            )
             self._path_resolver.update_from_model(self._thumbnail_model)
             self._grid_model_dirty = False
         else:
@@ -790,7 +796,10 @@ class AppController(QObject):
 
         if self._is_grid_view_active and self._thumbnail_model:
             self._grid_refreshes += 1
-            self._thumbnail_model.refresh_from_controller(self.image_files)
+            self._thumbnail_model.refresh_from_controller(
+                self.image_files,
+                metadata_map_fn=self._get_bulk_metadata_map,
+            )
             self._path_resolver.update_from_model(self._thumbnail_model)
             self._grid_model_dirty = False
         else:
@@ -1139,7 +1148,10 @@ class AppController(QObject):
                 and self._thumbnail_model.rowCount() == 0
             ):
                 self._grid_refreshes += 1
-                self._thumbnail_model.refresh_from_controller(self.image_files)
+                self._thumbnail_model.refresh_from_controller(
+                    self.image_files,
+                    metadata_map_fn=self._get_bulk_metadata_map,
+                )
                 self._path_resolver.update_from_model(self._thumbnail_model)
                 self._grid_model_dirty = False
 
@@ -1218,7 +1230,10 @@ class AppController(QObject):
         # Refresh thumbnail model if it exists (for external file changes or startup)
         if self._thumbnail_model and self._is_grid_view_active:
             self._grid_refreshes += 1
-            self._thumbnail_model.refresh_from_controller(self.image_files)
+            self._thumbnail_model.refresh_from_controller(
+                self.image_files,
+                metadata_map_fn=self._get_bulk_metadata_map,
+            )
             self._path_resolver.update_from_model(self._thumbnail_model)
             self._grid_model_dirty = False
 
@@ -2351,7 +2366,10 @@ class AppController(QObject):
                 self._grid_refreshes += 1
 
                 # Always use controller's list, even if empty.
-                self._thumbnail_model.refresh_from_controller(self.image_files)
+                self._thumbnail_model.refresh_from_controller(
+                    self.image_files,
+                    metadata_map_fn=self._get_bulk_metadata_map,
+                )
 
                 # Update path resolver for the current directory
                 self._path_resolver.update_from_model(self._thumbnail_model)
@@ -2588,11 +2606,14 @@ class AppController(QObject):
                 "todo": False,
             }
 
-    def _get_bulk_metadata_map(self) -> Dict[str, dict]:
-        """Get flattened metadata map for all images (for efficient grid refresh)."""
+    def _get_bulk_metadata_map(self, images=None) -> Dict[str, dict]:
+        """Get flattened metadata map for the given images (defaults to self.image_files).
+
+        Used to avoid per-image sidecar lookups on the UI thread during grid refresh.
+        """
         bulk_map = {}
         try:
-            for img in self.image_files:
+            for img in (images if images is not None else self.image_files):
                 key = self.sidecar.metadata_key_for_path(img.path)
                 meta = self.sidecar.get_metadata(img.path, create=False)
                 if meta is None:

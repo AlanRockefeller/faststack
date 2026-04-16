@@ -528,12 +528,19 @@ class ThumbnailModel(QAbstractListModel):
         )
 
     def refresh_from_controller(
-        self, images: List, metadata_map: Optional[Dict[str, dict]] = None
+        self,
+        images: List,
+        metadata_map: Optional[Dict[str, dict]] = None,
+        metadata_map_fn: Optional[Callable[[List], Dict[str, dict]]] = None,
     ):
         """Refresh images from a pre-loaded list without scanning disk.
 
         Folders are still scanned, but image entries are built from the
         provided objects.
+
+        If ``metadata_map_fn`` is provided and ``metadata_map`` is not,
+        the map is built lazily after filename filtering so we only
+        fetch sidecar metadata for images that will actually be shown.
         """
         self._next_source_reason = "refresh"
         cur, own = QThread.currentThread(), self.thread()
@@ -555,6 +562,11 @@ class ThumbnailModel(QAbstractListModel):
             if self._active_filter:
                 needle = self._active_filter.lower()
                 images = [img for img in images if needle in img.path.stem.lower()]
+
+            # Build metadata map lazily, after filename filter, so we
+            # don't do sidecar lookups for images that got filtered out.
+            if metadata_map is None and metadata_map_fn is not None:
+                metadata_map = metadata_map_fn(images)
 
             # Apply active flag filters (AND logic)
             if self._active_filter_flags:
