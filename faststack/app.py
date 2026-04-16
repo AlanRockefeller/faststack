@@ -420,10 +420,6 @@ class AppController(QObject):
         # union of all ranges. Do not add per-range semantics without also
         # updating every consumer — see _get_user_flag_toggle_indices for the
         # canonical pattern.
-        #
-        # Note: end_current_batch() currently appends without merging, so
-        # ranges can technically overlap. This is harmless because consumers
-        # union anyway, but is tracked as a cleanup item.
         self.batches: List[List[int]] = []
 
         self._filter_string: str = ""  # Default filter
@@ -2618,6 +2614,26 @@ class AppController(QObject):
         self._batch_indices_cache = set()
         self._batch_indices_cache_key = None
 
+    def _normalize_batches(self) -> None:
+        """Sort ``self.batches`` by start index and merge overlapping or
+        adjacent ranges in place.
+
+        Call after any append to ``self.batches`` to maintain the invariant
+        that ranges are sorted, non-overlapping, and non-adjacent. See the
+        attribute comment on ``self.batches`` for the selection semantics.
+        """
+        if not self.batches:
+            return
+        self.batches.sort()
+        merged: List[List[int]] = [self.batches[0]]
+        for current_start, current_end in self.batches[1:]:
+            last_start, last_end = merged[-1]
+            if current_start <= last_end + 1:
+                merged[-1] = [last_start, max(last_end, current_end)]
+            else:
+                merged.append([current_start, current_end])
+        self.batches = merged
+
     def _get_batch_indices(self) -> Set[int]:
         """Get set of all indices that are in any batch (for thumbnail model).
 
@@ -2993,15 +3009,17 @@ class AppController(QObject):
             start = min(self.batch_start_index, self.current_index)
             end = max(self.batch_start_index, self.current_index)
             self.batches.append([start, end])
-            self.batches.sort()  # Keep batches sorted by start index
+            self._normalize_batches()
             self._invalidate_batch_cache()
             log.info("Defined new batch: [%d, %d]", start, end)
             self.batch_start_index = None
             self._metadata_cache_index = (-1, -1)  # Invalidate cache
             self.dataChanged.emit()
             self.sync_ui_state()
-            count = end - start + 1
-            self.update_status_message(f"Batch defined: {count} images")
+            count = self.get_batch_count_for_current_image()
+            self.update_status_message(
+                f"Batch defined: {count} image{'' if count == 1 else 's'}"
+            )
         else:
             log.warning("No batch start marked. Press '{' first.")
             self.update_status_message("No batch start marked")
@@ -3049,18 +3067,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            # Sort and merge overlapping/adjacent batches
-            self.batches.sort()
-            merged_batches = [self.batches[0]] if self.batches else []
-            for i in range(1, len(self.batches)):
-                last_start, last_end = merged_batches[-1]
-                current_start, current_end = self.batches[i]
-                if current_start <= last_end + 1:
-                    merged_batches[-1] = [last_start, max(last_end, current_end)]
-                else:
-                    merged_batches.append([current_start, current_end])
-            self.batches = merged_batches
-
+            self._normalize_batches()
             self._invalidate_batch_cache()
             self._metadata_cache_index = (-1, -1)
             self.dataChanged.emit()
@@ -3100,18 +3107,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            # Sort and merge overlapping/adjacent batches
-            self.batches.sort()
-            merged_batches = [self.batches[0]] if self.batches else []
-            for i in range(1, len(self.batches)):
-                last_start, last_end = merged_batches[-1]
-                current_start, current_end = self.batches[i]
-                if current_start <= last_end + 1:
-                    merged_batches[-1] = [last_start, max(last_end, current_end)]
-                else:
-                    merged_batches.append([current_start, current_end])
-            self.batches = merged_batches
-
+            self._normalize_batches()
             self._invalidate_batch_cache()
             self._metadata_cache_index = (-1, -1)
             self.dataChanged.emit()
@@ -3155,18 +3151,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            # Sort and merge overlapping/adjacent batches
-            self.batches.sort()
-            merged_batches = [self.batches[0]] if self.batches else []
-            for i in range(1, len(self.batches)):
-                last_start, last_end = merged_batches[-1]
-                current_start, current_end = self.batches[i]
-                if current_start <= last_end + 1:
-                    merged_batches[-1] = [last_start, max(last_end, current_end)]
-                else:
-                    merged_batches.append([current_start, current_end])
-            self.batches = merged_batches
-
+            self._normalize_batches()
             self._invalidate_batch_cache()
             self._metadata_cache_index = (-1, -1)
             self.dataChanged.emit()
@@ -3306,45 +3291,16 @@ class AppController(QObject):
             self.update_status_message("Removed image from batch")
             log.info("Removed index %d from a batch.", index_to_toggle)
         else:
-            # Add to batch - merge with adjacent batches if possible
-            if not self.batches:
-                self.batches.append([index_to_toggle, index_to_toggle])
+            had_batches = bool(self.batches)
+            self.batches.append([index_to_toggle, index_to_toggle])
+            self._normalize_batches()
+            if not had_batches:
                 self.update_status_message("Created new batch with current image.")
                 log.info(
                     "No existing batches. Created new batch for index %d.",
                     index_to_toggle,
                 )
             else:
-                # Check if adjacent to any existing batch
-                merged = False
-                for i, (start, end) in enumerate(self.batches):
-                    # Adjacent to start of batch
-                    if index_to_toggle == start - 1:
-                        self.batches[i] = [index_to_toggle, end]
-                        merged = True
-                        break
-                    # Adjacent to end of batch
-                    elif index_to_toggle == end + 1:
-                        self.batches[i] = [start, index_to_toggle]
-                        merged = True
-                        break
-
-                if not merged:
-                    # Not adjacent to any batch, create new one
-                    self.batches.append([index_to_toggle, index_to_toggle])
-
-                # Sort and merge any overlapping batches
-                self.batches.sort()
-                merged_batches = [self.batches[0]] if self.batches else []
-                for i in range(1, len(self.batches)):
-                    last_start, last_end = merged_batches[-1]
-                    current_start, current_end = self.batches[i]
-                    if current_start <= last_end + 1:
-                        merged_batches[-1] = [last_start, max(last_end, current_end)]
-                    else:
-                        merged_batches.append([current_start, current_end])
-                self.batches = merged_batches
-
                 self.update_status_message("Added image to batch")
                 log.info("Added index %d to batch.", index_to_toggle)
 

@@ -157,6 +157,43 @@ def test_grid_cursor_not_found_feedback(mock_controller):
     )
 
 
+def test_end_current_batch_normalizes_overlapping_ranges(mock_controller):
+    """Overlapping batch closures should be merged into canonical ranges."""
+    mock_controller.image_files = [ImageFile(Path(f"test{i}.jpg")) for i in range(30)]
+
+    mock_controller.current_index = 5
+    mock_controller.begin_new_batch()
+    mock_controller.current_index = 15
+    mock_controller.end_current_batch()
+
+    mock_controller.current_index = 10
+    mock_controller.begin_new_batch()
+    mock_controller.current_index = 20
+    mock_controller.end_current_batch()
+
+    assert mock_controller.batches == [[5, 20]]
+
+
+def test_batch_count_and_info_use_normalized_ranges(mock_controller):
+    """Batch count consumers should reflect the merged batch union."""
+    mock_controller.image_files = [ImageFile(Path(f"test{i}.jpg")) for i in range(30)]
+
+    mock_controller.current_index = 5
+    mock_controller.begin_new_batch()
+    mock_controller.current_index = 15
+    mock_controller.end_current_batch()
+
+    mock_controller.current_index = 10
+    mock_controller.begin_new_batch()
+    mock_controller.current_index = 20
+    mock_controller.end_current_batch()
+
+    mock_controller.current_index = 12
+
+    assert mock_controller.get_batch_count_for_current_image() == 16
+    assert mock_controller._get_batch_info(12) == "16 in Batch"
+
+
 def test_delete_indices_summary_return(mock_controller):
     """Test that _delete_indices returns queued=True, not optimistic all_deleted."""
     img1 = ImageFile(Path("test1.jpg"))
