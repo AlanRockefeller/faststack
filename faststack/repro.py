@@ -1,17 +1,18 @@
 import sys
+import traceback
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# Repo root
+# Repo root must be on sys.path before importing faststack when this script is run directly.
 sys.path.append(str(Path(".").resolve().parent))
+
+from faststack.app import AppController  # noqa: E402
+from faststack.models import ImageFile  # noqa: E402
 
 print(f"DEBUG: sys.path[-1] is {sys.path[-1]}")
 
-from faststack.app import AppController
-
 # Mock dependencies
 mock_engine = MagicMock()
-mock_config = MagicMock()
 
 with (
     patch("config.config"),
@@ -25,8 +26,6 @@ with (
 
 # Setup state
 # Use real list to avoid mock issues
-from faststack.models import ImageFile
-
 mock_image = ImageFile(Path("test.jpg"))
 controller.image_files = [mock_image]
 controller.current_index = 0
@@ -46,6 +45,4 @@ try:
     print("Assertion passed!")
 except Exception as e:
     print(f"\nAssertion FAILED: {type(e).__name__}: {e}")
-    import traceback
-
     traceback.print_exc()

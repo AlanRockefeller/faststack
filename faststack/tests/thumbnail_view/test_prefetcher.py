@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from PIL import Image
+from PySide6.QtGui import QImage
 
 from faststack.io.utils import compute_path_hash
 from faststack.thumbnail_view.prefetcher import ThumbnailCache, ThumbnailPrefetcher
@@ -185,6 +186,16 @@ class TestThumbnailCache:
         assert cache.size == 2
         assert cache.bytes_used == 10
 
+    def test_qimage_size_accounting(self):
+        """QImage entries should count their in-memory pixel footprint."""
+        cache = ThumbnailCache(max_bytes=1024 * 1024, max_items=10)
+        image = QImage(10, 10, QImage.Format.Format_RGB888)
+
+        cache.put("img", image)
+
+        assert cache.get("img") is image
+        assert cache.bytes_used == image.bytesPerLine() * image.height()
+
     def test_update_existing_key(self, cache):
         """Test updating an existing key."""
         cache.put("key1", b"old")
@@ -216,7 +227,9 @@ class TestThumbnailPrefetcher:
             lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app
         )
 
-        assert cache.get(cache_key) is not None
+        cached_image = cache.get(cache_key)
+        assert isinstance(cached_image, QImage)
+        assert not cached_image.isNull()
 
     def test_submit_skips_if_cached(self, prefetcher, test_image, cache):
         """Test that submit skips if already cached."""
@@ -328,9 +341,10 @@ class TestThumbnailDecode:
                 lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app
             )
 
-            cached_bytes = cache.get(cache_key)
-            assert cached_bytes is not None
-            assert len(cached_bytes) > 0
+            cached_image = cache.get(cache_key)
+            assert isinstance(cached_image, QImage)
+            assert not cached_image.isNull()
+            assert cached_image.height() >= cached_image.width()
         finally:
             prefetcher.shutdown()
 
@@ -357,7 +371,9 @@ class TestThumbnailDecode:
             assert _wait_until(
                 lambda: cache.get(cache_key) is not None, timeout_s=2.0, qt_app=qt_app
             )
-            assert cache.get(cache_key) is not None
+            cached_image = cache.get(cache_key)
+            assert isinstance(cached_image, QImage)
+            assert not cached_image.isNull()
         finally:
             prefetcher.shutdown()
 

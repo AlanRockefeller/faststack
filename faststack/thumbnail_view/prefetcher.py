@@ -6,15 +6,10 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import Future
+from contextlib import nullcontext
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
-
-if TYPE_CHECKING:
-    from faststack.imaging.cache import ByteLRUCache
-
-import io
-from contextlib import nullcontext
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -27,9 +22,12 @@ from faststack.util.executors import create_priority_executor
 
 log = logging.getLogger(__name__)
 
+DEFAULT_THUMBNAIL_CACHE_BYTES = 768 * 1024 * 1024
+
 # Optional Qt dispatch so callbacks always run on Qt thread when available
 try:
     from PySide6.QtCore import QCoreApplication, QObject, Qt, Signal
+    from PySide6.QtGui import QImage
 
     class _ReadyEmitter(QObject):
         ready = Signal(str)
@@ -39,11 +37,43 @@ except Exception:
     _ReadyEmitter = None
     _HAS_QT = False
     QCoreApplication = None
+    QImage = None
 
 # Try to initialize turbojpeg with shared discovery logic.
 _tj, HAS_TURBOJPEG = create_turbojpeg()
 if not HAS_TURBOJPEG:
     log.debug("TurboJPEG unavailable, using PIL for thumbnail decoding")
+
+
+def _thumbnail_cache_item_size(value: object) -> int:
+    """Return the memory footprint we want to charge against the cache."""
+    if QImage is not None and isinstance(value, QImage):
+        return value.bytesPerLine() * value.height()
+    return len(value)
+
+
+def _rgb_to_qimage(rgb_array: np.ndarray) -> "QImage":
+    """Materialize a Qt-owned QImage from an RGB numpy array."""
+    if QImage is None:
+        raise RuntimeError("QImage is unavailable for thumbnail caching")
+
+    if not rgb_array.flags.c_contiguous:
+        rgb_array = np.ascontiguousarray(rgb_array)
+
+    height, width = rgb_array.shape[:2]
+    # NOTE: image_view borrows rgb_array's buffer until .copy() returns.
+    # Keep rgb_array alive as a local and do not inline or reorder this sequence.
+    image_view = QImage(
+        rgb_array.data,
+        width,
+        height,
+        rgb_array.strides[0],
+        QImage.Format.Format_RGB888,
+    )
+    image = image_view.copy()
+    if image.isNull():
+        raise RuntimeError("Failed to materialize thumbnail QImage")
+    return image
 
 
 class ThumbnailPrefetcher:
@@ -62,7 +92,7 @@ class ThumbnailPrefetcher:
 
     def __init__(
         self,
-        cache: "ByteLRUCache",
+        cache: "ThumbnailCache",
         on_ready_callback: Optional[Callable[[str], None]] = None,
         max_workers: int = None,
         target_size: int = 200,
@@ -259,10 +289,10 @@ class ThumbnailPrefetcher:
         mtime_ns: int,
         size: int,
         timer: Optional["thumb_debug.ThumbTimer"] = None,
-    ) -> Optional[bytes]:
+    ) -> Optional["QImage"]:
         """Worker function to decode a thumbnail.
 
-        Returns JPEG bytes or None on error.
+        Returns a cache-ready QImage or None on error.
         """
         if timer:
             timer.t_worker_start = time.perf_counter()
@@ -302,12 +332,9 @@ class ThumbnailPrefetcher:
                     )
                 return None
 
-            # Encode to JPEG bytes for storage
-            with timer.stage("encode") if timer else nullcontext():
-                pil_image = Image.fromarray(rgb_array, mode="RGB")
-                buf = io.BytesIO()
-                pil_image.save(buf, format="JPEG", quality=85)
-                result = buf.getvalue()
+            # Materialize a Qt-owned image once so cache hits can return immediately.
+            with timer.stage("qimage") if timer else nullcontext():
+                result = _rgb_to_qimage(rgb_array)
 
             if timer and timer.cancelled:
                 thumb_debug.log_trace("cancel_too_late", rid=timer.rid)
@@ -388,7 +415,7 @@ class ThumbnailPrefetcher:
                     pil_img.thumbnail(
                         (target_size, target_size), Image.Resampling.LANCZOS
                     )
-                    return np.array(pil_img.copy())
+                    return np.array(pil_img)
 
         except Exception as e:
             log.debug("PIL decode failed for %s: %s", path, e)
@@ -432,10 +459,10 @@ class ThumbnailPrefetcher:
                     thumb_debug.log_trace(event, rid=timer.rid)
                 return
 
-            jpeg_bytes = future.result()
-            if jpeg_bytes:
+            cached_image = future.result()
+            if cached_image is not None:
                 # Store in cache
-                self._cache.put(cache_key, jpeg_bytes)
+                self._cache.put(cache_key, cached_image)
 
                 if timer:
                     thumb_debug.inc("decode_done_ok")
@@ -486,40 +513,48 @@ class ThumbnailPrefetcher:
 
 
 class ThumbnailCache:
-    """Simple byte-based LRU cache for thumbnails with dual capacity limit.
+    """Simple size-aware LRU cache for thumbnails with dual capacity limit.
 
     Limits:
     - max_bytes: Maximum total bytes
     - max_items: Maximum number of items
     """
 
-    def __init__(self, max_bytes: int = 256 * 1024 * 1024, max_items: int = 5000):
+    def __init__(
+        self,
+        max_bytes: int = DEFAULT_THUMBNAIL_CACHE_BYTES,
+        max_items: int = 5000,
+        size_of: Callable[[object], int] = _thumbnail_cache_item_size,
+    ):
         self._max_bytes = max_bytes
         self._max_items = max_items
-        self._cache: Dict[str, bytes] = OrderedDict()
+        self._size_of = size_of
+        self._cache: Dict[str, Tuple[object, int]] = OrderedDict()
         self._current_bytes = 0
         self._lock = Lock()
 
-    def get(self, key: str) -> Optional[bytes]:
+    def get(self, key: str) -> Optional[object]:
         """Get item from cache, returns None if not found."""
         with self._lock:
             if key not in self._cache:
                 return None
             # Move to end (most recently used)
             self._cache.move_to_end(key, last=True)
-            return self._cache[key]
+            return self._cache[key][0]
 
-    def put(self, key: str, value: bytes):
+    def put(self, key: str, value: object):
         """Put item in cache, evicting if necessary."""
         with self._lock:
+            value_size = self._size_of(value)
             # If already present, remove old entry logic by just updating (OrderedDict handles key existence)
             # But we must update _current_bytes first if it exists
             if key in self._cache:
-                self._current_bytes -= len(self._cache[key])
+                _, old_size = self._cache[key]
+                self._current_bytes -= old_size
                 self._cache.move_to_end(key, last=True)
 
-            self._cache[key] = value
-            self._current_bytes += len(value)
+            self._cache[key] = (value, value_size)
+            self._current_bytes += value_size
 
             # Evict if over limits
             while (
@@ -527,8 +562,8 @@ class ThumbnailCache:
                 or len(self._cache) > self._max_items
             ):
                 # Pop oldest (first item)
-                _, oldest_val = self._cache.popitem(last=False)
-                self._current_bytes -= len(oldest_val)
+                _, (_, oldest_size) = self._cache.popitem(last=False)
+                self._current_bytes -= oldest_size
 
     def discard(self, key: str) -> bool:
         """Remove a single entry if present. No-op if missing.
@@ -537,10 +572,10 @@ class ThumbnailCache:
         """
         with self._lock:
             try:
-                val = self._cache.pop(key)
+                _, size = self._cache.pop(key)
             except KeyError:
                 return False
-            self._current_bytes -= len(val)
+            self._current_bytes -= size
             return True
 
     def clear(self):

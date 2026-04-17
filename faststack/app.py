@@ -78,6 +78,7 @@ from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
 from faststack.imaging.mask_engine import inverse_transform
 from faststack.imaging.metadata import get_exif_data
 from faststack.thumbnail_view import (
+    DEFAULT_THUMBNAIL_CACHE_BYTES,
     ThumbnailModel,
     ThumbnailPrefetcher,
     ThumbnailCache,
@@ -351,7 +352,7 @@ class AppController(QObject):
         self._grid_model_dirty = True  # Start dirty to ensure initial load
         self._folder_loaded = False  # Track whether the current folder scan is complete
         self._thumbnail_cache = ThumbnailCache(
-            max_bytes=256 * 1024 * 1024,  # 256 MB
+            max_bytes=DEFAULT_THUMBNAIL_CACHE_BYTES,  # cache-ready thumbnail QImages
             max_items=5000,
         )
         self._path_resolver = PathResolver()
@@ -8030,7 +8031,6 @@ class AppController(QObject):
 
         t_start = time.perf_counter()
 
-        image_file = self.image_files[self.current_index]
         if self.view_override_path:
             active_path = Path(self.view_override_path)
         else:
