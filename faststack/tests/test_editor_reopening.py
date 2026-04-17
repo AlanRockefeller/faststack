@@ -1,5 +1,5 @@
-import unittest
 import sys
+import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -130,7 +130,6 @@ class TestEditorReopening(unittest.TestCase):
     def test_prepare_darken_skips_reset_on_reuse(self):
         """_prepare_darken_image_state must NOT call _reset_darken_on_navigation
         when load_image_for_editing returns _REUSED."""
-        target = Path("test.jpg")
         self.controller.image_editor.current_filepath = None  # Force a load
         self.controller.image_editor.float_image = None  # Force needs_load=True
         self.controller.image_editor.current_edits = {}
@@ -184,7 +183,7 @@ class TestEditorReopening(unittest.TestCase):
         # Mock snapshot
         self.controller.image_editor.snapshot_for_export.return_value = MagicMock()
 
-        with patch.object(self.controller, "_save_executor") as mock_executor:
+        with patch.object(self.controller, "_save_executor"):
             # 2. CALL SAVE
             self.controller.save_edited_image()
 

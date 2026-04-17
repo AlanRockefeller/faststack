@@ -236,19 +236,20 @@ class ThumbnailProvider(QQuickImageProvider):
 
         # Check cache (O(1) lookup)
         t_cache_get_start = time.perf_counter() if timer else 0
-        cached_bytes = self._cache.get(cache_key)
+        cached_value = self._cache.get(cache_key)
         dt_cache_get = (time.perf_counter() - t_cache_get_start) * 1000 if timer else 0
 
-        if cached_bytes:
+        if cached_value is not None:
             if timer:
                 thumb_debug.inc("req_cache_hit")
                 thumb_debug.log_trace(
                     "cache_hit", rid=timer.rid, ms=f"{dt_cache_get:.3f}"
                 )
 
-            # Decode JPEG bytes to QImage
+            # Most cache hits are already materialized QImages. Keep a bytes fallback
+            # for tests and defensive handling of manually injected bad entries.
             t_decode_start = time.perf_counter() if timer else 0
-            image = self._bytes_to_image(cached_bytes)
+            image = self._cached_to_image(cached_value)
             dt_decode = (time.perf_counter() - t_decode_start) * 1000 if timer else 0
 
             if image is not None and not image.isNull():
@@ -287,6 +288,19 @@ class ThumbnailProvider(QQuickImageProvider):
         size.setWidth(self._placeholder.width())
         size.setHeight(self._placeholder.height())
         return self._placeholder
+
+    def _cached_to_image(self, cached_value: object) -> Optional[QImage]:
+        """Convert a cached thumbnail payload into a QImage."""
+        if isinstance(cached_value, QImage):
+            return cached_value
+        if isinstance(cached_value, (bytes, bytearray, memoryview)):
+            return self._bytes_to_image(bytes(cached_value))
+
+        log.warning(
+            "Unsupported cached thumbnail type: %s",
+            type(cached_value).__name__,
+        )
+        return None
 
     def _bytes_to_image(self, jpeg_bytes: bytes) -> Optional[QImage]:
         """Convert JPEG bytes to QImage.

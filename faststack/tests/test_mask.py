@@ -1,6 +1,5 @@
 """Tests for the reusable mask subsystem and background darkening tool."""
 
-import math
 import unittest
 
 import numpy as np
@@ -427,7 +426,6 @@ class TestEditorIntegration(unittest.TestCase):
         # Create a small test image
         img = PILImage.new("RGB", (50, 50), color=(128, 128, 128))
         import tempfile
-        from pathlib import Path
 
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             img.save(f.name)
@@ -712,10 +710,11 @@ class TestOverlayFallback(unittest.TestCase):
         """Verify that requesting mask_overlay with no image returns a
         transparent QImage, not an opaque placeholder."""
         try:
-            from PySide6.QtGui import QImage
-            from PySide6.QtCore import Qt
-            from faststack.ui.provider import ImageProvider
             from unittest.mock import Mock
+
+            from PySide6.QtGui import QImage
+
+            from faststack.ui.provider import ImageProvider
         except ImportError:
             self.skipTest("PySide6 not available")
 

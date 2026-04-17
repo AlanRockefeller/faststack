@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import ExifTags, Image, ImageFilter, ImageOps
 
+# Mask subsystem (lazy imports avoided — lightweight dataclasses)
+from faststack.imaging.mask import MaskData
+from faststack.imaging.mask_engine import MaskRasterCache
 from faststack.imaging.math_utils import (
     _analyze_highlight_state,
     _apply_headroom_shoulder,
@@ -26,10 +29,6 @@ from faststack.imaging.math_utils import (
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.models import DecodedImage
-
-# Mask subsystem (lazy imports avoided — lightweight dataclasses)
-from faststack.imaging.mask import DarkenSettings, MaskData
-from faststack.imaging.mask_engine import MaskRasterCache
 
 try:
     from PySide6.QtGui import QImage

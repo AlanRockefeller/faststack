@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from PySide6.QtCore import QSize
+from PySide6.QtGui import QColor, QImage
 
 from faststack.thumbnail_view.prefetcher import ThumbnailCache
 from faststack.thumbnail_view.provider import (
@@ -155,3 +156,20 @@ class TestDecodeFailureRecovery:
         assert args[1] == 999  # mtime_ns
         assert args[2] == 200  # thumb_size
         assert kwargs["priority"] == prefetcher.PRIO_HIGH
+
+    def test_qimage_cache_hit_returns_cached_image_without_submit(self, wired_provider):
+        provider, cache, prefetcher = wired_provider
+
+        cache_key = "200/abc123/999"
+        cached = QImage(20, 12, QImage.Format.Format_RGB888)
+        cached.fill(QColor(12, 34, 56))
+        cache.put(cache_key, cached)
+
+        out_size = QSize()
+        result = provider.requestImage(f"{cache_key}?r=1", out_size, QSize())
+
+        assert result is cached
+        pixel = result.pixelColor(0, 0)
+        assert (pixel.red(), pixel.green(), pixel.blue()) == (12, 34, 56)
+        assert (out_size.width(), out_size.height()) == (20, 12)
+        prefetcher.submit.assert_not_called()

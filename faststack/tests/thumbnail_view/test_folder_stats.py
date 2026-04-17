@@ -272,7 +272,7 @@ class TestComputeCoverageBuckets:
         buckets = _compute_coverage_buckets(jpg_files, entries, num_buckets=1)
 
         assert len(buckets) == 1
-        assert buckets[0] == (1.0, 0.0, 0.0)  # uploaded, not stacked, not todo
+        assert buckets[0] == (1.0, 0.0, 0.0, 0.0)
 
     def test_single_file_stacked(self):
         """Test with single stacked file."""
@@ -282,7 +282,7 @@ class TestComputeCoverageBuckets:
         buckets = _compute_coverage_buckets(jpg_files, entries, num_buckets=1)
 
         assert len(buckets) == 1
-        assert buckets[0] == (0.0, 1.0, 0.0)  # not uploaded, stacked, not todo
+        assert buckets[0] == (0.0, 0.0, 1.0, 0.0)
 
     def test_even_distribution(self):
         """Test even distribution across buckets."""
@@ -356,7 +356,7 @@ class TestComputeCoverageBuckets:
         stats = read_folder_stats(temp_folder)
 
         assert stats is not None
-        assert stats.coverage_buckets == [(1.0, 0.0, 0.0)]
+        assert stats.coverage_buckets == [(1.0, 0.0, 0.0, 0.0)]
 
 
 class TestCountImagesInFolder:
