@@ -1,0 +1,16 @@
+In sidecar.py: cache concrete path resolution and add a stable-key alias index so legacy RAW/filename sidecar keys resolve in O(1) instead of falling back to the O(n) scan.
+In app.py (line 2610) and model.py (line 530): build the bulk metadata map keyed by img.path, treat an empty map as authoritative, and only fall back to metadata_key_fn on miss so grid refresh doesn’t re-resolve the same stable key.
+
+background:
+
+The reason is that stable-key resolution is on real whole-folder paths today, not just edge cases. get_metadata() can fall back to an O(n) migration scan on misses in sidecar.py (line 152), and the app calls this in folder-wide loops for filtering, bulk metadata build, and batch helpers in app.py (line 830), app.py (line 2617), app.py (line 3114), and app.py (line 3158). The grid path in model.py (line 566) can also resolve the same key again after the bulk map is built.
+
+I spot-checked it with a local micro-benchmark in the repo venv. The current bulk-map + flag-filter pattern was about 0.30s for 1k stable images and 1.48s for 5k. A first pass over 5k legacy/raw-keyed entries was about 3.25s. So this is big enough to matter on large folders.
+
+If we do it, I’d prioritize it in this order:
+
+Stop resolving the same stable key multiple times per image in the refresh/filter path.
+Add a small per-SidecarManager cache for metadata_key_for_path().
+Only after that, consider eager one-time legacy-key normalization on load if older sidecars are still common.
+
+

@@ -46,6 +46,17 @@ class SidecarManager:
         self.path = directory / "faststack.json"
         self.watcher = watcher
         self.debug = debug
+        # Precomputed once: the case-normalized absolute base dir used by
+        # metadata_key_for_path / _metadata_filename_key on every call.
+        self._base_dir_normcased = Path(
+            os.path.normcase(os.path.abspath(str(directory)))
+        )
+        # Bounded per-instance caches: input str → resolved key. Folder
+        # refresh resolves the same paths repeatedly across bulk-map build,
+        # flag filter, and grid entry construction.
+        self._stable_key_cache: dict[str, str] = {}
+        self._filename_key_cache: dict[str, str] = {}
+        self._key_cache_max = 8192
         self.data = self.load()
 
     def stop_watcher(self):
@@ -187,21 +198,30 @@ class SidecarManager:
 
     def metadata_key_for_path(self, image_path: Union[str, Path]) -> str:
         """Return the stable sidecar key for a concrete image path."""
+        cache_key = str(image_path)
+        cached = self._stable_key_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         path = Path(image_path)
         if not path.name:
             return ""
         if not path.is_absolute():
             path = self.directory / path
-        base_dir = Path(os.path.normcase(os.path.abspath(str(self.directory))))
         abs_path = Path(os.path.normcase(os.path.abspath(str(path))))
 
         try:
-            relative = abs_path.relative_to(base_dir)
+            relative = abs_path.relative_to(self._base_dir_normcased)
             stable_path = relative.parent / relative.stem
-            return str(stable_path).replace("\\", "/")
+            result = str(stable_path).replace("\\", "/")
         except ValueError:
             stable_path = abs_path.parent / abs_path.stem
-            return str(stable_path).replace("\\", "/")
+            result = str(stable_path).replace("\\", "/")
+
+        if len(self._stable_key_cache) >= self._key_cache_max:
+            del self._stable_key_cache[next(iter(self._stable_key_cache))]
+        self._stable_key_cache[cache_key] = result
+        return result
 
     def _lookup_keys(self, image_ref: Union[str, Path]) -> tuple[str, list[str]]:
         """Return (stable_key, migration_candidate_keys) for a metadata lookup."""
@@ -230,19 +250,28 @@ class SidecarManager:
 
     def _metadata_filename_key(self, image_path: Union[str, Path]) -> str:
         """Return the extension-preserving key used by the regressed patch."""
+        cache_key = str(image_path)
+        cached = self._filename_key_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         path = Path(image_path)
         if not path.name:
             return ""
         if not path.is_absolute():
             path = self.directory / path
-        base_dir = Path(os.path.normcase(os.path.abspath(str(self.directory))))
         abs_path = Path(os.path.normcase(os.path.abspath(str(path))))
 
         try:
-            relative = abs_path.relative_to(base_dir)
-            return str(relative).replace("\\", "/")
+            relative = abs_path.relative_to(self._base_dir_normcased)
+            result = str(relative).replace("\\", "/")
         except ValueError:
-            return str(abs_path).replace("\\", "/")
+            result = str(abs_path).replace("\\", "/")
+
+        if len(self._filename_key_cache) >= self._key_cache_max:
+            del self._filename_key_cache[next(iter(self._filename_key_cache))]
+        self._filename_key_cache[cache_key] = result
+        return result
 
     def _stable_key_from_key(self, key: str, check_fs: bool = False) -> str:
         """Convert any historical sidecar key form into today's stable key.

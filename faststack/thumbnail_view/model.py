@@ -572,10 +572,15 @@ class ThumbnailModel(QAbstractListModel):
             if self._active_filter_flags:
                 flags = self._active_filter_flags
                 filtered = []
+                # When metadata_map is provided (even empty) treat it as
+                # authoritative — don't fall through to per-image sidecar
+                # lookups, and key lookups by str(img.path) so we don't
+                # re-resolve a stable key the bulk-map builder already paid for.
+                map_authoritative = metadata_map is not None
                 for img in images:
                     try:
-                        if metadata_map and self._metadata_key_fn:
-                            meta = metadata_map.get(self._metadata_key_fn(img.path), {})
+                        if map_authoritative:
+                            meta = metadata_map.get(str(img.path), {})
                         elif self._get_metadata:
                             meta = self._get_metadata(img.path)
                         else:
@@ -618,6 +623,9 @@ class ThumbnailModel(QAbstractListModel):
         self, images: List, metadata_map: Optional[Dict[str, dict]] = None
     ):
         """Convert list of objects (ImageFile or similar) to ThumbnailEntry."""
+        # See refresh_from_controller: a non-None metadata_map is authoritative
+        # and keyed by str(img.path).
+        map_authoritative = metadata_map is not None
         for img in images:
             try:
                 # Use mtime from object if available to avoid stat()
@@ -636,8 +644,8 @@ class ThumbnailModel(QAbstractListModel):
             is_favorite = False
             is_todo = False
 
-            if metadata_map and self._metadata_key_fn:
-                meta = metadata_map.get(self._metadata_key_fn(img.path), {})
+            if map_authoritative:
+                meta = metadata_map.get(str(img.path), {})
                 is_stacked = meta.get("stacked", False)
                 is_uploaded = meta.get("uploaded", False)
                 is_edited = meta.get("edited", False)

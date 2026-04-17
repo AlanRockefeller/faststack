@@ -2608,18 +2608,24 @@ class AppController(QObject):
             }
 
     def _get_bulk_metadata_map(self, images=None) -> Dict[str, dict]:
-        """Get flattened metadata map for the given images (defaults to self.image_files).
+        """Get flattened metadata map for the given images, keyed by str(img.path).
 
-        Used to avoid per-image sidecar lookups on the UI thread during grid refresh.
+        Used to avoid per-image sidecar lookups on the UI thread during grid
+        refresh. Keying by the raw path string lets downstream consumers
+        look up entries directly without re-resolving the stable sidecar key.
+
+        The map is treated as authoritative by the grid (see
+        ``ThumbnailModel.refresh_from_controller``), so per-image errors must
+        be isolated — a single bad path must not collapse flags for the
+        whole folder.
         """
         bulk_map = {}
-        try:
-            for img in (images if images is not None else self.image_files):
-                key = self.sidecar.metadata_key_for_path(img.path)
+        for img in (images if images is not None else self.image_files):
+            try:
                 meta = self.sidecar.get_metadata(img.path, create=False)
                 if meta is None:
                     continue
-                bulk_map[key] = {
+                bulk_map[str(img.path)] = {
                     "stacked": getattr(meta, "stacked", False),
                     "uploaded": getattr(meta, "uploaded", False),
                     "edited": getattr(meta, "edited", False),
@@ -2627,8 +2633,12 @@ class AppController(QObject):
                     "favorite": getattr(meta, "favorite", False),
                     "todo": getattr(meta, "todo", False),
                 }
-        except Exception as e:
-            log.warning("Failed to build bulk metadata map: %s", e)
+            except Exception as e:
+                log.warning(
+                    "Failed to read metadata for %s during bulk build: %s",
+                    img.path,
+                    e,
+                )
         return bulk_map
 
     def _invalidate_batch_cache(self):
