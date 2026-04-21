@@ -586,7 +586,9 @@ class AppController(QObject):
                 current_key = None
                 if 0 <= self.current_index < len(self.image_files):
                     try:
-                        current_key = self._key(self.image_files[self.current_index].path)
+                        current_key = self._key(
+                            self.image_files[self.current_index].path
+                        )
                     except (OSError, TypeError, ValueError):
                         current_key = None
                 if current_key is None and session_info is not None:
@@ -597,8 +599,12 @@ class AppController(QObject):
                     except (OSError, TypeError, ValueError):
                         current_key = None
 
-                save_in_progress = bool(current_key and current_key in self._saving_keys)
-                keep_preview = save_in_progress or self._is_current_live_edit_session_dirty()
+                save_in_progress = bool(
+                    current_key and current_key in self._saving_keys
+                )
+                keep_preview = (
+                    save_in_progress or self._is_current_live_edit_session_dirty()
+                )
                 if save_in_progress:
                     log.debug(
                         "Editor closed but save in progress for %s; keeping session memory",
@@ -2089,7 +2095,9 @@ class AppController(QObject):
             return False
 
         self._note_latest_save_token(target=target, session_token=session_token)
-        log.info("Skipping save request for %s; another save is already in flight", target)
+        log.info(
+            "Skipping save request for %s; another save is already in flight", target
+        )
         if status_message:
             self.update_status_message(status_message, timeout=3000)
         return True
@@ -2548,7 +2556,9 @@ class AppController(QObject):
             )
         except RuntimeError as e:
             self._last_save_prepare_error = f"Failed to prepare save: {e}"
-            log.warning("Failed to capture save snapshot for %s: %s", effective_target, e)
+            log.warning(
+                "Failed to capture save snapshot for %s: %s", effective_target, e
+            )
             self.update_status_message(self._last_save_prepare_error, timeout=5000)
             return None
         except Exception as e:
@@ -2561,7 +2571,9 @@ class AppController(QObject):
             self.update_status_message(self._last_save_prepare_error, timeout=5000)
             return None
 
-        self._note_latest_save_token(target=effective_target, session_token=session_token)
+        self._note_latest_save_token(
+            target=effective_target, session_token=session_token
+        )
         save_metadata_path = (
             self.image_files[self.current_index].path
             if 0 <= self.current_index < len(self.image_files)
@@ -2863,7 +2875,10 @@ class AppController(QObject):
                 if target and save_session_token is not None
                 else None
             )
-            if latest_save_token is not None and latest_save_token != save_session_token:
+            if (
+                latest_save_token is not None
+                and latest_save_token != save_session_token
+            ):
                 log.info(
                     "Skipping retry for stale save request %s (rev=%s); newer save token exists",
                     target,

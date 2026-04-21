@@ -75,7 +75,11 @@ def test_raw_pairing_logic():
     raw4_path = Path("IMG_01.ARW")
     raw4_stat = MagicMock()
     raw4_stat.st_mtime = 1008.0
-    potentials = [(raw2_path, raw2_stat), (raw3_path, raw3_stat), (raw4_path, raw4_stat)]
+    potentials = [
+        (raw2_path, raw2_stat),
+        (raw3_path, raw3_stat),
+        (raw4_path, raw4_stat),
+    ]
     assert _find_raw_pair(jpg_path, jpg_stat, potentials) == raw3_path
 
     # Case 4: No potential RAWs
