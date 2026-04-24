@@ -203,6 +203,8 @@ class PriorityExecutor:
             self._count += 1
             neg_seq = -self._count
 
+        # Relies on CPython queue.Queue internals (.mutex and .queue heap);
+        # recheck this on major Python upgrades.
         with self._queue.mutex:
             for idx, item in enumerate(self._queue.queue):
                 current_priority, _old_neg_seq, fn, args, kwargs, fut = item

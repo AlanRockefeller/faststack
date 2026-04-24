@@ -300,7 +300,9 @@ class UIState(QObject):
         self.app_controller = app_controller
         self._app_controller = app_controller  # Backward compatibility alias
         self._clock = clock_func or (lambda: __import__("time").monotonic())
-        self._last_prefetch_data = None  # (startIndex, endIndex, maxCount)
+        self._last_prefetch_data = (
+            None  # (startIndex, endIndex, maxCount, visibleStartIndex, visibleEndIndex)
+        )
         self._last_prefetch_time = 0
         self._is_preloading = False
         self._preload_progress = 0
