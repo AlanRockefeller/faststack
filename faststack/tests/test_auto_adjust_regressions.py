@@ -85,6 +85,7 @@ class _Qt(IntFlag):
     Key_2 = 132
     Key_3 = 133
     Key_4 = 134
+    Key_Underscore = 135
 
 
 def _load_keybinder_class():
@@ -132,8 +133,17 @@ class _Controller:
     def quick_auto_adjust(self):
         self.calls.append("quick_auto_adjust")
 
+    def quick_auto_white_balance(self):
+        self.calls.append("quick_auto_white_balance")
+
+    def toggle_batch_membership(self):
+        self.calls.append("toggle_batch_membership")
+
     def reduce_auto_adjust_highlights(self):
         self.calls.append("reduce_auto_adjust_highlights")
+
+    def raise_auto_adjust_whites(self):
+        self.calls.append("raise_auto_adjust_whites")
 
     def deepen_auto_adjust_blacks(self):
         self.calls.append("deepen_auto_adjust_blacks")
@@ -168,6 +178,7 @@ def test_undo_flushes_pending_auto_adjust_save_before_reporting_nothing_to_undo(
         _clear_active_auto_adjust_state=Mock(),
         _restore_metadata_snapshot=Mock(),
         _post_undo_refresh_and_select=Mock(),
+        _is_current_live_edit_session_dirty=Mock(return_value=False),
         sidecar=object(),
     )
 
@@ -311,6 +322,41 @@ def test_shift_l_runs_combined_auto_adjust():
     assert controller.calls == ["quick_auto_adjust"]
 
 
+def test_ctrl_shift_b_runs_quick_auto_white_balance():
+    keybinder_cls = _load_keybinder_class()
+    controller = _Controller()
+    keybinder = keybinder_cls(controller)
+
+    handled = keybinder.handle_key_press(
+        _Event(_Qt.Key_B, "B", _Qt.ControlModifier | _Qt.ShiftModifier)
+    )
+
+    assert handled is True
+    assert controller.calls == ["quick_auto_white_balance"]
+
+
+def test_ctrl_b_does_not_match_ctrl_shift_b_shortcut():
+    keybinder_cls = _load_keybinder_class()
+    controller = _Controller()
+    keybinder = keybinder_cls(controller)
+
+    handled = keybinder.handle_key_press(_Event(_Qt.Key_B, "b", _Qt.ControlModifier))
+
+    assert handled is True
+    assert controller.calls == ["toggle_batch_membership"]
+
+
+def test_shift_b_does_not_match_ctrl_shift_b_shortcut():
+    keybinder_cls = _load_keybinder_class()
+    controller = _Controller()
+    keybinder = keybinder_cls(controller)
+
+    handled = keybinder.handle_key_press(_Event(_Qt.Key_B, "B", _Qt.ShiftModifier))
+
+    assert handled is True
+    assert controller.calls == ["toggle_batch_membership"]
+
+
 def test_shift_equals_character_still_triggers_shadow_adjust():
     keybinder_cls = _load_keybinder_class()
     controller = _Controller()
@@ -320,6 +366,19 @@ def test_shift_equals_character_still_triggers_shadow_adjust():
 
     assert handled is True
     assert controller.calls == ["deepen_auto_adjust_blacks"]
+
+
+def test_underscore_character_still_triggers_raise_whites():
+    keybinder_cls = _load_keybinder_class()
+    controller = _Controller()
+    keybinder = keybinder_cls(controller)
+
+    handled = keybinder.handle_key_press(
+        _Event(_Qt.Key_Minus, "_", _Qt.ShiftModifier)
+    )
+
+    assert handled is True
+    assert controller.calls == ["raise_auto_adjust_whites"]
 
 
 def test_shift_minus_character_still_triggers_highlight_adjust():

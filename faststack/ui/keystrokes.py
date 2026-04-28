@@ -94,8 +94,8 @@ class Keybinder:
 
         # Check for modifier + key combinations
         for (mapped_key, mapped_modifier), method_name in self.modifier_key_map.items():
-            # Check if required modifier is present in event modifiers
-            if key == mapped_key and (modifiers & mapped_modifier):
+            # Check if all required modifiers are present in event modifiers
+            if key == mapped_key and (modifiers & mapped_modifier) == mapped_modifier:
                 log.debug(
                     f"Matched modifier key: {key} + {mapped_modifier} -> {method_name}"
                 )
