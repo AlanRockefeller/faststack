@@ -5,6 +5,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import QtCore
 
 Window {
     id: imageEditorDialog
@@ -15,6 +16,12 @@ Window {
     title: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.editorFilename ? "Image Editor - " + imageEditorDialog.uiStateRef.editorFilename + " (" + imageEditorDialog.uiStateRef.editorBitDepth + "-bit)" : "Image Editor"
     visible: imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.isEditorOpen : false
     flags: Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
+    Settings {
+        id: histSettings
+        category: "histogram"
+        property bool overlaidMode: true
+    }
+
     property int updatePulse: 0
     property color backgroundColor: "#1e1e1e" // Default dark background
     property color textColor: "white" // Default text color
@@ -183,59 +190,101 @@ Window {
                 }
                 Repeater { model: detailModel; delegate: editSlider }
 
-                // --- Histogram Group ---
+                // Histogram toggle button
                 RowLayout {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 140
-                    Layout.topMargin: 5
-                    spacing: 5
-                    
-                    SingleChannelHistogram {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        
-                        channelName: "Red"
-                        channelColor: "#e15050"
-                        gridLineColor: imageEditorDialog.controlBorder
-                        dangerColor: "#40ff0000"
-                        textColor: imageEditorDialog.textColor
-                        minimal: false
-                        
-                        histogramData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r"] || []) : []
-                        clipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r_clip"] || 0) : 0
-                        preClipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r_preclip"] || 0) : 0
+                    Layout.topMargin: 8
+                    Item { Layout.fillWidth: true }
+                    Row {
+                        spacing: 0
+                        Rectangle {
+                            width: 70; height: 20
+                            radius: 3
+                            color: histSettings.overlaidMode ? "#2c2c2c" : "transparent"
+                            border.color: "#3a3a3a"; border.width: 1
+                            Text {
+                                anchors.centerIn: parent
+                                text: "Overlaid"
+                                font.pixelSize: 10
+                                color: histSettings.overlaidMode ? "#e8e6e3" : "#6b6764"
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    histSettings.overlaidMode = true
+                                }
+                            }
+                        }
+                        Rectangle {
+                            width: 70; height: 20
+                            radius: 3
+                            color: !histSettings.overlaidMode ? "#2c2c2c" : "transparent"
+                            border.color: "#3a3a3a"; border.width: 1
+                            Text {
+                                anchors.centerIn: parent
+                                text: "Channels"
+                                font.pixelSize: 10
+                                color: !histSettings.overlaidMode ? "#e8e6e3" : "#6b6764"
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    histSettings.overlaidMode = false
+                                }
+                            }
+                        }
                     }
-                    
-                    SingleChannelHistogram {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        
-                        channelName: "Green"
-                        channelColor: "#50e150"
+                }
+
+                // Histogram display (overlaid or 3-channel)
+                Item {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 140
+
+                    OverlaidHistogram {
+                        anchors.fill: parent
+                        visible: histSettings.overlaidMode
+                        rData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r"] || []) : []
+                        gData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g"] || []) : []
+                        bData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b"] || []) : []
+                        rClip: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r_clip"] || 0) : 0
+                        gClip: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g_clip"] || 0) : 0
+                        bClip: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b_clip"] || 0) : 0
                         gridLineColor: imageEditorDialog.controlBorder
-                        dangerColor: "#40ff0000"
-                        textColor: imageEditorDialog.textColor
-                        minimal: false
-                        
-                        histogramData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g"] || []) : []
-                        clipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g_clip"] || 0) : 0
-                        preClipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g_preclip"] || 0) : 0
                     }
 
-                    SingleChannelHistogram {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        
-                        channelName: "Blue"
-                        channelColor: "#5050e1"
-                        gridLineColor: imageEditorDialog.controlBorder
-                        dangerColor: "#40ff0000"
-                        textColor: imageEditorDialog.textColor
-                        minimal: false
-                        
-                        histogramData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b"] || []) : []
-                        clipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b_clip"] || 0) : 0
-                        preClipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b_preclip"] || 0) : 0
+                    RowLayout {
+                        anchors.fill: parent
+                        visible: !histSettings.overlaidMode
+                        spacing: 5
+
+                        SingleChannelHistogram {
+                            Layout.fillWidth: true; Layout.fillHeight: true
+                            channelName: "Red"; channelColor: "#e15050"
+                            gridLineColor: imageEditorDialog.controlBorder
+                            dangerColor: "#40ff0000"; textColor: imageEditorDialog.textColor; minimal: false
+                            histogramData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r"] || []) : []
+                            clipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r_clip"] || 0) : 0
+                            preClipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r_preclip"] || 0) : 0
+                        }
+                        SingleChannelHistogram {
+                            Layout.fillWidth: true; Layout.fillHeight: true
+                            channelName: "Green"; channelColor: "#50e150"
+                            gridLineColor: imageEditorDialog.controlBorder
+                            dangerColor: "#40ff0000"; textColor: imageEditorDialog.textColor; minimal: false
+                            histogramData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g"] || []) : []
+                            clipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g_clip"] || 0) : 0
+                            preClipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g_preclip"] || 0) : 0
+                        }
+                        SingleChannelHistogram {
+                            Layout.fillWidth: true; Layout.fillHeight: true
+                            channelName: "Blue"; channelColor: "#5050e1"
+                            gridLineColor: imageEditorDialog.controlBorder
+                            dangerColor: "#40ff0000"; textColor: imageEditorDialog.textColor; minimal: false
+                            histogramData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b"] || []) : []
+                            clipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b_clip"] || 0) : 0
+                            preClipCount: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b_preclip"] || 0) : 0
+                        }
                     }
                 }
 
