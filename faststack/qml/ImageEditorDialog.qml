@@ -18,6 +18,8 @@ Window {
     property int updatePulse: 0
     property color backgroundColor: "#1e1e1e" // Default dark background
     property color textColor: "white" // Default text color
+    property bool sourceExpanded: true
+    readonly property int secondaryButtonHeight: 30
 
     // Modern Color Palette
     readonly property color accentColor: "#6366f1" // Modern Indigo
@@ -105,13 +107,28 @@ Window {
     // Component for Section Header
     Component {
         id: sectionHeader
-        Label {
-            font.bold: true
-            font.pixelSize: 15
-            font.letterSpacing: 1.0
-            color: imageEditorDialog.accentColorHover
+        ColumnLayout {
+            property alias text: sectionHeaderText.text
+
+            Layout.fillWidth: true
             Layout.topMargin: 5
             Layout.bottomMargin: 10
+            spacing: 6
+
+            Text {
+                id: sectionHeaderText
+                Layout.fillWidth: true
+                font.pixelSize: 10
+                font.weight: Font.DemiBold
+                font.letterSpacing: 1.2
+                color: "#9a9795"
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                height: 1
+                color: "#2e2e2e"
+            }
         }
     }
 
@@ -137,7 +154,7 @@ Window {
                 Loader { 
                     sourceComponent: sectionHeader 
                     Layout.topMargin: 0 // Remove top margin for the very first item
-                    onLoaded: item.text = "☀ Light"
+                    onLoaded: item.text = "LIGHT"
                 }
                 ListModel {
                     id: lightModel
@@ -156,7 +173,7 @@ Window {
                 // --- Detail Group ---
                 Loader { 
                     sourceComponent: sectionHeader
-                    onLoaded: item.text = "🔍 Detail"
+                    onLoaded: item.text = "DETAIL"
                 }
                 ListModel {
                     id: detailModel
@@ -254,41 +271,103 @@ Window {
                 spacing: 15
 
                 // --- Source Group ---
-                Loader { 
-                    sourceComponent: sectionHeader 
-                    Layout.topMargin: 0 // Remove top margin for the very first item
-                    onLoaded: item.text = "📸 Source"
-                    visible: imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.hasRaw : false
-                }
-                Button {
-                    text: (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isRawActive) ? "RAW Loaded" : "Load RAW"
+                ColumnLayout {
                     Layout.fillWidth: true
+                    Layout.topMargin: 0 // Remove top margin for the very first item
                     visible: imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.hasRaw : false
-                    enabled: imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isRawActive : false
-                    onClicked: {
-                        if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.enableRawEditing()
-                        imageEditorDialog.updatePulse++
+                    spacing: 6
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+
+                        Text {
+                            text: imageEditorDialog.sourceExpanded ? "▾" : "▸"
+                            font.pixelSize: 10
+                            color: "#9a9795"
+                            Layout.alignment: Qt.AlignVCenter
+                        }
+
+                        Text {
+                            text: "SOURCE"
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
+                            font.letterSpacing: 1.2
+                            color: "#9a9795"
+                            Layout.alignment: Qt.AlignVCenter
+                        }
+
+                        Rectangle {
+                            Layout.alignment: Qt.AlignVCenter
+                            implicitWidth: sourceBadgeText.implicitWidth + 10
+                            implicitHeight: sourceBadgeText.implicitHeight + 4
+                            color: "#2a2010"
+                            border.color: "#3a3010"
+                            border.width: 1
+                            radius: 3
+
+                            Text {
+                                id: sourceBadgeText
+                                anchors.centerIn: parent
+                                text: "experimental"
+                                font.pixelSize: 9
+                                font.family: "IBM Plex Mono"
+                                color: "#7a6a3a"
+                            }
+                        }
+
+                        Item { Layout.fillWidth: true }
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        height: 1
+                        color: "#2e2e2e"
+                    }
+
+                    TapHandler {
+                        acceptedButtons: Qt.LeftButton
+                        onTapped: imageEditorDialog.sourceExpanded = !imageEditorDialog.sourceExpanded
                     }
                 }
-                Label {
-                    text: imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.saveBehaviorMessage : ""
+
+                ColumnLayout {
                     Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: 11
-                    color: imageEditorDialog.textColor
-                    opacity: 0.7
-                    font.italic: true
+                    visible: (imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.hasRaw : false) && imageEditorDialog.sourceExpanded
+                    opacity: 0.65
+                    spacing: 8
+
+                    Button {
+                        text: (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isRawActive) ? "RAW Loaded" : "Load RAW"
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: imageEditorDialog.secondaryButtonHeight
+                        font.pixelSize: 12
+                        enabled: imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isRawActive : false
+                        onClicked: {
+                            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.enableRawEditing()
+                            imageEditorDialog.updatePulse++
+                        }
+                    }
+                    Label {
+                        text: imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.saveBehaviorMessage : ""
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 11
+                        color: imageEditorDialog.textColor
+                        opacity: 0.7
+                        font.italic: true
+                    }
                 }
                 Loader { 
                     sourceComponent: sectionSeparator 
-                    visible: imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.hasRaw : false
+                    visible: (imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.hasRaw : false) && imageEditorDialog.sourceExpanded
                 }
 
                 // --- Color Group ---
                 Loader { 
                     sourceComponent: sectionHeader 
                     Layout.topMargin: (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.hasRaw) ? 5 : 0 // Adjust logic if needed
-                    onLoaded: item.text = "🎨 Color"
+                    onLoaded: item.text = "COLOR"
                 }
                 ListModel {
                     id: colorModel
@@ -306,6 +385,7 @@ Window {
                         id: autoWbButton
                         text: "Auto WB"
                         Layout.fillWidth: true
+                        Layout.preferredHeight: imageEditorDialog.secondaryButtonHeight
                         font.pixelSize: 12
                         onClicked: {
                             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.auto_white_balance()
@@ -316,6 +396,7 @@ Window {
                         id: autoLevelsButton
                         text: "Auto Levels"
                         Layout.fillWidth: true
+                        Layout.preferredHeight: imageEditorDialog.secondaryButtonHeight
                         font.pixelSize: 12
                         onClicked: {
                             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.auto_levels()
@@ -329,7 +410,7 @@ Window {
                 // --- Effects Group ---
                 Loader { 
                     sourceComponent: sectionHeader
-                    onLoaded: item.text = "✨ Effects"
+                    onLoaded: item.text = "EFFECTS"
                 }
                 ListModel {
                     id: effectsModel
@@ -364,7 +445,7 @@ Window {
                 // --- Transform Group ---
                 Loader { 
                     sourceComponent: sectionHeader
-                    onLoaded: item.text = "🔄 Transform"
+                    onLoaded: item.text = "TRANSFORM"
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -400,15 +481,15 @@ Window {
                         text: "Reset"
                         flat: true
                         Layout.preferredWidth: 80
-                        Material.foreground: imageEditorDialog.textColor
+                        Material.foreground: "#6b6764"
                         onClicked: {
                             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.reset_edit_parameters()
                             imageEditorDialog.updatePulse++
                         }
                         background: Rectangle {
-                            color: resetButton.down ? "#20ffffff" : "transparent"
+                            color: "transparent"
                             radius: 4
-                            border.color: resetButton.hovered ? "#40ffffff" : "transparent"
+                            border.color: "transparent"
                         }
                     }
 
@@ -431,9 +512,10 @@ Window {
                             verticalAlignment: Text.AlignVCenter
                         }
                         background: Rectangle {
-                            color: closeEditorButton.down ? "#40ffffff" : "#20ffffff"
+                            color: closeEditorButton.down ? "#20ffffff" : "transparent"
                             radius: 4
-                            border.color: closeEditorButton.hovered ? "#60ffffff" : "transparent"
+                            border.color: closeEditorButton.hovered ? "#60ffffff" : imageEditorDialog.controlBorder
+                            border.width: 1
                         }
                     }
 
@@ -608,8 +690,8 @@ Window {
                     Rectangle {
                         anchors.fill: parent
                         radius: 3
-                        color: imageEditorDialog.controlBg
-                        border.color: imageEditorDialog.controlBorder
+                        color: "#2e2e2e"
+                        border.color: "#383838"
                         border.width: 1
                     }
 
@@ -639,9 +721,9 @@ Window {
                      width: 12
                      height: 12
                      radius: 6
-                     color: slider.pressed ? imageEditorDialog.accentColor : "white"
-                     border.color: slider.pressed ? "white" : imageEditorDialog.accentColor
-                     border.width: 2
+                     color: "#e8e6e3"
+                     border.color: slider.pressed ? imageEditorDialog.accentColor : "#5a5755"
+                     border.width: 1
                      
                      // Glow/Scale effect on hover
                      scale: hoverHandler.hovered || slider.pressed ? 1.3 : 1.0
@@ -654,95 +736,26 @@ Window {
                 }
             }
 
-            // Refined SpinBox
-            SpinBox {
-                id: valueInput
-                from: sliderRow.minVal
-                to: sliderRow.maxVal
-                stepSize: 1
-                editable: true
-                Layout.preferredWidth: 80
+            Text {
+                id: valueReadout
+                property int displayValue: Math.round(sliderRow.isReversed ? -slider.value : slider.value)
+
+                text: displayValue === 0 ? "0" : (displayValue > 0 ? "+" + displayValue : "−" + Math.abs(displayValue))
+                Layout.preferredWidth: 40
                 Layout.alignment: Qt.AlignVCenter
-                
-                value: sliderRow.isReversed ? -slider.value : slider.value
-                
-                onValueModified: {
-                     var val = value
-                     var sendValue = sliderRow.isReversed ? -val : val
-                     if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, sendValue / sliderRow.maxVal)
-                     imageEditorDialog.updatePulse++ 
-                }
+                horizontalAlignment: Text.AlignRight
+                verticalAlignment: Text.AlignVCenter
+                font.family: "IBM Plex Mono"
+                font.pixelSize: 11
+                color: displayValue === 0 ? "#6b6764" : "#e8e6e3"
 
-                contentItem: TextInput {
-                    z: 2
-                    text: valueInput.displayText
-                    font.pixelSize: 12
-                    font.family: valueInput.font.family
-                    color: imageEditorDialog.textColor
-                    selectionColor: imageEditorDialog.accentColor
-                    selectedTextColor: "#ffffff"
-                    horizontalAlignment: Qt.AlignHCenter
-                    verticalAlignment: Qt.AlignVCenter
-                    readOnly: !valueInput.editable
-                    validator: valueInput.validator
-                    inputMethodHints: Qt.ImhFormattedNumbersOnly
-                    
-                    // Highlight on focus
-                    onActiveFocusChanged: {
-                        if(activeFocus) valueInputBackground.border.color = imageEditorDialog.accentColor
-                        else valueInputBackground.border.color = imageEditorDialog.controlBorder
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        if (!slider.isResetting)
+                            slider.triggerReset()
                     }
-                }
-
-                up.indicator: Item {
-                    x: valueInput.mirrored ? 0 : parent.width - width
-                    height: parent.height
-                    width: 16 // Smaller button
-                    
-                    Rectangle {
-                        anchors.centerIn: parent
-                        width: 16; height: 16
-                        radius: 2
-                        color: valueInput.up.pressed ? imageEditorDialog.accentColor : (valueInput.up.hovered ? Qt.lighter(imageEditorDialog.controlBg, 1.5) : "transparent")
-                        
-                        Text {
-                            text: "+"
-                            font.pixelSize: 12
-                            anchors.centerIn: parent
-                            color: valueInput.up.pressed ? "white" : imageEditorDialog.textColor
-                        }
-                    }
-                }
-
-                down.indicator: Item {
-                    x: valueInput.mirrored ? parent.width - width : 0
-                    height: parent.height
-                    width: 16 // Smaller button
-                    
-                    Rectangle {
-                        anchors.centerIn: parent
-                        width: 16; height: 16
-                        radius: 2
-                        color: valueInput.down.pressed ? imageEditorDialog.accentColor : (valueInput.down.hovered ? Qt.lighter(imageEditorDialog.controlBg, 1.5) : "transparent")
-                        
-                        Text {
-                            text: "-"
-                            font.pixelSize: 12
-                            anchors.centerIn: parent
-                            color: valueInput.down.pressed ? "white" : imageEditorDialog.textColor
-                        }
-                    }
-                }
-
-                background: Rectangle {
-                    id: valueInputBackground
-                    implicitWidth: 80
-                    color: "transparent"
-                    border.color: imageEditorDialog.controlBorder
-                    border.width: 1
-                    radius: 4
-                    
-                    Behavior on border.color { ColorAnimation { duration: 150 } }
                 }
             }
         }
