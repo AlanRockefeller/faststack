@@ -190,50 +190,11 @@ Window {
                 }
                 Repeater { model: detailModel; delegate: editSlider }
 
-                // Histogram toggle button
-                RowLayout {
+                HistogramModeToggle {
                     Layout.fillWidth: true
                     Layout.topMargin: 8
-                    Item { Layout.fillWidth: true }
-                    Row {
-                        spacing: 0
-                        Rectangle {
-                            width: 70; height: 20
-                            radius: 3
-                            color: histSettings.overlaidMode ? "#2c2c2c" : "transparent"
-                            border.color: "#3a3a3a"; border.width: 1
-                            Text {
-                                anchors.centerIn: parent
-                                text: "Overlaid"
-                                font.pixelSize: 10
-                                color: histSettings.overlaidMode ? "#e8e6e3" : "#6b6764"
-                            }
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: {
-                                    histSettings.overlaidMode = true
-                                }
-                            }
-                        }
-                        Rectangle {
-                            width: 70; height: 20
-                            radius: 3
-                            color: !histSettings.overlaidMode ? "#2c2c2c" : "transparent"
-                            border.color: "#3a3a3a"; border.width: 1
-                            Text {
-                                anchors.centerIn: parent
-                                text: "Channels"
-                                font.pixelSize: 10
-                                color: !histSettings.overlaidMode ? "#e8e6e3" : "#6b6764"
-                            }
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: {
-                                    histSettings.overlaidMode = false
-                                }
-                            }
-                        }
-                    }
+                    overlaidMode: histSettings.overlaidMode
+                    onModeRequested: (overlaid) => histSettings.overlaidMode = overlaid
                 }
 
                 // Histogram display (overlaid or 3-channel)
@@ -250,6 +211,9 @@ Window {
                         rClip: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r_clip"] || 0) : 0
                         gClip: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g_clip"] || 0) : 0
                         bClip: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b_clip"] || 0) : 0
+                        rPreClip: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r_preclip"] || 0) : 0
+                        gPreClip: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g_preclip"] || 0) : 0
+                        bPreClip: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b_preclip"] || 0) : 0
                         gridLineColor: imageEditorDialog.controlBorder
                     }
 
@@ -397,15 +361,17 @@ Window {
                             imageEditorDialog.updatePulse++
                         }
                     }
-                    Label {
-                        text: imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.saveBehaviorMessage : ""
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: 11
-                        color: imageEditorDialog.textColor
-                        opacity: 0.7
-                        font.italic: true
-                    }
+                }
+
+                Label {
+                    text: imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.saveBehaviorMessage : ""
+                    visible: text.length > 0
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: 11
+                    color: imageEditorDialog.textColor
+                    opacity: 0.7
+                    font.italic: true
                 }
                 Loader { 
                     sourceComponent: sectionSeparator 

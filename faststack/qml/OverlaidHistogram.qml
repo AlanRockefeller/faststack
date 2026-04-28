@@ -116,25 +116,57 @@ Item {
 
             Row {
                 anchors.centerIn: parent
-                spacing: 16
+                spacing: 14
 
-                Text {
-                    text: "R:" + root.rClip
-                    font.pixelSize: 10
-                    font.family: "IBM Plex Mono"
-                    color: root.rClip > 0 ? "#ff6060" : "#804040"
+                Row {
+                    spacing: 4
+                    Text {
+                        text: "R P:" + root.rPreClip
+                        font.pixelSize: 10
+                        font.family: "IBM Plex Mono"
+                        color: "#804040"
+                    }
+                    Text {
+                        text: "C:" + root.rClip
+                        font.pixelSize: 10
+                        font.family: "IBM Plex Mono"
+                        font.bold: root.rClip > 0
+                        color: root.rClip > 0 ? "#ff6060" : "#804040"
+                    }
                 }
-                Text {
-                    text: "G:" + root.gClip
-                    font.pixelSize: 10
-                    font.family: "IBM Plex Mono"
-                    color: root.gClip > 0 ? "#60ff60" : "#407040"
+
+                Row {
+                    spacing: 4
+                    Text {
+                        text: "G P:" + root.gPreClip
+                        font.pixelSize: 10
+                        font.family: "IBM Plex Mono"
+                        color: "#407040"
+                    }
+                    Text {
+                        text: "C:" + root.gClip
+                        font.pixelSize: 10
+                        font.family: "IBM Plex Mono"
+                        font.bold: root.gClip > 0
+                        color: root.gClip > 0 ? "#60ff60" : "#407040"
+                    }
                 }
-                Text {
-                    text: "B:" + root.bClip
-                    font.pixelSize: 10
-                    font.family: "IBM Plex Mono"
-                    color: root.bClip > 0 ? "#8080ff" : "#404080"
+
+                Row {
+                    spacing: 4
+                    Text {
+                        text: "B P:" + root.bPreClip
+                        font.pixelSize: 10
+                        font.family: "IBM Plex Mono"
+                        color: "#404080"
+                    }
+                    Text {
+                        text: "C:" + root.bClip
+                        font.pixelSize: 10
+                        font.family: "IBM Plex Mono"
+                        font.bold: root.bClip > 0
+                        color: root.bClip > 0 ? "#8080ff" : "#404080"
+                    }
                 }
             }
         }

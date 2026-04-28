@@ -66,49 +66,10 @@ Window {
         anchors.margins: histogramWindow.width > 200 ? 15 : 2
         spacing: histogramWindow.width > 200 ? 8 : 2
 
-        // Histogram toggle button
-        RowLayout {
+        HistogramModeToggle {
             Layout.fillWidth: true
-            Item { Layout.fillWidth: true }
-            Row {
-                spacing: 0
-                Rectangle {
-                    width: 70; height: 20
-                    radius: 3
-                    color: histSettings.overlaidMode ? "#2c2c2c" : "transparent"
-                    border.color: "#3a3a3a"; border.width: 1
-                    Text {
-                        anchors.centerIn: parent
-                        text: "Overlaid"
-                        font.pixelSize: 10
-                        color: histSettings.overlaidMode ? "#e8e6e3" : "#6b6764"
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            histSettings.overlaidMode = true
-                        }
-                    }
-                }
-                Rectangle {
-                    width: 70; height: 20
-                    radius: 3
-                    color: !histSettings.overlaidMode ? "#2c2c2c" : "transparent"
-                    border.color: "#3a3a3a"; border.width: 1
-                    Text {
-                        anchors.centerIn: parent
-                        text: "Channels"
-                        font.pixelSize: 10
-                        color: !histSettings.overlaidMode ? "#e8e6e3" : "#6b6764"
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            histSettings.overlaidMode = false
-                        }
-                    }
-                }
-            }
+            overlaidMode: histSettings.overlaidMode
+            onModeRequested: (overlaid) => histSettings.overlaidMode = overlaid
         }
 
         // Histogram display (overlaid or 3-channel)
@@ -125,6 +86,9 @@ Window {
                 rClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["r_clip"] || 0) : 0
                 gClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["g_clip"] || 0) : 0
                 bClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["b_clip"] || 0) : 0
+                rPreClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["r_preclip"] || 0) : 0
+                gPreClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["g_preclip"] || 0) : 0
+                bPreClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["b_preclip"] || 0) : 0
                 gridLineColor: histogramWindow.gridLineColor
             }
 
