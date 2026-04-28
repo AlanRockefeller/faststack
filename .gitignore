@@ -53,6 +53,7 @@ dist/
 # Runtime / generated data
 # ----------------------------
 var/
+tmp/pytest-temp/
 
 # ----------------------------
 # Logs
