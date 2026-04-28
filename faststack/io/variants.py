@@ -17,7 +17,7 @@ _DEVELOPED_TOKEN_RE = re.compile(
 )
 
 # Trailing `-backup(\d+)?` token at end of (stripped) stem.
-_BACKUP_TRAILING_RE = re.compile(r"(?:^|-)([Bb][Aa][Cc][Kk][Uu][Pp])(\d+)?$")
+_BACKUP_TRAILING_RE = re.compile(r"-([Bb][Aa][Cc][Kk][Uu][Pp])(\d+)?$")
 
 
 @dataclass
