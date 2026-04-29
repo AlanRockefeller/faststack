@@ -11,6 +11,7 @@ Item {
     property color gridLineColor: "#50ffffff" // Default semi-transparent white
     property color dangerColor: Qt.rgba(1, 0, 0, 0.25)
     property color textColor: "white"
+    readonly property bool compactStats: root.width < 50
     
     // Allow minimal mode (hide text)
     property bool minimal: false
@@ -146,13 +147,13 @@ Item {
             visible: !root.minimal && root.height > 80
             
             Text {
-                text: "Preclip: " + root.preClipCount
+                text: (root.compactStats ? "P: " : "Pre-clip: ") + root.preClipCount
                 color: root.textColor
                 font.pixelSize: Math.max(8, Math.min(11, root.height / 15))
                 Layout.alignment: Qt.AlignHCenter
             }
             Text {
-                text: "Clipped: " + root.clipCount
+                text: (root.compactStats ? "C: " : "Clipped: ") + root.clipCount
                 color: root.clipCount > 0 ? "red" : root.textColor
                 font.bold: root.clipCount > 0
                 font.pixelSize: Math.max(8, Math.min(11, root.height / 15))
