@@ -111,58 +111,72 @@ Item {
         // Stat bar
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 20
+            Layout.preferredHeight: 38
             color: "#1a1a1a"
 
-            Row {
-                anchors.centerIn: parent
-                spacing: 14
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 8
+                anchors.rightMargin: 8
+                spacing: 10
 
-                Row {
-                    spacing: 4
+                Column {
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    spacing: 1
                     Text {
-                        text: "R P:" + root.rPreClip
-                        font.pixelSize: 10
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "R Preclip: " + root.rPreClip
+                        font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         color: "#804040"
                     }
                     Text {
-                        text: "C:" + root.rClip
-                        font.pixelSize: 10
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Clipped: " + root.rClip
+                        font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         font.bold: root.rClip > 0
                         color: root.rClip > 0 ? "#ff6060" : "#804040"
                     }
                 }
 
-                Row {
-                    spacing: 4
+                Column {
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    spacing: 1
                     Text {
-                        text: "G P:" + root.gPreClip
-                        font.pixelSize: 10
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "G Preclip: " + root.gPreClip
+                        font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         color: "#407040"
                     }
                     Text {
-                        text: "C:" + root.gClip
-                        font.pixelSize: 10
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Clipped: " + root.gClip
+                        font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         font.bold: root.gClip > 0
                         color: root.gClip > 0 ? "#60ff60" : "#407040"
                     }
                 }
 
-                Row {
-                    spacing: 4
+                Column {
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    spacing: 1
                     Text {
-                        text: "B P:" + root.bPreClip
-                        font.pixelSize: 10
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "B Preclip: " + root.bPreClip
+                        font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         color: "#404080"
                     }
                     Text {
-                        text: "C:" + root.bClip
-                        font.pixelSize: 10
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Clipped: " + root.bClip
+                        font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         font.bold: root.bClip > 0
                         color: root.bClip > 0 ? "#8080ff" : "#404080"

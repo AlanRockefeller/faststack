@@ -58,6 +58,16 @@ Window {
     property color primaryTextColor: "#222222"
     property color gridLineColor: "#dcdcdc"
     property color dangerColor: Qt.rgba(1, 0, 0, 0.25)
+    property var histogramDataRef: histogramWindow.uiStateRef ? histogramWindow.uiStateRef.histogramData : null
+    property var rHistogramData: histogramWindow.histogramDataRef ? (histogramWindow.histogramDataRef["r"] || []) : []
+    property var gHistogramData: histogramWindow.histogramDataRef ? (histogramWindow.histogramDataRef["g"] || []) : []
+    property var bHistogramData: histogramWindow.histogramDataRef ? (histogramWindow.histogramDataRef["b"] || []) : []
+    property int rClipCount: histogramWindow.histogramDataRef ? (histogramWindow.histogramDataRef["r_clip"] || 0) : 0
+    property int gClipCount: histogramWindow.histogramDataRef ? (histogramWindow.histogramDataRef["g_clip"] || 0) : 0
+    property int bClipCount: histogramWindow.histogramDataRef ? (histogramWindow.histogramDataRef["b_clip"] || 0) : 0
+    property int rPreClipCount: histogramWindow.histogramDataRef ? (histogramWindow.histogramDataRef["r_preclip"] || 0) : 0
+    property int gPreClipCount: histogramWindow.histogramDataRef ? (histogramWindow.histogramDataRef["g_preclip"] || 0) : 0
+    property int bPreClipCount: histogramWindow.histogramDataRef ? (histogramWindow.histogramDataRef["b_preclip"] || 0) : 0
 
     color: windowBackgroundColor
 
@@ -80,15 +90,15 @@ Window {
             OverlaidHistogram {
                 anchors.fill: parent
                 visible: histSettings.overlaidMode
-                rData: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["r"] || []) : []
-                gData: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["g"] || []) : []
-                bData: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["b"] || []) : []
-                rClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["r_clip"] || 0) : 0
-                gClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["g_clip"] || 0) : 0
-                bClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["b_clip"] || 0) : 0
-                rPreClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["r_preclip"] || 0) : 0
-                gPreClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["g_preclip"] || 0) : 0
-                bPreClip: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["b_preclip"] || 0) : 0
+                rData: histogramWindow.rHistogramData
+                gData: histogramWindow.gHistogramData
+                bData: histogramWindow.bHistogramData
+                rClip: histogramWindow.rClipCount
+                gClip: histogramWindow.gClipCount
+                bClip: histogramWindow.bClipCount
+                rPreClip: histogramWindow.rPreClipCount
+                gPreClip: histogramWindow.gPreClipCount
+                bPreClip: histogramWindow.bPreClipCount
                 gridLineColor: histogramWindow.gridLineColor
             }
 
@@ -107,9 +117,9 @@ Window {
                     dangerColor: histogramWindow.dangerColor
                     textColor: histogramWindow.primaryTextColor
 
-                    histogramData: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["r"] || []) : []
-                    clipCount: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["r_clip"] || 0) : 0
-                    preClipCount: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["r_preclip"] || 0) : 0
+                    histogramData: histogramWindow.rHistogramData
+                    clipCount: histogramWindow.rClipCount
+                    preClipCount: histogramWindow.rPreClipCount
                 }
 
                 SingleChannelHistogram {
@@ -122,9 +132,9 @@ Window {
                     dangerColor: histogramWindow.dangerColor
                     textColor: histogramWindow.primaryTextColor
 
-                    histogramData: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["g"] || []) : []
-                    clipCount: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["g_clip"] || 0) : 0
-                    preClipCount: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["g_preclip"] || 0) : 0
+                    histogramData: histogramWindow.gHistogramData
+                    clipCount: histogramWindow.gClipCount
+                    preClipCount: histogramWindow.gPreClipCount
                 }
 
                 SingleChannelHistogram {
@@ -137,9 +147,9 @@ Window {
                     dangerColor: histogramWindow.dangerColor
                     textColor: histogramWindow.primaryTextColor
 
-                    histogramData: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["b"] || []) : []
-                    clipCount: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["b_clip"] || 0) : 0
-                    preClipCount: histogramWindow.uiStateRef && histogramWindow.uiStateRef.histogramData ? (histogramWindow.uiStateRef.histogramData["b_preclip"] || 0) : 0
+                    histogramData: histogramWindow.bHistogramData
+                    clipCount: histogramWindow.bClipCount
+                    preClipCount: histogramWindow.bPreClipCount
                 }
             }
         }

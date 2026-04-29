@@ -140,22 +140,23 @@ Item {
             }
         }
 
-        RowLayout {
+        ColumnLayout {
             Layout.alignment: Qt.AlignHCenter
-            spacing: 5
+            spacing: 0
             visible: !root.minimal && root.height > 80
             
             Text {
-                text: "P:" + root.preClipCount
+                text: "Preclip: " + root.preClipCount
                 color: root.textColor
                 font.pixelSize: Math.max(8, Math.min(11, root.height / 15))
-                visible: root.width > 120
+                Layout.alignment: Qt.AlignHCenter
             }
             Text {
-                text: (root.width > 120 ? "Clipped: " : "C:") + root.clipCount
+                text: "Clipped: " + root.clipCount
                 color: root.clipCount > 0 ? "red" : root.textColor
                 font.bold: root.clipCount > 0
                 font.pixelSize: Math.max(8, Math.min(11, root.height / 15))
+                Layout.alignment: Qt.AlignHCenter
             }
         }
     }
