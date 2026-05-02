@@ -66,6 +66,17 @@ class TestVariantsLogic(unittest.TestCase):
         self.assertEqual(group.backup_paths[2].name, "img-backup2.jpg")
         self.assertEqual(group.backup_paths[10].name, "img-backup10.jpg")
 
+    def test_plain_backup_filename_is_not_variant(self):
+        """A literal backup.jpg filename should not create an empty group key."""
+        groups = build_variant_map([Path("backup.jpg")])
+
+        self.assertIn("backup", groups)
+        self.assertNotIn("", groups)
+
+        group = groups["backup"]
+        self.assertEqual(group.main_path.name, "backup.jpg")
+        self.assertEqual(group.backup_paths, {})
+
     def test_developed_backup_handling(self):
         """Verify developed backups are handled correctly."""
         # Policy: developed-backup is "developed" candidate, AND "backup" candidate.
