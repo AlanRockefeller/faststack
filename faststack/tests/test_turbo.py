@@ -112,5 +112,5 @@ def test_missing_turbojpeg_package_emits_one_warning(monkeypatch, caplog):
 
     warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warning_records) == 1
-    assert "PyTurboJPEG not found" in warning_records[0].message
+    assert "PyTurboJPEG is not installed" in warning_records[0].message
     assert "Pillow" in warning_records[0].message

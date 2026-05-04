@@ -319,7 +319,7 @@ class UIState(QObject):
         self._saturation = 0.0
         self._white_balance_by = 0.0
         self._white_balance_mg = 0.0
-        self._current_crop_box = [0, 0, 1000, 1000]
+        self._current_crop_box = (0, 0, 1000, 1000)
         self._crop_rotation = 0.0
         self._debug_mode = False
         self._aspect_ratio_names = [

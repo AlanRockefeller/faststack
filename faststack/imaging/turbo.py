@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 log = logging.getLogger(__name__)
-_fallback_warning_emitted = False
+_fallback_warnings_emitted: set[str] = set()
 
 try:
     from turbojpeg import TJPF_RGB, TurboJPEG
@@ -99,10 +99,9 @@ def _install_hint() -> str:
 
 def _warn_fallback_once(message: str, *args: object) -> None:
     """Emit only one user-facing TurboJPEG fallback warning per process."""
-    global _fallback_warning_emitted
-    if _fallback_warning_emitted:
+    if message in _fallback_warnings_emitted:
         return
-    _fallback_warning_emitted = True
+    _fallback_warnings_emitted.add(message)
     log.warning(message, *args)
 
 

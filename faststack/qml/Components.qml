@@ -358,7 +358,6 @@ Item {
                 // Crop overlay - anchored to mainImage to rotate with it
                 Item {
                     id: cropOverlay
-                    property var cropBox: loupeView.uiStateRef ? loupeView.uiStateRef.currentCropBox : [0, 0, 1000, 1000]
                     property bool hasActiveCrop: {
                         var b = _liveCropBox()
                         return b && b.length === 4 && !(b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000)
