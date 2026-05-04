@@ -209,7 +209,6 @@ Item {
                     return
                 }
                 mainImage.updateZoomState()
-                if (cropOverlay.visible) cropOverlay.updateCropRect()
             }
 
             // Fix B: Stable Logical Size
@@ -319,7 +318,6 @@ Item {
                             return
                         }
                         mainImage.updateHistogramWithZoom()
-                        if (cropOverlay.visible) cropOverlay.updateCropRect()
                     }
                     onYChanged: {
                         if (imageRotator._lockedPanY > -1e8 && Math.abs(y - imageRotator._lockedPanY) > 0.01) {
@@ -327,7 +325,6 @@ Item {
                             return
                         }
                         mainImage.updateHistogramWithZoom()
-                        if (cropOverlay.visible) cropOverlay.updateCropRect()
                     }
                 }
             ]
@@ -361,54 +358,47 @@ Item {
                 // Crop overlay - anchored to mainImage to rotate with it
                 Item {
                     id: cropOverlay
-                    property var cropBox: loupeView.uiStateRef ? loupeView.uiStateRef.currentCropBox : [0, 0, 1000, 1000]
-                    property bool hasActiveCrop: cropBox && cropBox.length === 4 && !(cropBox[0]===0 && cropBox[1]===0 && cropBox[2]===1000 && cropBox[3]===1000)
+                    property bool hasActiveCrop: {
+                        var b = _liveCropBox()
+                        return b && b.length === 4 && !(b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000)
+                    }
+                    property bool hasDrawableCrop: {
+                        var b = _liveCropBox()
+                        return b && b.length === 4 && (b[2] - b[0]) > 0 && (b[3] - b[1]) > 0
+                               && !(b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000)
+                    }
                     // Show visual content only when there is an actual user-drawn crop or rotate mode.
-                    // The overlay Item itself stays alive (visible: isCropping) so updateCropRect() always fires.
-                    property bool showCropContent: hasActiveCrop || mainMouseArea.isRotating
-                    
+                    property bool showCropContent: hasActiveCrop || mainMouseArea.isRotating || mainMouseArea.isCropDragging
+
+                    property int _cropBoxRev: 0
+                    Connections {
+                        target: loupeView.uiStateRef
+                        function onCurrentCropBoxChanged() {
+                            cropOverlay._cropBoxRev += 1
+                        }
+                    }
+
+                    function _liveCropBox() {
+                        var _ = cropOverlay._cropBoxRev
+                        return loupeView.uiStateRef ? loupeView.uiStateRef.currentCropBox : null
+                    }
+
                     visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping
                     anchors.fill: parent // Fills mainImage
                     z: 100
-                    
-                    onCropBoxChanged: { if (parent.source) updateCropRect() }
-                    Component.onCompleted: { if (parent.source) updateCropRect() }
-                    
-                    Connections {
-                        target: loupeView.uiStateRef
-                        function onCurrentCropBoxChanged() { if (mainImage.source) cropOverlay.updateCropRect() }
-                    }
-                    
-                    Connections {
-                         target: mainImage
-                         function onWidthChanged() { cropOverlay.updateCropRect() }
-                         function onHeightChanged() { cropOverlay.updateCropRect() }
-                    }
-                    
-                    function updateCropRect() {
-                        if (!loupeView.uiStateRef || !loupeView.uiStateRef.currentCropBox || loupeView.uiStateRef.currentCropBox.length !== 4) return
-                        var box = loupeView.uiStateRef.currentCropBox
-                        
-                        // Local coords in mainImage (Source Space)
-                        var localLeft = (box[0] / 1000) * parent.width
-                        var localTop = (box[1] / 1000) * parent.height
-                        var localRight = (box[2] / 1000) * parent.width
-                        var localBottom = (box[3] / 1000) * parent.height
-                        
-                        cropRect.x = localLeft
-                        cropRect.y = localTop
-                        cropRect.width = localRight - localLeft
-                        cropRect.height = localBottom - localTop
-                    }
-                    
+
                     // Dimmer Rectangles — only render when a real crop is active/being drawn
-                    Rectangle { visible: cropOverlay.showCropContent; x: 0; y: 0; width: parent.width; height: cropRect.y; color: "black"; opacity: 0.3 }
-                    Rectangle { visible: cropOverlay.showCropContent; x: 0; y: cropRect.y + cropRect.height; width: parent.width; height: parent.height - (cropRect.y + cropRect.height); color: "black"; opacity: 0.3 }
-                    Rectangle { visible: cropOverlay.showCropContent; x: 0; y: cropRect.y; width: cropRect.x; height: cropRect.height; color: "black"; opacity: 0.3 }
-                    Rectangle { visible: cropOverlay.showCropContent; x: cropRect.x + cropRect.width; y: cropRect.y; width: parent.width - (cropRect.x + cropRect.width); height: cropRect.height; color: "black"; opacity: 0.3 }
+                    Rectangle { visible: cropOverlay.hasDrawableCrop; x: 0; y: 0; width: parent.width; height: cropRect.y; color: "black"; opacity: 0.3 }
+                    Rectangle { visible: cropOverlay.hasDrawableCrop; x: 0; y: cropRect.y + cropRect.height; width: parent.width; height: parent.height - (cropRect.y + cropRect.height); color: "black"; opacity: 0.3 }
+                    Rectangle { visible: cropOverlay.hasDrawableCrop; x: 0; y: cropRect.y; width: cropRect.x; height: cropRect.height; color: "black"; opacity: 0.3 }
+                    Rectangle { visible: cropOverlay.hasDrawableCrop; x: cropRect.x + cropRect.width; y: cropRect.y; width: parent.width - (cropRect.x + cropRect.width); height: cropRect.height; color: "black"; opacity: 0.3 }
                     
                     Rectangle {
                         id: cropRect
+                        x: { var b = cropOverlay._liveCropBox(); return (b && b.length === 4) ? (b[0] / 1000) * parent.width : 0 }
+                        y: { var b = cropOverlay._liveCropBox(); return (b && b.length === 4) ? (b[1] / 1000) * parent.height : 0 }
+                        width: { var b = cropOverlay._liveCropBox(); return (b && b.length === 4) ? ((b[2] - b[0]) / 1000) * parent.width : 0 }
+                        height: { var b = cropOverlay._liveCropBox(); return (b && b.length === 4) ? ((b[3] - b[1]) / 1000) * parent.height : 0 }
                         visible: cropOverlay.showCropContent
                         color: "transparent"
                         border.color: "white"
@@ -439,8 +429,9 @@ Item {
                             anchors.horizontalCenter: handleLine.horizontalCenter
                         }
                     }
+
                 }
-                
+
                 source: loupeView.displayedImageSource
                 
                 function _currentDpr() {

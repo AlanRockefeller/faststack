@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple
 
 log = logging.getLogger(__name__)
+_fallback_warnings_emitted: set[str] = set()
 
 try:
     from turbojpeg import TJPF_RGB, TurboJPEG
@@ -72,16 +75,53 @@ def _candidate_library_paths() -> list[Optional[str]]:
     return unique
 
 
-def create_turbojpeg() -> Tuple[Optional["TurboJPEG"], bool]:
-    """Create a TurboJPEG decoder if possible."""
+def _install_hint() -> str:
+    """Return a concise, platform-specific libjpeg-turbo install hint."""
+    if os.name == "nt":
+        return (
+            "Windows: install the x64 libjpeg-turbo package so "
+            r"C:\libjpeg-turbo64\bin\turbojpeg.dll exists, or set "
+            "FASTSTACK_TURBOJPEG_LIB to the full turbojpeg.dll path."
+        )
+    if sys.platform == "darwin":
+        return (
+            "macOS: install libjpeg-turbo with `brew install jpeg-turbo`, "
+            "or set FASTSTACK_TURBOJPEG_LIB to the full libturbojpeg.dylib path."
+        )
+    return (
+        "Linux: install the TurboJPEG shared library, for example "
+        "`sudo apt install libturbojpeg` on Debian/Ubuntu, "
+        "`sudo dnf install turbojpeg` on Fedora, or "
+        "`sudo pacman -S libjpeg-turbo` on Arch. You can also set "
+        "FASTSTACK_TURBOJPEG_LIB to the full libturbojpeg.so path."
+    )
+
+
+def _warn_fallback_once(message: str, *args: object) -> None:
+    """Emit only one user-facing TurboJPEG fallback warning per process."""
+    if message in _fallback_warnings_emitted:
+        return
+    _fallback_warnings_emitted.add(message)
+    log.warning(message, *args)
+
+
+@lru_cache(maxsize=8)
+def _create_turbojpeg_cached(
+    _decoder_identity: int,
+    candidates: tuple[Optional[str], ...],
+) -> Tuple[Optional["TurboJPEG"], bool]:
+    """Probe TurboJPEG once per candidate set and cache the result."""
     if TurboJPEG is None:
-        log.warning(
-            "PyTurboJPEG not found. Falling back to Pillow for JPEG decoding. Installing PyTurboJPEG will improve image navigation speed."
+        _warn_fallback_once(
+            "PyTurboJPEG is not installed. Falling back to Pillow for JPEG "
+            "decoding, which is slower for large folders. Install PyTurboJPEG "
+            "and libjpeg-turbo to enable faster image navigation. %s",
+            _install_hint(),
         )
         return None, False
 
     failures: list[str] = []
-    for candidate in _candidate_library_paths():
+    for candidate in candidates:
         try:
             decoder = TurboJPEG() if candidate is None else TurboJPEG(candidate)
         except Exception as exc:
@@ -97,9 +137,18 @@ def create_turbojpeg() -> Tuple[Optional["TurboJPEG"], bool]:
 
     for failure in failures:
         log.debug("TurboJPEG load attempt failed: %s", failure)
-    log.warning(
+    _warn_fallback_once(
         "TurboJPEG initialization failed (%d location(s) tried). "
-        "Falling back to Pillow for JPEG decoding.",
+        "PyTurboJPEG is installed, but the native libjpeg-turbo shared "
+        "library was not found or could not be loaded. Falling back to "
+        "Pillow for JPEG decoding, which is slower for large folders. %s",
         len(failures),
+        _install_hint(),
     )
     return None, False
+
+
+def create_turbojpeg() -> Tuple[Optional["TurboJPEG"], bool]:
+    """Create a TurboJPEG decoder if possible."""
+    candidates = tuple(_candidate_library_paths())
+    return _create_turbojpeg_cached(id(TurboJPEG), candidates)

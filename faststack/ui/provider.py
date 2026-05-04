@@ -319,7 +319,7 @@ class UIState(QObject):
         self._saturation = 0.0
         self._white_balance_by = 0.0
         self._white_balance_mg = 0.0
-        self._current_crop_box = [0, 0, 1000, 1000]
+        self._current_crop_box = (0, 0, 1000, 1000)
         self._crop_rotation = 0.0
         self._debug_mode = False
         self._aspect_ratio_names = [
@@ -1089,10 +1089,15 @@ class UIState(QObject):
         self.darkenMode = "assisted"
         self.darkenBrushRadius = 0.03
 
-    @Property("QVariant", notify=histogram_data_changed)
-    def histogramData(self):
-        """Returns histogram data as a dict with 'r', 'g', 'b' keys, each containing a list of 256 values."""
-        return self._histogram_data
+    @Property("QVariantMap", notify=histogram_data_changed)
+    def histogramData(self) -> dict:
+        """Returns histogram data as a dict with 'r', 'g', 'b' keys, each containing a list of 256 values.
+
+        Note: declared as QVariantMap (not QVariant) so QML JavaScript receives a real
+        Object. Under PySide6 6.11+, returning a dict through Property("QVariant") produces
+        a QJSValue wrapper that JS cannot index by key.
+        """
+        return self._histogram_data if self._histogram_data is not None else {}
 
     @histogramData.setter
     def histogramData(self, new_value):
@@ -1100,14 +1105,18 @@ class UIState(QObject):
             self._histogram_data = new_value
             self.histogram_data_changed.emit()
 
-    @Property("QVariant", notify=highlightStateChanged)
-    def highlightState(self):
+    @Property("QVariantMap", notify=highlightStateChanged)
+    def highlightState(self) -> dict:
         """Returns highlight analysis state for UI display.
 
         Returns dict with:
         - headroom_pct: Fraction of pixels with recoverable data above 1.0 (16-bit sources)
         - source_clipped_pct: Fraction of pixels clipped in the SOURCE image (JPEG flat-top @ 254+)
         - current_nearwhite_pct: Fraction of pixels currently near white in the processed state.
+
+        Note: declared as QVariantMap (not QVariant) so QML JavaScript receives a real
+        Object. Under PySide6 6.11+, returning a dict through Property("QVariant") produces
+        a QJSValue wrapper that JS cannot index by key.
         """
         editor = self.app_controller.image_editor
         state = {}
@@ -1216,10 +1225,14 @@ class UIState(QObject):
             self._current_aspect_ratio_index = new_value
             self.current_aspect_ratio_index_changed.emit(new_value)
 
-    @Property("QVariant", notify=current_crop_box_changed)
-    def currentCropBox(self) -> tuple:
-        # QML will receive this as a list
-        return self._current_crop_box
+    @Property("QVariantList", notify=current_crop_box_changed)
+    def currentCropBox(self) -> list:
+        # Return a plain list so QML JavaScript receives a real Array.
+        # Under PySide6 6.11+, returning a tuple through Property("QVariant")
+        # produces a QJSValue wrapper that JS cannot index.
+        return (
+            list(self._current_crop_box) if self._current_crop_box is not None else []
+        )
 
     @currentCropBox.setter
     def currentCropBox(self, new_value):
