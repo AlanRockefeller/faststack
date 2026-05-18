@@ -1773,30 +1773,10 @@ class ImageEditor:
         if base is None:
             return None
 
-        # Heavy computation outside lock using snapshot
-        # base is float32 (H, W, 3) 0-1
-        arr = self._apply_edits(base, edits=edits, for_export=False)
-
-        # Convert to 8-bit for display
-        # Global shoulder is now applied in linear space within _apply_edits()
-        # Just clip to 0-1 as safety clamp
-        arr = np.clip(arr, 0.0, 1.0)
-        # Map to 0-255
-        arr_u8 = (arr * 255).astype(np.uint8)
-
-        if QImage is None:
-            raise ImportError(
-                "PySide6.QtGui.QImage is required for get_preview_data_cached"
-            )
-
-        # Create QImage from buffer
-        img_buffer = arr_u8.tobytes()
-        decoded = DecodedImage(
-            buffer=memoryview(img_buffer),
-            width=arr_u8.shape[1],
-            height=arr_u8.shape[0],
-            bytes_per_line=arr_u8.shape[1] * 3,
-            format=QImage.Format.Format_RGB888,
+        decoded = self._render_decoded_from_float(
+            base,
+            edits=edits,
+            for_export=False,
         )
 
         with self._lock:
@@ -1806,6 +1786,51 @@ class ImageEditor:
                 self._cached_rev = rev
 
         return decoded
+
+    def _render_decoded_from_float(
+        self,
+        base: np.ndarray,
+        *,
+        edits: Dict[str, Any],
+        for_export: bool,
+    ) -> DecodedImage:
+        """Render edits against a float RGB array and package it for Qt display."""
+        arr = self._apply_edits(base, edits=edits, for_export=for_export)
+        arr = np.clip(arr, 0.0, 1.0)
+        arr_u8 = (arr * 255).astype(np.uint8)
+
+        if QImage is None:
+            raise ImportError(
+                "PySide6.QtGui.QImage is required for rendering decoded image data"
+            )
+
+        img_buffer = arr_u8.tobytes()
+        return DecodedImage(
+            buffer=memoryview(img_buffer),
+            width=arr_u8.shape[1],
+            height=arr_u8.shape[0],
+            bytes_per_line=arr_u8.shape[1] * 3,
+            format=QImage.Format.Format_RGB888,
+        )
+
+    def get_full_resolution_preview_data(self) -> Optional[DecodedImage]:
+        """Apply current edits to the full-resolution master for live display."""
+        try:
+            self._ensure_float_image()
+        except RuntimeError:
+            return None
+
+        with self._lock:
+            if self.float_image is None:
+                return None
+            base = self.float_image.copy()
+            edits = dict(self.current_edits)
+
+        return self._render_decoded_from_float(
+            base,
+            edits=edits,
+            for_export=True,
+        )
 
     def get_preview_data(self) -> Optional[DecodedImage]:
         """Apply current edits and return the data as a DecodedImage."""

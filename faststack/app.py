@@ -1995,6 +1995,49 @@ class AppController(QObject):
 
         return False
 
+    def _current_live_session_has_geometry_edits(self) -> bool:
+        """Return True when live edits change image dimensions/orientation."""
+        if self.image_editor is None:
+            return False
+        if (
+            self.image_editor.current_filepath is None
+            or self.image_editor.original_image is None
+        ):
+            return False
+
+        edits = getattr(self.image_editor, "current_edits", None) or {}
+
+        try:
+            if int(edits.get("rotation", 0)) % 360 != 0:
+                return True
+        except (TypeError, ValueError):
+            return True
+
+        try:
+            if abs(float(edits.get("straighten_angle", 0.0))) > 0.001:
+                return True
+        except (TypeError, ValueError):
+            return True
+
+        crop_box = edits.get("crop_box")
+        if crop_box is not None:
+            try:
+                normalized_crop_box = tuple(int(v) for v in crop_box)
+            except (TypeError, ValueError):
+                return True
+            if normalized_crop_box != (0, 0, 1000, 1000):
+                return True
+
+        return False
+
+    def _should_render_live_preview_full_resolution(self) -> bool:
+        """Use full-res live previews after committed geometry edits."""
+        if self.ui_state is None:
+            return False
+        if self.ui_state.isEditorOpen or self.ui_state.isCropping:
+            return False
+        return self._current_live_session_has_geometry_edits()
+
     def _is_current_live_edit_session_dirty(self) -> bool:
         """Return True when the current session has unsaved edits beyond the latest submitted save."""
         state = self._live_edit_session_state
@@ -8231,10 +8274,16 @@ class AppController(QObject):
         if pending:
             self.histogram_timer.start()
 
-    def _kick_preview_worker(self):
+    def _kick_preview_worker(self, *, full_resolution: Optional[bool] = None):
         """Kicks off a background preview render task."""
         if getattr(self, "_shutting_down", False):
             return
+
+        render_full_resolution = (
+            self._should_render_live_preview_full_resolution()
+            if full_resolution is None
+            else full_resolution
+        )
 
         with self._preview_lock:
             if self._preview_inflight:
@@ -8249,7 +8298,10 @@ class AppController(QObject):
         # Submit task to dedicated preview executor
         try:
             fut = self._preview_executor.submit(
-                self._render_preview_worker, token, self.image_editor
+                self._render_preview_worker,
+                token,
+                self.image_editor,
+                render_full_resolution,
             )
             fut.add_done_callback(self._on_preview_done)
         except RuntimeError:
@@ -8258,11 +8310,15 @@ class AppController(QObject):
                 self._preview_inflight = False
 
     @staticmethod
-    def _render_preview_worker(token, image_editor):
+    def _render_preview_worker(token, image_editor, full_resolution: bool = False):
         # Heavy work (PIL apply_edits) happens here off-thread
         try:
-            # allow_compute=True ensures we actually do the work
-            decoded = image_editor.get_preview_data_cached(allow_compute=True)
+            decoded = None
+            if full_resolution:
+                decoded = image_editor.get_full_resolution_preview_data()
+            if decoded is None:
+                # allow_compute=True ensures we actually do the work
+                decoded = image_editor.get_preview_data_cached(allow_compute=True)
             return token, decoded
         except Exception:
             log.exception("Preview render failed")
@@ -8621,18 +8677,21 @@ class AppController(QObject):
         self.image_editor.set_crop_box(crop_box_raw)
         self.image_editor.set_edit_param("straighten_angle", current_rotation)
 
-        # Render the cropped preview synchronously and publish it as the
-        # current loupe image before clearing crop mode. This guarantees the
-        # QML side re-requests the image URL and the ImageProvider serves the
-        # cropped preview instead of a stale cached full-size frame.
+        # Render the committed crop from the full-resolution master and publish
+        # it before clearing crop mode, so the loupe does not keep showing the
+        # preview-resolution crop used while dragging the overlay.
         try:
-            decoded = self.image_editor.get_preview_data_cached(allow_compute=True)
+            decoded = self.image_editor.get_full_resolution_preview_data()
         except Exception:
-            log.exception("execute_crop: synchronous preview render failed")
+            log.exception("execute_crop: full-resolution render failed")
             decoded = None
 
         if decoded is not None:
             with self._preview_lock:
+                # Older preview-worker results may still be in flight from crop
+                # setup/rotation. Invalidate them so they cannot overwrite this
+                # full-resolution committed crop.
+                self._preview_token += 1
                 self._last_rendered_preview = decoded
                 self.ui_refresh_generation += 1
                 self._last_rendered_preview_index = self.current_index
