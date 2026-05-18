@@ -892,11 +892,11 @@ ApplicationWindow {
                 }
                 onHoveredChanged: {
                     if (hovered) {
-                        sortSubMenu.popup(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
+                        sortSubMenu.popupAt(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
                     }
                 }
                 onClicked: {
-                    sortSubMenu.popup(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
+                    sortSubMenu.popupAt(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
                 }
                 // Ensure keyboard activation works reliably
                 Keys.onReturnPressed: clicked()
@@ -999,10 +999,22 @@ ApplicationWindow {
         }
     }
 
-    Menu {
+    // A Popup, not a Menu: opening a sibling Menu would auto-close
+    // actionsMenu (Qt menu mutual-exclusion). Popups don't exclude.
+    Popup {
         id: sortSubMenu
         parent: Overlay.overlay
         implicitWidth: 180
+        padding: 0
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+        // Position relative to a source item, mapped into the overlay.
+        function popupAt(item, dx, dy) {
+            var p = item.mapToItem(Overlay.overlay, dx, dy)
+            x = p.x
+            y = p.y
+            open()
+        }
 
         background: Rectangle {
             implicitWidth: 180
