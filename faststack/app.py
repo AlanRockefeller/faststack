@@ -1846,6 +1846,15 @@ class AppController(QObject):
         except (IndexError, OSError, TypeError, ValueError):
             return None
 
+    def _block_auto_adjust_during_crop(self) -> bool:
+        """Return True after blocking auto-adjust while crop selection is transient."""
+        if self.ui_state and getattr(self.ui_state, "isCropping", False) is True:
+            self.update_status_message(
+                "Apply or cancel the crop before auto-adjusting."
+            )
+            return True
+        return False
+
     def _schedule_auto_adjust_save(self, action_type: str) -> None:
         """Legacy no-op: quick auto-adjust saves are now session-based."""
         self._auto_adjust_save_pending_action = None
@@ -8878,6 +8887,8 @@ class AppController(QObject):
     @Slot()
     def auto_levels(self):
         """Calculates and applies auto levels (preview only). Returns False if skipped."""
+        if self._block_auto_adjust_during_crop():
+            return False
         if not self.image_files or self.current_index >= len(self.image_files):
             self.update_status_message("No image to adjust")
             return False
@@ -8930,6 +8941,8 @@ class AppController(QObject):
 
     def _seed_active_auto_adjust_state(self) -> Optional[ActiveAutoAdjustState]:
         """Create transient auto-adjust state from the current loaded image."""
+        if self._block_auto_adjust_during_crop():
+            return None
         recommendation = self._compute_auto_levels_recommendation()
         state = self._build_active_auto_adjust_state(recommendation)
         self._active_auto_adjust_state = state
@@ -8985,6 +8998,8 @@ class AppController(QObject):
     @Slot()
     def quick_auto_levels(self):
         """Apply auto levels to the live session without saving yet."""
+        if self._block_auto_adjust_during_crop():
+            return
         if not self.image_files:
             self.update_status_message("No image to adjust")
             return
@@ -9006,6 +9021,8 @@ class AppController(QObject):
     @Slot()
     def quick_auto_adjust(self):
         """Apply AWB and auto-levels to the live session without saving yet."""
+        if self._block_auto_adjust_during_crop():
+            return
         if not self.image_files:
             self.update_status_message("No image to adjust")
             return
@@ -9040,6 +9057,8 @@ class AppController(QObject):
         self,
     ) -> Optional[ActiveAutoAdjustState]:
         """Reuse the live transient state or create a fresh one from current pixels."""
+        if self._block_auto_adjust_during_crop():
+            return None
         if self._has_valid_active_auto_adjust_state():
             return self._active_auto_adjust_state
         if self._ensure_active_image_loaded_for_auto_adjust() is None:
@@ -9049,6 +9068,8 @@ class AppController(QObject):
     @Slot()
     def reduce_auto_adjust_highlights(self):
         """Darken the highlight side by one fixed step in the live session."""
+        if self._block_auto_adjust_during_crop():
+            return
         state = self._ensure_or_seed_active_auto_adjust_state()
         if state is None:
             return
@@ -9059,6 +9080,8 @@ class AppController(QObject):
     @Slot()
     def raise_auto_adjust_whites(self):
         """Raise the white side by one fixed step in the live session."""
+        if self._block_auto_adjust_during_crop():
+            return
         state = self._ensure_or_seed_active_auto_adjust_state()
         if state is None:
             return
@@ -9069,6 +9092,8 @@ class AppController(QObject):
     @Slot()
     def deepen_auto_adjust_blacks(self):
         """Deepen the shadow side by one fixed step in the live session."""
+        if self._block_auto_adjust_during_crop():
+            return
         state = self._ensure_or_seed_active_auto_adjust_state()
         if state is None:
             return
@@ -9079,6 +9104,8 @@ class AppController(QObject):
     @Slot()
     def raise_auto_adjust_blacks(self):
         """Raise the shadow side by one fixed step in the live session."""
+        if self._block_auto_adjust_during_crop():
+            return
         state = self._ensure_or_seed_active_auto_adjust_state()
         if state is None:
             return
@@ -9191,6 +9218,8 @@ class AppController(QObject):
 
     def batch_auto_levels(self):
         """Auto-level every image in the current batch, one at a time via event loop."""
+        if self._block_auto_adjust_during_crop():
+            return
         batch_indices = sorted(self._get_batch_indices())
         if not batch_indices:
             self.update_status_message("No images in batch.")
@@ -9274,6 +9303,8 @@ class AppController(QObject):
     @Slot()
     def quick_auto_white_balance(self):
         """Quickly apply auto white balance to the live session without saving yet."""
+        if self._block_auto_adjust_during_crop():
+            return
         if not self.image_files:
             self.update_status_message("No image to adjust")
             return
@@ -9295,6 +9326,8 @@ class AppController(QObject):
         Returns the detail message string if a correction was applied, or None
         if no change / error.
         """
+        if self._block_auto_adjust_during_crop():
+            return None
         mode = config.get("awb", "mode", fallback="lab")
         if mode == "lab":
             return self.auto_white_balance_lab()
