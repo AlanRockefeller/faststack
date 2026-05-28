@@ -275,6 +275,13 @@ class AppController(QObject):
         self._auto_adjust_save_pending_action: Optional[str] = None
         self._auto_adjust_save_in_progress: bool = False
         self._live_edit_session_state: Optional[LiveEditSessionState] = None
+        self._crop_mode_has_saved_geometry: bool = False
+        self._crop_mode_saved_crop_box: Optional[Tuple[int, int, int, int]] = None
+        self._crop_mode_saved_straighten_angle: float = 0.0
+        self._crop_mode_saved_rotation: int = 0
+        self._crop_mode_saved_edit_revision: int = 0
+        self._crop_mode_saved_path_key: Optional[str] = None
+        self._crop_mode_saved_session_id: Optional[str] = None
         # target_path -> save request awaiting retry. Set when a background save
         # for a session the user has navigated away from fails permanently;
         # flushed synchronously on shutdown so unsaved edits are not lost.
@@ -1540,31 +1547,8 @@ class AppController(QObject):
             )
             return None
 
-        # Debug preview condition
-        if self.ui_state.isEditorOpen or self.ui_state.isCropping:
-            # Robust path comparison
-            editor_path = self.image_editor.current_filepath
-            file_path = self.image_files[index].path
-
-            match = False
-            if editor_path and file_path:
-                try:
-                    match = Path(editor_path).resolve() == Path(file_path).resolve()
-                except (OSError, ValueError):
-                    match = str(editor_path) == str(file_path)
-
-            if not match:
-                # Debug log if mismatch
-                log.debug(
-                    "Path mismatch in preview. Editor: %s, File: %s",
-                    editor_path,
-                    file_path,
-                )
-
-            # Return background-rendered preview if Editor is open OR Cropping is active
-            if match and self.image_editor.original_image:
-                if self._last_rendered_preview:
-                    return self._last_rendered_preview
+        if self._has_current_live_preview_for_index(index):
+            return self._last_rendered_preview
 
         _, _, display_gen = self.get_display_info()
 
@@ -1908,6 +1892,18 @@ class AppController(QObject):
             int(getattr(self.image_editor, "_edits_rev", 0)),
         )
 
+    def _has_current_live_preview_for_index(self, index: int) -> bool:
+        """Return True when the rendered preview belongs to the current live edit session."""
+        if self._last_rendered_preview is None:
+            return False
+        if index != self.current_index:
+            return False
+        if self._last_rendered_preview_index != index:
+            return False
+        if self._get_current_live_edit_session_info() is None:
+            return False
+        return self._current_live_session_has_meaningful_edits()
+
     def _ensure_live_edit_session_state(self, *, force_reset: bool = False) -> None:
         """Bind dirty-session tracking to the currently loaded editor session."""
         info = self._get_current_live_edit_session_info()
@@ -2189,6 +2185,7 @@ class AppController(QObject):
             log.debug("Cleared active auto-adjust state: %s", reason)
 
         if clear_editor and self.image_editor:
+            self._clear_crop_mode_snapshot()
             self.image_editor.clear()
 
     def _has_valid_active_auto_adjust_state(self) -> bool:
@@ -2560,6 +2557,10 @@ class AppController(QObject):
     ) -> Optional[dict[str, Any]]:
         """Capture an immutable save request for the current live editor session."""
         self._last_save_prepare_error = None
+        if self._crop_mode_has_saved_geometry or (
+            self.ui_state and getattr(self.ui_state, "isCropping", False) is True
+        ):
+            self._cancel_crop_transaction_for_session_boundary()
         if not self.image_editor.original_image:
             return None
 
@@ -4445,8 +4446,155 @@ class AppController(QObject):
         self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
 
-    def _reset_crop_only(self):
+    @staticmethod
+    def _normalize_crop_box_tuple(
+        crop_box: Any,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        if crop_box is None:
+            return None
+        try:
+            if hasattr(crop_box, "toVariant"):
+                crop_box = crop_box.toVariant()
+            if isinstance(crop_box, list):
+                crop_box = tuple(crop_box)
+            if not isinstance(crop_box, tuple) or len(crop_box) != 4:
+                return None
+            left, top, right, bottom = [
+                max(0, min(1000, int(value))) for value in crop_box
+            ]
+        except (TypeError, ValueError):
+            return None
+        return (
+            min(left, right),
+            min(top, bottom),
+            max(left, right),
+            max(top, bottom),
+        )
+
+    def _set_crop_overlay_box_only(self, crop_box: Tuple[int, int, int, int]) -> None:
+        if hasattr(self.ui_state, "set_current_crop_box_visual_only"):
+            self.ui_state.set_current_crop_box_visual_only(crop_box)
+            return
+        self.ui_state.currentCropBox = crop_box
+
+    def _clear_crop_mode_snapshot(self) -> None:
+        self._crop_mode_has_saved_geometry = False
+        self._crop_mode_saved_crop_box = None
+        self._crop_mode_saved_straighten_angle = 0.0
+        self._crop_mode_saved_rotation = 0
+        self._crop_mode_saved_edit_revision = 0
+        self._crop_mode_saved_path_key = None
+        self._crop_mode_saved_session_id = None
+
+    def _snapshot_crop_mode_geometry(self) -> None:
+        edits = getattr(self.image_editor, "current_edits", None) or {}
+        self._crop_mode_saved_edit_revision = int(
+            getattr(self.image_editor, "_edits_rev", 0)
+        )
+        self._crop_mode_saved_crop_box = self._normalize_crop_box_tuple(
+            edits.get("crop_box")
+        )
+        try:
+            self._crop_mode_saved_straighten_angle = float(
+                edits.get("straighten_angle", 0.0)
+            )
+        except (TypeError, ValueError):
+            self._crop_mode_saved_straighten_angle = 0.0
+        try:
+            self._crop_mode_saved_rotation = int(edits.get("rotation", 0)) % 360
+        except (TypeError, ValueError):
+            self._crop_mode_saved_rotation = 0
+
+        self._crop_mode_saved_path_key = None
+        if self.image_editor.current_filepath is not None:
+            try:
+                self._crop_mode_saved_path_key = self._key(
+                    self.image_editor.current_filepath
+                )
+            except (OSError, TypeError, ValueError):
+                self._crop_mode_saved_path_key = None
+        self._crop_mode_saved_session_id = getattr(
+            self.image_editor, "session_id", None
+        )
+        self._crop_mode_has_saved_geometry = True
+
+    def _restore_crop_mode_geometry(self) -> bool:
+        if not self._crop_mode_has_saved_geometry:
+            return False
+        if not self.image_editor:
+            return False
+
+        if self._crop_mode_saved_path_key and self.image_editor.current_filepath:
+            try:
+                current_path_key = self._key(self.image_editor.current_filepath)
+            except (OSError, TypeError, ValueError):
+                current_path_key = None
+            if current_path_key != self._crop_mode_saved_path_key:
+                return False
+
+        saved_session_id = self._crop_mode_saved_session_id
+        if (
+            saved_session_id is not None
+            and getattr(self.image_editor, "session_id", None) != saved_session_id
+        ):
+            return False
+
+        saved_crop_box = self._crop_mode_saved_crop_box
+        saved_angle = self._crop_mode_saved_straighten_angle
+        saved_rotation = self._crop_mode_saved_rotation
+        saved_revision = self._crop_mode_saved_edit_revision
+
+        changed = False
+        with self.image_editor._lock:
+            edits = self.image_editor.current_edits
+            if edits.get("crop_box") != saved_crop_box:
+                edits["crop_box"] = saved_crop_box
+                changed = True
+
+            try:
+                current_angle = float(edits.get("straighten_angle", 0.0))
+            except (TypeError, ValueError):
+                current_angle = 0.0
+            if not math.isclose(
+                current_angle,
+                saved_angle,
+                rel_tol=1e-5,
+                abs_tol=1e-7,
+            ):
+                edits["straighten_angle"] = saved_angle
+                changed = True
+
+            try:
+                current_rotation = int(edits.get("rotation", 0)) % 360
+            except (TypeError, ValueError):
+                current_rotation = 0
+            if current_rotation != saved_rotation:
+                edits["rotation"] = saved_rotation
+                changed = True
+
+            if changed or self.image_editor._edits_rev != saved_revision:
+                self.image_editor._edits_rev = saved_revision
+                if changed:
+                    self.image_editor._cached_preview = None
+                    self.image_editor._cached_rev = -1
+
+        overlay_box = saved_crop_box or (0, 0, 1000, 1000)
+        self._set_crop_overlay_box_only(overlay_box)
+        if hasattr(self.ui_state, "cropRotation"):
+            self.ui_state.cropRotation = 0.0
+        return True
+
+    def _cancel_crop_transaction_for_session_boundary(self) -> None:
+        if self._crop_mode_has_saved_geometry:
+            self._restore_crop_mode_geometry()
+        if self.ui_state and getattr(self.ui_state, "isCropping", False) is True:
+            self.ui_state.isCropping = False
+        self._clear_crop_mode_snapshot()
+
+    def _reset_crop_only(self, *, clear_crop_transaction: bool = True):
         """Resets crop settings (crop box and straighten) to default and exits crop mode, PRESERVING 90-deg rotation."""
+        if clear_crop_transaction:
+            self._clear_crop_mode_snapshot()
         if self.ui_state.isCropping:
             self.ui_state.isCropping = False
             self.update_status_message("Crop mode exited")
@@ -8389,10 +8537,28 @@ class AppController(QObject):
     def cancel_crop_mode(self):
         """Cancel crop mode without applying changes."""
         if self.ui_state.isCropping:
-            self._reset_crop_only()
-            # Notify UI and kick fresh render
-            self.ui_refresh_generation += 1
-            self._kick_preview_worker()
+            self._restore_crop_mode_geometry()
+            try:
+                decoded = self.image_editor.get_full_resolution_preview_data()
+            except Exception:
+                log.exception("cancel_crop_mode: restored preview render failed")
+                decoded = None
+
+            if decoded is not None:
+                with self._preview_lock:
+                    self._preview_token += 1
+                    self._last_rendered_preview = decoded
+                    self.ui_refresh_generation += 1
+                    self._last_rendered_preview_index = self.current_index
+                    self._last_rendered_preview_gen = self.ui_refresh_generation
+
+            self.ui_state.isCropping = False
+            self._clear_crop_mode_snapshot()
+            if decoded is not None:
+                self.ui_state.currentImageSourceChanged.emit()
+            else:
+                self.ui_refresh_generation += 1
+                self._kick_preview_worker()
             self.update_status_message("Crop cancelled")
 
     @Slot()
@@ -8417,8 +8583,9 @@ class AppController(QObject):
             if not self.load_image_for_editing():
                 return
 
-            # Reset to full image defaults (UI and Backend)
-            self._reset_crop_only()
+            self._snapshot_crop_mode_geometry()
+            # Reset to full image defaults for this crop transaction only.
+            self._reset_crop_only(clear_crop_transaction=False)
             # Set isCropping to True now that reset is done
             self.ui_state.isCropping = True
 
@@ -8700,11 +8867,12 @@ class AppController(QObject):
                 self._last_rendered_preview_gen = self.ui_refresh_generation
 
         self.ui_state.isCropping = False
+        self._clear_crop_mode_snapshot()
         # Do NOT assign ui_state.currentCropBox here — its setter syncs back
         # into image_editor.set_crop_box(), which would overwrite the crop we
         # just committed. The crop overlay is already hidden by
         # `visible: isCropping` in QML, and re-entering crop mode resets the
-        # box via toggle_crop_mode -> _reset_crop_only.
+        # box inside a new crop transaction.
         self.ui_state.resetZoomPan()
         if decoded is not None:
             self.ui_state.currentImageSourceChanged.emit()

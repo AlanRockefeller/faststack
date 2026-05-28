@@ -1234,8 +1234,7 @@ class UIState(QObject):
             list(self._current_crop_box) if self._current_crop_box is not None else []
         )
 
-    @currentCropBox.setter
-    def currentCropBox(self, new_value):
+    def _normalize_crop_box_value(self, new_value):
         # Convert QJSValue or list to tuple if needed
         original_value = new_value
         try:
@@ -1259,6 +1258,7 @@ class UIState(QObject):
                 type(original_value),
                 e,
             )
+            return None
 
         # only accept 4-element tuples
         if (
@@ -1269,10 +1269,29 @@ class UIState(QObject):
             log.warning(
                 "UIState.currentCropBox: ignoring invalid crop box %r", new_value
             )
+            return None
+        return new_value
+
+    def _set_current_crop_box_value(self, new_value) -> bool:
+        if self._current_crop_box == new_value:
+            return False
+        self._current_crop_box = new_value
+        self.current_crop_box_changed.emit(new_value)
+        return True
+
+    def set_current_crop_box_visual_only(self, new_value) -> bool:
+        """Update the crop overlay without mutating the editor session."""
+        new_value = self._normalize_crop_box_value(new_value)
+        if new_value is None:
+            return False
+        return self._set_current_crop_box_value(new_value)
+
+    @currentCropBox.setter
+    def currentCropBox(self, new_value):
+        new_value = self._normalize_crop_box_value(new_value)
+        if new_value is None:
             return
-        if self._current_crop_box != new_value:
-            self._current_crop_box = new_value
-            self.current_crop_box_changed.emit(new_value)
+        if self._set_current_crop_box_value(new_value):
             # Sync with ImageEditor
             if (
                 hasattr(self.app_controller, "image_editor")
