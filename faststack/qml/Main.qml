@@ -66,15 +66,6 @@ ApplicationWindow {
     }
 
     onClosing: function(close) {
-        if (!root.allowCloseWithRecycleBins
-                && root.uiStateRef
-                && root.uiStateRef.hasRecycleBinItems) {
-            close.accepted = false
-            root.uiStateRef.refreshRecycleBinStats()
-            recycleBinCleanupDialog.open()
-            return
-        }
-
         if (!root.allowCloseWithBatches && root.controllerRef) {
             var definedBatchCount = root.controllerRef.get_defined_batch_count()
             if (definedBatchCount > 0) {
@@ -85,8 +76,18 @@ ApplicationWindow {
             }
         }
 
+        if (!root.allowCloseWithRecycleBins
+                && root.uiStateRef
+                && root.uiStateRef.hasRecycleBinItems) {
+            close.accepted = false
+            root.uiStateRef.refreshRecycleBinStats()
+            recycleBinCleanupDialog.open()
+            return
+        }
+
         if (root.controllerRef && !root.controllerRef.prepare_for_app_close()) {
             close.accepted = false
+            root.allowCloseWithBatches = false
             return
         }
 
@@ -1912,6 +1913,11 @@ ApplicationWindow {
         }
 
         onOpened: refreshBinInfo()
+        onClosed: {
+            if (!root.allowCloseWithRecycleBins) {
+                root.allowCloseWithBatches = false
+            }
+        }
 
         // Ensure the dialog is fully opaque and has a solid background
         background: Rectangle {
@@ -2198,7 +2204,10 @@ ApplicationWindow {
                     MouseArea {
                         anchors.fill: parent
                         hoverEnabled: true
-                        onClicked: recycleBinCleanupDialog.close()
+                        onClicked: {
+                            root.allowCloseWithBatches = false
+                            recycleBinCleanupDialog.close()
+                        }
                         cursorShape: Qt.PointingHandCursor
                         onEntered: parent.color = root.isDarkTheme ? "#2a2a2a" : "#eeeeee"
                         onExited: parent.color = "transparent"
