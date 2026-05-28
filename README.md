@@ -17,7 +17,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Instant Navigation:** Sub-10ms next/previous image switching, high performance decoding via `PyTurboJPEG`.
 - **Image Editor:** Built-in editor with exposure, contrast, white balance, sharpness, and more (E key)
 - **Background Darkening:** Mask-based background darkening tool (K key) with smart edge detection, subject protection, and multiple modes. Paint rough background hints and the tool refines them into natural-looking dark backgrounds.
-- **Quick Auto Adjust:** Press `l` for quick auto-levels, `L` for auto white balance + auto-levels together, `A` for auto white balance, `-`/`_` to keep adjusting the highlight/white side in 14-point steps, and `=` to deepen the shadow side in 7-point steps. These update the live in-memory edit session immediately and save once when you navigate away, start a drag, or explicitly save.
+- **Quick Auto Adjust:** Press `l` for quick auto-levels, `L` for auto white balance + auto-levels together, `A` for auto white balance, `-`/`_` to keep adjusting the highlight/white side in 14-point steps, and `=`/`+` to adjust the shadow/black side in 7-point steps. These update the live in-memory edit session immediately and save once when you navigate away, start a drag, or explicitly save.
 - **Photoshop / Gimp Integration:** Edit current image in Photoshop or Gimp (P key) - always uses RAW files when available.
 - **Clipboard Support:** Copy image path to clipboard (Ctrl+C)
 - **Image Filtering:** Filter images by filename
@@ -144,6 +144,7 @@ If you do nothing, FastStack will still run, but JPEG decoding and thumbnail gen
 - `L`: Quick auto white balance + auto levels (live session; saved on navigation, drag, or Ctrl+S)
 - `-`: Darken the current auto-adjust highlights/whites by 14 points in the live session
 - `_`: Raise the current auto-adjust whites by 14 points in the live session
+- `+`: Raise the current auto-adjust shadows/blacks by 7 points in the live session
 - `=`: Deepen the current auto-adjust shadows/background by 7 points in the live session
 - `E`: Toggle Image Editor
 - `Esc`: Close active dialog, editor, cancel crop, or exit fullscreen

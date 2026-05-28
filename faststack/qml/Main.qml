@@ -1730,6 +1730,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;L: Quick auto white balance + auto levels (live)<br>" +
                           "&nbsp;&nbsp;-: Darken current auto-adjust highlights/whites (live)<br>" +
                           "&nbsp;&nbsp;_: Raise current auto-adjust whites (live)<br>" +
+                          "&nbsp;&nbsp;+: Raise current auto-adjust shadows/blacks (live)<br>" +
                           "&nbsp;&nbsp;=: Deepen current auto-adjust shadows/background (live)<br>" +
                           "&nbsp;&nbsp;K: Background Darkening Tool<br>" +
                           "&nbsp;&nbsp;O (or right-click): Toggle crop mode<br>" +

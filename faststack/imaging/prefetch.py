@@ -236,6 +236,68 @@ def apply_saturation_compensation(
     rgb_region[:] = rgb.reshape(height, width * 3).astype(np.uint8)
 
 
+def apply_loupe_color_correction(
+    buffer: np.ndarray,
+    *,
+    icc_bytes: Optional[bytes] = None,
+    color_mode: Optional[str] = None,
+) -> np.ndarray:
+    """Apply the same display-only color correction used by the loupe decode path."""
+    corrected = np.ascontiguousarray(buffer)
+    mode = (
+        color_mode
+        if color_mode is not None
+        else config.get("color", "mode", fallback="none")
+    ).lower()
+
+    if mode == "icc":
+        monitor_profile = get_monitor_profile()
+        monitor_icc_path = config.get("color", "monitor_icc_path", fallback="").strip()
+        if monitor_profile is None:
+            return corrected
+
+        src_profile = None
+        src_profile_key = None
+        if icc_bytes:
+            try:
+                src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+                src_profile_key = hashlib.sha256(icc_bytes).hexdigest()
+            except Exception as e:
+                log.warning("Failed to parse ICC profile: %s", e)
+
+        if src_profile is None:
+            src_profile = SRGB_PROFILE
+            src_profile_key = "srgb_builtin"
+
+        try:
+            img = PILImage.fromarray(corrected)
+            transform = get_icc_transform(
+                src_profile,
+                monitor_profile,
+                src_profile_key,
+                monitor_icc_path,
+            )
+            ImageCms.applyTransform(img, transform, inPlace=True)
+            return np.ascontiguousarray(np.array(img, dtype=np.uint8))
+        except Exception as e:
+            log.warning("ICC conversion failed: %s", e)
+            return corrected
+
+    if mode == "saturation":
+        val = config.get("color", "saturation_factor", fallback="1.0")
+        saturation_factor = float(val) if val is not None else 1.0
+        if saturation_factor != 1.0:
+            apply_saturation_compensation(
+                corrected.ravel(),
+                corrected.shape[1],
+                corrected.shape[0],
+                corrected.strides[0],
+                saturation_factor,
+            )
+
+    return corrected
+
+
 class Prefetcher:
     def __init__(
         self,

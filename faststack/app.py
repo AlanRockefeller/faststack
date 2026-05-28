@@ -2392,6 +2392,8 @@ class AppController(QObject):
         black_step_points = round(_AUTO_ADJUST_BLACK_STEP * 100)
         if extra_black_steps > 0:
             suffixes.append(f"blacks -{extra_black_steps * black_step_points}pt")
+        elif extra_black_steps < 0:
+            suffixes.append(f"blacks +{-extra_black_steps * black_step_points}pt")
         if suffixes:
             msg = f"{msg}; {', '.join(suffixes)}"
         return msg
@@ -8912,6 +8914,16 @@ class AppController(QObject):
             return
 
         state.extra_black_steps += 1
+        self._apply_auto_adjust_preview(state)
+
+    @Slot()
+    def raise_auto_adjust_blacks(self):
+        """Raise the shadow side by one fixed step in the live session."""
+        state = self._ensure_or_seed_active_auto_adjust_state()
+        if state is None:
+            return
+
+        state.extra_black_steps -= 1
         self._apply_auto_adjust_preview(state)
 
     def _apply_auto_adjust_preview(self, state: ActiveAutoAdjustState) -> None:

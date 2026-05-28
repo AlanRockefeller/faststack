@@ -124,6 +124,9 @@ class Keybinder:
             if text == "_":
                 self._call("raise_auto_adjust_whites")
                 return True
+            if text == "+":
+                self._call("raise_auto_adjust_blacks")
+                return True
             if text == "=":
                 self._call("deepen_auto_adjust_blacks")
                 return True
@@ -132,6 +135,9 @@ class Keybinder:
                 return True
             if key == Qt.Key_Underscore:
                 self._call("raise_auto_adjust_whites")
+                return True
+            if key == Qt.Key_Plus:
+                self._call("raise_auto_adjust_blacks")
                 return True
             if key == Qt.Key_Equal and modifiers == Qt.NoModifier:
                 self._call("deepen_auto_adjust_blacks")

@@ -28,6 +28,7 @@ from faststack.imaging.math_utils import (
     _srgb_to_linear,
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
+from faststack.imaging.prefetch import apply_loupe_color_correction
 from faststack.models import DecodedImage
 
 try:
@@ -1793,11 +1794,18 @@ class ImageEditor:
         *,
         edits: Dict[str, Any],
         for_export: bool,
+        apply_loupe_color: bool = False,
     ) -> DecodedImage:
         """Render edits against a float RGB array and package it for Qt display."""
         arr = self._apply_edits(base, edits=edits, for_export=for_export)
         arr = np.clip(arr, 0.0, 1.0)
         arr_u8 = (arr * 255).astype(np.uint8)
+        if apply_loupe_color:
+            icc_bytes = None
+            with self._lock:
+                if self.original_image is not None:
+                    icc_bytes = self.original_image.info.get("icc_profile")
+            arr_u8 = apply_loupe_color_correction(arr_u8, icc_bytes=icc_bytes)
 
         if QImage is None:
             raise ImportError(
@@ -1809,7 +1817,7 @@ class ImageEditor:
             buffer=memoryview(img_buffer),
             width=arr_u8.shape[1],
             height=arr_u8.shape[0],
-            bytes_per_line=arr_u8.shape[1] * 3,
+            bytes_per_line=arr_u8.strides[0],
             format=QImage.Format.Format_RGB888,
         )
 
@@ -1830,6 +1838,7 @@ class ImageEditor:
             base,
             edits=edits,
             for_export=True,
+            apply_loupe_color=True,
         )
 
     def get_preview_data(self) -> Optional[DecodedImage]:
