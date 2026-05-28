@@ -279,7 +279,6 @@ class AppController(QObject):
         self._crop_mode_saved_crop_box: Optional[Tuple[int, int, int, int]] = None
         self._crop_mode_saved_straighten_angle: float = 0.0
         self._crop_mode_saved_rotation: int = 0
-        self._crop_mode_saved_edit_revision: int = 0
         self._crop_mode_saved_path_key: Optional[str] = None
         self._crop_mode_saved_session_id: Optional[str] = None
         # target_path -> save request awaiting retry. Set when a background save
@@ -4482,15 +4481,11 @@ class AppController(QObject):
         self._crop_mode_saved_crop_box = None
         self._crop_mode_saved_straighten_angle = 0.0
         self._crop_mode_saved_rotation = 0
-        self._crop_mode_saved_edit_revision = 0
         self._crop_mode_saved_path_key = None
         self._crop_mode_saved_session_id = None
 
     def _snapshot_crop_mode_geometry(self) -> None:
         edits = getattr(self.image_editor, "current_edits", None) or {}
-        self._crop_mode_saved_edit_revision = int(
-            getattr(self.image_editor, "_edits_rev", 0)
-        )
         self._crop_mode_saved_crop_box = self._normalize_crop_box_tuple(
             edits.get("crop_box")
         )
@@ -4542,8 +4537,6 @@ class AppController(QObject):
         saved_crop_box = self._crop_mode_saved_crop_box
         saved_angle = self._crop_mode_saved_straighten_angle
         saved_rotation = self._crop_mode_saved_rotation
-        saved_revision = self._crop_mode_saved_edit_revision
-
         changed = False
         with self.image_editor._lock:
             edits = self.image_editor.current_edits
@@ -4572,11 +4565,10 @@ class AppController(QObject):
                 edits["rotation"] = saved_rotation
                 changed = True
 
-            if changed or self.image_editor._edits_rev != saved_revision:
-                self.image_editor._edits_rev = saved_revision
-                if changed:
-                    self.image_editor._cached_preview = None
-                    self.image_editor._cached_rev = -1
+            if changed:
+                self.image_editor._edits_rev += 1
+                self.image_editor._cached_preview = None
+                self.image_editor._cached_rev = -1
 
         overlay_box = saved_crop_box or (0, 0, 1000, 1000)
         self._set_crop_overlay_box_only(overlay_box)
