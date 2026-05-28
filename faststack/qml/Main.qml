@@ -1108,8 +1108,17 @@ ApplicationWindow {
     Shortcut {
         sequence: "Escape"
         context: Qt.ApplicationShortcut
-        enabled: root.fullScreenLoupe
+        enabled: root.fullScreenLoupe && (!root.uiStateRef || !root.uiStateRef.isCropping)
         onActivated: root.exitFullScreenLoupe()
+    }
+
+    Shortcut {
+        sequence: "Escape"
+        context: Qt.ApplicationShortcut
+        enabled: root.uiStateRef ? root.uiStateRef.isCropping && !root.uiStateRef.isDialogOpen : false
+        onActivated: {
+            if (root.controllerRef) root.controllerRef.cancel_crop_mode()
+        }
     }
 
     Shortcut {
