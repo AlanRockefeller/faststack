@@ -20,6 +20,18 @@ Item {
     // Expose zoom state to parent (Main.qml title bar)
     readonly property real currentZoomScale: imageRotator.zoomScale
     readonly property real currentFitScale: imageRotator.fitScale
+    readonly property real currentPixelZoomScale: {
+        if (!loupeView.uiStateRef || !mainImage || mainImage.sourceSize.width <= 0 || mainImage.sourceSize.height <= 0) return currentZoomScale
+
+        var nativeW = loupeView.uiStateRef.currentNativeImageWidth
+        var nativeH = loupeView.uiStateRef.currentNativeImageHeight
+        if (nativeW <= 0 || nativeH <= 0) return currentZoomScale
+
+        var scaleW = imageRotator.zoomScale * mainImage.sourceSize.width / nativeW
+        var scaleH = imageRotator.zoomScale * mainImage.sourceSize.height / nativeH
+        if (scaleW > 0 && scaleH > 0) return Math.min(scaleW, scaleH)
+        return currentZoomScale
+    }
     // Freeze the displayed source for the full crop session once crop mode
     // starts. Zoom-triggered high-res swaps stay blocked until crop mode exits,
     // because any async source swap during cropping can rescale the image and
@@ -48,7 +60,19 @@ Item {
     function releaseCropImageSource() {
         cropDragImageSource = ""
     }
-    
+
+    function cancelActiveCropRotation() {
+        if (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping || !mainMouseArea.isRotating) return false
+
+        mainMouseArea.cropRotation = mainMouseArea.cropStartRotation
+        mainMouseArea.clearPendingRotation(mainMouseArea.cropRotation)
+        if (loupeView.controllerRef) loupeView.controllerRef.set_straighten_angle(mainMouseArea.cropRotation, -1)
+
+        mainMouseArea.endCropInteraction()
+        mainMouseArea.isRotating = false
+        return true
+    }
+
     Connections {
         target: loupeView.uiStateRef
         function onCurrentIndexChanged() {
@@ -77,6 +101,7 @@ Item {
                     mainMouseArea.isRotating = false
                     mainMouseArea.cropRotation = 0
                 }
+                if (loupeView.uiStateRef) loupeView.uiStateRef.isCropRotating = false
                 loupeView.releaseCropImageSource()
             }
         }
@@ -85,19 +110,13 @@ Item {
     Keys.onEscapePressed: (event) => {
         if (loupeView.uiStateRef && loupeView.uiStateRef.isCropping) {
             if (mainMouseArea.isRotating) {
-                // Revert rotation
-                mainMouseArea.cropRotation = mainMouseArea.cropStartRotation
-                mainMouseArea.clearPendingRotation(mainMouseArea.cropRotation)
-                if (loupeView.controllerRef) loupeView.controllerRef.set_straighten_angle(mainMouseArea.cropRotation, -1)
-
-                mainMouseArea.endCropInteraction()
-                mainMouseArea.isRotating = false
+                loupeView.cancelActiveCropRotation()
                 event.accepted = true
             } else if (loupeView.controllerRef) {
                 mainMouseArea.clearPendingRotation(0)
                 mainMouseArea.endCropInteraction()
                 loupeView.controllerRef.cancel_crop_mode()
-                mainMouseArea.cropRotation = 0 // Reset local rotation
+                mainMouseArea.cropRotation = 0
                 mainMouseArea.isRotating = false
                 event.accepted = true
             }
@@ -358,17 +377,17 @@ Item {
                 // Crop overlay - anchored to mainImage to rotate with it
                 Item {
                     id: cropOverlay
-                    property bool hasActiveCrop: {
+                    property bool isFullImageCrop: {
                         var b = _liveCropBox()
-                        return b && b.length === 4 && !(b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000)
+                        return b && b.length === 4 && b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000
                     }
-                    property bool hasDrawableCrop: {
+                    property bool hasPositiveCrop: {
                         var b = _liveCropBox()
                         return b && b.length === 4 && (b[2] - b[0]) > 0 && (b[3] - b[1]) > 0
-                               && !(b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000)
                     }
-                    // Show visual content only when there is an actual user-drawn crop or rotate mode.
-                    property bool showCropContent: hasActiveCrop || mainMouseArea.isRotating || mainMouseArea.isCropDragging
+                    property bool hasDrawableCrop: hasPositiveCrop && !isFullImageCrop
+                    // Show visual content only for a real crop box or rotate mode.
+                    property bool showCropContent: hasDrawableCrop || mainMouseArea.isRotating
 
                     property int _cropBoxRev: 0
                     Connections {
@@ -407,7 +426,7 @@ Item {
                         // Rotation Handle Line
                         Rectangle {
                             id: handleLine
-                            visible: mainMouseArea.isRotating
+                            visible: cropOverlay.hasDrawableCrop && mainMouseArea.isRotating
                             width: 2 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
                             height: 25 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
                             color: "white"
@@ -418,7 +437,7 @@ Item {
                         // Rotation Knob
                         Rectangle {
                             id: rotateKnob
-                            visible: mainMouseArea.isRotating
+                            visible: cropOverlay.hasDrawableCrop && mainMouseArea.isRotating
                             width: 12 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
                             height: 12 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
                             radius: width / 2
@@ -639,6 +658,7 @@ Item {
 
         onIsRotatingChanged: {
             if (loupeView.uiStateRef) {
+                loupeView.uiStateRef.isCropRotating = isRotating && loupeView.uiStateRef.isCropping
                 if (isRotating) {
                     loupeView.uiStateRef.statusMessage = "Press ESC to exit rotate mode"
                 } else {
@@ -688,7 +708,6 @@ Item {
             cropStartX = mouseX
             cropStartY = mouseY
             setCropBoxStart(clampedMx, clampedMy, clampedMx, clampedMy)
-            loupeView.uiStateRef.currentCropBox = [Math.round(clampedMx), Math.round(clampedMy), Math.round(clampedMx), Math.round(clampedMy)]
         }
 
         function beginCropInteraction() {

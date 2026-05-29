@@ -66,15 +66,6 @@ ApplicationWindow {
     }
 
     onClosing: function(close) {
-        if (!root.allowCloseWithRecycleBins
-                && root.uiStateRef
-                && root.uiStateRef.hasRecycleBinItems) {
-            close.accepted = false
-            root.uiStateRef.refreshRecycleBinStats()
-            recycleBinCleanupDialog.open()
-            return
-        }
-
         if (!root.allowCloseWithBatches && root.controllerRef) {
             var definedBatchCount = root.controllerRef.get_defined_batch_count()
             if (definedBatchCount > 0) {
@@ -85,8 +76,18 @@ ApplicationWindow {
             }
         }
 
+        if (!root.allowCloseWithRecycleBins
+                && root.uiStateRef
+                && root.uiStateRef.hasRecycleBinItems) {
+            close.accepted = false
+            root.uiStateRef.refreshRecycleBinStats()
+            recycleBinCleanupDialog.open()
+            return
+        }
+
         if (root.controllerRef && !root.controllerRef.prepare_for_app_close()) {
             close.accepted = false
+            root.allowCloseWithBatches = false
             return
         }
 
@@ -433,13 +434,14 @@ ApplicationWindow {
             property var loupe: mainViewLoader.item
             property real zs: loupe ? loupe.currentZoomScale : 0
             property real fs: loupe ? loupe.currentFitScale : 0
+            property real ps: loupe ? loupe.currentPixelZoomScale : 0
 
             text: {
-                if (!loupe || fs <= 0 || zs <= 0) return ""
+                if (!loupe || fs <= 0 || zs <= 0 || ps <= 0) return ""
                 if (root.uiStateRef && root.uiStateRef.isGridViewActive) return ""
                 var ratio = zs / fs
-                if (Math.abs(ratio - 1.0) < 0.03) return "Zoom: Fit to window (" + Math.round(zs * 100) + "%)"
-                return "Zoom: " + Math.round(zs * 100) + "%"
+                if (Math.abs(ratio - 1.0) < 0.03) return "Zoom: Fit to window (" + Math.round(ps * 100) + "%)"
+                return "Zoom: " + Math.round(ps * 100) + "%"
             }
         }
 
@@ -791,6 +793,11 @@ ApplicationWindow {
                 defaultTextColor: root.currentTextColor
                 onClicked: {
                     if (root.uiStateRef) {
+                        if (root.uiStateRef.isCropping) {
+                            root.uiStateRef.statusMessage = "Apply or cancel the crop before editing"
+                            actionsMenu.close()
+                            return
+                        }
                         root.uiStateRef.isEditorOpen = !root.uiStateRef.isEditorOpen
                         if (root.uiStateRef.isEditorOpen && root.controllerRef) {
                             root.controllerRef.load_image_for_editing()
@@ -892,11 +899,11 @@ ApplicationWindow {
                 }
                 onHoveredChanged: {
                     if (hovered) {
-                        sortSubMenu.popup(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
+                        sortSubMenu.popupAt(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
                     }
                 }
                 onClicked: {
-                    sortSubMenu.popup(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
+                    sortSubMenu.popupAt(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
                 }
                 // Ensure keyboard activation works reliably
                 Keys.onReturnPressed: clicked()
@@ -999,10 +1006,22 @@ ApplicationWindow {
         }
     }
 
-    Menu {
+    // A Popup, not a Menu: opening a sibling Menu would auto-close
+    // actionsMenu (Qt menu mutual-exclusion). Popups don't exclude.
+    Popup {
         id: sortSubMenu
         parent: Overlay.overlay
         implicitWidth: 180
+        padding: 0
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+        // Position relative to a source item, mapped into the overlay.
+        function popupAt(item, dx, dy) {
+            var p = item.mapToItem(Overlay.overlay, dx, dy)
+            x = p.x
+            y = p.y
+            open()
+        }
 
         background: Rectangle {
             implicitWidth: 180
@@ -1096,8 +1115,17 @@ ApplicationWindow {
     Shortcut {
         sequence: "Escape"
         context: Qt.ApplicationShortcut
-        enabled: root.fullScreenLoupe
+        enabled: root.fullScreenLoupe && (!root.uiStateRef || !root.uiStateRef.isCropping)
         onActivated: root.exitFullScreenLoupe()
+    }
+
+    Shortcut {
+        sequence: "Escape"
+        context: Qt.ApplicationShortcut
+        enabled: root.uiStateRef ? root.uiStateRef.isCropping && !root.uiStateRef.isCropRotating && !root.uiStateRef.isDialogOpen : false
+        onActivated: {
+            if (root.controllerRef) root.controllerRef.cancel_crop_mode()
+        }
     }
 
     Shortcut {
@@ -1106,6 +1134,11 @@ ApplicationWindow {
         enabled: root.uiStateRef ? !root.uiStateRef.isDialogOpen : true
         onActivated: {
             if (!root.uiStateRef) return
+
+            if (root.uiStateRef.isCropping) {
+                root.uiStateRef.statusMessage = "Apply or cancel the crop before editing"
+                return
+            }
 
             if (root.uiStateRef.isEditorOpen) {
                 root.uiStateRef.isEditorOpen = false
@@ -1718,6 +1751,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;L: Quick auto white balance + auto levels (live)<br>" +
                           "&nbsp;&nbsp;-: Darken current auto-adjust highlights/whites (live)<br>" +
                           "&nbsp;&nbsp;_: Raise current auto-adjust whites (live)<br>" +
+                          "&nbsp;&nbsp;+: Raise current auto-adjust shadows/blacks (live)<br>" +
                           "&nbsp;&nbsp;=: Deepen current auto-adjust shadows/background (live)<br>" +
                           "&nbsp;&nbsp;K: Background Darkening Tool<br>" +
                           "&nbsp;&nbsp;O (or right-click): Toggle crop mode<br>" +
@@ -1890,6 +1924,11 @@ ApplicationWindow {
         }
 
         onOpened: refreshBinInfo()
+        onClosed: {
+            if (!root.allowCloseWithRecycleBins) {
+                root.allowCloseWithBatches = false
+            }
+        }
 
         // Ensure the dialog is fully opaque and has a solid background
         background: Rectangle {
@@ -2176,7 +2215,10 @@ ApplicationWindow {
                     MouseArea {
                         anchors.fill: parent
                         hoverEnabled: true
-                        onClicked: recycleBinCleanupDialog.close()
+                        onClicked: {
+                            root.allowCloseWithBatches = false
+                            recycleBinCleanupDialog.close()
+                        }
                         cursorShape: Qt.PointingHandCursor
                         onEntered: parent.color = root.isDarkTheme ? "#2a2a2a" : "#eeeeee"
                         onExited: parent.color = "transparent"

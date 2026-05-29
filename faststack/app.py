@@ -212,6 +212,7 @@ class AppController(QObject):
         debug_cache: bool = False,
         debug_thumb_timing: bool = False,
         debug_thumb_trace: bool = False,
+        start_in_loupe: bool = False,
     ):
         super().__init__()
         self.debug_thumb_timing = debug_thumb_timing
@@ -265,6 +266,9 @@ class AppController(QObject):
         self._preview_token = 0
         self._preview_lock = threading.Lock()
         self._last_rendered_preview = None  # Store latest valid render
+        self._last_rendered_preview_session_key: Optional[tuple[str, Optional[str]]] = (
+            None
+        )
         self._shutting_down = False  # Flag to gate async callbacks during shutdown
         self._refresh_scheduled = False  # Coalesce guard for deferred disk refresh
         self._opencv_warning_shown = False  # Only show OpenCV warning once per session
@@ -275,6 +279,12 @@ class AppController(QObject):
         self._auto_adjust_save_pending_action: Optional[str] = None
         self._auto_adjust_save_in_progress: bool = False
         self._live_edit_session_state: Optional[LiveEditSessionState] = None
+        self._crop_mode_has_saved_geometry: bool = False
+        self._crop_mode_saved_crop_box: Optional[Tuple[int, int, int, int]] = None
+        self._crop_mode_saved_straighten_angle: float = 0.0
+        self._crop_mode_saved_rotation: int = 0
+        self._crop_mode_saved_path_key: Optional[str] = None
+        self._crop_mode_saved_session_id: Optional[str] = None
         # target_path -> save request awaiting retry. Set when a background save
         # for a session the user has navigated away from fails permanently;
         # flushed synchronously on shutdown so unsaved edits are not lost.
@@ -373,7 +383,7 @@ class AppController(QObject):
         )  # Protect last_displayed_image from race conditions
 
         # -- Grid View (Thumbnail) Infrastructure --
-        self._is_grid_view_active = True  # Default to grid view on startup
+        self._is_grid_view_active = not start_in_loupe  # Default to grid view
         self._grid_nav_history: list[Path] = (
             []
         )  # Stack of previous directories for back navigation
@@ -465,6 +475,7 @@ class AppController(QObject):
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
         self._exif_brief_cache: dict = {}  # normalized path key → formatted EXIF string
+        self._native_image_size_cache: Dict[str, tuple[float, int, int]] = {}
         self._exif_pending_path: Optional[str] = (
             None  # path currently awaiting EXIF read
         )
@@ -617,7 +628,7 @@ class AppController(QObject):
 
             if not keep_preview:
                 with self._preview_lock:
-                    self._last_rendered_preview = None
+                    self._clear_last_rendered_preview_locked()
 
     def is_valid_working_tif(self, path: Path) -> bool:
         """Checks if a working TIFF path is valid for editing."""
@@ -1081,6 +1092,8 @@ class AppController(QObject):
             if event.key() == Qt.Key_Escape and getattr(
                 self.ui_state, "isCropping", False
             ):
+                if getattr(self.ui_state, "isCropRotating", False):
+                    return False  # Let the loupe leave rotate mode first.
                 self.cancel_crop_mode()
                 return True  # Consume event, crop mode cancelled
 
@@ -1220,6 +1233,9 @@ class AppController(QObject):
                 self._refresh_thumbnail_model_from_controller()
 
         self._set_folder_loaded(True)
+
+        if not self._is_grid_view_active:
+            self._maybe_decode_current_image("startup-loupe")
 
         log.info(
             "Load summary: scans=variant:%d grid_refreshes:%d",
@@ -1540,31 +1556,8 @@ class AppController(QObject):
             )
             return None
 
-        # Debug preview condition
-        if self.ui_state.isEditorOpen or self.ui_state.isCropping:
-            # Robust path comparison
-            editor_path = self.image_editor.current_filepath
-            file_path = self.image_files[index].path
-
-            match = False
-            if editor_path and file_path:
-                try:
-                    match = Path(editor_path).resolve() == Path(file_path).resolve()
-                except (OSError, ValueError):
-                    match = str(editor_path) == str(file_path)
-
-            if not match:
-                # Debug log if mismatch
-                log.debug(
-                    "Path mismatch in preview. Editor: %s, File: %s",
-                    editor_path,
-                    file_path,
-                )
-
-            # Return background-rendered preview if Editor is open OR Cropping is active
-            if match and self.image_editor.original_image:
-                if self._last_rendered_preview:
-                    return self._last_rendered_preview
+        if self._has_current_live_preview_for_index(index):
+            return self._last_rendered_preview
 
         _, _, display_gen = self.get_display_info()
 
@@ -1791,6 +1784,8 @@ class AppController(QObject):
         if (
             self._last_rendered_preview is not None
             and self._last_rendered_preview_index == self.current_index
+            and self._last_rendered_preview_session_key
+            == self._get_current_live_preview_session_key()
         ):
             self._last_rendered_preview_gen = self.ui_refresh_generation
 
@@ -1850,6 +1845,51 @@ class AppController(QObject):
             return "Saving will restore to main image (backup will be created)."
         return ""
 
+    def get_current_display_native_size(self) -> Tuple[int, int]:
+        """Return native pixel dimensions for the image currently represented in loupe."""
+        if (
+            self._last_rendered_preview is not None
+            and self._last_rendered_preview_index == self.current_index
+            and self._current_live_session_has_geometry_edits()
+            and self._last_rendered_preview_session_key
+            == self._get_current_live_preview_session_key()
+        ):
+            return (
+                int(self._last_rendered_preview.width),
+                int(self._last_rendered_preview.height),
+            )
+
+        if not self.image_files or not (
+            0 <= self.current_index < len(self.image_files)
+        ):
+            return (0, 0)
+
+        try:
+            path = (
+                Path(self.view_override_path)
+                if self.view_override_path
+                else self.image_files[self.current_index].path
+            )
+            mtime = path.stat().st_mtime
+            key = self._key(path)
+            if key is None:
+                return (0, 0)
+
+            cached = self._native_image_size_cache.get(key)
+            if cached is not None and cached[0] == mtime:
+                return (cached[1], cached[2])
+
+            with Image.open(path) as img:
+                width, height = img.size
+                orientation = img.getexif().get(274, 1)
+            if orientation in (5, 6, 7, 8):
+                width, height = height, width
+
+            self._native_image_size_cache[key] = (mtime, int(width), int(height))
+            return (int(width), int(height))
+        except (OSError, TypeError, ValueError):
+            return (0, 0)
+
     def _get_current_auto_adjust_path(self) -> Optional[Path]:
         """Return the currently viewed file path used as the auto-adjust source."""
         if not self.image_files or not (
@@ -1862,6 +1902,15 @@ class AppController(QObject):
             return self.get_active_edit_path(self.current_index)
         except (IndexError, OSError, TypeError, ValueError):
             return None
+
+    def _block_auto_adjust_during_crop(self) -> bool:
+        """Return True after blocking auto-adjust while crop selection is transient."""
+        if self.ui_state and getattr(self.ui_state, "isCropping", False) is True:
+            self.update_status_message(
+                "Apply or cancel the crop before auto-adjusting."
+            )
+            return True
+        return False
 
     def _schedule_auto_adjust_save(self, action_type: str) -> None:
         """Legacy no-op: quick auto-adjust saves are now session-based."""
@@ -1907,6 +1956,49 @@ class AppController(QObject):
             getattr(self.image_editor, "session_id", None),
             int(getattr(self.image_editor, "_edits_rev", 0)),
         )
+
+    def _get_current_live_preview_session_key(
+        self,
+    ) -> Optional[tuple[str, Optional[str]]]:
+        """Return the path/session identity for the active live preview."""
+        info = self._get_current_live_edit_session_info()
+        if info is None:
+            return None
+        active_path_key, session_id, _revision = info
+        return (active_path_key, session_id)
+
+    def _publish_last_rendered_preview_locked(
+        self,
+        decoded: DecodedImage,
+        session_key: Optional[tuple[str, Optional[str]]] = None,
+    ) -> None:
+        """Publish a rendered preview while holding _preview_lock."""
+        self._last_rendered_preview = decoded
+        self._last_rendered_preview_session_key = (
+            session_key
+            if session_key is not None
+            else self._get_current_live_preview_session_key()
+        )
+
+    def _clear_last_rendered_preview_locked(self) -> None:
+        """Clear rendered preview state while holding _preview_lock."""
+        self._last_rendered_preview = None
+        self._last_rendered_preview_session_key = None
+
+    def _has_current_live_preview_for_index(self, index: int) -> bool:
+        """Return True when the rendered preview belongs to the current live edit session."""
+        if self._last_rendered_preview is None:
+            return False
+        if index != self.current_index:
+            return False
+        if self._last_rendered_preview_index != index:
+            return False
+        session_key = self._get_current_live_preview_session_key()
+        if session_key is None:
+            return False
+        if self._last_rendered_preview_session_key != session_key:
+            return False
+        return self._current_live_session_has_meaningful_edits()
 
     def _ensure_live_edit_session_state(self, *, force_reset: bool = False) -> None:
         """Bind dirty-session tracking to the currently loaded editor session."""
@@ -1994,6 +2086,49 @@ class AppController(QObject):
                 return True
 
         return False
+
+    def _current_live_session_has_geometry_edits(self) -> bool:
+        """Return True when live edits change image dimensions/orientation."""
+        if self.image_editor is None:
+            return False
+        if (
+            self.image_editor.current_filepath is None
+            or self.image_editor.original_image is None
+        ):
+            return False
+
+        edits = getattr(self.image_editor, "current_edits", None) or {}
+
+        try:
+            if int(edits.get("rotation", 0)) % 360 != 0:
+                return True
+        except (TypeError, ValueError):
+            return True
+
+        try:
+            if abs(float(edits.get("straighten_angle", 0.0))) > 0.001:
+                return True
+        except (TypeError, ValueError):
+            return True
+
+        crop_box = edits.get("crop_box")
+        if crop_box is not None:
+            try:
+                normalized_crop_box = tuple(int(v) for v in crop_box)
+            except (TypeError, ValueError):
+                return True
+            if normalized_crop_box != (0, 0, 1000, 1000):
+                return True
+
+        return False
+
+    def _should_render_live_preview_full_resolution(self) -> bool:
+        """Use full-res live previews after committed geometry edits."""
+        if self.ui_state is None:
+            return False
+        if self.ui_state.isEditorOpen or self.ui_state.isCropping:
+            return False
+        return self._current_live_session_has_geometry_edits()
 
     def _is_current_live_edit_session_dirty(self) -> bool:
         """Return True when the current session has unsaved edits beyond the latest submitted save."""
@@ -2146,6 +2281,7 @@ class AppController(QObject):
             log.debug("Cleared active auto-adjust state: %s", reason)
 
         if clear_editor and self.image_editor:
+            self._clear_crop_mode_snapshot()
             self.image_editor.clear()
 
     def _has_valid_active_auto_adjust_state(self) -> bool:
@@ -2349,6 +2485,8 @@ class AppController(QObject):
         black_step_points = round(_AUTO_ADJUST_BLACK_STEP * 100)
         if extra_black_steps > 0:
             suffixes.append(f"blacks -{extra_black_steps * black_step_points}pt")
+        elif extra_black_steps < 0:
+            suffixes.append(f"blacks +{-extra_black_steps * black_step_points}pt")
         if suffixes:
             msg = f"{msg}; {', '.join(suffixes)}"
         return msg
@@ -2515,6 +2653,10 @@ class AppController(QObject):
     ) -> Optional[dict[str, Any]]:
         """Capture an immutable save request for the current live editor session."""
         self._last_save_prepare_error = None
+        if self._crop_mode_has_saved_geometry or (
+            self.ui_state and getattr(self.ui_state, "isCropping", False) is True
+        ):
+            self._cancel_crop_transaction_for_session_boundary()
         if not self.image_editor.original_image:
             return None
 
@@ -4400,9 +4542,151 @@ class AppController(QObject):
         self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
 
-    def _reset_crop_only(self):
+    @staticmethod
+    def _normalize_crop_box_tuple(
+        crop_box: Any,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        if crop_box is None:
+            return None
+        try:
+            if hasattr(crop_box, "toVariant"):
+                crop_box = crop_box.toVariant()
+            if isinstance(crop_box, list):
+                crop_box = tuple(crop_box)
+            if not isinstance(crop_box, tuple) or len(crop_box) != 4:
+                return None
+            left, top, right, bottom = [
+                max(0, min(1000, int(value))) for value in crop_box
+            ]
+        except (TypeError, ValueError):
+            return None
+        return (
+            min(left, right),
+            min(top, bottom),
+            max(left, right),
+            max(top, bottom),
+        )
+
+    def _set_crop_overlay_box_only(self, crop_box: Tuple[int, int, int, int]) -> None:
+        if hasattr(self.ui_state, "set_current_crop_box_visual_only"):
+            self.ui_state.set_current_crop_box_visual_only(crop_box)
+            return
+        self.ui_state.currentCropBox = crop_box
+
+    def _clear_crop_mode_snapshot(self) -> None:
+        self._crop_mode_has_saved_geometry = False
+        self._crop_mode_saved_crop_box = None
+        self._crop_mode_saved_straighten_angle = 0.0
+        self._crop_mode_saved_rotation = 0
+        self._crop_mode_saved_path_key = None
+        self._crop_mode_saved_session_id = None
+
+    def _snapshot_crop_mode_geometry(self) -> None:
+        edits = getattr(self.image_editor, "current_edits", None) or {}
+        self._crop_mode_saved_crop_box = self._normalize_crop_box_tuple(
+            edits.get("crop_box")
+        )
+        try:
+            self._crop_mode_saved_straighten_angle = float(
+                edits.get("straighten_angle", 0.0)
+            )
+        except (TypeError, ValueError):
+            self._crop_mode_saved_straighten_angle = 0.0
+        try:
+            self._crop_mode_saved_rotation = int(edits.get("rotation", 0)) % 360
+        except (TypeError, ValueError):
+            self._crop_mode_saved_rotation = 0
+
+        self._crop_mode_saved_path_key = None
+        if self.image_editor.current_filepath is not None:
+            try:
+                self._crop_mode_saved_path_key = self._key(
+                    self.image_editor.current_filepath
+                )
+            except (OSError, TypeError, ValueError):
+                self._crop_mode_saved_path_key = None
+        self._crop_mode_saved_session_id = getattr(
+            self.image_editor, "session_id", None
+        )
+        self._crop_mode_has_saved_geometry = True
+
+    def _restore_crop_mode_geometry(self) -> bool:
+        if not self._crop_mode_has_saved_geometry:
+            return False
+        if not self.image_editor:
+            return False
+
+        if self._crop_mode_saved_path_key and self.image_editor.current_filepath:
+            try:
+                current_path_key = self._key(self.image_editor.current_filepath)
+            except (OSError, TypeError, ValueError):
+                current_path_key = None
+            if current_path_key != self._crop_mode_saved_path_key:
+                return False
+
+        saved_session_id = self._crop_mode_saved_session_id
+        if (
+            saved_session_id is not None
+            and getattr(self.image_editor, "session_id", None) != saved_session_id
+        ):
+            return False
+
+        saved_crop_box = self._crop_mode_saved_crop_box
+        saved_angle = self._crop_mode_saved_straighten_angle
+        saved_rotation = self._crop_mode_saved_rotation
+        changed = False
+        with self.image_editor._lock:
+            edits = self.image_editor.current_edits
+            if edits.get("crop_box") != saved_crop_box:
+                edits["crop_box"] = saved_crop_box
+                changed = True
+
+            try:
+                current_angle = float(edits.get("straighten_angle", 0.0))
+            except (TypeError, ValueError):
+                current_angle = 0.0
+            if not math.isclose(
+                current_angle,
+                saved_angle,
+                rel_tol=1e-5,
+                abs_tol=1e-7,
+            ):
+                edits["straighten_angle"] = saved_angle
+                changed = True
+
+            try:
+                current_rotation = int(edits.get("rotation", 0)) % 360
+            except (TypeError, ValueError):
+                current_rotation = 0
+            if current_rotation != saved_rotation:
+                edits["rotation"] = saved_rotation
+                changed = True
+
+            if changed:
+                self.image_editor._edits_rev += 1
+                self.image_editor._cached_preview = None
+                self.image_editor._cached_rev = -1
+
+        overlay_box = saved_crop_box or (0, 0, 1000, 1000)
+        self._set_crop_overlay_box_only(overlay_box)
+        if hasattr(self.ui_state, "cropRotation"):
+            self.ui_state.cropRotation = 0.0
+        return True
+
+    def _cancel_crop_transaction_for_session_boundary(self) -> None:
+        if self._crop_mode_has_saved_geometry:
+            self._restore_crop_mode_geometry()
+        if self.ui_state and getattr(self.ui_state, "isCropping", False) is True:
+            self.ui_state.isCropRotating = False
+            self.ui_state.isCropping = False
+        self._clear_crop_mode_snapshot()
+
+    def _reset_crop_only(self, *, clear_crop_transaction: bool = True):
         """Resets crop settings (crop box and straighten) to default and exits crop mode, PRESERVING 90-deg rotation."""
+        if clear_crop_transaction:
+            self._clear_crop_mode_snapshot()
         if self.ui_state.isCropping:
+            self.ui_state.isCropRotating = False
             self.ui_state.isCropping = False
             self.update_status_message("Crop mode exited")
         self.ui_state.currentCropBox = (0, 0, 1000, 1000)
@@ -6298,7 +6582,7 @@ class AppController(QObject):
             self.image_editor.reset_edits()
         self._clear_live_edit_session_state()
         with self._preview_lock:
-            self._last_rendered_preview = None
+            self._clear_last_rendered_preview_locked()
 
         self.refresh_image_list()
 
@@ -6345,7 +6629,7 @@ class AppController(QObject):
                 self.image_editor.reset_edits()
             self._clear_live_edit_session_state()
             with self._preview_lock:
-                self._last_rendered_preview = None
+                self._clear_last_rendered_preview_locked()
             self._bump_display_generation()
             if self.image_cache and 0 <= self.current_index < len(self.image_files):
                 self.image_cache.pop_path(self.image_files[self.current_index].path)
@@ -7397,6 +7681,9 @@ class AppController(QObject):
         was kept, or False on failure.  The @Slot annotation coerces
         _REUSED to true for QML callers (none of which inspect the value).
         """
+        if self.ui_state.isCropping:
+            self.update_status_message("Apply or cancel the crop before editing")
+            return False
         try:
             if self.view_override_path:
                 active_path = Path(self.view_override_path)
@@ -7979,6 +8266,9 @@ class AppController(QObject):
                 self._hist_pending = None
             return
 
+        if self.ui_state.isCropping:
+            return
+
         with self._hist_lock:
             self._hist_pending = (zoom, pan_x, pan_y, image_scale)
             self._hist_null_retries = 0  # Fresh request resets retry counter
@@ -8028,9 +8318,11 @@ class AppController(QObject):
 
         # Snap the currently known preview data to avoid racing with the editor.
         # Only use cached preview if it matches the current image to prevent stale histograms.
-        preview_data = self._last_rendered_preview
-        if preview_data and self._last_rendered_preview_index != self.current_index:
-            preview_data = None
+        preview_data = (
+            self._last_rendered_preview
+            if self._has_current_live_preview_for_index(self.current_index)
+            else None
+        )
         if not preview_data:
             # Fallback for initial load if no edit preview yet (could use get_decoded_image?)
             # But histogram is mostly for edits. If preview_data is None, we likely can't compute anyway.
@@ -8231,10 +8523,16 @@ class AppController(QObject):
         if pending:
             self.histogram_timer.start()
 
-    def _kick_preview_worker(self):
+    def _kick_preview_worker(self, *, full_resolution: Optional[bool] = None):
         """Kicks off a background preview render task."""
         if getattr(self, "_shutting_down", False):
             return
+
+        render_full_resolution = (
+            self._should_render_live_preview_full_resolution()
+            if full_resolution is None
+            else full_resolution
+        )
 
         with self._preview_lock:
             if self._preview_inflight:
@@ -8245,11 +8543,16 @@ class AppController(QObject):
             self._preview_pending = False
             self._preview_token += 1
             token = self._preview_token
+            session_key = self._get_current_live_preview_session_key()
 
         # Submit task to dedicated preview executor
         try:
             fut = self._preview_executor.submit(
-                self._render_preview_worker, token, self.image_editor
+                self._render_preview_worker,
+                token,
+                session_key,
+                self.image_editor,
+                render_full_resolution,
             )
             fut.add_done_callback(self._on_preview_done)
         except RuntimeError:
@@ -8258,34 +8561,53 @@ class AppController(QObject):
                 self._preview_inflight = False
 
     @staticmethod
-    def _render_preview_worker(token, image_editor):
+    def _render_preview_worker(
+        token,
+        session_key,
+        image_editor,
+        full_resolution: bool = False,
+    ):
         # Heavy work (PIL apply_edits) happens here off-thread
         try:
-            # allow_compute=True ensures we actually do the work
-            decoded = image_editor.get_preview_data_cached(allow_compute=True)
-            return token, decoded
+            decoded = None
+            if full_resolution:
+                decoded = image_editor.get_full_resolution_preview_data()
+            if decoded is None:
+                # allow_compute=True ensures we actually do the work
+                decoded = image_editor.get_preview_data_cached(allow_compute=True)
+            return token, session_key, decoded
         except Exception:
             log.exception("Preview render failed")
-            return token, None
+            return token, session_key, None
 
     def _on_preview_done(self, fut):
         if getattr(self, "_shutting_down", False):
             return
 
         try:
-            token, decoded = fut.result()
+            token, session_key, decoded = fut.result()
         except Exception:
-            token, decoded = None, None
+            token, session_key, decoded = None, None, None
 
         # Emit from worker thread; Qt will queue to UI thread
-        self.previewReady.emit((token, decoded))
+        self.previewReady.emit((token, session_key, decoded))
 
     @Slot(object)
+    def _emit_preview_accepted_side_effects(self):
+        self.ui_state.currentImageSourceChanged.emit()
+        self.ui_state.highlightStateChanged.emit()
+        self.update_histogram()
+        if self.ui_state._is_darkening:
+            self._update_darken_overlay()
+
     def _apply_preview_result(self, payload):
         if getattr(self, "_shutting_down", False):
             return
 
-        token, decoded = payload
+        try:
+            token, session_key, decoded = payload
+        except (TypeError, ValueError):
+            token, session_key, decoded = None, None, None
         should_kick = False
         should_accept = False
 
@@ -8300,8 +8622,10 @@ class AppController(QObject):
                 decoded is not None
                 and token == self._preview_token
                 and not self._preview_pending
+                and session_key is not None
+                and session_key == self._get_current_live_preview_session_key()
             ):
-                self._last_rendered_preview = decoded
+                self._publish_last_rendered_preview_locked(decoded, session_key)
                 self.ui_refresh_generation += 1
                 self._last_rendered_preview_index = self.current_index
                 self._last_rendered_preview_gen = self.ui_refresh_generation
@@ -8314,12 +8638,7 @@ class AppController(QObject):
 
         # Emit outside lock to avoid holding lock during UI work
         if should_accept:
-            self.ui_state.currentImageSourceChanged.emit()
-            self.ui_state.highlightStateChanged.emit()
-            self.update_histogram()
-            # Keep mask overlay in sync with the preview whenever it changes
-            if self.ui_state._is_darkening:
-                self._update_darken_overlay()
+            self._emit_preview_accepted_side_effects()
 
         # Call directly (not via singleShot) since we're on the UI thread.
         # This prevents race where a new slider event could interleave between
@@ -8331,10 +8650,30 @@ class AppController(QObject):
     def cancel_crop_mode(self):
         """Cancel crop mode without applying changes."""
         if self.ui_state.isCropping:
-            self._reset_crop_only()
-            # Notify UI and kick fresh render
-            self.ui_refresh_generation += 1
-            self._kick_preview_worker()
+            self._restore_crop_mode_geometry()
+            try:
+                decoded = self.image_editor.get_full_resolution_preview_data()
+            except Exception:
+                log.exception("cancel_crop_mode: restored preview render failed")
+                decoded = None
+
+            if decoded is not None:
+                with self._preview_lock:
+                    self._preview_token += 1
+                    self._preview_pending = False
+                    self._publish_last_rendered_preview_locked(decoded)
+                    self.ui_refresh_generation += 1
+                    self._last_rendered_preview_index = self.current_index
+                    self._last_rendered_preview_gen = self.ui_refresh_generation
+
+            self.ui_state.isCropRotating = False
+            self.ui_state.isCropping = False
+            self._clear_crop_mode_snapshot()
+            if decoded is not None:
+                self._emit_preview_accepted_side_effects()
+            else:
+                self.ui_refresh_generation += 1
+                self._kick_preview_worker()
             self.update_status_message("Crop cancelled")
 
     @Slot()
@@ -8344,6 +8683,10 @@ class AppController(QObject):
             # Exiting crop mode: reuse the specialized cleanup
             self.cancel_crop_mode()
         else:
+            if self.ui_state.isEditorOpen:
+                self.update_status_message("Close the editor before cropping")
+                return
+
             # Entering crop mode requires a loaded image with a valid float buffer.
             if not self.image_files or not (
                 0 <= self.current_index < len(self.image_files)
@@ -8359,9 +8702,11 @@ class AppController(QObject):
             if not self.load_image_for_editing():
                 return
 
-            # Reset to full image defaults (UI and Backend)
-            self._reset_crop_only()
+            self._snapshot_crop_mode_geometry()
+            # Reset to full image defaults for this crop transaction only.
+            self._reset_crop_only(clear_crop_transaction=False)
             # Set isCropping to True now that reset is done
+            self.ui_state.isCropRotating = False
             self.ui_state.isCropping = True
 
             self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
@@ -8621,42 +8966,48 @@ class AppController(QObject):
         self.image_editor.set_crop_box(crop_box_raw)
         self.image_editor.set_edit_param("straighten_angle", current_rotation)
 
-        # Render the cropped preview synchronously and publish it as the
-        # current loupe image before clearing crop mode. This guarantees the
-        # QML side re-requests the image URL and the ImageProvider serves the
-        # cropped preview instead of a stale cached full-size frame.
+        # Render the committed crop from the full-resolution master and publish
+        # it before clearing crop mode, so the loupe does not keep showing the
+        # preview-resolution crop used while dragging the overlay.
         try:
-            decoded = self.image_editor.get_preview_data_cached(allow_compute=True)
+            decoded = self.image_editor.get_full_resolution_preview_data()
         except Exception:
-            log.exception("execute_crop: synchronous preview render failed")
+            log.exception("execute_crop: full-resolution render failed")
             decoded = None
 
         if decoded is not None:
             with self._preview_lock:
-                self._last_rendered_preview = decoded
+                # Older preview-worker results may still be in flight from crop
+                # setup/rotation. Invalidate them so they cannot overwrite this
+                # full-resolution committed crop.
+                self._preview_token += 1
+                self._preview_pending = False
+                self._publish_last_rendered_preview_locked(decoded)
                 self.ui_refresh_generation += 1
                 self._last_rendered_preview_index = self.current_index
                 self._last_rendered_preview_gen = self.ui_refresh_generation
 
+        self.ui_state.isCropRotating = False
         self.ui_state.isCropping = False
+        self._clear_crop_mode_snapshot()
         # Do NOT assign ui_state.currentCropBox here — its setter syncs back
         # into image_editor.set_crop_box(), which would overwrite the crop we
         # just committed. The crop overlay is already hidden by
         # `visible: isCropping` in QML, and re-entering crop mode resets the
-        # box via toggle_crop_mode -> _reset_crop_only.
+        # box inside a new crop transaction.
         self.ui_state.resetZoomPan()
         if decoded is not None:
-            self.ui_state.currentImageSourceChanged.emit()
+            self._emit_preview_accepted_side_effects()
         else:
             self._kick_preview_worker()
-        if self.ui_state.isHistogramVisible:
-            self.update_histogram()
         self.update_status_message("Crop applied", timeout=5000)
         log.info("Crop applied to live session for %s", filepath)
 
     @Slot()
     def auto_levels(self):
         """Calculates and applies auto levels (preview only). Returns False if skipped."""
+        if self._block_auto_adjust_during_crop():
+            return False
         if not self.image_files or self.current_index >= len(self.image_files):
             self.update_status_message("No image to adjust")
             return False
@@ -8709,6 +9060,8 @@ class AppController(QObject):
 
     def _seed_active_auto_adjust_state(self) -> Optional[ActiveAutoAdjustState]:
         """Create transient auto-adjust state from the current loaded image."""
+        if self._block_auto_adjust_during_crop():
+            return None
         recommendation = self._compute_auto_levels_recommendation()
         state = self._build_active_auto_adjust_state(recommendation)
         self._active_auto_adjust_state = state
@@ -8764,6 +9117,8 @@ class AppController(QObject):
     @Slot()
     def quick_auto_levels(self):
         """Apply auto levels to the live session without saving yet."""
+        if self._block_auto_adjust_during_crop():
+            return
         if not self.image_files:
             self.update_status_message("No image to adjust")
             return
@@ -8785,6 +9140,8 @@ class AppController(QObject):
     @Slot()
     def quick_auto_adjust(self):
         """Apply AWB and auto-levels to the live session without saving yet."""
+        if self._block_auto_adjust_during_crop():
+            return
         if not self.image_files:
             self.update_status_message("No image to adjust")
             return
@@ -8819,6 +9176,8 @@ class AppController(QObject):
         self,
     ) -> Optional[ActiveAutoAdjustState]:
         """Reuse the live transient state or create a fresh one from current pixels."""
+        if self._block_auto_adjust_during_crop():
+            return None
         if self._has_valid_active_auto_adjust_state():
             return self._active_auto_adjust_state
         if self._ensure_active_image_loaded_for_auto_adjust() is None:
@@ -8828,6 +9187,8 @@ class AppController(QObject):
     @Slot()
     def reduce_auto_adjust_highlights(self):
         """Darken the highlight side by one fixed step in the live session."""
+        if self._block_auto_adjust_during_crop():
+            return
         state = self._ensure_or_seed_active_auto_adjust_state()
         if state is None:
             return
@@ -8838,6 +9199,8 @@ class AppController(QObject):
     @Slot()
     def raise_auto_adjust_whites(self):
         """Raise the white side by one fixed step in the live session."""
+        if self._block_auto_adjust_during_crop():
+            return
         state = self._ensure_or_seed_active_auto_adjust_state()
         if state is None:
             return
@@ -8848,11 +9211,25 @@ class AppController(QObject):
     @Slot()
     def deepen_auto_adjust_blacks(self):
         """Deepen the shadow side by one fixed step in the live session."""
+        if self._block_auto_adjust_during_crop():
+            return
         state = self._ensure_or_seed_active_auto_adjust_state()
         if state is None:
             return
 
         state.extra_black_steps += 1
+        self._apply_auto_adjust_preview(state)
+
+    @Slot()
+    def raise_auto_adjust_blacks(self):
+        """Raise the shadow side by one fixed step in the live session."""
+        if self._block_auto_adjust_during_crop():
+            return
+        state = self._ensure_or_seed_active_auto_adjust_state()
+        if state is None:
+            return
+
+        state.extra_black_steps -= 1
         self._apply_auto_adjust_preview(state)
 
     def _apply_auto_adjust_preview(self, state: ActiveAutoAdjustState) -> None:
@@ -8960,6 +9337,8 @@ class AppController(QObject):
 
     def batch_auto_levels(self):
         """Auto-level every image in the current batch, one at a time via event loop."""
+        if self._block_auto_adjust_during_crop():
+            return
         batch_indices = sorted(self._get_batch_indices())
         if not batch_indices:
             self.update_status_message("No images in batch.")
@@ -9043,6 +9422,8 @@ class AppController(QObject):
     @Slot()
     def quick_auto_white_balance(self):
         """Quickly apply auto white balance to the live session without saving yet."""
+        if self._block_auto_adjust_during_crop():
+            return
         if not self.image_files:
             self.update_status_message("No image to adjust")
             return
@@ -9064,6 +9445,8 @@ class AppController(QObject):
         Returns the detail message string if a correction was applied, or None
         if no change / error.
         """
+        if self._block_auto_adjust_during_crop():
+            return None
         mode = config.get("awb", "mode", fallback="lab")
         if mode == "lab":
             return self.auto_white_balance_lab()
@@ -9563,6 +9946,7 @@ def main(
     debug_cache: bool = False,
     debug_thumb_timing: bool = False,
     debug_thumb_trace: bool = False,
+    start_in_loupe: bool = False,
 ):
     """FastStack Application Entry Point"""
     global _debug_mode, _debug_thumb_timing, _debug_thumb_trace
@@ -9621,7 +10005,7 @@ def main(
                 print(f"  Closest existing path: {check}")
                 break
             check = check.parent
-        print("\nUsage: faststack <directory>")
+        print("\nUsage: faststack [--loupe] <directory>")
         sys.exit(1)
     app.setOrganizationName("FastStack")
     app.setOrganizationDomain("faststack.dev")
@@ -9642,6 +10026,7 @@ def main(
         debug_cache=debug_cache,
         debug_thumb_timing=debug_thumb_timing,
         debug_thumb_trace=debug_thumb_trace,
+        start_in_loupe=start_in_loupe,
     )
     if debug:
         log.info("Startup: after AppController: %.3fs", time.perf_counter() - t0)
@@ -9673,7 +10058,10 @@ def main(
     # Defer heavy loading to after event loop starts so the window appears instantly.
     # controller.load() does disk scanning, image decode, and thumbnail model refresh —
     # all of which can run after the first event loop iteration.
-    QTimer.singleShot(0, controller.load)
+    QTimer.singleShot(
+        0,
+        lambda: controller.load(skip_thumbnail_refresh=start_in_loupe),
+    )
     if debug:
         log.info(
             "Startup: controller.load() deferred to event loop (%.3fs to window)",
@@ -9758,6 +10146,11 @@ def cli():
         "--debugcache", action="store_true", help="Enable debug cache features"
     )
     parser.add_argument(
+        "--loupe",
+        action="store_true",
+        help="Start directly in loupe view and skip initial thumbnail model refresh",
+    )
+    parser.add_argument(
         "--debug-thumbtiming",
         action="store_true",
         help="Enable thumbnail pipeline timing logs (implies --debug)",
@@ -9776,6 +10169,7 @@ def cli():
         debug_cache=args.debugcache,
         debug_thumb_timing=args.debug_thumbtiming,
         debug_thumb_trace=args.debug_thumbtrace,
+        start_in_loupe=args.loupe,
     )
 
 

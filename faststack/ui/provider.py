@@ -2,7 +2,9 @@
 
 import collections
 import logging
+import math
 import threading
+from numbers import Real
 from pathlib import Path
 
 from PySide6.QtCore import Property, QObject, Qt, Signal, Slot
@@ -82,31 +84,61 @@ class ImageProvider(QQuickImageProvider):
             # Also accept the editor-rendered preview when the live edit
             # session holds meaningful edits (e.g. a crop applied outside the
             # editor), so the main loupe reflects those edits immediately.
-            has_live_edits = False
-            live_check = getattr(
-                self.app_controller, "_current_live_session_has_meaningful_edits", None
+            has_current_live_preview = False
+            live_preview_check = getattr(
+                self.app_controller, "_has_current_live_preview_for_index", None
             )
-            if callable(live_check):
+            if callable(live_preview_check):
                 try:
-                    has_live_edits = bool(live_check())
+                    has_current_live_preview = bool(live_preview_check(index))
                 except Exception:
-                    has_live_edits = False
-            use_editor_preview = (
-                (
-                    self.app_controller.ui_state.isEditorOpen
-                    or has_active_auto_adjust
-                    or has_live_edits
-                )
-                and index == self.app_controller.current_index
-                and not self.app_controller.ui_state.isZoomed
+                    has_current_live_preview = False
+            # Whether there is a usable rendered preview buffer for this index.
+            # The stored session key must match the current live edit session so
+            # a preview from an old/replaced editor session can never be served.
+            # This is independent of the meaningful-edits requirement, so a valid
+            # editor-open preview displays without satisfying the stricter
+            # _has_current_live_preview_for_index() check a second time.
+            current_preview_session_key = None
+            get_preview_key = getattr(
+                self.app_controller,
+                "_get_current_live_preview_session_key",
+                None,
+            )
+            if callable(get_preview_key):
+                try:
+                    current_preview_session_key = get_preview_key()
+                except Exception:
+                    current_preview_session_key = None
+
+            has_valid_preview_buffer = (
+                current_preview_session_key is not None
                 and self.app_controller._last_rendered_preview is not None
-                and getattr(self.app_controller, "_last_rendered_preview_index", None)
-                == index
+                and self.app_controller._last_rendered_preview_index == index
+                and getattr(
+                    self.app_controller, "_last_rendered_preview_session_key", None
+                )
+                == current_preview_session_key
                 and (
                     gen is None
                     or getattr(self.app_controller, "_last_rendered_preview_gen", None)
                     == gen
                 )
+            )
+
+            # A committed live preview (session-key match) is sufficient on its
+            # own. When the editor is open or an auto-adjust session is active we
+            # also accept the editor-rendered preview, provided a valid buffer
+            # exists for the current index.
+            use_editor_preview = (
+                (
+                    self.app_controller.ui_state.isEditorOpen
+                    or has_active_auto_adjust
+                    or has_current_live_preview
+                )
+                and index == self.app_controller.current_index
+                and not self.app_controller.ui_state.isZoomed
+                and has_valid_preview_buffer
             )
 
             if _debug:
@@ -145,7 +177,7 @@ class ImageProvider(QQuickImageProvider):
                 if (
                     self.app_controller.ui_state.isEditorOpen
                     or has_active_auto_adjust
-                    or has_live_edits
+                    or has_current_live_preview
                 ) and index == self.app_controller.current_index:
                     qimg = qimg.copy()
                 else:
@@ -235,6 +267,7 @@ class UIState(QObject):
         Signal()
     )  # New signal for when the image loaded in editor changes
     is_cropping_changed = Signal(bool)
+    is_crop_rotating_changed = Signal(bool)
 
     is_histogram_visible_changed = Signal(bool)
     histogram_data_changed = Signal()
@@ -312,6 +345,7 @@ class UIState(QObject):
         # Image Editor State
         self._is_editor_open = False
         self._is_cropping = False
+        self._is_crop_rotating = False
         self._is_histogram_visible = False
         self._histogram_data = {}  # Will be a dict with 'r', 'g', 'b' arrays
         self._brightness = 0.0
@@ -483,6 +517,14 @@ class UIState(QObject):
         if self.isGridViewActive:
             return ""
         return f"image://provider/{self.app_controller.current_index}/{self.app_controller.ui_refresh_generation}"
+
+    @Property(int, notify=currentImageSourceChanged)
+    def currentNativeImageWidth(self):
+        return self.app_controller.get_current_display_native_size()[0]
+
+    @Property(int, notify=currentImageSourceChanged)
+    def currentNativeImageHeight(self):
+        return self.app_controller.get_current_display_native_size()[1]
 
     @Property(str, notify=metadataChanged)
     def currentFilename(self):
@@ -1037,6 +1079,17 @@ class UIState(QObject):
             self._is_cropping = new_value
             self.is_cropping_changed.emit(new_value)
 
+    @Property(bool, notify=is_crop_rotating_changed)
+    def isCropRotating(self) -> bool:
+        return self._is_crop_rotating
+
+    @isCropRotating.setter
+    def isCropRotating(self, new_value: bool):
+        new_value = bool(new_value)
+        if self._is_crop_rotating != new_value:
+            self._is_crop_rotating = new_value
+            self.is_crop_rotating_changed.emit(new_value)
+
     @Property(bool, notify=is_histogram_visible_changed)
     def isHistogramVisible(self) -> bool:
         return self._is_histogram_visible
@@ -1234,8 +1287,7 @@ class UIState(QObject):
             list(self._current_crop_box) if self._current_crop_box is not None else []
         )
 
-    @currentCropBox.setter
-    def currentCropBox(self, new_value):
+    def _normalize_crop_box_value(self, new_value):
         # Convert QJSValue or list to tuple if needed
         original_value = new_value
         try:
@@ -1259,20 +1311,76 @@ class UIState(QObject):
                 type(original_value),
                 e,
             )
+            return None
 
-        # only accept 4-element tuples
-        if (
-            not isinstance(new_value, tuple)
-            or len(new_value) != 4
-            or not all(isinstance(v, (int, float)) for v in new_value)
-        ):
+        if not isinstance(new_value, tuple) or len(new_value) != 4:
             log.warning(
                 "UIState.currentCropBox: ignoring invalid crop box %r", new_value
             )
+            return None
+
+        if not all(isinstance(v, Real) and not isinstance(v, bool) for v in new_value):
+            log.warning(
+                "UIState.currentCropBox: ignoring non-numeric crop box %r", new_value
+            )
+            return None
+
+        try:
+            values = tuple(new_value)
+            left, top, right, bottom = values
+            finite_values = tuple(float(v) for v in values)
+        except (TypeError, ValueError) as e:
+            log.warning(
+                "UIState.currentCropBox: failed to validate crop box %r: %s",
+                new_value,
+                e,
+            )
+            return None
+
+        if not all(math.isfinite(v) for v in finite_values):
+            log.warning(
+                "UIState.currentCropBox: ignoring non-finite crop box %r", new_value
+            )
+            return None
+
+        if not all(0.0 <= v <= 1000.0 for v in finite_values):
+            log.warning(
+                "UIState.currentCropBox: ignoring out-of-range crop box %r", new_value
+            )
+            return None
+
+        if not (left < right and top < bottom):
+            # Transient during drag: QML can briefly emit zero-size or
+            # inverted boxes when the user reverses direction. Reject
+            # silently to avoid log spam.
+            log.debug(
+                "UIState.currentCropBox: ignoring inverted or zero-size crop box %r",
+                new_value,
+            )
+            return None
+
+        return new_value
+
+    def _set_current_crop_box_value(self, new_value) -> bool:
+        if self._current_crop_box == new_value:
+            return False
+        self._current_crop_box = new_value
+        self.current_crop_box_changed.emit(new_value)
+        return True
+
+    def set_current_crop_box_visual_only(self, new_value) -> bool:
+        """Update the crop overlay without mutating the editor session."""
+        new_value = self._normalize_crop_box_value(new_value)
+        if new_value is None:
+            return False
+        return self._set_current_crop_box_value(new_value)
+
+    @currentCropBox.setter
+    def currentCropBox(self, new_value):
+        new_value = self._normalize_crop_box_value(new_value)
+        if new_value is None:
             return
-        if self._current_crop_box != new_value:
-            self._current_crop_box = new_value
-            self.current_crop_box_changed.emit(new_value)
+        if self._set_current_crop_box_value(new_value):
             # Sync with ImageEditor
             if (
                 hasattr(self.app_controller, "image_editor")

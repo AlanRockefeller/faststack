@@ -8,7 +8,11 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 - `l` now runs quick auto-levels, `L` runs auto white balance plus auto-levels, `A` runs quick auto white balance, `-` lowers highlights/whites in 14-point steps, `_` raises whites in 14-point steps, and `=` keeps pushing shadows in 7-point steps inside that live session.
 - Crop and editor edits now keep accumulating in memory on the current image instead of forcing an immediate save or backup churn.
 - The live session is persisted once when you navigate away, start a drag, explicitly save, or quit, so preview stays responsive while drag-out and navigation still get the latest pixels.
-- Updated README/help text and kept the version at 1.6.3.
+- Fixes crop preview behavior so committed crops continue to display correctly when zooming.
+- Adds `+` as the inverse shadow/blacks adjustment for quick auto-adjust.
+- Fixes the Actions → Sort submenu behavior by using a popup instead of a sibling menu.
+- Adds `--loupe` startup mode for faster launch into single-image view on large folders.
+- Updates README shortcut and command-line documentation.
 
 ## 1.6.2 (2026-03-28)
 

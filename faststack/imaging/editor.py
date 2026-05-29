@@ -28,6 +28,7 @@ from faststack.imaging.math_utils import (
     _srgb_to_linear,
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
+from faststack.imaging.prefetch import apply_loupe_color_correction
 from faststack.models import DecodedImage
 
 try:
@@ -1768,35 +1769,21 @@ class ImageEditor:
             # Prepare for computation - snapshot data under lock
             base = self.float_preview.copy() if self.float_preview is not None else None
             edits = dict(self.current_edits)
+            icc_bytes = (
+                self.original_image.info.get("icc_profile")
+                if self.original_image is not None
+                else None
+            )
             rev = self._edits_rev
 
         if base is None:
             return None
 
-        # Heavy computation outside lock using snapshot
-        # base is float32 (H, W, 3) 0-1
-        arr = self._apply_edits(base, edits=edits, for_export=False)
-
-        # Convert to 8-bit for display
-        # Global shoulder is now applied in linear space within _apply_edits()
-        # Just clip to 0-1 as safety clamp
-        arr = np.clip(arr, 0.0, 1.0)
-        # Map to 0-255
-        arr_u8 = (arr * 255).astype(np.uint8)
-
-        if QImage is None:
-            raise ImportError(
-                "PySide6.QtGui.QImage is required for get_preview_data_cached"
-            )
-
-        # Create QImage from buffer
-        img_buffer = arr_u8.tobytes()
-        decoded = DecodedImage(
-            buffer=memoryview(img_buffer),
-            width=arr_u8.shape[1],
-            height=arr_u8.shape[0],
-            bytes_per_line=arr_u8.shape[1] * 3,
-            format=QImage.Format.Format_RGB888,
+        decoded = self._render_decoded_from_float(
+            base,
+            edits=edits,
+            for_export=False,
+            icc_bytes=icc_bytes,
         )
 
         with self._lock:
@@ -1806,6 +1793,69 @@ class ImageEditor:
                 self._cached_rev = rev
 
         return decoded
+
+    def _render_decoded_from_float(
+        self,
+        base: np.ndarray,
+        *,
+        edits: Dict[str, Any],
+        for_export: bool,
+        apply_loupe_color: bool = False,
+        icc_bytes: Optional[bytes] = None,
+        cache_context: Optional[dict] = None,
+    ) -> DecodedImage:
+        """Render edits against a float RGB array and package it for Qt display."""
+        arr = self._apply_edits(
+            base,
+            edits=edits,
+            for_export=for_export,
+            cache_context=cache_context,
+        )
+        arr = np.clip(arr, 0.0, 1.0)
+        arr_u8 = (arr * 255).astype(np.uint8)
+        if apply_loupe_color:
+            arr_u8 = apply_loupe_color_correction(arr_u8, icc_bytes=icc_bytes)
+
+        if QImage is None:
+            raise ImportError(
+                "PySide6.QtGui.QImage is required for rendering decoded image data"
+            )
+
+        img_buffer = arr_u8.tobytes()
+        return DecodedImage(
+            buffer=memoryview(img_buffer),
+            width=arr_u8.shape[1],
+            height=arr_u8.shape[0],
+            bytes_per_line=arr_u8.strides[0],
+            format=QImage.Format.Format_RGB888,
+        )
+
+    def get_full_resolution_preview_data(self) -> Optional[DecodedImage]:
+        """Apply current edits to the full-resolution master for live display."""
+        try:
+            self._ensure_float_image()
+        except RuntimeError:
+            return None
+
+        with self._lock:
+            if self.float_image is None:
+                return None
+            base = self.float_image.copy()
+            edits = dict(self.current_edits)
+            icc_bytes = (
+                self.original_image.info.get("icc_profile")
+                if self.original_image is not None
+                else None
+            )
+
+        return self._render_decoded_from_float(
+            base,
+            edits=edits,
+            for_export=True,
+            apply_loupe_color=True,
+            icc_bytes=icc_bytes,
+            cache_context={},
+        )
 
     def get_preview_data(self) -> Optional[DecodedImage]:
         """Apply current edits and return the data as a DecodedImage."""
