@@ -263,6 +263,7 @@ class UIState(QObject):
     autoLevelStrengthAutoChanged = Signal(bool)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
+    is_editor_expanded_changed = Signal(bool)
     editorImageChanged = (
         Signal()
     )  # New signal for when the image loaded in editor changes
@@ -344,6 +345,7 @@ class UIState(QObject):
         self._status_message = ""  # New private variable for status message
         # Image Editor State
         self._is_editor_open = False
+        self._is_editor_expanded = False
         self._is_cropping = False
         self._is_crop_rotating = False
         self._is_histogram_visible = False
@@ -992,6 +994,16 @@ class UIState(QObject):
         if self._is_editor_open != new_value:
             self._is_editor_open = new_value
             self.is_editor_open_changed.emit(new_value)
+
+    @Property(bool, notify=is_editor_expanded_changed)
+    def isEditorExpanded(self) -> bool:
+        return self._is_editor_expanded
+
+    @isEditorExpanded.setter
+    def isEditorExpanded(self, new_value: bool):
+        if self._is_editor_expanded != new_value:
+            self._is_editor_expanded = new_value
+            self.is_editor_expanded_changed.emit(new_value)
 
     @Property(str, notify=editorImageChanged)
     def editorFilename(self) -> str:

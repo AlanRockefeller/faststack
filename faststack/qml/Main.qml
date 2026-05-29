@@ -798,9 +798,12 @@ ApplicationWindow {
                             actionsMenu.close()
                             return
                         }
-                        root.uiStateRef.isEditorOpen = !root.uiStateRef.isEditorOpen
-                        if (root.uiStateRef.isEditorOpen && root.controllerRef) {
-                            root.controllerRef.load_image_for_editing()
+                        if (root.uiStateRef.isEditorOpen) {
+                            root.uiStateRef.isEditorOpen = false
+                        } else {
+                            root.uiStateRef.isEditorExpanded = false
+                            root.uiStateRef.isEditorOpen = true
+                            if (root.controllerRef) root.controllerRef.load_image_for_editing()
                         }
                     }
                     actionsMenu.close()
@@ -1130,7 +1133,7 @@ ApplicationWindow {
 
     Shortcut {
         sequence: "E"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
         enabled: root.uiStateRef ? !root.uiStateRef.isDialogOpen : true
         onActivated: {
             if (!root.uiStateRef) return
@@ -1143,6 +1146,7 @@ ApplicationWindow {
             if (root.uiStateRef.isEditorOpen) {
                 root.uiStateRef.isEditorOpen = false
             } else {
+                root.uiStateRef.isEditorExpanded = false
                 root.uiStateRef.isEditorOpen = true
                 if (root.controllerRef) {
                     root.controllerRef.load_image_for_editing()
@@ -1844,6 +1848,15 @@ ApplicationWindow {
         windowBackgroundColor: root.currentBackgroundColor
         primaryTextColor: root.currentTextColor
         gridLineColor: root.isDarkTheme ? "#454545" : "#dcdcdc"
+    }
+
+    CompactEditorWindow {
+        id: compactEditorWindow
+        onVisibleChanged: {
+            if (!visible) {
+                mainViewLoader.forceActiveFocus()
+            }
+        }
     }
 
     ImageEditorDialog {

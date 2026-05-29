@@ -1071,6 +1071,16 @@ class AppController(QObject):
         )
         self.eventFilter(self.main_window, event)
 
+    @Slot(int, int, str)
+    def handle_key_from_compact_editor(self, key: int, modifiers: int, text: str):
+        """Forward navigation keys from the compact editor through eventFilter."""
+        from PySide6.QtGui import QKeyEvent
+
+        event = QKeyEvent(
+            QKeyEvent.Type.KeyPress, key, Qt.KeyboardModifier(modifiers), text
+        )
+        self.eventFilter(self.main_window, event)
+
     def eventFilter(self, watched, event) -> bool:
         # Don't handle key events when a dialog is open
         if self._dialog_open:
@@ -1097,9 +1107,12 @@ class AppController(QObject):
                 self.cancel_crop_mode()
                 return True  # Consume event, crop mode cancelled
 
-            # When editing, let QML handle Enter/Esc and related keys.
-            # Otherwise keybinder can swallow them before QML sees them.
-            if getattr(self.ui_state, "isEditorOpen", False):
+            # When editing in full (expanded) mode, let QML handle Enter/Esc
+            # and related keys. In compact mode, the editor is a separate
+            # window so the main window keybinder should still run.
+            if getattr(self.ui_state, "isEditorOpen", False) and getattr(
+                self.ui_state, "isEditorExpanded", False
+            ):
                 return False
 
             # When cropping, let QML handle Enter/Return for crop execution
@@ -2144,6 +2157,11 @@ class AppController(QObject):
             return False
         return self._current_live_session_has_meaningful_edits()
 
+    @Slot(result=bool)
+    def has_unsaved_edits(self) -> bool:
+        """QML-callable: True when the editor has unsaved meaningful edits."""
+        return self._is_current_live_edit_session_dirty()
+
     def _mark_current_live_edit_session_submitted(self, revision: int) -> None:
         """Record that a save request has been queued for the current session revision."""
         state = self._live_edit_session_state
@@ -2950,8 +2968,9 @@ class AppController(QObject):
     @Slot()
     def save_edited_image(self):
         """Save the current live editor session in the background."""
+        close_after = self.ui_state.isEditorOpen and self.ui_state.isEditorExpanded
         request = self._prepare_current_session_save_request(
-            editor_was_open=self.ui_state.isEditorOpen,
+            editor_was_open=close_after,
             success_message="Image saved",
         )
         if request is None:
@@ -2963,7 +2982,7 @@ class AppController(QObject):
         if not self._submit_save_request_async(request, saving_status="Saving..."):
             return
 
-        if self.ui_state.isEditorOpen:
+        if close_after:
             self.ui_state.isEditorOpen = False
 
     @Slot(object)
@@ -8232,6 +8251,18 @@ class AppController(QObject):
         self.set_edit_parameter("rotation", new_rotation)
         if self.ui_state.isHistogramVisible:
             self.update_histogram()
+
+    def toggle_editor(self):
+        """Toggle compact image editor. Called from keybinder E key."""
+        if self.ui_state.isCropping:
+            self.ui_state.statusMessage = "Apply or cancel the crop before editing"
+            return
+        if self.ui_state.isEditorOpen:
+            self.ui_state.isEditorOpen = False
+        else:
+            self.ui_state.isEditorExpanded = False
+            self.ui_state.isEditorOpen = True
+            self.load_image_for_editing()
 
     @Slot()
     def toggle_histogram(self):
