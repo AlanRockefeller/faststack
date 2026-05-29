@@ -1089,6 +1089,8 @@ class AppController(QObject):
             if event.key() == Qt.Key_Escape and getattr(
                 self.ui_state, "isCropping", False
             ):
+                if getattr(self.ui_state, "isCropRotating", False):
+                    return False  # Let the loupe leave rotate mode first.
                 self.cancel_crop_mode()
                 return True  # Consume event, crop mode cancelled
 
@@ -4637,6 +4639,7 @@ class AppController(QObject):
         if self._crop_mode_has_saved_geometry:
             self._restore_crop_mode_geometry()
         if self.ui_state and getattr(self.ui_state, "isCropping", False) is True:
+            self.ui_state.isCropRotating = False
             self.ui_state.isCropping = False
         self._clear_crop_mode_snapshot()
 
@@ -4645,6 +4648,7 @@ class AppController(QObject):
         if clear_crop_transaction:
             self._clear_crop_mode_snapshot()
         if self.ui_state.isCropping:
+            self.ui_state.isCropRotating = False
             self.ui_state.isCropping = False
             self.update_status_message("Crop mode exited")
         self.ui_state.currentCropBox = (0, 0, 1000, 1000)
@@ -8601,6 +8605,7 @@ class AppController(QObject):
                     self._last_rendered_preview_index = self.current_index
                     self._last_rendered_preview_gen = self.ui_refresh_generation
 
+            self.ui_state.isCropRotating = False
             self.ui_state.isCropping = False
             self._clear_crop_mode_snapshot()
             if decoded is not None:
@@ -8636,6 +8641,7 @@ class AppController(QObject):
             # Reset to full image defaults for this crop transaction only.
             self._reset_crop_only(clear_crop_transaction=False)
             # Set isCropping to True now that reset is done
+            self.ui_state.isCropRotating = False
             self.ui_state.isCropping = True
 
             self.ui_state.aspectRatioNames = [r["name"] for r in ASPECT_RATIOS]
@@ -8915,6 +8921,7 @@ class AppController(QObject):
                 self._last_rendered_preview_index = self.current_index
                 self._last_rendered_preview_gen = self.ui_refresh_generation
 
+        self.ui_state.isCropRotating = False
         self.ui_state.isCropping = False
         self._clear_crop_mode_snapshot()
         # Do NOT assign ui_state.currentCropBox here — its setter syncs back

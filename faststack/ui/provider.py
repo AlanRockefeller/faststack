@@ -235,6 +235,7 @@ class UIState(QObject):
         Signal()
     )  # New signal for when the image loaded in editor changes
     is_cropping_changed = Signal(bool)
+    is_crop_rotating_changed = Signal(bool)
 
     is_histogram_visible_changed = Signal(bool)
     histogram_data_changed = Signal()
@@ -312,6 +313,7 @@ class UIState(QObject):
         # Image Editor State
         self._is_editor_open = False
         self._is_cropping = False
+        self._is_crop_rotating = False
         self._is_histogram_visible = False
         self._histogram_data = {}  # Will be a dict with 'r', 'g', 'b' arrays
         self._brightness = 0.0
@@ -1044,6 +1046,17 @@ class UIState(QObject):
         if self._is_cropping != new_value:
             self._is_cropping = new_value
             self.is_cropping_changed.emit(new_value)
+
+    @Property(bool, notify=is_crop_rotating_changed)
+    def isCropRotating(self) -> bool:
+        return self._is_crop_rotating
+
+    @isCropRotating.setter
+    def isCropRotating(self, new_value: bool):
+        new_value = bool(new_value)
+        if self._is_crop_rotating != new_value:
+            self._is_crop_rotating = new_value
+            self.is_crop_rotating_changed.emit(new_value)
 
     @Property(bool, notify=is_histogram_visible_changed)
     def isHistogramVisible(self) -> bool:

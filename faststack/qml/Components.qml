@@ -60,6 +60,25 @@ Item {
     function releaseCropImageSource() {
         cropDragImageSource = ""
     }
+
+    function cancelActiveCropRotation() {
+        if (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping || !mainMouseArea.isRotating) return false
+
+        mainMouseArea.cropRotation = mainMouseArea.cropStartRotation
+        mainMouseArea.clearPendingRotation(mainMouseArea.cropRotation)
+        if (loupeView.controllerRef) loupeView.controllerRef.set_straighten_angle(mainMouseArea.cropRotation, -1)
+
+        mainMouseArea.endCropInteraction()
+        mainMouseArea.isRotating = false
+        return true
+    }
+
+    Shortcut {
+        sequence: "Escape"
+        context: Qt.ApplicationShortcut
+        enabled: loupeView.uiStateRef ? loupeView.uiStateRef.isCropping && loupeView.uiStateRef.isCropRotating && !loupeView.uiStateRef.isDialogOpen : false
+        onActivated: loupeView.cancelActiveCropRotation()
+    }
     
     Connections {
         target: loupeView.uiStateRef
@@ -89,6 +108,7 @@ Item {
                     mainMouseArea.isRotating = false
                     mainMouseArea.cropRotation = 0
                 }
+                if (loupeView.uiStateRef) loupeView.uiStateRef.isCropRotating = false
                 loupeView.releaseCropImageSource()
             }
         }
@@ -97,13 +117,7 @@ Item {
     Keys.onEscapePressed: (event) => {
         if (loupeView.uiStateRef && loupeView.uiStateRef.isCropping) {
             if (mainMouseArea.isRotating) {
-                // Revert rotation
-                mainMouseArea.cropRotation = mainMouseArea.cropStartRotation
-                mainMouseArea.clearPendingRotation(mainMouseArea.cropRotation)
-                if (loupeView.controllerRef) loupeView.controllerRef.set_straighten_angle(mainMouseArea.cropRotation, -1)
-
-                mainMouseArea.endCropInteraction()
-                mainMouseArea.isRotating = false
+                loupeView.cancelActiveCropRotation()
                 event.accepted = true
             } else if (loupeView.controllerRef) {
                 mainMouseArea.clearPendingRotation(0)
@@ -651,6 +665,7 @@ Item {
 
         onIsRotatingChanged: {
             if (loupeView.uiStateRef) {
+                loupeView.uiStateRef.isCropRotating = isRotating && loupeView.uiStateRef.isCropping
                 if (isRotating) {
                     loupeView.uiStateRef.statusMessage = "Press ESC to exit rotate mode"
                 } else {
