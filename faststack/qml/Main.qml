@@ -793,6 +793,11 @@ ApplicationWindow {
                 defaultTextColor: root.currentTextColor
                 onClicked: {
                     if (root.uiStateRef) {
+                        if (root.uiStateRef.isCropping) {
+                            root.uiStateRef.statusMessage = "Apply or cancel the crop before editing"
+                            actionsMenu.close()
+                            return
+                        }
                         root.uiStateRef.isEditorOpen = !root.uiStateRef.isEditorOpen
                         if (root.uiStateRef.isEditorOpen && root.controllerRef) {
                             root.controllerRef.load_image_for_editing()
@@ -1129,6 +1134,11 @@ ApplicationWindow {
         enabled: root.uiStateRef ? !root.uiStateRef.isDialogOpen : true
         onActivated: {
             if (!root.uiStateRef) return
+
+            if (root.uiStateRef.isCropping) {
+                root.uiStateRef.statusMessage = "Apply or cancel the crop before editing"
+                return
+            }
 
             if (root.uiStateRef.isEditorOpen) {
                 root.uiStateRef.isEditorOpen = false

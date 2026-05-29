@@ -93,6 +93,43 @@ class ImageProvider(QQuickImageProvider):
                     has_current_live_preview = bool(live_preview_check(index))
                 except Exception:
                     has_current_live_preview = False
+            # Whether there is a usable rendered preview buffer for this index.
+            # The stored session key must match the current live edit session so
+            # a preview from an old/replaced editor session can never be served.
+            # This is independent of the meaningful-edits requirement, so a valid
+            # editor-open preview displays without satisfying the stricter
+            # _has_current_live_preview_for_index() check a second time.
+            current_preview_session_key = None
+            get_preview_key = getattr(
+                self.app_controller,
+                "_get_current_live_preview_session_key",
+                None,
+            )
+            if callable(get_preview_key):
+                try:
+                    current_preview_session_key = get_preview_key()
+                except Exception:
+                    current_preview_session_key = None
+
+            has_valid_preview_buffer = (
+                current_preview_session_key is not None
+                and self.app_controller._last_rendered_preview is not None
+                and self.app_controller._last_rendered_preview_index == index
+                and getattr(
+                    self.app_controller, "_last_rendered_preview_session_key", None
+                )
+                == current_preview_session_key
+                and (
+                    gen is None
+                    or getattr(self.app_controller, "_last_rendered_preview_gen", None)
+                    == gen
+                )
+            )
+
+            # A committed live preview (session-key match) is sufficient on its
+            # own. When the editor is open or an auto-adjust session is active we
+            # also accept the editor-rendered preview, provided a valid buffer
+            # exists for the current index.
             use_editor_preview = (
                 (
                     self.app_controller.ui_state.isEditorOpen
@@ -101,12 +138,7 @@ class ImageProvider(QQuickImageProvider):
                 )
                 and index == self.app_controller.current_index
                 and not self.app_controller.ui_state.isZoomed
-                and has_current_live_preview
-                and (
-                    gen is None
-                    or getattr(self.app_controller, "_last_rendered_preview_gen", None)
-                    == gen
-                )
+                and has_valid_preview_buffer
             )
 
             if _debug:

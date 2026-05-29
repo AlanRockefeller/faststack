@@ -73,13 +73,6 @@ Item {
         return true
     }
 
-    Shortcut {
-        sequence: "Escape"
-        context: Qt.ApplicationShortcut
-        enabled: loupeView.uiStateRef ? loupeView.uiStateRef.isCropping && loupeView.uiStateRef.isCropRotating && !loupeView.uiStateRef.isDialogOpen : false
-        onActivated: loupeView.cancelActiveCropRotation()
-    }
-    
     Connections {
         target: loupeView.uiStateRef
         function onCurrentIndexChanged() {
@@ -123,7 +116,7 @@ Item {
                 mainMouseArea.clearPendingRotation(0)
                 mainMouseArea.endCropInteraction()
                 loupeView.controllerRef.cancel_crop_mode()
-                mainMouseArea.cropRotation = 0 // Reset local rotation
+                mainMouseArea.cropRotation = 0
                 mainMouseArea.isRotating = false
                 event.accepted = true
             }

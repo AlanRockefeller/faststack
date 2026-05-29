@@ -7681,6 +7681,9 @@ class AppController(QObject):
         was kept, or False on failure.  The @Slot annotation coerces
         _REUSED to true for QML callers (none of which inspect the value).
         """
+        if self.ui_state.isCropping:
+            self.update_status_message("Apply or cancel the crop before editing")
+            return False
         try:
             if self.view_override_path:
                 active_path = Path(self.view_override_path)
@@ -8652,6 +8655,7 @@ class AppController(QObject):
             if decoded is not None:
                 with self._preview_lock:
                     self._preview_token += 1
+                    self._preview_pending = False
                     self._publish_last_rendered_preview_locked(decoded)
                     self.ui_refresh_generation += 1
                     self._last_rendered_preview_index = self.current_index
@@ -8674,6 +8678,10 @@ class AppController(QObject):
             # Exiting crop mode: reuse the specialized cleanup
             self.cancel_crop_mode()
         else:
+            if self.ui_state.isEditorOpen:
+                self.update_status_message("Close the editor before cropping")
+                return
+
             # Entering crop mode requires a loaded image with a valid float buffer.
             if not self.image_files or not (
                 0 <= self.current_index < len(self.image_files)
@@ -8968,6 +8976,7 @@ class AppController(QObject):
                 # setup/rotation. Invalidate them so they cannot overwrite this
                 # full-resolution committed crop.
                 self._preview_token += 1
+                self._preview_pending = False
                 self._publish_last_rendered_preview_locked(decoded)
                 self.ui_refresh_generation += 1
                 self._last_rendered_preview_index = self.current_index
