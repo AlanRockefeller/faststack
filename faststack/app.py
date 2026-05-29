@@ -1073,13 +1073,13 @@ class AppController(QObject):
 
     @Slot(int, int, str)
     def handle_key_from_compact_editor(self, key: int, modifiers: int, text: str):
-        """Forward navigation keys from the compact editor to main window."""
+        """Forward navigation keys from the compact editor through eventFilter."""
         from PySide6.QtGui import QKeyEvent
 
         event = QKeyEvent(
             QKeyEvent.Type.KeyPress, key, Qt.KeyboardModifier(modifiers), text
         )
-        self.keybinder.handle_key_press(event)
+        self.eventFilter(self.main_window, event)
 
     def eventFilter(self, watched, event) -> bool:
         # Don't handle key events when a dialog is open
@@ -2968,8 +2968,9 @@ class AppController(QObject):
     @Slot()
     def save_edited_image(self):
         """Save the current live editor session in the background."""
+        close_after = self.ui_state.isEditorOpen and self.ui_state.isEditorExpanded
         request = self._prepare_current_session_save_request(
-            editor_was_open=self.ui_state.isEditorOpen,
+            editor_was_open=close_after,
             success_message="Image saved",
         )
         if request is None:
@@ -2981,7 +2982,7 @@ class AppController(QObject):
         if not self._submit_save_request_async(request, saving_status="Saving..."):
             return
 
-        if self.ui_state.isEditorOpen and self.ui_state.isEditorExpanded:
+        if close_after:
             self.ui_state.isEditorOpen = False
 
     @Slot(object)
@@ -3100,10 +3101,7 @@ class AppController(QObject):
                 # 1. Editor Cleanup (only if revision is unchanged)
                 if still_on_identical_revision:
                     if editor_was_open:
-                        if (
-                            self.ui_state.isEditorOpen
-                            and self.ui_state.isEditorExpanded
-                        ):
+                        if self.ui_state.isEditorOpen:
                             self.ui_state.isEditorOpen = False
                         # Closing triggers _on_editor_open_changed -> image_editor.clear()
                         # but we call it explicitly here just in case they closed it manually.

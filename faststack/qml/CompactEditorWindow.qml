@@ -70,6 +70,14 @@ Window {
 
     property int updatePulse: 0
     property int lastLoadedIndex: -1
+    property string closeTooltip: "Close editor"
+
+    function refreshCloseTooltip() {
+        if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits())
+            compactEditor.closeTooltip = "Discard unsaved edits and close"
+        else
+            compactEditor.closeTooltip = "Close editor"
+    }
 
     Timer {
         id: deferredLoadTimer
@@ -245,6 +253,10 @@ Window {
                     Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
                     padding: 0
                     flat: true
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 500
+                    ToolTip.text: compactEditor.closeTooltip
+                    onHoveredChanged: if (hovered) compactEditor.refreshCloseTooltip()
                     onClicked: {
                         if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits()) {
                             discardDialog.open()
@@ -558,6 +570,10 @@ Window {
                     Layout.preferredWidth: 60
                     Layout.preferredHeight: 28
                     font.pixelSize: 11
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 500
+                    ToolTip.text: compactEditor.closeTooltip
+                    onHoveredChanged: if (hovered) compactEditor.refreshCloseTooltip()
                     onClicked: {
                         if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits()) {
                             discardDialog.open()
