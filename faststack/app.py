@@ -8266,6 +8266,9 @@ class AppController(QObject):
                 self._hist_pending = None
             return
 
+        if self.ui_state.isCropping:
+            return
+
         with self._hist_lock:
             self._hist_pending = (zoom, pan_x, pan_y, image_scale)
             self._hist_null_retries = 0  # Fresh request resets retry counter
@@ -8590,6 +8593,13 @@ class AppController(QObject):
         self.previewReady.emit((token, session_key, decoded))
 
     @Slot(object)
+    def _emit_preview_accepted_side_effects(self):
+        self.ui_state.currentImageSourceChanged.emit()
+        self.ui_state.highlightStateChanged.emit()
+        self.update_histogram()
+        if self.ui_state._is_darkening:
+            self._update_darken_overlay()
+
     def _apply_preview_result(self, payload):
         if getattr(self, "_shutting_down", False):
             return
@@ -8628,12 +8638,7 @@ class AppController(QObject):
 
         # Emit outside lock to avoid holding lock during UI work
         if should_accept:
-            self.ui_state.currentImageSourceChanged.emit()
-            self.ui_state.highlightStateChanged.emit()
-            self.update_histogram()
-            # Keep mask overlay in sync with the preview whenever it changes
-            if self.ui_state._is_darkening:
-                self._update_darken_overlay()
+            self._emit_preview_accepted_side_effects()
 
         # Call directly (not via singleShot) since we're on the UI thread.
         # This prevents race where a new slider event could interleave between
@@ -8665,7 +8670,7 @@ class AppController(QObject):
             self.ui_state.isCropping = False
             self._clear_crop_mode_snapshot()
             if decoded is not None:
-                self.ui_state.currentImageSourceChanged.emit()
+                self._emit_preview_accepted_side_effects()
             else:
                 self.ui_refresh_generation += 1
                 self._kick_preview_worker()
@@ -8992,11 +8997,9 @@ class AppController(QObject):
         # box inside a new crop transaction.
         self.ui_state.resetZoomPan()
         if decoded is not None:
-            self.ui_state.currentImageSourceChanged.emit()
+            self._emit_preview_accepted_side_effects()
         else:
             self._kick_preview_worker()
-        if self.ui_state.isHistogramVisible:
-            self.update_histogram()
         self.update_status_message("Crop applied", timeout=5000)
         log.info("Crop applied to live session for %s", filepath)
 
