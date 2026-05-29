@@ -212,6 +212,7 @@ class AppController(QObject):
         debug_cache: bool = False,
         debug_thumb_timing: bool = False,
         debug_thumb_trace: bool = False,
+        start_in_loupe: bool = False,
     ):
         super().__init__()
         self.debug_thumb_timing = debug_thumb_timing
@@ -379,7 +380,7 @@ class AppController(QObject):
         )  # Protect last_displayed_image from race conditions
 
         # -- Grid View (Thumbnail) Infrastructure --
-        self._is_grid_view_active = True  # Default to grid view on startup
+        self._is_grid_view_active = not start_in_loupe  # Default to grid view
         self._grid_nav_history: list[Path] = (
             []
         )  # Stack of previous directories for back navigation
@@ -471,6 +472,7 @@ class AppController(QObject):
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
         self._exif_brief_cache: dict = {}  # normalized path key → formatted EXIF string
+        self._native_image_size_cache: Dict[str, tuple[float, int, int]] = {}
         self._exif_pending_path: Optional[str] = (
             None  # path currently awaiting EXIF read
         )
@@ -1227,6 +1229,9 @@ class AppController(QObject):
 
         self._set_folder_loaded(True)
 
+        if not self._is_grid_view_active:
+            self._maybe_decode_current_image("startup-loupe")
+
         log.info(
             "Load summary: scans=variant:%d grid_refreshes:%d",
             self._scan_count_variant,
@@ -1832,6 +1837,49 @@ class AppController(QObject):
         if self.view_override_path and self._get_save_target_path_for_current_view():
             return "Saving will restore to main image (backup will be created)."
         return ""
+
+    def get_current_display_native_size(self) -> Tuple[int, int]:
+        """Return native pixel dimensions for the image currently represented in loupe."""
+        if (
+            self._last_rendered_preview is not None
+            and self._last_rendered_preview_index == self.current_index
+            and self._current_live_session_has_geometry_edits()
+        ):
+            return (
+                int(self._last_rendered_preview.width),
+                int(self._last_rendered_preview.height),
+            )
+
+        if not self.image_files or not (
+            0 <= self.current_index < len(self.image_files)
+        ):
+            return (0, 0)
+
+        try:
+            path = (
+                Path(self.view_override_path)
+                if self.view_override_path
+                else self.image_files[self.current_index].path
+            )
+            mtime = path.stat().st_mtime
+            key = self._key(path)
+            if key is None:
+                return (0, 0)
+
+            cached = self._native_image_size_cache.get(key)
+            if cached is not None and cached[0] == mtime:
+                return (cached[1], cached[2])
+
+            with Image.open(path) as img:
+                width, height = img.size
+                orientation = img.getexif().get(274, 1)
+            if orientation in (5, 6, 7, 8):
+                width, height = height, width
+
+            self._native_image_size_cache[key] = (mtime, int(width), int(height))
+            return (int(width), int(height))
+        except (OSError, TypeError, ValueError):
+            return (0, 0)
 
     def _get_current_auto_adjust_path(self) -> Optional[Path]:
         """Return the currently viewed file path used as the auto-adjust source."""
@@ -9827,6 +9875,7 @@ def main(
     debug_cache: bool = False,
     debug_thumb_timing: bool = False,
     debug_thumb_trace: bool = False,
+    start_in_loupe: bool = False,
 ):
     """FastStack Application Entry Point"""
     global _debug_mode, _debug_thumb_timing, _debug_thumb_trace
@@ -9885,7 +9934,7 @@ def main(
                 print(f"  Closest existing path: {check}")
                 break
             check = check.parent
-        print("\nUsage: faststack <directory>")
+        print("\nUsage: faststack [--loupe] <directory>")
         sys.exit(1)
     app.setOrganizationName("FastStack")
     app.setOrganizationDomain("faststack.dev")
@@ -9906,6 +9955,7 @@ def main(
         debug_cache=debug_cache,
         debug_thumb_timing=debug_thumb_timing,
         debug_thumb_trace=debug_thumb_trace,
+        start_in_loupe=start_in_loupe,
     )
     if debug:
         log.info("Startup: after AppController: %.3fs", time.perf_counter() - t0)
@@ -9937,7 +9987,10 @@ def main(
     # Defer heavy loading to after event loop starts so the window appears instantly.
     # controller.load() does disk scanning, image decode, and thumbnail model refresh —
     # all of which can run after the first event loop iteration.
-    QTimer.singleShot(0, controller.load)
+    QTimer.singleShot(
+        0,
+        lambda: controller.load(skip_thumbnail_refresh=start_in_loupe),
+    )
     if debug:
         log.info(
             "Startup: controller.load() deferred to event loop (%.3fs to window)",
@@ -10022,6 +10075,11 @@ def cli():
         "--debugcache", action="store_true", help="Enable debug cache features"
     )
     parser.add_argument(
+        "--loupe",
+        action="store_true",
+        help="Start directly in loupe view and skip initial thumbnail model refresh",
+    )
+    parser.add_argument(
         "--debug-thumbtiming",
         action="store_true",
         help="Enable thumbnail pipeline timing logs (implies --debug)",
@@ -10040,6 +10098,7 @@ def cli():
         debug_cache=args.debugcache,
         debug_thumb_timing=args.debug_thumbtiming,
         debug_thumb_trace=args.debug_thumbtrace,
+        start_in_loupe=args.loupe,
     )
 
 

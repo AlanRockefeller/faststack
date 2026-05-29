@@ -20,6 +20,18 @@ Item {
     // Expose zoom state to parent (Main.qml title bar)
     readonly property real currentZoomScale: imageRotator.zoomScale
     readonly property real currentFitScale: imageRotator.fitScale
+    readonly property real currentPixelZoomScale: {
+        if (!loupeView.uiStateRef || !mainImage || mainImage.sourceSize.width <= 0 || mainImage.sourceSize.height <= 0) return currentZoomScale
+
+        var nativeW = loupeView.uiStateRef.currentNativeImageWidth
+        var nativeH = loupeView.uiStateRef.currentNativeImageHeight
+        if (nativeW <= 0 || nativeH <= 0) return currentZoomScale
+
+        var scaleW = imageRotator.zoomScale * mainImage.sourceSize.width / nativeW
+        var scaleH = imageRotator.zoomScale * mainImage.sourceSize.height / nativeH
+        if (scaleW > 0 && scaleH > 0) return Math.min(scaleW, scaleH)
+        return currentZoomScale
+    }
     // Freeze the displayed source for the full crop session once crop mode
     // starts. Zoom-triggered high-res swaps stay blocked until crop mode exits,
     // because any async source swap during cropping can rescale the image and

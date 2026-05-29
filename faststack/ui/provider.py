@@ -484,6 +484,14 @@ class UIState(QObject):
             return ""
         return f"image://provider/{self.app_controller.current_index}/{self.app_controller.ui_refresh_generation}"
 
+    @Property(int, notify=currentImageSourceChanged)
+    def currentNativeImageWidth(self):
+        return self.app_controller.get_current_display_native_size()[0]
+
+    @Property(int, notify=currentImageSourceChanged)
+    def currentNativeImageHeight(self):
+        return self.app_controller.get_current_display_native_size()[1]
+
     @Property(str, notify=metadataChanged)
     def currentFilename(self):
         if not self.app_controller.image_files:

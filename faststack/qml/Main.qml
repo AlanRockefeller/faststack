@@ -434,13 +434,14 @@ ApplicationWindow {
             property var loupe: mainViewLoader.item
             property real zs: loupe ? loupe.currentZoomScale : 0
             property real fs: loupe ? loupe.currentFitScale : 0
+            property real ps: loupe ? loupe.currentPixelZoomScale : 0
 
             text: {
-                if (!loupe || fs <= 0 || zs <= 0) return ""
+                if (!loupe || fs <= 0 || zs <= 0 || ps <= 0) return ""
                 if (root.uiStateRef && root.uiStateRef.isGridViewActive) return ""
                 var ratio = zs / fs
-                if (Math.abs(ratio - 1.0) < 0.03) return "Zoom: Fit to window (" + Math.round(zs * 100) + "%)"
-                return "Zoom: " + Math.round(zs * 100) + "%"
+                if (Math.abs(ratio - 1.0) < 0.03) return "Zoom: Fit to window (" + Math.round(ps * 100) + "%)"
+                return "Zoom: " + Math.round(ps * 100) + "%"
             }
         }
 

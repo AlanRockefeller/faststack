@@ -58,6 +58,7 @@ FastStack performs best on Python 3.12 due to PySide6 compatibility.
 4.  **Run:**
     ```bash
     faststack
+    faststack --loupe /path/to/photos  # start in loupe view, skip initial thumbnails
     ```
 
 ### Windows / Linux
@@ -67,6 +68,31 @@ python -m venv venv
 pip install .
 faststack
 ```
+
+Start directly in single-image loupe view when you want faster startup on large
+folders and do not need the thumbnail grid immediately:
+
+```bash
+faststack --loupe "C:\path\to\photos"
+```
+
+### Command Line Options
+
+```text
+faststack [options] [image_dir]
+python -m faststack.app [options] [image_dir]
+```
+
+- `image_dir`: Optional directory of images to open. If omitted, FastStack uses
+  the configured default directory or prompts for one.
+- `--loupe`: Start directly in single-image loupe view and skip the initial
+  thumbnail grid refresh for faster startup on large folders.
+- `--debug`: Enable verbose debug logging and timing information.
+- `--debugcache`: Enable cache telemetry/debug output.
+- `--debug-thumbtiming`: Enable thumbnail pipeline timing logs. Implies
+  `--debug`.
+- `--debug-thumbtrace`: Enable detailed thumbnail pipeline trace logs. Implies
+  `--debug`.
 
 ### Windows Performance Note
 On Windows, `PyTurboJPEG` also needs the native `libjpeg-turbo` library (`turbojpeg.dll`).
