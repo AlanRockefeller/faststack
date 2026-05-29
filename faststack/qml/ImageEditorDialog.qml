@@ -14,7 +14,7 @@ Window {
     property var uiStateRef: null
     property var controllerRef: null
     title: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.editorFilename ? "Image Editor - " + imageEditorDialog.uiStateRef.editorFilename + " (" + imageEditorDialog.uiStateRef.editorBitDepth + "-bit)" : "Image Editor"
-    visible: imageEditorDialog.uiStateRef ? imageEditorDialog.uiStateRef.isEditorOpen : false
+    visible: imageEditorDialog.uiStateRef ? (imageEditorDialog.uiStateRef.isEditorOpen && imageEditorDialog.uiStateRef.isEditorExpanded) : false
     flags: Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
     Settings {
         id: histSettings
@@ -491,7 +491,7 @@ Window {
                     spacing: 10
 
                     // Reset (Tertiary)
-                    Button { 
+                    Button {
                         id: resetButton
                         text: "Reset"
                         flat: true
@@ -500,6 +500,23 @@ Window {
                         onClicked: {
                             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.reset_edit_parameters()
                             imageEditorDialog.updatePulse++
+                        }
+                        background: Rectangle {
+                            color: "transparent"
+                            radius: 4
+                            border.color: "transparent"
+                        }
+                    }
+
+                    // Compact (collapse to compact editor)
+                    Button {
+                        id: compactButton
+                        text: "Compact"
+                        flat: true
+                        Layout.preferredWidth: 80
+                        Material.foreground: "#6b6764"
+                        onClicked: {
+                            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorExpanded = false
                         }
                         background: Rectangle {
                             color: "transparent"
