@@ -1769,6 +1769,11 @@ class ImageEditor:
             # Prepare for computation - snapshot data under lock
             base = self.float_preview.copy() if self.float_preview is not None else None
             edits = dict(self.current_edits)
+            icc_bytes = (
+                self.original_image.info.get("icc_profile")
+                if self.original_image is not None
+                else None
+            )
             rev = self._edits_rev
 
         if base is None:
@@ -1778,6 +1783,7 @@ class ImageEditor:
             base,
             edits=edits,
             for_export=False,
+            icc_bytes=icc_bytes,
         )
 
         with self._lock:
@@ -1795,16 +1801,19 @@ class ImageEditor:
         edits: Dict[str, Any],
         for_export: bool,
         apply_loupe_color: bool = False,
+        icc_bytes: Optional[bytes] = None,
+        cache_context: Optional[dict] = None,
     ) -> DecodedImage:
         """Render edits against a float RGB array and package it for Qt display."""
-        arr = self._apply_edits(base, edits=edits, for_export=for_export)
+        arr = self._apply_edits(
+            base,
+            edits=edits,
+            for_export=for_export,
+            cache_context=cache_context,
+        )
         arr = np.clip(arr, 0.0, 1.0)
         arr_u8 = (arr * 255).astype(np.uint8)
         if apply_loupe_color:
-            icc_bytes = None
-            with self._lock:
-                if self.original_image is not None:
-                    icc_bytes = self.original_image.info.get("icc_profile")
             arr_u8 = apply_loupe_color_correction(arr_u8, icc_bytes=icc_bytes)
 
         if QImage is None:
@@ -1833,12 +1842,19 @@ class ImageEditor:
                 return None
             base = self.float_image.copy()
             edits = dict(self.current_edits)
+            icc_bytes = (
+                self.original_image.info.get("icc_profile")
+                if self.original_image is not None
+                else None
+            )
 
         return self._render_decoded_from_float(
             base,
             edits=edits,
             for_export=True,
             apply_loupe_color=True,
+            icc_bytes=icc_bytes,
+            cache_context={},
         )
 
     def get_preview_data(self) -> Optional[DecodedImage]:

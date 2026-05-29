@@ -384,17 +384,17 @@ Item {
                 // Crop overlay - anchored to mainImage to rotate with it
                 Item {
                     id: cropOverlay
-                    property bool hasActiveCrop: {
+                    property bool isFullImageCrop: {
                         var b = _liveCropBox()
-                        return b && b.length === 4 && !(b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000)
+                        return b && b.length === 4 && b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000
                     }
-                    property bool hasDrawableCrop: {
+                    property bool hasPositiveCrop: {
                         var b = _liveCropBox()
                         return b && b.length === 4 && (b[2] - b[0]) > 0 && (b[3] - b[1]) > 0
-                               && !(b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000)
                     }
-                    // Show visual content only when there is an actual user-drawn crop or rotate mode.
-                    property bool showCropContent: hasActiveCrop || mainMouseArea.isRotating || mainMouseArea.isCropDragging
+                    property bool hasDrawableCrop: hasPositiveCrop && !isFullImageCrop
+                    // Show visual content only for a real crop box or rotate mode.
+                    property bool showCropContent: hasDrawableCrop || mainMouseArea.isRotating
 
                     property int _cropBoxRev: 0
                     Connections {
@@ -433,7 +433,7 @@ Item {
                         // Rotation Handle Line
                         Rectangle {
                             id: handleLine
-                            visible: mainMouseArea.isRotating
+                            visible: cropOverlay.hasDrawableCrop && mainMouseArea.isRotating
                             width: 2 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
                             height: 25 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
                             color: "white"
@@ -444,7 +444,7 @@ Item {
                         // Rotation Knob
                         Rectangle {
                             id: rotateKnob
-                            visible: mainMouseArea.isRotating
+                            visible: cropOverlay.hasDrawableCrop && mainMouseArea.isRotating
                             width: 12 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
                             height: 12 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
                             radius: width / 2
@@ -715,7 +715,6 @@ Item {
             cropStartX = mouseX
             cropStartY = mouseY
             setCropBoxStart(clampedMx, clampedMy, clampedMx, clampedMy)
-            loupeView.uiStateRef.currentCropBox = [Math.round(clampedMx), Math.round(clampedMy), Math.round(clampedMx), Math.round(clampedMy)]
         }
 
         function beginCropInteraction() {

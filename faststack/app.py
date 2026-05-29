@@ -266,6 +266,9 @@ class AppController(QObject):
         self._preview_token = 0
         self._preview_lock = threading.Lock()
         self._last_rendered_preview = None  # Store latest valid render
+        self._last_rendered_preview_session_key: Optional[tuple[str, Optional[str]]] = (
+            None
+        )
         self._shutting_down = False  # Flag to gate async callbacks during shutdown
         self._refresh_scheduled = False  # Coalesce guard for deferred disk refresh
         self._opencv_warning_shown = False  # Only show OpenCV warning once per session
@@ -625,7 +628,7 @@ class AppController(QObject):
 
             if not keep_preview:
                 with self._preview_lock:
-                    self._last_rendered_preview = None
+                    self._clear_last_rendered_preview_locked()
 
     def is_valid_working_tif(self, path: Path) -> bool:
         """Checks if a working TIFF path is valid for editing."""
@@ -1781,6 +1784,8 @@ class AppController(QObject):
         if (
             self._last_rendered_preview is not None
             and self._last_rendered_preview_index == self.current_index
+            and self._last_rendered_preview_session_key
+            == self._get_current_live_preview_session_key()
         ):
             self._last_rendered_preview_gen = self.ui_refresh_generation
 
@@ -1846,6 +1851,8 @@ class AppController(QObject):
             self._last_rendered_preview is not None
             and self._last_rendered_preview_index == self.current_index
             and self._current_live_session_has_geometry_edits()
+            and self._last_rendered_preview_session_key
+            == self._get_current_live_preview_session_key()
         ):
             return (
                 int(self._last_rendered_preview.width),
@@ -1950,6 +1957,34 @@ class AppController(QObject):
             int(getattr(self.image_editor, "_edits_rev", 0)),
         )
 
+    def _get_current_live_preview_session_key(
+        self,
+    ) -> Optional[tuple[str, Optional[str]]]:
+        """Return the path/session identity for the active live preview."""
+        info = self._get_current_live_edit_session_info()
+        if info is None:
+            return None
+        active_path_key, session_id, _revision = info
+        return (active_path_key, session_id)
+
+    def _publish_last_rendered_preview_locked(
+        self,
+        decoded: DecodedImage,
+        session_key: Optional[tuple[str, Optional[str]]] = None,
+    ) -> None:
+        """Publish a rendered preview while holding _preview_lock."""
+        self._last_rendered_preview = decoded
+        self._last_rendered_preview_session_key = (
+            session_key
+            if session_key is not None
+            else self._get_current_live_preview_session_key()
+        )
+
+    def _clear_last_rendered_preview_locked(self) -> None:
+        """Clear rendered preview state while holding _preview_lock."""
+        self._last_rendered_preview = None
+        self._last_rendered_preview_session_key = None
+
     def _has_current_live_preview_for_index(self, index: int) -> bool:
         """Return True when the rendered preview belongs to the current live edit session."""
         if self._last_rendered_preview is None:
@@ -1958,7 +1993,10 @@ class AppController(QObject):
             return False
         if self._last_rendered_preview_index != index:
             return False
-        if self._get_current_live_edit_session_info() is None:
+        session_key = self._get_current_live_preview_session_key()
+        if session_key is None:
+            return False
+        if self._last_rendered_preview_session_key != session_key:
             return False
         return self._current_live_session_has_meaningful_edits()
 
@@ -6544,7 +6582,7 @@ class AppController(QObject):
             self.image_editor.reset_edits()
         self._clear_live_edit_session_state()
         with self._preview_lock:
-            self._last_rendered_preview = None
+            self._clear_last_rendered_preview_locked()
 
         self.refresh_image_list()
 
@@ -6591,7 +6629,7 @@ class AppController(QObject):
                 self.image_editor.reset_edits()
             self._clear_live_edit_session_state()
             with self._preview_lock:
-                self._last_rendered_preview = None
+                self._clear_last_rendered_preview_locked()
             self._bump_display_generation()
             if self.image_cache and 0 <= self.current_index < len(self.image_files):
                 self.image_cache.pop_path(self.image_files[self.current_index].path)
@@ -8274,9 +8312,11 @@ class AppController(QObject):
 
         # Snap the currently known preview data to avoid racing with the editor.
         # Only use cached preview if it matches the current image to prevent stale histograms.
-        preview_data = self._last_rendered_preview
-        if preview_data and self._last_rendered_preview_index != self.current_index:
-            preview_data = None
+        preview_data = (
+            self._last_rendered_preview
+            if self._has_current_live_preview_for_index(self.current_index)
+            else None
+        )
         if not preview_data:
             # Fallback for initial load if no edit preview yet (could use get_decoded_image?)
             # But histogram is mostly for edits. If preview_data is None, we likely can't compute anyway.
@@ -8497,12 +8537,14 @@ class AppController(QObject):
             self._preview_pending = False
             self._preview_token += 1
             token = self._preview_token
+            session_key = self._get_current_live_preview_session_key()
 
         # Submit task to dedicated preview executor
         try:
             fut = self._preview_executor.submit(
                 self._render_preview_worker,
                 token,
+                session_key,
                 self.image_editor,
                 render_full_resolution,
             )
@@ -8513,7 +8555,12 @@ class AppController(QObject):
                 self._preview_inflight = False
 
     @staticmethod
-    def _render_preview_worker(token, image_editor, full_resolution: bool = False):
+    def _render_preview_worker(
+        token,
+        session_key,
+        image_editor,
+        full_resolution: bool = False,
+    ):
         # Heavy work (PIL apply_edits) happens here off-thread
         try:
             decoded = None
@@ -8522,29 +8569,32 @@ class AppController(QObject):
             if decoded is None:
                 # allow_compute=True ensures we actually do the work
                 decoded = image_editor.get_preview_data_cached(allow_compute=True)
-            return token, decoded
+            return token, session_key, decoded
         except Exception:
             log.exception("Preview render failed")
-            return token, None
+            return token, session_key, None
 
     def _on_preview_done(self, fut):
         if getattr(self, "_shutting_down", False):
             return
 
         try:
-            token, decoded = fut.result()
+            token, session_key, decoded = fut.result()
         except Exception:
-            token, decoded = None, None
+            token, session_key, decoded = None, None, None
 
         # Emit from worker thread; Qt will queue to UI thread
-        self.previewReady.emit((token, decoded))
+        self.previewReady.emit((token, session_key, decoded))
 
     @Slot(object)
     def _apply_preview_result(self, payload):
         if getattr(self, "_shutting_down", False):
             return
 
-        token, decoded = payload
+        try:
+            token, session_key, decoded = payload
+        except (TypeError, ValueError):
+            token, session_key, decoded = None, None, None
         should_kick = False
         should_accept = False
 
@@ -8559,8 +8609,10 @@ class AppController(QObject):
                 decoded is not None
                 and token == self._preview_token
                 and not self._preview_pending
+                and session_key is not None
+                and session_key == self._get_current_live_preview_session_key()
             ):
-                self._last_rendered_preview = decoded
+                self._publish_last_rendered_preview_locked(decoded, session_key)
                 self.ui_refresh_generation += 1
                 self._last_rendered_preview_index = self.current_index
                 self._last_rendered_preview_gen = self.ui_refresh_generation
@@ -8600,7 +8652,7 @@ class AppController(QObject):
             if decoded is not None:
                 with self._preview_lock:
                     self._preview_token += 1
-                    self._last_rendered_preview = decoded
+                    self._publish_last_rendered_preview_locked(decoded)
                     self.ui_refresh_generation += 1
                     self._last_rendered_preview_index = self.current_index
                     self._last_rendered_preview_gen = self.ui_refresh_generation
@@ -8916,7 +8968,7 @@ class AppController(QObject):
                 # setup/rotation. Invalidate them so they cannot overwrite this
                 # full-resolution committed crop.
                 self._preview_token += 1
-                self._last_rendered_preview = decoded
+                self._publish_last_rendered_preview_locked(decoded)
                 self.ui_refresh_generation += 1
                 self._last_rendered_preview_index = self.current_index
                 self._last_rendered_preview_gen = self.ui_refresh_generation
