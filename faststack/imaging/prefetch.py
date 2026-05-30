@@ -196,14 +196,14 @@ def get_icc_profile_description(profile: ImageCms.ImageCmsProfile) -> str:
         desc = ImageCms.getProfileDescription(profile)
         if desc and desc.strip():
             return desc.strip()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("getProfileDescription failed: %s", e)
     try:
         name = ImageCms.getProfileName(profile)
         if name and name.strip():
             return name.strip()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("getProfileName failed: %s", e)
     return "(unknown)"
 
 
@@ -222,8 +222,8 @@ def get_icc_profile_details(profile: ImageCms.ImageCmsProfile) -> Dict[str, str]
             val = func(profile)
             if val and val.strip():
                 details[label] = val.strip()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Failed to extract ICC field %s: %s", label, e)
 
     try:
         inner = profile.profile
@@ -261,8 +261,8 @@ def get_icc_profile_details(profile: ImageCms.ImageCmsProfile) -> Dict[str, str]
         ri = getattr(inner, "rendering_intent", None)
         if ri is not None:
             details["Rendering intent"] = intents.get(ri, str(ri))
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("Failed to read profile.profile attributes: %s", e)
 
     return details
 

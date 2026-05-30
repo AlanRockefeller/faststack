@@ -5000,6 +5000,13 @@ class AppController(QObject):
             )
             return
 
+        if self.view_override_path and self.view_override_kind:
+            displayed_path = self.view_override_path
+        else:
+            displayed_path = str(self.image_files[self.current_index].path)
+        if self._block_if_saving(displayed_path):
+            return
+
         try:
             text = self._build_color_info_text()
         except Exception as e:
@@ -5097,8 +5104,9 @@ class AppController(QObject):
                     if raw_cs is not None:
                         cs_labels = {1: "sRGB", 2: "AdobeRGB", 65535: "Uncalibrated"}
                         exif_color_space = cs_labels.get(raw_cs, f"Unknown ({raw_cs})")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("Failed to parse EXIF color space: %s", e)
+                    exif_color_space = f"Unreadable ({e})"
         except Exception as e:
             lines.append(f"Image read error:  {e}")
 
@@ -5128,19 +5136,25 @@ class AppController(QObject):
             lines.append("EXIF color space:  Not set")
 
         # --- Source Interpretation ---
+        # Reflects the real loupe decode path: embedded ICC is used when
+        # present and readable, otherwise FastStack falls back to sRGB.
+        # EXIF ColorSpace is reported as metadata only; it is NOT used as the
+        # source profile during decode.
         lines.append("")
         if icc_desc:
-            lines.append(f"Source interpretation:  {icc_desc} (from embedded ICC)")
+            lines.append(
+                f"Source interpretation:  {icc_desc} (from embedded ICC profile)"
+            )
         elif icc_bytes:
             lines.append(
-                "Source interpretation:  sRGB (embedded ICC unreadable, using default)"
-            )
-        elif exif_color_space and exif_color_space not in ("Uncalibrated", "Not set"):
-            lines.append(
-                f"Source interpretation:  {exif_color_space} (from EXIF, no embedded ICC)"
+                "Source interpretation:  sRGB (FastStack fallback;"
+                " embedded ICC unreadable)"
             )
         else:
-            lines.append("Source interpretation:  sRGB (default assumption)")
+            lines.append(
+                "Source interpretation:  sRGB (FastStack fallback;"
+                " no embedded ICC profile)"
+            )
 
         return "\n".join(lines)
 
