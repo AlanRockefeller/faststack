@@ -1,5 +1,6 @@
 """Main application entry point for FastStack."""
 
+import io
 import logging
 import sys
 import math
@@ -72,7 +73,13 @@ from faststack.imaging.cache import (
     get_decoded_image_size,
     build_cache_key,
 )
-from faststack.imaging.prefetch import Prefetcher, clear_icc_caches
+from faststack.imaging.prefetch import (
+    Prefetcher,
+    clear_icc_caches,
+    get_icc_profile_description,
+    get_icc_profile_details,
+    get_monitor_profile,
+)
 from faststack.ui.keystrokes import Keybinder
 from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS
 from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
@@ -4980,6 +4987,162 @@ class AppController(QObject):
 
         # Notify QML
         self.ui_state.saturationFactorChanged.emit()
+
+    @Slot()
+    def show_color_information_dialog(self):
+        """Show a read-only dialog with color-management diagnostics."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            self.update_status_message("No image selected")
+            return
+        if self._is_grid_view_active:
+            self.update_status_message(
+                "Color Information is only available in loupe mode"
+            )
+            return
+
+        try:
+            text = self._build_color_info_text()
+        except Exception as e:
+            log.error("Failed to build color info: %s", e)
+            text = f"Error gathering color information:\n{e}"
+
+        if self.main_window and hasattr(self.main_window, "openColorInfoDialog"):
+            self.main_window.openColorInfoDialog(text)
+
+    def _build_color_info_text(self) -> str:
+        from PIL import ExifTags, ImageCms
+
+        lines: list[str] = []
+
+        # --- FastStack Pipeline ---
+        lines.append("=== FastStack Pipeline ===")
+        lines.append("")
+
+        color_mode = self.get_color_mode()
+        mode_labels = {
+            "none": "Off",
+            "saturation": "Saturation Compensation",
+            "icc": "Full ICC Profile",
+        }
+        lines.append(f"Color mode:  {mode_labels.get(color_mode, color_mode)}")
+
+        if color_mode == "saturation":
+            lines.append(f"Saturation factor:  {self.get_saturation_factor():.2f}")
+
+        monitor_icc_path = config.get("color", "monitor_icc_path", fallback="").strip()
+        lines.append(f"Monitor ICC path:  {monitor_icc_path or '(not configured)'}")
+
+        if monitor_icc_path:
+            exists = os.path.isfile(monitor_icc_path)
+            lines.append(f"Monitor ICC exists:  {'Yes' if exists else 'No'}")
+            if exists:
+                try:
+                    prof = get_monitor_profile()
+                    if prof is not None:
+                        lines.append("Monitor ICC loads:  Yes")
+                        desc = get_icc_profile_description(prof)
+                        lines.append(f"Monitor ICC description:  {desc}")
+                        details = get_icc_profile_details(prof)
+                        for key, val in details.items():
+                            if key != "Description":
+                                lines.append(f"  {key}:  {val}")
+                    else:
+                        lines.append("Monitor ICC loads:  No (returned None)")
+                except Exception as e:
+                    lines.append(f"Monitor ICC loads:  No ({e})")
+
+        lines.append("")
+        if color_mode == "none":
+            lines.append("Output behavior:  No explicit color transform")
+        elif color_mode == "saturation":
+            lines.append(
+                "Output behavior:  sRGB-style display with saturation adjustment"
+            )
+        elif color_mode == "icc":
+            lines.append(
+                "Output behavior:  Source profile converted to monitor ICC"
+                " using ImageCms"
+            )
+
+        # --- Current Photo ---
+        lines.append("")
+        lines.append("=== Current Photo ===")
+        lines.append("")
+
+        img_file = self.image_files[self.current_index]
+        if self.view_override_path and self.view_override_kind:
+            displayed_path = self.view_override_path
+            variant_label = self.view_override_kind
+        else:
+            displayed_path = str(img_file.path)
+            variant_label = "main"
+
+        lines.append(f"File path:  {displayed_path}")
+        lines.append(f"Viewing:  {variant_label}")
+
+        icc_bytes = None
+        exif_color_space = None
+        try:
+            with Image.open(displayed_path) as pil_img:
+                icc_bytes = pil_img.info.get("icc_profile")
+                lines.append(f"Image mode:  {pil_img.mode}")
+                fmt = pil_img.format
+                if fmt:
+                    lines.append(f"Image format:  {fmt}")
+
+                try:
+                    exif = pil_img.getexif()
+                    exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+                    raw_cs = exif_ifd.get(0xA001)
+                    if raw_cs is not None:
+                        cs_labels = {1: "sRGB", 2: "AdobeRGB", 65535: "Uncalibrated"}
+                        exif_color_space = cs_labels.get(raw_cs, f"Unknown ({raw_cs})")
+                except Exception:
+                    pass
+        except Exception as e:
+            lines.append(f"Image read error:  {e}")
+
+        # --- Color Profile Info ---
+        lines.append("")
+        lines.append("--- Color Profile ---")
+
+        icc_desc = None
+        if icc_bytes:
+            lines.append("Embedded ICC profile:  Yes")
+            try:
+                src_prof = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+                icc_desc = get_icc_profile_description(src_prof)
+                lines.append(f"Embedded ICC description:  {icc_desc}")
+                details = get_icc_profile_details(src_prof)
+                for key, val in details.items():
+                    if key != "Description":
+                        lines.append(f"  {key}:  {val}")
+            except Exception as e:
+                lines.append(f"  (unreadable: {e})")
+        else:
+            lines.append("Embedded ICC profile:  None")
+
+        if exif_color_space:
+            lines.append(f"EXIF color space:  {exif_color_space}")
+        else:
+            lines.append("EXIF color space:  Not set")
+
+        # --- Source Interpretation ---
+        lines.append("")
+        if icc_desc:
+            lines.append(f"Source interpretation:  {icc_desc} (from embedded ICC)")
+        elif icc_bytes:
+            lines.append(
+                "Source interpretation:  sRGB (embedded ICC unreadable, using default)"
+            )
+        elif exif_color_space and exif_color_space not in ("Uncalibrated", "Not set"):
+            lines.append(
+                f"Source interpretation:  {exif_color_space} (from EXIF, no embedded ICC)"
+            )
+        else:
+            lines.append("Source interpretation:  sRGB (default assumption)")
+
+        return "\n".join(lines)
 
     @Slot(result=str)
     def get_awb_mode(self):

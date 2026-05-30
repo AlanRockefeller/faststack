@@ -190,6 +190,83 @@ def get_monitor_profile() -> Optional[ImageCms.ImageCmsProfile]:
         return _monitor_profile_cache[monitor_icc_path]
 
 
+def get_icc_profile_description(profile: ImageCms.ImageCmsProfile) -> str:
+    """Extract a human-readable description from an ICC profile object."""
+    try:
+        desc = ImageCms.getProfileDescription(profile)
+        if desc and desc.strip():
+            return desc.strip()
+    except Exception:
+        pass
+    try:
+        name = ImageCms.getProfileName(profile)
+        if name and name.strip():
+            return name.strip()
+    except Exception:
+        pass
+    return "(unknown)"
+
+
+def get_icc_profile_details(profile: ImageCms.ImageCmsProfile) -> Dict[str, str]:
+    """Extract detailed metadata from an ICC profile for diagnostic display."""
+    details: Dict[str, str] = {}
+
+    details["Description"] = get_icc_profile_description(profile)
+
+    for label, func in [
+        ("Copyright", ImageCms.getProfileCopyright),
+        ("Manufacturer", ImageCms.getProfileManufacturer),
+        ("Model", ImageCms.getProfileModel),
+    ]:
+        try:
+            val = func(profile)
+            if val and val.strip():
+                details[label] = val.strip()
+        except Exception:
+            pass
+
+    try:
+        inner = profile.profile
+        device_classes = {
+            "mntr": "Display (monitor)",
+            "scnr": "Input (scanner)",
+            "prtr": "Output (printer)",
+            "link": "Device link",
+            "spac": "Color space conversion",
+            "abst": "Abstract",
+            "nmcl": "Named color",
+        }
+        dc = getattr(inner, "device_class", None)
+        if dc:
+            details["Profile class"] = device_classes.get(dc, dc)
+
+        xs = getattr(inner, "xcolor_space", None)
+        if xs and xs.strip():
+            details["Color space"] = xs.strip()
+
+        cs = getattr(inner, "connection_space", None)
+        if cs and cs.strip():
+            details["PCS"] = cs.strip()
+
+        ver = getattr(inner, "version", None)
+        if ver:
+            details["ICC version"] = str(ver)
+
+        intents = {
+            0: "Perceptual",
+            1: "Relative colorimetric",
+            2: "Saturation",
+            3: "Absolute colorimetric",
+        }
+        ri = getattr(inner, "rendering_intent", None)
+        if ri is not None:
+            details["Rendering intent"] = intents.get(ri, str(ri))
+    except Exception:
+        pass
+
+    return details
+
+
 # apply_orientation_to_np and apply_exif_orientation imported from orientation.py
 
 

@@ -131,6 +131,11 @@ ApplicationWindow {
         exifDialog.open()
     }
 
+    function openColorInfoDialog(text) {
+        colorInfoDialog.infoText = text
+        colorInfoDialog.open()
+    }
+
     function setGridPrefetch(item, enabled) {
         var methodName = "set" + "PrefetchEnabled"
         var setter = item ? item[methodName] : null
@@ -748,6 +753,19 @@ ApplicationWindow {
                 defaultTextColor: root.currentTextColor
                 onClicked: {
                     if (root.controllerRef) root.controllerRef.set_color_mode("icc")
+                    viewMenu.close()
+                }
+            }
+
+            MenuActionItem {
+                width: 220
+                text: "Color Information..."
+                enabled: root.uiStateRef ? !root.uiStateRef.isGridViewActive : false
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                disabledTextColor: root.isDarkTheme ? "#666666" : "#999999"
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.show_color_information_dialog()
                     viewMenu.close()
                 }
             }
@@ -1885,6 +1903,12 @@ ApplicationWindow {
 
     ExifDialog {
         id: exifDialog
+        backgroundColor: root.currentBackgroundColor
+        textColor: root.currentTextColor
+    }
+
+    ColorInfoDialog {
+        id: colorInfoDialog
         backgroundColor: root.currentBackgroundColor
         textColor: root.currentTextColor
     }
