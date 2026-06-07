@@ -1,6 +1,7 @@
 # FastStack
 
-# Version 1.6.3 - April 16, 2026
+# Version 1.6.4 - June 7, 2026
+
 # By Alan Rockefeller
 
 Ultra-fast, caching JPG viewer designed for culling and selecting RAW or JPG files for focus stacking and website upload.
@@ -9,7 +10,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 
 ## Features
 
-- **Crop:** Added the ability to crop and rotate images via the cr(O)p hotkey (or right mouse click).   It can be a freeform crop, or constrained to several popular aspect ratios.
+- **Crop:** Added the ability to crop and rotate images via the cr(O)p hotkey (or right mouse click). It can be a freeform crop, or constrained to several popular aspect ratios.
 - **Zoom & Pan:** Smooth zooming and panning.
 - **Stack Selection:** Group images into stacks (`[`, `]`) and select them for processing (`S`).
 - **Spark Line**: In grid view, a spark line is visible on each folder, so you can see how far you have gotten in uploading photos in each directory.
@@ -21,7 +22,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Photoshop / Gimp Integration:** Edit current image in Photoshop or Gimp (P key) - always uses RAW files when available.
 - **Clipboard Support:** Copy image path to clipboard (Ctrl+C)
 - **Image Filtering:** Filter images by filename
-- **Drag & Drop:** Drag images to external applications.   Press { and } to batch files to drag & drop multiple images.
+- **Drag & Drop:** Drag images to external applications. Press { and } to batch files to drag & drop multiple images.
 - **Theme Support:** Toggle between light and dark themes
 - **Delete & Undo:** Move images to recycle bin (Delete/Backspace) with undo support (Ctrl+Z)
 - **Has Memory:** Starts where you left off, tells you which images have been edited, stacked and uploaded.
@@ -34,26 +35,31 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 ## Installation
 
 ### macOS (Recommended)
+
 FastStack performs best on Python 3.12 due to PySide6 compatibility.
 
 1.  **Install Python 3.12 (via Homebrew):**
+
     ```bash
     brew install python@3.12
     ```
 
 2.  **Create and Activate a Virtual Environment:**
+
     ```bash
     python3.12 -m venv venv
     source venv/bin/activate
     ```
 
 3.  **Install FastStack:**
+
     ```bash
     # From source directory
     python -m pip install -U pip
     python -m pip install .
     ```
-    *Note: If you encounter issues with `opencv-python` or `PySide6` on newer Python versions (3.13+), please stick to Python 3.12.*
+
+    _Note: If you encounter issues with `opencv-python` or `PySide6` on newer Python versions (3.13+), please stick to Python 3.12._
 
 4.  **Run:**
     ```bash
@@ -62,6 +68,7 @@ FastStack performs best on Python 3.12 due to PySide6 compatibility.
     ```
 
 ### Windows / Linux
+
 ```bash
 python -m venv venv
 # Activate venv (Windows: venv\Scripts\activate, Linux: source venv/bin/activate)
@@ -95,6 +102,7 @@ python -m faststack.app [options] [image_dir]
   `--debug`.
 
 ### Windows Performance Note
+
 On Windows, `PyTurboJPEG` also needs the native `libjpeg-turbo` library (`turbojpeg.dll`).
 
 - If `turbojpeg.dll` is installed, FastStack uses it automatically for faster JPEG decode and thumbnail generation.
@@ -117,6 +125,7 @@ faststack "C:\path\to\photos"
 ```
 
 ### Troubleshooting on Windows
+
 If startup logs mention:
 
 ```text
@@ -150,7 +159,7 @@ If you do nothing, FastStack will still run, but JPEG decoding and thumbnail gen
 - `X`: Remove current image from batch/stack
 - `B`: Toggle current image in/out of batch
 - `D`: Toggle todo flag - shows up red on the sparkline so you can see if you have flagged images to work on later
-- `[`: Begin new stack group 
+- `[`: Begin new stack group
 - `]`: End current stack group
 - `C`: Clear all stacks
 - `{`: Begin new drag & drop batch
@@ -192,7 +201,7 @@ shown in the loupe.
 
 ### What it does
 
-The editor applies a *live, non-destructive* session on top of the current
+The editor applies a _live, non-destructive_ session on top of the current
 image: nothing is written to disk until you save. The panel shows a live
 histogram (overlay or per-channel R/G/B) and grouped adjustments:
 
@@ -212,7 +221,7 @@ While the compact editor has focus, the arrow keys are split so you can both
 browse and adjust without reaching for the mouse:
 
 - `Left` / `Right` — go to the previous / next image. (Any unsaved edits on the
-  current image are committed first — see *Saving* below.)
+  current image are committed first — see _Saving_ below.)
 - `Up` / `Down` — raise / lower the **highlighted** slider. The highlighted row
   is tinted and outlined; Exposure is highlighted by default.
 - **Click a slider's label** (or its value) to make it the highlighted slider
