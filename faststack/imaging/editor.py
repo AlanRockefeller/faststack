@@ -852,9 +852,14 @@ class ImageEditor:
         mask_assets_override: Optional[Dict[str, "MaskData"]] = None,
         cache_override: Optional["MaskRasterCache"] = None,
         cache_context: Optional[dict] = None,
+        update_highlight_state: bool = True,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
         Returns float32 array (H, W, 3).
+
+        ``update_highlight_state`` controls whether non-export renders publish
+        highlight telemetry for the live clipping indicator. Analysis callers
+        should disable it when rendering downsampled scratch buffers.
         """
         if edits is None:
             edits = self.current_edits
@@ -1150,7 +1155,7 @@ class ImageEditor:
                         else:
                             self._cached_highlight_analysis = entry
 
-            if not for_export:
+            if not for_export and update_highlight_state:
                 with self._lock:
                     self._last_highlight_state = analysis_state
 
@@ -1656,7 +1661,7 @@ class ImageEditor:
         # The baseline and every candidate share identical edits upstream of
         # vibrance, so an isolated cache lets _apply_edits reuse the highlight
         # analysis instead of recomputing it per pass (and avoids touching the
-        # live preview cache).
+        # live preview cache or live clipping telemetry).
         analysis_cache: dict = {}
 
         baseline = self._apply_edits(
@@ -1664,6 +1669,7 @@ class ImageEditor:
             edits=baseline_edits,
             for_export=False,
             cache_context=analysis_cache,
+            update_highlight_state=False,
         )
         rgb = np.clip(baseline, 0.0, 1.0)
         cmax = rgb.max(axis=2)
@@ -1707,6 +1713,7 @@ class ImageEditor:
                 edits=candidate_edits,
                 for_export=False,
                 cache_context=analysis_cache,
+                update_highlight_state=False,
             )
             candidate_clip = self._channel_overshoot_fraction(candidate_arr)
             if candidate_clip <= baseline_clip + _AUTO_VIBRANCE_CLIP_TOLERANCE:

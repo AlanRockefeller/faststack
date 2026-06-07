@@ -800,20 +800,10 @@ Item {
             isDraggingOutside = false
 
             // Flaky-trackpad tolerance: if a crop release is still within its
-            // grace window, a fresh right-button press is treated as the same
-            // drag stuttering (not a new crop). Resume the in-progress drag so
-            // the box keeps growing from its original anchor instead of being
-            // reset to a tiny box under the cursor.
+            // grace window, finalize that deferred release before interpreting
+            // the new press. The crop hit-test below handles both normal follow-up
+            // drags and stuttered trackpad presses from the current visible box.
             if (cropReleasePending) {
-                cropReleaseGraceTimer.stop()
-                cropReleasePending = false
-                if (hasRightButton(mouse) && loupeView.uiStateRef && loupeView.uiStateRef.isCropping) {
-                    isCropDragging = true
-                    return
-                }
-                // A different gesture (e.g. left click) — finalize the crop the
-                // deferred release was holding open, then handle this press
-                // normally below.
                 endCropInteraction()
             }
 
@@ -831,12 +821,12 @@ Item {
                 return
             }
 
-            if (hasRightButton(mouse)) {
+            if (hasRightButton(mouse) && (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping)) {
                 // Activate drag guard BEFORE toggle_crop_mode so that any
                 // source/geometry changes it triggers are properly deferred.
                 beginCropInteraction()
 
-                if (!loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
+                if (loupeView.uiStateRef && !loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
                     loupeView.controllerRef.toggle_crop_mode() // Ensure mode is ON
                 }
 
