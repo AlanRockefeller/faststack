@@ -26,6 +26,7 @@ Window {
     property double autoLevelClippingThreshold: 0.1
     property double autoLevelStrength: 1.0
     property bool autoLevelStrengthAuto: false
+    property bool autoVibranceEnabled: true
     property int prefetchRadius: 4
     property int theme: 0
     property string defaultDirectory: ""
@@ -57,6 +58,7 @@ Window {
     readonly property color controlBg: "#10ffffff"
     readonly property color controlBorder: "#30ffffff"
     readonly property color separatorColor: "#20ffffff"
+    readonly property string autoVibranceTooltip: "When enabled, FastStack may add a small vibrance boost only when you press capital L (Shift+L / Quick Auto Adjust). Lowercase l still runs auto levels only and leaves vibrance unchanged."
 
     Material.theme: Material.Dark
     Material.accent: accentColor
@@ -137,6 +139,7 @@ Window {
             settingsDialog.autoLevelClippingThreshold = settingsDialog.uiStateRef.autoLevelClippingThreshold
             settingsDialog.autoLevelStrength = settingsDialog.uiStateRef.autoLevelStrength
             settingsDialog.autoLevelStrengthAuto = settingsDialog.uiStateRef.autoLevelStrengthAuto
+            settingsDialog.autoVibranceEnabled = settingsDialog.uiStateRef.autoVibranceEnabled
             settingsDialog.awbMode = settingsDialog.uiStateRef.awbMode
             settingsDialog.awbStrength = settingsDialog.uiStateRef.awbStrength
             settingsDialog.awbWarmBias = settingsDialog.uiStateRef.awbWarmBias
@@ -189,6 +192,7 @@ Window {
         state.autoLevelClippingThreshold = settingsDialog.autoLevelClippingThreshold
         state.autoLevelStrength = settingsDialog.autoLevelStrength
         state.autoLevelStrengthAuto = settingsDialog.autoLevelStrengthAuto
+        state.autoVibranceEnabled = settingsDialog.autoVibranceEnabled
 
         state.awbMode = settingsDialog.awbMode
         state.awbStrength = settingsDialog.awbStrength
@@ -849,6 +853,30 @@ Window {
                                         color: autoLvlAuto.checked ? settingsDialog.accentColor : "transparent"
                                         Text { text: "✓"; color: "white"; anchors.centerIn: parent; visible: autoLvlAuto.checked; font.bold: true }
                                     }
+                                }
+                            }
+
+                            Label {
+                                text: "Auto Vibrance"
+                                color: settingsDialog.textColor
+                            }
+                            CheckBox {
+                                id: autoVibranceCheck
+                                text: "Enabled"
+                                checked: settingsDialog.autoVibranceEnabled
+                                hoverEnabled: true
+                                onCheckedChanged: settingsDialog.autoVibranceEnabled = checked
+                                ToolTip.visible: hovered
+                                ToolTip.delay: 500
+                                ToolTip.text: settingsDialog.autoVibranceTooltip
+                                contentItem: Text { text: autoVibranceCheck.text; color: settingsDialog.textColor; leftPadding: autoVibranceCheck.indicator.width + autoVibranceCheck.spacing; verticalAlignment: Text.AlignVCenter }
+                                indicator: Rectangle {
+                                    implicitWidth: 18; implicitHeight: 18
+                                    x: autoVibranceCheck.leftPadding; y: parent.height / 2 - height / 2
+                                    radius: 3
+                                    border.color: settingsDialog.accentColor
+                                    color: autoVibranceCheck.checked ? settingsDialog.accentColor : "transparent"
+                                    Text { text: "✓"; color: "white"; anchors.centerIn: parent; visible: autoVibranceCheck.checked; font.bold: true }
                                 }
                             }
                         }

@@ -72,6 +72,10 @@ Window {
         return 0.0;
     }
 
+    function sliderEditScale(key) {
+        return (key === "exposure" || key === "whites") ? 2.0 : 1.0
+    }
+
     // Background
     color: imageEditorDialog.backgroundColor
 
@@ -611,10 +615,16 @@ Window {
                 from: sliderRow.minVal
                 to: sliderRow.maxVal
                 stepSize: 1
+                property real editScale: imageEditorDialog.sliderEditScale(sliderRow.key)
                 
                 property real backendValue: {
-                    var val = imageEditorDialog.getBackendValue(sliderRow.key) * sliderRow.maxVal
+                    var val = imageEditorDialog.getBackendValue(sliderRow.key) / slider.editScale * sliderRow.maxVal
                     return sliderRow.isReversed ? -val : val
+                }
+
+                function editValueFromSliderValue(sliderValue) {
+                    var sendValue = sliderRow.isReversed ? -sliderValue : sliderValue
+                    return sendValue / sliderRow.maxVal * slider.editScale
                 }
                 
                 // Auto-sync visual slider with backend changes when not dragging
@@ -633,8 +643,7 @@ Window {
                     repeat: true
                     onTriggered: {
                         if (Math.abs(slider._pendingValue - slider._lastSentValue) > 0.001) {
-                            var sendValue = sliderRow.isReversed ? -slider._pendingValue : slider._pendingValue
-                            if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, sendValue / sliderRow.maxVal)
+                            if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(slider._pendingValue))
                             slider._lastSentValue = slider._pendingValue
                         }
                     }
@@ -692,8 +701,7 @@ Window {
                              if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
                         } else {
                              // Send final value immediately
-                             var sendValue = sliderRow.isReversed ? -value : value
-                             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, sendValue / sliderRow.maxVal)
+                             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
                         }
                         
                         if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.update_histogram()

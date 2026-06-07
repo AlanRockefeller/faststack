@@ -2,6 +2,18 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## 1.6.4 (2026-06-06)
+
+- Image editor exposure and whites slider changes now apply twice as much per slider unit without changing auto levels or other exposure logic.
+- Fixed crop geometry when rotating an already-cropped image in the editor, so preview and save now preserve the intended crop after 90-degree rotation.
+- Compact image editor now includes a contrast slider.
+- Right-click crop entry in loupe view is now reliable after panning and with trackpads that report mixed button state.
+- Loupe status bar EXIF details now show the distance in meters from the previous photo when both images have GPS coordinates.
+- Auto level/color (capital L shortcut) now also raises the vibrance if it thinks it should be raised. There is a setting to enable/disable this, enabled by default.
+- Crop mode now works while the compact image editor is open - it is still disabled if the expanded editor is open.
+- Highlights slider now recovers a broad range of bright tones with a smooth falloff, instead of only affecting near-white pixels, while leaving midtones unchanged.
+- Compact image editor keyboard handling reworked: Left/Right now navigate to the previous/next image even when the editor is focused, Up/Down raise/lower the highlighted slider, and clicking a slider's label highlights it as the Up/Down target. Other shortcuts (B to batch, F, D, I, G, etc.) now also work while the editor is focused. README gained a full Image Editor section.
+
 ## 1.6.3 (2026-04-16)
 
 - Reworked quick auto-adjust and crop into one shared live edit session for the current image instead of saving on every keypress.

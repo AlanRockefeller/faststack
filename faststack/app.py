@@ -119,6 +119,7 @@ _AWB_NOOP_EPS = 0.005
 _AWB_LABEL_EPS = 0.002
 _AUTO_ADJUST_HIGHLIGHT_STEP = 0.14
 _AUTO_ADJUST_BLACK_STEP = 0.07
+_AUTO_VIBRANCE_EPS = 0.001
 
 
 def _awb_direction(value: float, pos_label: str, neg_label: str) -> str:
@@ -136,6 +137,8 @@ class ActiveAutoAdjustState:
     base_whites: float
     p_low: float
     p_high: float
+    base_vibrance: float
+    auto_vibrance_delta: float = 0.0
     extra_highlight_steps: int = 0
     extra_black_steps: int = 0
 
@@ -210,7 +213,7 @@ class AppController(QObject):
     _deleteFinished = Signal(
         object
     )  # Signal for async delete completion (result dict from worker)
-    _exifBriefReady = Signal(str, str)  # (path_str, brief) from background thread
+    _exifBriefReady = Signal(object, str)  # (cache_key, brief) from background thread
 
     def __init__(
         self,
@@ -481,10 +484,10 @@ class AppController(QObject):
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
-        self._exif_brief_cache: dict = {}  # normalized path key → formatted EXIF string
+        self._exif_brief_cache: dict = {}  # EXIF context key → formatted EXIF string
         self._native_image_size_cache: Dict[str, tuple[float, int, int]] = {}
-        self._exif_pending_path: Optional[str] = (
-            None  # path currently awaiting EXIF read
+        self._exif_pending_path: Optional[tuple[str, str]] = (
+            None  # current/previous source keys awaiting EXIF read
         )
         with self._last_image_lock:
             self.last_displayed_image = None
@@ -571,6 +574,9 @@ class AppController(QObject):
         self.auto_level_strength = config.getfloat("core", "auto_level_strength", 1.0)
         self.auto_level_strength_auto = config.getboolean(
             "core", "auto_level_strength_auto", False
+        )
+        self.auto_vibrance_enabled = config.getboolean(
+            "core", "auto_vibrance_enabled", True
         )
 
         # Connect editor open/close signal for memory cleanup
@@ -2477,6 +2483,7 @@ class AppController(QObject):
         whites: float,
         extra_highlight_steps: int = 0,
         extra_black_steps: int = 0,
+        auto_vibrance_delta: float = 0.0,
     ) -> str:
         """Build a human-readable status line for the current levels state."""
         if abs(blacks) <= 0.001 and abs(whites) <= 0.001:
@@ -2512,6 +2519,8 @@ class AppController(QObject):
             suffixes.append(f"blacks -{extra_black_steps * black_step_points}pt")
         elif extra_black_steps < 0:
             suffixes.append(f"blacks +{-extra_black_steps * black_step_points}pt")
+        if auto_vibrance_delta > _AUTO_VIBRANCE_EPS:
+            suffixes.append(f"vibrance +{auto_vibrance_delta:.2f}")
         if suffixes:
             msg = f"{msg}; {', '.join(suffixes)}"
         return msg
@@ -2537,9 +2546,21 @@ class AppController(QObject):
                 self.update_histogram()
         return changed
 
+    def _apply_vibrance_to_editor(
+        self,
+        *,
+        vibrance: float,
+    ) -> bool:
+        """Apply derived vibrance to the editor and synchronize the UI state."""
+        changed = self.image_editor.set_edit_param("vibrance", vibrance)
+        self.ui_state.vibrance = vibrance
+        return changed
+
     def _build_active_auto_adjust_state(
         self,
         recommendation: dict[str, Any],
+        *,
+        include_auto_vibrance: bool = False,
     ) -> ActiveAutoAdjustState:
         """Create transient auto-adjust state for the current loaded session."""
         active_path = self._get_current_auto_adjust_path()
@@ -2548,6 +2569,21 @@ class AppController(QObject):
             if active_path is not None
             else self._key(self.image_editor.current_filepath)
         )
+        try:
+            current_vibrance = float(self.image_editor.get_edit_value("vibrance", 0.0))
+        except (TypeError, ValueError):
+            current_vibrance = 0.0
+        auto_vibrance_delta = 0.0
+        if include_auto_vibrance and self.auto_vibrance_enabled:
+            auto_vibrance_delta = self.image_editor.analyze_auto_vibrance(
+                blacks=float(recommendation["base_blacks"]),
+                whites=float(recommendation["base_whites"]),
+            )
+
+        base_vibrance = max(
+            -1.0,
+            min(1.0, current_vibrance + auto_vibrance_delta),
+        )
         return ActiveAutoAdjustState(
             active_path_key=active_path_key,
             session_id=getattr(self.image_editor, "session_id", None),
@@ -2555,6 +2591,8 @@ class AppController(QObject):
             base_whites=float(recommendation["base_whites"]),
             p_low=float(recommendation["p_low"]),
             p_high=float(recommendation["p_high"]),
+            base_vibrance=base_vibrance,
+            auto_vibrance_delta=auto_vibrance_delta,
         )
 
     def _save_current_auto_adjust(
@@ -2975,6 +3013,10 @@ class AppController(QObject):
     @Slot()
     def save_edited_image(self):
         """Save the current live editor session in the background."""
+        if self.ui_state.isCropping:
+            self.update_status_message("Apply or cancel the crop before saving")
+            return
+
         close_after = self.ui_state.isEditorOpen and self.ui_state.isEditorExpanded
         request = self._prepare_current_session_save_request(
             editor_was_open=close_after,
@@ -3946,7 +3988,7 @@ class AppController(QObject):
 
         # EXIF brief: instant from cache, otherwise schedule deferred read.
         # Always read EXIF from the variant group's main image (not backup/developed).
-        exif_key = self._exif_source_key(self.current_index)
+        exif_key = self._exif_brief_context_key(self.current_index)
         exif_brief = self._exif_brief_cache.get(exif_key, None)
         if exif_brief is None:
             exif_brief = ""
@@ -3980,13 +4022,8 @@ class AppController(QObject):
         {".jpg", ".jpeg", ".jpe", ".tif", ".tiff", ".heif", ".heic"}
     )
 
-    def _exif_source_key(self, index: int) -> str:
-        """Return a normalized cache key for the EXIF source of image at *index*.
-
-        Resolves to the variant group's main image path when available,
-        so backups/developed files use the same EXIF as the original.
-        Uses ``normalize_path_key`` for Windows case-insensitivity.
-        """
+    def _exif_source_path(self, index: int) -> Path:
+        """Return the file path used as the EXIF source of image at *index*."""
         img = self.image_files[index]
         source_path = img.path
         key_cf = get_group_key_for_path(img.path, self._variant_map)
@@ -3994,7 +4031,22 @@ class AppController(QObject):
             group = self._variant_map[key_cf]
             if group.main_path is not None:
                 source_path = group.main_path
+        return source_path
+
+    def _exif_source_key(self, index: int) -> str:
+        """Return a normalized cache key for the EXIF source of image at *index*.
+
+        Resolves to the variant group's main image path when available,
+        so backups/developed files use the same EXIF as the original.
+        Uses ``normalize_path_key`` for Windows case-insensitivity.
+        """
+        source_path = self._exif_source_path(index)
         return normalize_path_key(source_path)
+
+    def _exif_brief_context_key(self, index: int) -> tuple[str, str]:
+        """Return the EXIF brief cache key for current image and its neighbor."""
+        previous_key = self._exif_source_key(index - 1) if index > 0 else ""
+        return self._exif_source_key(index), previous_key
 
     def _read_exif_deferred(self):
         """Called after 150ms of no navigation. Submits EXIF read to background."""
@@ -4002,7 +4054,7 @@ class AppController(QObject):
             return
         if not self.image_files or self.current_index >= len(self.image_files):
             return
-        exif_key = self._exif_source_key(self.current_index)
+        exif_key = self._exif_brief_context_key(self.current_index)
         if self._exif_pending_path is not None and self._exif_pending_path != exif_key:
             self._exif_pending_path = None
             return  # Different image path pending, or we aren't tracking this key.
@@ -4010,14 +4062,12 @@ class AppController(QObject):
         if exif_key in self._exif_brief_cache:
             self._exif_pending_path = None
             return  # already cached
-        # Resolve the actual file path for the EXIF source
-        img = self.image_files[self.current_index]
-        source_path = img.path
-        key_cf = get_group_key_for_path(img.path, self._variant_map)
-        if key_cf is not None:
-            group = self._variant_map[key_cf]
-            if group.main_path is not None:
-                source_path = group.main_path
+        source_path = self._exif_source_path(self.current_index)
+        previous_path = (
+            self._exif_source_path(self.current_index - 1)
+            if self.current_index > 0
+            else None
+        )
         # Early return for formats without EXIF support
         if source_path.suffix.lower() not in self._EXIF_SUFFIXES:
             self._exif_brief_cache[exif_key] = ""
@@ -4026,11 +4076,15 @@ class AppController(QObject):
         # Submit to dedicated EXIF executor to avoid blocking histograms
         signal = self._exifBriefReady
 
-        def _worker(key=exif_key, p=str(source_path)):
+        def _worker(
+            key=exif_key,
+            p=str(source_path),
+            previous=str(previous_path) if previous_path is not None else None,
+        ):
             from faststack.imaging.metadata import get_exif_brief
 
             try:
-                brief = get_exif_brief(p)
+                brief = get_exif_brief(p, previous)
             except Exception as e:
                 log.error("Failed to get EXIF brief for %s: %s", p, e, exc_info=True)
                 brief = ""
@@ -4041,7 +4095,7 @@ class AppController(QObject):
         except RuntimeError:
             pass  # executor shut down, ignore
 
-    def _on_exif_brief_ready(self, exif_key: str, brief: str):
+    def _on_exif_brief_ready(self, exif_key: tuple[str, str], brief: str):
         """Slot called on main thread when background EXIF read completes."""
         if getattr(self, "_shutting_down", False) or not self.ui_state:
             return
@@ -4052,7 +4106,7 @@ class AppController(QObject):
         if (
             self.image_files
             and self.current_index < len(self.image_files)
-            and self._exif_source_key(self.current_index) == exif_key
+            and self._exif_brief_context_key(self.current_index) == exif_key
         ):
             self._metadata_cache_index = (-1, -1)
             if self.ui_state:
@@ -5390,6 +5444,20 @@ class AppController(QObject):
         self.auto_level_strength_auto = value
         # Store as canonical lowercase string
         config.set("core", "auto_level_strength_auto", "true" if value else "false")
+        config.save()
+
+    @Slot(result=bool)
+    def get_auto_vibrance_enabled(self):
+        return self.auto_vibrance_enabled
+
+    @Slot(bool)
+    def set_auto_vibrance_enabled(self, value):
+        self.auto_vibrance_enabled = bool(value)
+        config.set(
+            "core",
+            "auto_vibrance_enabled",
+            "true" if self.auto_vibrance_enabled else "false",
+        )
         config.save()
 
     def open_directory_dialog(self):
@@ -8013,6 +8081,10 @@ class AppController(QObject):
     @Slot(str, "QVariant")
     def set_edit_parameter(self, key: str, value: Any):
         """Sets an edit parameter and updates the UIState for the slider visual."""
+        if self.ui_state.isCropping:
+            self.update_status_message("Apply or cancel the crop before editing")
+            return
+
         # Robust guard: only allow edits if the editor is actually holding an image.
         if not self.image_editor:
             return
@@ -8041,6 +8113,13 @@ class AppController(QObject):
             if hasattr(self.ui_state, key):
                 setattr(self.ui_state, key, final_value)
 
+            if changed and key == "rotation":
+                crop_box = self._normalize_crop_box_tuple(
+                    self.image_editor.get_edit_value("crop_box")
+                )
+                if crop_box is not None:
+                    self._set_crop_overlay_box_only(crop_box)
+
             # Trigger a refresh of the image to show the edit, ONLY if something changed
             # Uses gate pattern: runs immediately if not inflight, else queues for next
             if changed:
@@ -8059,9 +8138,22 @@ class AppController(QObject):
         self.image_editor.set_crop_box(crop_box)
         self.ui_state.currentCropBox = crop_box  # Update QML visual (if implemented)
 
-    @Slot()
-    def reset_edit_parameters(self):
-        """Resets all editing parameters in the editor."""
+    def _reset_edit_parameters(self, *, allow_during_crop: bool = False) -> bool:
+        """Reset all editing parameters, optionally as a confirmed discard."""
+        if self.ui_state.isCropping and not allow_during_crop:
+            self.update_status_message(
+                "Apply or cancel the crop before resetting edits"
+            )
+            return False
+
+        if self.ui_state.isCropping:
+            # Discard resets the whole edit session, so do not restore the crop
+            # snapshot as cancel_crop_mode() would.  Clearing isCropping emits the
+            # QML cleanup path that releases frozen crop interaction state.
+            self.ui_state.isCropRotating = False
+            self.ui_state.isCropping = False
+            self._clear_crop_mode_snapshot()
+
         self.image_editor.reset_edits()
         self._clear_active_auto_adjust_state(
             "editor parameters reset",
@@ -8078,6 +8170,19 @@ class AppController(QObject):
 
         if self.ui_state.isHistogramVisible:
             self.update_histogram()
+
+        return True
+
+    @Slot()
+    def reset_edit_parameters(self):
+        """Resets all editing parameters in the editor."""
+        self._reset_edit_parameters()
+
+    @Slot()
+    def discard_edit_parameters(self):
+        """Discard edits even if a transient crop transaction is active."""
+        if self._reset_edit_parameters(allow_during_crop=True):
+            self._mark_current_live_edit_session_clean()
 
     # ---- Background Darkening Tool ----
 
@@ -8891,8 +8996,8 @@ class AppController(QObject):
             # Exiting crop mode: reuse the specialized cleanup
             self.cancel_crop_mode()
         else:
-            if self.ui_state.isEditorOpen:
-                self.update_status_message("Close the editor before cropping")
+            if self.ui_state.isEditorOpen and self.ui_state.isEditorExpanded:
+                self.update_status_message("Collapse the editor before cropping")
                 return
 
             # Entering crop mode requires a loaded image with a valid float buffer.
@@ -9266,12 +9371,19 @@ class AppController(QObject):
         self._last_auto_levels_msg = msg
         return changed
 
-    def _seed_active_auto_adjust_state(self) -> Optional[ActiveAutoAdjustState]:
+    def _seed_active_auto_adjust_state(
+        self,
+        *,
+        include_auto_vibrance: bool = False,
+    ) -> Optional[ActiveAutoAdjustState]:
         """Create transient auto-adjust state from the current loaded image."""
         if self._block_auto_adjust_during_crop():
             return None
         recommendation = self._compute_auto_levels_recommendation()
-        state = self._build_active_auto_adjust_state(recommendation)
+        state = self._build_active_auto_adjust_state(
+            recommendation,
+            include_auto_vibrance=include_auto_vibrance,
+        )
         self._active_auto_adjust_state = state
         return state
 
@@ -9298,6 +9410,10 @@ class AppController(QObject):
             whites=whites,
             kick_preview=False,
         )
+        changed_vibrance = self._apply_vibrance_to_editor(
+            vibrance=state.base_vibrance,
+        )
+        changed = changed or changed_vibrance
         detail = self._format_auto_levels_detail(
             p_low=state.p_low,
             p_high=state.p_high,
@@ -9305,6 +9421,7 @@ class AppController(QObject):
             whites=whites,
             extra_highlight_steps=state.extra_highlight_steps,
             extra_black_steps=state.extra_black_steps,
+            auto_vibrance_delta=state.auto_vibrance_delta,
         )
         self._last_auto_levels_msg = detail
 
@@ -9364,7 +9481,7 @@ class AppController(QObject):
         # auto_white_balance() is preview-only here: it mutates the in-memory
         # editor session and status text, but does not save or append undo.
         awb_msg = self.auto_white_balance()
-        state = self._seed_active_auto_adjust_state()
+        state = self._seed_active_auto_adjust_state(include_auto_vibrance=True)
         if state is None:
             self.update_status_message("Auto adjust failed")
             return
@@ -9443,11 +9560,18 @@ class AppController(QObject):
     def _apply_auto_adjust_preview(self, state: ActiveAutoAdjustState) -> None:
         """Render the current auto-adjust state into the editor/UI immediately."""
         blacks, whites = self._derive_auto_adjust_levels(state)
-        self._apply_levels_to_editor(
+        changed_levels = self._apply_levels_to_editor(
             blacks=blacks,
             whites=whites,
-            kick_preview=True,
+            kick_preview=False,
         )
+        changed_vibrance = self._apply_vibrance_to_editor(
+            vibrance=state.base_vibrance,
+        )
+        if changed_levels or changed_vibrance:
+            self._kick_preview_worker()
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
         detail = self._format_auto_levels_detail(
             p_low=state.p_low,
             p_high=state.p_high,
@@ -9455,6 +9579,7 @@ class AppController(QObject):
             whites=whites,
             extra_highlight_steps=state.extra_highlight_steps,
             extra_black_steps=state.extra_black_steps,
+            auto_vibrance_delta=state.auto_vibrance_delta,
         )
         self._last_auto_levels_msg = detail
         self.update_status_message(detail, timeout=9000)

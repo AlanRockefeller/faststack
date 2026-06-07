@@ -163,7 +163,150 @@ def format_shutter_speed_camera_style(exposure_value: Any) -> str:
     return _SHUTTER_TABLE[best_i][1]
 
 
-def get_exif_brief(path: Union[str, Path]) -> str:
+_EXIF_BRIEF_SUFFIXES = frozenset(
+    {".jpg", ".jpeg", ".jpe", ".tif", ".tiff", ".heif", ".heic"}
+)
+_GPS_IFD_TAG = 0x8825
+_EARTH_RADIUS_METERS = 6_371_008.8
+
+
+def _exif_rational_to_float(x: Any) -> Optional[float]:
+    """Convert EXIF rational-ish values to float."""
+    if x is None:
+        return None
+    if hasattr(x, "numerator") and hasattr(x, "denominator"):
+        try:
+            n, d = int(x.numerator), int(x.denominator)
+            if d != 0:
+                return float(Fraction(n, d))
+        except Exception as e:
+            log.debug(
+                "_exif_rational_to_float failed for rational object %r (%s): %s",
+                x,
+                type(x).__name__,
+                e,
+            )
+    if isinstance(x, (tuple, list)) and len(x) == 2:
+        try:
+            n, d = int(x[0]), int(x[1])
+            if d != 0:
+                return float(Fraction(n, d))
+        except Exception as e:
+            log.debug(
+                "_exif_rational_to_float failed for tuple/list %r (%s): %s",
+                x,
+                type(x).__name__,
+                e,
+            )
+    try:
+        return float(x)
+    except Exception as e:
+        if x is not None:
+            log.debug(
+                "_exif_rational_to_float failed for value %r (%s): %s",
+                x,
+                type(x).__name__,
+                e,
+            )
+        return None
+
+
+def _get_exif_ifd(exif_obj: Any, ifd_tag: int) -> dict:
+    """Read a Pillow EXIF sub-IFD as a plain dict."""
+    if not hasattr(exif_obj, "get_ifd"):
+        return {}
+    try:
+        return dict(exif_obj.get_ifd(ifd_tag) or {})
+    except Exception as e:
+        log.debug("Failed to read EXIF IFD %s: %s", ifd_tag, e)
+        return {}
+
+
+def _clean_gps_ref(value: Any) -> str:
+    return clean_exif_value(value).upper()
+
+
+def _gps_degrees(value: Any) -> Optional[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    degrees = _exif_rational_to_float(value[0])
+    minutes = _exif_rational_to_float(value[1])
+    seconds = _exif_rational_to_float(value[2])
+    if degrees is None or minutes is None or seconds is None:
+        return None
+    return degrees + (minutes / 60.0) + (seconds / 3600.0)
+
+
+def _gps_coordinates_from_info(gps_info: Any) -> Optional[tuple[float, float]]:
+    if not isinstance(gps_info, dict):
+        return None
+
+    lat_value = gps_info.get(2) or gps_info.get("GPSLatitude")
+    lon_value = gps_info.get(4) or gps_info.get("GPSLongitude")
+    if lat_value is None or lon_value is None:
+        return None
+
+    lat = _gps_degrees(lat_value)
+    lon = _gps_degrees(lon_value)
+    if lat is None or lon is None:
+        return None
+
+    lat_ref = gps_info.get(1) or gps_info.get("GPSLatitudeRef")
+    lon_ref = gps_info.get(3) or gps_info.get("GPSLongitudeRef")
+    if lat_ref is not None and _clean_gps_ref(lat_ref) == "S":
+        lat = -lat
+    if lon_ref is not None and _clean_gps_ref(lon_ref) == "W":
+        lon = -lon
+
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return lat, lon
+
+
+def get_exif_gps_coordinates(path: Union[str, Path]) -> Optional[tuple[float, float]]:
+    """Return decimal GPS coordinates from EXIF, if present."""
+    path = Path(path)
+    if path.suffix.lower() not in _EXIF_BRIEF_SUFFIXES or not path.exists():
+        return None
+
+    try:
+        with Image.open(path) as img:
+            exif_obj = img.getexif()
+            if not exif_obj:
+                return None
+            gps_ifd = _get_exif_ifd(exif_obj, _GPS_IFD_TAG)
+            gps_raw = dict(exif_obj).get(_GPS_IFD_TAG)
+    except Exception:
+        return None
+
+    gps_info = gps_ifd if gps_ifd else (gps_raw if isinstance(gps_raw, dict) else None)
+    return _gps_coordinates_from_info(gps_info)
+
+
+def _distance_meters(
+    first: tuple[float, float], second: tuple[float, float]
+) -> Optional[float]:
+    lat1, lon1 = (math.radians(first[0]), math.radians(first[1]))
+    lat2, lon2 = (math.radians(second[0]), math.radians(second[1]))
+    d_lat = lat2 - lat1
+    d_lon = lon2 - lon1
+    a = (
+        math.sin(d_lat / 2.0) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(d_lon / 2.0) ** 2
+    )
+    distance = 2.0 * _EARTH_RADIUS_METERS * math.asin(min(1.0, math.sqrt(a)))
+    if not math.isfinite(distance):
+        return None
+    return distance
+
+
+def _format_distance_meters(distance: float) -> str:
+    return f"{max(0, int(distance + 0.5))} m"
+
+
+def get_exif_brief(
+    path: Union[str, Path], previous_path: Union[str, Path, None] = None
+) -> str:
     """Return a compact EXIF summary for the status bar.
 
     Opens only the image header (Pillow lazy-loads), extracts ISO, aperture,
@@ -173,15 +316,7 @@ def get_exif_brief(path: Union[str, Path]) -> str:
     Supported formats: JPEG, TIFF, HEIF.
     """
     path = Path(path)
-    if path.suffix.lower() not in {
-        ".jpg",
-        ".jpeg",
-        ".jpe",
-        ".tif",
-        ".tiff",
-        ".heif",
-        ".heic",
-    }:
+    if path.suffix.lower() not in _EXIF_BRIEF_SUFFIXES:
         return ""
     if not path.exists():
         return ""
@@ -194,6 +329,7 @@ def get_exif_brief(path: Union[str, Path]) -> str:
             exif_ifd = dict(
                 exif.get_ifd(ExifTags.IFD.Exif) if hasattr(ExifTags, "IFD") else {}
             )
+            gps_ifd = _get_exif_ifd(exif, _GPS_IFD_TAG)
 
         if not exif:
             return ""
@@ -202,6 +338,9 @@ def get_exif_brief(path: Union[str, Path]) -> str:
 
     tags = dict(exif)
     tags.update(exif_ifd)
+    gps_raw = tags.get(_GPS_IFD_TAG)
+    gps_info = gps_ifd if gps_ifd else (gps_raw if isinstance(gps_raw, dict) else None)
+    gps_coordinates = _gps_coordinates_from_info(gps_info)
 
     parts: list[str] = []
 
@@ -249,6 +388,13 @@ def get_exif_brief(path: Union[str, Path]) -> str:
         except Exception as e:
             log.error(f"Failed to parse EXIF datetime {dt!r}: {e}", exc_info=True)
 
+    if previous_path is not None and gps_coordinates is not None:
+        previous_gps_coordinates = get_exif_gps_coordinates(previous_path)
+        if previous_gps_coordinates is not None:
+            distance = _distance_meters(previous_gps_coordinates, gps_coordinates)
+            if distance is not None:
+                parts.append(_format_distance_meters(distance))
+
     return " | ".join(parts)
 
 
@@ -277,7 +423,7 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
 
             # Fetch GPS sub-IFD while image is still open (Pillow ≥8.2
             # stores GPSInfo as an integer IFD offset, not a dict)
-            gps_ifd = dict(exif_obj.get_ifd(0x8825)) if hasattr(ExifTags, "IFD") else {}
+            gps_ifd = _get_exif_ifd(exif_obj, _GPS_IFD_TAG)
 
         # Normalize to a dict for consistency
         exif = dict(exif_obj)
@@ -394,32 +540,10 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
     # if it is already a mapping (older Pillow versions).
     gps_raw = get_val("GPSInfo")
     gps_info = gps_ifd if gps_ifd else (gps_raw if isinstance(gps_raw, dict) else None)
-    if gps_info:
-        try:
-
-            def convert_to_degrees(value):
-                d = float(value[0])
-                m = float(value[1])
-                s = float(value[2])
-                return d + (m / 60.0) + (s / 3600.0)
-
-            # GPSInfo keys are integers.
-            # 1: GPSLatitudeRef, 2: GPSLatitude
-            # 3: GPSLongitudeRef, 4: GPSLongitude
-
-            if 2 in gps_info and 4 in gps_info:
-                lat = convert_to_degrees(gps_info[2])
-                lon = convert_to_degrees(gps_info[4])
-
-                if 1 in gps_info and gps_info[1] == "S":
-                    lat = -lat
-                if 3 in gps_info and gps_info[3] == "W":
-                    lon = -lon
-
-                summary["GPS"] = f"{lat:.5f}, {lon:.5f}"
-        except Exception as e:
-            log.warning(f"Failed to parse GPS info: {e}")
-            pass
+    coordinates = _gps_coordinates_from_info(gps_info)
+    if coordinates is not None:
+        lat, lon = coordinates
+        summary["GPS"] = f"{lat:.5f}, {lon:.5f}"
 
     # Convert all values in full dict to string to ensure JSON serializability for QML
     # Apply cleaning to all values

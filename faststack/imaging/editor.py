@@ -42,6 +42,17 @@ log = logging.getLogger(__name__)
 
 _REPLACE_RETRY_DELAY = 0.3
 _REPLACE_MAX_RETRIES = 3
+_AUTO_VIBRANCE_MAX = 0.18
+_AUTO_VIBRANCE_MIN = 0.03
+_AUTO_VIBRANCE_TARGET_SAT = 0.22
+_AUTO_VIBRANCE_SAT_CEILING = 0.18
+_AUTO_VIBRANCE_MIN_COLOR_DELTA = 0.015
+_AUTO_VIBRANCE_CLIP_TOLERANCE = 0.0001
+# Cap on the longest edge of the buffer analyze_auto_vibrance renders. The
+# recommendation only depends on aggregate saturation/clipping statistics, which
+# are stable under uniform downsampling, so bounding the resolution keeps the
+# several _apply_edits passes cheap on the UI thread (Shift+L is synchronous).
+_AUTO_VIBRANCE_ANALYSIS_MAX_EDGE = 640
 
 
 def _safe_replace(tmp_path: Path, target_path: Path) -> None:
@@ -133,19 +144,23 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
 HEADROOM_COMPRESSION_STEEPNESS = 2.0
 
 # Adaptive Parameters (tuned by image content analysis)
-# Pivot: Brightness threshold where recovery starts
-ADAPTIVE_PIVOT_MIN = 0.45
-ADAPTIVE_PIVOT_MAX = 0.65
+# Pivot: Linear-light brightness where recovery starts to take hold. The effect
+# tapers in smoothly (smoothstep) from zero at the pivot to full at display
+# white, so a low pivot widens the affected band across all bright pixels
+# (Photoshop-style) while still leaving midtones near the pivot essentially
+# untouched. linear 0.30/0.50 ≈ sRGB 0.58/0.74.
+ADAPTIVE_PIVOT_MIN = 0.30
+ADAPTIVE_PIVOT_MAX = 0.50
 
-# K Factor: Steepness of the compression shoulder
+# K Factor: Steepness of the over-white compression shoulder
 ADAPTIVE_K_BASE = 8.0
-ADAPTIVE_K_SCALING = 6.0
-ADAPTIVE_K_HEADROOM_BASE = 6.0
-ADAPTIVE_K_HEADROOM_SCALING = 8.0
+ADAPTIVE_K_SCALING = 4.0
+ADAPTIVE_K_HEADROOM_BASE = 8.0
+ADAPTIVE_K_HEADROOM_SCALING = 4.0
 
 # Chroma Rolloff: Desaturation in extreme highlights
-ADAPTIVE_ROLLOFF_MIN = 0.10
-ADAPTIVE_ROLLOFF_MAX = 0.30
+ADAPTIVE_ROLLOFF_MIN = 0.02
+ADAPTIVE_ROLLOFF_MAX = 0.12
 
 # Analysis Safety
 HEADROOM_MAX_BRIGHTNESS_PERCENTILE = 99.5
@@ -429,7 +444,7 @@ class ImageEditor:
             "saturation": 0.0,
             "white_balance_by": 0.0,  # Blue/Yellow (Cool/Warm)
             "white_balance_mg": 0.0,  # Magenta/Green (Tint)
-            "crop_box": None,  # (left, top, right, bottom) normalized to 0-1000
+            "crop_box": None,  # Normalized box after 90-degree rotation.
             "sharpness": 0.0,
             "rotation": 0,
             "exposure": 0.0,
@@ -444,6 +459,62 @@ class ImageEditor:
             "straighten_angle": 0.0,
             "darken_settings": None,  # DarkenSettings or None
         }
+
+    @staticmethod
+    def _rotate_point_90_normalized(
+        x: float, y: float, steps_ccw: int
+    ) -> Tuple[float, float]:
+        """Rotate a normalized 0-1000 point around image center in 90-degree steps."""
+        steps = steps_ccw % 4
+        if steps == 1:
+            return y, 1000.0 - x
+        if steps == 2:
+            return 1000.0 - x, 1000.0 - y
+        if steps == 3:
+            return 1000.0 - y, x
+        return x, y
+
+    @classmethod
+    def _rotate_crop_box_for_rotation_change(
+        cls,
+        crop_box: Any,
+        old_rotation: int,
+        new_rotation: int,
+    ) -> Any:
+        """Keep an existing crop visually stable when 90-degree rotation changes."""
+        if crop_box is None:
+            return crop_box
+
+        try:
+            if len(crop_box) != 4:
+                return crop_box
+            left, top, right, bottom = (float(v) for v in crop_box)
+        except (TypeError, ValueError):
+            return crop_box
+
+        delta_steps = ((int(new_rotation) - int(old_rotation)) // 90) % 4
+        if delta_steps == 0:
+            return crop_box
+
+        corners = (
+            (left, top),
+            (right, top),
+            (right, bottom),
+            (left, bottom),
+        )
+        rotated = (
+            cls._rotate_point_90_normalized(x, y, delta_steps) for x, y in corners
+        )
+        xs, ys = zip(*rotated)
+
+        new_left = max(0, min(1000, int(round(min(xs)))))
+        new_top = max(0, min(1000, int(round(min(ys)))))
+        new_right = max(0, min(1000, int(round(max(xs)))))
+        new_bottom = max(0, min(1000, int(round(max(ys)))))
+
+        if new_right <= new_left or new_bottom <= new_top:
+            return crop_box
+        return new_left, new_top, new_right, new_bottom
 
     @staticmethod
     def _edits_skip_linear(edits: Dict[str, Any]) -> bool:
@@ -843,7 +914,7 @@ class ImageEditor:
 
         apply_rotation = abs(straighten_angle) > 0.001 and (for_export or has_crop_box)
 
-        # Capture original dimensions BEFORE rotation for crop coordinate transformation
+        # Capture dimensions after 90-degree rotation and before free rotation.
         orig_h, orig_w = arr.shape[:2]
 
         if apply_rotation:
@@ -902,15 +973,14 @@ class ImageEditor:
             crop_box = edits.get("crop_box", 0.0)
             if len(crop_box) == 4:
                 # The crop_box is in 0-1000 normalized coordinates relative to the
-                # ORIGINAL (un-rotated) image. After rotation with expand=True,
-                # the original image is centered within a larger canvas.
-                # We need to transform the coordinates from original image space
-                # to the expanded canvas space.
+                # image after 90-degree rotation, but before free straighten. If
+                # straighten uses expand=True, transform that box onto the expanded
+                # canvas before slicing.
 
                 if apply_rotation and abs(straighten_angle) > 0.001:
                     # Transform crop box through rotation:
-                    # 1. Convert 0-1000 to pixel coords in original image
-                    # 2. Rotate corners around original center
+                    # 1. Convert 0-1000 to pixel coords in the rotated base image
+                    # 2. Rotate corners around the rotated base center
                     # 3. Translate to expanded canvas
                     new_h, new_w = arr.shape[:2]
                     orig_cx, orig_cy = orig_w / 2.0, orig_h / 2.0
@@ -1533,6 +1603,126 @@ class ImageEditor:
 
         return blacks, whites, float(p_low), float(p_high)
 
+    def analyze_auto_vibrance(
+        self,
+        *,
+        blacks: float,
+        whites: float,
+    ) -> float:
+        """Recommend a conservative vibrance boost for low-color auto-adjusts."""
+        with self._lock:
+            # Prefer the unedited master buffer so this analysis cannot double-apply
+            # edits if preview rendering semantics change.  float_preview is only a
+            # fallback for preview-only loads where no master buffer exists.
+            source_arr = (
+                self.float_image if self.float_image is not None else self.float_preview
+            )
+            edits_snapshot = dict(self.current_edits)
+            fallback_original = (
+                self.original_image.copy()
+                if source_arr is None and self.original_image is not None
+                else None
+            )
+
+        if source_arr is None:
+            if fallback_original is None:
+                return 0.0
+            source_arr = (
+                np.array(fallback_original.convert("RGB")).astype(np.float32) / 255.0
+            )
+
+        # Downsample the source before copying so full-resolution masters stay
+        # cheap while _apply_edits still receives a private mutable array.
+        longest_edge = max(source_arr.shape[0], source_arr.shape[1])
+        stride = max(1, longest_edge // _AUTO_VIBRANCE_ANALYSIS_MAX_EDGE)
+        analysis_source = (
+            source_arr[::stride, ::stride, :] if stride > 1 else source_arr
+        )
+        img_arr = np.array(analysis_source, dtype=np.float32, copy=True, order="C")
+
+        try:
+            current_vibrance = float(edits_snapshot.get("vibrance", 0.0))
+            current_saturation = float(edits_snapshot.get("saturation", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        if abs(current_vibrance) > 0.001 or abs(current_saturation) > 0.001:
+            return 0.0
+
+        baseline_edits = dict(edits_snapshot)
+        baseline_edits["blacks"] = float(blacks)
+        baseline_edits["whites"] = float(whites)
+        baseline_edits["vibrance"] = current_vibrance
+
+        # The baseline and every candidate share identical edits upstream of
+        # vibrance, so an isolated cache lets _apply_edits reuse the highlight
+        # analysis instead of recomputing it per pass (and avoids touching the
+        # live preview cache).
+        analysis_cache: dict = {}
+
+        baseline = self._apply_edits(
+            img_arr.copy(),
+            edits=baseline_edits,
+            for_export=False,
+            cache_context=analysis_cache,
+        )
+        rgb = np.clip(baseline, 0.0, 1.0)
+        cmax = rgb.max(axis=2)
+        cmin = rgb.min(axis=2)
+        delta = cmax - cmin
+        luma = rgb.dot([0.299, 0.587, 0.114])
+        useful = (luma > 0.08) & (luma < 0.92) & (cmax > 0.04)
+        if int(np.count_nonzero(useful)) < 100:
+            return 0.0
+
+        sat = np.zeros_like(cmax)
+        np.divide(delta, cmax, out=sat, where=cmax > 0.0001)
+        useful_sat = sat[useful]
+        useful_delta = delta[useful]
+        median_sat = float(np.percentile(useful_sat, 50))
+        high_color_delta = float(np.percentile(useful_delta, 95))
+        if (
+            median_sat >= _AUTO_VIBRANCE_SAT_CEILING
+            or high_color_delta < _AUTO_VIBRANCE_MIN_COLOR_DELTA
+        ):
+            return 0.0
+
+        recommended = min(
+            _AUTO_VIBRANCE_MAX,
+            (_AUTO_VIBRANCE_TARGET_SAT - median_sat) * 0.9,
+        )
+        if recommended < _AUTO_VIBRANCE_MIN:
+            return 0.0
+
+        baseline_clip = self._channel_overshoot_fraction(baseline)
+        for candidate in (
+            recommended,
+            recommended * 0.75,
+            recommended * 0.5,
+            recommended * 0.25,
+        ):
+            candidate_edits = dict(baseline_edits)
+            candidate_edits["vibrance"] = current_vibrance + candidate
+            candidate_arr = self._apply_edits(
+                img_arr.copy(),
+                edits=candidate_edits,
+                for_export=False,
+                cache_context=analysis_cache,
+            )
+            candidate_clip = self._channel_overshoot_fraction(candidate_arr)
+            if candidate_clip <= baseline_clip + _AUTO_VIBRANCE_CLIP_TOLERANCE:
+                return float(candidate)
+
+        return 0.0
+
+    @staticmethod
+    def _channel_overshoot_fraction(arr: np.ndarray) -> float:
+        """Return fraction of pixels with any channel outside export range."""
+        if arr.size == 0:
+            return 0.0
+        overshoot = np.any((arr < 0.0) | (arr > 1.0), axis=2)
+        total = arr.shape[0] * arr.shape[1]
+        return float(np.count_nonzero(overshoot)) / float(total)
+
     @staticmethod
     def _u8_percentile_from_hist(
         hist: np.ndarray, percentile: float, method: str = "lower"
@@ -1821,6 +2011,12 @@ class ImageEditor:
                 "PySide6.QtGui.QImage is required for rendering decoded image data"
             )
 
+        # tobytes() always serializes in C-contiguous (row-major) order, so
+        # bytes_per_line must reflect that layout. Operations like np.rot90
+        # (90-degree rotation) leave arr_u8 as a non-contiguous view whose
+        # strides[0] is NOT width*channels; force contiguity so the stride and
+        # the serialized buffer agree, otherwise QImage decodes to a null image.
+        arr_u8 = np.ascontiguousarray(arr_u8)
         img_buffer = arr_u8.tobytes()
         return DecodedImage(
             buffer=memoryview(img_buffer),
@@ -1873,6 +2069,7 @@ class ImageEditor:
                 # Guard against arbitrary angles in 'rotation'. It expects 90-degree steps.
                 # For arbitrary rotation (drag to rotate), use 'straighten_angle'.
                 try:
+                    current_val = int(self.current_edits.get(key, 0)) % 360
                     # Round to nearest 90 degrees
                     val_deg = float(value)
                     rounded_deg = round(val_deg / 90.0) * 90
@@ -1885,6 +2082,14 @@ class ImageEditor:
                             final_val,
                         )
 
+                    crop_box = self.current_edits.get("crop_box")
+                    self.current_edits["crop_box"] = (
+                        self._rotate_crop_box_for_rotation_change(
+                            crop_box,
+                            current_val,
+                            final_val,
+                        )
+                    )
                     self.current_edits[key] = final_val
                     self._edits_rev += 1
                     return True
@@ -2093,11 +2298,14 @@ class ImageEditor:
                 # nudge pivot earlier to expose micro-contrast (Photoshop-like feel)
                 if headroom_pct < 0.01:
                     if near_white_pct > 0.05 and clipped_pct < 0.05:
-                        # Lots of recoverable near-white, not much flat clipping
-                        pivot = max(0.60, pivot - 0.12 * near_white_pct)
+                        # Lots of recoverable near-white, not much flat clipping:
+                        # nudge the pivot earlier so the broad highlight band is
+                        # engaged, floored low enough to keep covering ordinary
+                        # bright pixels rather than just the clipped top end.
+                        pivot = max(0.28, pivot - 0.12 * near_white_pct)
                     if clipped_pct > 0.02:
                         # Increase chroma rolloff for flat-clipped JPEGs
-                        chroma_rolloff = max(chroma_rolloff, 0.25)
+                        chroma_rolloff = max(chroma_rolloff, 0.14)
 
                 arr = _highlight_recover_linear(
                     arr,
@@ -2780,15 +2988,27 @@ class ImageEditor:
     def rotate_image_cw(self):
         """Decreases the rotation edit parameter by 90° modulo 360 (clockwise)."""
         with self._lock:
-            current = self.current_edits.get("rotation", 0)
-            self.current_edits["rotation"] = (current - 90) % 360
+            current = int(self.current_edits.get("rotation", 0)) % 360
+            new_rotation = (current - 90) % 360
+            self.current_edits["crop_box"] = self._rotate_crop_box_for_rotation_change(
+                self.current_edits.get("crop_box"),
+                current,
+                new_rotation,
+            )
+            self.current_edits["rotation"] = new_rotation
             self._edits_rev += 1
 
     def rotate_image_ccw(self):
         """Increases the rotation edit parameter by 90° modulo 360 (counter-clockwise)."""
         with self._lock:
-            current = self.current_edits.get("rotation", 0)
-            self.current_edits["rotation"] = (current + 90) % 360
+            current = int(self.current_edits.get("rotation", 0)) % 360
+            new_rotation = (current + 90) % 360
+            self.current_edits["crop_box"] = self._rotate_crop_box_for_rotation_change(
+                self.current_edits.get("crop_box"),
+                current,
+                new_rotation,
+            )
+            self.current_edits["rotation"] = new_rotation
             self._edits_rev += 1
 
 

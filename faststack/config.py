@@ -91,6 +91,7 @@ DEFAULT_CONFIG = {
         "auto_level_threshold": "0.1",
         "auto_level_strength": "1.0",
         "auto_level_strength_auto": "False",
+        "auto_vibrance_enabled": "True",
     },
     "helicon": {
         "exe": "C:\\Program Files\\Helicon Software\\Helicon Focus 8\\HeliconFocus.exe",

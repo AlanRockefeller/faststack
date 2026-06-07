@@ -187,6 +187,37 @@ ApplicationWindow {
         return ""
     }
 
+    // The EXIF brief shown in the status bar may end with a GPS-derived
+    // distance segment formatted as "<n> m" (see metadata._format_distance_meters).
+    // These helpers let the status bar render the distance as its own label so a
+    // tooltip can explain what it means.
+    function exifBriefDistanceRegExp() {
+        return /^\d+ m$/
+    }
+
+    function exifBriefWithoutDistance(brief) {
+        var s = root.stringOrEmpty(brief)
+        if (s === "") return ""
+        var re = root.exifBriefDistanceRegExp()
+        var kept = []
+        var parts = s.split(" | ")
+        for (var i = 0; i < parts.length; i++) {
+            if (!re.test(parts[i])) kept.push(parts[i])
+        }
+        return kept.join(" | ")
+    }
+
+    function exifBriefDistance(brief) {
+        var s = root.stringOrEmpty(brief)
+        if (s === "") return ""
+        var re = root.exifBriefDistanceRegExp()
+        var parts = s.split(" | ")
+        for (var i = 0; i < parts.length; i++) {
+            if (re.test(parts[i])) return parts[i]
+        }
+        return ""
+    }
+
     function itemsWithStatus(items, status) {
         var source = root.toArray(items)
         var result = []
@@ -1265,7 +1296,10 @@ ApplicationWindow {
 
                     // Global Key for saving edited image (Ctrl+S) when editor is open
                     if (event.key === Qt.Key_S && (event.modifiers & Qt.ControlModifier)) {
-                        if (root.uiStateRef.isEditorOpen) {
+                        if (root.uiStateRef.isEditorOpen && root.uiStateRef.isCropping) {
+                            root.uiStateRef.statusMessage = "Apply or cancel the crop before saving"
+                            event.accepted = true
+                        } else if (root.uiStateRef.isEditorOpen) {
                             root.controllerRef.save_edited_image()
                             event.accepted = true
                         }
@@ -1345,12 +1379,38 @@ ApplicationWindow {
                       : "N/A"
                 color: root.currentTextColor
             }
+            // EXIF brief: ISO, aperture, shutter speed, capture time.
             Label {
+                id: exifBriefLabel
                 visible: root.uiStateRef
                          && root.uiStateRef.imageCount > 0
-                         && root.stringOrEmpty(root.uiStateRef.exifBrief).length > 0
-                text: root.uiStateRef ? root.stringOrEmpty(root.uiStateRef.exifBrief) : ""
+                         && root.exifBriefWithoutDistance(root.uiStateRef.exifBrief).length > 0
+                text: root.uiStateRef ? root.exifBriefWithoutDistance(root.uiStateRef.exifBrief) : ""
                 color: root.currentTextColor
+            }
+            // GPS distance from the previous image, in meters. Shown as its own
+            // label so a tooltip can explain it on hover.
+            Label {
+                id: exifDistanceLabel
+                property string distanceText: root.uiStateRef ? root.exifBriefDistance(root.uiStateRef.exifBrief) : ""
+                visible: root.uiStateRef
+                         && root.uiStateRef.imageCount > 0
+                         && exifDistanceLabel.distanceText.length > 0
+                text: exifBriefLabel.visible
+                      ? ("| " + exifDistanceLabel.distanceText)
+                      : exifDistanceLabel.distanceText
+                color: root.currentTextColor
+
+                ToolTip.visible: exifDistanceMouse.containsMouse && exifDistanceLabel.visible
+                ToolTip.text: "Distance in meters between this image and the previous one (calculated from GPS EXIF data)"
+                ToolTip.delay: 500
+
+                MouseArea {
+                    id: exifDistanceMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.NoButton
+                }
             }
             Label {
                 id: directoryPathLabel
@@ -1768,6 +1828,12 @@ ApplicationWindow {
                           "<b>Image Editing:</b><br>" +
                           "&nbsp;&nbsp;E: Toggle Image Editor<br>" +
                           "&nbsp;&nbsp;Ctrl+S (in editor): Save current live edits<br>" +
+                          "<b>&nbsp;&nbsp;Compact Editor (when focused):</b><br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Left / Right: Previous / Next image<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Up / Down: Raise / lower the highlighted slider<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Click a slider label: Highlight it for Up/Down<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;S: Save&nbsp;&nbsp;E / Esc: Close&nbsp;&nbsp;O: Crop<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;B, F, D, I, etc. work as in the main view<br>" +
                           "&nbsp;&nbsp;A: Quick auto white balance (live)<br>" +
                           "&nbsp;&nbsp;l: Quick auto levels (live)<br>" +
                           "&nbsp;&nbsp;L: Quick auto white balance + auto levels (live)<br>" +

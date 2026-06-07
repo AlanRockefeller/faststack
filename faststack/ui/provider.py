@@ -42,6 +42,29 @@ class ImageProvider(QQuickImageProvider):
         # Lock to protect keepalive deque from concurrent access by QML rendering threads
         self._keepalive_lock = threading.Lock()
 
+    def _fallback_image(self) -> QImage:
+        return self.placeholder.copy()
+
+    def _log_provider_fallback(
+        self,
+        request_id: str,
+        reason: str,
+        *,
+        stale: bool,
+        exc_info: bool = False,
+    ) -> None:
+        if stale:
+            log.debug(
+                "Ignoring stale image provider request %s: %s", request_id, reason
+            )
+            return
+        log.warning(
+            "Image provider could not satisfy current request %s: %s",
+            request_id,
+            reason,
+            exc_info=exc_info,
+        )
+
     def requestImage(self, id: str, size: object, requestedSize: object) -> QImage:
         """Handles image requests from QML."""
         import time
@@ -52,8 +75,9 @@ class ImageProvider(QQuickImageProvider):
             print(f"[DBGCACHE] {_t_start*1000:.3f} requestImage: START id={id}")
 
         if not id:
-            return self.placeholder
+            return self._fallback_image()
 
+        request_is_stale = False
         try:
             # Handle mask overlay requests
             if id.startswith("mask_overlay/"):
@@ -68,6 +92,56 @@ class ImageProvider(QQuickImageProvider):
             parts = id.split("/")
             index = int(parts[0])
             gen = int(parts[1]) if len(parts) > 1 else None
+
+            current_index = getattr(self.app_controller, "current_index", None)
+            current_generation = getattr(
+                self.app_controller,
+                "ui_refresh_generation",
+                None,
+            )
+            ui_state = getattr(self.app_controller, "ui_state", None)
+            grid_active_value = getattr(ui_state, "isGridViewActive", False)
+            grid_active = (
+                grid_active_value if isinstance(grid_active_value, bool) else False
+            )
+            index_is_current = not isinstance(current_index, int) or (
+                index == current_index
+            )
+            generation_is_current = (
+                gen is None
+                or not isinstance(
+                    current_generation,
+                    int,
+                )
+                or (gen == current_generation)
+            )
+            request_is_stale = (
+                grid_active or not index_is_current or not generation_is_current
+            )
+
+            image_files = getattr(self.app_controller, "image_files", None)
+            image_count = len(image_files) if isinstance(image_files, list) else None
+            if image_count is not None and (
+                index < 0 or index >= image_count or image_count == 0
+            ):
+                stale_bounds_request = request_is_stale or image_count == 0
+                self._log_provider_fallback(
+                    id,
+                    f"index {index} outside image list of {image_count}",
+                    stale=stale_bounds_request,
+                )
+                return self._fallback_image()
+
+            if request_is_stale:
+                self._log_provider_fallback(
+                    id,
+                    (
+                        "request no longer matches current image source "
+                        f"(current index={current_index}, generation={current_generation})"
+                    ),
+                    stale=True,
+                )
+                return self._fallback_image()
 
             # If editor is open, use the background-rendered preview buffer
             # BUT only if the requested index matches the currently edited index!
@@ -169,6 +243,13 @@ class ImageProvider(QQuickImageProvider):
                     image_data.bytes_per_line,
                     fmt,
                 )
+                if qimg.isNull():
+                    self._log_provider_fallback(
+                        id,
+                        "decoded buffer produced a null QImage",
+                        stale=request_is_stale,
+                    )
+                    return self._fallback_image()
 
                 # Detach from Python buffer to prevent ownership issues and force proper texture upload
                 # OPTIMIZATION: Only do this expensive copy when serving the live editor preview,
@@ -214,9 +295,23 @@ class ImageProvider(QQuickImageProvider):
                 return qimg
 
         except (ValueError, IndexError) as e:
-            log.error(f"Invalid image ID requested from QML: {id}. Error: {e}")
+            log.warning("Invalid image ID requested from QML: %s. Error: %s", id, e)
+            return self._fallback_image()
+        except Exception:
+            self._log_provider_fallback(
+                id,
+                "unexpected provider error",
+                stale=request_is_stale,
+                exc_info=True,
+            )
+            return self._fallback_image()
 
-        return self.placeholder
+        self._log_provider_fallback(
+            id,
+            "decode returned no image data",
+            stale=request_is_stale,
+        )
+        return self._fallback_image()
 
 
 class UIState(QObject):
@@ -261,6 +356,7 @@ class UIState(QObject):
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
+    autoVibranceEnabledChanged = Signal(bool)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_editor_expanded_changed = Signal(bool)
@@ -955,6 +1051,15 @@ class UIState(QObject):
     def autoLevelStrengthAuto(self, value):
         self.app_controller.set_auto_level_strength_auto(value)
         self.autoLevelStrengthAutoChanged.emit(value)
+
+    @Property(bool, notify=autoVibranceEnabledChanged)
+    def autoVibranceEnabled(self):
+        return self.app_controller.get_auto_vibrance_enabled()
+
+    @autoVibranceEnabled.setter
+    def autoVibranceEnabled(self, value):
+        self.app_controller.set_auto_vibrance_enabled(value)
+        self.autoVibranceEnabledChanged.emit(value)
 
     @Slot()
     def open_folder(self):
