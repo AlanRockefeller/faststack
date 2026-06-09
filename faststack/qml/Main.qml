@@ -870,6 +870,18 @@ ApplicationWindow {
                     actionsMenu.close()
                 }
             }
+            MenuActionItem {
+                width: 220
+                text: "Duplicate Image"
+                enabled: root.uiStateRef ? root.uiStateRef.imageCount > 0 : false
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                disabledTextColor: root.isDarkTheme ? "#666666" : "#999999"
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.duplicate_current_image()
+                    actionsMenu.close()
+                }
+            }
 
             MenuActionItem {
                 width: 220

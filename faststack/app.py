@@ -1432,6 +1432,38 @@ class AppController(QObject):
         ranges.sort()
         return ranges
 
+    @staticmethod
+    def _shift_ranges_after_insert(
+        ranges: List[List[int]], insert_index: int
+    ) -> List[List[int]]:
+        """Shift index ranges after inserting one unselected image."""
+        shifted: List[List[int]] = []
+        for start, end in ranges:
+            if end < insert_index:
+                shifted.append([start, end])
+            elif start >= insert_index:
+                shifted.append([start + 1, end + 1])
+            else:
+                shifted.append([start, insert_index - 1])
+                shifted.append([insert_index + 1, end + 1])
+        return [r for r in shifted if r[0] <= r[1]]
+
+    @staticmethod
+    def _duplicate_path_for(source: Path) -> Path:
+        """Return an unused duplicate filename next to source."""
+        first = source.with_name(f"{source.stem}_duplicate{source.suffix}")
+        if not first.exists():
+            return first
+
+        counter = 2
+        while True:
+            candidate = source.with_name(
+                f"{source.stem}_duplicate{counter}{source.suffix}"
+            )
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
     def _reindex_after_save(self, saved_path: str) -> bool:
         """Re-derive current_index to point at *saved_path* after a save.
 
@@ -2584,6 +2616,7 @@ class AppController(QObject):
             -1.0,
             min(1.0, current_vibrance + auto_vibrance_delta),
         )
+        auto_vibrance_delta = base_vibrance - current_vibrance
         return ActiveAutoAdjustState(
             active_path_key=active_path_key,
             session_id=getattr(self.image_editor, "session_id", None),
@@ -2716,10 +2749,25 @@ class AppController(QObject):
     ) -> Optional[dict[str, Any]]:
         """Capture an immutable save request for the current live editor session."""
         self._last_save_prepare_error = None
-        if self._crop_mode_has_saved_geometry or (
-            self.ui_state and getattr(self.ui_state, "isCropping", False) is True
-        ):
-            self._cancel_crop_transaction_for_session_boundary()
+        if self.ui_state and getattr(self.ui_state, "isCropping", False) is True:
+            self._last_save_prepare_error = "Apply or cancel the crop before saving"
+            self.update_status_message(self._last_save_prepare_error)
+            return None
+        if self._crop_mode_has_saved_geometry:
+            try:
+                self._restore_crop_mode_geometry()
+            except Exception:
+                log.exception("Failed to restore stale crop transaction before save")
+                self._last_save_prepare_error = (
+                    "Failed to restore crop state before saving"
+                )
+                self.update_status_message(
+                    self._last_save_prepare_error,
+                    timeout=5000,
+                )
+                return None
+            finally:
+                self._clear_crop_mode_snapshot()
         if not self.image_editor.original_image:
             return None
 
@@ -3013,10 +3061,6 @@ class AppController(QObject):
     @Slot()
     def save_edited_image(self):
         """Save the current live editor session in the background."""
-        if self.ui_state.isCropping:
-            self.update_status_message("Apply or cancel the crop before saving")
-            return
-
         close_after = self.ui_state.isEditorOpen and self.ui_state.isEditorExpanded
         request = self._prepare_current_session_save_request(
             editor_was_open=close_after,
@@ -3617,6 +3661,108 @@ class AppController(QObject):
 
         # 2. Otherwise default to single image deletion
         self._delete_indices([self.current_index], "loupe")
+
+    @Slot()
+    def duplicate_current_image(self):
+        """Copy the current visible image and insert the copy after it."""
+        if not self.image_files:
+            self.update_status_message("No image to duplicate.")
+            return
+
+        if not (0 <= self.current_index < len(self.image_files)):
+            self.update_status_message("No image to duplicate.")
+            return
+
+        if self._filter_enabled:
+            self.update_status_message("Clear filters before duplicating.")
+            return
+
+        if self.ui_state and getattr(self.ui_state, "isCropping", False) is True:
+            self.update_status_message("Apply/save or discard edits before duplicating.")
+            return
+
+        if self.has_unsaved_edits():
+            self.update_status_message("Apply/save or discard edits before duplicating.")
+            return
+
+        source_image = self.image_files[self.current_index]
+        source_path = (
+            Path(self.view_override_path)
+            if self.view_override_path
+            else source_image.path
+        )
+        if self._block_if_saving(source_path):
+            return
+
+        if not source_path.exists():
+            self.update_status_message("Current image file is missing.")
+            return
+
+        duplicate_path = self._duplicate_path_for(source_path)
+
+        try:
+            shutil.copy2(source_path, duplicate_path)
+            stat = duplicate_path.stat()
+        except OSError as exc:
+            log.exception("Failed to duplicate image %s", source_path)
+            self.update_status_message(f"Duplicate failed: {exc}")
+            return
+
+        duplicate_image = ImageFile(
+            path=duplicate_path,
+            raw_pair=None,
+            timestamp=stat.st_mtime,
+        )
+        insert_index = self.current_index + 1
+        self.image_files.insert(insert_index, duplicate_image)
+
+        all_insert_index = len(self._all_images)
+        for idx, img in enumerate(self._all_images):
+            if self._key(img.path) == self._key(source_image.path):
+                all_insert_index = idx + 1
+                break
+        self._all_images.insert(all_insert_index, duplicate_image)
+
+        if self.batches:
+            self.batches = self._shift_ranges_after_insert(
+                self.batches, insert_index
+            )
+            self._invalidate_batch_cache()
+        if (
+            self.batch_start_index is not None
+            and self.batch_start_index >= insert_index
+        ):
+            self.batch_start_index += 1
+
+        stacks_changed = False
+        if self.stacks:
+            old_stacks = [s[:] for s in self.stacks]
+            self.stacks = self._shift_ranges_after_insert(self.stacks, insert_index)
+            stacks_changed = self.stacks != old_stacks
+        if (
+            self.stack_start_index is not None
+            and self.stack_start_index >= insert_index
+        ):
+            self.stack_start_index += 1
+        if stacks_changed:
+            self.sidecar.data.stacks = self.stacks
+            self.sidecar.save()
+            self._metadata_cache_index = (-1, -1)
+
+        self.prefetcher.set_image_files(self.image_files)
+        self._rebuild_path_to_index()
+        clear_raw_count_cache()
+        self._grid_model_dirty = True
+
+        if self._thumbnail_model and self._is_grid_view_active:
+            self._refresh_thumbnail_model_from_controller()
+
+        self.dataChanged.emit()
+        if stacks_changed:
+            self.ui_state.stackSummaryChanged.emit()
+        self.sync_ui_state()
+        self.update_status_message(f"Duplicated image as {duplicate_path.name}")
+        log.info("Duplicated image %s -> %s", source_path, duplicate_path)
 
     @Slot(int)
     def grid_delete_at_cursor(self, cursor_index: int):
@@ -4752,14 +4898,6 @@ class AppController(QObject):
         if hasattr(self.ui_state, "cropRotation"):
             self.ui_state.cropRotation = 0.0
         return True
-
-    def _cancel_crop_transaction_for_session_boundary(self) -> None:
-        if self._crop_mode_has_saved_geometry:
-            self._restore_crop_mode_geometry()
-        if self.ui_state and getattr(self.ui_state, "isCropping", False) is True:
-            self.ui_state.isCropRotating = False
-            self.ui_state.isCropping = False
-        self._clear_crop_mode_snapshot()
 
     def _reset_crop_only(self, *, clear_crop_transaction: bool = True):
         """Resets crop settings (crop box and straighten) to default and exits crop mode, PRESERVING 90-deg rotation."""
@@ -8963,7 +9101,16 @@ class AppController(QObject):
     def cancel_crop_mode(self):
         """Cancel crop mode without applying changes."""
         if self.ui_state.isCropping:
-            self._restore_crop_mode_geometry()
+            try:
+                self._restore_crop_mode_geometry()
+            except Exception:
+                log.exception("cancel_crop_mode: failed to restore crop geometry")
+
+            # Clear the mode before rendering the restored preview so the crop
+            # overlay cannot stay visible during slow or failed preview work.
+            self.ui_state.isCropRotating = False
+            self.ui_state.isCropping = False
+
             try:
                 decoded = self.image_editor.get_full_resolution_preview_data()
             except Exception:
@@ -8979,8 +9126,6 @@ class AppController(QObject):
                     self._last_rendered_preview_index = self.current_index
                     self._last_rendered_preview_gen = self.ui_refresh_generation
 
-            self.ui_state.isCropRotating = False
-            self.ui_state.isCropping = False
             self._clear_crop_mode_snapshot()
             if decoded is not None:
                 self._emit_preview_accepted_side_effects()

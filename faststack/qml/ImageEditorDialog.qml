@@ -73,6 +73,7 @@ Window {
     }
 
     function sliderEditScale(key) {
+        if (key === "contrast") return 0.5
         return (key === "exposure" || key === "whites") ? 2.0 : 1.0
     }
 

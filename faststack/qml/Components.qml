@@ -73,6 +73,17 @@ Item {
         return true
     }
 
+    function cancelCropMode() {
+        if (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping || !loupeView.controllerRef) return false
+
+        mainMouseArea.clearPendingRotation(0)
+        mainMouseArea.endCropInteraction()
+        mainMouseArea.cropRotation = 0
+        mainMouseArea.isRotating = false
+        loupeView.controllerRef.cancel_crop_mode()
+        return true
+    }
+
     Connections {
         target: loupeView.uiStateRef
         function onCurrentIndexChanged() {
@@ -122,12 +133,7 @@ Item {
             if (mainMouseArea.isRotating) {
                 loupeView.cancelActiveCropRotation()
                 event.accepted = true
-            } else if (loupeView.controllerRef) {
-                mainMouseArea.clearPendingRotation(0)
-                mainMouseArea.endCropInteraction()
-                loupeView.controllerRef.cancel_crop_mode()
-                mainMouseArea.cropRotation = 0
-                mainMouseArea.isRotating = false
+            } else if (loupeView.cancelCropMode()) {
                 event.accepted = true
             }
         }

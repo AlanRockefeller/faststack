@@ -13,6 +13,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 - Crop mode now works while the compact image editor is open - it is still disabled if the expanded editor is open.
 - Highlights slider now recovers a broad range of bright tones with a smooth falloff, instead of only affecting near-white pixels, while leaving midtones unchanged.
 - Compact image editor keyboard handling reworked: Left/Right now navigate to the previous/next image even when the editor is focused, Up/Down raise/lower the highlighted slider, and clicking a slider's label highlights it as the Up/Down target. Other shortcuts (B to batch, F, D, I, G, etc.) now also work while the editor is focused. README gained a full Image Editor section.
+- Added Actions -> Duplicate Image, which copies the current visible image to a `_duplicate` filename and inserts it as the next image without copying backups or RAW pairs.
 
 ## 1.6.3 (2026-04-16)
 

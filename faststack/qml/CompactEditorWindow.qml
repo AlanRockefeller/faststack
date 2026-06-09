@@ -41,6 +41,8 @@ Window {
         } else {
             positionAtRightGutter()
         }
+        compactEditor.keyboardHandlerReady = true
+        Qt.callLater(compactEditor.focusKeyboardHandler)
     }
 
     function positionAtRightGutter() {
@@ -53,6 +55,7 @@ Window {
 
     onXChanged: if (visible) compactSettings.savedX = x
     onYChanged: if (visible) compactSettings.savedY = y
+    onActiveChanged: if (active) compactEditor.focusKeyboardHandler()
 
     // --- Color Palette (matches full editor) ---
     readonly property color backgroundColor: "#1e1e1e"
@@ -78,6 +81,11 @@ Window {
     // slider's label (or value) to retarget. Defaults to the first slider so the
     // arrow keys work immediately when the editor opens.
     property string highlightedSliderKey: "exposure"
+    property bool keyboardHandlerReady: false
+
+    function focusKeyboardHandler() {
+        if (compactEditor.visible && compactEditor.keyboardHandlerReady) keyScope.forceActiveFocus()
+    }
 
     // Adjust the currently highlighted slider by `delta` slider-space steps
     // (the sliders all run -100..100). Driven by the Up/Down arrow keys.
@@ -100,6 +108,36 @@ Window {
             compactEditor.closeTooltip = "Discard unsaved edits and close"
         else
             compactEditor.closeTooltip = "Close editor"
+    }
+
+    function requestClose() {
+        if (compactEditor.cropActive) {
+            if (compactEditor.controllerRef) compactEditor.controllerRef.cancel_crop_mode()
+            return
+        }
+        if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits()) {
+            if (!discardDialog.opened) discardDialog.open()
+        } else {
+            if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorOpen = false
+        }
+    }
+
+    function handleArrowKey(key) {
+        if (compactEditor.cropActive || discardDialog.opened) return false
+        if (key === Qt.Key_Left || key === Qt.Key_Right) {
+            if (compactEditor.controllerRef)
+                compactEditor.controllerRef.handle_key_from_compact_editor(key, Qt.NoModifier, "")
+            return true
+        }
+        if (key === Qt.Key_Up) {
+            compactEditor.adjustHighlightedSlider(1)
+            return true
+        }
+        if (key === Qt.Key_Down) {
+            compactEditor.adjustHighlightedSlider(-1)
+            return true
+        }
+        return false
     }
 
     Timer {
@@ -141,6 +179,7 @@ Window {
         if (visible && compactEditor.controllerRef) {
             ensureEditorLoaded()
             if (compactSettings.savedX < 0) positionAtRightGutter()
+            Qt.callLater(compactEditor.focusKeyboardHandler)
         }
     }
 
@@ -162,26 +201,53 @@ Window {
     }
 
     function sliderEditScale(key) {
+        if (key === "contrast") return 0.5
         return (key === "exposure" || key === "whites") ? 2.0 : 1.0
+    }
+
+    Shortcut {
+        sequence: "Left"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Left)
+    }
+
+    Shortcut {
+        sequence: "Right"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Right)
+    }
+
+    Shortcut {
+        sequence: "Up"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.adjustHighlightedSlider(1)
+    }
+
+    Shortcut {
+        sequence: "Down"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.adjustHighlightedSlider(-1)
     }
 
     onClosing: (close) => {
         if (compactEditor.uiStateRef && compactEditor.controllerRef) {
-            if (compactEditor.controllerRef.has_unsaved_edits()) {
-                close.accepted = false
-                discardDialog.open()
-                return
-            }
-            compactEditor.uiStateRef.isEditorOpen = false
+            close.accepted = false
+            compactEditor.requestClose()
         }
     }
 
     // Keyboard handling for the compact editor window.
     //
-    // The sliders use focusPolicy: Qt.NoFocus so they never steal the arrow
-    // keys, which lets this scope decide what every key does:
-    //   - Left / Right     -> previous / next image (forwarded to main window)
+    // Arrow keys are handled by WindowShortcut entries above so they still work
+    // when a child control has focus:
+    //   - Left / Right     -> previous / next image
     //   - Up / Down        -> raise / lower the highlighted slider
+    //
+    // This focus scope handles the remaining compact-editor keys:
     //   - Esc / E / S / O  -> editor-local actions (close / save / crop)
     //   - everything else  -> forwarded to the main window key bindings so
     //                         keys like B (batch), F, D, I, etc. still work
@@ -209,35 +275,29 @@ Window {
                     if (compactEditor.uiStateRef) compactEditor.uiStateRef.statusMessage = "Apply or cancel the crop before saving"
                     event.accepted = true
                     return
+                } else if (event.key === Qt.Key_Left || event.key === Qt.Key_Right || event.key === Qt.Key_Up || event.key === Qt.Key_Down) {
+                    event.accepted = true
+                    return
                 }
             }
 
-            if (event.key === Qt.Key_Escape) {
-                if (compactEditor.uiStateRef && compactEditor.controllerRef) {
-                    if (compactEditor.controllerRef.has_unsaved_edits()) {
-                        discardDialog.open()
-                    } else {
-                        compactEditor.uiStateRef.isEditorOpen = false
-                    }
-                }
+            if (compactEditor.handleArrowKey(event.key)) {
+                event.accepted = true
+            } else if (event.key === Qt.Key_Escape) {
+                compactEditor.requestClose()
                 event.accepted = true
             } else if (event.key === Qt.Key_E && !(event.modifiers & Qt.ControlModifier)) {
-                if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorOpen = false
+                compactEditor.requestClose()
                 event.accepted = true
             } else if (event.key === Qt.Key_S) {
                 // S or Ctrl+S both save the live edits from the compact editor.
                 compactEditor.ensureEditorLoaded()
-                if (compactEditor.controllerRef) compactEditor.controllerRef.save_edited_image()
-                event.accepted = true
-            } else if (event.key === Qt.Key_Up) {
-                compactEditor.adjustHighlightedSlider(1)
-                event.accepted = true
-            } else if (event.key === Qt.Key_Down) {
-                compactEditor.adjustHighlightedSlider(-1)
+                if (compactEditor.uiStateRef && !compactEditor.uiStateRef.isSaving && compactEditor.controllerRef)
+                    compactEditor.controllerRef.save_edited_image()
                 event.accepted = true
             } else {
-                // Forward every other key (Left/Right navigation, B, F, D, I,
-                // G, etc.) to the main window's key bindings.
+                // Forward every other key (B, F, D, I, G, etc.) to the main
+                // window's key bindings.
                 if (compactEditor.controllerRef)
                     compactEditor.controllerRef.handle_key_from_compact_editor(event.key, event.modifiers, event.text)
                 event.accepted = true
@@ -323,13 +383,7 @@ Window {
                     ToolTip.delay: 500
                     ToolTip.text: compactEditor.closeTooltip
                     onHoveredChanged: if (hovered) compactEditor.refreshCloseTooltip()
-                    onClicked: {
-                        if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits()) {
-                            discardDialog.open()
-                        } else {
-                            if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorOpen = false
-                        }
-                    }
+                    onClicked: compactEditor.requestClose()
                     contentItem: Text {
                         text: "✕"
                         font.pixelSize: 13
@@ -644,13 +698,7 @@ Window {
                     ToolTip.delay: 500
                     ToolTip.text: compactEditor.closeTooltip
                     onHoveredChanged: if (hovered) compactEditor.refreshCloseTooltip()
-                    onClicked: {
-                        if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits()) {
-                            discardDialog.open()
-                        } else {
-                            if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorOpen = false
-                        }
-                    }
+                    onClicked: compactEditor.requestClose()
                     contentItem: Text {
                         text: closeBtn.text
                         font: closeBtn.font
@@ -736,7 +784,10 @@ Window {
                     anchors.fill: parent
                     enabled: !compactEditor.cropActive
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: compactEditor.highlightedSliderKey = sliderRow.key
+                    onClicked: {
+                        compactEditor.highlightedSliderKey = sliderRow.key
+                        compactEditor.focusKeyboardHandler()
+                    }
                 }
             }
 
@@ -796,6 +847,7 @@ Window {
 
                 function triggerReset() {
                     compactEditor.ensureEditorLoaded()
+                    compactEditor.highlightedSliderKey = sliderRow.key
                     slider.isResetting = true
                     sendTimer.stop()
                     if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
@@ -809,6 +861,8 @@ Window {
                 onPressedChanged: {
                     if (pressed) {
                         compactEditor.ensureEditorLoaded()
+                        compactEditor.highlightedSliderKey = sliderRow.key
+                        compactEditor.focusKeyboardHandler()
                         compactEditor.slidersPressedCount++
                         if (!slider.isResetting) {
                             _pendingValue = value
@@ -829,6 +883,7 @@ Window {
 
                 onMoved: {
                     if (slider.isResetting) return
+                    compactEditor.highlightedSliderKey = sliderRow.key
                     _pendingValue = value
                     if (!sendTimer.running) sendTimer.start()
                 }
@@ -893,6 +948,7 @@ Window {
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
                         compactEditor.highlightedSliderKey = sliderRow.key
+                        compactEditor.focusKeyboardHandler()
                         if (!slider.isResetting) slider.triggerReset()
                     }
                 }
