@@ -9,7 +9,8 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 - Compact image editor now includes a contrast slider.
 - Right-click crop entry in loupe view is now reliable after panning and with trackpads that report mixed button state.
 - Loupe status bar EXIF details now show the distance in meters from the previous photo when both images have GPS coordinates.
-- Auto level/color (capital L shortcut) now also raises the vibrance if it thinks it should be raised. There is a setting to enable/disable this, enabled by default.
+- Quick auto levels/auto color (`l` and `L`) now also raise the vibrance if FastStack thinks it should be raised. There is a setting to enable/disable this, enabled by default.
+- Holding Space in loupe view now shows the original source image with the current crop still applied, hiding other live edits until Space is released.
 - Crop mode now works while the compact image editor is open - it is still disabled if the expanded editor is open.
 - Highlights slider now recovers a broad range of bright tones with a smooth falloff, instead of only affecting near-white pixels, while leaving midtones unchanged.
 - Compact image editor keyboard handling reworked: Left/Right now navigate to the previous/next image even when the editor is focused, Up/Down raise/lower the highlighted slider, and clicking a slider's label highlights it as the Up/Down target. Other shortcuts (B to batch, F, D, I, G, etc.) now also work while the editor is focused. README gained a full Image Editor section.

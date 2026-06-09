@@ -381,8 +381,8 @@ Item {
                     id: darkenOverlay
                     anchors.fill: parent
                     z: 90
-                    visible: loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible
-                    source: (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible)
+                    visible: loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible && !loupeView.uiStateRef.originalCompareActive
+                    source: (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible && !loupeView.uiStateRef.originalCompareActive)
                             ? "image://provider/mask_overlay/" + loupeView.uiStateRef.darkenOverlayGeneration
                             : ""
                     fillMode: Image.Stretch

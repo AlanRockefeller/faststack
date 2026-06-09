@@ -74,6 +74,8 @@ Window {
     property int updatePulse: 0
     readonly property bool cropActive: compactEditor.uiStateRef ? compactEditor.uiStateRef.isCropping : false
     property int lastLoadedIndex: -1
+    property bool lastLoadWasFull: false
+    property bool forceNextPreviewLoad: false
     property string closeTooltip: "Close editor"
 
     // Key of the slider that the Up/Down arrow keys will adjust. The matching
@@ -92,7 +94,7 @@ Window {
     function adjustHighlightedSlider(delta) {
         if (compactEditor.cropActive) return
         if (!compactEditor.controllerRef || !compactEditor.highlightedSliderKey) return
-        compactEditor.ensureEditorLoaded()
+        compactEditor.ensureEditorLoaded("slider-key")
         var key = compactEditor.highlightedSliderKey
         var scale = compactEditor.sliderEditScale(key)
         // Convert the stored edit-space value into slider space, step it, clamp,
@@ -142,26 +144,54 @@ Window {
 
     Timer {
         id: deferredLoadTimer
-        interval: 200
+        interval: 250
         repeat: false
         onTriggered: {
             if (!compactEditor.visible || !compactEditor.controllerRef || !compactEditor.uiStateRef) return
             var idx = compactEditor.uiStateRef.currentIndex
-            if (idx === compactEditor.lastLoadedIndex) return
+            var forceLoad = compactEditor.forceNextPreviewLoad
+            compactEditor.forceNextPreviewLoad = false
+            if (!forceLoad && idx === compactEditor.lastLoadedIndex) {
+                compactEditor.controllerRef.note_compact_editor_reload_skipped(idx, "already-loaded")
+                return
+            }
+            var loaded = compactEditor.controllerRef.load_image_for_editing_preview()
+            if (!loaded) {
+                compactEditor.lastLoadedIndex = -1
+                compactEditor.lastLoadWasFull = false
+                return
+            }
             compactEditor.lastLoadedIndex = idx
-            compactEditor.controllerRef.load_image_for_editing()
+            compactEditor.lastLoadWasFull = false
             compactEditor.controllerRef.update_histogram()
             compactEditor.updatePulse++
         }
     }
 
-    function ensureEditorLoaded() {
+    function schedulePreviewLoad(reason, forceLoad) {
+        if (!compactEditor.visible || !compactEditor.controllerRef || !compactEditor.uiStateRef) return
+        var idx = compactEditor.uiStateRef.currentIndex
+        var coalesced = deferredLoadTimer.running
+        compactEditor.forceNextPreviewLoad = compactEditor.forceNextPreviewLoad || !!forceLoad
+        if (idx !== compactEditor.lastLoadedIndex) compactEditor.lastLoadWasFull = false
+        compactEditor.controllerRef.note_compact_editor_reload_scheduled(idx, coalesced, deferredLoadTimer.interval, reason)
+        deferredLoadTimer.restart()
+    }
+
+    function ensureEditorLoaded(reason) {
         if (!compactEditor.controllerRef || !compactEditor.uiStateRef) return
         var idx = compactEditor.uiStateRef.currentIndex
-        if (idx !== compactEditor.lastLoadedIndex) {
+        if (idx !== compactEditor.lastLoadedIndex || !compactEditor.lastLoadWasFull) {
             deferredLoadTimer.stop()
+            compactEditor.controllerRef.note_compact_editor_full_load_required(idx, reason || "user-action")
+            var loaded = compactEditor.controllerRef.load_image_for_editing()
+            if (!loaded) {
+                compactEditor.lastLoadedIndex = -1
+                compactEditor.lastLoadWasFull = false
+                return
+            }
             compactEditor.lastLoadedIndex = idx
-            compactEditor.controllerRef.load_image_for_editing()
+            compactEditor.lastLoadWasFull = true
             compactEditor.controllerRef.update_histogram()
             compactEditor.updatePulse++
         }
@@ -170,16 +200,17 @@ Window {
     Connections {
         target: compactEditor.uiStateRef
         function onCurrentIndexChanged() {
-            if (!compactEditor.visible) return
-            deferredLoadTimer.restart()
+            compactEditor.schedulePreviewLoad("navigation")
         }
     }
 
     onVisibleChanged: {
         if (visible && compactEditor.controllerRef) {
-            ensureEditorLoaded()
+            compactEditor.schedulePreviewLoad("open", true)
             if (compactSettings.savedX < 0) positionAtRightGutter()
             Qt.callLater(compactEditor.focusKeyboardHandler)
+        } else {
+            deferredLoadTimer.stop()
         }
     }
 
@@ -291,7 +322,7 @@ Window {
                 event.accepted = true
             } else if (event.key === Qt.Key_S) {
                 // S or Ctrl+S both save the live edits from the compact editor.
-                compactEditor.ensureEditorLoaded()
+                compactEditor.ensureEditorLoaded("save")
                 if (compactEditor.uiStateRef && !compactEditor.uiStateRef.isSaving && compactEditor.controllerRef)
                     compactEditor.controllerRef.save_edited_image()
                 event.accepted = true
@@ -356,6 +387,7 @@ Window {
                     padding: 0
                     flat: true
                     onClicked: {
+                        compactEditor.ensureEditorLoaded("expand")
                         if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorExpanded = true
                     }
                     contentItem: Text {
@@ -578,7 +610,7 @@ Window {
                     padding: 0
                     flat: true
                     onClicked: {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("auto-levels")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.auto_levels()
                         compactEditor.updatePulse++
                     }
@@ -634,7 +666,7 @@ Window {
                     padding: 0
                     flat: true
                     onClicked: {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("auto-white-balance")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.auto_white_balance()
                         compactEditor.updatePulse++
                     }
@@ -677,7 +709,7 @@ Window {
                     font.pixelSize: 11
                     Material.foreground: compactEditor.mutedText
                     onClicked: {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("reset")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.reset_edit_parameters()
                         compactEditor.updatePulse++
                     }
@@ -722,7 +754,7 @@ Window {
                     font.pixelSize: 11
                     enabled: compactEditor.uiStateRef ? (!compactEditor.uiStateRef.isSaving && !compactEditor.cropActive) : true
                     onClicked: {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("save")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.save_edited_image()
                     }
                     contentItem: Text {
@@ -846,7 +878,7 @@ Window {
                 }
 
                 function triggerReset() {
-                    compactEditor.ensureEditorLoaded()
+                    compactEditor.ensureEditorLoaded("slider-reset")
                     compactEditor.highlightedSliderKey = sliderRow.key
                     slider.isResetting = true
                     sendTimer.stop()
@@ -860,7 +892,7 @@ Window {
 
                 onPressedChanged: {
                     if (pressed) {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("slider-change")
                         compactEditor.highlightedSliderKey = sliderRow.key
                         compactEditor.focusKeyboardHandler()
                         compactEditor.slidersPressedCount++

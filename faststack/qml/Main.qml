@@ -1016,6 +1016,21 @@ ApplicationWindow {
                     actionsMenu.close()
                 }
             }
+
+            CheckableMenuActionItem {
+                width: 220
+                itemText: "Automatically add edited photos to batch"
+                checked: root.uiStateRef ? root.uiStateRef.autoAddEditedToBatch : true
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                onClicked: {
+                    if (root.uiStateRef) {
+                        root.uiStateRef.autoAddEditedToBatch = !root.uiStateRef.autoAddEditedToBatch
+                    }
+                    actionsMenu.close()
+                }
+            }
+
             MenuActionItem {
                 width: 220
                 text: "Jump to Last Uploaded"
@@ -1133,6 +1148,19 @@ ApplicationWindow {
                 defaultTextColor: root.currentTextColor
                 onClicked: {
                     if (root.controllerRef) root.controllerRef.set_sort_mode("date")
+                    sortSubMenu.close()
+                    actionsMenu.close()
+                }
+            }
+            MenuActionItem {
+                width: 180
+                text: "By Date (reverse)"
+                hoverFillColor: root.menuHoverColor
+                selectedFillColor: root.menuSelectedColor
+                selected: root.uiStateRef && root.uiStateRef.sortMode === "date_reverse"
+                defaultTextColor: root.currentTextColor
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.set_sort_mode("date_reverse")
                     sortSubMenu.close()
                     actionsMenu.close()
                 }
@@ -1806,6 +1834,7 @@ ApplicationWindow {
                           "<b>Viewing:</b><br>" +
                           "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
                           "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
+                          "&nbsp;&nbsp;Hold Space: Show original with current crop<br>" +
                           "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br>" +
                           "&nbsp;&nbsp;Ctrl+1/2/3/4: Zoom to 100%/200%/300%/400%<br><br>" +
                           "<b>Stacking:</b><br>" +
@@ -1847,8 +1876,8 @@ ApplicationWindow {
                           "&nbsp;&nbsp;&nbsp;&nbsp;S: Save&nbsp;&nbsp;E / Esc: Close&nbsp;&nbsp;O: Crop<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;B, F, D, I, etc. work as in the main view<br>" +
                           "&nbsp;&nbsp;A: Quick auto white balance (live)<br>" +
-                          "&nbsp;&nbsp;l: Quick auto levels (live)<br>" +
-                          "&nbsp;&nbsp;L: Quick auto white balance + auto levels (live)<br>" +
+                          "&nbsp;&nbsp;l: Quick auto levels + vibrance (live)<br>" +
+                          "&nbsp;&nbsp;L: Quick auto white balance + auto levels + vibrance (live)<br>" +
                           "&nbsp;&nbsp;-: Darken current auto-adjust highlights/whites (live)<br>" +
                           "&nbsp;&nbsp;_: Raise current auto-adjust whites (live)<br>" +
                           "&nbsp;&nbsp;+: Raise current auto-adjust shadows/blacks (live)<br>" +

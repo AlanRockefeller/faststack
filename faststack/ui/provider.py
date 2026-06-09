@@ -215,14 +215,33 @@ class ImageProvider(QQuickImageProvider):
                 and has_valid_preview_buffer
             )
 
+            use_original_compare_preview = (
+                getattr(self.app_controller, "_original_compare_active", False)
+                and index == self.app_controller.current_index
+                and self.app_controller._original_compare_preview is not None
+                and self.app_controller._original_compare_index == index
+                and getattr(
+                    self.app_controller,
+                    "_original_compare_session_key",
+                    None,
+                )
+                == current_preview_session_key
+                and (
+                    gen is None
+                    or getattr(self.app_controller, "_original_compare_gen", None)
+                    == gen
+                )
+            )
+
             if _debug:
                 _t_get = time.perf_counter()
 
-            image_data = (
-                self.app_controller._last_rendered_preview
-                if use_editor_preview
-                else self.app_controller.get_decoded_image(index)
-            )
+            if use_original_compare_preview:
+                image_data = self.app_controller._original_compare_preview
+            elif use_editor_preview:
+                image_data = self.app_controller._last_rendered_preview
+            else:
+                image_data = self.app_controller.get_decoded_image(index)
 
             if _debug:
                 _t_got = time.perf_counter()
@@ -259,6 +278,7 @@ class ImageProvider(QQuickImageProvider):
                     self.app_controller.ui_state.isEditorOpen
                     or has_active_auto_adjust
                     or has_current_live_preview
+                    or use_original_compare_preview
                 ) and index == self.app_controller.current_index:
                     qimg = qimg.copy()
                 else:
@@ -363,6 +383,7 @@ class UIState(QObject):
     editorImageChanged = (
         Signal()
     )  # New signal for when the image loaded in editor changes
+    originalCompareActiveChanged = Signal(bool)
     is_cropping_changed = Signal(bool)
     is_crop_rotating_changed = Signal(bool)
 
@@ -420,6 +441,7 @@ class UIState(QObject):
     isSavingChanged = Signal(bool)  # Signal for save operation in progress
     batchAutoLevelsProgressChanged = Signal()
     batchAutoLevelsActiveChanged = Signal()
+    autoAddEditedToBatchChanged = Signal()
 
     # Variant badges
     variantBadgesChanged = Signal()
@@ -442,6 +464,7 @@ class UIState(QObject):
         # Image Editor State
         self._is_editor_open = False
         self._is_editor_expanded = False
+        self._original_compare_active = False
         self._is_cropping = False
         self._is_crop_rotating = False
         self._is_histogram_visible = False
@@ -502,6 +525,7 @@ class UIState(QObject):
         self._batch_al_current = 0
         self._batch_al_total = 0
         self._batch_al_active = False
+        self._auto_add_edited_to_batch = True  # Load from config in app_controller
 
         # Connect to controller's dialog state signal
         self.app_controller.dialogStateChanged.connect(self._on_dialog_state_changed)
@@ -1109,6 +1133,16 @@ class UIState(QObject):
         if self._is_editor_expanded != new_value:
             self._is_editor_expanded = new_value
             self.is_editor_expanded_changed.emit(new_value)
+
+    @Property(bool, notify=originalCompareActiveChanged)
+    def originalCompareActive(self) -> bool:
+        return self._original_compare_active
+
+    @originalCompareActive.setter
+    def originalCompareActive(self, new_value: bool):
+        if self._original_compare_active != new_value:
+            self._original_compare_active = new_value
+            self.originalCompareActiveChanged.emit(new_value)
 
     @Property(str, notify=editorImageChanged)
     def editorFilename(self) -> str:
@@ -1803,6 +1837,18 @@ class UIState(QObject):
         if self._debug_thumb_timing != value:
             self._debug_thumb_timing = value
             self.debugThumbTimingChanged.emit(value)
+
+    @Property(bool, notify=autoAddEditedToBatchChanged)
+    def autoAddEditedToBatch(self) -> bool:
+        return self._auto_add_edited_to_batch
+
+    @autoAddEditedToBatch.setter
+    def autoAddEditedToBatch(self, value: bool):
+        if self._auto_add_edited_to_batch != value:
+            self._auto_add_edited_to_batch = value
+            self.autoAddEditedToBatchChanged.emit()
+            if hasattr(self.app_controller, "save_config"):
+                self.app_controller.save_config()
 
     # --- RAW / Editor Source Logic ---
 

@@ -189,6 +189,7 @@ class AppController(QObject):
     is_zoomed_changed = Signal(bool)  # Signal for zoom state changes
     histogramReady = Signal(object)  # Signal for off-thread histogram result
     previewReady = Signal(object)  # Signal for off-thread preview result
+    originalCompareReady = Signal(object)  # Signal for held-space compare result
     dialogStateChanged = Signal(bool)  # Signal for dialog open/close state
     # Thread-safe signal for thumbnail ready (emitted from worker thread, received on GUI thread)
     _thumbnailReadySignal = Signal(str)
@@ -246,6 +247,7 @@ class AppController(QObject):
         self._hist_lock = threading.Lock()
         self.histogramReady.connect(self._apply_histogram_result)
         self.previewReady.connect(self._apply_preview_result)
+        self.originalCompareReady.connect(self._apply_original_compare_result)
 
         # Save Offloading Setup (runs save_image in background thread)
         # ⚠️ NON-DAEMON: We must ensure saving finishes to avoid data loss on exit.
@@ -279,6 +281,13 @@ class AppController(QObject):
         self._last_rendered_preview_session_key: Optional[tuple[str, Optional[str]]] = (
             None
         )
+        self._original_compare_preview = None
+        self._original_compare_session_key: Optional[tuple[str, Optional[str]]] = None
+        self._original_compare_index: int = -1
+        self._original_compare_gen: int = -1
+        self._original_compare_active: bool = False
+        self._original_compare_inflight: bool = False
+        self._original_compare_token: int = 0
         self._shutting_down = False  # Flag to gate async callbacks during shutdown
         self._refresh_scheduled = False  # Coalesce guard for deferred disk refresh
         self._opencv_warning_shown = False  # Only show OpenCV warning once per session
@@ -300,6 +309,7 @@ class AppController(QObject):
         # flushed synchronously on shutdown so unsaved edits are not lost.
         self._pending_save_recovery: Dict[str, dict] = {}
         self._latest_save_tokens: Dict[str, Any] = {}
+        self._pending_edit_save_requests: Dict[str, dict] = {}
         self._last_save_prepare_error: Optional[str] = None
         self._shutdown_flush_prepared = False
 
@@ -578,6 +588,9 @@ class AppController(QObject):
         self.auto_vibrance_enabled = config.getboolean(
             "core", "auto_vibrance_enabled", True
         )
+        self.ui_state.autoAddEditedToBatch = config.getboolean(
+            "core", "auto_add_edited_to_batch", True
+        )
 
         # Connect editor open/close signal for memory cleanup
         self.ui_state.is_editor_open_changed.connect(self._on_editor_open_changed)
@@ -780,7 +793,7 @@ class AppController(QObject):
 
     @Slot(str)
     def set_sort_mode(self, mode: str):
-        if mode not in ("default", "filename", "date"):
+        if mode not in ("default", "filename", "date", "date_reverse"):
             return
         if self.sort_mode == mode:
             return
@@ -912,6 +925,9 @@ class AppController(QObject):
             # Use the timestamp captured at scan time (ImageFile.timestamp)
             # so we avoid live filesystem calls during sort.  Tiebreak on
             # lowercase filename for determinism when mtimes are equal.
+            result.sort(key=lambda img: (img.timestamp, img.path.name.lower()))
+        elif mode == "date_reverse":
+            # Reverse chronological order (newest first)
             result.sort(key=lambda img: (-img.timestamp, img.path.name.lower()))
         return result
 
@@ -1095,11 +1111,22 @@ class AppController(QObject):
         self.eventFilter(self.main_window, event)
 
     def eventFilter(self, watched, event) -> bool:
+        if watched == self.main_window and event.type() == QEvent.Type.KeyRelease:
+            if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+                was_active = self._original_compare_active
+                self.stop_original_compare_preview()
+                return was_active
+
         # Don't handle key events when a dialog is open
         if self._dialog_open:
             return False
 
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key_Space and self._can_show_original_compare(event):
+                if not event.isAutoRepeat():
+                    self.start_original_compare_preview()
+                return True
+
             # QML handles Crop Enter/Esc keys now.
             # We defer to QML to avoid double-triggering or focus conflicts.
             # handled = self.keybinder.handle_key_press(event) ...
@@ -1846,6 +1873,13 @@ class AppController(QObject):
             == self._get_current_live_preview_session_key()
         ):
             self._last_rendered_preview_gen = self.ui_refresh_generation
+        if (
+            self._original_compare_preview is not None
+            and self._original_compare_index == self.current_index
+            and self._original_compare_session_key
+            == self._get_current_live_preview_session_key()
+        ):
+            self._original_compare_gen = self.ui_refresh_generation
 
         # Essential signals - emit immediately for responsive image display
         self.ui_state.currentIndexChanged.emit()
@@ -2180,6 +2214,514 @@ class AppController(QObject):
 
         return False
 
+    @classmethod
+    def _json_safe_edit_value(cls, value: Any) -> Any:
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, tuple):
+            return [cls._json_safe_edit_value(v) for v in value]
+        if isinstance(value, list):
+            return [cls._json_safe_edit_value(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): cls._json_safe_edit_value(v) for k, v in value.items()}
+        return value
+
+    @classmethod
+    def _serialize_editor_edits(cls, edits: dict[str, Any]) -> dict[str, Any]:
+        """Convert editor parameters into JSON-safe pending edit metadata."""
+        serialized: dict[str, Any] = {}
+        for key, value in edits.items():
+            if key == "darken_settings":
+                serialized[key] = (
+                    value.to_dict() if isinstance(value, DarkenSettings) else value
+                )
+            else:
+                serialized[key] = cls._json_safe_edit_value(value)
+        return serialized
+
+    def _deserialize_editor_edits(self, serialized: Any) -> dict[str, Any]:
+        edits = self.image_editor._initial_edits()
+        if not isinstance(serialized, dict):
+            return edits
+
+        numeric_keys = {
+            "brightness",
+            "contrast",
+            "saturation",
+            "white_balance_by",
+            "white_balance_mg",
+            "sharpness",
+            "exposure",
+            "highlights",
+            "shadows",
+            "vibrance",
+            "vignette",
+            "blacks",
+            "whites",
+            "clarity",
+            "texture",
+            "straighten_angle",
+        }
+        for key in edits:
+            if key not in serialized:
+                continue
+            value = serialized[key]
+            try:
+                if key == "crop_box":
+                    edits[key] = (
+                        self._normalize_crop_box_tuple(value)
+                        if value is not None
+                        else None
+                    )
+                elif key == "darken_settings":
+                    edits[key] = (
+                        DarkenSettings.from_dict(value)
+                        if isinstance(value, dict)
+                        else None
+                    )
+                elif key == "rotation":
+                    edits[key] = int(value) % 360
+                elif key in numeric_keys:
+                    edits[key] = float(value)
+                else:
+                    edits[key] = value
+            except (TypeError, ValueError):
+                log.warning("Ignoring invalid pending edit value for %s: %r", key, value)
+        return edits
+
+    @classmethod
+    def _serialize_mask_assets(cls, masks: Any) -> dict[str, Any]:
+        if not isinstance(masks, dict):
+            return {}
+        serialized: dict[str, Any] = {}
+        for mask_id, mask_data in masks.items():
+            if isinstance(mask_data, MaskData):
+                serialized[str(mask_id)] = mask_data.to_dict()
+            elif isinstance(mask_data, dict):
+                serialized[str(mask_id)] = cls._json_safe_edit_value(mask_data)
+        return serialized
+
+    @staticmethod
+    def _deserialize_mask_assets(serialized: Any) -> dict[str, MaskData]:
+        if not isinstance(serialized, dict):
+            return {}
+        masks: dict[str, MaskData] = {}
+        for mask_id, mask_data in serialized.items():
+            if not isinstance(mask_data, dict):
+                continue
+            try:
+                masks[str(mask_id)] = MaskData.from_dict(mask_data)
+            except (TypeError, ValueError, KeyError):
+                log.warning("Ignoring invalid pending mask data for %s", mask_id)
+        return masks
+
+    @staticmethod
+    def _serialize_auto_adjust_state(
+        state: Optional[ActiveAutoAdjustState],
+    ) -> Optional[dict[str, Any]]:
+        if state is None:
+            return None
+        return {
+            "base_blacks": float(state.base_blacks),
+            "base_whites": float(state.base_whites),
+            "p_low": float(state.p_low),
+            "p_high": float(state.p_high),
+            "base_vibrance": float(state.base_vibrance),
+            "auto_vibrance_delta": float(state.auto_vibrance_delta),
+            "extra_highlight_steps": int(state.extra_highlight_steps),
+            "extra_black_steps": int(state.extra_black_steps),
+        }
+
+    def _serialize_current_auto_adjust_state(self) -> Optional[dict[str, Any]]:
+        if not self._has_valid_active_auto_adjust_state():
+            return None
+        return self._serialize_auto_adjust_state(self._active_auto_adjust_state)
+
+    def _deserialize_auto_adjust_state(
+        self,
+        serialized: Any,
+        *,
+        active_path: Path,
+    ) -> Optional[ActiveAutoAdjustState]:
+        if not isinstance(serialized, dict):
+            return None
+        try:
+            return ActiveAutoAdjustState(
+                active_path_key=self._key(active_path),
+                session_id=getattr(self.image_editor, "session_id", None),
+                base_blacks=float(serialized["base_blacks"]),
+                base_whites=float(serialized["base_whites"]),
+                p_low=float(serialized.get("p_low", 0.0)),
+                p_high=float(serialized.get("p_high", 255.0)),
+                base_vibrance=float(serialized.get("base_vibrance", 0.0)),
+                auto_vibrance_delta=float(
+                    serialized.get("auto_vibrance_delta", 0.0)
+                ),
+                extra_highlight_steps=int(
+                    serialized.get("extra_highlight_steps", 0)
+                ),
+                extra_black_steps=int(serialized.get("extra_black_steps", 0)),
+            )
+        except (KeyError, TypeError, ValueError):
+            log.warning("Ignoring invalid saved auto-adjust state: %r", serialized)
+            return None
+
+    def _build_pending_edit_state(self, request: dict[str, Any]) -> dict[str, Any]:
+        snapshot = request.get("snapshot", {})
+        context = request.get("context", {})
+        session_token = context.get("session_token")
+        if isinstance(session_token, tuple):
+            session_token = list(session_token)
+        source_path = (
+            context.get("edit_source_path")
+            or snapshot.get("source_filepath")
+            or snapshot.get("filepath_snapshot")
+            or ""
+        )
+        return {
+            "version": 1,
+            "status": "pending_save",
+            "request_id": context.get("save_request_id"),
+            "revision": context.get("save_revision"),
+            "session_token": session_token,
+            "source_path": str(source_path),
+            "target_path": str(context.get("target") or ""),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "edits": self._serialize_editor_edits(snapshot.get("edits") or {}),
+            "masks": self._serialize_mask_assets(snapshot.get("mask_assets") or {}),
+            "auto_adjust": context.get("auto_adjust_state"),
+        }
+
+    def _build_saved_edit_state_for_result(
+        self,
+        save_result: dict[str, Any],
+        *,
+        saved_path: Path,
+        backup_path: Optional[Path],
+    ) -> Optional[dict[str, Any]]:
+        request = save_result.get("request") or {}
+        state = self._build_pending_edit_state(request)
+        context = request.get("context", {})
+        source_path = context.get("edit_source_path") or state.get("source_path")
+        if backup_path is not None:
+            try:
+                source_matches_saved = (
+                    source_path is None
+                    or self._key(Path(source_path)) == self._key(saved_path)
+                )
+            except (OSError, TypeError, ValueError):
+                source_matches_saved = False
+            if source_matches_saved:
+                source_path = str(backup_path)
+
+        state["status"] = "saved"
+        state["source_path"] = str(source_path or backup_path or saved_path)
+        state["saved_at"] = datetime.now().isoformat(timespec="seconds")
+        if not self._edit_state_has_replayable_source(state, saved_path):
+            log.debug(
+                "Not storing saved edit state for %s; source is not replayable",
+                saved_path,
+            )
+            return None
+        return state
+
+    def _build_saved_edit_state_from_editor(
+        self,
+        *,
+        saved_path: Path,
+        backup_path: Optional[Path],
+    ) -> Optional[dict[str, Any]]:
+        with self.image_editor._lock:
+            edits = dict(self.image_editor.current_edits)
+            masks = dict(self.image_editor._mask_assets)
+            source_path = self.image_editor.source_filepath or saved_path
+
+        if backup_path is not None:
+            try:
+                if self._key(source_path) == self._key(saved_path):
+                    source_path = backup_path
+            except (OSError, TypeError, ValueError):
+                pass
+
+        state = {
+            "version": 1,
+            "status": "saved",
+            "request_id": None,
+            "revision": int(getattr(self.image_editor, "_edits_rev", 0)),
+            "session_token": None,
+            "source_path": str(source_path),
+            "target_path": str(saved_path),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "edits": self._serialize_editor_edits(edits),
+            "masks": self._serialize_mask_assets(masks),
+            "auto_adjust": self._serialize_current_auto_adjust_state(),
+        }
+        if not self._edit_state_has_replayable_source(state, saved_path):
+            log.debug(
+                "Not storing saved edit state for %s; source is not replayable",
+                saved_path,
+            )
+            return None
+        return state
+
+    def _edit_state_has_replayable_source(
+        self, edit_state: dict[str, Any], target_fallback: Optional[Path]
+    ) -> bool:
+        """Return true when edit parameters can be safely replayed from source."""
+        source_raw = edit_state.get("source_path")
+        if not source_raw:
+            return False
+
+        target_raw = edit_state.get("target_path") or target_fallback
+        if not target_raw:
+            return False
+
+        source_path = Path(source_raw)
+        target_path = Path(target_raw)
+        if not source_path.is_absolute():
+            source_path = self.image_dir / source_path
+        if not target_path.is_absolute():
+            target_path = self.image_dir / target_path
+
+        try:
+            if not source_path.exists():
+                return False
+            source_key = self._key(source_path.resolve(strict=True))
+            target_key = self._key(target_path.resolve(strict=False))
+            return source_key != target_key
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def _write_pending_edit_state_for_request(self, request: dict[str, Any]) -> None:
+        context = request.get("context", {})
+        sidecar = context.get("save_sidecar") or self.sidecar
+        metadata_path = context.get("save_metadata_path")
+        if sidecar is None or not metadata_path:
+            return
+        edit_state = self._build_pending_edit_state(request)
+        if not self._edit_state_has_replayable_source(edit_state, Path(metadata_path)):
+            log.debug(
+                "Skipping persisted pending edit state for %s; source is not a "
+                "durable path distinct from the save target",
+                metadata_path,
+            )
+            return
+        try:
+            sidecar.update_metadata(
+                Path(metadata_path),
+                {"edit_state": edit_state},
+            )
+        except Exception:
+            log.exception("Failed to write pending edit state for %s", metadata_path)
+
+    def _remember_pending_edit_save_request(self, request: dict[str, Any]) -> None:
+        save_image_key = request.get("context", {}).get("save_image_key")
+        if save_image_key:
+            self._pending_edit_save_requests[save_image_key] = request
+
+    def _forget_pending_edit_save_request(
+        self, save_image_key: Optional[str], request_id: Optional[str]
+    ) -> None:
+        if not save_image_key or not request_id:
+            return
+        request = self._pending_edit_save_requests.get(save_image_key)
+        if request is None:
+            return
+        if request.get("context", {}).get("save_request_id") == request_id:
+            self._pending_edit_save_requests.pop(save_image_key, None)
+
+    def _pending_edit_metadata_path(self, fallback: Optional[Path]) -> Optional[Path]:
+        if 0 <= self.current_index < len(self.image_files):
+            return self.image_files[self.current_index].path
+        return fallback
+
+    def _get_sidecar_edit_state(self, image_path: Optional[Path]) -> Optional[dict]:
+        if image_path is None:
+            return None
+        meta = self.sidecar.get_metadata(image_path, create=False)
+        edit_state = getattr(meta, "edit_state", None) if meta is not None else None
+        return edit_state if isinstance(edit_state, dict) else None
+
+    def _edit_source_path_from_state(
+        self, edit_state: Optional[dict], fallback: Path
+    ) -> Path:
+        if isinstance(edit_state, dict):
+            source_path = edit_state.get("source_path")
+            if source_path:
+                candidate = Path(source_path)
+                if not candidate.is_absolute():
+                    candidate = self.image_dir / candidate
+                try:
+                    if candidate.exists():
+                        return candidate
+                except OSError:
+                    pass
+        return fallback
+
+    def _active_edit_load_path(
+        self, active_path: Path
+    ) -> tuple[Path, Optional[dict[str, Any]]]:
+        edit_state = self._get_pending_edit_state_for_loaded_path(active_path)
+        return self._edit_source_path_from_state(edit_state, active_path), edit_state
+
+    def _bind_loaded_editor_output_path(self, active_path: Path) -> None:
+        try:
+            active_mtime = active_path.stat().st_mtime
+        except OSError:
+            active_mtime = 0.0
+        with self.image_editor._lock:
+            self.image_editor.current_filepath = active_path
+            self.image_editor.current_mtime = active_mtime
+
+    @staticmethod
+    def _float_source_to_pil(source_arr: np.ndarray) -> Image.Image:
+        arr_u8 = (np.clip(source_arr, 0.0, 1.0) * 255).astype(np.uint8)
+        return Image.fromarray(arr_u8, mode="RGB")
+
+    def _restore_source_buffer_from_pending_request(
+        self, request: dict[str, Any], active_path: Path
+    ) -> bool:
+        snapshot = request.get("snapshot", {})
+        source_arr = snapshot.get("source_arr")
+        if not isinstance(source_arr, np.ndarray):
+            return False
+
+        restored_source = np.array(source_arr, dtype=np.float32, copy=True)
+        restored_original = self._float_source_to_pil(restored_source)
+        main_exif = snapshot.get("main_exif")
+        if main_exif:
+            restored_original.info["exif"] = main_exif
+
+        thumb = restored_original.copy()
+        thumb.thumbnail((1920, 1080))
+        restored_preview = np.array(thumb.convert("RGB")).astype(np.float32) / 255.0
+
+        with self.image_editor._lock:
+            self.image_editor.current_filepath = Path(
+                snapshot.get("filepath_snapshot") or active_path
+            )
+            self.image_editor.source_filepath = Path(
+                snapshot.get("source_filepath")
+                or snapshot.get("filepath_snapshot")
+                or active_path
+            )
+            self.image_editor.original_image = restored_original
+            self.image_editor.float_image = restored_source
+            self.image_editor.float_preview = restored_preview
+            self.image_editor.bit_depth = int(
+                snapshot.get("bit_depth") or self.image_editor.bit_depth
+            )
+            self.image_editor.current_mtime = float(
+                snapshot.get("current_mtime") or self.image_editor.current_mtime
+            )
+            self.image_editor._source_exif_bytes = snapshot.get("source_exif")
+            self.image_editor._cached_preview = None
+            self.image_editor._cached_rev = -1
+        return True
+
+    def _get_pending_edit_state_for_loaded_path(
+        self, active_path: Path
+    ) -> Optional[dict[str, Any]]:
+        metadata_path = self._pending_edit_metadata_path(active_path)
+        if metadata_path is None:
+            return None
+
+        try:
+            metadata_key = self._key(metadata_path)
+        except (OSError, TypeError, ValueError):
+            metadata_key = None
+        request = (
+            self._pending_edit_save_requests.get(metadata_key)
+            if metadata_key is not None
+            else None
+        )
+        if request is not None:
+            snapshot_path = request.get("snapshot", {}).get("filepath_snapshot")
+            if snapshot_path:
+                try:
+                    if self._key(Path(snapshot_path)) != self._key(active_path):
+                        request = None
+                except (OSError, TypeError, ValueError):
+                    request = None
+        if request is not None:
+            return self._build_pending_edit_state(request)
+
+        meta = self.sidecar.get_metadata(metadata_path, create=False)
+        edit_state = getattr(meta, "edit_state", None) if meta is not None else None
+        if not isinstance(edit_state, dict):
+            return None
+        if edit_state.get("status") not in ("pending_save", "saved"):
+            return None
+
+        target_path = edit_state.get("target_path")
+        if target_path:
+            try:
+                if self._key(Path(target_path)) != self._key(active_path):
+                    return None
+            except (OSError, TypeError, ValueError):
+                return None
+        if not self._edit_state_has_replayable_source(edit_state, active_path):
+            log.info(
+                "Ignoring edit state with non-replayable source for %s",
+                active_path,
+            )
+            return None
+        return edit_state
+
+    def _restore_pending_edit_state_for_loaded_path(self, active_path: Path) -> bool:
+        metadata_path = self._pending_edit_metadata_path(active_path)
+        request = None
+        if metadata_path is not None:
+            try:
+                metadata_key = self._key(metadata_path)
+            except (OSError, TypeError, ValueError):
+                metadata_key = None
+            if metadata_key is not None:
+                request = self._pending_edit_save_requests.get(metadata_key)
+        if request is not None:
+            snapshot_path = request.get("snapshot", {}).get("filepath_snapshot")
+            if snapshot_path:
+                try:
+                    if self._key(Path(snapshot_path)) != self._key(active_path):
+                        request = None
+                except (OSError, TypeError, ValueError):
+                    request = None
+
+        if request is not None:
+            self._restore_source_buffer_from_pending_request(request, active_path)
+
+        edit_state = self._get_pending_edit_state_for_loaded_path(active_path)
+        if edit_state is None:
+            return False
+
+        edits = self._deserialize_editor_edits(edit_state.get("edits"))
+        masks = self._deserialize_mask_assets(edit_state.get("masks"))
+        with self.image_editor._lock:
+            self.image_editor.current_edits = edits
+            self.image_editor._mask_assets.clear()
+            self.image_editor._mask_assets.update(masks)
+            self.image_editor._mask_raster_cache.clear()
+            self.image_editor._edits_rev += 1
+            self.image_editor._cached_preview = None
+            self.image_editor._cached_rev = -1
+            self.image_editor._cached_highlight_analysis = None
+            self.image_editor._cached_detail_bands = None
+            self.image_editor._cached_u8_lut = None
+            self.image_editor._cached_u8_wb_lut = None
+
+        self._active_auto_adjust_state = self._deserialize_auto_adjust_state(
+            edit_state.get("auto_adjust"),
+            active_path=active_path,
+        )
+
+        log.debug(
+            "Restored %s edit state for %s (request %s)",
+            edit_state.get("status", "saved"),
+            active_path,
+            edit_state.get("request_id"),
+        )
+        return True
+
     def _should_render_live_preview_full_resolution(self) -> bool:
         """Use full-res live previews after committed geometry edits."""
         if self.ui_state is None:
@@ -2434,12 +2976,15 @@ class AppController(QObject):
                 self._ensure_live_edit_session_state()
                 return active_path
 
+        load_path, _edit_state = self._active_edit_load_path(active_path)
         cached_preview = self.get_decoded_image(self.current_index)
         if self.image_editor.load_image(
-            str(active_path),
+            str(load_path),
             cached_preview=cached_preview,
             source_exif=self._capture_source_exif_for_active_image(),
         ):
+            self._bind_loaded_editor_output_path(active_path)
+            self._restore_pending_edit_state_for_loaded_path(active_path)
             self._ensure_live_edit_session_state(force_reset=True)
             return active_path
 
@@ -2673,6 +3218,10 @@ class AppController(QObject):
         metadata_before = self._mark_image_edited_in_sidecar(
             self.sidecar,
             metadata_path,
+            saved_edit_state=self._build_saved_edit_state_from_editor(
+                saved_path=saved_path,
+                backup_path=backup_path,
+            ),
         )
         self.undo_history.append(
             (
@@ -2848,7 +3397,14 @@ class AppController(QObject):
                 "save_action_type": "save_edit",
                 "save_image_key": save_image_key,
                 "save_revision": save_revision,
+                "save_request_id": uuid.uuid4().hex,
                 "session_token": session_token,
+                "edit_source_path": str(
+                    export_snapshot.get("source_filepath")
+                    or export_snapshot.get("filepath_snapshot")
+                    or ""
+                ),
+                "auto_adjust_state": self._serialize_current_auto_adjust_state(),
                 "save_directory_key": self._key(self.image_dir),
                 "save_metadata_path": (
                     str(save_metadata_path) if save_metadata_path else None
@@ -2928,6 +3484,9 @@ class AppController(QObject):
             self._mark_current_live_edit_session_save_failed(context["save_revision"])
             self.update_status_message(f"Failed to start background save: {e}")
             return False
+
+        self._remember_pending_edit_save_request(request)
+        self._write_pending_edit_state_for_request(request)
 
         try:
             future.add_done_callback(on_done)
@@ -3221,8 +3780,16 @@ class AppController(QObject):
                     if save_result.get("save_metadata_path")
                     else saved_path
                 )
+                saved_edit_state = self._build_saved_edit_state_for_result(
+                    save_result,
+                    saved_path=saved_path,
+                    backup_path=backup_path,
+                )
                 metadata_before = self._mark_image_edited_in_sidecar(
-                    save_sidecar, metadata_path
+                    save_sidecar,
+                    metadata_path,
+                    completed_edit_state_request_id=save_result.get("save_request_id"),
+                    saved_edit_state=saved_edit_state,
                 )
                 save_directory_key = save_result.get("save_directory_key")
                 current_directory_key = self._key(self.image_dir)
@@ -3270,8 +3837,21 @@ class AppController(QObject):
                 if saved_path:
                     self.image_cache.pop_path(saved_path)
 
+            # Auto-add to batch if enabled
+            if saved_path:
+                auto_add_path = (
+                    Path(save_result["save_metadata_path"])
+                    if save_result.get("save_metadata_path")
+                    else Path(saved_path)
+                )
+                self._auto_add_edited_to_batch_if_enabled(auto_add_path)
+
             if self.ui_state:
                 self.ui_state.variantBadgesChanged.emit()
+
+            self._forget_pending_edit_save_request(
+                save_key, save_result.get("save_request_id")
+            )
 
             success_message = save_result.get("success_message")
             if success_message:
@@ -4505,6 +5085,44 @@ class AppController(QObject):
                 f"All {len(indices_to_add)} edited image(s) already in batch."
             )
 
+    def _auto_add_edited_to_batch_if_enabled(self, image_path: Path):
+        """If auto-add is enabled, add the edited image at this path to the batch."""
+        if not self.ui_state.autoAddEditedToBatch:
+            return
+
+        if not self.image_files:
+            return
+
+        try:
+            image_key = self.sidecar.metadata_key_for_path(image_path)
+        except (OSError, TypeError, ValueError):
+            image_key = None
+
+        for i, img in enumerate(self.image_files):
+            try:
+                matches = (
+                    image_key is not None
+                    and self.sidecar.metadata_key_for_path(img.path) == image_key
+                )
+            except (OSError, TypeError, ValueError):
+                matches = self._key(img.path) == self._key(image_path)
+
+            if matches:
+                in_batch = any(start <= i <= end for start, end in self.batches)
+                if not in_batch:
+                    self.batches.append((i, i))
+                    self._normalize_batches()
+                    self._invalidate_batch_cache()
+                    self._metadata_cache_index = (-1, -1)
+                    self.dataChanged.emit()
+                    self.sync_ui_state()
+
+                    if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
+                        self._thumbnail_model.refresh()
+
+                    log.info("Auto-added edited image to batch: %s", image_path.name)
+                break
+
     def remove_from_batch_or_stack(self):
         """Remove current image from any batch or stack it's in."""
         if not self.image_files or self.current_index >= len(self.image_files):
@@ -5117,6 +5735,11 @@ class AppController(QObject):
 
         # tell QML it changed (once is enough)
         self.ui_state.themeChanged.emit()
+
+    def save_config(self):
+        """Save current UI state config values."""
+        config.set("core", "auto_add_edited_to_batch", self.ui_state.autoAddEditedToBatch)
+        config.save()
 
     @Slot(result=str)
     def get_color_mode(self):
@@ -7382,7 +8005,7 @@ class AppController(QObject):
         # after the save executor drains so we do not race the same file twice.
         for tgt, req in list(self._pending_save_recovery.items()):
             try:
-                self.image_editor.save_from_snapshot(req["snapshot"])
+                recovery_result = self.image_editor.save_from_snapshot(req["snapshot"])
             except Exception:
                 log.exception("Final shutdown retry failed for %s", tgt)
                 continue
@@ -7391,8 +8014,24 @@ class AppController(QObject):
                 meta_path_str = ctx.get("save_metadata_path") or tgt
                 meta_sidecar = ctx.get("save_sidecar") or self.sidecar
                 if meta_path_str and meta_sidecar is not None:
+                    saved_edit_state = None
+                    if (
+                        isinstance(recovery_result, tuple)
+                        and len(recovery_result) == 2
+                    ):
+                        saved_edit_state = self._build_saved_edit_state_for_result(
+                            {"request": req},
+                            saved_path=recovery_result[0],
+                            backup_path=recovery_result[1],
+                        )
                     self._mark_image_edited_in_sidecar(
-                        meta_sidecar, Path(meta_path_str)
+                        meta_sidecar,
+                        Path(meta_path_str),
+                        completed_edit_state_request_id=ctx.get("save_request_id"),
+                        saved_edit_state=saved_edit_state,
+                    )
+                    self._forget_pending_edit_save_request(
+                        ctx.get("save_image_key"), ctx.get("save_request_id")
                     )
                 log.info("Recovered pending save for %s on shutdown", tgt)
             except Exception:
@@ -7643,6 +8282,9 @@ class AppController(QObject):
             self.dataChanged.emit()
             self.sync_ui_state()
 
+            # Auto-add to batch if enabled
+            self._auto_add_edited_to_batch_if_enabled(image_file.path)
+
             self.update_status_message(
                 f"Opened {current_image_path.name} in Photoshop."
             )
@@ -7701,13 +8343,33 @@ class AppController(QObject):
         }
 
     def _mark_image_edited_in_sidecar(
-        self, sidecar: SidecarManager, image_path: Path
+        self,
+        sidecar: SidecarManager,
+        image_path: Path,
+        *,
+        completed_edit_state_request_id: Optional[str] = None,
+        saved_edit_state: Optional[dict[str, Any]] = None,
     ) -> Optional[dict]:
         """Mark an image as edited and return the pre-save metadata snapshot."""
         old_meta = self._capture_metadata_snapshot(sidecar, image_path)
         new_meta = dict(old_meta or {})
         new_meta["edited"] = True
         new_meta["edited_date"] = datetime.now().strftime("%Y-%m-%d")
+        if saved_edit_state is not None:
+            current_edit_state = new_meta.get("edit_state")
+            if (
+                isinstance(current_edit_state, dict)
+                and current_edit_state.get("status") == "pending_save"
+                and completed_edit_state_request_id is not None
+                and current_edit_state.get("request_id") != completed_edit_state_request_id
+            ):
+                log.debug(
+                    "Preserving newer pending edit state for %s after save %s finished",
+                    image_path,
+                    completed_edit_state_request_id,
+                )
+            else:
+                new_meta["edit_state"] = saved_edit_state
         sidecar.update_metadata(image_path, new_meta)
         return old_meta
 
@@ -7758,6 +8420,7 @@ class AppController(QObject):
         current_meta = sidecar.data.entries.get(stable_key)
         restored_edited = bool(snapshot.get("edited", False)) if snapshot else False
         restored_edited_date = snapshot.get("edited_date") if snapshot else None
+        restored_edit_state = snapshot.get("edit_state") if snapshot else None
         changed = False
 
         if current_meta is None:
@@ -7771,6 +8434,9 @@ class AppController(QObject):
             changed = True
         if current_meta.edited_date != restored_edited_date:
             current_meta.edited_date = restored_edited_date
+            changed = True
+        if current_meta.edit_state != restored_edit_state:
+            current_meta.edit_state = restored_edit_state
             changed = True
 
         if snapshot is None:
@@ -8075,8 +8741,66 @@ class AppController(QObject):
     #   False — load failed or was aborted
     _REUSED = 2  # truthy int so QML @Slot(result=bool) coerces to true
 
+    @Slot(int, bool, int)
+    @Slot(int, bool, int, str)
+    def note_compact_editor_reload_scheduled(
+        self, index: int, coalesced: bool, delay_ms: int, reason: str = "navigation"
+    ):
+        """Debug hook for compact-editor navigation reload debounce."""
+        log.debug(
+            "[COMPACT_EDITOR_RELOAD] scheduled preview-only index=%d "
+            "reason=%s delay=%dms coalesced=%s",
+            index,
+            reason,
+            delay_ms,
+            coalesced,
+        )
+
+    @Slot(int, str)
+    def note_compact_editor_full_load_required(self, index: int, reason: str):
+        """Debug hook for compact-editor actions that need a full editor load."""
+        log.debug(
+            "[COMPACT_EDITOR_RELOAD] full load required index=%d reason=%s",
+            index,
+            reason,
+        )
+
+    @Slot(int, str)
+    def note_compact_editor_reload_skipped(self, index: int, reason: str):
+        """Debug hook for compact-editor navigation reload debounce."""
+        log.debug(
+            "[COMPACT_EDITOR_RELOAD] skipped index=%d reason=%s",
+            index,
+            reason,
+        )
+
+    @Slot(result=bool)
+    def load_image_for_editing_preview(self):
+        """Load the current image for compact navigation using preview buffers only."""
+        t0 = time.perf_counter()
+        index = self.current_index
+        result = self._load_image_for_editing(preview_only=True)
+        result_label = (
+            "reused"
+            if result is self._REUSED
+            else "loaded"
+            if result is True
+            else "failed"
+        )
+        log.debug(
+            "[COMPACT_EDITOR_RELOAD] preview-only load index=%d "
+            "result=%s total=%dms",
+            index,
+            result_label,
+            int((time.perf_counter() - t0) * 1000),
+        )
+        return result
+
     @Slot(result=bool)
     def load_image_for_editing(self):
+        return self._load_image_for_editing(preview_only=False)
+
+    def _load_image_for_editing(self, *, preview_only: bool):
         """Load the currently viewed image into the editor.
 
         Returns True on real reload, _REUSED when the existing session
@@ -8091,7 +8815,9 @@ class AppController(QObject):
                 active_path = Path(self.view_override_path)
             else:
                 active_path = self.get_active_edit_path(self.current_index)
+            load_path, _edit_state = self._active_edit_load_path(active_path)
             filepath = str(active_path)
+            load_filepath = str(load_path)
 
             editor_path = getattr(self.image_editor, "current_filepath", None)
             match = False
@@ -8105,16 +8831,32 @@ class AppController(QObject):
                 except (OSError, ValueError):
                     pass
 
-            if match:
-                # Also require an intact float buffer — a preview_only load leaves
-                # current_filepath/mtime set but float_image=None, which breaks
-                # crop, darken, and full-editor flows that need the master buffer.
+            if match and not preview_only:
+                # Also require an intact float buffer. A preview_only load leaves
+                # current_filepath/mtime set but float_image=None; promote that
+                # session before crop, darken, save, or full-editor flows use it.
                 if getattr(self.image_editor, "float_image", None) is None:
-                    match = False
+                    try:
+                        t_promote = time.perf_counter()
+                        self.image_editor._ensure_float_image()
+                        log.debug(
+                            "[COMPACT_EDITOR_RELOAD] full promotion index=%d "
+                            "total=%dms  %s",
+                            self.current_index,
+                            int((time.perf_counter() - t_promote) * 1000),
+                            active_path.name,
+                        )
+                    except RuntimeError:
+                        match = False
+                    else:
+                        if getattr(self.image_editor, "float_image", None) is None:
+                            match = False
 
             if match:
                 log.debug(
-                    "load_image_for_editing: Reusing existing session for %s", filepath
+                    "load_image_for_editing: Reusing existing session for %s (preview_only=%s)",
+                    filepath,
+                    preview_only,
                 )
                 self._ensure_live_edit_session_state()
                 # Ensure the background renderer is current and notify UI to refresh
@@ -8146,12 +8888,23 @@ class AppController(QObject):
 
             # Load into editor
             if self.image_editor.load_image(
-                filepath, cached_preview=cached_preview, source_exif=source_exif
+                load_filepath,
+                cached_preview=cached_preview,
+                source_exif=source_exif,
+                preview_only=preview_only,
             ):
+                log.debug(
+                    "load_image_for_editing: loaded %s for %s (preview_only=%s)",
+                    load_filepath,
+                    filepath,
+                    preview_only,
+                )
                 self._clear_active_auto_adjust_state(
                     "editor session reloaded",
                     clear_editor=False,
                 )
+                self._bind_loaded_editor_output_path(active_path)
+                self._restore_pending_edit_state_for_loaded_path(active_path)
                 self._ensure_live_edit_session_state(force_reset=True)
                 # Notify UIState to update bindings
                 # We do this via signals or by calling the update function on UIState if available
@@ -8266,6 +9019,12 @@ class AppController(QObject):
                     clear_editor=False,
                 )
                 self._kick_preview_worker()
+
+                # Auto-add to batch if enabled and this is the first edit
+                if self.image_editor.current_filepath:
+                    self._auto_add_edited_to_batch_if_enabled(
+                        Path(self.image_editor.current_filepath)
+                    )
         except Exception as e:
             log.error("Error setting edit parameter %s=%s: %s", key, value, e)
 
@@ -9080,6 +9839,13 @@ class AppController(QObject):
                 self.ui_refresh_generation += 1
                 self._last_rendered_preview_index = self.current_index
                 self._last_rendered_preview_gen = self.ui_refresh_generation
+                if (
+                    self._original_compare_active
+                    and self._original_compare_preview is not None
+                    and self._original_compare_index == self.current_index
+                    and self._original_compare_session_key == session_key
+                ):
+                    self._original_compare_gen = self.ui_refresh_generation
                 should_accept = True
 
             # Consume pending flag atomically before scheduling
@@ -9096,6 +9862,156 @@ class AppController(QObject):
         # scheduling and execution, causing a spurious extra render.
         if should_kick:
             self._kick_preview_worker()
+
+    def _can_show_original_compare(self, event) -> bool:
+        if not self.image_files:
+            return False
+        if self._is_grid_view_active:
+            return False
+        if getattr(self.ui_state, "isCropping", False):
+            return False
+        if getattr(self.ui_state, "isEditorOpen", False) and getattr(
+            self.ui_state, "isEditorExpanded", False
+        ):
+            return False
+        blocked_modifiers = event.modifiers() & (
+            Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
+        )
+        return not blocked_modifiers
+
+    @Slot()
+    def start_original_compare_preview(self):
+        """Show the source image with crop framing while space is held."""
+        if getattr(self, "_shutting_down", False):
+            return
+        if not self.image_files or self._is_grid_view_active:
+            return
+        if getattr(self.ui_state, "isCropping", False):
+            return
+
+        active_path = self._ensure_active_image_loaded_for_auto_adjust()
+        if active_path is None:
+            return
+
+        session_key = self._get_current_live_preview_session_key()
+        if session_key is None:
+            return
+
+        render_full_resolution = (
+            bool(getattr(self.ui_state, "isZoomed", False))
+            or self._should_render_live_preview_full_resolution()
+        )
+
+        with self._preview_lock:
+            self._original_compare_active = True
+            if hasattr(self.ui_state, "originalCompareActive"):
+                self.ui_state.originalCompareActive = True
+
+            buffer_ready = (
+                self._original_compare_preview is not None
+                and self._original_compare_index == self.current_index
+                and self._original_compare_session_key == session_key
+            )
+            if buffer_ready:
+                self.ui_refresh_generation += 1
+                self._original_compare_gen = self.ui_refresh_generation
+                self.ui_state.currentImageSourceChanged.emit()
+                return
+
+            if self._original_compare_inflight:
+                return
+
+            self._original_compare_inflight = True
+            self._original_compare_token += 1
+            token = self._original_compare_token
+            index = self.current_index
+
+        try:
+            future = self._preview_executor.submit(
+                self._render_original_compare_worker,
+                token,
+                session_key,
+                index,
+                self.image_editor,
+                render_full_resolution,
+            )
+            future.add_done_callback(self._on_original_compare_done)
+        except RuntimeError:
+            log.warning("Original compare render failed to start")
+            with self._preview_lock:
+                self._original_compare_inflight = False
+
+    @Slot()
+    def stop_original_compare_preview(self):
+        """Return the loupe to the normal edited preview after space is released."""
+        with self._preview_lock:
+            if not self._original_compare_active:
+                return
+            self._original_compare_active = False
+            self._original_compare_inflight = False
+            self._original_compare_token += 1
+
+        if hasattr(self.ui_state, "originalCompareActive"):
+            self.ui_state.originalCompareActive = False
+        self.ui_refresh_generation += 1
+        self.ui_state.currentImageSourceChanged.emit()
+
+    @staticmethod
+    def _render_original_compare_worker(
+        token,
+        session_key,
+        index: int,
+        image_editor,
+        full_resolution: bool,
+    ):
+        try:
+            decoded = image_editor.get_original_compare_preview_data(
+                full_resolution=full_resolution
+            )
+            return token, session_key, index, decoded
+        except Exception:
+            log.exception("Original compare render failed")
+            return token, session_key, index, None
+
+    def _on_original_compare_done(self, future):
+        if getattr(self, "_shutting_down", False):
+            return
+
+        try:
+            payload = future.result()
+        except Exception:
+            payload = None
+
+        self.originalCompareReady.emit(payload)
+
+    @Slot(object)
+    def _apply_original_compare_result(self, payload):
+        try:
+            token, session_key, index, decoded = payload
+        except (TypeError, ValueError):
+            token, session_key, index, decoded = None, None, -1, None
+
+        should_emit = False
+        with self._preview_lock:
+            if token == self._original_compare_token:
+                self._original_compare_inflight = False
+            if (
+                decoded is not None
+                and self._original_compare_active
+                and token == self._original_compare_token
+                and index == self.current_index
+                and session_key is not None
+                and session_key == self._get_current_live_preview_session_key()
+            ):
+                self._original_compare_preview = decoded
+                self._original_compare_session_key = session_key
+                self._original_compare_index = index
+                self.ui_refresh_generation += 1
+                self._original_compare_gen = self.ui_refresh_generation
+                should_emit = True
+
+        if should_emit:
+            self.ui_state.currentImageSourceChanged.emit()
 
     @Slot()
     def cancel_crop_mode(self):
@@ -9600,7 +10516,7 @@ class AppController(QObject):
         if self._ensure_active_image_loaded_for_auto_adjust() is None:
             return
 
-        state = self._seed_active_auto_adjust_state()
+        state = self._seed_active_auto_adjust_state(include_auto_vibrance=True)
         if state is None:
             self.update_status_message("Auto levels failed")
             return
@@ -9780,7 +10696,12 @@ class AppController(QObject):
                 timestamp = time.time()
                 metadata_path = image_file.path
                 metadata_before = self._mark_image_edited_in_sidecar(
-                    self.sidecar, metadata_path
+                    self.sidecar,
+                    metadata_path,
+                    saved_edit_state=self._build_saved_edit_state_from_editor(
+                        saved_path=saved_path,
+                        backup_path=backup_path,
+                    ),
                 )
 
                 self.undo_history.append(

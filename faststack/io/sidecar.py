@@ -40,6 +40,14 @@ def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
         return EntryMetadata()
 
 
+def _entrymetadata_to_json(meta: EntryMetadata) -> dict:
+    """Convert EntryMetadata to a JSON-ready dict without noisy empty edit state."""
+    data = meta.__dict__.copy()
+    if data.get("edit_state") is None:
+        data.pop("edit_state", None)
+    return data
+
+
 class SidecarManager:
     def __init__(self, directory: Path, watcher, debug: bool = False):
         self.directory = directory
@@ -120,7 +128,8 @@ class SidecarManager:
                     "version": self.data.version,
                     "last_index": self.data.last_index,
                     "entries": {
-                        key: meta.__dict__ for key, meta in self.data.entries.items()
+                        key: _entrymetadata_to_json(meta)
+                        for key, meta in self.data.entries.items()
                     },
                     "stacks": self.data.stacks,
                 }

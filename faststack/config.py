@@ -92,6 +92,7 @@ DEFAULT_CONFIG = {
         "auto_level_strength": "1.0",
         "auto_level_strength_auto": "False",
         "auto_vibrance_enabled": "True",
+        "auto_add_edited_to_batch": "True",
     },
     "helicon": {
         "exe": "C:\\Program Files\\Helicon Software\\Helicon Focus 8\\HeliconFocus.exe",

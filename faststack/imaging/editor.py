@@ -352,6 +352,7 @@ class ImageEditor:
         # Stores the currently applied edits (used for preview)
         self.current_edits: Dict[str, Any] = self._initial_edits()
         self.current_filepath: Optional[Path] = None
+        self.source_filepath: Optional[Path] = None
         self.session_id: Optional[str] = None
 
         # Caching support for smooth updates
@@ -405,6 +406,7 @@ class ImageEditor:
         with self._lock:
             self.original_image = None
             self.current_filepath = None
+            self.source_filepath = None
             self.session_id = None
             self.float_image = None
             self.float_preview = None
@@ -596,6 +598,7 @@ class ImageEditor:
                 self.float_image = None
                 self.float_preview = None
                 self.current_filepath = None
+                self.source_filepath = None
                 self.session_id = None
                 self._source_exif_bytes = None
                 self._edits_rev += 1
@@ -778,6 +781,7 @@ class ImageEditor:
             # Assign all state atomically under lock to prevent race with preview worker
             with self._lock:
                 self.current_filepath = load_filepath
+                self.source_filepath = load_filepath
                 self.session_id = uuid.uuid4().hex
                 self.original_image = loaded_original
                 self.float_image = loaded_float_image
@@ -811,6 +815,7 @@ class ImageEditor:
                 self.float_image = None
                 self.float_preview = None
                 self.current_filepath = None
+                self.source_filepath = None
                 self.session_id = None
                 self._edits_rev += 1
                 self._cached_preview = None
@@ -2060,6 +2065,64 @@ class ImageEditor:
             cache_context={},
         )
 
+    def _crop_only_edits(self, edits: Dict[str, Any]) -> Dict[str, Any]:
+        """Return edits for before/after comparison while preserving crop framing."""
+        crop_only = self._initial_edits()
+        for key in ("crop_box", "rotation", "straighten_angle"):
+            crop_only[key] = edits.get(key, crop_only[key])
+        return crop_only
+
+    def _float_preview_from_master(self) -> Optional[np.ndarray]:
+        """Build a display-sized float preview from the unedited source buffer."""
+        with self._lock:
+            source = self.float_image.copy() if self.float_image is not None else None
+            original = self.original_image.copy() if self.original_image is not None else None
+
+        if source is not None:
+            arr_u8 = (np.clip(source, 0.0, 1.0) * 255).astype(np.uint8)
+            thumb = Image.fromarray(arr_u8, mode="RGB")
+        elif original is not None:
+            thumb = original.convert("RGB")
+        else:
+            return None
+
+        thumb.thumbnail((1920, 1080))
+        return np.array(thumb.convert("RGB")).astype(np.float32) / 255.0
+
+    def get_original_compare_preview_data(
+        self, *, full_resolution: bool = False
+    ) -> Optional[DecodedImage]:
+        """Render the source image with only crop framing applied."""
+        try:
+            self._ensure_float_image()
+        except RuntimeError:
+            return None
+
+        with self._lock:
+            if self.float_image is None:
+                return None
+            base = self.float_image.copy() if full_resolution else None
+            edits = self._crop_only_edits(dict(self.current_edits))
+            icc_bytes = (
+                self.original_image.info.get("icc_profile")
+                if self.original_image is not None
+                else None
+            )
+
+        if base is None:
+            base = self._float_preview_from_master()
+            if base is None:
+                return None
+
+        return self._render_decoded_from_float(
+            base,
+            edits=edits,
+            for_export=full_resolution,
+            apply_loupe_color=full_resolution,
+            icc_bytes=icc_bytes,
+            cache_context={},
+        )
+
     def get_preview_data(self) -> Optional[DecodedImage]:
         """Apply current edits and return the data as a DecodedImage."""
         return self.get_preview_data_cached()
@@ -2514,8 +2577,15 @@ class ImageEditor:
                 mask_snapshot = None
                 export_cache = None
 
+            mask_assets_snapshot = {
+                key: copy.deepcopy(mask)
+                for key, mask in self._mask_assets.items()
+                if mask is not None
+            }
+
             # --- Paths ---
             filepath_snapshot = self.current_filepath
+            source_filepath_snapshot = self.source_filepath or self.current_filepath
 
             # --- EXIF (may read original_image and _source_exif_bytes) ---
             main_exif = self._get_sanitized_exif_bytes()
@@ -2542,10 +2612,14 @@ class ImageEditor:
             "export_cache": export_cache,
             "original_path": original_path,
             "filepath_snapshot": filepath_snapshot,
+            "source_filepath": source_filepath_snapshot,
+            "current_mtime": self.current_mtime,
+            "bit_depth": self.bit_depth,
             "main_exif": main_exif,
             "source_exif": source_exif,
             "write_developed_jpg": write_developed_jpg,
             "developed_path": developed_path,
+            "mask_assets": mask_assets_snapshot,
         }
 
     def save_from_snapshot(

@@ -155,6 +155,7 @@ If you do nothing, FastStack will still run, but JPEG decoding and thumbnail gen
 - `G`: Jump to Image Number
 - `I`: Show EXIF Data
 - `F11`: Toggle Fullscreen (Loupe View)
+- `Space` (hold in loupe view): Show the original with the current crop, hiding other edits until released
 - `S`: Toggle current image in/out of stack
 - `X`: Remove current image from batch/stack
 - `B`: Toggle current image in/out of batch
@@ -175,8 +176,8 @@ If you do nothing, FastStack will still run, but JPEG decoding and thumbnail gen
 - `Ctrl+Z`: Undo last saved action (delete or saved edit)
 - `A`: Quick auto white balance (live session; saved on navigation, drag, or Ctrl+S)
 - `Ctrl+Shift+B`: Quick auto white balance (alternate)
-- `l`: Quick auto levels (live session; saved on navigation, drag, or Ctrl+S)
-- `L`: Quick auto white balance + auto levels (live session; saved on navigation, drag, or Ctrl+S)
+- `l`: Quick auto levels + vibrance (live session; saved on navigation, drag, or Ctrl+S)
+- `L`: Quick auto white balance + auto levels + vibrance (live session; saved on navigation, drag, or Ctrl+S)
 - `-`: Darken the current auto-adjust highlights/whites by 14 points in the live session
 - `_`: Raise the current auto-adjust whites by 14 points in the live session
 - `+`: Raise the current auto-adjust shadows/blacks by 7 points in the live session

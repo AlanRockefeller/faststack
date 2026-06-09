@@ -58,7 +58,7 @@ Window {
     readonly property color controlBg: "#10ffffff"
     readonly property color controlBorder: "#30ffffff"
     readonly property color separatorColor: "#20ffffff"
-    readonly property string autoVibranceTooltip: "When enabled, FastStack may add a small vibrance boost only when you press capital L (Shift+L / Quick Auto Adjust). Lowercase l still runs auto levels only and leaves vibrance unchanged."
+    readonly property string autoVibranceTooltip: "When enabled, FastStack may add a small vibrance boost to quick auto levels (l) and quick auto adjust (Shift+L)."
 
     Material.theme: Material.Dark
     Material.accent: accentColor
