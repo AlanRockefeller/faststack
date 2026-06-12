@@ -75,6 +75,7 @@ from faststack.imaging.cache import (
 )
 from faststack.imaging.prefetch import (
     Prefetcher,
+    apply_loupe_color_correction,
     clear_icc_caches,
     get_icc_profile_description,
     get_icc_profile_details,
@@ -273,6 +274,9 @@ class AppController(QObject):
         self._exif_executor = create_daemon_threadpool_executor(
             max_workers=2, thread_name_prefix="EXIF"
         )
+        self._editor_prewarm_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="EditPrewarm"
+        )
         self._preview_inflight = False
         self._preview_pending = False
         self._preview_token = 0
@@ -282,12 +286,14 @@ class AppController(QObject):
             None
         )
         self._original_compare_preview = None
-        self._original_compare_session_key: Optional[tuple[str, Optional[str]]] = None
+        self._original_compare_session_key: Optional[tuple[str, Optional[str], int]] = None
         self._original_compare_index: int = -1
         self._original_compare_gen: int = -1
         self._original_compare_active: bool = False
         self._original_compare_inflight: bool = False
         self._original_compare_token: int = 0
+        self._editor_prewarm_future: Optional[concurrent.futures.Future] = None
+        self._editor_prewarm_lock = threading.Lock()
         self._shutting_down = False  # Flag to gate async callbacks during shutdown
         self._refresh_scheduled = False  # Coalesce guard for deferred disk refresh
         self._opencv_warning_shown = False  # Only show OpenCV warning once per session
@@ -370,6 +376,17 @@ class AppController(QObject):
         self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
         self._suppressed_paths: Dict[str, float] = {}  # key -> monotonic expiry time
         self._suppressed_paths_lock = threading.Lock()  # guards cross-thread access
+        # Paths reported by the watcher since the last debounced refresh, so
+        # _on_watcher_refresh can invalidate decodes per-path instead of
+        # busting the entire cache via a display-generation bump.
+        self._watcher_changed_paths: set = set()
+        self._watcher_changed_lock = threading.Lock()
+        # Per-path decode invalidation epochs (path key -> monotonic time).
+        # _prefetch_cache_put rejects decode results that STARTED before the
+        # path's epoch: their pixels were read from a file that has since
+        # been replaced (e.g. by a save).
+        self._decode_invalidation_epochs: Dict[str, float] = {}
+        self._decode_invalidation_lock = threading.Lock()
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
         self.image_editor = ImageEditor()  # Initialize the editor
         self._dialog_open_count = 0  # Track nested dialogs
@@ -390,7 +407,7 @@ class AppController(QObject):
         self.image_cache.misses = 0  # Initialize cache miss counter
         self.prefetcher = Prefetcher(
             image_files=self.image_files,
-            cache_put=self.image_cache.__setitem__,
+            cache_put=self._prefetch_cache_put,
             prefetch_radius=config.getint("core", "prefetch_radius", 12),
             get_display_info=self.get_display_info,
             debug=_debug_mode,
@@ -526,6 +543,15 @@ class AppController(QObject):
         self.histogram_timer.setSingleShot(True)
         self.histogram_timer.setInterval(50)  # 50ms throttle (max 20fps)
         self.histogram_timer.timeout.connect(self._kick_histogram_worker)
+
+        # High-quality preview refinement: every preview-resolution render
+        # (slider drag, adjust keys, auto-adjust) re-arms this debounce; once
+        # input goes idle the same frame is re-rendered at display
+        # resolution, so drags stay cheap and the settled image is sharp.
+        self._hq_preview_timer = QTimer(self)
+        self._hq_preview_timer.setSingleShot(True)
+        self._hq_preview_timer.setInterval(350)
+        self._hq_preview_timer.timeout.connect(self._refine_preview_resolution)
 
         # Preview refresh uses a gate pattern instead of a timer:
         # - _kick_preview_worker() runs immediately if not inflight
@@ -989,6 +1015,105 @@ class AppController(QObject):
         with self._display_lock:
             self.display_generation += 1
 
+    def _prefetch_cache_put(self, cache_key, decoded, path=None, decode_started=None):
+        """Cache insert for prefetch decode results, with staleness guard.
+
+        A decode that STARTED before its path's invalidation epoch read pixels
+        from a file that has since been replaced (saved); inserting it would
+        resurrect stale pixels right after the targeted pop_path. Reject it —
+        the next update_prefetch/blocking decode re-reads the new file.
+        """
+        if path is not None and decode_started is not None:
+            try:
+                epoch_key = self._key(Path(path))
+            except (OSError, TypeError, ValueError):
+                epoch_key = str(path)
+            with self._decode_invalidation_lock:
+                entry = self._decode_invalidation_epochs.get(epoch_key)
+            if entry is not None:
+                epoch_time, fingerprint = entry
+                if fingerprint is None:
+                    log.debug(
+                        "Discarding prefetch decode for %s because optimistic "
+                        "live-preview seed is active",
+                        path,
+                    )
+                    return
+                if decode_started < epoch_time:
+                    log.debug(
+                        "Discarding stale prefetch decode for %s "
+                        "(file replaced while decode was in flight)",
+                        path,
+                    )
+                    return
+        self.image_cache[cache_key] = decoded
+
+    @staticmethod
+    def _file_state_fingerprint(p: Path) -> Optional[tuple]:
+        """(mtime, size) identity of the file's current on-disk state."""
+        try:
+            st = p.stat()
+            return (st.st_mtime, st.st_size)
+        except OSError:
+            return None
+
+    def _invalidate_decoded_path(self, path, *, force: bool = False) -> None:
+        """Targeted decode-cache invalidation for one changed file.
+
+        Replaces the old display-generation bump (which stale-keyed every
+        cached decode and forced the whole prefetch window to re-decode after
+        each save). Records the invalidation epoch BEFORE popping cache
+        entries so in-flight decodes of the old file contents are rejected by
+        _prefetch_cache_put when they land, then cancels/unschedules any
+        pending prefetch for the path so it gets re-submitted fresh.
+
+        A save is invalidated twice (save-completion handler + the watcher
+        events it triggers, in either order). The (mtime, size) fingerprint
+        dedupes watcher echoes only: if the file's on-disk state is the one
+        we already invalidated, cached entries were decoded after that epoch
+        and are coherent, so the duplicate watcher invalidation is skipped
+        instead of forcing another blocking re-decode of the displayed image.
+        """
+        if path is None:
+            return
+        p = Path(path)
+        try:
+            epoch_key = self._key(p)
+        except (OSError, TypeError, ValueError):
+            epoch_key = str(p)
+        now = time.monotonic()
+        fingerprint = self._file_state_fingerprint(p)
+        with self._decode_invalidation_lock:
+            entry = self._decode_invalidation_epochs.get(epoch_key)
+            if (
+                not force and
+                entry is not None
+                and fingerprint is not None
+                and entry[1] == fingerprint
+            ):
+                return
+            # Opportunistic pruning: no decode stays in flight for minutes,
+            # so old epochs can never reject anything and may be dropped.
+            if len(self._decode_invalidation_epochs) > 64:
+                cutoff = now - 120.0
+                self._decode_invalidation_epochs = {
+                    k: v
+                    for k, v in self._decode_invalidation_epochs.items()
+                    if v[0] >= cutoff
+                }
+            self._decode_invalidation_epochs[epoch_key] = (now, fingerprint)
+        self.image_cache.pop_path(p)
+        self.prefetcher.invalidate_path(p)
+
+    def _mark_optimistic_decode_seed_epoch(self, path: Path) -> None:
+        """Record that the decode cache currently contains optimistic pixels."""
+        try:
+            epoch_key = self._key(path)
+        except (OSError, TypeError, ValueError):
+            epoch_key = str(path)
+        with self._decode_invalidation_lock:
+            self._decode_invalidation_epochs[epoch_key] = (time.monotonic(), None)
+
     def on_display_size_changed(self, width: int, height: int):
         """Debounces display size change events to prevent spamming resizes."""
         log.debug(
@@ -1053,6 +1178,11 @@ class AppController(QObject):
         # mirroring what _handle_resize() does.
         self.prefetcher.cancel_all()
         if self._loupe_decode_allowed():
+            self.prefetcher.submit_task(
+                self.current_index,
+                self.prefetcher.generation,
+                priority=True,
+            )
             self.prefetcher.update_prefetch(self.current_index)
 
         # Force QML to reload the image at the new resolution
@@ -1086,6 +1216,11 @@ class AppController(QObject):
         # naturally unreachable and LRU will evict them. This lets us instantly
         # reuse cached images if user toggles zoom on/off repeatedly.
         self.prefetcher.cancel_all()  # Cancel stale tasks to avoid wasted work
+        self.prefetcher.submit_task(
+            self.current_index,
+            self.prefetcher.generation,
+            priority=True,
+        )
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
         self.ui_state.isZoomedChanged.emit()
@@ -1120,6 +1255,23 @@ class AppController(QObject):
         # Don't handle key events when a dialog is open
         if self._dialog_open:
             return False
+
+        # While cropping, claim Esc at the ShortcutOverride stage so the QML
+        # Shortcut system never matches it (an app-wide "Escape" Shortcut that
+        # matches but fails to run its handler — e.g. an ambiguous match —
+        # consumes the key and the KeyPress below never arrives). Accepting
+        # the override re-delivers Esc as a normal KeyPress, which the crop
+        # branch below handles deterministically. Rotate mode is excluded:
+        # there Esc must reach the loupe's QML key handler to exit rotation.
+        if (
+            watched == self.main_window
+            and event.type() == QEvent.Type.ShortcutOverride
+            and event.key() == Qt.Key_Escape
+            and getattr(self.ui_state, "isCropping", False)
+            and not getattr(self.ui_state, "isCropRotating", False)
+        ):
+            event.accept()
+            return True
 
         if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
             if event.key() == Qt.Key_Space and self._can_show_original_compare(event):
@@ -1321,6 +1473,13 @@ class AppController(QObject):
                         return
                     # Cleanup expired entry
                     del self._suppressed_paths[key]
+            with self._watcher_changed_lock:
+                self._watcher_changed_paths.add(p)
+        else:
+            # Caller didn't say what changed; the debounced refresh must fall
+            # back to a global cache invalidation. None marks "unknown".
+            with self._watcher_changed_lock:
+                self._watcher_changed_paths.add(None)
 
         try:
             QMetaObject.invokeMethod(
@@ -1328,6 +1487,20 @@ class AppController(QObject):
             )
         except RuntimeError:
             pass  # QObject already deleted during shutdown
+
+    def _suppress_watcher_paths(self, *paths: Optional[Path], ttl: float = 3.0) -> None:
+        """Temporarily ignore watcher refreshes for specific paths."""
+        now = time.monotonic()
+        with self._suppressed_paths_lock:
+            for path in paths:
+                if path is None:
+                    continue
+                try:
+                    key = self._key(path)
+                except (OSError, TypeError, ValueError):
+                    continue
+                if key:
+                    self._suppressed_paths[key] = now + ttl
 
     @Slot()
     def _start_watcher_debounce_timer(self) -> None:
@@ -1377,10 +1550,26 @@ class AppController(QObject):
         if self.image_files and 0 <= self.current_index < len(self.image_files):
             preserved_path = self.image_files[self.current_index].path
 
+        with self._watcher_changed_lock:
+            changed_paths = self._watcher_changed_paths
+            self._watcher_changed_paths = set()
+
         self.refresh_image_list()
 
-        # Bust decode cache so modified-on-disk files are re-decoded
-        self._bump_display_generation()
+        # Bust decode caches so modified-on-disk files are re-decoded.
+        # Invalidate only the files the watcher reported (a save produces a
+        # handful of events; the other ~hundreds of cached decodes are still
+        # valid). Fall back to the global display-generation bump when the
+        # change set is unattributable (None sentinel) or implausibly large.
+        # An EMPTY drain means a coalesced/duplicate debounce fire whose
+        # changes were already drained by an earlier fire — invalidate
+        # nothing, or every duplicate fire would re-decode the whole window.
+        if changed_paths:
+            if None not in changed_paths and len(changed_paths) <= 100:
+                for p in changed_paths:
+                    self._invalidate_decoded_path(p)
+            else:
+                self._bump_display_generation()
 
         # Re-select the same image if it still exists, otherwise clamp
         if self.image_files and preserved_path:
@@ -1877,7 +2066,7 @@ class AppController(QObject):
             self._original_compare_preview is not None
             and self._original_compare_index == self.current_index
             and self._original_compare_session_key
-            == self._get_current_live_preview_session_key()
+            == self._get_current_original_compare_session_key()
         ):
             self._original_compare_gen = self.ui_refresh_generation
 
@@ -2058,6 +2247,16 @@ class AppController(QObject):
             return None
         active_path_key, session_id, _revision = info
         return (active_path_key, session_id)
+
+    def _get_current_original_compare_session_key(
+        self,
+    ) -> Optional[tuple[str, Optional[str], int]]:
+        """Return the path/session/revision identity for held-space compare."""
+        info = self._get_current_live_edit_session_info()
+        if info is None:
+            return None
+        active_path_key, session_id, revision = info
+        return (active_path_key, session_id, revision)
 
     def _publish_last_rendered_preview_locked(
         self,
@@ -2564,6 +2763,26 @@ class AppController(QObject):
         edit_state = self._get_pending_edit_state_for_loaded_path(active_path)
         return self._edit_source_path_from_state(edit_state, active_path), edit_state
 
+    def _cached_preview_for_load(
+        self, load_path: Path, active_path: Path
+    ) -> Optional[DecodedImage]:
+        """Display-cache buffer for seeding the editor's float_preview, or None.
+
+        The decode cache holds the SAVED file's pixels. When the editor loads
+        from a distinct source (the backup) to replay persisted edits, seeding
+        float_preview from the saved pixels would apply the restored edits a
+        second time in every preview-sized render (e.g. crop-on-crop). In that
+        case load_image must rebuild the preview from the pixels it actually
+        loads, so return None.
+        """
+        try:
+            same = self._key(load_path) == self._key(active_path)
+        except (OSError, TypeError, ValueError):
+            same = str(load_path) == str(active_path)
+        if not same:
+            return None
+        return self.get_decoded_image(self.current_index)
+
     def _bind_loaded_editor_output_path(self, active_path: Path) -> None:
         try:
             active_mtime = active_path.stat().st_mtime
@@ -2591,10 +2810,21 @@ class AppController(QObject):
         main_exif = snapshot.get("main_exif")
         if main_exif:
             restored_original.info["exif"] = main_exif
+        source_icc_bytes = snapshot.get("source_icc_bytes")
+        if source_icc_bytes:
+            restored_original.info["icc_profile"] = source_icc_bytes
 
         thumb = restored_original.copy()
         thumb.thumbnail((1920, 1080))
-        restored_preview = np.array(thumb.convert("RGB")).astype(np.float32) / 255.0
+        # float_preview is display-space by contract; cook the rebuilt preview
+        # like the prefetcher cooks cached previews (sRGB assumed when the
+        # snapshot carries no ICC profile).
+        preview_u8 = apply_loupe_color_correction(
+            np.asarray(thumb.convert("RGB"), dtype=np.uint8),
+            icc_bytes=restored_original.info.get("icc_profile"),
+        )
+        restored_preview = preview_u8.astype(np.float32)
+        restored_preview *= np.float32(1.0 / 255.0)
 
         with self.image_editor._lock:
             self.image_editor.current_filepath = Path(
@@ -2953,9 +3183,12 @@ class AppController(QObject):
             except (OSError, ValueError):
                 paths_match = str(editor_path) == str(active_path)
 
-        has_buffers = (
-            self.image_editor.original_image is not None
-            and self.image_editor.float_image is not None
+        # Auto-adjust sessions load preview_only, so accept a session that has
+        # only the float preview; the full float master is materialized lazily
+        # by _ensure_float_image() (pre-warmed in the background below).
+        has_buffers = self.image_editor.original_image is not None and (
+            self.image_editor.float_image is not None
+            or self.image_editor.float_preview is not None
         )
         if paths_match and has_buffers:
             if self._has_valid_active_auto_adjust_state():
@@ -2977,19 +3210,71 @@ class AppController(QObject):
                 return active_path
 
         load_path, _edit_state = self._active_edit_load_path(active_path)
-        cached_preview = self.get_decoded_image(self.current_index)
+        cached_preview = self._cached_preview_for_load(load_path, active_path)
+        # preview_only skips the ~400ms full-resolution float conversion that
+        # would otherwise block the UI thread on the first auto-adjust
+        # keypress; analysis only needs the preview-sized buffer.
         if self.image_editor.load_image(
             str(load_path),
             cached_preview=cached_preview,
             source_exif=self._capture_source_exif_for_active_image(),
+            preview_only=True,
         ):
             self._bind_loaded_editor_output_path(active_path)
             self._restore_pending_edit_state_for_loaded_path(active_path)
             self._ensure_live_edit_session_state(force_reset=True)
+            self._prewarm_editor_float_image()
             return active_path
 
         self.update_status_message("Failed to load image")
         return None
+
+    def _prewarm_editor_float_image(self) -> None:
+        """Materialize the editor's float master off the UI thread.
+
+        After a preview_only load, the first consumer of float_image would
+        otherwise pay the full-resolution conversion inline — and
+        snapshot_for_export runs on the main thread. _ensure_float_image is
+        thread-safe and no-ops if the master already exists or the image
+        changed underneath it.
+        """
+        editor = self.image_editor
+        if editor is None:
+            return
+
+        with editor._lock:
+            session_id = editor.session_id
+            current_filepath = editor.current_filepath
+
+        with self._editor_prewarm_lock:
+            future = self._editor_prewarm_future
+            if future is not None and not future.done():
+                return
+
+            def _job() -> None:
+                try:
+                    with editor._lock:
+                        if (
+                            editor.session_id != session_id
+                            or editor.current_filepath != current_filepath
+                        ):
+                            return
+                    editor._ensure_float_image()
+                except Exception:
+                    pass  # editor cleared/reloaded before the worker ran
+
+            def _clear_future(_future: concurrent.futures.Future) -> None:
+                with self._editor_prewarm_lock:
+                    if self._editor_prewarm_future is _future:
+                        self._editor_prewarm_future = None
+
+            try:
+                future = self._editor_prewarm_executor.submit(_job)
+            except RuntimeError:
+                return  # shutting down
+
+            self._editor_prewarm_future = future
+            future.add_done_callback(_clear_future)
 
     def _compute_auto_levels_recommendation(self) -> dict[str, Any]:
         """Compute the current baseline auto-level recommendation."""
@@ -3247,9 +3532,9 @@ class AppController(QObject):
 
         self.refresh_image_list()
         self._reindex_after_save(saved_path)
-        self._bump_display_generation()
-        self.image_cache.pop_path(saved_path)
-        self.prefetcher.cancel_all()
+        # Only the saved file's pixels changed; per-path invalidation keeps
+        # the rest of the decode cache and the in-flight prefetch window warm.
+        self._invalidate_decoded_path(saved_path, force=True)
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
 
@@ -3435,6 +3720,7 @@ class AppController(QObject):
         ):
             return False
 
+        self._suppress_watcher_paths(target)
         self._increment_save_tracking(target=target, save_image_key=save_image_key)
         self._mark_current_live_edit_session_submitted(context["save_revision"])
         self.ui_state.isSaving = True
@@ -3537,6 +3823,7 @@ class AppController(QObject):
                 )
             return False
 
+        self._suppress_watcher_paths(target)
         self._increment_save_tracking(target=target, save_image_key=save_image_key)
         self._mark_current_live_edit_session_submitted(context["save_revision"])
         self.ui_state.isSaving = True
@@ -3570,6 +3857,34 @@ class AppController(QObject):
         self._on_save_finished(save_result)
         return bool(save_result.get("success"))
 
+    def _seed_decode_cache_from_live_preview(self, path) -> None:
+        """Keep the just-edited pixels visible while their save is in flight.
+
+        Navigation clears the live edit session, so the provider falls back to
+        the decode cache — which still holds the PRE-EDIT pixels until the
+        background save completes and the path is invalidated. Seeding the
+        cache with the last rendered live preview means navigating back shows
+        the edited image immediately instead of flashing the original; the
+        save-completion invalidation then replaces it with the real decode.
+        """
+        if path is None or self.is_zoomed:
+            return
+        path = Path(path)
+        with self._preview_lock:
+            decoded = self._last_rendered_preview
+            session_key = self._last_rendered_preview_session_key
+        if decoded is None or session_key is None:
+            return
+        try:
+            if session_key[0] != self._key(path):
+                return
+        except (OSError, TypeError, ValueError):
+            return
+        self._mark_optimistic_decode_seed_epoch(path)
+        self.prefetcher.invalidate_path(path)
+        _, _, display_gen = self.get_display_info()
+        self.image_cache[build_cache_key(path, display_gen)] = decoded
+
     def _flush_current_live_edit_session_for_navigation(self) -> bool:
         """Queue a background save for the current dirty session before switching images."""
         request = self._prepare_current_session_save_request(
@@ -3578,6 +3893,9 @@ class AppController(QObject):
         )
         if request is None:
             return self._last_save_prepare_error is None
+        self._seed_decode_cache_from_live_preview(
+            request.get("context", {}).get("target")
+        )
         return self._submit_save_request_async(request)
 
     def _flush_current_live_edit_session_for_drag(
@@ -3730,16 +4048,21 @@ class AppController(QObject):
                 )
             else:
                 self.update_status_message(f"Save failed: {error_msg}", timeout=5000)
+            # Drop the optimistic live-preview cache seed (if any) so the
+            # display falls back to the file's actual pixels.
+            if target:
+                self._invalidate_decoded_path(target, force=True)
             return
-
-        # Success — drop any prior recovery snapshot for this target.
-        target = save_result.get("target")
-        if target and target in self._pending_save_recovery:
-            self._pending_save_recovery.pop(target, None)
 
         result = save_result.get("result")
         if isinstance(result, tuple) and len(result) == 2:
             saved_path, backup_path = result
+            # Success — drop any prior recovery snapshot for this target and
+            # keep the watcher quiet for the save-generated file churn.
+            target = save_result.get("target")
+            if target and target in self._pending_save_recovery:
+                self._pending_save_recovery.pop(target, None)
+            self._suppress_watcher_paths(target, saved_path)
 
             # --- Post-Save Cleanup ---
 
@@ -3824,10 +4147,11 @@ class AppController(QObject):
             self.refresh_image_list()
 
             if still_on_same_session:
-                # Still viewing the saved image — pin index and force sync
+                # Still viewing the saved image — pin index and force sync.
+                # Only the saved file's pixels changed; invalidate it alone
+                # instead of clearing the whole decode cache.
                 self._reindex_after_save(saved_path)
-                self.image_cache.clear()
-                self.prefetcher.cancel_all()
+                self._invalidate_decoded_path(saved_path, force=True)
                 self.prefetcher.update_prefetch(self.current_index)
                 self.sync_ui_state()
             else:
@@ -3835,7 +4159,7 @@ class AppController(QObject):
                 if preserved_path:
                     self._reindex_after_save(preserved_path)
                 if saved_path:
-                    self.image_cache.pop_path(saved_path)
+                    self._invalidate_decoded_path(saved_path, force=True)
 
             # Auto-add to batch if enabled
             if saved_path:
@@ -4408,7 +4732,9 @@ class AppController(QObject):
     def _get_metadata_dict(self, image_path: Path | str) -> dict:
         """Get metadata for an image path as a dict for thumbnail model."""
         try:
-            meta = self.sidecar.get_metadata(image_path, create=False)
+            # migrate=False: this runs per image on grid refresh; the legacy
+            # migration scan costs O(entries) filesystem stats per miss.
+            meta = self.sidecar.get_metadata(image_path, create=False, migrate=False)
             if meta is None:
                 return {
                     "stacked": False,
@@ -4452,7 +4778,9 @@ class AppController(QObject):
         bulk_map = {}
         for img in (images if images is not None else self.image_files):
             try:
-                meta = self.sidecar.get_metadata(img.path, create=False)
+                # migrate=False: see _get_metadata_dict — most images have no
+                # entry, and the migration scan is O(entries) stats per miss.
+                meta = self.sidecar.get_metadata(img.path, create=False, migrate=False)
                 if meta is None:
                     continue
                 bulk_map[str(img.path)] = {
@@ -4486,6 +4814,7 @@ class AppController(QObject):
         """
         if not self.batches:
             return
+        self.batches = [[int(start), int(end)] for start, end in self.batches]
         self.batches.sort()
         merged: List[List[int]] = [self.batches[0]]
         for current_start, current_end in self.batches[1:]:
@@ -4700,7 +5029,11 @@ class AppController(QObject):
 
         # Compute and cache
         image_path = self.image_files[self.current_index].path
-        meta = self.sidecar.get_metadata(image_path, create=False)
+        # migrate=False: this is a read-only display lookup that runs once per
+        # navigation step; the legacy-key migration scan would otherwise do
+        # O(sidecar entries) filesystem checks for every image that has no
+        # entry — hundreds of stats per keypress while holding an arrow key.
+        meta = self.sidecar.get_metadata(image_path, create=False, migrate=False)
         stack_info = self._get_stack_info(self.current_index)
         batch_info = self._get_batch_info(self.current_index)
 
@@ -4947,8 +5280,8 @@ class AppController(QObject):
             self.dataChanged.emit()
             self.sync_ui_state()
 
-            # Refresh grid to show batch badges
-            self._thumbnail_model.refresh()
+            # Re-announce batch badges (no model reset needed)
+            self._thumbnail_model.notify_batch_state_changed()
 
             self.update_status_message(f"Added {added_count} image(s) to batch")
             log.info("Added %d image(s) to batch from grid selection", added_count)
@@ -4988,7 +5321,7 @@ class AppController(QObject):
             self.sync_ui_state()
 
             if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
-                self._thumbnail_model.refresh()
+                self._thumbnail_model.notify_batch_state_changed()
 
             self.update_status_message(
                 f"Added {added_count} favorite(s) to batch ({len(indices_to_add)} total favorites)"
@@ -5032,7 +5365,7 @@ class AppController(QObject):
             self.sync_ui_state()
 
             if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
-                self._thumbnail_model.refresh()
+                self._thumbnail_model.notify_batch_state_changed()
 
             self.update_status_message(
                 f"Added {added_count} uploaded image(s) to batch ({len(indices_to_add)} total uploaded)"
@@ -5074,7 +5407,7 @@ class AppController(QObject):
             self.sync_ui_state()
 
             if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
-                self._thumbnail_model.refresh()
+                self._thumbnail_model.notify_batch_state_changed()
 
             self.update_status_message(
                 f"Added {added_count} edited image(s) to batch ({len(indices_to_add)} total edited)"
@@ -5098,7 +5431,14 @@ class AppController(QObject):
         except (OSError, TypeError, ValueError):
             image_key = None
 
-        for i, img in enumerate(self.image_files):
+        # The edited image is almost always the current one; checking it first
+        # avoids paying a per-image sidecar-key lookup across the whole folder
+        # on every quick auto-adjust keystroke.
+        indices = list(range(len(self.image_files)))
+        if 0 <= self.current_index < len(indices):
+            indices.insert(0, indices.pop(self.current_index))
+        for i in indices:
+            img = self.image_files[i]
             try:
                 matches = (
                     image_key is not None
@@ -5110,7 +5450,7 @@ class AppController(QObject):
             if matches:
                 in_batch = any(start <= i <= end for start, end in self.batches)
                 if not in_batch:
-                    self.batches.append((i, i))
+                    self.batches.append([i, i])
                     self._normalize_batches()
                     self._invalidate_batch_cache()
                     self._metadata_cache_index = (-1, -1)
@@ -5118,7 +5458,7 @@ class AppController(QObject):
                     self.sync_ui_state()
 
                     if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
-                        self._thumbnail_model.refresh()
+                        self._thumbnail_model.notify_batch_state_changed()
 
                     log.info("Auto-added edited image to batch: %s", image_path.name)
                 break
@@ -5453,6 +5793,14 @@ class AppController(QObject):
             self.image_editor, "session_id", None
         )
         self._crop_mode_has_saved_geometry = True
+        log.debug(
+            "Crop snapshot: crop=%s angle=%.4f rotation=%s path=%s session=%s",
+            self._crop_mode_saved_crop_box,
+            self._crop_mode_saved_straighten_angle,
+            self._crop_mode_saved_rotation,
+            self._crop_mode_saved_path_key,
+            self._crop_mode_saved_session_id,
+        )
 
     def _restore_crop_mode_geometry(self) -> bool:
         if not self._crop_mode_has_saved_geometry:
@@ -5515,6 +5863,13 @@ class AppController(QObject):
         self._set_crop_overlay_box_only(overlay_box)
         if hasattr(self.ui_state, "cropRotation"):
             self.ui_state.cropRotation = 0.0
+        log.debug(
+            "Crop restore: crop=%s angle=%.4f rotation=%s changed=%s",
+            saved_crop_box,
+            saved_angle,
+            saved_rotation,
+            changed,
+        )
         return True
 
     def _reset_crop_only(self, *, clear_crop_transaction: bool = True):
@@ -6011,6 +6366,13 @@ class AppController(QObject):
         if not self.image_editor.original_image:
             return
 
+        # During a crop transaction the QML rotate knob reports an angle
+        # relative to the displayed image, which already has any committed
+        # straighten baked in. Compose them so re-straightening an
+        # already-straightened image doesn't silently discard the old angle.
+        if self.ui_state.isCropping and self._crop_mode_has_saved_geometry:
+            angle = self._crop_mode_saved_straighten_angle + angle
+
         # log.info(f"AppController.set_straighten_angle: {angle}, AR: {target_aspect_ratio}")
 
         # Update Aspect Ratio Compensation for Crop Box
@@ -6077,8 +6439,12 @@ class AppController(QObject):
                         right = 1000
                         left = max(0, left)
 
-                    self.ui_state.currentCropBox = (left, top, right, bottom)
-                    self.image_editor.set_crop_box((left, top, right, bottom))
+                    crop_box = (left, top, right, bottom)
+                    if self.ui_state.isCropping:
+                        self._set_crop_overlay_box_only(crop_box)
+                    else:
+                        self.ui_state.currentCropBox = crop_box
+                        self.image_editor.set_crop_box(crop_box)
 
         log.debug("AppController.set_straighten_angle: %s", angle)
         # Pass the angle as-is (degrees CW).
@@ -6091,6 +6457,8 @@ class AppController(QObject):
         # Crucially, sync_ui_state emits currentImageSourceChanged, forcing QML to reload.
         # self.display_generation += 1
         # self.sync_ui_state() # DISABLE TO PREVENT FLASHING - QML handles preview live
+        if self.ui_state.isCropping:
+            self._kick_preview_worker()
 
     @Slot(result=int)
     def get_awb_warm_bias(self):
@@ -7655,10 +8023,13 @@ class AppController(QObject):
             self._clear_live_edit_session_state()
             with self._preview_lock:
                 self._clear_last_rendered_preview_locked()
-            self._bump_display_generation()
+            # Nothing changed on disk; just force a fresh decode of the
+            # current image so the display drops the reverted edits.
             if self.image_cache and 0 <= self.current_index < len(self.image_files):
-                self.image_cache.pop_path(self.image_files[self.current_index].path)
-            self.prefetcher.cancel_all()
+                self._invalidate_decoded_path(
+                    self.image_files[self.current_index].path,
+                    force=True,
+                )
             self.prefetcher.update_prefetch(self.current_index)
             self.sync_ui_state()
             if self.ui_state.isHistogramVisible:
@@ -7989,6 +8360,11 @@ class AppController(QObject):
         self._safe_shutdown_executor(
             getattr(self, "_exif_executor", None),
             "exif",
+            wait=False,
+        )
+        self._safe_shutdown_executor(
+            getattr(self, "_editor_prewarm_executor", None),
+            "editor prewarm",
             wait=False,
         )
         # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
@@ -8865,7 +9241,9 @@ class AppController(QObject):
                 return self._REUSED
 
             # Fetch cached preview if available for faster initial display
-            cached_preview = self.get_decoded_image(self.current_index)
+            # (declined when loading from a backup source — see
+            # _cached_preview_for_load for the double-applied-edits hazard).
+            cached_preview = self._cached_preview_for_load(load_path, active_path)
 
             # Determine if we should capture source EXIF (e.g., for RAW mode)
             source_exif = None
@@ -8948,8 +9326,17 @@ class AppController(QObject):
                 self.ui_state.currentAspectRatioIndex = 0
                 self.ui_state.currentCropBox = (0, 0, 1000, 1000)
 
-        # Kick off background render
-        self._kick_preview_worker()
+        # Kick off a background render only when the session holds unsaved
+        # edits that the decoded file can't show. After a navigation reload
+        # the session merely replays the already-saved (or save-submitted)
+        # state, and publishing a preview-resolution render here would
+        # replace the sharp full-resolution decode in the loupe ~250ms after
+        # the image appears: a slight shift (crop rounded at preview vs full
+        # resolution), visible blur, and a sourceSize change that breaks the
+        # zoom percentage and Ctrl+1 (1:1 of preview pixels instead of
+        # native pixels).
+        if self._is_current_live_edit_session_dirty():
+            self._kick_preview_worker()
         # Notify UI
         self.ui_state.editorImageChanged.emit()
 
@@ -9733,6 +10120,55 @@ class AppController(QObject):
         if pending:
             self.histogram_timer.start()
 
+    def _display_preview_long_edge(self) -> Optional[int]:
+        """Long-edge cap for display-only full-resolution renders.
+
+        Returns None when the display size is unknown or the view is zoomed
+        (get_display_info reports 0x0 while zoomed), which renders uncapped.
+        """
+        display_w, display_h, _ = self.get_display_info()
+        if display_w and display_h:
+            return max(int(display_w), int(display_h))
+        return None
+
+    def _build_live_crop_preview_edits_override(self) -> Optional[dict]:
+        """Snapshot a temporary crop override for live crop preview rendering."""
+        if not getattr(self.ui_state, "isCropping", False):
+            return None
+
+        draft_crop_box = self._normalize_crop_box_tuple(
+            getattr(self.ui_state, "currentCropBox", None)
+        )
+        if draft_crop_box is None:
+            return None
+
+        with self.image_editor._lock:
+            preview_edits = dict(self.image_editor.current_edits)
+
+        # Use the same draft-to-source mapping as execute_crop so the live
+        # preview and the committed crop always agree.
+        if self._crop_mode_has_saved_geometry:
+            base_crop_box = self._crop_mode_saved_crop_box
+            base_angle = self._crop_mode_saved_straighten_angle
+        else:
+            base_crop_box = self._normalize_crop_box_tuple(
+                preview_edits.get("crop_box")
+            )
+            base_angle = 0.0
+        composed_crop_box = self.image_editor.map_crop_draft_to_source(
+            draft_crop_box,
+            base_crop_box,
+            base_angle,
+        )
+        if composed_crop_box is None:
+            return None
+
+        if preview_edits.get("crop_box") == composed_crop_box:
+            return None
+
+        preview_edits["crop_box"] = composed_crop_box
+        return preview_edits
+
     def _kick_preview_worker(self, *, full_resolution: Optional[bool] = None):
         """Kicks off a background preview render task."""
         if getattr(self, "_shutting_down", False):
@@ -9755,6 +10191,15 @@ class AppController(QObject):
             token = self._preview_token
             session_key = self._get_current_live_preview_session_key()
 
+        # Full-resolution live previews are only consumed unzoomed (the
+        # provider falls back to the decoded cache when zoomed), so cap the
+        # render at the display size — a 20MP master costs several hundred ms
+        # per render for pixels the screen cannot show.
+        display_long_edge = (
+            self._display_preview_long_edge() if render_full_resolution else None
+        )
+        preview_edits_override = self._build_live_crop_preview_edits_override()
+
         # Submit task to dedicated preview executor
         try:
             fut = self._preview_executor.submit(
@@ -9763,12 +10208,58 @@ class AppController(QObject):
                 session_key,
                 self.image_editor,
                 render_full_resolution,
+                display_long_edge,
+                preview_edits_override,
+                self.previewReady.emit,
             )
             fut.add_done_callback(self._on_preview_done)
         except RuntimeError:
             log.warning("Preview executor failed (shutting down?)")
             with self._preview_lock:
                 self._preview_inflight = False
+            return
+
+        # Schedule (or cancel) the idle-time high-quality refinement pass.
+        # Always called from the main thread (slots and queued signals).
+        if render_full_resolution:
+            self._hq_preview_timer.stop()
+        else:
+            self._hq_preview_timer.start()
+
+    def _refine_preview_resolution(self):
+        """Re-render the last preview-resolution frame at display resolution.
+
+        Armed by every preview-resolution kick; fires once slider/keyboard
+        input has been idle for the debounce interval. The full-resolution
+        path emits a cheap preview-size frame first, so a refinement that a
+        new drag interrupts never blocks live feedback.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        if self.ui_state is None or self.ui_state.isCropping or self.ui_state.isZoomed:
+            return
+        if not self.image_editor or self.image_editor.current_filepath is None:
+            return
+
+        with self._preview_lock:
+            if self._preview_inflight:
+                # A render is still running; check again once it settles.
+                self._hq_preview_timer.start()
+                return
+            # Only refine a frame that is still being displayed: same index
+            # and same live edit session as when the drag happened. After
+            # navigation the session key changes and there is nothing to
+            # sharpen (the loupe serves the decoded file again).
+            has_current_buffer = (
+                self._last_rendered_preview is not None
+                and self._last_rendered_preview_index == self.current_index
+                and self._last_rendered_preview_session_key
+                == self._get_current_live_preview_session_key()
+            )
+        if not has_current_buffer:
+            return
+
+        self._kick_preview_worker(full_resolution=True)
 
     @staticmethod
     def _render_preview_worker(
@@ -9776,15 +10267,35 @@ class AppController(QObject):
         session_key,
         image_editor,
         full_resolution: bool = False,
+        display_long_edge=None,
+        preview_edits_override=None,
+        emit_intermediate=None,
     ):
         # Heavy work (PIL apply_edits) happens here off-thread
         try:
             decoded = None
             if full_resolution:
-                decoded = image_editor.get_full_resolution_preview_data()
+                # Publish a cheap preview-sized frame first so keypresses give
+                # immediate feedback; the high-resolution frame replaces it
+                # when ready. Intermediate payloads carry final=False so the
+                # gate stays inflight until the real result lands.
+                if emit_intermediate is not None:
+                    quick = image_editor.get_preview_data_cached(
+                        allow_compute=True,
+                        edits_override=preview_edits_override,
+                    )
+                    if quick is not None:
+                        emit_intermediate((token, session_key, quick, False))
+                decoded = image_editor.get_full_resolution_preview_data(
+                    max_long_edge=display_long_edge,
+                    edits_override=preview_edits_override,
+                )
             if decoded is None:
                 # allow_compute=True ensures we actually do the work
-                decoded = image_editor.get_preview_data_cached(allow_compute=True)
+                decoded = image_editor.get_preview_data_cached(
+                    allow_compute=True,
+                    edits_override=preview_edits_override,
+                )
             return token, session_key, decoded
         except Exception:
             log.exception("Preview render failed")
@@ -9800,7 +10311,14 @@ class AppController(QObject):
             token, session_key, decoded = None, None, None
 
         # Emit from worker thread; Qt will queue to UI thread
-        self.previewReady.emit((token, session_key, decoded))
+        try:
+            self.previewReady.emit((token, session_key, decoded, True))
+        except RuntimeError:
+            # The final payload is the only thing that releases the preview
+            # gate; if the emit fails (Qt object torn down mid-shutdown),
+            # release it here so a surviving session cannot wedge rendering.
+            with self._preview_lock:
+                self._preview_inflight = False
 
     @Slot(object)
     def _emit_preview_accepted_side_effects(self):
@@ -9815,21 +10333,32 @@ class AppController(QObject):
             return
 
         try:
-            token, session_key, decoded = payload
+            token, session_key, decoded, is_final = payload
         except (TypeError, ValueError):
-            token, session_key, decoded = None, None, None
+            token, session_key, decoded, is_final = None, None, None, True
         should_kick = False
         should_accept = False
 
         with self._preview_lock:
-            self._preview_inflight = False
+            # If the future completed before add_done_callback registered, the
+            # final frame is delivered synchronously and can be processed
+            # before the queued intermediate; that late intermediate (gate
+            # already released) must not overwrite the full-quality result.
+            stale_intermediate = not is_final and not self._preview_inflight
+
+            # Intermediate frames (fast preview-size pass of a full-resolution
+            # render) must not release the gate: the worker is still busy
+            # producing the final frame.
+            if is_final:
+                self._preview_inflight = False
 
             # Accept result only if:
             # 1. We got valid decoded data
             # 2. Token matches (not stale from an old request)
             # 3. No pending request waiting (avoid "snap back" stale frame flash)
             if (
-                decoded is not None
+                not stale_intermediate
+                and decoded is not None
                 and token == self._preview_token
                 and not self._preview_pending
                 and session_key is not None
@@ -9843,13 +10372,14 @@ class AppController(QObject):
                     self._original_compare_active
                     and self._original_compare_preview is not None
                     and self._original_compare_index == self.current_index
-                    and self._original_compare_session_key == session_key
+                    and self._original_compare_session_key
+                    == self._get_current_original_compare_session_key()
                 ):
                     self._original_compare_gen = self.ui_refresh_generation
                 should_accept = True
 
             # Consume pending flag atomically before scheduling
-            if self._preview_pending:
+            if is_final and self._preview_pending:
                 self._preview_pending = False
                 should_kick = True
 
@@ -9893,7 +10423,7 @@ class AppController(QObject):
         if active_path is None:
             return
 
-        session_key = self._get_current_live_preview_session_key()
+        session_key = self._get_current_original_compare_session_key()
         if session_key is None:
             return
 
@@ -10001,7 +10531,7 @@ class AppController(QObject):
                 and token == self._original_compare_token
                 and index == self.current_index
                 and session_key is not None
-                and session_key == self._get_current_live_preview_session_key()
+                and session_key == self._get_current_original_compare_session_key()
             ):
                 self._original_compare_preview = decoded
                 self._original_compare_session_key = session_key
@@ -10028,7 +10558,10 @@ class AppController(QObject):
             self.ui_state.isCropping = False
 
             try:
-                decoded = self.image_editor.get_full_resolution_preview_data()
+                # Runs synchronously on the UI thread; cap at display size.
+                decoded = self.image_editor.get_full_resolution_preview_data(
+                    max_long_edge=self._display_preview_long_edge()
+                )
             except Exception:
                 log.exception("cancel_crop_mode: restored preview render failed")
                 decoded = None
@@ -10077,8 +10610,13 @@ class AppController(QObject):
                 return
 
             self._snapshot_crop_mode_geometry()
-            # Reset to full image defaults for this crop transaction only.
-            self._reset_crop_only(clear_crop_transaction=False)
+            # Keep the committed crop in the editor; the overlay is the only
+            # thing that becomes draft state during this crop transaction.
+            self._set_crop_overlay_box_only((0, 0, 1000, 1000))
+            if hasattr(self.ui_state, "cropRotation"):
+                self.ui_state.cropRotation = 0.0
+            if hasattr(self.ui_state, "currentAspectRatioIndex"):
+                self.ui_state.currentAspectRatioIndex = 0
             # Set isCropping to True now that reset is done
             self.ui_state.isCropRotating = False
             self.ui_state.isCropping = True
@@ -10281,7 +10819,9 @@ class AppController(QObject):
                 )
 
             # Coerce elements to int and clamp to [0, 1000]
-            left, top, right, bottom = [max(0, min(1000, int(x))) for x in crop_box_raw]
+            left, top, right, bottom = [
+                max(0, min(1000, int(x))) for x in crop_box_raw
+            ]
 
             # Ensure correct order (left <= right, top <= bottom)
             crop_box_raw = (
@@ -10294,10 +10834,6 @@ class AppController(QObject):
         except (ValueError, TypeError, AttributeError) as e:
             log.warning("Invalid crop box format: %s", e)
             self.update_status_message("Invalid crop selection")
-            return
-
-        if crop_box_raw == (0, 0, 1000, 1000):
-            self.update_status_message("No crop area selected")
             return
 
         if self.view_override_path:
@@ -10313,9 +10849,12 @@ class AppController(QObject):
             except (OSError, ValueError):
                 paths_match = str(editor_path) == str(filepath)
 
-        has_buffers = (
-            self.image_editor.original_image is not None
-            and self.image_editor.float_image is not None
+        # Accept preview-only sessions (auto-adjust/compact editor loads):
+        # reloading here would reset live edits, and the full-resolution render
+        # below materializes the float master via _ensure_float_image anyway.
+        has_buffers = self.image_editor.original_image is not None and (
+            self.image_editor.float_image is not None
+            or self.image_editor.float_preview is not None
         )
         if not paths_match or not has_buffers:
             log.debug(
@@ -10337,14 +10876,62 @@ class AppController(QObject):
             self.image_editor.current_edits.get("straighten_angle", 0.0)
         )
 
-        self.image_editor.set_crop_box(crop_box_raw)
+        committed_crop_box = self._normalize_crop_box_tuple(
+            self.image_editor.get_edit_value("crop_box")
+        )
+
+        # A full-image box with no prior crop and no straighten is a no-op:
+        # applying it would still mark the image edited, auto-add it to the
+        # batch, and report "Crop applied". A full box remains meaningful when
+        # a straighten is pending (committing the box makes the rotation
+        # render) or a crop is already committed (Enter confirms and exits).
+        if (
+            crop_box_raw == (0, 0, 1000, 1000)
+            and committed_crop_box is None
+            and abs(current_rotation) <= 0.001
+        ):
+            self.update_status_message("No crop area selected")
+            return
+
+        # The draft overlay is normalized against the image displayed when
+        # crop mode was entered (the snapshot geometry), which with a
+        # committed straighten is a rotated, fill-trimmed window onto the
+        # source. Map it back through that geometry; a plain linear compose
+        # would pick the wrong source region.
+        if self._crop_mode_has_saved_geometry:
+            base_crop_box = self._crop_mode_saved_crop_box
+            base_angle = self._crop_mode_saved_straighten_angle
+        else:
+            base_crop_box = committed_crop_box
+            base_angle = 0.0
+        final_crop_box = self.image_editor.map_crop_draft_to_source(
+            crop_box_raw, base_crop_box, base_angle
+        )
+        if final_crop_box is None:
+            self.update_status_message("Invalid crop selection")
+            return
+
+        log.debug(
+            "execute_crop: committed=%s draft=%s base=(%s, %.4f) final=%s angle=%.4f",
+            committed_crop_box,
+            crop_box_raw,
+            base_crop_box,
+            base_angle,
+            final_crop_box,
+            current_rotation,
+        )
+
+        self.image_editor.set_crop_box(final_crop_box)
         self.image_editor.set_edit_param("straighten_angle", current_rotation)
 
         # Render the committed crop from the full-resolution master and publish
         # it before clearing crop mode, so the loupe does not keep showing the
         # preview-resolution crop used while dragging the overlay.
         try:
-            decoded = self.image_editor.get_full_resolution_preview_data()
+            # Runs synchronously on the UI thread; cap at display size.
+            decoded = self.image_editor.get_full_resolution_preview_data(
+                max_long_edge=self._display_preview_long_edge()
+            )
         except Exception:
             log.exception("execute_crop: full-resolution render failed")
             decoded = None
@@ -10370,6 +10957,9 @@ class AppController(QObject):
         # `visible: isCropping` in QML, and re-entering crop mode resets the
         # box inside a new crop transaction.
         self.ui_state.resetZoomPan()
+        # Cropping is a real edit, so keep batch tagging in sync immediately
+        # instead of waiting for a later save/navigation refresh.
+        self._auto_add_edited_to_batch_if_enabled(filepath)
         if decoded is not None:
             self._emit_preview_accepted_side_effects()
         else:
@@ -10412,6 +11002,10 @@ class AppController(QObject):
             msg = f"Auto levels: no change ({recommendation['noop_reason']})"
 
         self.update_status_message(f"{msg} (preview only)", timeout=9000)
+        if changed and self.image_editor and self.image_editor.current_filepath:
+            self._auto_add_edited_to_batch_if_enabled(
+                Path(self.image_editor.current_filepath)
+            )
         log.info(
             "Auto levels preview applied to %s (clip %.2f%%, str %.2f). Msg: %s",
             active_path,
@@ -10644,6 +11238,12 @@ class AppController(QObject):
         )
         self._last_auto_levels_msg = detail
         self.update_status_message(detail, timeout=9000)
+        # Every quick-adjust entry point funnels through here, so this is the
+        # single place that keeps batch tagging in sync with live edits.
+        if self.image_editor and self.image_editor.current_filepath:
+            self._auto_add_edited_to_batch_if_enabled(
+                Path(self.image_editor.current_filepath)
+            )
 
     def _apply_auto_levels_at_index(self, index: int) -> bool:
         """Apply auto levels and save for image at the given index.
@@ -10722,7 +11322,7 @@ class AppController(QObject):
                     clear_editor=False,
                 )
                 self.image_editor.clear()
-                self.image_cache.pop_path(saved_path)
+                self._invalidate_decoded_path(saved_path, force=True)
                 return True
 
             return False

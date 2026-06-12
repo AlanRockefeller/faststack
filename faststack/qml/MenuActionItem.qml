@@ -13,6 +13,11 @@ ItemDelegate {
     property bool useEnabledHover: true
     property real disabledTextOpacity: 0.6
     property int textLeftPadding: 10
+    // Optional leading checkbox glyph for toggle-style menu entries. Named to
+    // avoid AbstractButton.checked, whose setter force-enables checkable and
+    // lets clicks overwrite the caller's binding.
+    property bool showCheckbox: false
+    property bool checkboxChecked: false
 
     height: 36
     hoverEnabled: true
@@ -24,7 +29,9 @@ ItemDelegate {
     }
 
     contentItem: Text {
-        text: menuActionItem.text
+        text: (menuActionItem.showCheckbox
+            ? (menuActionItem.checkboxChecked ? "☑ " : "☐ ")
+            : "") + menuActionItem.text
         font.bold: menuActionItem.boldWhenSelected && menuActionItem.selected
         color: menuActionItem.enabled ? menuActionItem.defaultTextColor : menuActionItem.disabledTextColor
         opacity: menuActionItem.enabled ? 1.0 : menuActionItem.disabledTextOpacity

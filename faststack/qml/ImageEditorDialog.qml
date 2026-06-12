@@ -609,14 +609,15 @@ Window {
             }
             
             // Slider
-            Slider {
-                id: slider
-                Layout.fillWidth: true
-                Layout.alignment: Qt.AlignVCenter
-                from: sliderRow.minVal
-                to: sliderRow.maxVal
-                stepSize: 1
-                property real editScale: imageEditorDialog.sliderEditScale(sliderRow.key)
+                Slider {
+                    id: slider
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    focusPolicy: Qt.StrongFocus
+                    from: sliderRow.minVal
+                    to: sliderRow.maxVal
+                    stepSize: 1
+                    property real editScale: imageEditorDialog.sliderEditScale(sliderRow.key)
                 
                 property real backendValue: {
                     var val = imageEditorDialog.getBackendValue(sliderRow.key) / slider.editScale * sliderRow.maxVal
@@ -681,6 +682,56 @@ Window {
                     slider._lastSentValue = 0.0
                     imageEditorDialog.updatePulse++
                     resetTimer.restart()
+                }
+
+                function nudgeByKeyboard(step) {
+                    if (slider.isResetting) return false
+                    var nextValue = Math.max(slider.from, Math.min(slider.to, slider.value + step))
+                    if (nextValue === slider.value) return true
+                    slider.value = nextValue
+                    _pendingValue = nextValue
+                    if (!sendTimer.running) sendTimer.start()
+                    return true
+                }
+
+                function commitKeyboardAdjust() {
+                    if (slider.isResetting) {
+                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
+                    } else {
+                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
+                    }
+                    if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.update_histogram()
+                }
+
+                Keys.priority: Keys.BeforeItem
+
+                Keys.onPressed: function(event) {
+                    if (slider.isResetting) {
+                        if (event.key === Qt.Key_Up || event.key === Qt.Key_Right || event.key === Qt.Key_Down || event.key === Qt.Key_Left) {
+                            event.accepted = true
+                        }
+                        return
+                    }
+                    if (event.key === Qt.Key_Up || event.key === Qt.Key_Right) {
+                        if (slider.nudgeByKeyboard(1)) event.accepted = true
+                    } else if (event.key === Qt.Key_Down || event.key === Qt.Key_Left) {
+                        if (slider.nudgeByKeyboard(-1)) event.accepted = true
+                    }
+                }
+
+                Keys.onReleased: function(event) {
+                    if (event.isAutoRepeat) return
+                    if (slider.isResetting) {
+                        if (event.key === Qt.Key_Up || event.key === Qt.Key_Right || event.key === Qt.Key_Down || event.key === Qt.Key_Left) {
+                            event.accepted = true
+                        }
+                        return
+                    }
+                    if (event.key === Qt.Key_Up || event.key === Qt.Key_Right || event.key === Qt.Key_Down || event.key === Qt.Key_Left) {
+                        sendTimer.stop()
+                        slider.commitKeyboardAdjust()
+                        event.accepted = true
+                    }
                 }
 
                 onPressedChanged: {

@@ -461,6 +461,23 @@ class ThumbnailModel(QAbstractListModel):
             len(images),
         )
 
+    def notify_batch_state_changed(self) -> None:
+        """Refresh batch badges without resetting the model.
+
+        IsInBatchRole is computed live in data() via the controller callback,
+        so a dataChanged ping is all QML needs. A full refresh() resets the
+        model, destroys every delegate, re-reads sidecar metadata for all
+        entries, and re-requests visible thumbnails — ~1s of UI-thread work
+        for a state change that isn't even stored in the entries.
+        """
+        if not self._entries:
+            return
+        self.dataChanged.emit(
+            self.index(0, 0),
+            self.index(len(self._entries) - 1, 0),
+            [self.IsInBatchRole],
+        )
+
     def remove_rows_by_path(self, paths: List[Path]) -> None:
         """Targeted removal of rows by path without full model reset."""
         if not paths or not self._entries:

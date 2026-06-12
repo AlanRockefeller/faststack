@@ -185,6 +185,18 @@ class ImageProvider(QQuickImageProvider):
                 except Exception:
                     current_preview_session_key = None
 
+            current_compare_session_key = None
+            get_compare_key = getattr(
+                self.app_controller,
+                "_get_current_original_compare_session_key",
+                None,
+            )
+            if callable(get_compare_key):
+                try:
+                    current_compare_session_key = get_compare_key()
+                except Exception:
+                    current_compare_session_key = None
+
             has_valid_preview_buffer = (
                 current_preview_session_key is not None
                 and self.app_controller._last_rendered_preview is not None
@@ -218,6 +230,7 @@ class ImageProvider(QQuickImageProvider):
             use_original_compare_preview = (
                 getattr(self.app_controller, "_original_compare_active", False)
                 and index == self.app_controller.current_index
+                and current_compare_session_key is not None
                 and self.app_controller._original_compare_preview is not None
                 and self.app_controller._original_compare_index == index
                 and getattr(
@@ -225,7 +238,7 @@ class ImageProvider(QQuickImageProvider):
                     "_original_compare_session_key",
                     None,
                 )
-                == current_preview_session_key
+                == current_compare_session_key
                 and (
                     gen is None
                     or getattr(self.app_controller, "_original_compare_gen", None)
@@ -1532,7 +1545,20 @@ class UIState(QObject):
         if new_value is None:
             return
         if self._set_current_crop_box_value(new_value):
-            # Sync with ImageEditor
+            # During crop mode this is draft overlay state only; the committed
+            # crop box is applied explicitly on Enter.
+            if getattr(self.app_controller.ui_state, "isCropping", False):
+                try:
+                    left, top, right, bottom = new_value
+                    if (right - left) < 20 or (bottom - top) < 20:
+                        return
+                except (TypeError, ValueError):
+                    return
+                kick_preview = getattr(self.app_controller, "_kick_preview_worker", None)
+                if callable(kick_preview):
+                    kick_preview()
+                return
+            # Sync with ImageEditor outside crop mode.
             if (
                 hasattr(self.app_controller, "image_editor")
                 and self.app_controller.image_editor

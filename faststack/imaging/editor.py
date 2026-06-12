@@ -1,5 +1,6 @@
 """Non-destructive image editor: crop, rotate, exposure, contrast, WB, sharpness."""
 
+import io
 import logging
 import math
 import os
@@ -14,6 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import ExifTags, Image, ImageFilter, ImageOps
 
+from faststack.imaging.jpeg import TURBO_AVAILABLE, decode_jpeg_rgb
+
 # Mask subsystem (lazy imports avoided — lightweight dataclasses)
 from faststack.imaging.mask import MaskData
 from faststack.imaging.mask_engine import MaskRasterCache
@@ -24,8 +27,10 @@ from faststack.imaging.math_utils import (
     _highlight_recover_linear,
     _lerp,
     _linear_to_srgb,
+    _linear_to_srgb_fast,
     _smoothstep01,
     _srgb_to_linear,
+    _srgb_to_linear_fast,
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
@@ -53,6 +58,34 @@ _AUTO_VIBRANCE_CLIP_TOLERANCE = 0.0001
 # are stable under uniform downsampling, so bounding the resolution keeps the
 # several _apply_edits passes cheap on the UI thread (Shift+L is synchronous).
 _AUTO_VIBRANCE_ANALYSIS_MAX_EDGE = 640
+
+
+_REC601_LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+
+
+def _rec601_gray(arr: np.ndarray) -> np.ndarray:
+    """Rec.601 luma of an (H, W, 3) float32 array, staying in float32.
+
+    The naive ``arr.dot([0.299, 0.587, 0.114])`` promotes through float64
+    (Python-list coefficients), which silently doubles the memory traffic of
+    every downstream blend; cv2.transform is also multithreaded.
+    """
+    if cv2 is not None and arr.flags["C_CONTIGUOUS"]:
+        return cv2.transform(arr, _REC601_LUMA.reshape(1, 3))
+    return arr @ _REC601_LUMA
+
+
+def _float01_to_u8(arr: np.ndarray) -> np.ndarray:
+    """Convert [0,1]-range float RGB to uint8 for encoding.
+
+    cv2.convertScaleAbs fuses scale+round+saturate into one multithreaded
+    pass (the numpy fallback truncates instead of rounding — a <=1 LSB
+    difference well below JPEG encoding noise).
+    """
+    clipped = np.clip(arr, 0.0, 1.0)
+    if cv2 is not None:
+        return cv2.convertScaleAbs(clipped, alpha=255.0)
+    return (clipped * 255).astype(np.uint8)
 
 
 def _safe_replace(tmp_path: Path, target_path: Path) -> None:
@@ -271,6 +304,220 @@ def _rotated_rect_with_max_area(w: int, h: int, angle_rad: float) -> tuple[int, 
     cw = max(1, min(w, cw))
     ch = max(1, min(h, ch))
     return cw, ch
+
+
+def _expanded_canvas_size(
+    src_w: int, src_h: int, straighten_angle: float
+) -> tuple[int, int]:
+    """Canvas size produced by PIL ``rotate(expand=True)`` for a src_w x src_h image.
+
+    Mirrors PIL's expand computation (corner extents with ceil/floor) so
+    geometry can be reasoned about without rotating pixels first.
+    """
+    # PIL special-cases right angles to exact transposes; the corner-extent
+    # math below would inflate them by 1-2px of float epsilon.
+    remainder = abs(straighten_angle) % 90.0
+    if remainder < 0.01 or remainder > 89.99:
+        if round(straighten_angle / 90.0) % 2:
+            return src_h, src_w
+        return src_w, src_h
+    angle_rad = math.radians(straighten_angle)
+    cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+    xs, ys = [], []
+    for px, py in ((0, 0), (src_w, 0), (src_w, src_h), (0, src_h)):
+        dx, dy = px - src_w / 2.0, py - src_h / 2.0
+        xs.append(dx * cos_a - dy * sin_a)
+        ys.append(dx * sin_a + dy * cos_a)
+    return (
+        int(math.ceil(max(xs)) - math.floor(min(xs))),
+        int(math.ceil(max(ys)) - math.floor(min(ys))),
+    )
+
+
+def _rotated_content_point(
+    px: float,
+    py: float,
+    src_w: float,
+    src_h: float,
+    canvas_w: float,
+    canvas_h: float,
+    cos_a: float,
+    sin_a: float,
+) -> tuple[float, float]:
+    """Where a source pixel lands on the expanded canvas after straightening.
+
+    The image is rotated with PIL ``rotate(-straighten_angle, expand=True)``;
+    a content point at offset d from the source center maps to
+    ``R(+straighten_angle) @ d`` in this y-down formula (verified against a
+    rotated-marker ground truth). ``cos_a``/``sin_a`` are of
+    ``+straighten_angle``.
+    """
+    dx, dy = px - src_w / 2.0, py - src_h / 2.0
+    return (
+        dx * cos_a - dy * sin_a + canvas_w / 2.0,
+        dx * sin_a + dy * cos_a + canvas_h / 2.0,
+    )
+
+
+def _source_footprint_halfplanes(
+    src_w: float,
+    src_h: float,
+    canvas_w: float,
+    canvas_h: float,
+    cos_a: float,
+    sin_a: float,
+) -> list[tuple[float, float, float]]:
+    """Half-planes (unit outward normal nx, ny, offset c) bounding the rotated
+    source rectangle on the expanded canvas. A point p is valid (real pixels,
+    not rotation fill) iff ``nx*px + ny*py <= c`` for all four planes."""
+    corners = [
+        _rotated_content_point(px, py, src_w, src_h, canvas_w, canvas_h, cos_a, sin_a)
+        for px, py in ((0.0, 0.0), (src_w, 0.0), (src_w, src_h), (0.0, src_h))
+    ]
+    cx = sum(p[0] for p in corners) / 4.0
+    cy = sum(p[1] for p in corners) / 4.0
+    planes = []
+    for i in range(4):
+        x1, y1 = corners[i]
+        x2, y2 = corners[(i + 1) % 4]
+        ex, ey = x2 - x1, y2 - y1
+        norm = math.hypot(ex, ey)
+        if norm <= 1e-9:
+            continue
+        nx, ny = ey / norm, -ex / norm
+        if nx * (cx - x1) + ny * (cy - y1) > 0:
+            nx, ny = -nx, -ny
+        planes.append((nx, ny, nx * x1 + ny * y1))
+    return planes
+
+
+def _trim_rect_to_halfplanes(
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
+    planes: list[tuple[float, float, float]],
+    inset: float = 0.0,
+) -> tuple[float, float, float, float]:
+    """Shrink an axis-aligned rect until it lies inside every half-plane.
+
+    Each violated plane is resolved by moving its extreme corner along the
+    plane normal (the minimal cut). Shrinking a side never increases any
+    plane's extreme-corner value, so one pass converges; extra passes guard
+    against float noise.
+    """
+    for _ in range(3):
+        dirty = False
+        for nx, ny, c in planes:
+            qx = right if nx > 0 else left
+            qy = bottom if ny > 0 else top
+            d = nx * qx + ny * qy - (c - inset)
+            if d <= 1e-6:
+                continue
+            dirty = True
+            if nx > 0:
+                right -= nx * d
+            else:
+                left -= nx * d
+            if ny > 0:
+                bottom -= ny * d
+            else:
+                top -= ny * d
+        if not dirty:
+            break
+    return left, top, right, bottom
+
+
+def _autocrop_canvas_rect(
+    cw: int, ch: int, canvas_w: int, canvas_h: int, straighten_angle: float
+) -> tuple[int, int, int, int]:
+    """Center the max-area autocrop rect on the expanded canvas, applying the
+    legacy 2px inset (skipped for exact 90-degree angles) and clamps."""
+    cx, cy = canvas_w / 2.0, canvas_h / 2.0
+    left = round(cx - cw / 2.0)
+    top = round(cy - ch / 2.0)
+    right = left + cw
+    bottom = top + ch
+
+    # Apply inset (2px) to match legacy behavior and avoid edge artifacts.
+    # Skip for exact 90-degree increments to preserve full dimensions.
+    is_exact_90 = abs(straighten_angle % 90.0) < 0.01
+    inset = 0 if is_exact_90 else 2
+    if (right - left) > 2 * inset and (bottom - top) > 2 * inset:
+        left += inset
+        top += inset
+        right -= inset
+        bottom -= inset
+
+    left = max(0, min(canvas_w - 1, left))
+    top = max(0, min(canvas_h - 1, top))
+    right = max(left + 1, min(canvas_w, right))
+    bottom = max(top + 1, min(canvas_h, bottom))
+    return left, top, right, bottom
+
+
+def _crop_box_canvas_rect(
+    crop_box: tuple[float, float, float, float],
+    src_w: int,
+    src_h: int,
+    straighten_angle: float,
+    canvas_w: int,
+    canvas_h: int,
+    inset: float = 2.0,
+) -> tuple[int, int, int, int]:
+    """Map a 0-1000 source-space crop box onto the expanded rotated canvas.
+
+    Returns the int canvas rect to slice: an upright rect with the drawn
+    box's own dimensions (swapped when the rotation lands at an odd
+    90-degree multiple), centered where the framed content lands after
+    rotation, then shrunk just enough that it contains no rotation fill.
+    Using the bounding box of the rotated rectangle instead would deliver an
+    image larger than the drawn box by ``w*|cos| + h*|sin|`` per axis.
+    """
+    angle_rad = math.radians(straighten_angle)
+    cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+
+    c_left = crop_box[0] * src_w / 1000.0
+    c_top = crop_box[1] * src_h / 1000.0
+    c_right = crop_box[2] * src_w / 1000.0
+    c_bottom = crop_box[3] * src_h / 1000.0
+
+    ccx, ccy = _rotated_content_point(
+        (c_left + c_right) / 2.0,
+        (c_top + c_bottom) / 2.0,
+        src_w,
+        src_h,
+        canvas_w,
+        canvas_h,
+        cos_a,
+        sin_a,
+    )
+    box_w = c_right - c_left
+    box_h = c_bottom - c_top
+    if round(straighten_angle / 90.0) % 2:
+        box_w, box_h = box_h, box_w
+    left = ccx - box_w / 2.0
+    right = ccx + box_w / 2.0
+    top = ccy - box_h / 2.0
+    bottom = ccy + box_h / 2.0
+
+    planes = _source_footprint_halfplanes(
+        src_w, src_h, canvas_w, canvas_h, cos_a, sin_a
+    )
+    left, top, right, bottom = _trim_rect_to_halfplanes(
+        left, top, right, bottom, planes, inset=inset
+    )
+
+    # Round inward so the slice never reintroduces fill at the borders.
+    left_i = max(0, int(math.ceil(left)))
+    top_i = max(0, int(math.ceil(top)))
+    right_i = min(canvas_w, int(math.floor(right)))
+    bottom_i = min(canvas_h, int(math.floor(bottom)))
+    left_i = min(left_i, canvas_w - 1)
+    top_i = min(top_i, canvas_h - 1)
+    right_i = max(right_i, left_i + 1)
+    bottom_i = max(bottom_i, top_i + 1)
+    return left_i, top_i, right_i, bottom_i
 
 
 def rotate_autocrop_rgb(
@@ -627,97 +874,160 @@ class ImageEditor:
             self._mask_assets.clear()
             self._mask_raster_cache.clear()
 
+        _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
+        _is_jpeg = load_filepath.suffix.lower() in (".jpg", ".jpeg")
+
         try:
-            # We must load and close the original file handle immediately
-            with Image.open(load_filepath) as im:
-                # Keep original PIL for EXIF/Format preservation
-                loaded_original = im.copy()
+            # --- JPEG fast path: decode pixels with TurboJPEG ---
+            # JPEGs are always 8-bit, so the OpenCV 16-bit probe is pointless
+            # and Pillow's full decode (~150ms at 20MP) can be replaced by
+            # TurboJPEG (~60ms; decode_jpeg_rgb falls back to Pillow itself).
+            # A lazy BytesIO-backed PIL handle supplies EXIF/ICC metadata
+            # without decoding pixels.
+            jpeg_arr = None
+            jpeg_meta_info: Optional[dict] = None
+            jpeg_meta_exif = None
+            if _is_jpeg:
+                try:
+                    file_bytes = load_filepath.read_bytes()
+                    meta_image = Image.open(io.BytesIO(file_bytes))
+                    jpeg_meta_info = dict(meta_image.info)
+                    jpeg_meta_exif = meta_image.getexif()
+                    jpeg_arr = decode_jpeg_rgb(
+                        file_bytes, source_path=str(load_filepath)
+                    )
+                except Exception as e:
+                    log.warning(
+                        "JPEG fast decode failed for %s (%s); using standard path",
+                        load_filepath,
+                        e,
+                    )
+                    jpeg_arr = None
+                if jpeg_arr is not None and (
+                    jpeg_arr.ndim != 3
+                    or jpeg_arr.shape[2] != 3
+                    or jpeg_arr.dtype != np.uint8
+                ):
+                    jpeg_arr = None
+
+            if jpeg_arr is None:
+                # We must load and close the original file handle immediately
+                with Image.open(load_filepath) as im:
+                    # Keep original PIL for EXIF/Format preservation
+                    loaded_original = im.copy()
             if _debug:
                 t_pil = time.perf_counter()
-
-            # --- Convert to Float32 ---
-            # Use OpenCV for reliable 16-bit loading as Pillow often downsamples to 8-bit RGB
-            _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
-            if preview_only and not _is_tiff:
-                cv_img = None
-            elif cv2 is None:
-                log.warning(
-                    "OpenCV not installed, falling back to Pillow (may lose 16-bit depth)"
-                )
-                cv_img = None
-            else:
-                # Use IMREAD_UNCHANGED to preserve bit depth
-                # Note: OpenCV loads as BGR by default
-                cv_img = cv2.imread(str(load_filepath), cv2.IMREAD_UNCHANGED)
-
-            # Robust validation: cv2.imread can return None or an empty/invalid array
-            cv_img_valid = (
-                cv_img is not None
-                and isinstance(cv_img, np.ndarray)
-                and cv_img.size > 0
-            )
 
             loaded_bit_depth = 8
             loaded_float_image = None
             float_image_orientation_applied = False
 
-            # Read EXIF orientation early (before float conversion) so we can
-            # apply it to the PIL image on the 8-bit path — rotating uint8 is
-            # ~5x faster than rotating float32.
-            orientation = get_exif_orientation(
-                load_filepath, exif=loaded_original.getexif()
-            )
-
-            if cv_img_valid and cv_img.dtype == np.uint16:
-                loaded_bit_depth = 16
-                # Normalize 0-65535 -> 0.0-1.0
-                arr = cv_img.astype(np.float32) / 65535.0
-
-                # Handle channels
-                if len(arr.shape) == 2:
-                    # Grayscale -> RGB
-                    arr = np.stack((arr,) * 3, axis=-1)
-                elif len(arr.shape) == 3 and arr.shape[2] == 3:
-                    # BGR -> RGB (OpenCV default)
-                    # Note: If IMREAD_UNCHANGED loads a TIFF, it *might* be RGB depending on backend (libtiff).
-                    # But consistently OpenCV uses BGR layout for 3-channel images.
-                    # Let's verify by assuming BGR and swapping.
-                    arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+            if jpeg_arr is not None:
+                orientation = get_exif_orientation(
+                    load_filepath, exif=jpeg_meta_exif
+                )
+                if orientation > 1:
+                    # apply_orientation_to_np may return a non-contiguous view
+                    jpeg_arr = np.ascontiguousarray(
+                        apply_orientation_to_np(jpeg_arr, orientation)
+                    )
+                    float_image_orientation_applied = True
+                loaded_original = Image.fromarray(jpeg_arr)
+                if jpeg_meta_info:
+                    # Carry EXIF/ICC over so getexif() and info["icc_profile"]
+                    # behave exactly like a Pillow-decoded image.
+                    loaded_original.info.update(jpeg_meta_info)
+                if not preview_only:
+                    loaded_float_image = jpeg_arr.astype(np.float32)
+                    loaded_float_image *= np.float32(1.0 / 255.0)
+                log.info(
+                    "Loaded 8-bit JPEG via %s: %s",
+                    "TurboJPEG" if TURBO_AVAILABLE else "Pillow (turbo unavailable)",
+                    load_filepath,
+                )
+            else:
+                # --- Convert to Float32 (standard path) ---
+                # Use OpenCV for reliable 16-bit loading as Pillow often
+                # downsamples to 8-bit RGB
+                if preview_only and not _is_tiff:
+                    cv_img = None
+                elif cv2 is None:
+                    log.warning(
+                        "OpenCV not installed, falling back to Pillow (may lose 16-bit depth)"
+                    )
+                    cv_img = None
                 else:
-                    # Invalid channel count, fall back to Pillow
-                    cv_img_valid = False
+                    # Use IMREAD_UNCHANGED to preserve bit depth
+                    # Note: OpenCV loads as BGR by default
+                    cv_img = cv2.imread(str(load_filepath), cv2.IMREAD_UNCHANGED)
+
+                # Robust validation: cv2.imread can return None or an empty/invalid array
+                cv_img_valid = (
+                    cv_img is not None
+                    and isinstance(cv_img, np.ndarray)
+                    and cv_img.size > 0
+                )
+
+                # Read EXIF orientation early (before float conversion) so we can
+                # apply it to the PIL image on the 8-bit path — rotating uint8 is
+                # ~5x faster than rotating float32.
+                orientation = get_exif_orientation(
+                    load_filepath, exif=loaded_original.getexif()
+                )
+
+                if cv_img_valid and cv_img.dtype == np.uint16:
+                    loaded_bit_depth = 16
+                    # Normalize 0-65535 -> 0.0-1.0
+                    arr = cv_img.astype(np.float32) / 65535.0
+
+                    # Handle channels
+                    if len(arr.shape) == 2:
+                        # Grayscale -> RGB
+                        arr = np.stack((arr,) * 3, axis=-1)
+                    elif len(arr.shape) == 3 and arr.shape[2] == 3:
+                        # BGR -> RGB (OpenCV default)
+                        # Note: If IMREAD_UNCHANGED loads a TIFF, it *might* be RGB depending on backend (libtiff).
+                        # But consistently OpenCV uses BGR layout for 3-channel images.
+                        # Let's verify by assuming BGR and swapping.
+                        arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                    else:
+                        # Invalid channel count, fall back to Pillow
+                        cv_img_valid = False
+                        loaded_bit_depth = 8
+                        # For fallback 8-bit from bad CV2, orient PIL first then convert
+                        if orientation > 1:
+                            loaded_original = ImageOps.exif_transpose(loaded_original)
+                        rgb = loaded_original.convert("RGB")
+                        arr = np.array(rgb).astype(np.float32) / 255.0
+                        float_image_orientation_applied = orientation > 1
+                        log.warning(
+                            "OpenCV loaded unexpected channel count, falling back to Pillow: %s",
+                            load_filepath,
+                        )
+
+                    loaded_float_image = arr
+                    if loaded_bit_depth == 16:
+                        log.info("Loaded 16-bit image via OpenCV: %s", load_filepath)
+                    else:
+                        log.info(
+                            "Loaded 8-bit image via Pillow (OpenCV fallback): %s",
+                            load_filepath,
+                        )
+                else:
+                    # Fallback to Pillow logic for 8-bit or if OpenCV failed/returned 8-bit
                     loaded_bit_depth = 8
-                    # For fallback 8-bit from bad CV2, orient PIL first then convert
+                    # Apply EXIF orientation on PIL image BEFORE float conversion.
+                    # Rotating uint8 PIL is ~5x faster than rotating float32 numpy.
                     if orientation > 1:
                         loaded_original = ImageOps.exif_transpose(loaded_original)
-                    rgb = loaded_original.convert("RGB")
-                    arr = np.array(rgb).astype(np.float32) / 255.0
-                    float_image_orientation_applied = orientation > 1
-                    log.warning(
-                        "OpenCV loaded unexpected channel count, falling back to Pillow: %s",
-                        load_filepath,
-                    )
-
-                loaded_float_image = arr
-                if loaded_bit_depth == 16:
-                    log.info("Loaded 16-bit image via OpenCV: %s", load_filepath)
-                else:
-                    log.info(
-                        "Loaded 8-bit image via Pillow (OpenCV fallback): %s",
-                        load_filepath,
-                    )
-            else:
-                # Fallback to Pillow logic for 8-bit or if OpenCV failed/returned 8-bit
-                loaded_bit_depth = 8
-                # Apply EXIF orientation on PIL image BEFORE float conversion.
-                # Rotating uint8 PIL is ~5x faster than rotating float32 numpy.
-                if orientation > 1:
-                    loaded_original = ImageOps.exif_transpose(loaded_original)
-                    float_image_orientation_applied = True
-                if not preview_only:
-                    rgb = loaded_original.convert("RGB")
-                    loaded_float_image = np.array(rgb).astype(np.float32) / 255.0
-                log.info("Loaded 8-bit image via Pillow: %s", load_filepath)
+                        float_image_orientation_applied = True
+                    if not preview_only:
+                        rgb = loaded_original.convert("RGB")
+                        # In-place multiply avoids a second full-size float
+                        # allocation (~40% faster than astype + divide at 20MP).
+                        loaded_float_image = np.asarray(rgb).astype(np.float32)
+                        loaded_float_image *= np.float32(1.0 / 255.0)
+                    log.info("Loaded 8-bit image via Pillow: %s", load_filepath)
             if _debug:
                 t_float = time.perf_counter()
 
@@ -766,14 +1076,40 @@ class ImageEditor:
 
                 loaded_float_preview = preview_arr.astype(np.float32) / 255.0
             else:
-                # Downscale from float_image (which now has orientation applied)
-                thumb = loaded_original.copy()
-                thumb.thumbnail((1920, 1080))
-                thumb_rgb = thumb.convert("RGB")
-                loaded_float_preview = np.array(thumb_rgb).astype(np.float32) / 255.0
+                # Downscale to preview size. The JPEG fast path already has the
+                # oriented pixels as a numpy array; cv2.resize is ~4x faster
+                # than the PIL thumbnail round-trip at 20MP.
+                if jpeg_arr is not None and cv2 is not None:
+                    h, w = jpeg_arr.shape[:2]
+                    scale = min(1920.0 / w, 1080.0 / h, 1.0)
+                    if scale < 1.0:
+                        preview_u8 = cv2.resize(
+                            jpeg_arr,
+                            (max(1, int(w * scale)), max(1, int(h * scale))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    else:
+                        preview_u8 = jpeg_arr
+                else:
+                    thumb = loaded_original.copy()
+                    thumb.thumbnail((1920, 1080))
+                    preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
 
-                # Thumbnail is derived from loaded_original AFTER exif_transpose,
-                # so orientation is already correct.
+                # float_preview is display-space by contract: cached previews
+                # from the prefetcher arrive already "cooked" (ICC/saturation
+                # applied), and preview-sized renders are shown WITHOUT any
+                # further color correction. A preview built from raw source
+                # pixels must get the same treatment, or ICC mode displays it
+                # badly oversaturated on wide-gamut monitors.
+                preview_u8 = apply_loupe_color_correction(
+                    preview_u8,
+                    icc_bytes=loaded_original.info.get("icc_profile"),
+                )
+                loaded_float_preview = preview_u8.astype(np.float32)
+                loaded_float_preview *= np.float32(1.0 / 255.0)
+
+                # Preview is derived from oriented pixels (exif_transpose /
+                # apply_orientation_to_np already ran), so orientation is correct.
 
             if _debug:
                 t_preview = time.perf_counter()
@@ -858,6 +1194,8 @@ class ImageEditor:
         cache_override: Optional["MaskRasterCache"] = None,
         cache_context: Optional[dict] = None,
         update_highlight_state: bool = True,
+        downscale_long_edge: Optional[int] = None,
+        protect_input: bool = False,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
         Returns float32 array (H, W, 3).
@@ -865,9 +1203,30 @@ class ImageEditor:
         ``update_highlight_state`` controls whether non-export renders publish
         highlight telemetry for the live clipping indicator. Analysis callers
         should disable it when rendering downsampled scratch buffers.
+
+        ``downscale_long_edge`` resizes the array down to the given long edge
+        AFTER geometry (rotation/crop) but BEFORE tonal edits. Display-only
+        renders use it so a full-resolution master is not processed at 20MP
+        when the screen can only show a fraction of that.
+
+        ``protect_input`` lets callers pass a shared buffer (e.g.
+        ``self.float_image``) without copying it first: after geometry and
+        downscale, the working array is copied only if it still shares memory
+        with ``img_arr``. Cropping then copies just the cropped region instead
+        of the whole master, and a downscale already produced fresh memory.
         """
         if edits is None:
             edits = self.current_edits
+
+        debug_enabled = log.isEnabledFor(logging.DEBUG)
+        debug_t0 = time.perf_counter() if debug_enabled else None
+        debug_stage_marks: list[tuple[str, float]] | None = (
+            [] if debug_enabled else None
+        )
+
+        def _mark(stage: str) -> None:
+            if debug_stage_marks is not None:
+                debug_stage_marks.append((stage, time.perf_counter()))
 
         # Alias
         arr = img_arr
@@ -911,6 +1270,21 @@ class ImageEditor:
         straighten_angle = float(edits.get("straighten_angle", 0.0))
         has_crop_box = "crop_box" in edits and edits.get("crop_box", 0.0)
 
+        # Effective crop selection in source space (post-90, pre-straighten).
+        # A full-frame box selects everything, so it gets the same fill-free
+        # autocrop geometry as "no crop" — rotate-only commits must not keep
+        # the whole expanded canvas with its four black wedges.
+        crop_box_vals: Optional[tuple] = None
+        if has_crop_box:
+            crop_box_edit = edits.get("crop_box")
+            try:
+                if len(crop_box_edit) == 4:
+                    crop_box_vals = tuple(float(v) for v in crop_box_edit)
+            except (TypeError, ValueError):
+                crop_box_vals = None
+            if crop_box_vals == (0.0, 0.0, 1000.0, 1000.0):
+                crop_box_vals = None
+
         # Apply rotation if significant
         # During preview (for_export=False), we might skip this if QML handles visuals,
         # BUT current QML implementation likely expects the buffer to be pre-transformed?
@@ -936,7 +1310,7 @@ class ImageEditor:
 
             # Calculate auto-crop parameters BEFORE rotation if needed
             crop_rect = None
-            if not has_crop_box:
+            if crop_box_vals is None:
                 h, w = arr.shape[:2]
                 # Normalize angle for helper (helper expects radians, handles quadrants but ensuring positive can help)
                 angle_rad = math.radians(straighten_angle)
@@ -950,104 +1324,77 @@ class ImageEditor:
             # Apply Auto-Crop if calculated
             if crop_rect:
                 cw, ch = crop_rect
-                # Center crop on the new expanded image
                 rh, rw = arr.shape[:2]
-                cx, cy = rw / 2.0, rh / 2.0
-
-                left = round(cx - cw / 2.0)
-                top = round(cy - ch / 2.0)
-                right = left + cw
-                bottom = top + ch
-
-                # Apply inset (2px) to match legacy behavior and avoid edge artifacts.
-                # Skip for exact 90-degree increments to preserve full dimensions.
-                is_exact_90 = abs(straighten_angle % 90.0) < 0.01
-                inset = 0 if is_exact_90 else 2
-
-                if (right - left) > 2 * inset and (bottom - top) > 2 * inset:
-                    left += inset
-                    top += inset
-                    right -= inset
-                    bottom -= inset
-
-                # Clamp
-                left = max(0, min(rw - 1, left))
-                top = max(0, min(rh - 1, top))
-                right = max(left + 1, min(rw, right))
-                bottom = max(top + 1, min(rh, bottom))
-
+                left, top, right, bottom = _autocrop_canvas_rect(
+                    cw, ch, rw, rh, straighten_angle
+                )
                 arr = arr[top:bottom, left:right, :]
 
         # 3. Crop
-        if has_crop_box:
-            crop_box = edits.get("crop_box", 0.0)
-            if len(crop_box) == 4:
-                # The crop_box is in 0-1000 normalized coordinates relative to the
-                # image after 90-degree rotation, but before free straighten. If
-                # straighten uses expand=True, transform that box onto the expanded
-                # canvas before slicing.
+        if crop_box_vals is not None:
+            # The crop_box is in 0-1000 normalized coordinates relative to the
+            # image after 90-degree rotation, but before free straighten. If
+            # straighten uses expand=True, transform that box onto the expanded
+            # canvas before slicing.
+            if apply_rotation and abs(straighten_angle) > 0.001:
+                new_h, new_w = arr.shape[:2]
+                left, t, r, b = _crop_box_canvas_rect(
+                    crop_box_vals, orig_w, orig_h, straighten_angle, new_w, new_h
+                )
+            else:
+                # No rotation - use current dimensions directly
+                h, w = arr.shape[:2]
+                left = int(crop_box_vals[0] * w / 1000)
+                t = int(crop_box_vals[1] * h / 1000)
+                r = int(crop_box_vals[2] * w / 1000)
+                b = int(crop_box_vals[3] * h / 1000)
 
-                if apply_rotation and abs(straighten_angle) > 0.001:
-                    # Transform crop box through rotation:
-                    # 1. Convert 0-1000 to pixel coords in the rotated base image
-                    # 2. Rotate corners around the rotated base center
-                    # 3. Translate to expanded canvas
-                    new_h, new_w = arr.shape[:2]
-                    orig_cx, orig_cy = orig_w / 2.0, orig_h / 2.0
-                    canvas_cx, canvas_cy = new_w / 2.0, new_h / 2.0
+                left = max(0, left)
+                t = max(0, t)
+                r = min(w, r)
+                b = min(h, b)
 
-                    # Get crop corners in original pixel space
-                    c_left = crop_box[0] * orig_w / 1000
-                    c_top = crop_box[1] * orig_h / 1000
-                    c_right = crop_box[2] * orig_w / 1000
-                    c_bottom = crop_box[3] * orig_h / 1000
+            if r > left and b > t:
+                arr = arr[t:b, left:r, :]
 
-                    # Define the 4 corners, rotate each around original center
-                    corners = [
-                        (c_left, c_top),
-                        (c_right, c_top),
-                        (c_right, c_bottom),
-                        (c_left, c_bottom),
-                    ]
-                    angle_rad = math.radians(-straighten_angle)
-                    cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+        if debug_enabled:
+            log.debug(
+                "geometry: src=%dx%d crop_box=%s angle=%.3f for_export=%s out=%dx%d",
+                orig_w,
+                orig_h,
+                crop_box_vals,
+                straighten_angle,
+                for_export,
+                arr.shape[1],
+                arr.shape[0],
+            )
 
-                    rotated_corners = []
-                    for px, py in corners:
-                        # Rotate around original center
-                        dx, dy = px - orig_cx, py - orig_cy
-                        rx = dx * cos_a - dy * sin_a
-                        ry = dx * sin_a + dy * cos_a
-                        # Translate to canvas center
-                        rotated_corners.append((rx + canvas_cx, ry + canvas_cy))
+        _mark("geometry")
 
-                    # Get axis-aligned bounding box of rotated corners
-                    xs = [c[0] for c in rotated_corners]
-                    ys = [c[1] for c in rotated_corners]
-                    left = int(min(xs))
-                    t = int(min(ys))
-                    r = int(max(xs))
-                    b = int(max(ys))
+        # 3.5. Display-size downscale (display-only renders)
+        # Tonal edits below are per-pixel, so applying them to an INTER_AREA
+        # downscale of the cropped master is visually equivalent to rendering
+        # at full resolution and letting the GPU scale it down — and several
+        # times cheaper.
+        if downscale_long_edge and cv2 is not None:
+            h, w = arr.shape[:2]
+            long_edge = max(h, w)
+            if long_edge > downscale_long_edge:
+                scale = downscale_long_edge / long_edge
+                new_w = max(1, round(w * scale))
+                new_h = max(1, round(h * scale))
+                arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-                    left = max(0, left)
-                    t = max(0, t)
-                    r = min(new_w, r)
-                    b = min(new_h, b)
-                else:
-                    # No rotation - use current dimensions directly
-                    h, w = arr.shape[:2]
-                    left = int(crop_box[0] * w / 1000)
-                    t = int(crop_box[1] * h / 1000)
-                    r = int(crop_box[2] * w / 1000)
-                    b = int(crop_box[3] * h / 1000)
+        _mark("downscale")
 
-                    left = max(0, left)
-                    t = max(0, t)
-                    r = min(w, r)
-                    b = min(h, b)
-
-                if r > left and b > t:
-                    arr = arr[t:b, left:r, :]
+        # Detach from a shared input buffer before any tonal op can touch it.
+        # Everything below either reassigns or mutates `arr` in place (vignette,
+        # the caller's final in-place clip), so from here on the array must be
+        # private memory when the caller didn't pass a copy. may_share_memory
+        # is a cheap bounds check; a false positive just costs the copy the
+        # caller would otherwise have made up front.
+        if protect_input and np.may_share_memory(arr, img_arr):
+            arr = arr.copy()
 
         # 4. Conversion to Linear Light
         # Cache sRGB u8 BEFORE linearization for accurate JPEG clipping detection.
@@ -1056,13 +1403,60 @@ class ImageEditor:
         # MOVED to after WB/Exposure so indicators reflect current pipeline state.
 
         # --- Skip linear round-trip optimization ---
-        # When exporting with only sRGB-space edits active (levels, brightness,
-        # contrast, saturation, vibrance, vignette), the sRGB→Linear→sRGB conversion
-        # is a no-op that costs ~3.5s on large images. Skip it entirely.
-        _skip_linear = for_export and self._edits_skip_linear(edits)
+        # When only sRGB-space edits are active (levels, brightness, contrast,
+        # saturation, vibrance, vignette), the sRGB→Linear→sRGB conversion is a
+        # no-op that costs ~3.5s on large images (and ~120ms per preview
+        # render). Skip it entirely. Previews still need the highlight
+        # telemetry for the live clipping indicators, which the skip branch
+        # computes from a 4x-strided view below.
+        _skip_linear = self._edits_skip_linear(edits)
 
         if for_export:
             log.debug("_apply_edits for_export: skip_linear=%s", _skip_linear)
+
+        if _skip_linear and not for_export:
+            upstream_hash = self._get_upstream_edits_hash(edits)
+            analysis_state = None
+            with self._lock:
+                cached_dict = (
+                    cache_context.get("highlight_analysis")
+                    if cache_context is not None
+                    else self._cached_highlight_analysis
+                )
+                if cached_dict and cached_dict["hash"] == upstream_hash:
+                    analysis_state = cached_dict["state"]
+
+            if analysis_state is None:
+                arr_stride = arr[::4, ::4, :]
+                if cv2 is not None:
+                    srgb_u8_stride = cv2.convertScaleAbs(arr_stride, alpha=255.0)
+                else:
+                    srgb_u8_stride = (np.clip(arr_stride, 0.0, 1.0) * 255).astype(
+                        np.uint8
+                    )
+                # With no WB/exposure active (guaranteed by _edits_skip_linear)
+                # the pre-exposure and current linear states are identical.
+                linear_stride = _srgb_to_linear_fast(arr_stride)
+                analysis_state = _analyze_highlight_state(
+                    linear_stride,
+                    srgb_u8=srgb_u8_stride,
+                    pre_exposure_linear=linear_stride,
+                )
+                with self._lock:
+                    entry = {
+                        "hash": upstream_hash,
+                        "state": analysis_state,
+                    }
+                    if cache_context is not None:
+                        cache_context["highlight_analysis"] = entry
+                    else:
+                        self._cached_highlight_analysis = entry
+
+            if update_highlight_state:
+                with self._lock:
+                    self._last_highlight_state = analysis_state
+
+            _mark("skip_linear")
 
         if not _skip_linear:
             # Capture strided view for analysis ONLY if needed
@@ -1091,7 +1485,10 @@ class ImageEditor:
                         np.uint8
                     )
 
-            arr = _srgb_to_linear(arr)
+            # Base image data is always in [0, 1], so the clamped LUT version
+            # is safe here; headroom (>1.0) only appears later, in linear space.
+            arr = _srgb_to_linear_fast(arr)
+            _mark("linear_convert")
 
             # 5. White Balance (Multipliers in Linear Space)
             by = edits.get("white_balance_by", 0.0) * 0.5
@@ -1175,6 +1572,8 @@ class ImageEditor:
                     edits=edits,
                     cache_context=cache_context,
                 )
+
+            _mark("linear_tone")
 
             # 8-10. Clarity / Texture / Sharpness (Unified Pyramid Detail Bands)
             #
@@ -1359,6 +1758,8 @@ class ImageEditor:
                 gain = np.clip(gain, 0.5, 2.0)
                 arr *= gain[..., None]
 
+            _mark("detail_bands")
+
             # 11. Global Headroom Shoulder (safety net for values > 1.0)
             # This ONLY affects values above 1.0, compressing headroom smoothly.
             # It does NOT interfere with normal highlight slider work below 1.0.
@@ -1367,7 +1768,10 @@ class ImageEditor:
             arr = _apply_headroom_shoulder(arr, max_overshoot=0.05)
 
             # --- Conversion back to sRGB ---
-            arr = _linear_to_srgb(arr)
+            # The headroom shoulder above caps values at 1.05, inside the LUT
+            # domain, so the fast version is exact here (within quantization).
+            arr = _linear_to_srgb_fast(arr)
+            _mark("linear_exit")
 
         # --- sRGB Space Operations ---
         # NOTE: All operations below must be non-mutating (use reassignment) when
@@ -1394,25 +1798,27 @@ class ImageEditor:
         if abs(sat_val) > 0.001:
             # Scale effect to reduce sensitivity (0.5x)
             factor = 1.0 + sat_val * 0.5
-            gray = arr.dot([0.299, 0.587, 0.114])
-            gray = np.expand_dims(gray, axis=2)
+            gray = _rec601_gray(arr)[..., None]
             arr = gray + (arr - gray) * factor
 
         # 12. Vibrance (Smart Saturation)
         vibrance = edits.get("vibrance", 0.0)
         if abs(vibrance) > 0.001:
-            cmax = arr.max(axis=2)
-            cmin = arr.min(axis=2)
+            if cv2 is not None:
+                # ~3x faster than numpy axis reductions at full resolution
+                cmax = cv2.max(cv2.max(arr[:, :, 0], arr[:, :, 1]), arr[:, :, 2])
+                cmin = cv2.min(cv2.min(arr[:, :, 0], arr[:, :, 1]), arr[:, :, 2])
+            else:
+                cmax = arr.max(axis=2)
+                cmin = arr.min(axis=2)
             delta = cmax - cmin
             sat = np.zeros_like(cmax)
-            mask = cmax > 0.0001
-            sat[mask] = delta[mask] / cmax[mask]
+            np.divide(delta, cmax, out=sat, where=cmax > 0.0001)
 
             sat_mask = np.clip(1.0 - sat, 0.0, 1.0)
             factor = 1.0 + vibrance * sat_mask
 
-            gray = arr.dot([0.299, 0.587, 0.114])
-            gray = np.expand_dims(gray, axis=2)
+            gray = _rec601_gray(arr)[..., None]
             arr = gray + (arr - gray) * np.expand_dims(factor, axis=2)
 
         # 13. Levels (Blacks/Whites)
@@ -1459,6 +1865,8 @@ class ImageEditor:
                     edge_protection=darken.edge_protection,
                 )
 
+        _mark("srgb_ops")
+
         # 14. Vignette
         vignette = edits.get("vignette", 0.0)
         if abs(vignette) > 0.001:
@@ -1475,11 +1883,37 @@ class ImageEditor:
                 gain = 1.0 + dist_sq * (-vignette)
                 arr *= np.expand_dims(gain, axis=2)
 
+        _mark("vignette")
+
         # Export contract: return in [0,1] sRGB when skip_linear (no tone mapping
         # was applied, just sRGB-space ops). save_image also clips, but this
-        # ensures callers always get valid data.
-        if _skip_linear:
+        # ensures callers always get valid data. Non-export callers need the
+        # unclipped overshoot (e.g. analyze_auto_vibrance measures clipping).
+        if _skip_linear and for_export:
             arr = np.clip(arr, 0.0, 1.0)
+
+        if debug_enabled and debug_t0 is not None and debug_stage_marks is not None:
+            total_ms = (time.perf_counter() - debug_t0) * 1000.0
+            if total_ms >= 500.0:
+                prev_time = debug_t0
+                breakdown = []
+                for name, mark_time in debug_stage_marks:
+                    breakdown.append(
+                        f"{name}={((mark_time - prev_time) * 1000.0):.0f}ms"
+                    )
+                    prev_time = mark_time
+                breakdown.append(
+                    f"final={((time.perf_counter() - prev_time) * 1000.0):.0f}ms"
+                )
+                log.debug(
+                    "[APPLY_EDITS_SLOW] total=%.0fms export=%s skip_linear=%s size=%dx%d stages=%s",
+                    total_ms,
+                    for_export,
+                    _skip_linear,
+                    arr.shape[1],
+                    arr.shape[0],
+                    ", ".join(breakdown),
+                )
 
         return (
             arr  # May exceed 1.0 in preview/non-export; clipped for skip_linear export.
@@ -1680,7 +2114,7 @@ class ImageEditor:
         cmax = rgb.max(axis=2)
         cmin = rgb.min(axis=2)
         delta = cmax - cmin
-        luma = rgb.dot([0.299, 0.587, 0.114])
+        luma = _rec601_gray(rgb)
         useful = (luma > 0.08) & (luma < 0.92) & (cmax > 0.04)
         if int(np.count_nonzero(useful)) < 100:
             return 0.0
@@ -1953,7 +2387,9 @@ class ImageEditor:
         return (hash(frozen), frozen)
 
     def get_preview_data_cached(
-        self, allow_compute: bool = True
+        self,
+        allow_compute: bool = True,
+        edits_override: Optional[Dict[str, Any]] = None,
     ) -> Optional[DecodedImage]:
         """Return cached preview if available, otherwise compute and cache.
 
@@ -1962,15 +2398,21 @@ class ImageEditor:
         """
         with self._lock:
             # Check cache validity
-            if self._cached_preview is not None and self._cached_rev == self._edits_rev:
+            if (
+                edits_override is None
+                and self._cached_preview is not None
+                and self._cached_rev == self._edits_rev
+            ):
                 return self._cached_preview
 
             if not allow_compute:
                 return None
 
-            # Prepare for computation - snapshot data under lock
-            base = self.float_preview.copy() if self.float_preview is not None else None
-            edits = dict(self.current_edits)
+            # Prepare for computation - snapshot data under lock. float_preview
+            # is only ever reassigned, never mutated in place, so the render
+            # can share it; protect_input copies only the post-crop region.
+            base = self.float_preview
+            edits = dict(self.current_edits) if edits_override is None else dict(edits_override)
             icc_bytes = (
                 self.original_image.info.get("icc_profile")
                 if self.original_image is not None
@@ -1986,11 +2428,12 @@ class ImageEditor:
             edits=edits,
             for_export=False,
             icc_bytes=icc_bytes,
+            protect_input=True,
         )
 
         with self._lock:
             # Only cache if revision hasn't changed during computation
-            if self._edits_rev == rev:
+            if edits_override is None and self._edits_rev == rev:
                 self._cached_preview = decoded
                 self._cached_rev = rev
 
@@ -2005,18 +2448,50 @@ class ImageEditor:
         apply_loupe_color: bool = False,
         icc_bytes: Optional[bytes] = None,
         cache_context: Optional[dict] = None,
+        downscale_long_edge: Optional[int] = None,
+        protect_input: bool = False,
     ) -> DecodedImage:
         """Render edits against a float RGB array and package it for Qt display."""
+        _debug = log.isEnabledFor(logging.DEBUG)
+        if _debug:
+            t0 = time.perf_counter()
         arr = self._apply_edits(
             base,
             edits=edits,
             for_export=for_export,
             cache_context=cache_context,
+            downscale_long_edge=downscale_long_edge,
+            protect_input=protect_input,
         )
-        arr = np.clip(arr, 0.0, 1.0)
-        arr_u8 = (arr * 255).astype(np.uint8)
+        if _debug:
+            t_apply = time.perf_counter()
+        # _apply_edits returns either a fresh array or a view of `base`; every
+        # caller passes a private copy or sets protect_input=True, so clipping
+        # in place cannot corrupt editor state. cv2.convertScaleAbs fuses
+        # scale+round+saturate into one multithreaded pass (~5x faster than
+        # clip + mul + astype).
+        if cv2 is not None:
+            np.clip(arr, 0.0, 1.0, out=arr)
+            arr_u8 = cv2.convertScaleAbs(arr, alpha=255.0)
+        else:
+            arr = np.clip(arr, 0.0, 1.0)
+            arr_u8 = (arr * 255).astype(np.uint8)
+        if _debug:
+            t_u8 = time.perf_counter()
         if apply_loupe_color:
             arr_u8 = apply_loupe_color_correction(arr_u8, icc_bytes=icc_bytes)
+        if _debug:
+            t_color = time.perf_counter()
+            log.debug(
+                "[RENDER_DECODED] apply=%dms u8=%dms color=%dms total=%dms  (%dx%d, %s)",
+                int((t_apply - t0) * 1000),
+                int((t_u8 - t_apply) * 1000),
+                int((t_color - t_u8) * 1000),
+                int((t_color - t0) * 1000),
+                arr_u8.shape[1],
+                arr_u8.shape[0],
+                "export" if for_export else "preview",
+            )
 
         if QImage is None:
             raise ImportError(
@@ -2038,8 +2513,18 @@ class ImageEditor:
             format=QImage.Format.Format_RGB888,
         )
 
-    def get_full_resolution_preview_data(self) -> Optional[DecodedImage]:
-        """Apply current edits to the full-resolution master for live display."""
+    def get_full_resolution_preview_data(
+        self,
+        max_long_edge: Optional[int] = None,
+        edits_override: Optional[Dict[str, Any]] = None,
+    ) -> Optional[DecodedImage]:
+        """Apply current edits to the full-resolution master for live display.
+
+        ``max_long_edge`` caps the rendered output (applied after crop, before
+        tonal edits) so display-only renders do not process a 20MP master when
+        the screen can only show a fraction of it. Pass None for true full
+        resolution.
+        """
         try:
             self._ensure_float_image()
         except RuntimeError:
@@ -2048,8 +2533,13 @@ class ImageEditor:
         with self._lock:
             if self.float_image is None:
                 return None
-            base = self.float_image.copy()
-            edits = dict(self.current_edits)
+            # Share the master instead of copying ~3 bytes/pixel of float32 up
+            # front; protect_input defers the copy until after crop/downscale,
+            # so only the (much smaller) displayed region is ever duplicated.
+            # float_image is only ever reassigned, never mutated in place, so
+            # rendering from the shared reference outside the lock is safe.
+            base = self.float_image
+            edits = dict(self.current_edits) if edits_override is None else dict(edits_override)
             icc_bytes = (
                 self.original_image.info.get("icc_profile")
                 if self.original_image is not None
@@ -2063,6 +2553,8 @@ class ImageEditor:
             apply_loupe_color=True,
             icc_bytes=icc_bytes,
             cache_context={},
+            downscale_long_edge=max_long_edge,
+            protect_input=True,
         )
 
     def _crop_only_edits(self, edits: Dict[str, Any]) -> Dict[str, Any]:
@@ -2073,10 +2565,24 @@ class ImageEditor:
         return crop_only
 
     def _float_preview_from_master(self) -> Optional[np.ndarray]:
-        """Build a display-sized float preview from the unedited source buffer."""
+        """Build a display-sized float preview from the unedited source buffer.
+
+        The result is display-space ("cooked"), matching the float_preview
+        contract — preview-sized renders are shown without further color
+        correction.
+        """
         with self._lock:
+            if self.float_preview is not None:
+                return self.float_preview.copy()
             source = self.float_image.copy() if self.float_image is not None else None
-            original = self.original_image.copy() if self.original_image is not None else None
+            original = (
+                self.original_image.copy() if self.original_image is not None else None
+            )
+            icc_bytes = (
+                self.original_image.info.get("icc_profile")
+                if self.original_image is not None
+                else None
+            )
 
         if source is not None:
             arr_u8 = (np.clip(source, 0.0, 1.0) * 255).astype(np.uint8)
@@ -2087,21 +2593,35 @@ class ImageEditor:
             return None
 
         thumb.thumbnail((1920, 1080))
-        return np.array(thumb.convert("RGB")).astype(np.float32) / 255.0
+        preview_u8 = apply_loupe_color_correction(
+            np.asarray(thumb.convert("RGB"), dtype=np.uint8),
+            icc_bytes=icc_bytes,
+        )
+        preview = preview_u8.astype(np.float32)
+        preview *= np.float32(1.0 / 255.0)
+        return preview
 
     def get_original_compare_preview_data(
         self, *, full_resolution: bool = False
     ) -> Optional[DecodedImage]:
         """Render the source image with only crop framing applied."""
-        try:
-            self._ensure_float_image()
-        except RuntimeError:
-            return None
+        if full_resolution:
+            try:
+                self._ensure_float_image()
+            except RuntimeError:
+                return None
 
         with self._lock:
-            if self.float_image is None:
+            if full_resolution and self.float_image is None:
                 return None
-            base = self.float_image.copy() if full_resolution else None
+            # Share the master (never mutated in place) and let protect_input
+            # copy only the cropped region; the preview branch already returns
+            # a private array, so it needs no protection.
+            base = (
+                self.float_image
+                if full_resolution
+                else self._float_preview_from_master()
+            )
             edits = self._crop_only_edits(dict(self.current_edits))
             icc_bytes = (
                 self.original_image.info.get("icc_profile")
@@ -2110,9 +2630,7 @@ class ImageEditor:
             )
 
         if base is None:
-            base = self._float_preview_from_master()
-            if base is None:
-                return None
+            return None
 
         return self._render_decoded_from_float(
             base,
@@ -2121,6 +2639,7 @@ class ImageEditor:
             apply_loupe_color=full_resolution,
             icc_bytes=icc_bytes,
             cache_context={},
+            protect_input=full_resolution,
         )
 
     def get_preview_data(self) -> Optional[DecodedImage]:
@@ -2395,8 +2914,149 @@ class ImageEditor:
     def set_crop_box(self, crop_box: Tuple[int, int, int, int]):
         """Set the normalized crop box (left, top, right, bottom) from 0-1000."""
         with self._lock:
+            if self.current_edits.get("crop_box") == crop_box:
+                return False
             self.current_edits["crop_box"] = crop_box
             self._edits_rev += 1
+            return True
+
+    def map_crop_draft_to_source(
+        self,
+        draft_box: Tuple[int, int, int, int],
+        base_crop_box: Optional[Tuple[int, int, int, int]],
+        base_straighten_angle: float,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Map a crop box drawn on the displayed render back into source space.
+
+        ``draft_box`` is normalized 0-1000 against the image shown when crop
+        mode was entered: the render produced by ``base_crop_box`` +
+        ``base_straighten_angle``. The result is normalized to source space
+        (post 90-degree rotation, pre-straighten) — the space
+        ``current_edits["crop_box"]`` uses. With a committed straighten the
+        display is a rotated, fill-trimmed window onto the source, so a
+        linear composition into the committed box selects the wrong region;
+        this replicates the render geometry and inverts it.
+        """
+        if draft_box is None:
+            return None
+        try:
+            draft = tuple(float(v) for v in draft_box)
+        except (TypeError, ValueError):
+            return None
+        if len(draft) != 4:
+            return None
+        if base_crop_box is not None and tuple(base_crop_box) == (0, 0, 1000, 1000):
+            base_crop_box = None
+
+        def _finalize(values: tuple) -> Tuple[int, int, int, int]:
+            left, top, right, bottom = (int(round(v)) for v in values)
+            left, right = min(left, right), max(left, right)
+            top, bottom = min(top, bottom), max(top, bottom)
+            left = max(0, min(1000, left))
+            top = max(0, min(1000, top))
+            right = max(0, min(1000, right))
+            bottom = max(0, min(1000, bottom))
+            if right <= left:
+                right = min(1000, left + 1)
+            if bottom <= top:
+                bottom = min(1000, top + 1)
+            return left, top, right, bottom
+
+        with self._lock:
+            original = self.original_image
+            try:
+                rotation = int(self.current_edits.get("rotation", 0) or 0) % 360
+            except (TypeError, ValueError):
+                rotation = 0
+
+        if abs(base_straighten_angle) <= 0.001 or original is None:
+            # The display is an unrotated window: plain linear composition.
+            if base_crop_box is None:
+                return _finalize(draft)
+            base_left, base_top, base_right, base_bottom = (
+                float(v) for v in base_crop_box
+            )
+            base_w = base_right - base_left
+            base_h = base_bottom - base_top
+            if base_w <= 0 or base_h <= 0:
+                return _finalize(draft)
+            return _finalize(
+                (
+                    base_left + base_w * draft[0] / 1000.0,
+                    base_top + base_h * draft[1] / 1000.0,
+                    base_left + base_w * draft[2] / 1000.0,
+                    base_top + base_h * draft[3] / 1000.0,
+                )
+            )
+
+        src_w, src_h = original.size
+        if rotation in (90, 270):
+            src_w, src_h = src_h, src_w
+        if src_w <= 0 or src_h <= 0:
+            return _finalize(draft)
+
+        canvas_w, canvas_h = _expanded_canvas_size(src_w, src_h, base_straighten_angle)
+
+        # The rect of the expanded canvas that was displayed (same geometry
+        # the renderer uses in _apply_edits).
+        if base_crop_box is None:
+            angle_rad = math.radians(base_straighten_angle)
+            cw, ch = _rotated_rect_with_max_area(src_w, src_h, angle_rad)
+            d_left, d_top, d_right, d_bottom = _autocrop_canvas_rect(
+                cw, ch, canvas_w, canvas_h, base_straighten_angle
+            )
+        else:
+            d_left, d_top, d_right, d_bottom = _crop_box_canvas_rect(
+                tuple(float(v) for v in base_crop_box),
+                src_w,
+                src_h,
+                base_straighten_angle,
+                canvas_w,
+                canvas_h,
+            )
+
+        disp_w = d_right - d_left
+        disp_h = d_bottom - d_top
+        if disp_w <= 0 or disp_h <= 0:
+            return _finalize(draft)
+
+        # Draft rect in canvas pixels.
+        c_left = d_left + disp_w * draft[0] / 1000.0
+        c_top = d_top + disp_h * draft[1] / 1000.0
+        c_right = d_left + disp_w * draft[2] / 1000.0
+        c_bottom = d_top + disp_h * draft[3] / 1000.0
+
+        angle_rad = math.radians(base_straighten_angle)
+
+        # Exact inverse of the renderer's geometry: a source box renders as
+        # an upright rect of the box's dimensions (swapped at odd 90-degree
+        # multiples) centered where the box center lands. So the source box
+        # takes the drawn rect's dimensions (swapped back) and is centered at
+        # the drawn rect's center inverse-rotated into source space — which
+        # makes repeated crop sessions compose exactly.
+        target_w = c_right - c_left
+        target_h = c_bottom - c_top
+        if round(base_straighten_angle / 90.0) % 2:
+            target_w, target_h = target_h, target_w
+
+        dx = (c_left + c_right) / 2.0 - canvas_w / 2.0
+        dy = (c_top + c_bottom) / 2.0 - canvas_h / 2.0
+        inv_cos, inv_sin = math.cos(-angle_rad), math.sin(-angle_rad)
+        scx = dx * inv_cos - dy * inv_sin + src_w / 2.0
+        scy = dx * inv_sin + dy * inv_cos + src_h / 2.0
+        left = max(0.0, scx - target_w / 2.0)
+        top = max(0.0, scy - target_h / 2.0)
+        right = min(float(src_w), scx + target_w / 2.0)
+        bottom = min(float(src_h), scy + target_h / 2.0)
+
+        return _finalize(
+            (
+                left * 1000.0 / src_w,
+                top * 1000.0 / src_h,
+                right * 1000.0 / src_w,
+                bottom * 1000.0 / src_h,
+            )
+        )
 
     def _write_tiff_16bit(self, path: Path, arr_float: np.ndarray):
         """
@@ -2499,7 +3159,8 @@ class ImageEditor:
 
         # 2. Expensive conversion outside lock
         rgb = original_ref.convert("RGB")
-        float_arr = np.array(rgb).astype(np.float32) / 255.0
+        float_arr = np.asarray(rgb).astype(np.float32)
+        float_arr *= np.float32(1.0 / 255.0)
 
         # 3. Store result under lock (checking if someone beat us to it, or if image changed)
         with self._lock:
@@ -2617,6 +3278,7 @@ class ImageEditor:
             "bit_depth": self.bit_depth,
             "main_exif": main_exif,
             "source_exif": source_exif,
+            "source_icc_bytes": self.original_image.info.get("icc_profile"),
             "write_developed_jpg": write_developed_jpg,
             "developed_path": developed_path,
             "mask_assets": mask_assets_snapshot,
@@ -2696,7 +3358,7 @@ class ImageEditor:
                     tmp_path.unlink(missing_ok=True)
                     raise
             else:
-                arr_u8 = (np.clip(final_float, 0.0, 1.0) * 255).astype(np.uint8)
+                arr_u8 = _float01_to_u8(final_float)
                 img_u8 = Image.fromarray(arr_u8, mode="RGB")
 
                 save_kwargs = {"quality": 95}
@@ -2737,7 +3399,7 @@ class ImageEditor:
                 elif source_exif:
                     exif_bytes = sanitize_exif_orientation(source_exif)
 
-                arr_u8 = (np.clip(final_float, 0.0, 1.0) * 255).astype(np.uint8)
+                arr_u8 = _float01_to_u8(final_float)
                 img_u8 = Image.fromarray(arr_u8)
 
                 dev_kwargs = {"quality": 90}

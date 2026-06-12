@@ -250,20 +250,6 @@ Window {
         onActivated: compactEditor.handleArrowKey(Qt.Key_Right)
     }
 
-    Shortcut {
-        sequence: "Up"
-        context: Qt.WindowShortcut
-        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
-        onActivated: compactEditor.adjustHighlightedSlider(1)
-    }
-
-    Shortcut {
-        sequence: "Down"
-        context: Qt.WindowShortcut
-        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
-        onActivated: compactEditor.adjustHighlightedSlider(-1)
-    }
-
     onClosing: (close) => {
         if (compactEditor.uiStateRef && compactEditor.controllerRef) {
             close.accepted = false
@@ -376,6 +362,62 @@ Window {
                 spacing: 6
 
                 Item { Layout.fillWidth: true }
+
+                Button {
+                    id: rotateCcwBtn
+                    implicitWidth: 26; implicitHeight: 26
+                    Layout.minimumWidth: 26; Layout.preferredWidth: 26; Layout.maximumWidth: 26
+                    Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
+                    enabled: !compactEditor.cropActive
+                    padding: 0
+                    flat: true
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 500
+                    ToolTip.text: "Rotate counter-clockwise"
+                    onClicked: {
+                        compactEditor.ensureEditorLoaded("rotate-ccw")
+                        if (compactEditor.controllerRef) compactEditor.controllerRef.rotate_image_ccw()
+                    }
+                    contentItem: Text {
+                        text: "↺"
+                        font.pixelSize: 16
+                        color: rotateCcwBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 4
+                        color: rotateCcwBtn.hovered ? "#30ffffff" : "transparent"
+                    }
+                }
+
+                Button {
+                    id: rotateCwBtn
+                    implicitWidth: 26; implicitHeight: 26
+                    Layout.minimumWidth: 26; Layout.preferredWidth: 26; Layout.maximumWidth: 26
+                    Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
+                    enabled: !compactEditor.cropActive
+                    padding: 0
+                    flat: true
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 500
+                    ToolTip.text: "Rotate clockwise"
+                    onClicked: {
+                        compactEditor.ensureEditorLoaded("rotate-cw")
+                        if (compactEditor.controllerRef) compactEditor.controllerRef.rotate_image_cw()
+                    }
+                    contentItem: Text {
+                        text: "↻"
+                        font.pixelSize: 16
+                        color: rotateCwBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 4
+                        color: rotateCwBtn.hovered ? "#30ffffff" : "transparent"
+                    }
+                }
 
                 // Expand button
                 Button {

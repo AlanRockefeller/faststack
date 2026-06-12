@@ -31,7 +31,6 @@ class Keybinder:
             # Batching
             Qt.Key_BraceLeft: "begin_new_batch",
             Qt.Key_BraceRight: "end_current_batch",
-            Qt.Key_Backslash: "clear_all_batches",
             Qt.Key_B: "toggle_batch_membership",
             # Remove from batch/stack
             Qt.Key_X: "remove_from_batch_or_stack",
@@ -92,10 +91,14 @@ class Keybinder:
         modifiers = event.modifiers()
         log.debug(f"Key pressed: {key} ({text!r}) with modifiers {modifiers}")
 
+        if text == "|" and modifiers == Qt.ShiftModifier:
+            self._call("clear_all_batches")
+            return True
+
         # Check for modifier + key combinations
         for (mapped_key, mapped_modifier), method_name in self.modifier_key_map.items():
             # Check if required modifier is present in event modifiers
-            if key == mapped_key and (modifiers & mapped_modifier):
+            if key == mapped_key and (modifiers & mapped_modifier) == mapped_modifier:
                 log.debug(
                     f"Matched modifier key: {key} + {mapped_modifier} -> {method_name}"
                 )
@@ -160,9 +163,6 @@ class Keybinder:
             return True
         if text == "}":
             self._call("end_current_batch")
-            return True
-        if text == "\\":
-            self._call("clear_all_batches")
             return True
 
         return False

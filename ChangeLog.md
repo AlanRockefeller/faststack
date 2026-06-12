@@ -2,6 +2,33 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## Unreleased
+
+- Applying a crop (and full-resolution renders generally) no longer copies the entire full-resolution float master before slicing out the crop — at 20MP that was a ~240MB copy on the UI thread per crop apply. The render now shares the master and copies only the cropped region, and skips even that when the display downscale already produced fresh memory. Preview-sized renders during crop drags get the same treatment. Output is bit-identical.
+- Rotate mode (crop straightening) now overlays a grid of horizontal and vertical reference lines. The lines stay screen-aligned while the image rotates underneath, so horizons and verticals can be lined up without guessing; the center lines are drawn brighter. The grid is only visible while rotate mode is active.
+- Image editing is much faster. Quick auto-adjust keys (`l`, `L`, `-`, `=`, `+`, `_`) and editor sliders now show results several times sooner:
+  - sRGB↔linear conversions in the edit pipeline use lookup tables (~3x faster, error under 0.03 of one 8-bit step).
+  - Preview renders skip the linear round-trip entirely when only sRGB-space edits (levels, brightness, contrast, saturation, vibrance, vignette) are active; the live clipping indicators are still computed from a downsampled view.
+  - Final display conversion uses a fused OpenCV pass (~5x faster).
+  - Quick auto-adjust loads the image preview-only, removing a ~400ms UI freeze on the first keypress; the full-resolution master is materialized in the background.
+  - Full-resolution live previews (after crop/rotate) now publish a fast preview-sized frame immediately, then replace it with the high-resolution frame, and the high-resolution render is capped at display size when not zoomed (it was processing 20MP for pixels the screen cannot show). Crop apply/cancel renders are capped the same way.
+  - The editor now decodes JPEG pixels with TurboJPEG (Pillow fallback) instead of Pillow, roughly halving image-load time on the first edit keypress; EXIF/ICC metadata is preserved via a lazy header read. Full editor loads of JPEGs also no longer decode the file a second time through OpenCV's 16-bit probe.
+  - More debug timing logs: `[RENDER_DECODED]` breaks down apply/u8/color time per preview render.
+- The batch-clear shortcut now uses `|` instead of plain `\`, so Shift must be held down.
+- Fixed re-editing a previously cropped (or otherwise edited) image showing a double-applied edit (e.g. crop-on-crop) in preview-sized renders: the editor seeded its preview buffer from the already-saved pixels while also replaying the saved edits on top. The preview is now rebuilt from the backup source pixels whenever edits are replayed.
+- EXIF orientation is now applied with OpenCV rotate/flip (bit-identical, ~5x faster): rotated camera images (orientation 3/6/8) were paying a ~244ms numpy transpose copy at 20MP on every editor load and prefetch decode.
+- A save no longer invalidates and re-decodes the displayed image two or three times: the save-completion handler and the watcher events it triggers now recognize (via an mtime+size fingerprint) that the file state was already invalidated. Single-file metadata changes (timestamp/backup flag after a save) also no longer cancel the whole prefetch generation, which was silently re-decoding the ±8 window in the background after every save.
+- Editor preview buffers are built with cv2.resize instead of a PIL thumbnail round-trip when the JPEG fast path is active (~4x faster at 20MP).
+- Fixed display-only oversaturation when editing a previously saved image in ICC color mode: editor preview buffers built from source pixels (backup re-edit loads, restored in-flight sessions, compare previews) were sRGB but displayed as monitor-space. They are now color-corrected to display space at build time, exactly like the prefetcher's cached previews. Saved files were never affected.
+- Navigating away from a just-edited image and back no longer flashes the original pixels while the background save is in flight: the last live preview is seeded into the decode cache when the session save is queued, then replaced by the real decode when the save completes (and dropped if the save fails).
+- Fixed a duplicate watcher-debounce fire (with an already-drained change set) falling back to a global cache invalidation, which re-decoded the whole prefetch window once after some saves.
+- Saving is much cheaper end to end:
+  - Adding an image to a batch (including the automatic add-on-first-edit) no longer rebuilds the entire grid model — batch badges are computed live, so the grid is just told to repaint them. This removes a ~1 second UI-thread stall after every save.
+  - Sidecar metadata lookups from grid refreshes no longer run the legacy-key migration scan (O(entries) filesystem checks per missing entry); measured 1184ms → 28ms for a 341-image folder with 300 sidecar entries. Migration still runs on user-action lookups, so old entries are still upgraded when an image is viewed or modified.
+  - The vibrance pipeline (active on every quick auto-adjust save and preview) avoids a hidden float64 promotion in the gray-blend math and uses OpenCV for channel max/min and luma (~3x faster at full resolution), and the save path's float→uint8 conversion is a fused OpenCV pass.
+- Navigation metadata lookups (filename/uploaded/stack/batch status shown per image) no longer run the sidecar legacy-key migration scan, which was doing hundreds of filesystem checks per navigated image on the GUI thread during fast arrow-key scrolling.
+- Saving an image no longer invalidates the entire decode cache. Saves, watcher-detected file changes, and edit-revert now invalidate only the files that actually changed, so navigation right after a save no longer hits a blocking re-decode and the prefetch window stays warm (previously every save re-decoded ~9 neighboring images and bumped the global cache generation several times). A per-path invalidation epoch makes this safe: decode results that started reading a file before it was replaced are discarded instead of re-inserting stale pixels. The global invalidation still applies for resize/zoom/color-mode changes and unattributable directory events.
+
 ## 1.6.4 (2026-06-06)
 
 - Image editor exposure and whites slider changes now apply twice as much per slider unit without changing auto levels or other exposure logic.
@@ -348,7 +375,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 ### Major Features
 
 - **Batch Selection System:** New batch selection mode for drag-and-drop operations
-  - `{` to begin batch, `}` to end batch, `\` to clear all batches
+  - `{` to begin batch, `}` to end batch, `|` to clear all batches
   - `X` or `S` keys remove individual images from batches/stacks (shrinks or splits ranges)
   - Batches automatically cleared after successful drag operation
   - Multiple files can now be dragged to browsers and external applications simultaneously

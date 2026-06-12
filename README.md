@@ -165,7 +165,7 @@ If you do nothing, FastStack will still run, but JPEG decoding and thumbnail gen
 - `C`: Clear all stacks
 - `{`: Begin new drag & drop batch
 - `}`: End current drag & drop batch
-- `\`: Clear drag & drop batch
+- `|` (Shift+`\`): Clear drag & drop batch
 - `U`: Toggle uploaded flag
 - `Ctrl+E`: Toggle edited flag
 - `Ctrl+S`: Toggle stacked flag

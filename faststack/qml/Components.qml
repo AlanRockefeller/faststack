@@ -621,6 +621,47 @@ Item {
 
 
         }
+
+        // Alignment grid for rotate mode. Lives in the viewport (NOT inside
+        // imageRotator/mainImage) so the lines stay screen-horizontal and
+        // screen-vertical while the image rotates underneath them.
+        Item {
+            id: rotateAlignGrid
+            anchors.fill: parent
+            z: 10
+            visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping && mainMouseArea.isRotating
+            property real gridSpacing: 56
+            property color lineColor: "#59ffffff"
+            property color centerLineColor: "#b3ffffff"
+
+            Repeater {
+                id: rotateGridVLines
+                model: rotateAlignGrid.visible ? 2 * Math.ceil(rotateAlignGrid.width / (2 * rotateAlignGrid.gridSpacing)) + 1 : 0
+                Rectangle {
+                    required property int index
+                    property int centerIndex: (rotateGridVLines.count - 1) / 2
+                    x: rotateAlignGrid.width / 2 + (index - centerIndex) * rotateAlignGrid.gridSpacing - width / 2
+                    y: 0
+                    width: 1
+                    height: rotateAlignGrid.height
+                    color: index === centerIndex ? rotateAlignGrid.centerLineColor : rotateAlignGrid.lineColor
+                }
+            }
+
+            Repeater {
+                id: rotateGridHLines
+                model: rotateAlignGrid.visible ? 2 * Math.ceil(rotateAlignGrid.height / (2 * rotateAlignGrid.gridSpacing)) + 1 : 0
+                Rectangle {
+                    required property int index
+                    property int centerIndex: (rotateGridHLines.count - 1) / 2
+                    x: 0
+                    y: rotateAlignGrid.height / 2 + (index - centerIndex) * rotateAlignGrid.gridSpacing - height / 2
+                    width: rotateAlignGrid.width
+                    height: 1
+                    color: index === centerIndex ? rotateAlignGrid.centerLineColor : rotateAlignGrid.lineColor
+                }
+            }
+        }
     }
 
     // Zoom and Pan logic would go here

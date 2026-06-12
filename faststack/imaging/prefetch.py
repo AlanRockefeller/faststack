@@ -114,6 +114,10 @@ _monitor_profile_warning_logged = False
 # Cache for ICC transforms to avoid rebuilding on every image
 _icc_transform_cache: Dict[tuple, ImageCms.ImageCmsTransform] = {}
 
+# Cache parsed source ICC profiles by digest so we do not rebuild the same
+# source profile object for every preview render.
+_source_profile_cache: Dict[str, ImageCms.ImageCmsProfile] = {}
+
 # Thread lock for all ICC caches
 _icc_cache_lock = threading.Lock()
 
@@ -146,12 +150,41 @@ def get_icc_transform(
 
 def clear_icc_caches():
     """Clear all ICC-related caches (profiles and transforms)."""
-    global _monitor_profile_cache, _icc_transform_cache, _monitor_profile_warning_logged
+    global _monitor_profile_cache, _icc_transform_cache, _source_profile_cache
+    global _monitor_profile_warning_logged
     with _icc_cache_lock:
         _monitor_profile_cache.clear()
         _icc_transform_cache.clear()
+        _source_profile_cache.clear()
         _monitor_profile_warning_logged = False
         log.info("Cleared ICC profile and transform caches")
+
+
+def _get_source_profile(
+    icc_bytes: Optional[bytes],
+) -> tuple[ImageCms.ImageCmsProfile, str]:
+    """Return a cached source ICC profile and stable cache key."""
+    if not icc_bytes:
+        return SRGB_PROFILE, "srgb_builtin"
+
+    src_profile_key = hashlib.sha256(icc_bytes).hexdigest()
+    with _icc_cache_lock:
+        cached = _source_profile_cache.get(src_profile_key)
+        if cached is not None:
+            return cached, src_profile_key
+
+    try:
+        src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+    except Exception as e:
+        log.warning("Failed to parse ICC profile: %s", e)
+        return SRGB_PROFILE, "srgb_builtin"
+
+    with _icc_cache_lock:
+        if len(_source_profile_cache) >= 32:
+            _source_profile_cache.pop(next(iter(_source_profile_cache)))
+        _source_profile_cache[src_profile_key] = src_profile
+
+    return src_profile, src_profile_key
 
 
 def get_monitor_profile() -> Optional[ImageCms.ImageCmsProfile]:
@@ -333,18 +366,7 @@ def apply_loupe_color_correction(
         if monitor_profile is None:
             return corrected
 
-        src_profile = None
-        src_profile_key = None
-        if icc_bytes:
-            try:
-                src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
-                src_profile_key = hashlib.sha256(icc_bytes).hexdigest()
-            except Exception as e:
-                log.warning("Failed to parse ICC profile: %s", e)
-
-        if src_profile is None:
-            src_profile = SRGB_PROFILE
-            src_profile_key = "srgb_builtin"
+        src_profile, src_profile_key = _get_source_profile(icc_bytes)
 
         try:
             img = PILImage.fromarray(corrected)
@@ -419,9 +441,31 @@ class Prefetcher:
 
     def set_image_files(self, image_files: List[ImageFile]):
         with self._futures_lock:
-            if self.image_files != image_files:
-                self.image_files = image_files
-                self._cancel_all_locked()
+            if self.image_files == image_files:
+                return
+            old = self.image_files
+            self.image_files = image_files
+
+            # A save changes one entry's metadata (timestamp/backup flag);
+            # cancelling the whole generation would force the entire prefetch
+            # window to re-decode. When the list shape is unchanged and only a
+            # few entries differ, invalidate just those indices.
+            if len(old) == len(image_files):
+                changed = [
+                    i for i, (a, b) in enumerate(zip(old, image_files)) if a != b
+                ]
+                if len(changed) <= 8:
+                    for i in changed:
+                        fut = self.futures.get(i)
+                        if fut is not None:
+                            fut.cancel()
+                        self.futures.pop(i, None)
+                        self.future_paths.pop(i, None)
+                        for scheduled in self._scheduled.values():
+                            scheduled.discard(i)
+                    return
+
+            self._cancel_all_locked()
 
     def update_prefetch(
         self,
@@ -656,6 +700,11 @@ class Prefetcher:
         if generation != self.generation or self._stop_event.is_set():
             return None
 
+        # Captured BEFORE the file is read: cache_put consumers compare this
+        # against per-path invalidation epochs to reject decodes whose source
+        # file was replaced (saved) while the decode was in flight.
+        decode_started = time.monotonic()
+
         # Use override path if provided, otherwise default to image_file.path
         target_path = override_path if override_path is not None else image_file.path
 
@@ -775,20 +824,7 @@ class Prefetcher:
                                 "Failed to read metadata from %s: %s", target_path, e
                             )
 
-                    src_profile = None
-                    src_profile_key = None
-                    if icc_bytes:
-                        try:
-                            src_profile = ImageCms.ImageCmsProfile(
-                                io.BytesIO(icc_bytes)
-                            )
-                            src_profile_key = hashlib.sha256(icc_bytes).hexdigest()
-                        except Exception as e:
-                            log.warning("Failed to parse ICC profile: %s", e)
-
-                    if src_profile is None:
-                        src_profile = SRGB_PROFILE
-                        src_profile_key = "srgb_builtin"
+                    src_profile, src_profile_key = _get_source_profile(icc_bytes)
 
                     try:
                         transform = get_icc_transform(
@@ -908,7 +944,7 @@ class Prefetcher:
                 return None
 
             cache_key = build_cache_key(target_path, display_generation)
-            self.cache_put(cache_key, decoded)
+            self.cache_put(cache_key, decoded, target_path, decode_started)
             return (target_path, display_generation)
 
         except Exception as e:
@@ -924,6 +960,28 @@ class Prefetcher:
             if self.futures.get(index) is future:
                 self.futures.pop(index, None)
                 self.future_paths.pop(index, None)
+
+    def invalidate_path(self, path: Path):
+        """Targeted invalidation for one file (e.g. after it was re-saved).
+
+        Cancels any in-flight decode for ``path`` and removes its index from
+        the scheduled sets so the next update_prefetch() re-submits it. Unlike
+        cancel_all(), this does not touch the generation counter, so decodes
+        of OTHER paths stay valid.
+        """
+        with self._futures_lock:
+            for idx, p in list(self.future_paths.items()):
+                if p == path:
+                    fut = self.futures.get(idx)
+                    if fut is not None:
+                        fut.cancel()
+                    self.futures.pop(idx, None)
+                    self.future_paths.pop(idx, None)
+            for i, image_file in enumerate(self.image_files):
+                if image_file.path == path:
+                    for scheduled in self._scheduled.values():
+                        scheduled.discard(i)
+                    break
 
     def _cancel_all_locked(self):
         """Internal helper to cancel all pending prefetching tasks.

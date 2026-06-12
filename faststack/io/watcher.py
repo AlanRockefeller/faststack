@@ -14,6 +14,10 @@ log = logging.getLogger(__name__)
 
 # Matches FastStack backup filenames: name-backup.jpg, name-backup2.jpg, etc.
 _BACKUP_RE = re.compile(r"-backup\d*\.jpe?g$")
+_TEMP_IMAGE_RE = re.compile(
+    r"/\.[^/]+\.(?:jpe?g|jpe|tiff?|cr2|cr3|nef|arw|orf|rw2|raf|dng)$",
+    re.IGNORECASE,
+)
 
 
 def _is_ignored_path(path: str) -> bool:
@@ -24,6 +28,7 @@ def _is_ignored_path(path: str) -> bool:
         p.endswith(".tmp")
         or p.endswith("faststack.json")
         or ".__faststack_tmp__" in p
+        or _TEMP_IMAGE_RE.search(p) is not None
         or _BACKUP_RE.search(p) is not None
         or "image recycle bin" in p.split("/")
     )

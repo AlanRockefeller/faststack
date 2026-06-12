@@ -28,6 +28,67 @@ def _linear_to_srgb(x: np.ndarray) -> np.ndarray:
     return np.where(x <= 0.0031308, 12.92 * x, (1.0 + a) * (x ** (1.0 / 2.4)) - a)
 
 
+# LUT-accelerated transfer functions for full-image renders. The exact
+# np.where + power versions above cost ~60ms per megapixel-scale call; the
+# quantized lookups below are ~3x faster. 65536 entries keeps the worst-case
+# round-trip error under 0.03 of one u8 step, far below the 8-bit
+# quantization every render goes through afterwards. Keep the exact versions
+# for tiny inputs where exactness is free (e.g. building 256-entry save LUTs).
+_TRANSFER_LUT_SIZE = 65536
+# Headroom shoulder caps linear values at 1.0 + max_overshoot (0.05); leave
+# a little margin. Inputs above the domain clamp to the last entry, which is
+# equivalent to the exact path once the caller clips display output to [0,1].
+_LINEAR_TO_SRGB_DOMAIN = 1.06
+
+_srgb_to_linear_lut: Optional[np.ndarray] = None
+_linear_to_srgb_lut: Optional[np.ndarray] = None
+
+
+def _srgb_to_linear_fast(x: np.ndarray) -> np.ndarray:
+    """LUT-based `_srgb_to_linear` for preview/display renders.
+
+    Input is clamped to [0.0, 1.0] — unlike the exact version this does NOT
+    preserve headroom above 1.0, so only call it on base image data (which is
+    always in [0, 1]) or analysis buffers feeding u8 display output.
+    """
+    global _srgb_to_linear_lut
+    lut = _srgb_to_linear_lut
+    if lut is None:
+        xs = np.linspace(0.0, 1.0, _TRANSFER_LUT_SIZE, dtype=np.float64)
+        lut = _srgb_to_linear(xs).astype(np.float32)
+        _srgb_to_linear_lut = lut
+    idx = np.clip(
+        x * np.float32(_TRANSFER_LUT_SIZE - 1) + np.float32(0.5),
+        0,
+        _TRANSFER_LUT_SIZE - 1,
+    ).astype(np.uint16)
+    return lut[idx]
+
+
+def _linear_to_srgb_fast(x: np.ndarray) -> np.ndarray:
+    """LUT-based `_linear_to_srgb` for preview/display renders.
+
+    Covers [0, 1.06]; inputs above that clamp to the last entry, which is
+    indistinguishable from the exact version after the caller clips display
+    output to [0, 1].
+    """
+    global _linear_to_srgb_lut
+    lut = _linear_to_srgb_lut
+    if lut is None:
+        xs = np.linspace(
+            0.0, _LINEAR_TO_SRGB_DOMAIN, _TRANSFER_LUT_SIZE, dtype=np.float64
+        )
+        lut = _linear_to_srgb(xs).astype(np.float32)
+        _linear_to_srgb_lut = lut
+    idx = np.clip(
+        x * np.float32((_TRANSFER_LUT_SIZE - 1) / _LINEAR_TO_SRGB_DOMAIN)
+        + np.float32(0.5),
+        0,
+        _TRANSFER_LUT_SIZE - 1,
+    ).astype(np.uint16)
+    return lut[idx]
+
+
 def _smoothstep01(x: np.ndarray) -> np.ndarray:
     """Hermite smoothstep: 0 at x<=0, 1 at x>=1, smooth S-curve between."""
     x = np.clip(x, 0.0, 1.0)

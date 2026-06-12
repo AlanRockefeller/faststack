@@ -65,13 +65,38 @@ ApplicationWindow {
         }
     }
 
+    function clampWindowToVisibleScreen() {
+        if (root.visibility !== Window.Windowed || !root.screen) return
+
+        var screenX = root.screen.virtualX
+        var screenY = root.screen.virtualY
+        var screenWidth = root.screen.desktopAvailableWidth
+        var screenHeight = root.screen.desktopAvailableHeight
+        if (screenWidth <= 0 || screenHeight <= 0) return
+
+        var newWidth = Math.min(root.width, screenWidth)
+        var newHeight = Math.min(root.height, screenHeight)
+        var newX = Math.max(screenX, Math.min(root.x, screenX + screenWidth - newWidth))
+        var newY = Math.max(screenY, Math.min(root.y, screenY + screenHeight - newHeight))
+
+        root.x = newX
+        root.y = newY
+        root.width = newWidth
+        root.height = newHeight
+    }
+
+    function openDialogSafely(dialog) {
+        root.clampWindowToVisibleScreen()
+        dialog.open()
+    }
+
     onClosing: function(close) {
         if (!root.allowCloseWithBatches && root.controllerRef) {
             var definedBatchCount = root.controllerRef.get_defined_batch_count()
             if (definedBatchCount > 0) {
                 close.accepted = false
                 quitBatchesDialog.batchCount = definedBatchCount
-                quitBatchesDialog.open()
+                root.openDialogSafely(quitBatchesDialog)
                 return
             }
         }
@@ -81,7 +106,7 @@ ApplicationWindow {
                 && root.uiStateRef.hasRecycleBinItems) {
             close.accepted = false
             root.uiStateRef.refreshRecycleBinStats()
-            recycleBinCleanupDialog.open()
+            root.openDialogSafely(recycleBinCleanupDialog)
             return
         }
 
@@ -128,12 +153,12 @@ ApplicationWindow {
     function openExifDialog(data) {
         exifDialog.summaryData = data.summary
         exifDialog.fullData = data.full
-        exifDialog.open()
+        root.openDialogSafely(exifDialog)
     }
 
     function openColorInfoDialog(text) {
         colorInfoDialog.infoText = text
-        colorInfoDialog.open()
+        root.openDialogSafely(colorInfoDialog)
     }
 
     function setGridPrefetch(item, enabled) {
@@ -691,7 +716,7 @@ ApplicationWindow {
                 text: "Settings..."
                 hoverFillColor: root.menuHoverColor
                 onClicked: {
-                    settingsDialog.open()
+                    root.openDialogSafely(settingsDialog)
                     fileMenu.close()
                 }
                 defaultTextColor: root.currentTextColor
@@ -909,7 +934,7 @@ ApplicationWindow {
                 text: "Show Stacks"
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
-                onClicked: { showStacksDialog.open(); actionsMenu.close() }
+                onClicked: { root.openDialogSafely(showStacksDialog); actionsMenu.close() }
             }
             MenuActionItem {
                 width: 220
@@ -923,7 +948,7 @@ ApplicationWindow {
                 text: "Filter Images..."
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
-                onClicked: { filterDialog.open(); actionsMenu.close() }
+                onClicked: { root.openDialogSafely(filterDialog); actionsMenu.close() }
             }
 
             // Separator before Sort options
@@ -1017,10 +1042,11 @@ ApplicationWindow {
                 }
             }
 
-            CheckableMenuActionItem {
+            MenuActionItem {
                 width: 220
-                itemText: "Automatically add edited photos to batch"
-                checked: root.uiStateRef ? root.uiStateRef.autoAddEditedToBatch : true
+                text: "Automatically add edited photos to batch"
+                showCheckbox: true
+                checkboxChecked: root.uiStateRef ? root.uiStateRef.autoAddEditedToBatch : true
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
                 onClicked: {
@@ -1189,7 +1215,7 @@ ApplicationWindow {
                 text: "Key Bindings"
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
-                onClicked: { aboutDialog.open(); helpMenu.close() }
+                onClicked: { root.openDialogSafely(aboutDialog); helpMenu.close() }
             }
         }
     }
@@ -2000,12 +2026,12 @@ ApplicationWindow {
     }
 
     function show_jump_to_image_dialog() {
-        jumpToImageDialog.open()
+        root.openDialogSafely(jumpToImageDialog)
     }
 
     function show_delete_batch_dialog(count) {
         deleteBatchDialog.batchCount = count
-        deleteBatchDialog.open()
+        root.openDialogSafely(deleteBatchDialog)
     }
 
     ExifDialog {
