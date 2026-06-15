@@ -98,7 +98,7 @@ def _rec601_gray(arr: np.ndarray) -> np.ndarray:
     every downstream blend; cv2.transform is also multithreaded.
     """
     if cv2 is not None and arr.flags["C_CONTIGUOUS"]:
-        return cv2.transform(arr, _REC601_LUMA.reshape(1, 3))
+        return cv2.transform(arr, _REC601_LUMA.reshape(1, 3)).reshape(arr.shape[:2])
     return arr @ _REC601_LUMA
 
 

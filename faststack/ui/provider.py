@@ -1232,13 +1232,22 @@ class UIState(QObject):
 
     @Property(bool, notify=originalCompareActiveChanged)
     def originalCompareActive(self) -> bool:
-        return self._original_compare_active
+        return bool(
+            getattr(
+                self.app_controller,
+                "_original_compare_active",
+                self._original_compare_active,
+            )
+        )
 
     @originalCompareActive.setter
     def originalCompareActive(self, new_value: bool):
-        if self._original_compare_active != new_value:
-            self._original_compare_active = new_value
-            self.originalCompareActiveChanged.emit(new_value)
+        active = bool(
+            getattr(self.app_controller, "_original_compare_active", new_value)
+        )
+        if self._original_compare_active != active:
+            self._original_compare_active = active
+            self.originalCompareActiveChanged.emit(active)
 
     @Property(str, notify=editorImageChanged)
     def editorFilename(self) -> str:
