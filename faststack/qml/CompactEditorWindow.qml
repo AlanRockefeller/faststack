@@ -674,6 +674,7 @@ Window {
             ListModel {
                 id: lightModel
                 ListElement { name: "Exposure"; key: "exposure"; min: -100; max: 100 }
+                ListElement { name: "Brightness"; key: "brightness"; min: -100; max: 100 }
                 ListElement { name: "Contrast"; key: "contrast"; min: -100; max: 100 }
                 ListElement { name: "Whites"; key: "whites"; min: -100; max: 100 }
                 ListElement { name: "Shadows"; key: "shadows"; min: -100; max: 100 }

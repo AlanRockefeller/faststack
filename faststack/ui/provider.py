@@ -390,6 +390,12 @@ class UIState(QObject):
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
     autoVibranceEnabledChanged = Signal(bool)
+    autoLevelMidtoneChanged = Signal(bool)
+    autoLevelMidtoneTargetChanged = Signal(float)
+    autoLevelChannelBudgetChanged = Signal(float)
+    levelsSoftKneeChanged = Signal(bool)
+    exportDitherChanged = Signal(bool)
+    awbTintDampChanged = Signal(float)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_editor_expanded_changed = Signal(bool)
@@ -450,6 +456,7 @@ class UIState(QObject):
     debugThumbTimingChanged = Signal(bool)  # Thumbnail pipeline timing
     isDialogOpenChanged = Signal(bool)  # New signal for dialog state
     editSourceModeChanged = Signal(str)  # Notify when JPEG/RAW mode changes
+    rawDevelopmentStateChanged = Signal()
     saveBehaviorMessageChanged = Signal()  # Signal for save behavior message updates
     isSavingChanged = Signal(bool)  # Signal for save operation in progress
     batchAutoLevelsProgressChanged = Signal()
@@ -555,6 +562,16 @@ class UIState(QObject):
             self.app_controller.editSourceModeChanged.connect(
                 lambda _: self.metadataChanged.emit()
             )  # Also update metadata binding if needed
+        if hasattr(self.app_controller, "rawDevelopmentStateChanged"):
+            self.app_controller.rawDevelopmentStateChanged.connect(
+                self.rawDevelopmentStateChanged
+            )
+            self.app_controller.rawDevelopmentStateChanged.connect(
+                self.saveBehaviorMessageChanged.emit
+            )
+            self.app_controller.rawDevelopmentStateChanged.connect(
+                self.metadataChanged.emit
+            )
 
         # Connect batch auto levels progress signals
         if hasattr(self.app_controller, "batchAutoLevelsProgress"):
@@ -788,6 +805,12 @@ class UIState(QObject):
             return self.app_controller.current_edit_source_mode == "raw"
         return False
 
+    @Property(bool, notify=rawDevelopmentStateChanged)
+    def isRawDeveloping(self):
+        if hasattr(self.app_controller, "is_raw_developing_current"):
+            return self.app_controller.is_raw_developing_current()
+        return False
+
     @Slot(result=bool)
     def load_image_for_editing(self):
         """Loads the currently viewed image into the editor."""
@@ -814,10 +837,16 @@ class UIState(QObject):
         if not hasattr(self.app_controller, "current_edit_source_mode"):
             return ""
 
+        if getattr(self.app_controller, "view_override_kind", None) == "developed":
+            return "Editing: developed JPG (saves in-place to the developed file)"
+
         if self.app_controller.current_edit_source_mode == "raw":
-            return "Editing: RAW (writes working .tif + creates -developed.jpg; original JPG untouched)"
-        else:
-            return "Editing: JPEG (will overwrite JPG)"
+            if self.isRawDeveloping:
+                return "Editing: RAW (developing working .tif...)"
+            if self.hasWorkingTif:
+                return "Editing: RAW (writes working .tif + creates -developed.jpg; original JPG untouched)"
+            return "Editing: RAW selected (develop RAW before saving)"
+        return "Editing: JPEG (will overwrite JPG)"
 
     @Property(str, notify=statusMessageChanged)
     def statusMessage(self):
@@ -1097,6 +1126,60 @@ class UIState(QObject):
     def autoVibranceEnabled(self, value):
         self.app_controller.set_auto_vibrance_enabled(value)
         self.autoVibranceEnabledChanged.emit(value)
+
+    @Property(bool, notify=autoLevelMidtoneChanged)
+    def autoLevelMidtone(self):
+        return self.app_controller.get_auto_level_midtone()
+
+    @autoLevelMidtone.setter
+    def autoLevelMidtone(self, value):
+        self.app_controller.set_auto_level_midtone(value)
+        self.autoLevelMidtoneChanged.emit(value)
+
+    @Property(float, notify=autoLevelMidtoneTargetChanged)
+    def autoLevelMidtoneTarget(self):
+        return self.app_controller.get_auto_level_midtone_target()
+
+    @autoLevelMidtoneTarget.setter
+    def autoLevelMidtoneTarget(self, value):
+        self.app_controller.set_auto_level_midtone_target(value)
+        self.autoLevelMidtoneTargetChanged.emit(value)
+
+    @Property(float, notify=autoLevelChannelBudgetChanged)
+    def autoLevelChannelBudget(self):
+        return self.app_controller.get_auto_level_channel_budget()
+
+    @autoLevelChannelBudget.setter
+    def autoLevelChannelBudget(self, value):
+        self.app_controller.set_auto_level_channel_budget(value)
+        self.autoLevelChannelBudgetChanged.emit(value)
+
+    @Property(bool, notify=levelsSoftKneeChanged)
+    def levelsSoftKnee(self):
+        return self.app_controller.get_levels_soft_knee()
+
+    @levelsSoftKnee.setter
+    def levelsSoftKnee(self, value):
+        self.app_controller.set_levels_soft_knee(value)
+        self.levelsSoftKneeChanged.emit(value)
+
+    @Property(bool, notify=exportDitherChanged)
+    def exportDither(self):
+        return self.app_controller.get_export_dither()
+
+    @exportDither.setter
+    def exportDither(self, value):
+        self.app_controller.set_export_dither(value)
+        self.exportDitherChanged.emit(value)
+
+    @Property(float, notify=awbTintDampChanged)
+    def awbTintDamp(self):
+        return self.app_controller.get_awb_tint_damp()
+
+    @awbTintDamp.setter
+    def awbTintDamp(self, value):
+        self.app_controller.set_awb_tint_damp(value)
+        self.awbTintDampChanged.emit(value)
 
     @Slot()
     def open_folder(self):
@@ -1554,7 +1637,9 @@ class UIState(QObject):
                         return
                 except (TypeError, ValueError):
                     return
-                kick_preview = getattr(self.app_controller, "_kick_preview_worker", None)
+                kick_preview = getattr(
+                    self.app_controller, "_kick_preview_worker", None
+                )
                 if callable(kick_preview):
                     kick_preview()
                 return

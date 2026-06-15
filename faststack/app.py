@@ -82,7 +82,7 @@ from faststack.imaging.prefetch import (
     get_monitor_profile,
 )
 from faststack.ui.keystrokes import Keybinder
-from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS
+from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, _safe_replace
 from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
 from faststack.imaging.mask_engine import inverse_transform
 from faststack.imaging.metadata import get_exif_data
@@ -121,6 +121,16 @@ _AWB_LABEL_EPS = 0.002
 _AUTO_ADJUST_HIGHLIGHT_STEP = 0.14
 _AUTO_ADJUST_BLACK_STEP = 0.07
 _AUTO_VIBRANCE_EPS = 0.001
+_AUTO_BRIGHTNESS_EPS = 0.001
+# Midtone correction dead band and recovery. Images whose projected
+# post-stretch median luma already sits within +/- deadband of the target are
+# left alone — a reasonable exposure should not be normalized toward one
+# canonical brightness (that made "most images too bright"). Images outside
+# the band are pulled only partway back to the nearest band *edge* (never to
+# the center), which keeps the correction continuous at the band boundary and
+# preserves intentional low-key / high-key character.
+_AUTO_MIDTONE_DEADBAND = 0.10
+_AUTO_MIDTONE_RECOVERY = 0.7
 
 
 def _awb_direction(value: float, pos_label: str, neg_label: str) -> str:
@@ -140,6 +150,8 @@ class ActiveAutoAdjustState:
     p_high: float
     base_vibrance: float
     auto_vibrance_delta: float = 0.0
+    base_brightness: float = 0.0
+    auto_brightness_delta: float = 0.0
     extra_highlight_steps: int = 0
     extra_black_steps: int = 0
 
@@ -209,6 +221,7 @@ class AppController(QObject):
         finished = Signal()
 
     editSourceModeChanged = Signal(str)  # Notify when JPEG/RAW mode changes
+    rawDevelopmentStateChanged = Signal()  # Notify when RAW development starts/stops
     _saveFinished = Signal(
         object
     )  # Signal for save completion (result or error from background)
@@ -286,7 +299,9 @@ class AppController(QObject):
             None
         )
         self._original_compare_preview = None
-        self._original_compare_session_key: Optional[tuple[str, Optional[str], int]] = None
+        self._original_compare_session_key: Optional[tuple[str, Optional[str], int]] = (
+            None
+        )
         self._original_compare_index: int = -1
         self._original_compare_gen: int = -1
         self._original_compare_active: bool = False
@@ -371,6 +386,8 @@ class AppController(QObject):
         # Edit Source Mode State
         # "jpeg" (default) or "raw"
         self.current_edit_source_mode: str = "jpeg"
+        self._raw_developing_keys: Set[str] = set()
+        self._raw_develop_lock = threading.Lock()
 
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
@@ -614,6 +631,19 @@ class AppController(QObject):
         self.auto_vibrance_enabled = config.getboolean(
             "core", "auto_vibrance_enabled", True
         )
+        self.auto_level_midtone = config.getboolean("core", "auto_level_midtone", True)
+        self.auto_level_midtone_target = config.getfloat(
+            "core", "auto_level_midtone_target", 0.38
+        )
+        self.auto_level_channel_budget = config.getfloat(
+            "core", "auto_level_channel_budget", 3.0
+        )
+        self.levels_soft_knee = config.getboolean("core", "levels_soft_knee", True)
+        self.export_dither = config.getboolean("core", "export_dither", True)
+        # Rendering preferences live on the editor so the imaging layer stays
+        # config-free.
+        self.image_editor.levels_soft_knee = self.levels_soft_knee
+        self.image_editor.export_dither = self.export_dither
         self.ui_state.autoAddEditedToBatch = config.getboolean(
             "core", "auto_add_edited_to_batch", True
         )
@@ -1086,8 +1116,8 @@ class AppController(QObject):
         with self._decode_invalidation_lock:
             entry = self._decode_invalidation_epochs.get(epoch_key)
             if (
-                not force and
-                entry is not None
+                not force
+                and entry is not None
                 and fingerprint is not None
                 and entry[1] == fingerprint
             ):
@@ -2485,7 +2515,9 @@ class AppController(QObject):
                 else:
                     edits[key] = value
             except (TypeError, ValueError):
-                log.warning("Ignoring invalid pending edit value for %s: %r", key, value)
+                log.warning(
+                    "Ignoring invalid pending edit value for %s: %r", key, value
+                )
         return edits
 
     @classmethod
@@ -2553,12 +2585,8 @@ class AppController(QObject):
                 p_low=float(serialized.get("p_low", 0.0)),
                 p_high=float(serialized.get("p_high", 255.0)),
                 base_vibrance=float(serialized.get("base_vibrance", 0.0)),
-                auto_vibrance_delta=float(
-                    serialized.get("auto_vibrance_delta", 0.0)
-                ),
-                extra_highlight_steps=int(
-                    serialized.get("extra_highlight_steps", 0)
-                ),
+                auto_vibrance_delta=float(serialized.get("auto_vibrance_delta", 0.0)),
+                extra_highlight_steps=int(serialized.get("extra_highlight_steps", 0)),
                 extra_black_steps=int(serialized.get("extra_black_steps", 0)),
             )
         except (KeyError, TypeError, ValueError):
@@ -2604,10 +2632,9 @@ class AppController(QObject):
         source_path = context.get("edit_source_path") or state.get("source_path")
         if backup_path is not None:
             try:
-                source_matches_saved = (
-                    source_path is None
-                    or self._key(Path(source_path)) == self._key(saved_path)
-                )
+                source_matches_saved = source_path is None or self._key(
+                    Path(source_path)
+                ) == self._key(saved_path)
             except (OSError, TypeError, ValueError):
                 source_matches_saved = False
             if source_matches_saved:
@@ -3281,6 +3308,7 @@ class AppController(QObject):
         blacks, whites, p_low, p_high = self.image_editor.analyze_auto_levels(
             self.auto_level_threshold,
             reset_levels=True,
+            channel_budget=self.auto_level_channel_budget,
         )
 
         dynamic_range = p_high - p_low
@@ -3315,9 +3343,49 @@ class AppController(QObject):
         elif p_low <= 0.0 and p_high >= 255.0:
             noop_reason = "already full range"
 
+        # Midtone correction: an endpoint stretch leaves a full-range but
+        # underexposed (or overexposed) image untouched. When the projected
+        # post-stretch median luma falls outside the dead band around the
+        # target, nudge brightness partway back toward the nearest band edge.
+        # A well-exposed image inside the band is left alone (normalizing every
+        # photo to one brightness made "most images too bright"); images that
+        # are corrected only recover partway, preserving intentional low-key /
+        # high-key character. The factor is capped so the auto result stays
+        # conservative; the levels soft knee protects highlights from the lift.
+        base_brightness = 0.0
+        if self.auto_level_midtone and dynamic_range >= 1.0:
+            stats = getattr(self.image_editor, "last_auto_levels_stats", {})
+            median_luma = float(stats.get("median_luma", 0.0))
+            if median_luma > 0.02:
+                bp = -base_blacks * 0.15
+                wp = 1.0 - base_whites * 0.15
+                span = max(wp - bp, 1e-4)
+                target = max(0.2, min(0.6, self.auto_level_midtone_target))
+                # Median luma projected through the levels stretch.
+                projected = (median_luma - bp) / span
+                band_low = target - _AUTO_MIDTONE_DEADBAND
+                band_high = target + _AUTO_MIDTONE_DEADBAND
+                desired = None
+                if 0.02 < projected < band_low:
+                    desired = projected + _AUTO_MIDTONE_RECOVERY * (
+                        band_low - projected
+                    )
+                elif projected > band_high:
+                    desired = projected + _AUTO_MIDTONE_RECOVERY * (
+                        band_high - projected
+                    )
+                if desired is not None:
+                    # Brightness multiplies before the levels ramp, so solve
+                    # (median * factor - bp) / span = desired for factor.
+                    factor = (desired * span + bp) / median_luma
+                    factor = max(0.85, min(1.3, factor))
+                    if abs(factor - 1.0) >= 0.02:
+                        base_brightness = factor - 1.0
+
         return {
             "base_blacks": base_blacks,
             "base_whites": base_whites,
+            "base_brightness": base_brightness,
             "p_low": p_low,
             "p_high": p_high,
             "dynamic_range": dynamic_range,
@@ -3346,6 +3414,7 @@ class AppController(QObject):
         extra_highlight_steps: int = 0,
         extra_black_steps: int = 0,
         auto_vibrance_delta: float = 0.0,
+        auto_brightness_delta: float = 0.0,
     ) -> str:
         """Build a human-readable status line for the current levels state."""
         if abs(blacks) <= 0.001 and abs(whites) <= 0.001:
@@ -3383,6 +3452,8 @@ class AppController(QObject):
             suffixes.append(f"blacks +{-extra_black_steps * black_step_points}pt")
         if auto_vibrance_delta > _AUTO_VIBRANCE_EPS:
             suffixes.append(f"vibrance +{auto_vibrance_delta:.2f}")
+        if abs(auto_brightness_delta) > _AUTO_BRIGHTNESS_EPS:
+            suffixes.append(f"midtone {auto_brightness_delta:+.2f}")
         if suffixes:
             msg = f"{msg}; {', '.join(suffixes)}"
         return msg
@@ -3418,6 +3489,16 @@ class AppController(QObject):
         self.ui_state.vibrance = vibrance
         return changed
 
+    def _apply_brightness_to_editor(
+        self,
+        *,
+        brightness: float,
+    ) -> bool:
+        """Apply derived brightness to the editor and synchronize the UI state."""
+        changed = self.image_editor.set_edit_param("brightness", brightness)
+        self.ui_state.brightness = brightness
+        return changed
+
     def _build_active_auto_adjust_state(
         self,
         recommendation: dict[str, Any],
@@ -3447,6 +3528,20 @@ class AppController(QObject):
             min(1.0, current_vibrance + auto_vibrance_delta),
         )
         auto_vibrance_delta = base_vibrance - current_vibrance
+
+        # Midtone brightness: only auto-set when the user has not touched the
+        # brightness slider themselves, mirroring the vibrance behavior.
+        try:
+            current_brightness = float(
+                self.image_editor.get_edit_value("brightness", 0.0)
+            )
+        except (TypeError, ValueError):
+            current_brightness = 0.0
+        base_brightness = current_brightness
+        if abs(current_brightness) <= 0.001:
+            base_brightness = float(recommendation.get("base_brightness", 0.0))
+        auto_brightness_delta = base_brightness - current_brightness
+
         return ActiveAutoAdjustState(
             active_path_key=active_path_key,
             session_id=getattr(self.image_editor, "session_id", None),
@@ -3456,6 +3551,8 @@ class AppController(QObject):
             p_high=float(recommendation["p_high"]),
             base_vibrance=base_vibrance,
             auto_vibrance_delta=auto_vibrance_delta,
+            base_brightness=base_brightness,
+            auto_brightness_delta=auto_brightness_delta,
         )
 
     def _save_current_auto_adjust(
@@ -4229,6 +4326,7 @@ class AppController(QObject):
         if self.current_edit_source_mode != new_mode:
             self.current_edit_source_mode = new_mode
             self.editSourceModeChanged.emit(new_mode)
+        self.rawDevelopmentStateChanged.emit()
 
         if self.debug_cache:
             _t_prefetch = time.perf_counter()
@@ -4582,11 +4680,15 @@ class AppController(QObject):
             return
 
         if self.ui_state and getattr(self.ui_state, "isCropping", False) is True:
-            self.update_status_message("Apply/save or discard edits before duplicating.")
+            self.update_status_message(
+                "Apply/save or discard edits before duplicating."
+            )
             return
 
         if self.has_unsaved_edits():
-            self.update_status_message("Apply/save or discard edits before duplicating.")
+            self.update_status_message(
+                "Apply/save or discard edits before duplicating."
+            )
             return
 
         source_image = self.image_files[self.current_index]
@@ -4628,9 +4730,7 @@ class AppController(QObject):
         self._all_images.insert(all_insert_index, duplicate_image)
 
         if self.batches:
-            self.batches = self._shift_ranges_after_insert(
-                self.batches, insert_index
-            )
+            self.batches = self._shift_ranges_after_insert(self.batches, insert_index)
             self._invalidate_batch_cache()
         if (
             self.batch_start_index is not None
@@ -6093,7 +6193,9 @@ class AppController(QObject):
 
     def save_config(self):
         """Save current UI state config values."""
-        config.set("core", "auto_add_edited_to_batch", self.ui_state.autoAddEditedToBatch)
+        config.set(
+            "core", "auto_add_edited_to_batch", self.ui_state.autoAddEditedToBatch
+        )
         config.save()
 
     @Slot(result=str)
@@ -6341,6 +6443,16 @@ class AppController(QObject):
     def get_awb_strength(self):
         return config.getfloat("awb", "strength")
 
+    @Slot(result=float)
+    def get_awb_tint_damp(self):
+        return config.getfloat("awb", "tint_damp", 0.6)
+
+    @Slot(float)
+    def set_awb_tint_damp(self, value):
+        value = max(0.0, min(1.0, value))
+        config.set("awb", "tint_damp", f"{value:.6g}")
+        config.save()
+
     @Slot(float)
     def set_awb_strength(self, value):
         config.set("awb", "strength", value)
@@ -6586,6 +6698,74 @@ class AppController(QObject):
             "core",
             "auto_vibrance_enabled",
             "true" if self.auto_vibrance_enabled else "false",
+        )
+        config.save()
+
+    @Slot(result=bool)
+    def get_auto_level_midtone(self):
+        return self.auto_level_midtone
+
+    @Slot(bool)
+    def set_auto_level_midtone(self, value):
+        self.auto_level_midtone = bool(value)
+        config.set(
+            "core",
+            "auto_level_midtone",
+            "true" if self.auto_level_midtone else "false",
+        )
+        config.save()
+
+    @Slot(result=float)
+    def get_auto_level_midtone_target(self):
+        return self.auto_level_midtone_target
+
+    @Slot(float)
+    def set_auto_level_midtone_target(self, value):
+        value = max(0.2, min(0.6, value))
+        self.auto_level_midtone_target = value
+        config.set("core", "auto_level_midtone_target", f"{value:.6g}")
+        config.save()
+
+    @Slot(result=float)
+    def get_auto_level_channel_budget(self):
+        return self.auto_level_channel_budget
+
+    @Slot(float)
+    def set_auto_level_channel_budget(self, value):
+        value = max(1.0, min(10.0, value))
+        self.auto_level_channel_budget = value
+        config.set("core", "auto_level_channel_budget", f"{value:.6g}")
+        config.save()
+
+    @Slot(result=bool)
+    def get_levels_soft_knee(self):
+        return self.levels_soft_knee
+
+    @Slot(bool)
+    def set_levels_soft_knee(self, value):
+        self.levels_soft_knee = bool(value)
+        self.image_editor.levels_soft_knee = self.levels_soft_knee
+        config.set(
+            "core",
+            "levels_soft_knee",
+            "true" if self.levels_soft_knee else "false",
+        )
+        config.save()
+        # Levels rendering changed; refresh the live preview if edits exist.
+        self._kick_preview_worker()
+
+    @Slot(result=bool)
+    def get_export_dither(self):
+        return self.export_dither
+
+    @Slot(bool)
+    def set_export_dither(self, value):
+        self.export_dither = bool(value)
+        self.image_editor.export_dither = self.export_dither
+        config.set(
+            "core",
+            "export_dither",
+            "true" if self.export_dither else "false",
         )
         config.save()
 
@@ -8391,10 +8571,7 @@ class AppController(QObject):
                 meta_sidecar = ctx.get("save_sidecar") or self.sidecar
                 if meta_path_str and meta_sidecar is not None:
                     saved_edit_state = None
-                    if (
-                        isinstance(recovery_result, tuple)
-                        and len(recovery_result) == 2
-                    ):
+                    if isinstance(recovery_result, tuple) and len(recovery_result) == 2:
                         saved_edit_state = self._build_saved_edit_state_for_result(
                             {"request": req},
                             saved_path=recovery_result[0],
@@ -8737,7 +8914,8 @@ class AppController(QObject):
                 isinstance(current_edit_state, dict)
                 and current_edit_state.get("status") == "pending_save"
                 and completed_edit_state_request_id is not None
-                and current_edit_state.get("request_id") != completed_edit_state_request_id
+                and current_edit_state.get("request_id")
+                != completed_edit_state_request_id
             ):
                 log.debug(
                     "Preserving newer pending edit state for %s after save %s finished",
@@ -8966,7 +9144,11 @@ class AppController(QObject):
         if self._block_if_saving(current_image_path):
             return
 
-        # 1. Update State
+        image_file = self.image_files[self.current_index]
+        if not image_file.has_raw:
+            self.update_status_message("No RAW file available.")
+            return
+
         # 1. Update State
         if self.current_edit_source_mode != "raw":
             self.current_edit_source_mode = "raw"
@@ -8978,7 +9160,6 @@ class AppController(QObject):
 
         # If the path returned IS the working TIFF (and it exists), we can just load it.
         # Check specific condition:
-        image_file = self.image_files[self.current_index]
         if path == image_file.working_tif_path and self.is_valid_working_tif(path):
             log.info("Valid working TIFF exists, switching to RAW mode immediately.")
             self.load_image_for_editing()  # This will now pick up the TIFF via get_active_edit_path
@@ -8988,27 +9169,79 @@ class AppController(QObject):
         # (Pass through to existing backend logic)
         self._develop_raw_backend()
 
+    def _raw_development_key_for_image(self, image_file: ImageFile) -> str:
+        return self._key(image_file.working_tif_path) or str(
+            image_file.working_tif_path
+        )
+
+    def _is_raw_development_in_flight(self, image_file: ImageFile) -> bool:
+        key = self._raw_development_key_for_image(image_file)
+        with self._raw_develop_lock:
+            return key in self._raw_developing_keys
+
+    @Slot(result=bool)
+    def is_raw_developing_current(self) -> bool:
+        if not self.image_files or not (
+            0 <= self.current_index < len(self.image_files)
+        ):
+            return False
+        return self._is_raw_development_in_flight(self.image_files[self.current_index])
+
+    def _mark_raw_development_started(self, image_file: ImageFile) -> Optional[str]:
+        key = self._raw_development_key_for_image(image_file)
+        with self._raw_develop_lock:
+            if key in self._raw_developing_keys:
+                return None
+            self._raw_developing_keys.add(key)
+        self.rawDevelopmentStateChanged.emit()
+        return key
+
+    def _mark_raw_development_finished(self, key: Optional[str]) -> None:
+        if not key:
+            return
+        with self._raw_develop_lock:
+            if key not in self._raw_developing_keys:
+                return
+            self._raw_developing_keys.remove(key)
+        self.rawDevelopmentStateChanged.emit()
+
     def _develop_raw_backend(self):
         """Internal: Triggers the actual RawTherapee process."""
         if not self.image_files:
-            return
+            return False
 
         image_file = self.image_files[self.current_index]
         if not image_file.has_raw:
             self.update_status_message("No RAW file available.")
-            return
+            return False
+
+        if self._is_raw_development_in_flight(image_file):
+            self.update_status_message("RAW development already in progress.")
+            return False
 
         raw_path = image_file.raw_path
         tif_path = image_file.working_tif_path
+        if raw_path is None or not raw_path.exists():
+            self.update_status_message("RAW file is missing.")
+            return False
+
+        develop_key = self._mark_raw_development_started(image_file)
+        if develop_key is None:
+            self.update_status_message("RAW development already in progress.")
+            return False
+        tmp_tif_path = tif_path.with_name(
+            f".{tif_path.stem}_{uuid.uuid4().hex[:8]}{tif_path.suffix}"
+        )
 
         # Resolve RawTherapee Executable
         from faststack.config import config
 
         rt_exe = config.get("rawtherapee", "exe")
         if not rt_exe or not os.path.exists(rt_exe):
+            self._mark_raw_development_finished(develop_key)
             self.update_status_message("RawTherapee not found. Check settings.")
             log.error("RawTherapee executable not configured or missing: %s", rt_exe)
-            return
+            return False
         self.update_status_message("Developing RAW... please wait.")
         log.info("Starting RAW development: %s -> %s", raw_path, tif_path)
 
@@ -9022,7 +9255,7 @@ class AppController(QObject):
             # -Y: Overwrite existing
             # -o: Output file
             # -c: Input file (must be last)
-            cmd = [rt_exe, "-t", "-b16", "-Y", "-o", str(tif_path)]
+            cmd = [rt_exe, "-t", "-b16", "-Y", "-o", str(tmp_tif_path)]
 
             if rt_args:
                 try:
@@ -9049,17 +9282,44 @@ class AppController(QObject):
                 result = subprocess.run(cmd, check=False, **run_kwargs)
 
                 if result.returncode == 0:
-                    if tif_path.exists() and tif_path.stat().st_size > 0:
+                    if tmp_tif_path.exists() and tmp_tif_path.stat().st_size > 0:
+                        try:
+                            _safe_replace(tmp_tif_path, tif_path)
+                        except OSError as e:
+                            msg = f"RawTherapee output was valid but could not replace working TIFF: {e}"
+                            log.error(msg)
+                            QTimer.singleShot(
+                                0,
+                                functools.partial(
+                                    self._on_develop_finished,
+                                    False,
+                                    msg,
+                                    develop_key,
+                                ),
+                            )
+                            return
                         log.info("RAW development successful.")
                         # Use partial to bind variable deeply
                         QTimer.singleShot(
-                            0, functools.partial(self._on_develop_finished, True, None)
+                            0,
+                            functools.partial(
+                                self._on_develop_finished,
+                                True,
+                                None,
+                                develop_key,
+                            ),
                         )
                         return  # Success path
                     msg = f"RawTherapee exited successfully but output file is missing or empty.\nCommand: {cmd_str}"
                     log.error(msg)
                     QTimer.singleShot(
-                        0, functools.partial(self._on_develop_finished, False, msg)
+                        0,
+                        functools.partial(
+                            self._on_develop_finished,
+                            False,
+                            msg,
+                            develop_key,
+                        ),
                     )
                 else:
                     stderr = result.stderr.strip() if result.stderr else "(no stderr)"
@@ -9067,41 +9327,47 @@ class AppController(QObject):
                     err_msg = f"RawTherapee failed (exit code {result.returncode}):\nCommand: {cmd_str}\nstderr: {stderr}\nstdout: {stdout}"
                     log.error(err_msg)
                     QTimer.singleShot(
-                        0, functools.partial(self._on_develop_finished, False, err_msg)
+                        0,
+                        functools.partial(
+                            self._on_develop_finished,
+                            False,
+                            err_msg,
+                            develop_key,
+                        ),
                     )
 
             except subprocess.TimeoutExpired:
                 err_msg = f"RawTherapee timed out after 60 seconds.\nCommand: {cmd_str}"
                 log.error(err_msg)
                 QTimer.singleShot(
-                    0, functools.partial(self._on_develop_finished, False, err_msg)
+                    0,
+                    functools.partial(
+                        self._on_develop_finished,
+                        False,
+                        err_msg,
+                        develop_key,
+                    ),
                 )
             except Exception as e:
                 err_msg = f"Unexpected error running RawTherapee: {str(e)}"
                 log.exception(err_msg)
                 QTimer.singleShot(
-                    0, functools.partial(self._on_develop_finished, False, err_msg)
+                    0,
+                    functools.partial(
+                        self._on_develop_finished,
+                        False,
+                        err_msg,
+                        develop_key,
+                    ),
                 )
             finally:
-                # Cleanup if we failed and left a bad file or 0-byte file (unless success logic already returned)
-                # Note: success logic returns early. If we are here, we likely failed or fell through (e.g. 0 byte file case did not return)
-                # Actually, the 0-byte case calls on_finished but doesn't return, so it falls here.
-                # Let's check specifically if we need to cleanup.
-                # If we succeeded, we returned.
-                if tif_path.exists() and "result" in locals():
-                    # Only cleanup if result was assigned (subprocess ran)
-                    # If it's 0 bytes or we are in an error state (which implies we didn't return early)
-                    try:
-                        if tif_path.stat().st_size == 0:
-                            tif_path.unlink()
-                        elif result.returncode != 0:
-                            # If we crashed but left a file, delete it
-                            tif_path.unlink()
-                    except (OSError, AttributeError):
-                        # AttributeError if result is None
-                        pass
+                try:
+                    tmp_tif_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         threading.Thread(target=worker, daemon=True).start()
+        return True
 
     # Preserving legacy slot name for compatibility if QML calls it directly,
     # but QML should call enable_raw_editing now.
@@ -9159,9 +9425,7 @@ class AppController(QObject):
         result_label = (
             "reused"
             if result is self._REUSED
-            else "loaded"
-            if result is True
-            else "failed"
+            else "loaded" if result is True else "failed"
         )
         log.debug(
             "[COMPACT_EDITOR_RELOAD] preview-only load index=%d "
@@ -9191,6 +9455,12 @@ class AppController(QObject):
                 active_path = Path(self.view_override_path)
             else:
                 active_path = self.get_active_edit_path(self.current_index)
+            if (
+                self.current_edit_source_mode == "raw"
+                and active_path.suffix.lower() in RAW_EXTENSIONS
+            ):
+                self._develop_raw_backend()
+                return False
             load_path, _edit_state = self._active_edit_load_path(active_path)
             filepath = str(active_path)
             load_filepath = str(load_path)
@@ -9340,12 +9610,26 @@ class AppController(QObject):
         # Notify UI
         self.ui_state.editorImageChanged.emit()
 
-    def _on_develop_finished(self, success: bool, error_msg: Optional[str]):
+    def _on_develop_finished(
+        self,
+        success: bool,
+        error_msg: Optional[str],
+        develop_key: Optional[str] = None,
+    ):
         """Callback on main thread after RAW development."""
+        self._mark_raw_development_finished(develop_key)
         if success:
             self.update_status_message("RAW Development complete.")
-            # Load active path (which should now be the developed TIFF)
-            self.load_image_for_editing()
+            if develop_key is None or (
+                self.image_files
+                and 0 <= self.current_index < len(self.image_files)
+                and develop_key
+                == self._raw_development_key_for_image(
+                    self.image_files[self.current_index]
+                )
+            ):
+                # Load active path (which should now be the developed TIFF)
+                self.load_image_for_editing()
         else:
             self.update_status_message(f"Development failed: {error_msg}")
             # Ensure UI reflects failure (maybe revert mode? or just show error)
@@ -10819,9 +11103,7 @@ class AppController(QObject):
                 )
 
             # Coerce elements to int and clamp to [0, 1000]
-            left, top, right, bottom = [
-                max(0, min(1000, int(x))) for x in crop_box_raw
-            ]
+            left, top, right, bottom = [max(0, min(1000, int(x))) for x in crop_box_raw]
 
             # Ensure correct order (left <= right, top <= bottom)
             crop_box_raw = (
@@ -10986,17 +11268,44 @@ class AppController(QObject):
 
         blacks = recommendation["base_blacks"]
         whites = recommendation["base_whites"]
+
+        # Midtone brightness: only auto-set when the user has not touched the
+        # brightness slider themselves. Applied before levels so the single
+        # preview kick below renders both.
+        auto_brightness_delta = 0.0
+        changed_brightness = False
+        try:
+            current_brightness = float(
+                self.image_editor.get_edit_value("brightness", 0.0)
+            )
+        except (TypeError, ValueError):
+            current_brightness = 0.0
+        base_brightness = float(recommendation.get("base_brightness", 0.0))
+        if abs(current_brightness) <= 0.001 and abs(base_brightness) > 0.001:
+            changed_brightness = self._apply_brightness_to_editor(
+                brightness=base_brightness
+            )
+            auto_brightness_delta = base_brightness - current_brightness
+
         msg = self._format_auto_levels_detail(
             p_low=recommendation["p_low"],
             p_high=recommendation["p_high"],
             blacks=blacks,
             whites=whites,
+            auto_brightness_delta=auto_brightness_delta,
         )
         changed = self._apply_levels_to_editor(
             blacks=blacks,
             whites=whites,
             kick_preview=True,
         )
+        if changed_brightness and not changed:
+            # Levels alone did not change anything; make sure the brightness
+            # nudge still reaches the preview.
+            self._kick_preview_worker()
+            if self.ui_state.isHistogramVisible:
+                self.update_histogram()
+        changed = changed or changed_brightness
 
         if not changed and recommendation["noop_reason"]:
             msg = f"Auto levels: no change ({recommendation['noop_reason']})"
@@ -11068,7 +11377,10 @@ class AppController(QObject):
         changed_vibrance = self._apply_vibrance_to_editor(
             vibrance=state.base_vibrance,
         )
-        changed = changed or changed_vibrance
+        changed_brightness = self._apply_brightness_to_editor(
+            brightness=state.base_brightness,
+        )
+        changed = changed or changed_vibrance or changed_brightness
         detail = self._format_auto_levels_detail(
             p_low=state.p_low,
             p_high=state.p_high,
@@ -11077,6 +11389,7 @@ class AppController(QObject):
             extra_highlight_steps=state.extra_highlight_steps,
             extra_black_steps=state.extra_black_steps,
             auto_vibrance_delta=state.auto_vibrance_delta,
+            auto_brightness_delta=state.auto_brightness_delta,
         )
         self._last_auto_levels_msg = detail
 
@@ -11223,7 +11536,10 @@ class AppController(QObject):
         changed_vibrance = self._apply_vibrance_to_editor(
             vibrance=state.base_vibrance,
         )
-        if changed_levels or changed_vibrance:
+        changed_brightness = self._apply_brightness_to_editor(
+            brightness=state.base_brightness,
+        )
+        if changed_levels or changed_vibrance or changed_brightness:
             self._kick_preview_worker()
             if self.ui_state.isHistogramVisible:
                 self.update_histogram()
@@ -11235,6 +11551,7 @@ class AppController(QObject):
             extra_highlight_steps=state.extra_highlight_steps,
             extra_black_steps=state.extra_black_steps,
             auto_vibrance_delta=state.auto_vibrance_delta,
+            auto_brightness_delta=state.auto_brightness_delta,
         )
         self._last_auto_levels_msg = detail
         self.update_status_message(detail, timeout=9000)
@@ -11530,6 +11847,7 @@ class AppController(QObject):
         strength = config.getfloat("awb", "strength", 0.7)
         warm_bias = config.getint("awb", "warm_bias", 6)
         tint_bias = config.getint("awb", "tint_bias", 0)
+        tint_damp = config.getfloat("awb", "tint_damp", 0.6)
         rgb_lower_bound = config.getint("awb", "rgb_lower_bound", 5)
         rgb_upper_bound = config.getint("awb", "rgb_upper_bound", 250)
         luma_lower_bound = config.getint("awb", "luma_lower_bound", 30)
@@ -11539,6 +11857,7 @@ class AppController(QObject):
             strength=strength,
             warm_bias=warm_bias,
             tint_bias=tint_bias,
+            tint_damp=tint_damp,
             rgb_lower_bound=rgb_lower_bound,
             rgb_upper_bound=rgb_upper_bound,
             luma_lower_bound=luma_lower_bound,
@@ -11575,12 +11894,14 @@ class AppController(QObject):
         selected_pixels = int(estimate.get("selected_pixels", 0))
         stride = int(estimate.get("stride", 0))
         neutrality_limit = float(estimate.get("neutrality_limit", 0.0))
+        confidence = float(estimate.get("confidence", 1.0))
         log.debug(
-            "[AUTO_COLOR] total=%dms  (selected=%d stride=%d neutral<=%.3f)",
+            "[AUTO_COLOR] total=%dms  (selected=%d stride=%d neutral<=%.3f confidence=%.2f)",
             int((t_awb_end - t_awb_start) * 1000),
             selected_pixels,
             stride,
             neutrality_limit,
+            confidence,
         )
         self.update_status_message(msg)
         return msg

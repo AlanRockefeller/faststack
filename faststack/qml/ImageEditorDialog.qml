@@ -45,7 +45,8 @@ Window {
     Material.accent: accentColor
 
     onClosing: (close) => {
-        if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
+        close.accepted = false
+        imageEditorDialog.requestClose()
     }
 
     onVisibleChanged: {
@@ -77,6 +78,14 @@ Window {
         return (key === "exposure" || key === "whites") ? 2.0 : 1.0
     }
 
+    function requestClose() {
+        if (imageEditorDialog.controllerRef && imageEditorDialog.controllerRef.has_unsaved_edits()) {
+            if (!discardDialog.opened) discardDialog.open()
+        } else {
+            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
+        }
+    }
+
     // Background
     color: imageEditorDialog.backgroundColor
 
@@ -84,7 +93,7 @@ Window {
         sequence: "Escape"
         context: Qt.WindowShortcut
         onActivated: {
-            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
+            imageEditorDialog.requestClose()
         }
     }
     Shortcut {
@@ -101,6 +110,25 @@ Window {
         context: Qt.WindowShortcut
         onActivated: {
             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.toggle_darken_mode()
+        }
+    }
+
+    Dialog {
+        id: discardDialog
+        title: "Discard Edits?"
+        modal: true
+        anchors.centerIn: parent
+        width: 280
+        standardButtons: Dialog.Yes | Dialog.No
+
+        Label {
+            text: "You have unsaved edits.\nDiscard and close?"
+            wrapMode: Text.WordWrap
+        }
+
+        onAccepted: {
+            if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.discard_edit_parameters()
+            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
         }
     }
 
@@ -356,11 +384,11 @@ Window {
                     spacing: 8
 
                     Button {
-                        text: (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isRawActive) ? "RAW Loaded" : "Load RAW"
+                        text: (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isRawDeveloping) ? "Developing RAW..." : ((imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isRawActive && imageEditorDialog.uiStateRef.hasWorkingTif) ? "RAW Loaded" : (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.hasWorkingTif ? "Load RAW" : "Develop RAW"))
                         Layout.fillWidth: true
                         Layout.preferredHeight: imageEditorDialog.secondaryButtonHeight
                         font.pixelSize: 12
-                        enabled: imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isRawActive : false
+                        enabled: imageEditorDialog.uiStateRef ? (!imageEditorDialog.uiStateRef.isRawDeveloping && !(imageEditorDialog.uiStateRef.isRawActive && imageEditorDialog.uiStateRef.hasWorkingTif)) : false
                         onClicked: {
                             if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.enableRawEditing()
                             imageEditorDialog.updatePulse++
@@ -538,7 +566,7 @@ Window {
                         text: "Close"
                         Layout.preferredWidth: 100
                         onClicked: { 
-                            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
+                            imageEditorDialog.requestClose()
                         }
                         contentItem: Text {
                             text: closeEditorButton.text

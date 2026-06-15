@@ -27,6 +27,11 @@ Window {
     property double autoLevelStrength: 1.0
     property bool autoLevelStrengthAuto: false
     property bool autoVibranceEnabled: true
+    property bool autoLevelMidtone: true
+    property double autoLevelMidtoneTarget: 0.38
+    property double autoLevelChannelBudget: 3.0
+    property bool levelsSoftKnee: true
+    property bool exportDither: true
     property int prefetchRadius: 4
     property int theme: 0
     property string defaultDirectory: ""
@@ -38,6 +43,7 @@ Window {
     property double awbStrength: 0.7
     property int awbWarmBias: 6
     property int awbTintBias: 0
+    property double awbTintDamp: 0.6
 
     property int awbLumaLowerBound: 30
     property int awbLumaUpperBound: 220
@@ -140,10 +146,16 @@ Window {
             settingsDialog.autoLevelStrength = settingsDialog.uiStateRef.autoLevelStrength
             settingsDialog.autoLevelStrengthAuto = settingsDialog.uiStateRef.autoLevelStrengthAuto
             settingsDialog.autoVibranceEnabled = settingsDialog.uiStateRef.autoVibranceEnabled
+            settingsDialog.autoLevelMidtone = settingsDialog.uiStateRef.autoLevelMidtone
+            settingsDialog.autoLevelMidtoneTarget = settingsDialog.uiStateRef.autoLevelMidtoneTarget
+            settingsDialog.autoLevelChannelBudget = settingsDialog.uiStateRef.autoLevelChannelBudget
+            settingsDialog.levelsSoftKnee = settingsDialog.uiStateRef.levelsSoftKnee
+            settingsDialog.exportDither = settingsDialog.uiStateRef.exportDither
             settingsDialog.awbMode = settingsDialog.uiStateRef.awbMode
             settingsDialog.awbStrength = settingsDialog.uiStateRef.awbStrength
             settingsDialog.awbWarmBias = settingsDialog.uiStateRef.awbWarmBias
             settingsDialog.awbTintBias = settingsDialog.uiStateRef.awbTintBias
+            settingsDialog.awbTintDamp = settingsDialog.uiStateRef.awbTintDamp
             settingsDialog.awbLumaLowerBound = settingsDialog.uiStateRef.awbLumaLowerBound
             settingsDialog.awbLumaUpperBound = settingsDialog.uiStateRef.awbLumaUpperBound
             settingsDialog.awbRgbLowerBound = settingsDialog.uiStateRef.awbRgbLowerBound
@@ -193,11 +205,17 @@ Window {
         state.autoLevelStrength = settingsDialog.autoLevelStrength
         state.autoLevelStrengthAuto = settingsDialog.autoLevelStrengthAuto
         state.autoVibranceEnabled = settingsDialog.autoVibranceEnabled
+        state.autoLevelMidtone = settingsDialog.autoLevelMidtone
+        state.autoLevelMidtoneTarget = settingsDialog.autoLevelMidtoneTarget
+        state.autoLevelChannelBudget = settingsDialog.autoLevelChannelBudget
+        state.levelsSoftKnee = settingsDialog.levelsSoftKnee
+        state.exportDither = settingsDialog.exportDither
 
         state.awbMode = settingsDialog.awbMode
         state.awbStrength = settingsDialog.awbStrength
         state.awbWarmBias = settingsDialog.awbWarmBias
         state.awbTintBias = settingsDialog.awbTintBias
+        state.awbTintDamp = settingsDialog.awbTintDamp
 
         state.awbLumaLowerBound = settingsDialog.awbLumaLowerBound
         state.awbLumaUpperBound = settingsDialog.awbLumaUpperBound
@@ -879,6 +897,166 @@ Window {
                                     Text { text: "✓"; color: "white"; anchors.centerIn: parent; visible: autoVibranceCheck.checked; font.bold: true }
                                 }
                             }
+
+                            Label {
+                                text: "Midtone Correction"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: midtoneHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: midtoneHover.containsMouse
+                                ToolTip.text: "When enabled, auto-levels also nudges brightness so a full-range but underexposed (or overexposed) image is corrected toward the midtone target instead of being left untouched. Default: on"
+                            }
+                            CheckBox {
+                                id: midtoneCheck
+                                text: "Enabled"
+                                checked: settingsDialog.autoLevelMidtone
+                                onCheckedChanged: settingsDialog.autoLevelMidtone = checked
+                                contentItem: Text { text: midtoneCheck.text; color: settingsDialog.textColor; leftPadding: midtoneCheck.indicator.width + midtoneCheck.spacing; verticalAlignment: Text.AlignVCenter }
+                                indicator: Rectangle {
+                                    implicitWidth: 18; implicitHeight: 18
+                                    x: midtoneCheck.leftPadding; y: parent.height / 2 - height / 2
+                                    radius: 3
+                                    border.color: settingsDialog.accentColor
+                                    color: midtoneCheck.checked ? settingsDialog.accentColor : "transparent"
+                                    Text { text: "✓"; color: "white"; anchors.centerIn: parent; visible: midtoneCheck.checked; font.bold: true }
+                                }
+                            }
+
+                            Label {
+                                text: "Midtone Target"
+                                color: settingsDialog.textColor
+                                opacity: settingsDialog.autoLevelMidtone ? 1.0 : 0.5
+
+                                MouseArea {
+                                    id: midtoneTargetHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: midtoneTargetHover.containsMouse
+                                ToolTip.text: "Median brightness (0.2-0.6) that midtone correction aims for after the levels stretch. Images whose brightness is already within a dead band of this target are left alone; others are nudged only partway toward it, so well-exposed and intentionally dark/bright photos are preserved. Higher values produce brighter results. Default: 0.38"
+                            }
+                            Loader {
+                                id: midtoneTargetLoader
+                                sourceComponent: styledTextField
+                                Layout.preferredWidth: 80
+                                opacity: settingsDialog.autoLevelMidtone ? 1.0 : 0.5
+                                enabled: settingsDialog.autoLevelMidtone
+                                onLoaded: {
+                                    settingsDialog.setLoaderProperty(midtoneTargetLoader, "text", settingsDialog.autoLevelMidtoneTarget.toFixed(2))
+                                    settingsDialog.connectLoaderSignal(midtoneTargetLoader, "editingFinished", function() {
+                                        var value = parseFloat(settingsDialog.loaderProperty(midtoneTargetLoader, "text", settingsDialog.autoLevelMidtoneTarget.toFixed(2)))
+                                        if (!isNaN(value) && value >= 0.2 && value <= 0.6) {
+                                            settingsDialog.autoLevelMidtoneTarget = value
+                                        }
+                                        settingsDialog.setLoaderProperty(midtoneTargetLoader, "text", settingsDialog.autoLevelMidtoneTarget.toFixed(2))
+                                    })
+                                }
+                                Binding {
+                                    target: midtoneTargetLoader.item
+                                    property: "text"
+                                    value: settingsDialog.autoLevelMidtoneTarget.toFixed(2)
+                                    when: midtoneTargetLoader.item && !settingsDialog.loaderProperty(midtoneTargetLoader, "activeFocus", false)
+                                }
+                            }
+
+                            Label {
+                                text: "Channel Clip Budget"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: channelBudgetHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: channelBudgetHover.containsMouse
+                                ToolTip.text: "How much each individual color channel may clip relative to the overall clip threshold (1-10x). 1.0 never clips any channel beyond the threshold (most conservative, a single saturated channel like a blue sky can block the stretch). Higher values allow a stronger stretch with mild per-channel clipping, softened by the highlight rolloff. Default: 3.0"
+                            }
+                            Loader {
+                                id: channelBudgetLoader
+                                sourceComponent: styledTextField
+                                Layout.preferredWidth: 80
+                                onLoaded: {
+                                    settingsDialog.setLoaderProperty(channelBudgetLoader, "text", settingsDialog.autoLevelChannelBudget.toFixed(1))
+                                    settingsDialog.connectLoaderSignal(channelBudgetLoader, "editingFinished", function() {
+                                        var value = parseFloat(settingsDialog.loaderProperty(channelBudgetLoader, "text", settingsDialog.autoLevelChannelBudget.toFixed(1)))
+                                        if (!isNaN(value) && value >= 1.0 && value <= 10.0) {
+                                            settingsDialog.autoLevelChannelBudget = value
+                                        }
+                                        settingsDialog.setLoaderProperty(channelBudgetLoader, "text", settingsDialog.autoLevelChannelBudget.toFixed(1))
+                                    })
+                                }
+                                Binding {
+                                    target: channelBudgetLoader.item
+                                    property: "text"
+                                    value: settingsDialog.autoLevelChannelBudget.toFixed(1)
+                                    when: channelBudgetLoader.item && !settingsDialog.loaderProperty(channelBudgetLoader, "activeFocus", false)
+                                }
+                            }
+
+                            Label {
+                                text: "Highlight Soft Rolloff"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: softKneeHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: softKneeHover.containsMouse
+                                ToolTip.text: "Compress stretched highlights and shadows smoothly instead of hard-clipping them. Preserves tonal separation and color in bright saturated areas (e.g. sunset clouds) when the blacks/whites sliders or auto-levels are active. Default: on"
+                            }
+                            CheckBox {
+                                id: softKneeCheck
+                                text: "Enabled"
+                                checked: settingsDialog.levelsSoftKnee
+                                onCheckedChanged: settingsDialog.levelsSoftKnee = checked
+                                contentItem: Text { text: softKneeCheck.text; color: settingsDialog.textColor; leftPadding: softKneeCheck.indicator.width + softKneeCheck.spacing; verticalAlignment: Text.AlignVCenter }
+                                indicator: Rectangle {
+                                    implicitWidth: 18; implicitHeight: 18
+                                    x: softKneeCheck.leftPadding; y: parent.height / 2 - height / 2
+                                    radius: 3
+                                    border.color: settingsDialog.accentColor
+                                    color: softKneeCheck.checked ? settingsDialog.accentColor : "transparent"
+                                    Text { text: "✓"; color: "white"; anchors.centerIn: parent; visible: softKneeCheck.checked; font.bold: true }
+                                }
+                            }
+
+                            Label {
+                                text: "Export Dithering"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: exportDitherHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: exportDitherHover.containsMouse
+                                ToolTip.text: "Add imperceptible noise when saving JPEGs with a strong levels stretch. Prevents visible banding in skies and smooth gradients caused by amplifying the source's 8-bit steps. Default: on"
+                            }
+                            CheckBox {
+                                id: exportDitherCheck
+                                text: "Enabled"
+                                checked: settingsDialog.exportDither
+                                onCheckedChanged: settingsDialog.exportDither = checked
+                                contentItem: Text { text: exportDitherCheck.text; color: settingsDialog.textColor; leftPadding: exportDitherCheck.indicator.width + exportDitherCheck.spacing; verticalAlignment: Text.AlignVCenter }
+                                indicator: Rectangle {
+                                    implicitWidth: 18; implicitHeight: 18
+                                    x: exportDitherCheck.leftPadding; y: parent.height / 2 - height / 2
+                                    radius: 3
+                                    border.color: settingsDialog.accentColor
+                                    color: exportDitherCheck.checked ? settingsDialog.accentColor : "transparent"
+                                    Text { text: "✓"; color: "white"; anchors.centerIn: parent; visible: exportDitherCheck.checked; font.bold: true }
+                                }
+                            }
                         }
 
                         Loader { sourceComponent: sectionSeparator }
@@ -957,6 +1135,41 @@ Window {
                                     property: "value"
                                     value: settingsDialog.awbStrength
                                     when: awbStrSlider.item && !settingsDialog.loaderProperty(awbStrSlider, "pressed", false)
+                                }
+                            }
+
+                            // Tint Damping
+                            Label {
+                                text: "Tint Correction (" + Math.round(settingsDialog.loaderProperty(awbTintDampSlider, "value", 0) * 100) + "%)"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: awbTintDampHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: awbTintDampHover.containsMouse
+                                ToolTip.text: "How much of the detected magenta/green (tint) cast to correct. Real light sources vary mostly along blue/yellow, so a large tint component is often subject color (foliage, flowers) rather than a cast. Lower values protect scenes without true neutrals; 100% applies the full tint correction. Default: 60%"
+                            }
+                            Loader {
+                                id: awbTintDampSlider
+                                sourceComponent: styledSlider
+                                Layout.fillWidth: true
+                                onLoaded: {
+                                    settingsDialog.setLoaderProperty(awbTintDampSlider, "from", 0.0)
+                                    settingsDialog.setLoaderProperty(awbTintDampSlider, "to", 1.0)
+                                    settingsDialog.setLoaderProperty(awbTintDampSlider, "stepSize", 0.05)
+                                    settingsDialog.setLoaderProperty(awbTintDampSlider, "value", settingsDialog.awbTintDamp)
+                                    settingsDialog.connectLoaderSignal(awbTintDampSlider, "valueChanged", function() {
+                                        settingsDialog.awbTintDamp = settingsDialog.loaderProperty(awbTintDampSlider, "value", settingsDialog.awbTintDamp)
+                                    })
+                                }
+                                Binding {
+                                    target: awbTintDampSlider.item
+                                    property: "value"
+                                    value: settingsDialog.awbTintDamp
+                                    when: awbTintDampSlider.item && !settingsDialog.loaderProperty(awbTintDampSlider, "pressed", false)
                                 }
                             }
 

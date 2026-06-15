@@ -848,8 +848,8 @@ ApplicationWindow {
             // Develop RAW (True Headroom)
             MenuActionItem {
                 width: 220
-                text: (root.uiStateRef && root.uiStateRef.hasWorkingTif) ? "Re-develop RAW" : "Develop RAW"
-                enabled: root.uiStateRef ? root.uiStateRef.hasRaw : false
+                text: (root.uiStateRef && root.uiStateRef.isRawDeveloping) ? "Developing RAW..." : ((root.uiStateRef && root.uiStateRef.hasWorkingTif) ? "Re-develop RAW" : "Develop RAW")
+                enabled: root.uiStateRef ? (root.uiStateRef.hasRaw && !root.uiStateRef.isRawDeveloping) : false
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
                 disabledTextColor: root.isDarkTheme ? "#666666" : "#999999"

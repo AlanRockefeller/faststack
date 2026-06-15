@@ -53,6 +53,33 @@ _AUTO_VIBRANCE_TARGET_SAT = 0.22
 _AUTO_VIBRANCE_SAT_CEILING = 0.18
 _AUTO_VIBRANCE_MIN_COLOR_DELTA = 0.015
 _AUTO_VIBRANCE_CLIP_TOLERANCE = 0.0001
+_AUTO_LEVELS_ANALYSIS_MAX_EDGE = 1920
+# Colorful-subject guard: median saturation can be low while a small subject
+# is already vivid. Scale the boost down as the 90th-percentile saturation
+# approaches full saturation so that subject is not pushed garish.
+_AUTO_VIBRANCE_P90_SOFT = 0.55
+_AUTO_VIBRANCE_P90_HARD = 0.85
+# Skin protection: halve the boost when a meaningful share of the analyzed
+# pixels falls in the skin-tone hue/saturation envelope.
+_AUTO_VIBRANCE_SKIN_FRACTION = 0.04
+_AUTO_VIBRANCE_SKIN_FACTOR = 0.5
+
+# Levels soft knee/toe: instead of hard-clipping the linear blacks/whites
+# ramp, values beyond the shoulder (or toe) are compressed smoothly so
+# stretched highlights keep tonal separation and hue instead of slamming each
+# channel to pure white/black independently. Spans are output-range fractions.
+_LEVELS_SHOULDER_SPAN = 0.05
+_LEVELS_TOE_SPAN = 0.02
+# Output values that correspond to a pre-soft-clip value of exactly 1.0 / 0.0:
+# shoulder(1.0) = knee + span*(1 - e^-1) = 1 - span*e^-1, toe(0.0) = toe*e^-1.
+# Used to count "effectively clipped" pixels whether or not the knee is active.
+_SOFT_CLIP_HI_MARK = 1.0 - _LEVELS_SHOULDER_SPAN * math.exp(-1.0)
+_SOFT_CLIP_LO_MARK = _LEVELS_TOE_SPAN * math.exp(-1.0)
+
+# Export dither: TPDF noise hides the 8-bit banding that appears when a
+# levels stretch amplifies the source's quantization steps. Only applied at
+# or above this stretch gain.
+_EXPORT_DITHER_MIN_GAIN = 1.2
 # Cap on the longest edge of the buffer analyze_auto_vibrance renders. The
 # recommendation only depends on aggregate saturation/clipping statistics, which
 # are stable under uniform downsampling, so bounding the resolution keeps the
@@ -86,6 +113,57 @@ def _float01_to_u8(arr: np.ndarray) -> np.ndarray:
     if cv2 is not None:
         return cv2.convertScaleAbs(clipped, alpha=255.0)
     return (clipped * 255).astype(np.uint8)
+
+
+def _apply_levels_soft_clip(arr: np.ndarray) -> np.ndarray:
+    """Soft shoulder/toe for the levels ramp (mutates ``arr`` in place).
+
+    The linear blacks/whites ramp sends out-of-range values past [0, 1] where
+    they would later hard-clip per channel — hue shifts in bright saturated
+    areas and abrupt steps in crushed shadows. Compress everything beyond the
+    shoulder/toe with an exponential rolloff that is C1-continuous at the
+    junction and asymptotes to the range limits, so a value of exactly 1.0
+    lands at ``_SOFT_CLIP_HI_MARK`` and strong overshoot still approaches 1.0.
+
+    Callers must pass an array they own (the levels ramp always allocates).
+    """
+    knee = 1.0 - _LEVELS_SHOULDER_SPAN
+    hi = arr > knee
+    if np.any(hi):
+        v = arr[hi]
+        # minimum() guards float32 rounding (knee + span can sum past 1.0)
+        arr[hi] = np.minimum(
+            knee
+            + _LEVELS_SHOULDER_SPAN
+            * (1.0 - np.exp((knee - v) / _LEVELS_SHOULDER_SPAN)),
+            1.0,
+        )
+    toe = _LEVELS_TOE_SPAN
+    lo = arr < toe
+    if np.any(lo):
+        v = arr[lo]
+        arr[lo] = np.maximum(toe * np.exp((v - toe) / toe), 0.0)
+    return arr
+
+
+def _normalized_wb_gains(by: float, mg: float) -> Tuple[float, float, float]:
+    """Linear-space WB channel gains, normalized to preserve luminance.
+
+    ``by``/``mg`` are the slider values already scaled by 0.5. The gains are
+    divided by their Rec.709-weighted sum so a neutral gray keeps its linear
+    luminance: white balance shifts hue only instead of also brightening or
+    darkening the image. Channel ratios (what the AWB estimator solves for)
+    are unaffected by the normalization.
+    """
+    r_gain = 1.0 + by
+    b_gain = 1.0 - by
+    g_gain = 1.0 - mg
+    luma_gain = 0.2126 * r_gain + 0.7152 * g_gain + 0.0722 * b_gain
+    if luma_gain > 1e-6:
+        r_gain /= luma_gain
+        g_gain /= luma_gain
+        b_gain /= luma_gain
+    return r_gain, g_gain, b_gain
 
 
 def _safe_replace(tmp_path: Path, target_path: Path) -> None:
@@ -640,13 +718,25 @@ class ImageEditor:
         self._cached_detail_bands: Optional[Dict[str, Any]] = None
 
         # Cached 768-entry LUT list for save_image_uint8_levels (R+G+B tables),
-        # keyed on (round(blacks, 3), round(whites, 3)).
-        self._cached_u8_lut: Optional[Tuple[Tuple[float, float], List[int]]] = None
+        # keyed on (round(blacks, 3), round(whites, 3), soft_knee).
+        self._cached_u8_lut: Optional[Tuple[Tuple[float, float, bool], List[int]]] = (
+            None
+        )
         self._cached_u8_wb_lut: Optional[Tuple[Tuple[float, float], List[int]]] = None
 
         # Mask subsystem — generic mask assets keyed by tool id
         self._mask_assets: Dict[str, MaskData] = {}
         self._mask_raster_cache = MaskRasterCache()
+
+        # Rendering preferences pushed in from AppController config:
+        # soft shoulder/toe on the levels ramp, and TPDF dither on 8-bit
+        # export when a strong levels stretch would band the source.
+        self.levels_soft_knee: bool = True
+        self.export_dither: bool = True
+
+        # Statistics from the most recent analyze_auto_levels() call
+        # (median luma etc.), read by the auto-adjust midtone recommendation.
+        self.last_auto_levels_stats: Dict[str, float] = {}
 
     def clear(self):
         """Clear all editor state so the next edit starts from a clean slate."""
@@ -923,9 +1013,7 @@ class ImageEditor:
             float_image_orientation_applied = False
 
             if jpeg_arr is not None:
-                orientation = get_exif_orientation(
-                    load_filepath, exif=jpeg_meta_exif
-                )
+                orientation = get_exif_orientation(load_filepath, exif=jpeg_meta_exif)
                 if orientation > 1:
                     # apply_orientation_to_np may return a non-contiguous view
                     jpeg_arr = np.ascontiguousarray(
@@ -1494,9 +1582,7 @@ class ImageEditor:
             by = edits.get("white_balance_by", 0.0) * 0.5
             mg = edits.get("white_balance_mg", 0.0) * 0.5
             if abs(by) > 0.001 or abs(mg) > 0.001:
-                r_gain = 1.0 + by
-                b_gain = 1.0 - by
-                g_gain = 1.0 - mg
+                r_gain, g_gain, b_gain = _normalized_wb_gains(by, mg)
                 arr[:, :, 0] *= r_gain
                 arr[:, :, 1] *= g_gain
                 arr[:, :, 2] *= b_gain
@@ -1830,6 +1916,9 @@ class ImageEditor:
             if abs(wp - bp) < 0.0001:
                 wp = bp + 0.0001
             arr = (arr - bp) / (wp - bp)
+            if self.levels_soft_knee:
+                # The ramp above allocates, so in-place soft clip is safe.
+                arr = _apply_levels_soft_clip(arr)
 
         # 13.5. Background Darkening (masked, after levels, before vignette)
         darken = edits.get("darken_settings")
@@ -1920,15 +2009,17 @@ class ImageEditor:
         )
 
     def auto_levels(
-        self, threshold_percent: float = 0.1
+        self, threshold_percent: float = 0.1, channel_budget: float = 3.0
     ) -> Tuple[float, float, float, float]:
         """
         Returns (blacks, whites, p_low, p_high).
-        p_low/p_high are computed conservatively from RGB to avoid introducing new channel clipping.
+        p_low/p_high are luma-driven with a per-channel clip budget so a single
+        saturated channel cannot veto the stretch (see analyze_auto_levels).
         """
         blacks, whites, p_low, p_high = self.analyze_auto_levels(
             threshold_percent,
             reset_levels=True,
+            channel_budget=channel_budget,
         )
 
         with self._lock:
@@ -1943,6 +2034,7 @@ class ImageEditor:
         *,
         edits: Optional[Dict[str, Any]] = None,
         reset_levels: bool = True,
+        channel_budget: float = 3.0,
     ) -> Tuple[float, float, float, float]:
         """Analyze auto-levels on the current edited baseline without mutating edits."""
         _debug = log.isEnabledFor(logging.DEBUG)
@@ -1952,12 +2044,37 @@ class ImageEditor:
         threshold_percent = max(0.0, min(10.0, threshold_percent))
 
         with self._lock:
-            img_arr = (
-                self.float_preview.copy()
-                if self.float_preview is not None
-                else (self.float_image.copy() if self.float_image is not None else None)
-            )
+            # Auto-levels is an aggregate percentile estimate. If the full
+            # master is already warm, sample it down before copying so analysis
+            # follows source pixels without rendering a 20MP+ buffer. If not,
+            # fall back to the preview so the first quick auto-adjust keypress
+            # remains preview-only. Final saves still apply the scalar edits to
+            # the full-resolution master.
+            source_arr = None
+            source_label = "none"
+            source_is_full = False
+            if self.float_image is not None:
+                source_arr = self.float_image
+                source_label = "full"
+                source_is_full = True
+            elif self.float_preview is not None:
+                source_arr = self.float_preview
+                source_label = "preview"
             edits_snapshot = dict(self.current_edits) if edits is None else dict(edits)
+
+        if source_arr is not None:
+            if source_is_full:
+                longest_edge = max(source_arr.shape[0], source_arr.shape[1])
+                stride = max(
+                    1,
+                    math.ceil(longest_edge / _AUTO_LEVELS_ANALYSIS_MAX_EDGE),
+                )
+                if stride > 1:
+                    source_arr = source_arr[::stride, ::stride, :]
+                    source_label = f"full/{stride}x"
+            img_arr = np.array(source_arr, dtype=np.float32, copy=True, order="C")
+        else:
+            img_arr = None
 
         if img_arr is None:
             # Fallback for tests or cases where float data isn't initialized yet
@@ -1966,6 +2083,7 @@ class ImageEditor:
                     np.array(self.original_image.convert("RGB")).astype(np.float32)
                     / 255.0
                 )
+                source_label = "pil"
             else:
                 return 0.0, 0.0, 0.0, 255.0
 
@@ -1979,45 +2097,57 @@ class ImageEditor:
             t_arr = time.perf_counter()
         edited_arr = self._apply_edits(img_arr, edits=edits_snapshot, for_export=False)
 
-        # Convert to uint8 (0-255) for histogram analysis
-        # This preserves the logic of the original algorithm which was tuned for 0-255 bins
-        rgb = (np.clip(edited_arr, 0.0, 1.0) * 255).astype(np.uint8)
+        # Quantize the float render to 10-bit bins for percentile analysis.
+        # 1024 bins resolve the endpoints ~4x finer than the legacy uint8
+        # histogram, which keeps black/white placement stable between the
+        # preview-sized analysis and the full-resolution export.
+        nbins = 1024
+        scaled = np.clip(edited_arr, 0.0, 1.0)
+        quantized = (scaled * (nbins - 1)).astype(np.uint16)
         if _debug:
             t_u8 = time.perf_counter()
 
-        low_p = threshold_percent
-        high_p = 100.0 - threshold_percent
+        bin_to_255 = 255.0 / (nbins - 1)
 
-        # --- Detect pre-clipping (per-channel) ---
-        # If *any* channel already has clipped pixels, do not push that end further.
-        # eps_pct strategy: "Practical" - ignore tiny hot pixels (0.01%) but pin
-        # if there is any meaningful pre-clipping, even if below the full threshold.
-        eps_pct = min(threshold_percent, 0.01)
+        # Per-channel clip budget: the luma percentiles drive the stretch,
+        # while each individual channel is allowed to clip up to
+        # channel_budget x threshold. A budget of 1.0 reproduces the old
+        # conservative min/max-channel anchors; larger budgets stop a single
+        # saturated channel (blue sky, red flower) from vetoing the whole
+        # stretch.
+        channel_budget = max(1.0, min(10.0, float(channel_budget)))
+        chan_t = min(50.0, threshold_percent * channel_budget)
 
-        total = rgb.shape[0] * rgb.shape[1]
-        clipped_low_pct = []
-        clipped_high_pct = []
-        p_lows = []
-        p_highs = []
-
+        # No explicit pre-clip pinning is needed: percentile ranks already
+        # count clipped pixels, so stretching to the q-th percentile keeps the
+        # *total* clipped fraction (pre-existing plus new) within the
+        # threshold rather than disabling the stretch outright the moment a
+        # few specular pixels sit at 255.
+        chan_lows = []
+        chan_highs = []
         for c in range(3):
-            chan = rgb[:, :, c]
-            hist = np.bincount(chan.reshape(-1), minlength=256)
-            # Treat near-white/near-black as clipped (JPEG artifacts often land on 254/1)
-            clipped_low_pct.append(100.0 * float(hist[0] + hist[1]) / float(total))
-            clipped_high_pct.append(100.0 * float(hist[254] + hist[255]) / float(total))
-            p_lows.append(self._u8_percentile_from_hist(hist, low_p, method="lower"))
-            p_highs.append(self._u8_percentile_from_hist(hist, high_p, method="higher"))
+            hist = np.bincount(quantized[:, :, c].reshape(-1), minlength=nbins)
+            chan_lows.append(self._percentile_from_hist(hist, chan_t, method="lower"))
+            chan_highs.append(
+                self._percentile_from_hist(hist, 100.0 - chan_t, method="higher")
+            )
 
-        # Conservative anchors to avoid new channel clipping
-        p_low = min(p_lows)
-        p_high = max(p_highs)
+        luma_q = (_rec601_gray(scaled) * (nbins - 1)).astype(np.uint16)
+        luma_hist = np.bincount(luma_q.reshape(-1), minlength=nbins)
+        luma_low = self._percentile_from_hist(
+            luma_hist, threshold_percent, method="lower"
+        )
+        luma_high = self._percentile_from_hist(
+            luma_hist, 100.0 - threshold_percent, method="higher"
+        )
+        median_luma = self._percentile_from_hist(luma_hist, 50.0, method="lower") / (
+            nbins - 1
+        )
 
-        # Pin ends if pre-clipping exists (prevents making it worse)
-        if max(clipped_high_pct) > eps_pct:
-            p_high = 255.0
-        if max(clipped_low_pct) > eps_pct:
-            p_low = 0.0
+        # Black point: luma-driven target, capped by the per-channel budgets.
+        p_low = min(luma_low, min(chan_lows)) * bin_to_255
+        # White point: luma-driven target, floored by the per-channel budgets.
+        p_high = max(luma_high, max(chan_highs)) * bin_to_255
 
         # Safety
         p_low = max(0.0, min(255.0, p_low))
@@ -2031,18 +2161,27 @@ class ImageEditor:
             blacks = -p_low / 40.0
             whites = (255.0 - p_high) / 40.0
 
+        with self._lock:
+            self.last_auto_levels_stats = {
+                "median_luma": float(median_luma),
+                "p_low": float(p_low),
+                "p_high": float(p_high),
+            }
+
         if _debug:
             t_end = time.perf_counter()
-            h, w = rgb.shape[:2]
+            h, w = scaled.shape[:2]
             log.debug(
-                "[AUTO_LEVEL] get_array=%dms render=%dms hist+clip=%dms total=%dms  (%dx%d, %s)",
+                "[AUTO_LEVEL] get_array=%dms render=%dms hist+clip=%dms total=%dms  "
+                "(%dx%d, %s, median_luma=%.3f)",
                 int((t_arr - t0) * 1000),
                 int((t_u8 - t_arr) * 1000),
                 int((t_end - t_u8) * 1000),
                 int((t_end - t0) * 1000),
                 w,
                 h,
-                "preview" if self.float_preview is not None else "full",
+                source_label,
+                median_luma,
             )
 
         return blacks, whites, float(p_low), float(p_high)
@@ -2135,6 +2274,41 @@ class ImageEditor:
             _AUTO_VIBRANCE_MAX,
             (_AUTO_VIBRANCE_TARGET_SAT - median_sat) * 0.9,
         )
+
+        # Colorful-subject guard: a gray-dominant scene with one vivid subject
+        # has a low *median* saturation, but boosting it pushes that subject
+        # toward garish. Fade the boost as the 90th-percentile saturation
+        # approaches full saturation.
+        p90_sat = float(np.percentile(useful_sat, 90))
+        if p90_sat > _AUTO_VIBRANCE_P90_SOFT:
+            guard = (_AUTO_VIBRANCE_P90_HARD - p90_sat) / (
+                _AUTO_VIBRANCE_P90_HARD - _AUTO_VIBRANCE_P90_SOFT
+            )
+            recommended *= max(0.0, min(1.0, guard))
+
+        # Skin protection: vibrance is hue-blind, and skin tolerates extra
+        # saturation poorly. When a meaningful share of the analyzed pixels
+        # sits in the skin-tone envelope (orange hue band, moderate
+        # saturation, mid luma), halve the boost.
+        r = rgb[:, :, 0]
+        g = rgb[:, :, 1]
+        b = rgb[:, :, 2]
+        hue_ratio = (g - b) / np.maximum(delta, 1e-6)
+        skin = (
+            useful
+            & (r >= g)
+            & (g > b)
+            & (delta > 0.02)
+            & (hue_ratio > 0.15)
+            & (hue_ratio < 0.8)
+            & (sat > 0.1)
+            & (sat < 0.65)
+        )
+        useful_count = max(1, int(np.count_nonzero(useful)))
+        skin_fraction = float(np.count_nonzero(skin)) / useful_count
+        if skin_fraction > _AUTO_VIBRANCE_SKIN_FRACTION:
+            recommended *= _AUTO_VIBRANCE_SKIN_FACTOR
+
         if recommended < _AUTO_VIBRANCE_MIN:
             return 0.0
 
@@ -2162,18 +2336,28 @@ class ImageEditor:
 
     @staticmethod
     def _channel_overshoot_fraction(arr: np.ndarray) -> float:
-        """Return fraction of pixels with any channel outside export range."""
+        """Return fraction of pixels with any channel effectively clipped.
+
+        With the levels soft knee active, values that would have hard-clipped
+        are compressed to just inside [0, 1]; the marks correspond to a
+        pre-soft-clip value of exactly 0.0 / 1.0, so this measures "would have
+        clipped" in both soft and hard modes. Comparisons using this are
+        differential (candidate vs. baseline), so legitimately near-black or
+        near-white content cancels out.
+        """
         if arr.size == 0:
             return 0.0
-        overshoot = np.any((arr < 0.0) | (arr > 1.0), axis=2)
+        overshoot = np.any(
+            (arr < _SOFT_CLIP_LO_MARK) | (arr > _SOFT_CLIP_HI_MARK), axis=2
+        )
         total = arr.shape[0] * arr.shape[1]
         return float(np.count_nonzero(overshoot)) / float(total)
 
     @staticmethod
-    def _u8_percentile_from_hist(
+    def _percentile_from_hist(
         hist: np.ndarray, percentile: float, method: str = "lower"
     ) -> float:
-        """Return a discrete uint8 percentile directly from histogram counts."""
+        """Return a discrete percentile (bin index) from histogram counts."""
         total = int(hist.sum())
         if total <= 0:
             return 0.0
@@ -2187,7 +2371,44 @@ class ImageEditor:
 
         cdf = np.cumsum(hist)
         value = int(np.searchsorted(cdf, target_index + 1, side="left"))
-        return float(max(0, min(255, value)))
+        return float(max(0, min(len(hist) - 1, value)))
+
+    def _crop_view_for_analysis(self, img_arr: np.ndarray) -> np.ndarray:
+        """Return a view of ``img_arr`` restricted to the active crop box.
+
+        Color statistics should describe the pixels the user is keeping, so
+        cropped-away borders/backgrounds cannot skew the estimate. The crop
+        box is defined after 90-degree rotation (a cheap numpy view that does
+        not change the pixel population); straighten is ignored because the
+        corner wedges are negligible for aggregate statistics.
+        """
+        with self._lock:
+            edits = dict(self.current_edits)
+        crop_box = edits.get("crop_box")
+        if not crop_box:
+            return img_arr
+        try:
+            if len(crop_box) != 4:
+                return img_arr
+            left_n, top_n, right_n, bottom_n = (float(v) for v in crop_box)
+        except (TypeError, ValueError):
+            return img_arr
+        if (left_n, top_n, right_n, bottom_n) == (0.0, 0.0, 1000.0, 1000.0):
+            return img_arr
+
+        try:
+            k = (int(edits.get("rotation", 0) or 0) % 360) // 90
+        except (TypeError, ValueError):
+            k = 0
+        view = np.rot90(img_arr, k=k) if k else img_arr
+        h, w = view.shape[:2]
+        left = max(0, min(w, int(left_n * w / 1000.0)))
+        top = max(0, min(h, int(top_n * h / 1000.0)))
+        right = max(0, min(w, int(right_n * w / 1000.0)))
+        bottom = max(0, min(h, int(bottom_n * h / 1000.0)))
+        if right - left < 32 or bottom - top < 32:
+            return img_arr
+        return view[top:bottom, left:right]
 
     def estimate_auto_white_balance(
         self,
@@ -2195,19 +2416,27 @@ class ImageEditor:
         strength: float = 0.7,
         warm_bias: int = 6,
         tint_bias: int = 0,
+        tint_damp: float = 0.6,
         luma_lower_bound: int = 30,
         luma_upper_bound: int = 220,
         rgb_lower_bound: int = 5,
         rgb_upper_bound: int = 250,
         target_pixels: int = 600_000,
     ) -> Optional[Dict[str, float]]:
-        """Estimate white-balance sliders from a robust preview-sized sample."""
+        """Estimate white-balance sliders from a robust preview-sized sample.
+
+        Combines a neutral-pixel weighted gray-world estimate with a
+        Shades-of-Gray (Minkowski) estimate, scales the applied strength by
+        confidence (neutral sample size and estimator agreement), and damps
+        the magenta/green axis since real illuminants vary mostly along
+        blue/yellow.
+        """
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
 
         img_arr = (
-            self.float_preview if self.float_preview is not None else self.float_image
+            self.float_image if self.float_image is not None else self.float_preview
         )
         if img_arr is None:
             if self.original_image is None:
@@ -2216,6 +2445,7 @@ class ImageEditor:
                 np.asarray(self.original_image.convert("RGB"), dtype=np.float32) / 255.0
             )
 
+        img_arr = self._crop_view_for_analysis(img_arr)
         h, w = img_arr.shape[:2]
         total_pixels = max(1, h * w)
         stride = max(1, int(math.sqrt(total_pixels / max(1, target_pixels))))
@@ -2232,6 +2462,10 @@ class ImageEditor:
 
         if not np.any(mask):
             return None
+
+        # Exposure-valid population before neutral narrowing; used by the
+        # secondary Shades-of-Gray estimator below.
+        broad_mask = mask
 
         spread = np.max(srgb, axis=2) - np.min(srgb, axis=2)
         chroma_ratio = spread / np.maximum(luma, 1.0 / 255.0)
@@ -2281,8 +2515,47 @@ class ImageEditor:
         g_gain_target = rb_target / max(g_mean, eps)
         mg_raw = 2.0 * (1.0 - g_gain_target)
 
-        by_value = (by_raw + (float(warm_bias) / 128.0)) * float(strength)
-        mg_value = (mg_raw + (float(tint_bias) / 128.0)) * float(strength)
+        # Secondary estimator: Shades-of-Gray (Minkowski p=6 mean) over the
+        # broad exposure-valid population. Its failure modes differ from the
+        # neutral-pixel estimate (it weights bright regions more), so
+        # agreement between the two is a confidence signal and blending
+        # tempers each one's biases.
+        by_sog: Optional[float] = None
+        mg_sog: Optional[float] = None
+        broad_linear = _srgb_to_linear(srgb[broad_mask]).astype(np.float32, copy=False)
+        if broad_linear.shape[0] >= 128 and np.isfinite(broad_linear).all():
+            p_norm = 6.0
+            sog = np.power(
+                np.mean(np.power(broad_linear, p_norm), axis=0), 1.0 / p_norm
+            )
+            sog_r, sog_g, sog_b = (float(v) for v in sog)
+            if min(sog_r, sog_g, sog_b) > eps:
+                ratio_rb_sog = sog_b / sog_r
+                by_sog = 2.0 * (ratio_rb_sog - 1.0) / max(ratio_rb_sog + 1.0, eps)
+                rb_target_sog = 2.0 * sog_r * sog_b / max(sog_r + sog_b, eps)
+                mg_sog = 2.0 * (1.0 - rb_target_sog / sog_g)
+
+        confidence = 1.0
+        if by_sog is not None and mg_sog is not None:
+            disagreement = max(abs(by_raw - by_sog), abs(mg_raw - mg_sog))
+            confidence = float(np.clip(1.25 - 2.5 * disagreement, 0.4, 1.0))
+            by_raw = 0.7 * by_raw + 0.3 * by_sog
+            mg_raw = 0.7 * mg_raw + 0.3 * mg_sog
+
+        # Few usable neutral pixels means an unreliable estimate; fade the
+        # correction toward identity instead of failing or over-correcting.
+        confidence *= float(np.clip((selected_count - 64) / 2000.0, 0.0, 1.0))
+        if confidence <= 0.0:
+            return None
+
+        # Real illuminants vary mostly along the blue/yellow (Planckian)
+        # axis; a large magenta/green component is more often subject color
+        # than color cast, so damp the tint axis.
+        mg_raw *= float(np.clip(tint_damp, 0.0, 1.0))
+
+        effective_strength = float(strength) * confidence
+        by_value = (by_raw + (float(warm_bias) / 128.0)) * effective_strength
+        mg_value = (mg_raw + (float(tint_bias) / 128.0)) * effective_strength
 
         by_value = float(np.clip(by_value, -1.0, 1.0))
         mg_value = float(np.clip(mg_value, -1.0, 1.0))
@@ -2290,7 +2563,9 @@ class ImageEditor:
         if _debug:
             t_end = time.perf_counter()
             log.debug(
-                "[AUTO_WB_EST] total=%dms sample=%dx%d stride=%d selected=%d neutral<=%.3f means=(%.4f, %.4f, %.4f) wb=(%.4f, %.4f)",
+                "[AUTO_WB_EST] total=%dms sample=%dx%d stride=%d selected=%d "
+                "neutral<=%.3f means=(%.4f, %.4f, %.4f) sog=(%s, %s) "
+                "confidence=%.2f wb=(%.4f, %.4f)",
                 int((t_end - t0) * 1000),
                 srgb.shape[1],
                 srgb.shape[0],
@@ -2300,6 +2575,9 @@ class ImageEditor:
                 r_mean,
                 g_mean,
                 b_mean,
+                f"{by_sog:.4f}" if by_sog is not None else "n/a",
+                f"{mg_sog:.4f}" if mg_sog is not None else "n/a",
+                confidence,
                 by_value,
                 mg_value,
             )
@@ -2313,6 +2591,7 @@ class ImageEditor:
             "selected_pixels": float(selected_count),
             "stride": float(stride),
             "neutrality_limit": neutrality_limit,
+            "confidence": confidence,
         }
 
     def _get_upstream_edits_hash(self, edits: Dict[str, Any]) -> int:
@@ -2412,7 +2691,11 @@ class ImageEditor:
             # is only ever reassigned, never mutated in place, so the render
             # can share it; protect_input copies only the post-crop region.
             base = self.float_preview
-            edits = dict(self.current_edits) if edits_override is None else dict(edits_override)
+            edits = (
+                dict(self.current_edits)
+                if edits_override is None
+                else dict(edits_override)
+            )
             icc_bytes = (
                 self.original_image.info.get("icc_profile")
                 if self.original_image is not None
@@ -2539,7 +2822,11 @@ class ImageEditor:
             # float_image is only ever reassigned, never mutated in place, so
             # rendering from the shared reference outside the lock is safe.
             base = self.float_image
-            edits = dict(self.current_edits) if edits_override is None else dict(edits_override)
+            edits = (
+                dict(self.current_edits)
+                if edits_override is None
+                else dict(edits_override)
+            )
             icc_bytes = (
                 self.original_image.info.get("icc_profile")
                 if self.original_image is not None
@@ -3284,6 +3571,42 @@ class ImageEditor:
             "mask_assets": mask_assets_snapshot,
         }
 
+    def _dither_for_export(
+        self, final_float: np.ndarray, edits: Dict[str, Any]
+    ) -> np.ndarray:
+        """Add ±1 LSB TPDF dither before 8-bit quantization when warranted.
+
+        A strong blacks/whites stretch amplifies the source's 8-bit
+        quantization steps into visible banding (skies, gradients). Triangular
+        noise decorrelates the quantization error and hides the bands. The
+        noise plane is shared across channels (luminance-only, no chroma
+        speckle) and the RNG is seeded so identical edits export identical
+        bytes. Returns a new array; the input snapshot buffer is not mutated.
+        """
+        if not self.export_dither:
+            return final_float
+        try:
+            blacks = float(edits.get("blacks", 0.0))
+            whites = float(edits.get("whites", 0.0))
+        except (TypeError, ValueError):
+            return final_float
+        bp = -blacks * 0.15
+        wp = 1.0 - (whites * 0.15)
+        gain = 1.0 / max(wp - bp, 1e-4)
+        if gain < _EXPORT_DITHER_MIN_GAIN:
+            return final_float
+
+        h, w = final_float.shape[:2]
+        rng = np.random.default_rng(0x5EED)
+        noise = rng.random((h, w), dtype=np.float32)
+        noise -= rng.random((h, w), dtype=np.float32)
+        noise *= 1.0 / 255.0
+        log.debug(
+            "[EXPORT_DITHER] applied TPDF dither (levels gain %.2f)",
+            gain,
+        )
+        return final_float + noise[..., None]
+
     def save_from_snapshot(
         self, snapshot: Dict[str, Any]
     ) -> Optional[Tuple[Path, Path]]:
@@ -3347,6 +3670,13 @@ class ImageEditor:
             # 3. Save Main File
             is_tiff = original_path.suffix.lower() in [".tif", ".tiff"]
 
+            # 8-bit outputs (main JPEG and/or developed JPG) share one
+            # dithered buffer; the 16-bit TIFF path stays undithered.
+            if not is_tiff or write_developed_jpg:
+                dithered_float = self._dither_for_export(final_float, edits_snapshot)
+            else:
+                dithered_float = final_float
+
             if is_tiff:
                 tmp_path = original_path.with_name(
                     f".{original_path.stem}_{uuid.uuid4().hex[:8]}{original_path.suffix}"
@@ -3358,7 +3688,7 @@ class ImageEditor:
                     tmp_path.unlink(missing_ok=True)
                     raise
             else:
-                arr_u8 = _float01_to_u8(final_float)
+                arr_u8 = _float01_to_u8(dithered_float)
                 img_u8 = Image.fromarray(arr_u8, mode="RGB")
 
                 save_kwargs = {"quality": 95}
@@ -3399,7 +3729,7 @@ class ImageEditor:
                 elif source_exif:
                     exif_bytes = sanitize_exif_orientation(source_exif)
 
-                arr_u8 = _float01_to_u8(final_float)
+                arr_u8 = _float01_to_u8(dithered_float)
                 img_u8 = Image.fromarray(arr_u8)
 
                 dev_kwargs = {"quality": 90}
@@ -3570,12 +3900,23 @@ class ImageEditor:
         if abs(blacks) <= 0.001 and abs(whites) <= 0.001:
             return None
 
+        bp = -blacks * 0.15
+        wp = 1.0 - (whites * 0.15)
+        if abs(wp - bp) < 0.0001:
+            wp = bp + 0.0001
+
+        # A LUT cannot dither (it is pointwise), so when the stretch is strong
+        # enough to band 8-bit sources, decline the fast path and let the
+        # float pipeline add TPDF dither during quantization.
+        if self.export_dither and 1.0 / max(wp - bp, 1e-4) >= _EXPORT_DITHER_MIN_GAIN:
+            return None
+
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
 
         # Build 768-entry LUT matching _apply_edits step 13 (cached by rounded key)
-        cache_key = (round(blacks, 3), round(whites, 3))
+        cache_key = (round(blacks, 3), round(whites, 3), bool(self.levels_soft_knee))
         with self._lock:
             cached = self._cached_u8_lut
             if cached is not None and cached[0] == cache_key:
@@ -3584,12 +3925,10 @@ class ImageEditor:
                 lut_rgb = None
 
         if lut_rgb is None:
-            bp = -blacks * 0.15
-            wp = 1.0 - (whites * 0.15)
-            if abs(wp - bp) < 0.0001:
-                wp = bp + 0.0001
             lut = np.arange(256, dtype=np.float32) / 255.0
             lut = (lut - bp) / (wp - bp)
+            if self.levels_soft_knee:
+                lut = _apply_levels_soft_clip(lut)
             lut = np.clip(lut, 0.0, 1.0)
             lut_rgb = (lut * 255.0).astype(np.uint8).tolist() * 3  # 768 entries
             with self._lock:
@@ -3674,11 +4013,11 @@ class ImageEditor:
                 lut_rgb = None
 
         if lut_rgb is None:
-            by_scaled = by * 0.5
-            mg_scaled = mg * 0.5
-            r_gain = max(0.0, 1.0 + by_scaled)
-            g_gain = max(0.0, 1.0 - mg_scaled)
-            b_gain = max(0.0, 1.0 - by_scaled)
+            # Must match _apply_edits step 5 (luma-preserving gains).
+            r_gain, g_gain, b_gain = _normalized_wb_gains(by * 0.5, mg * 0.5)
+            r_gain = max(0.0, r_gain)
+            g_gain = max(0.0, g_gain)
+            b_gain = max(0.0, b_gain)
 
             lut = np.arange(256, dtype=np.float32) / 255.0
             lut_linear = _srgb_to_linear(lut)
