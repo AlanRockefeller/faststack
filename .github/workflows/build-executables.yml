@@ -1,0 +1,75 @@
+name: Build Executables
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            python_architecture: x64
+            artifact: windows-x64
+          - os: macos-15-intel
+            python_architecture: x64
+            artifact: macos-x64
+          - os: macos-15
+            python_architecture: arm64
+            artifact: macos-arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.python_architecture }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[bundle]" ruff
+
+      - name: Run Ruff
+        run: python -m ruff check faststack/
+
+      - name: Build executable
+        run: python -m PyInstaller packaging/faststack.spec --noconfirm --clean
+
+      - name: Ad-hoc sign macOS app
+        if: runner.os == 'macOS'
+        run: codesign --force --deep --sign - dist/FastStack.app
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts
+          Compress-Archive -Path dist\FastStack -DestinationPath artifacts\FastStack-${{ matrix.artifact }}.zip -Force
+
+      - name: Package macOS artifact
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent dist/FastStack.app artifacts/FastStack-${{ matrix.artifact }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: FastStack-${{ matrix.artifact }}
+          path: artifacts/*.zip
+          if-no-files-found: error

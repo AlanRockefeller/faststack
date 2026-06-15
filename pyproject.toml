@@ -37,6 +37,9 @@ dev = [
     "build",
     "twine",
 ]
+bundle = [
+    "pyinstaller>=6.15,<7.0",
+]
 
 [project.scripts]
 faststack = "faststack.app:cli"

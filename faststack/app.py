@@ -86,6 +86,7 @@ from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, _safe_replace
 from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
 from faststack.imaging.mask_engine import inverse_transform
 from faststack.imaging.metadata import get_exif_data
+from faststack.resources import faststack_qml_dir, pyside_qml_dir
 from faststack.thumbnail_view import (
     DEFAULT_THUMBNAIL_CACHE_BYTES,
     ThumbnailModel,
@@ -12281,7 +12282,15 @@ def main(
     log.info("Starting FastStack")
 
     os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
-    os.environ["QML2_IMPORT_PATH"] = os.path.join(os.path.dirname(__file__), "qml")
+    app_qml_dir = faststack_qml_dir()
+    qt_qml_dir = pyside_qml_dir()
+    qml_import_paths = [str(app_qml_dir)]
+    if qt_qml_dir is not None:
+        qml_import_paths.append(str(qt_qml_dir))
+    existing_qml_import_path = os.environ.get("QML2_IMPORT_PATH")
+    if existing_qml_import_path:
+        qml_import_paths.append(existing_qml_import_path)
+    os.environ["QML2_IMPORT_PATH"] = os.pathsep.join(qml_import_paths)
 
     app = QApplication(
         sys.argv
@@ -12332,13 +12341,13 @@ def main(
     app.setApplicationName("FastStack")
 
     engine = QQmlApplicationEngine()
-    engine.addImportPath(os.path.join(os.path.dirname(PySide6.__file__), "qml"))
+    engine.addImportPath(str(app_qml_dir))
+    if qt_qml_dir is not None:
+        engine.addImportPath(str(qt_qml_dir))
+        qt5compat_path = qt_qml_dir / "Qt5Compat"
+        if qt5compat_path.is_dir():
+            engine.addImportPath(str(qt5compat_path))
     engine.addImportPath("qrc:/qt-project.org/imports")
-    engine.addImportPath(os.path.join(os.path.dirname(__file__), "qml"))
-    # Add the path to Qt5Compat.GraphicalEffects to QML import paths
-    engine.addImportPath(
-        os.path.join(os.path.dirname(PySide6.__file__), "qml", "Qt5Compat")
-    )
 
     controller = AppController(
         image_dir=image_dir_path,
@@ -12361,7 +12370,7 @@ def main(
     context.setContextProperty("controller", controller)
     context.setContextProperty("thumbnailModel", controller._thumbnail_model)
 
-    qml_file = Path(__file__).parent / "qml" / "Main.qml"
+    qml_file = app_qml_dir / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_file)))
     if debug:
         log.info("Startup: after engine.load(QML): %.3fs", time.perf_counter() - t0)
