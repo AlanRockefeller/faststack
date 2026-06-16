@@ -105,6 +105,19 @@ Automatic installation is intentionally disabled for source/virtualenv installs
 because a running Python app cannot reliably replace its own environment across
 Windows, Linux, and macOS.
 
+### Maintainer Release Builds
+
+Windows and macOS binaries are built by GitHub Actions from `v*` tags. From a
+clean checkout after the intended changes are merged to `main`, run:
+
+```bash
+./build-release.sh
+```
+
+The script creates the next `v<version>-buildN` tag on `origin/main`, pushes it,
+and the workflow publishes the Windows and macOS ZIP files to the GitHub Release
+for that tag.
+
 ### Command Line Options
 
 ```text
