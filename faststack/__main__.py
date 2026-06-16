@@ -1,4 +1,4 @@
-from .app import cli
+from faststack.app import cli
 
 if __name__ == "__main__":
     cli()
