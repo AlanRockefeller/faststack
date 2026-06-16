@@ -91,7 +91,7 @@ from FastStack and update from the checkout:
 
 ```bash
 git pull
-.venv/Scripts/python.exe -m pip install -e .
+venv/Scripts/python.exe -m pip install -e .
 ```
 
 On Linux or macOS, use the Python executable from the active virtualenv:

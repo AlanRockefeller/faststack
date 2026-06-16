@@ -6267,6 +6267,8 @@ class AppController(QObject):
     def check_for_updates(self, manual=False):
         """Check GitHub Releases for a newer FastStack version."""
         manual = bool(manual)
+        if self._shutting_down:
+            return
         if self._update_check_inflight:
             if manual:
                 self.update_status_message("Update check already running")
@@ -6288,12 +6290,19 @@ class AppController(QObject):
             self.update_status_message("Checking for updates...")
 
         current_version = get_current_version()
-        future = self._update_executor.submit(
-            check_for_update,
-            current_version=current_version,
-        )
+        try:
+            future = self._update_executor.submit(
+                check_for_update,
+                current_version=current_version,
+            )
+        except RuntimeError as e:
+            self._update_check_inflight = False
+            log.warning("Could not start update check: %s", e)
+            return
 
         def _done(fut):
+            if self._shutting_down:
+                return
             try:
                 payload = fut.result().to_qml_dict()
                 payload["error"] = ""
@@ -6309,6 +6318,8 @@ class AppController(QObject):
                 }
             payload["manual"] = manual
             payload["token"] = token
+            if self._shutting_down:
+                return
             self._updateCheckFinished.emit(payload)
 
         future.add_done_callback(_done)

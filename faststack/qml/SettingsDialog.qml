@@ -804,7 +804,7 @@ Window {
                                 id: autoUpdateBox
                                 text: "Unavailable"
                                 enabled: false
-                                checked: false
+                                checked: settingsDialog.autoUpdateEnabled
                                 opacity: 0.55
                                 hoverEnabled: true
                                 ToolTip.visible: hovered
@@ -830,6 +830,7 @@ Window {
                                 flat: true
                                 onClicked: {
                                     if (settingsDialog.controllerRef) {
+                                        settingsDialog.visible = false
                                         settingsDialog.controllerRef.check_for_updates(true)
                                     }
                                 }

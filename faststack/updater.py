@@ -167,6 +167,11 @@ def check_for_update(
     """Check GitHub Releases and return normalized update information."""
     current = current_version or get_current_version()
     payload = fetch_latest_release(timeout=timeout)
+    if not isinstance(payload, dict):
+        raise UpdateCheckError(
+            f"GitHub returned an unexpected release payload shape: "
+            f"{type(payload).__name__}"
+        )
 
     tag_name = str(payload.get("tag_name") or "").strip()
     latest_version = normalize_version(tag_name)
