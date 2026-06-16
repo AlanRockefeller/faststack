@@ -2560,6 +2560,8 @@ class AppController(QObject):
             "p_high": float(state.p_high),
             "base_vibrance": float(state.base_vibrance),
             "auto_vibrance_delta": float(state.auto_vibrance_delta),
+            "base_brightness": float(state.base_brightness),
+            "auto_brightness_delta": float(state.auto_brightness_delta),
             "extra_highlight_steps": int(state.extra_highlight_steps),
             "extra_black_steps": int(state.extra_black_steps),
         }
@@ -2587,6 +2589,10 @@ class AppController(QObject):
                 p_high=float(serialized.get("p_high", 255.0)),
                 base_vibrance=float(serialized.get("base_vibrance", 0.0)),
                 auto_vibrance_delta=float(serialized.get("auto_vibrance_delta", 0.0)),
+                base_brightness=float(serialized.get("base_brightness", 0.0)),
+                auto_brightness_delta=float(
+                    serialized.get("auto_brightness_delta", 0.0)
+                ),
                 extra_highlight_steps=int(serialized.get("extra_highlight_steps", 0)),
                 extra_black_steps=int(serialized.get("extra_black_steps", 0)),
             )
