@@ -38,6 +38,8 @@ Window {
     property string photoshopPath: ""
     property string rawtherapeePath: ""
     property string optimizeFor: "speed"
+    property bool updateCheckEnabled: true
+    property bool autoUpdateEnabled: false
 
     property string awbMode: "lab"
     property double awbStrength: 0.7
@@ -142,6 +144,8 @@ Window {
             settingsDialog.theme = settingsDialog.uiStateRef.theme
             settingsDialog.defaultDirectory = settingsDialog.uiStateRef.get_default_directory()
             settingsDialog.optimizeFor = settingsDialog.uiStateRef.get_optimize_for()
+            settingsDialog.updateCheckEnabled = settingsDialog.uiStateRef.get_update_check_enabled()
+            settingsDialog.autoUpdateEnabled = settingsDialog.uiStateRef.get_auto_update_enabled()
             settingsDialog.autoLevelClippingThreshold = settingsDialog.uiStateRef.autoLevelClippingThreshold
             settingsDialog.autoLevelStrength = settingsDialog.uiStateRef.autoLevelStrength
             settingsDialog.autoLevelStrengthAuto = settingsDialog.uiStateRef.autoLevelStrengthAuto
@@ -201,6 +205,8 @@ Window {
         state.set_theme(settingsDialog.theme)
         state.set_default_directory(settingsDialog.defaultDirectory)
         state.set_optimize_for(settingsDialog.optimizeFor)
+        state.set_update_check_enabled(settingsDialog.updateCheckEnabled)
+        state.set_auto_update_enabled(settingsDialog.autoUpdateEnabled)
         state.autoLevelClippingThreshold = settingsDialog.autoLevelClippingThreshold
         state.autoLevelStrength = settingsDialog.autoLevelStrength
         state.autoLevelStrengthAuto = settingsDialog.autoLevelStrengthAuto
@@ -753,6 +759,83 @@ Window {
                                 }
                                 contentItem: Text { text: themeCombo.displayText; color: settingsDialog.textColor; verticalAlignment: Text.AlignVCenter; leftPadding: 10 }
                                 background: Rectangle { color: "#10ffffff"; border.color: settingsDialog.controlBorder; radius: 4 }
+                            }
+                        }
+
+                        Loader { sourceComponent: sectionSeparator }
+
+                        Loader {
+                            sourceComponent: sectionHeader
+                            onLoaded: item.text = "Updates"
+                        }
+
+                        GridLayout {
+                            columns: 2
+                            columnSpacing: 20
+                            rowSpacing: 12
+                            Layout.fillWidth: true
+
+                            Label {
+                                text: "Check for Updates"
+                                color: settingsDialog.textColor
+                            }
+                            CheckBox {
+                                id: updateCheckBox
+                                text: "Enabled"
+                                checked: settingsDialog.updateCheckEnabled
+                                onCheckedChanged: settingsDialog.updateCheckEnabled = checked
+                                contentItem: Text { text: updateCheckBox.text; color: settingsDialog.textColor; leftPadding: updateCheckBox.indicator.width + updateCheckBox.spacing; verticalAlignment: Text.AlignVCenter }
+                                indicator: Rectangle {
+                                    implicitWidth: 18; implicitHeight: 18
+                                    x: updateCheckBox.leftPadding; y: parent.height / 2 - height / 2
+                                    radius: 3
+                                    border.color: settingsDialog.accentColor
+                                    color: updateCheckBox.checked ? settingsDialog.accentColor : "transparent"
+                                    Text { text: "✓"; color: "white"; anchors.centerIn: parent; visible: updateCheckBox.checked; font.bold: true }
+                                }
+                            }
+
+                            Label {
+                                text: "Install Updates Automatically"
+                                color: settingsDialog.textColor
+                                opacity: 0.55
+                            }
+                            CheckBox {
+                                id: autoUpdateBox
+                                text: "Unavailable"
+                                enabled: false
+                                checked: settingsDialog.autoUpdateEnabled
+                                opacity: 0.55
+                                hoverEnabled: true
+                                ToolTip.visible: hovered
+                                ToolTip.delay: 500
+                                ToolTip.text: "Automatic installation is disabled for source and virtualenv installs. FastStack can open the GitHub release page instead."
+                                contentItem: Text { text: autoUpdateBox.text; color: settingsDialog.textColor; leftPadding: autoUpdateBox.indicator.width + autoUpdateBox.spacing; verticalAlignment: Text.AlignVCenter }
+                                indicator: Rectangle {
+                                    implicitWidth: 18; implicitHeight: 18
+                                    x: autoUpdateBox.leftPadding; y: parent.height / 2 - height / 2
+                                    radius: 3
+                                    border.color: settingsDialog.controlBorder
+                                    color: "transparent"
+                                }
+                            }
+
+                            Label {
+                                text: "Manual Check"
+                                color: settingsDialog.textColor
+                            }
+                            Button {
+                                id: updateCheckNowButton
+                                text: "Check Now"
+                                flat: true
+                                onClicked: {
+                                    if (settingsDialog.controllerRef) {
+                                        settingsDialog.visible = false
+                                        settingsDialog.controllerRef.check_for_updates(true)
+                                    }
+                                }
+                                background: Rectangle { color: updateCheckNowButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: updateCheckNowButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                             }
                         }
                         

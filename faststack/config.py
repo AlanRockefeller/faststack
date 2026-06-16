@@ -125,6 +125,12 @@ DEFAULT_CONFIG = {
         "source_dir": "C:\\Users\\alanr\\pictures\\olympus.stack.input.photos",
         "mirror_base": "C:\\Users\\alanr\\Pictures\\Lightroom",
     },
+    "updates": {
+        "check_for_updates": "true",
+        "auto_update": "false",
+        "last_check_at": "",
+        "last_ignored_version": "",
+    },
 }
 
 

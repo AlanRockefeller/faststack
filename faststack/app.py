@@ -10,7 +10,7 @@ import time
 import argparse
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Set
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import os
 import re
 import shutil
@@ -30,7 +30,7 @@ import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
 import PySide6
-from PySide6.QtGui import QDrag, QPixmap
+from PySide6.QtGui import QDesktopServices, QDrag, QPixmap
 from PySide6.QtCore import (
     QUrl,
     QTimer,
@@ -87,6 +87,7 @@ from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
 from faststack.imaging.mask_engine import inverse_transform
 from faststack.imaging.metadata import get_exif_data
 from faststack.resources import faststack_qml_dir, pyside_qml_dir
+from faststack.updater import check_for_update, get_current_version
 from faststack.thumbnail_view import (
     DEFAULT_THUMBNAIL_CACHE_BYTES,
     ThumbnailModel,
@@ -230,6 +231,7 @@ class AppController(QObject):
         object
     )  # Signal for async delete completion (result dict from worker)
     _exifBriefReady = Signal(object, str)  # (cache_key, brief) from background thread
+    _updateCheckFinished = Signal(object)  # Update check result from background thread
 
     def __init__(
         self,
@@ -291,6 +293,12 @@ class AppController(QObject):
         self._editor_prewarm_executor = create_daemon_threadpool_executor(
             max_workers=1, thread_name_prefix="EditPrewarm"
         )
+        self._update_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="UpdateCheck"
+        )
+        self._updateCheckFinished.connect(self._on_update_check_finished)
+        self._update_check_token = 0
+        self._update_check_inflight = False
         self._preview_inflight = False
         self._preview_pending = False
         self._preview_token = 0
@@ -6206,6 +6214,173 @@ class AppController(QObject):
         config.save()
 
     @Slot(result=str)
+    def get_current_version(self):
+        return get_current_version()
+
+    @Slot(result=bool)
+    def get_update_check_enabled(self):
+        return config.getboolean("updates", "check_for_updates", True)
+
+    @Slot(bool)
+    def set_update_check_enabled(self, enabled):
+        config.set("updates", "check_for_updates", "true" if enabled else "false")
+        config.save()
+
+    @Slot(result=bool)
+    def get_auto_update_enabled(self):
+        return config.getboolean("updates", "auto_update", False)
+
+    @Slot(bool)
+    def set_auto_update_enabled(self, enabled):
+        # Source/venv installs cannot be safely self-updated yet. Persist false
+        # so the setting exists without promising unavailable behavior.
+        config.set("updates", "auto_update", "false")
+        config.save()
+
+    def _last_update_check_time(self) -> Optional[datetime]:
+        raw_value = config.get("updates", "last_check_at", fallback="").strip()
+        if not raw_value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw_value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    @Slot()
+    def maybe_check_for_updates(self):
+        """Run the automatic update check if enabled and outside the cooldown."""
+        if not self.get_update_check_enabled():
+            return
+
+        last_check = self._last_update_check_time()
+        if last_check is not None:
+            elapsed = datetime.now(timezone.utc) - last_check
+            if elapsed.total_seconds() < 24 * 60 * 60:
+                return
+
+        self.check_for_updates(False)
+
+    @Slot(bool)
+    def check_for_updates(self, manual=False):
+        """Check GitHub Releases for a newer FastStack version."""
+        manual = bool(manual)
+        if self._shutting_down:
+            return
+        if self._update_check_inflight:
+            if manual:
+                self.update_status_message("Update check already running")
+            return
+        if not manual and not self.get_update_check_enabled():
+            return
+
+        self._update_check_inflight = True
+        self._update_check_token += 1
+        token = self._update_check_token
+        config.set(
+            "updates",
+            "last_check_at",
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+        config.save()
+
+        if manual:
+            self.update_status_message("Checking for updates...")
+
+        current_version = get_current_version()
+        try:
+            future = self._update_executor.submit(
+                check_for_update,
+                current_version=current_version,
+            )
+        except RuntimeError as e:
+            self._update_check_inflight = False
+            log.warning("Could not start update check: %s", e)
+            return
+
+        def _done(fut):
+            if self._shutting_down:
+                return
+            try:
+                payload = fut.result().to_qml_dict()
+                payload["error"] = ""
+            except Exception as e:
+                log.warning("Update check failed: %s", e)
+                payload = {
+                    "currentVersion": current_version,
+                    "latestVersion": "",
+                    "releaseUrl": "",
+                    "summary": "",
+                    "isNewer": False,
+                    "error": str(e),
+                }
+            payload["manual"] = manual
+            payload["token"] = token
+            if self._shutting_down:
+                return
+            self._updateCheckFinished.emit(payload)
+
+        future.add_done_callback(_done)
+
+    @Slot(object)
+    def _on_update_check_finished(self, payload):
+        if self._shutting_down:
+            return
+        if int(payload.get("token", -1)) != self._update_check_token:
+            return
+
+        self._update_check_inflight = False
+        manual = bool(payload.get("manual", False))
+        error = str(payload.get("error") or "")
+        if error:
+            if manual:
+                self.update_status_message(
+                    f"Could not check for updates: {error}", 6000
+                )
+            return
+
+        current_version = str(payload.get("currentVersion") or get_current_version())
+        latest_version = str(payload.get("latestVersion") or "")
+        if payload.get("isNewer"):
+            ignored_version = config.get(
+                "updates", "last_ignored_version", fallback=""
+            ).strip()
+            if not manual and latest_version == ignored_version:
+                log.info("Update %s is available but skipped by user.", latest_version)
+                return
+
+            if self.main_window and hasattr(self.main_window, "openUpdateDialog"):
+                self.main_window.openUpdateDialog(payload)
+            else:
+                self.update_status_message(
+                    f"FastStack {latest_version} is available", 8000
+                )
+            return
+
+        if manual:
+            self.update_status_message(f"FastStack {current_version} is up to date")
+
+    @Slot(str)
+    def skip_update_version(self, version):
+        version = str(version or "").strip()
+        if not version:
+            return
+        config.set("updates", "last_ignored_version", version)
+        config.save()
+        self.update_status_message(f"Skipped FastStack {version}")
+
+    @Slot(str)
+    def open_update_release(self, url):
+        url = str(url or "").strip()
+        if not url:
+            self.update_status_message("No update release URL available")
+            return
+        if not QDesktopServices.openUrl(QUrl(url)):
+            self.update_status_message("Could not open update release page", 5000)
+
+    @Slot(result=str)
     def get_color_mode(self):
         """Returns current color management mode: 'none', 'saturation', or 'icc'."""
         return config.get("color", "mode", fallback="none")
@@ -8552,6 +8727,11 @@ class AppController(QObject):
         self._safe_shutdown_executor(
             getattr(self, "_editor_prewarm_executor", None),
             "editor prewarm",
+            wait=False,
+        )
+        self._safe_shutdown_executor(
+            getattr(self, "_update_executor", None),
+            "update",
             wait=False,
         )
         # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
@@ -12397,6 +12577,7 @@ def main(
         0,
         lambda: controller.load(skip_thumbnail_refresh=start_in_loupe),
     )
+    QTimer.singleShot(2000, controller.maybe_check_for_updates)
     if debug:
         log.info(
             "Startup: controller.load() deferred to event loop (%.3fs to window)",

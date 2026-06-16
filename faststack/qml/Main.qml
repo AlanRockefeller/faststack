@@ -161,6 +161,11 @@ ApplicationWindow {
         root.openDialogSafely(colorInfoDialog)
     }
 
+    function openUpdateDialog(info) {
+        updateDialog.updateInfo = info
+        root.openDialogSafely(updateDialog)
+    }
+
     function setGridPrefetch(item, enabled) {
         var methodName = "set" + "PrefetchEnabled"
         var setter = item ? item[methodName] : null
@@ -1217,6 +1222,16 @@ ApplicationWindow {
                 defaultTextColor: root.currentTextColor
                 onClicked: { root.openDialogSafely(aboutDialog); helpMenu.close() }
             }
+            MenuActionItem {
+                width: 200
+                text: "Check for Updates"
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.check_for_updates(true)
+                    helpMenu.close()
+                }
+            }
         }
     }
 
@@ -1838,7 +1853,8 @@ ApplicationWindow {
                 // Column 1
                 Text {
                     width: 450
-                    text: "<b>FastStack Keyboard and Mouse Commands</b><br><br>" +
+                    text: "<b>FastStack " + (root.uiStateRef ? root.uiStateRef.get_current_version() : "") + "</b><br>" +
+                          "<b>Keyboard and Mouse Commands</b><br><br>" +
                           "<b>Navigation:</b><br>" +
                           "&nbsp;&nbsp;Right Arrow: Next Image<br>" +
                           "&nbsp;&nbsp;Left Arrow: Previous Image<br>" +
@@ -2050,6 +2066,124 @@ ApplicationWindow {
         id: batchProgressDialog
         backgroundColor: root.currentBackgroundColor
         textColor: root.currentTextColor
+    }
+
+    Dialog {
+        id: updateDialog
+        title: "Update Available"
+        modal: true
+        standardButtons: Dialog.NoButton
+        closePolicy: Popup.CloseOnEscape
+        width: Math.min(580, parent ? parent.width * 0.9 : 580)
+        height: Math.min(520, parent ? parent.height * 0.86 : 520)
+        x: parent ? (parent.width - width) / 2 : 0
+        y: parent ? (parent.height - height) / 2 : 0
+        padding: 18
+
+        property var updateInfo: ({})
+        readonly property string latestVersion: updateInfo && updateInfo.latestVersion ? updateInfo.latestVersion : ""
+        readonly property string currentVersion: updateInfo && updateInfo.currentVersion ? updateInfo.currentVersion : ""
+        readonly property string releaseUrl: updateInfo && updateInfo.releaseUrl ? updateInfo.releaseUrl : ""
+        readonly property string releaseSummary: updateInfo && updateInfo.summary ? updateInfo.summary : "Open the release page for details."
+
+        onOpened: {
+            if (root.controllerRef) root.controllerRef.dialog_opened()
+        }
+        onClosed: {
+            if (root.controllerRef) root.controllerRef.dialog_closed()
+        }
+
+        background: Rectangle {
+            color: root.isDarkTheme ? "#1e1e1e" : "#fdfdfd"
+            border.color: root.isDarkTheme ? "#444444" : "#dddddd"
+            border.width: 1
+            radius: 8
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 14
+
+            Label {
+                Layout.fillWidth: true
+                text: "FastStack " + updateDialog.latestVersion + " is available"
+                color: root.currentTextColor
+                font.pixelSize: 20
+                font.bold: true
+                wrapMode: Text.WordWrap
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: "Installed version: " + updateDialog.currentVersion
+                color: root.isDarkTheme ? "#bbbbbb" : "#555555"
+                font.pixelSize: 13
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                color: root.isDarkTheme ? "#151515" : "#f4f4f4"
+                border.color: root.isDarkTheme ? "#333333" : "#dddddd"
+                border.width: 1
+                radius: 6
+
+                ScrollView {
+                    anchors.fill: parent
+                    anchors.margins: 10
+                    clip: true
+
+                    TextArea {
+                        text: updateDialog.releaseSummary
+                        color: root.currentTextColor
+                        readOnly: true
+                        selectByMouse: true
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 13
+                        background: Rectangle { color: "transparent" }
+                    }
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: "FastStack will open the GitHub release page so you can update your source or virtualenv install."
+                color: root.isDarkTheme ? "#bbbbbb" : "#555555"
+                font.pixelSize: 12
+                wrapMode: Text.WordWrap
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Button {
+                    text: "Skip This Version"
+                    Layout.preferredWidth: 150
+                    onClicked: {
+                        if (root.controllerRef) root.controllerRef.skip_update_version(updateDialog.latestVersion)
+                        updateDialog.close()
+                    }
+                }
+
+                Item { Layout.fillWidth: true }
+
+                Button {
+                    text: "Remind Me Later"
+                    Layout.preferredWidth: 140
+                    onClicked: updateDialog.close()
+                }
+
+                Button {
+                    text: "Open Release"
+                    highlighted: true
+                    Layout.preferredWidth: 130
+                    onClicked: {
+                        if (root.controllerRef) root.controllerRef.open_update_release(updateDialog.releaseUrl)
+                        updateDialog.close()
+                    }
+                }
+            }
+        }
     }
 
     // Debug Cache Indicator (Yellow Square)
