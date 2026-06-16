@@ -44,7 +44,9 @@ htmlcov/
 # ----------------------------
 # Build / packaging outputs
 # ----------------------------
-build/
+build/*
+!build/
+!build/INSTALL-*.md
 dist/
 *.spec
 !packaging/*.spec
