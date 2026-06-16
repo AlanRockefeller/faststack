@@ -437,75 +437,6 @@ def _rotated_content_point(
     )
 
 
-def _source_footprint_halfplanes(
-    src_w: float,
-    src_h: float,
-    canvas_w: float,
-    canvas_h: float,
-    cos_a: float,
-    sin_a: float,
-) -> list[tuple[float, float, float]]:
-    """Half-planes (unit outward normal nx, ny, offset c) bounding the rotated
-    source rectangle on the expanded canvas. A point p is valid (real pixels,
-    not rotation fill) iff ``nx*px + ny*py <= c`` for all four planes."""
-    corners = [
-        _rotated_content_point(px, py, src_w, src_h, canvas_w, canvas_h, cos_a, sin_a)
-        for px, py in ((0.0, 0.0), (src_w, 0.0), (src_w, src_h), (0.0, src_h))
-    ]
-    cx = sum(p[0] for p in corners) / 4.0
-    cy = sum(p[1] for p in corners) / 4.0
-    planes = []
-    for i in range(4):
-        x1, y1 = corners[i]
-        x2, y2 = corners[(i + 1) % 4]
-        ex, ey = x2 - x1, y2 - y1
-        norm = math.hypot(ex, ey)
-        if norm <= 1e-9:
-            continue
-        nx, ny = ey / norm, -ex / norm
-        if nx * (cx - x1) + ny * (cy - y1) > 0:
-            nx, ny = -nx, -ny
-        planes.append((nx, ny, nx * x1 + ny * y1))
-    return planes
-
-
-def _trim_rect_to_halfplanes(
-    left: float,
-    top: float,
-    right: float,
-    bottom: float,
-    planes: list[tuple[float, float, float]],
-    inset: float = 0.0,
-) -> tuple[float, float, float, float]:
-    """Shrink an axis-aligned rect until it lies inside every half-plane.
-
-    Each violated plane is resolved by moving its extreme corner along the
-    plane normal (the minimal cut). Shrinking a side never increases any
-    plane's extreme-corner value, so one pass converges; extra passes guard
-    against float noise.
-    """
-    for _ in range(3):
-        dirty = False
-        for nx, ny, c in planes:
-            qx = right if nx > 0 else left
-            qy = bottom if ny > 0 else top
-            d = nx * qx + ny * qy - (c - inset)
-            if d <= 1e-6:
-                continue
-            dirty = True
-            if nx > 0:
-                right -= nx * d
-            else:
-                left -= nx * d
-            if ny > 0:
-                bottom -= ny * d
-            else:
-                top -= ny * d
-        if not dirty:
-            break
-    return left, top, right, bottom
-
-
 def _autocrop_canvas_rect(
     cw: int, ch: int, canvas_w: int, canvas_h: int, straighten_angle: float
 ) -> tuple[int, int, int, int]:
@@ -541,16 +472,16 @@ def _crop_box_canvas_rect(
     straighten_angle: float,
     canvas_w: int,
     canvas_h: int,
-    inset: float = 2.0,
 ) -> tuple[int, int, int, int]:
     """Map a 0-1000 source-space crop box onto the expanded rotated canvas.
 
     Returns the int canvas rect to slice: an upright rect with the drawn
     box's own dimensions (swapped when the rotation lands at an odd
     90-degree multiple), centered where the framed content lands after
-    rotation, then shrunk just enough that it contains no rotation fill.
-    Using the bounding box of the rotated rectangle instead would deliver an
-    image larger than the drawn box by ``w*|cos| + h*|sin|`` per axis.
+    rotation. Manual crops intentionally preserve that rectangle even when
+    part of it crosses the rotated source footprint, so the resulting image
+    can include the black fill produced by rotation instead of silently
+    shrinking the user's crop.
     """
     angle_rad = math.radians(straighten_angle)
     cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
@@ -575,26 +506,27 @@ def _crop_box_canvas_rect(
     if round(straighten_angle / 90.0) % 2:
         box_w, box_h = box_h, box_w
     left = ccx - box_w / 2.0
-    right = ccx + box_w / 2.0
     top = ccy - box_h / 2.0
-    bottom = ccy + box_h / 2.0
 
-    planes = _source_footprint_halfplanes(
-        src_w, src_h, canvas_w, canvas_h, cos_a, sin_a
-    )
-    left, top, right, bottom = _trim_rect_to_halfplanes(
-        left, top, right, bottom, planes, inset=inset
-    )
+    width_i = max(1, int(round(box_w)))
+    height_i = max(1, int(round(box_h)))
+    left_i = int(round(left))
+    top_i = int(round(top))
 
-    # Round inward so the slice never reintroduces fill at the borders.
-    left_i = max(0, int(math.ceil(left)))
-    top_i = max(0, int(math.ceil(top)))
-    right_i = min(canvas_w, int(math.floor(right)))
-    bottom_i = min(canvas_h, int(math.floor(bottom)))
-    left_i = min(left_i, canvas_w - 1)
-    top_i = min(top_i, canvas_h - 1)
-    right_i = max(right_i, left_i + 1)
-    bottom_i = max(bottom_i, top_i + 1)
+    if width_i >= canvas_w:
+        left_i = 0
+        right_i = canvas_w
+    else:
+        left_i = max(0, min(canvas_w - width_i, left_i))
+        right_i = left_i + width_i
+
+    if height_i >= canvas_h:
+        top_i = 0
+        bottom_i = canvas_h
+    else:
+        top_i = max(0, min(canvas_h - height_i, top_i))
+        bottom_i = top_i + height_i
+
     return left_i, top_i, right_i, bottom_i
 
 

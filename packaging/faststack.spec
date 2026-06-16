@@ -10,7 +10,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
 
 
-ROOT = Path(SPECPATH).parent.parent
+ROOT = Path(SPECPATH).parent
 APP_NAME = "FastStack"
 BUNDLE_ID = "dev.faststack.FastStack"
 
