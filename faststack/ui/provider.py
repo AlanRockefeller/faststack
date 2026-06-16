@@ -1091,6 +1091,30 @@ class UIState(QObject):
     def open_directory_dialog(self):
         return self.app_controller.open_directory_dialog()
 
+    @Slot(result=str)
+    def get_current_version(self):
+        return self.app_controller.get_current_version()
+
+    @Slot(result=bool)
+    def get_update_check_enabled(self):
+        return self.app_controller.get_update_check_enabled()
+
+    @Slot(bool)
+    def set_update_check_enabled(self, enabled):
+        self.app_controller.set_update_check_enabled(enabled)
+
+    @Slot(result=bool)
+    def get_auto_update_enabled(self):
+        return self.app_controller.get_auto_update_enabled()
+
+    @Slot(bool)
+    def set_auto_update_enabled(self, enabled):
+        self.app_controller.set_auto_update_enabled(enabled)
+
+    @Slot()
+    def check_for_updates(self):
+        self.app_controller.check_for_updates(True)
+
     @Property(float, notify=autoLevelClippingThresholdChanged)
     def autoLevelClippingThreshold(self):
         return self.app_controller.get_auto_level_clipping_threshold()

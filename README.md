@@ -83,6 +83,28 @@ folders and do not need the thumbnail grid immediately:
 faststack --loupe "C:\path\to\photos"
 ```
 
+### Updating
+
+FastStack checks GitHub Releases for newer versions when update checks are
+enabled in Settings. For source or virtualenv installs, open the release page
+from FastStack and update from the checkout:
+
+```bash
+git pull
+.venv/Scripts/python.exe -m pip install -e .
+```
+
+On Linux or macOS, use the Python executable from the active virtualenv:
+
+```bash
+git pull
+python -m pip install -e .
+```
+
+Automatic installation is intentionally disabled for source/virtualenv installs
+because a running Python app cannot reliably replace its own environment across
+Windows, Linux, and macOS.
+
 ### Command Line Options
 
 ```text

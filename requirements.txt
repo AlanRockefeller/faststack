@@ -3,4 +3,4 @@ numpy==2.*
 cachetools==5.*
 watchdog==4.*
 Pillow==10.*      # fallback decode; keep it
-
+packaging>=24,<26
