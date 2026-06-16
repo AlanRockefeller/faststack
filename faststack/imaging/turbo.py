@@ -26,6 +26,7 @@ def _candidate_library_paths() -> list[Optional[str]]:
     explicit = os.getenv("FASTSTACK_TURBOJPEG_LIB") or os.getenv("TURBOJPEG_LIB")
     if explicit:
         candidates.append(explicit)
+    candidates.extend(_bundled_library_paths())
     candidates.append(None)
 
     if os.name == "nt":
@@ -73,6 +74,38 @@ def _candidate_library_paths() -> list[Optional[str]]:
         seen.add(key)
         unique.append(candidate)
     return unique
+
+
+def _bundled_library_paths() -> list[str]:
+    """Return libjpeg-turbo candidates inside a frozen app bundle."""
+    roots: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+
+    if getattr(sys, "frozen", False) and sys.executable:
+        executable_dir = Path(sys.executable).resolve().parent
+        roots.extend([executable_dir, executable_dir / "_internal"])
+
+    if os.name == "nt":
+        library_names = ("turbojpeg.dll",)
+    elif sys.platform == "darwin":
+        library_names = ("libturbojpeg.dylib",)
+    else:
+        library_names = ("libturbojpeg.so", "libturbojpeg.so.0")
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        for directory in (root, root / "lib", root / "bin"):
+            for library_name in library_names:
+                candidate = directory / library_name
+                key = os.path.normcase(str(candidate))
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(str(candidate))
+    return candidates
 
 
 def _install_hint() -> str:

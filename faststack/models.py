@@ -72,6 +72,7 @@ class EntryMetadata:
     uploaded_date: Optional[str] = None
     edited: bool = False
     edited_date: Optional[str] = None
+    edit_state: Optional[Dict[str, Any]] = None
     restacked: bool = False
     restacked_date: Optional[str] = None
     favorite: bool = False

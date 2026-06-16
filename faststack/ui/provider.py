@@ -42,6 +42,29 @@ class ImageProvider(QQuickImageProvider):
         # Lock to protect keepalive deque from concurrent access by QML rendering threads
         self._keepalive_lock = threading.Lock()
 
+    def _fallback_image(self) -> QImage:
+        return self.placeholder.copy()
+
+    def _log_provider_fallback(
+        self,
+        request_id: str,
+        reason: str,
+        *,
+        stale: bool,
+        exc_info: bool = False,
+    ) -> None:
+        if stale:
+            log.debug(
+                "Ignoring stale image provider request %s: %s", request_id, reason
+            )
+            return
+        log.warning(
+            "Image provider could not satisfy current request %s: %s",
+            request_id,
+            reason,
+            exc_info=exc_info,
+        )
+
     def requestImage(self, id: str, size: object, requestedSize: object) -> QImage:
         """Handles image requests from QML."""
         import time
@@ -52,8 +75,9 @@ class ImageProvider(QQuickImageProvider):
             print(f"[DBGCACHE] {_t_start*1000:.3f} requestImage: START id={id}")
 
         if not id:
-            return self.placeholder
+            return self._fallback_image()
 
+        request_is_stale = False
         try:
             # Handle mask overlay requests
             if id.startswith("mask_overlay/"):
@@ -68,6 +92,56 @@ class ImageProvider(QQuickImageProvider):
             parts = id.split("/")
             index = int(parts[0])
             gen = int(parts[1]) if len(parts) > 1 else None
+
+            current_index = getattr(self.app_controller, "current_index", None)
+            current_generation = getattr(
+                self.app_controller,
+                "ui_refresh_generation",
+                None,
+            )
+            ui_state = getattr(self.app_controller, "ui_state", None)
+            grid_active_value = getattr(ui_state, "isGridViewActive", False)
+            grid_active = (
+                grid_active_value if isinstance(grid_active_value, bool) else False
+            )
+            index_is_current = not isinstance(current_index, int) or (
+                index == current_index
+            )
+            generation_is_current = (
+                gen is None
+                or not isinstance(
+                    current_generation,
+                    int,
+                )
+                or (gen == current_generation)
+            )
+            request_is_stale = (
+                grid_active or not index_is_current or not generation_is_current
+            )
+
+            image_files = getattr(self.app_controller, "image_files", None)
+            image_count = len(image_files) if isinstance(image_files, list) else None
+            if image_count is not None and (
+                index < 0 or index >= image_count or image_count == 0
+            ):
+                stale_bounds_request = request_is_stale or image_count == 0
+                self._log_provider_fallback(
+                    id,
+                    f"index {index} outside image list of {image_count}",
+                    stale=stale_bounds_request,
+                )
+                return self._fallback_image()
+
+            if request_is_stale:
+                self._log_provider_fallback(
+                    id,
+                    (
+                        "request no longer matches current image source "
+                        f"(current index={current_index}, generation={current_generation})"
+                    ),
+                    stale=True,
+                )
+                return self._fallback_image()
 
             # If editor is open, use the background-rendered preview buffer
             # BUT only if the requested index matches the currently edited index!
@@ -111,6 +185,18 @@ class ImageProvider(QQuickImageProvider):
                 except Exception:
                     current_preview_session_key = None
 
+            current_compare_session_key = None
+            get_compare_key = getattr(
+                self.app_controller,
+                "_get_current_original_compare_session_key",
+                None,
+            )
+            if callable(get_compare_key):
+                try:
+                    current_compare_session_key = get_compare_key()
+                except Exception:
+                    current_compare_session_key = None
+
             has_valid_preview_buffer = (
                 current_preview_session_key is not None
                 and self.app_controller._last_rendered_preview is not None
@@ -141,14 +227,34 @@ class ImageProvider(QQuickImageProvider):
                 and has_valid_preview_buffer
             )
 
+            use_original_compare_preview = (
+                getattr(self.app_controller, "_original_compare_active", False)
+                and index == self.app_controller.current_index
+                and current_compare_session_key is not None
+                and self.app_controller._original_compare_preview is not None
+                and self.app_controller._original_compare_index == index
+                and getattr(
+                    self.app_controller,
+                    "_original_compare_session_key",
+                    None,
+                )
+                == current_compare_session_key
+                and (
+                    gen is None
+                    or getattr(self.app_controller, "_original_compare_gen", None)
+                    == gen
+                )
+            )
+
             if _debug:
                 _t_get = time.perf_counter()
 
-            image_data = (
-                self.app_controller._last_rendered_preview
-                if use_editor_preview
-                else self.app_controller.get_decoded_image(index)
-            )
+            if use_original_compare_preview:
+                image_data = self.app_controller._original_compare_preview
+            elif use_editor_preview:
+                image_data = self.app_controller._last_rendered_preview
+            else:
+                image_data = self.app_controller.get_decoded_image(index)
 
             if _debug:
                 _t_got = time.perf_counter()
@@ -169,6 +275,13 @@ class ImageProvider(QQuickImageProvider):
                     image_data.bytes_per_line,
                     fmt,
                 )
+                if qimg.isNull():
+                    self._log_provider_fallback(
+                        id,
+                        "decoded buffer produced a null QImage",
+                        stale=request_is_stale,
+                    )
+                    return self._fallback_image()
 
                 # Detach from Python buffer to prevent ownership issues and force proper texture upload
                 # OPTIMIZATION: Only do this expensive copy when serving the live editor preview,
@@ -178,6 +291,7 @@ class ImageProvider(QQuickImageProvider):
                     self.app_controller.ui_state.isEditorOpen
                     or has_active_auto_adjust
                     or has_current_live_preview
+                    or use_original_compare_preview
                 ) and index == self.app_controller.current_index:
                     qimg = qimg.copy()
                 else:
@@ -214,9 +328,23 @@ class ImageProvider(QQuickImageProvider):
                 return qimg
 
         except (ValueError, IndexError) as e:
-            log.error(f"Invalid image ID requested from QML: {id}. Error: {e}")
+            log.warning("Invalid image ID requested from QML: %s. Error: %s", id, e)
+            return self._fallback_image()
+        except Exception:
+            self._log_provider_fallback(
+                id,
+                "unexpected provider error",
+                stale=request_is_stale,
+                exc_info=True,
+            )
+            return self._fallback_image()
 
-        return self.placeholder
+        self._log_provider_fallback(
+            id,
+            "decode returned no image data",
+            stale=request_is_stale,
+        )
+        return self._fallback_image()
 
 
 class UIState(QObject):
@@ -261,12 +389,20 @@ class UIState(QObject):
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
+    autoVibranceEnabledChanged = Signal(bool)
+    autoLevelMidtoneChanged = Signal(bool)
+    autoLevelMidtoneTargetChanged = Signal(float)
+    autoLevelChannelBudgetChanged = Signal(float)
+    levelsSoftKneeChanged = Signal(bool)
+    exportDitherChanged = Signal(bool)
+    awbTintDampChanged = Signal(float)
     # Image Editor Signals
     is_editor_open_changed = Signal(bool)
     is_editor_expanded_changed = Signal(bool)
     editorImageChanged = (
         Signal()
     )  # New signal for when the image loaded in editor changes
+    originalCompareActiveChanged = Signal(bool)
     is_cropping_changed = Signal(bool)
     is_crop_rotating_changed = Signal(bool)
 
@@ -320,10 +456,12 @@ class UIState(QObject):
     debugThumbTimingChanged = Signal(bool)  # Thumbnail pipeline timing
     isDialogOpenChanged = Signal(bool)  # New signal for dialog state
     editSourceModeChanged = Signal(str)  # Notify when JPEG/RAW mode changes
+    rawDevelopmentStateChanged = Signal()
     saveBehaviorMessageChanged = Signal()  # Signal for save behavior message updates
     isSavingChanged = Signal(bool)  # Signal for save operation in progress
     batchAutoLevelsProgressChanged = Signal()
     batchAutoLevelsActiveChanged = Signal()
+    autoAddEditedToBatchChanged = Signal()
 
     # Variant badges
     variantBadgesChanged = Signal()
@@ -346,6 +484,7 @@ class UIState(QObject):
         # Image Editor State
         self._is_editor_open = False
         self._is_editor_expanded = False
+        self._original_compare_active = False
         self._is_cropping = False
         self._is_crop_rotating = False
         self._is_histogram_visible = False
@@ -406,6 +545,7 @@ class UIState(QObject):
         self._batch_al_current = 0
         self._batch_al_total = 0
         self._batch_al_active = False
+        self._auto_add_edited_to_batch = True  # Load from config in app_controller
 
         # Connect to controller's dialog state signal
         self.app_controller.dialogStateChanged.connect(self._on_dialog_state_changed)
@@ -422,6 +562,16 @@ class UIState(QObject):
             self.app_controller.editSourceModeChanged.connect(
                 lambda _: self.metadataChanged.emit()
             )  # Also update metadata binding if needed
+        if hasattr(self.app_controller, "rawDevelopmentStateChanged"):
+            self.app_controller.rawDevelopmentStateChanged.connect(
+                self.rawDevelopmentStateChanged
+            )
+            self.app_controller.rawDevelopmentStateChanged.connect(
+                self.saveBehaviorMessageChanged.emit
+            )
+            self.app_controller.rawDevelopmentStateChanged.connect(
+                self.metadataChanged.emit
+            )
 
         # Connect batch auto levels progress signals
         if hasattr(self.app_controller, "batchAutoLevelsProgress"):
@@ -655,6 +805,12 @@ class UIState(QObject):
             return self.app_controller.current_edit_source_mode == "raw"
         return False
 
+    @Property(bool, notify=rawDevelopmentStateChanged)
+    def isRawDeveloping(self):
+        if hasattr(self.app_controller, "is_raw_developing_current"):
+            return self.app_controller.is_raw_developing_current()
+        return False
+
     @Slot(result=bool)
     def load_image_for_editing(self):
         """Loads the currently viewed image into the editor."""
@@ -681,10 +837,16 @@ class UIState(QObject):
         if not hasattr(self.app_controller, "current_edit_source_mode"):
             return ""
 
+        if getattr(self.app_controller, "view_override_kind", None) == "developed":
+            return "Editing: developed JPG (saves in-place to the developed file)"
+
         if self.app_controller.current_edit_source_mode == "raw":
-            return "Editing: RAW (writes working .tif + creates -developed.jpg; original JPG untouched)"
-        else:
-            return "Editing: JPEG (will overwrite JPG)"
+            if self.isRawDeveloping:
+                return "Editing: RAW (developing working .tif...)"
+            if self.hasWorkingTif:
+                return "Editing: RAW (writes working .tif + creates -developed.jpg; original JPG untouched)"
+            return "Editing: RAW selected (develop RAW before saving)"
+        return "Editing: JPEG (will overwrite JPG)"
 
     @Property(str, notify=statusMessageChanged)
     def statusMessage(self):
@@ -956,6 +1118,69 @@ class UIState(QObject):
         self.app_controller.set_auto_level_strength_auto(value)
         self.autoLevelStrengthAutoChanged.emit(value)
 
+    @Property(bool, notify=autoVibranceEnabledChanged)
+    def autoVibranceEnabled(self):
+        return self.app_controller.get_auto_vibrance_enabled()
+
+    @autoVibranceEnabled.setter
+    def autoVibranceEnabled(self, value):
+        self.app_controller.set_auto_vibrance_enabled(value)
+        self.autoVibranceEnabledChanged.emit(value)
+
+    @Property(bool, notify=autoLevelMidtoneChanged)
+    def autoLevelMidtone(self):
+        return self.app_controller.get_auto_level_midtone()
+
+    @autoLevelMidtone.setter
+    def autoLevelMidtone(self, value):
+        self.app_controller.set_auto_level_midtone(value)
+        self.autoLevelMidtoneChanged.emit(value)
+
+    @Property(float, notify=autoLevelMidtoneTargetChanged)
+    def autoLevelMidtoneTarget(self):
+        return self.app_controller.get_auto_level_midtone_target()
+
+    @autoLevelMidtoneTarget.setter
+    def autoLevelMidtoneTarget(self, value):
+        self.app_controller.set_auto_level_midtone_target(value)
+        self.autoLevelMidtoneTargetChanged.emit(value)
+
+    @Property(float, notify=autoLevelChannelBudgetChanged)
+    def autoLevelChannelBudget(self):
+        return self.app_controller.get_auto_level_channel_budget()
+
+    @autoLevelChannelBudget.setter
+    def autoLevelChannelBudget(self, value):
+        self.app_controller.set_auto_level_channel_budget(value)
+        self.autoLevelChannelBudgetChanged.emit(value)
+
+    @Property(bool, notify=levelsSoftKneeChanged)
+    def levelsSoftKnee(self):
+        return self.app_controller.get_levels_soft_knee()
+
+    @levelsSoftKnee.setter
+    def levelsSoftKnee(self, value):
+        self.app_controller.set_levels_soft_knee(value)
+        self.levelsSoftKneeChanged.emit(value)
+
+    @Property(bool, notify=exportDitherChanged)
+    def exportDither(self):
+        return self.app_controller.get_export_dither()
+
+    @exportDither.setter
+    def exportDither(self, value):
+        self.app_controller.set_export_dither(value)
+        self.exportDitherChanged.emit(value)
+
+    @Property(float, notify=awbTintDampChanged)
+    def awbTintDamp(self):
+        return self.app_controller.get_awb_tint_damp()
+
+    @awbTintDamp.setter
+    def awbTintDamp(self, value):
+        self.app_controller.set_awb_tint_damp(value)
+        self.awbTintDampChanged.emit(value)
+
     @Slot()
     def open_folder(self):
         self.app_controller.open_folder()
@@ -1004,6 +1229,25 @@ class UIState(QObject):
         if self._is_editor_expanded != new_value:
             self._is_editor_expanded = new_value
             self.is_editor_expanded_changed.emit(new_value)
+
+    @Property(bool, notify=originalCompareActiveChanged)
+    def originalCompareActive(self) -> bool:
+        return bool(
+            getattr(
+                self.app_controller,
+                "_original_compare_active",
+                self._original_compare_active,
+            )
+        )
+
+    @originalCompareActive.setter
+    def originalCompareActive(self, new_value: bool):
+        active = bool(
+            getattr(self.app_controller, "_original_compare_active", new_value)
+        )
+        if self._original_compare_active != active:
+            self._original_compare_active = active
+            self.originalCompareActiveChanged.emit(active)
 
     @Property(str, notify=editorImageChanged)
     def editorFilename(self) -> str:
@@ -1393,7 +1637,22 @@ class UIState(QObject):
         if new_value is None:
             return
         if self._set_current_crop_box_value(new_value):
-            # Sync with ImageEditor
+            # During crop mode this is draft overlay state only; the committed
+            # crop box is applied explicitly on Enter.
+            if getattr(self.app_controller.ui_state, "isCropping", False):
+                try:
+                    left, top, right, bottom = new_value
+                    if (right - left) < 20 or (bottom - top) < 20:
+                        return
+                except (TypeError, ValueError):
+                    return
+                kick_preview = getattr(
+                    self.app_controller, "_kick_preview_worker", None
+                )
+                if callable(kick_preview):
+                    kick_preview()
+                return
+            # Sync with ImageEditor outside crop mode.
             if (
                 hasattr(self.app_controller, "image_editor")
                 and self.app_controller.image_editor
@@ -1698,6 +1957,18 @@ class UIState(QObject):
         if self._debug_thumb_timing != value:
             self._debug_thumb_timing = value
             self.debugThumbTimingChanged.emit(value)
+
+    @Property(bool, notify=autoAddEditedToBatchChanged)
+    def autoAddEditedToBatch(self) -> bool:
+        return self._auto_add_edited_to_batch
+
+    @autoAddEditedToBatch.setter
+    def autoAddEditedToBatch(self, value: bool):
+        if self._auto_add_edited_to_batch != value:
+            self._auto_add_edited_to_batch = value
+            self.autoAddEditedToBatchChanged.emit()
+            if hasattr(self.app_controller, "save_config"):
+                self.app_controller.save_config()
 
     # --- RAW / Editor Source Logic ---
 

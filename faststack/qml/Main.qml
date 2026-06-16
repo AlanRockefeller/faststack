@@ -65,13 +65,38 @@ ApplicationWindow {
         }
     }
 
+    function clampWindowToVisibleScreen() {
+        if (root.visibility !== Window.Windowed || !root.screen) return
+
+        var screenX = root.screen.virtualX
+        var screenY = root.screen.virtualY
+        var screenWidth = root.screen.desktopAvailableWidth
+        var screenHeight = root.screen.desktopAvailableHeight
+        if (screenWidth <= 0 || screenHeight <= 0) return
+
+        var newWidth = Math.min(root.width, screenWidth)
+        var newHeight = Math.min(root.height, screenHeight)
+        var newX = Math.max(screenX, Math.min(root.x, screenX + screenWidth - newWidth))
+        var newY = Math.max(screenY, Math.min(root.y, screenY + screenHeight - newHeight))
+
+        root.x = newX
+        root.y = newY
+        root.width = newWidth
+        root.height = newHeight
+    }
+
+    function openDialogSafely(dialog) {
+        root.clampWindowToVisibleScreen()
+        dialog.open()
+    }
+
     onClosing: function(close) {
         if (!root.allowCloseWithBatches && root.controllerRef) {
             var definedBatchCount = root.controllerRef.get_defined_batch_count()
             if (definedBatchCount > 0) {
                 close.accepted = false
                 quitBatchesDialog.batchCount = definedBatchCount
-                quitBatchesDialog.open()
+                root.openDialogSafely(quitBatchesDialog)
                 return
             }
         }
@@ -81,7 +106,7 @@ ApplicationWindow {
                 && root.uiStateRef.hasRecycleBinItems) {
             close.accepted = false
             root.uiStateRef.refreshRecycleBinStats()
-            recycleBinCleanupDialog.open()
+            root.openDialogSafely(recycleBinCleanupDialog)
             return
         }
 
@@ -128,12 +153,12 @@ ApplicationWindow {
     function openExifDialog(data) {
         exifDialog.summaryData = data.summary
         exifDialog.fullData = data.full
-        exifDialog.open()
+        root.openDialogSafely(exifDialog)
     }
 
     function openColorInfoDialog(text) {
         colorInfoDialog.infoText = text
-        colorInfoDialog.open()
+        root.openDialogSafely(colorInfoDialog)
     }
 
     function setGridPrefetch(item, enabled) {
@@ -184,6 +209,37 @@ ApplicationWindow {
         }
 
         // Avoid rendering unexpected objects as "[object Object]".
+        return ""
+    }
+
+    // The EXIF brief shown in the status bar may end with a GPS-derived
+    // distance segment formatted as "<n> m" (see metadata._format_distance_meters).
+    // These helpers let the status bar render the distance as its own label so a
+    // tooltip can explain what it means.
+    function exifBriefDistanceRegExp() {
+        return /^\d+ m$/
+    }
+
+    function exifBriefWithoutDistance(brief) {
+        var s = root.stringOrEmpty(brief)
+        if (s === "") return ""
+        var re = root.exifBriefDistanceRegExp()
+        var kept = []
+        var parts = s.split(" | ")
+        for (var i = 0; i < parts.length; i++) {
+            if (!re.test(parts[i])) kept.push(parts[i])
+        }
+        return kept.join(" | ")
+    }
+
+    function exifBriefDistance(brief) {
+        var s = root.stringOrEmpty(brief)
+        if (s === "") return ""
+        var re = root.exifBriefDistanceRegExp()
+        var parts = s.split(" | ")
+        for (var i = 0; i < parts.length; i++) {
+            if (re.test(parts[i])) return parts[i]
+        }
         return ""
     }
 
@@ -660,7 +716,7 @@ ApplicationWindow {
                 text: "Settings..."
                 hoverFillColor: root.menuHoverColor
                 onClicked: {
-                    settingsDialog.open()
+                    root.openDialogSafely(settingsDialog)
                     fileMenu.close()
                 }
                 defaultTextColor: root.currentTextColor
@@ -792,8 +848,8 @@ ApplicationWindow {
             // Develop RAW (True Headroom)
             MenuActionItem {
                 width: 220
-                text: (root.uiStateRef && root.uiStateRef.hasWorkingTif) ? "Re-develop RAW" : "Develop RAW"
-                enabled: root.uiStateRef ? root.uiStateRef.hasRaw : false
+                text: (root.uiStateRef && root.uiStateRef.isRawDeveloping) ? "Developing RAW..." : ((root.uiStateRef && root.uiStateRef.hasWorkingTif) ? "Re-develop RAW" : "Develop RAW")
+                enabled: root.uiStateRef ? (root.uiStateRef.hasRaw && !root.uiStateRef.isRawDeveloping) : false
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
                 disabledTextColor: root.isDarkTheme ? "#666666" : "#999999"
@@ -839,6 +895,18 @@ ApplicationWindow {
                     actionsMenu.close()
                 }
             }
+            MenuActionItem {
+                width: 220
+                text: "Duplicate Image"
+                enabled: root.uiStateRef ? root.uiStateRef.imageCount > 0 : false
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                disabledTextColor: root.isDarkTheme ? "#666666" : "#999999"
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.duplicate_current_image()
+                    actionsMenu.close()
+                }
+            }
 
             MenuActionItem {
                 width: 220
@@ -866,7 +934,7 @@ ApplicationWindow {
                 text: "Show Stacks"
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
-                onClicked: { showStacksDialog.open(); actionsMenu.close() }
+                onClicked: { root.openDialogSafely(showStacksDialog); actionsMenu.close() }
             }
             MenuActionItem {
                 width: 220
@@ -880,7 +948,7 @@ ApplicationWindow {
                 text: "Filter Images..."
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
-                onClicked: { filterDialog.open(); actionsMenu.close() }
+                onClicked: { root.openDialogSafely(filterDialog); actionsMenu.close() }
             }
 
             // Separator before Sort options
@@ -973,6 +1041,22 @@ ApplicationWindow {
                     actionsMenu.close()
                 }
             }
+
+            MenuActionItem {
+                width: 220
+                text: "Automatically add edited photos to batch"
+                showCheckbox: true
+                checkboxChecked: root.uiStateRef ? root.uiStateRef.autoAddEditedToBatch : true
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                onClicked: {
+                    if (root.uiStateRef) {
+                        root.uiStateRef.autoAddEditedToBatch = !root.uiStateRef.autoAddEditedToBatch
+                    }
+                    actionsMenu.close()
+                }
+            }
+
             MenuActionItem {
                 width: 220
                 text: "Jump to Last Uploaded"
@@ -1094,6 +1178,19 @@ ApplicationWindow {
                     actionsMenu.close()
                 }
             }
+            MenuActionItem {
+                width: 180
+                text: "By Date (reverse)"
+                hoverFillColor: root.menuHoverColor
+                selectedFillColor: root.menuSelectedColor
+                selected: root.uiStateRef && root.uiStateRef.sortMode === "date_reverse"
+                defaultTextColor: root.currentTextColor
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.set_sort_mode("date_reverse")
+                    sortSubMenu.close()
+                    actionsMenu.close()
+                }
+            }
         }
     }
 
@@ -1118,7 +1215,7 @@ ApplicationWindow {
                 text: "Key Bindings"
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
-                onClicked: { aboutDialog.open(); helpMenu.close() }
+                onClicked: { root.openDialogSafely(aboutDialog); helpMenu.close() }
             }
         }
     }
@@ -1265,7 +1362,10 @@ ApplicationWindow {
 
                     // Global Key for saving edited image (Ctrl+S) when editor is open
                     if (event.key === Qt.Key_S && (event.modifiers & Qt.ControlModifier)) {
-                        if (root.uiStateRef.isEditorOpen) {
+                        if (root.uiStateRef.isEditorOpen && root.uiStateRef.isCropping) {
+                            root.uiStateRef.statusMessage = "Apply or cancel the crop before saving"
+                            event.accepted = true
+                        } else if (root.uiStateRef.isEditorOpen) {
                             root.controllerRef.save_edited_image()
                             event.accepted = true
                         }
@@ -1345,12 +1445,38 @@ ApplicationWindow {
                       : "N/A"
                 color: root.currentTextColor
             }
+            // EXIF brief: ISO, aperture, shutter speed, capture time.
             Label {
+                id: exifBriefLabel
                 visible: root.uiStateRef
                          && root.uiStateRef.imageCount > 0
-                         && root.stringOrEmpty(root.uiStateRef.exifBrief).length > 0
-                text: root.uiStateRef ? root.stringOrEmpty(root.uiStateRef.exifBrief) : ""
+                         && root.exifBriefWithoutDistance(root.uiStateRef.exifBrief).length > 0
+                text: root.uiStateRef ? root.exifBriefWithoutDistance(root.uiStateRef.exifBrief) : ""
                 color: root.currentTextColor
+            }
+            // GPS distance from the previous image, in meters. Shown as its own
+            // label so a tooltip can explain it on hover.
+            Label {
+                id: exifDistanceLabel
+                property string distanceText: root.uiStateRef ? root.exifBriefDistance(root.uiStateRef.exifBrief) : ""
+                visible: root.uiStateRef
+                         && root.uiStateRef.imageCount > 0
+                         && exifDistanceLabel.distanceText.length > 0
+                text: exifBriefLabel.visible
+                      ? ("| " + exifDistanceLabel.distanceText)
+                      : exifDistanceLabel.distanceText
+                color: root.currentTextColor
+
+                ToolTip.visible: exifDistanceMouse.containsMouse && exifDistanceLabel.visible
+                ToolTip.text: "Distance in meters between this image and the previous one (calculated from GPS EXIF data)"
+                ToolTip.delay: 500
+
+                MouseArea {
+                    id: exifDistanceMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.NoButton
+                }
             }
             Label {
                 id: directoryPathLabel
@@ -1734,6 +1860,7 @@ ApplicationWindow {
                           "<b>Viewing:</b><br>" +
                           "&nbsp;&nbsp;Mouse Wheel: Zoom in/out<br>" +
                           "&nbsp;&nbsp;Left-click + Drag: Pan image<br>" +
+                          "&nbsp;&nbsp;Hold Space: Show original with current crop<br>" +
                           "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br>" +
                           "&nbsp;&nbsp;Ctrl+1/2/3/4: Zoom to 100%/200%/300%/400%<br><br>" +
                           "<b>Stacking:</b><br>" +
@@ -1768,9 +1895,15 @@ ApplicationWindow {
                           "<b>Image Editing:</b><br>" +
                           "&nbsp;&nbsp;E: Toggle Image Editor<br>" +
                           "&nbsp;&nbsp;Ctrl+S (in editor): Save current live edits<br>" +
+                          "<b>&nbsp;&nbsp;Compact Editor (when focused):</b><br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Left / Right: Previous / Next image<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Up / Down: Raise / lower the highlighted slider<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Click a slider label: Highlight it for Up/Down<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;S: Save&nbsp;&nbsp;E / Esc: Close&nbsp;&nbsp;O: Crop<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;B, F, D, I, etc. work as in the main view<br>" +
                           "&nbsp;&nbsp;A: Quick auto white balance (live)<br>" +
-                          "&nbsp;&nbsp;l: Quick auto levels (live)<br>" +
-                          "&nbsp;&nbsp;L: Quick auto white balance + auto levels (live)<br>" +
+                          "&nbsp;&nbsp;l: Quick auto levels + vibrance (live)<br>" +
+                          "&nbsp;&nbsp;L: Quick auto white balance + auto levels + vibrance (live)<br>" +
                           "&nbsp;&nbsp;-: Darken current auto-adjust highlights/whites (live)<br>" +
                           "&nbsp;&nbsp;_: Raise current auto-adjust whites (live)<br>" +
                           "&nbsp;&nbsp;+: Raise current auto-adjust shadows/blacks (live)<br>" +
@@ -1893,12 +2026,12 @@ ApplicationWindow {
     }
 
     function show_jump_to_image_dialog() {
-        jumpToImageDialog.open()
+        root.openDialogSafely(jumpToImageDialog)
     }
 
     function show_delete_batch_dialog(count) {
         deleteBatchDialog.batchCount = count
-        deleteBatchDialog.open()
+        root.openDialogSafely(deleteBatchDialog)
     }
 
     ExifDialog {

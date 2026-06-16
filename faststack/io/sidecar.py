@@ -40,6 +40,14 @@ def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
         return EntryMetadata()
 
 
+def _entrymetadata_to_json(meta: EntryMetadata) -> dict:
+    """Convert EntryMetadata to a JSON-ready dict without noisy empty edit state."""
+    data = meta.__dict__.copy()
+    if data.get("edit_state") is None:
+        data.pop("edit_state", None)
+    return data
+
+
 class SidecarManager:
     def __init__(self, directory: Path, watcher, debug: bool = False):
         self.directory = directory
@@ -120,7 +128,8 @@ class SidecarManager:
                     "version": self.data.version,
                     "last_index": self.data.last_index,
                     "entries": {
-                        key: meta.__dict__ for key, meta in self.data.entries.items()
+                        key: _entrymetadata_to_json(meta)
+                        for key, meta in self.data.entries.items()
                     },
                     "stacks": self.data.stacks,
                 }
@@ -138,27 +147,47 @@ class SidecarManager:
 
     @overload
     def get_metadata(
-        self, image_ref: Union[str, Path], *, create: Literal[True] = True
+        self,
+        image_ref: Union[str, Path],
+        *,
+        create: Literal[True] = True,
+        migrate: bool = True,
     ) -> EntryMetadata: ...
 
     @overload
     def get_metadata(
-        self, image_ref: Union[str, Path], *, create: Literal[False]
+        self,
+        image_ref: Union[str, Path],
+        *,
+        create: Literal[False],
+        migrate: bool = True,
     ) -> Optional[EntryMetadata]: ...
 
     @overload
     def get_metadata(
-        self, image_ref: Union[str, Path], *, create: bool
+        self, image_ref: Union[str, Path], *, create: bool, migrate: bool = True
     ) -> Optional[EntryMetadata]: ...
 
     def get_metadata(
-        self, image_ref: Union[str, Path], *, create: bool = True
+        self,
+        image_ref: Union[str, Path],
+        *,
+        create: bool = True,
+        migrate: bool = True,
     ) -> Optional[EntryMetadata]:
         """Get metadata for an image, optionally creating a persistent entry.
 
         When create=True (default), always returns an EntryMetadata (creating
         and storing one if it doesn't exist).  When create=False, returns None
         if no entry exists — callers must handle the None case explicitly.
+
+        ``migrate=False`` skips the legacy-key migration scan, which walks
+        EVERY sidecar entry with per-entry filesystem checks. That scan runs
+        on every lookup miss, so bulk read-only callers (grid refresh,
+        bulk metadata maps) — which miss for most images in a folder — must
+        disable it or pay O(images x entries) filesystem stats per refresh.
+        User-action paths keep migrate=True so ancient entries still get
+        migrated when an image is actually viewed or modified.
         """
         stable_key, candidate_keys = self._lookup_keys(image_ref)
         if not stable_key:
@@ -180,7 +209,7 @@ class SidecarManager:
                 if candidate_key in self.data.entries and candidate_key != stable_key:
                     del self.data.entries[candidate_key]
                 break
-        if meta is None:
+        if meta is None and migrate:
             for existing_key, existing_meta in list(self.data.entries.items()):
                 if existing_key == stable_key:
                     continue

@@ -45,7 +45,8 @@ Window {
     Material.accent: accentColor
 
     onClosing: (close) => {
-        if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
+        close.accepted = false
+        imageEditorDialog.requestClose()
     }
 
     onVisibleChanged: {
@@ -72,6 +73,19 @@ Window {
         return 0.0;
     }
 
+    function sliderEditScale(key) {
+        if (key === "contrast") return 0.5
+        return (key === "exposure" || key === "whites") ? 2.0 : 1.0
+    }
+
+    function requestClose() {
+        if (imageEditorDialog.controllerRef && imageEditorDialog.controllerRef.has_unsaved_edits()) {
+            if (!discardDialog.opened) discardDialog.open()
+        } else {
+            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
+        }
+    }
+
     // Background
     color: imageEditorDialog.backgroundColor
 
@@ -79,7 +93,7 @@ Window {
         sequence: "Escape"
         context: Qt.WindowShortcut
         onActivated: {
-            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
+            imageEditorDialog.requestClose()
         }
     }
     Shortcut {
@@ -96,6 +110,25 @@ Window {
         context: Qt.WindowShortcut
         onActivated: {
             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.toggle_darken_mode()
+        }
+    }
+
+    Dialog {
+        id: discardDialog
+        title: "Discard Edits?"
+        modal: true
+        anchors.centerIn: parent
+        width: 280
+        standardButtons: Dialog.Yes | Dialog.No
+
+        Label {
+            text: "You have unsaved edits.\nDiscard and close?"
+            wrapMode: Text.WordWrap
+        }
+
+        onAccepted: {
+            if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.discard_edit_parameters()
+            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
         }
     }
 
@@ -351,11 +384,11 @@ Window {
                     spacing: 8
 
                     Button {
-                        text: (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isRawActive) ? "RAW Loaded" : "Load RAW"
+                        text: (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isRawDeveloping) ? "Developing RAW..." : ((imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isRawActive && imageEditorDialog.uiStateRef.hasWorkingTif) ? "RAW Loaded" : (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.hasWorkingTif ? "Load RAW" : "Develop RAW"))
                         Layout.fillWidth: true
                         Layout.preferredHeight: imageEditorDialog.secondaryButtonHeight
                         font.pixelSize: 12
-                        enabled: imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isRawActive : false
+                        enabled: imageEditorDialog.uiStateRef ? (!imageEditorDialog.uiStateRef.isRawDeveloping && !(imageEditorDialog.uiStateRef.isRawActive && imageEditorDialog.uiStateRef.hasWorkingTif)) : false
                         onClicked: {
                             if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.enableRawEditing()
                             imageEditorDialog.updatePulse++
@@ -533,7 +566,7 @@ Window {
                         text: "Close"
                         Layout.preferredWidth: 100
                         onClicked: { 
-                            if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.isEditorOpen = false
+                            imageEditorDialog.requestClose()
                         }
                         contentItem: Text {
                             text: closeEditorButton.text
@@ -604,17 +637,24 @@ Window {
             }
             
             // Slider
-            Slider {
-                id: slider
-                Layout.fillWidth: true
-                Layout.alignment: Qt.AlignVCenter
-                from: sliderRow.minVal
-                to: sliderRow.maxVal
-                stepSize: 1
+                Slider {
+                    id: slider
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    focusPolicy: Qt.StrongFocus
+                    from: sliderRow.minVal
+                    to: sliderRow.maxVal
+                    stepSize: 1
+                    property real editScale: imageEditorDialog.sliderEditScale(sliderRow.key)
                 
                 property real backendValue: {
-                    var val = imageEditorDialog.getBackendValue(sliderRow.key) * sliderRow.maxVal
+                    var val = imageEditorDialog.getBackendValue(sliderRow.key) / slider.editScale * sliderRow.maxVal
                     return sliderRow.isReversed ? -val : val
+                }
+
+                function editValueFromSliderValue(sliderValue) {
+                    var sendValue = sliderRow.isReversed ? -sliderValue : sliderValue
+                    return sendValue / sliderRow.maxVal * slider.editScale
                 }
                 
                 // Auto-sync visual slider with backend changes when not dragging
@@ -633,8 +673,7 @@ Window {
                     repeat: true
                     onTriggered: {
                         if (Math.abs(slider._pendingValue - slider._lastSentValue) > 0.001) {
-                            var sendValue = sliderRow.isReversed ? -slider._pendingValue : slider._pendingValue
-                            if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, sendValue / sliderRow.maxVal)
+                            if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(slider._pendingValue))
                             slider._lastSentValue = slider._pendingValue
                         }
                     }
@@ -673,6 +712,56 @@ Window {
                     resetTimer.restart()
                 }
 
+                function nudgeByKeyboard(step) {
+                    if (slider.isResetting) return false
+                    var nextValue = Math.max(slider.from, Math.min(slider.to, slider.value + step))
+                    if (nextValue === slider.value) return true
+                    slider.value = nextValue
+                    _pendingValue = nextValue
+                    if (!sendTimer.running) sendTimer.start()
+                    return true
+                }
+
+                function commitKeyboardAdjust() {
+                    if (slider.isResetting) {
+                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
+                    } else {
+                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
+                    }
+                    if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.update_histogram()
+                }
+
+                Keys.priority: Keys.BeforeItem
+
+                Keys.onPressed: function(event) {
+                    if (slider.isResetting) {
+                        if (event.key === Qt.Key_Up || event.key === Qt.Key_Right || event.key === Qt.Key_Down || event.key === Qt.Key_Left) {
+                            event.accepted = true
+                        }
+                        return
+                    }
+                    if (event.key === Qt.Key_Up || event.key === Qt.Key_Right) {
+                        if (slider.nudgeByKeyboard(1)) event.accepted = true
+                    } else if (event.key === Qt.Key_Down || event.key === Qt.Key_Left) {
+                        if (slider.nudgeByKeyboard(-1)) event.accepted = true
+                    }
+                }
+
+                Keys.onReleased: function(event) {
+                    if (event.isAutoRepeat) return
+                    if (slider.isResetting) {
+                        if (event.key === Qt.Key_Up || event.key === Qt.Key_Right || event.key === Qt.Key_Down || event.key === Qt.Key_Left) {
+                            event.accepted = true
+                        }
+                        return
+                    }
+                    if (event.key === Qt.Key_Up || event.key === Qt.Key_Right || event.key === Qt.Key_Down || event.key === Qt.Key_Left) {
+                        sendTimer.stop()
+                        slider.commitKeyboardAdjust()
+                        event.accepted = true
+                    }
+                }
+
                 onPressedChanged: {
                     if (pressed) {
                         imageEditorDialog.slidersPressedCount++
@@ -692,8 +781,7 @@ Window {
                              if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
                         } else {
                              // Send final value immediately
-                             var sendValue = sliderRow.isReversed ? -value : value
-                             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, sendValue / sliderRow.maxVal)
+                             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
                         }
                         
                         if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.update_histogram()

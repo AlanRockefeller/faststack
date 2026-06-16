@@ -47,6 +47,8 @@ htmlcov/
 build/
 dist/
 *.spec
+!packaging/*.spec
+artifacts/
 *.egg-info/
 
 # ----------------------------

@@ -7,6 +7,8 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
+from faststack.imaging.optional_deps import cv2
+
 log = logging.getLogger(__name__)
 
 
@@ -50,6 +52,23 @@ def apply_orientation_to_np(buffer: np.ndarray, orientation: int) -> np.ndarray:
         if not buffer.flags["C_CONTIGUOUS"]:
             return np.ascontiguousarray(buffer)
         return buffer
+
+    # cv2 fast paths: materializing a numpy rot90/flip view via
+    # ascontiguousarray is a cache-hostile transposing copy (~244ms at 20MP);
+    # cv2.rotate/flip produce bit-identical contiguous output ~5x faster.
+    # Orientations 5/7 (mirror + rotate) stay on numpy — cameras essentially
+    # never emit them.
+    if cv2 is not None and buffer.flags["C_CONTIGUOUS"]:
+        if orientation == 2:
+            return cv2.flip(buffer, 1)
+        if orientation == 3:
+            return cv2.rotate(buffer, cv2.ROTATE_180)
+        if orientation == 4:
+            return cv2.flip(buffer, 0)
+        if orientation == 6:
+            return cv2.rotate(buffer, cv2.ROTATE_90_CLOCKWISE)
+        if orientation == 8:
+            return cv2.rotate(buffer, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     # Apply transformation based on orientation
     if orientation == 2:

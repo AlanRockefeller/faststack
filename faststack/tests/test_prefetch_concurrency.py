@@ -17,7 +17,7 @@ def mock_get_display_info():
     return 1920, 1080, 1
 
 
-def mock_cache_put(key, value):
+def mock_cache_put(key, value, path=None, decode_started=None):
     pass
 
 

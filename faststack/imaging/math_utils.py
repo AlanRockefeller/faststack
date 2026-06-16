@@ -28,6 +28,67 @@ def _linear_to_srgb(x: np.ndarray) -> np.ndarray:
     return np.where(x <= 0.0031308, 12.92 * x, (1.0 + a) * (x ** (1.0 / 2.4)) - a)
 
 
+# LUT-accelerated transfer functions for full-image renders. The exact
+# np.where + power versions above cost ~60ms per megapixel-scale call; the
+# quantized lookups below are ~3x faster. 65536 entries keeps the worst-case
+# round-trip error under 0.03 of one u8 step, far below the 8-bit
+# quantization every render goes through afterwards. Keep the exact versions
+# for tiny inputs where exactness is free (e.g. building 256-entry save LUTs).
+_TRANSFER_LUT_SIZE = 65536
+# Headroom shoulder caps linear values at 1.0 + max_overshoot (0.05); leave
+# a little margin. Inputs above the domain clamp to the last entry, which is
+# equivalent to the exact path once the caller clips display output to [0,1].
+_LINEAR_TO_SRGB_DOMAIN = 1.06
+
+_srgb_to_linear_lut: Optional[np.ndarray] = None
+_linear_to_srgb_lut: Optional[np.ndarray] = None
+
+
+def _srgb_to_linear_fast(x: np.ndarray) -> np.ndarray:
+    """LUT-based `_srgb_to_linear` for preview/display renders.
+
+    Input is clamped to [0.0, 1.0] — unlike the exact version this does NOT
+    preserve headroom above 1.0, so only call it on base image data (which is
+    always in [0, 1]) or analysis buffers feeding u8 display output.
+    """
+    global _srgb_to_linear_lut
+    lut = _srgb_to_linear_lut
+    if lut is None:
+        xs = np.linspace(0.0, 1.0, _TRANSFER_LUT_SIZE, dtype=np.float64)
+        lut = _srgb_to_linear(xs).astype(np.float32)
+        _srgb_to_linear_lut = lut
+    idx = np.clip(
+        x * np.float32(_TRANSFER_LUT_SIZE - 1) + np.float32(0.5),
+        0,
+        _TRANSFER_LUT_SIZE - 1,
+    ).astype(np.uint16)
+    return lut[idx]
+
+
+def _linear_to_srgb_fast(x: np.ndarray) -> np.ndarray:
+    """LUT-based `_linear_to_srgb` for preview/display renders.
+
+    Covers [0, 1.06]; inputs above that clamp to the last entry, which is
+    indistinguishable from the exact version after the caller clips display
+    output to [0, 1].
+    """
+    global _linear_to_srgb_lut
+    lut = _linear_to_srgb_lut
+    if lut is None:
+        xs = np.linspace(
+            0.0, _LINEAR_TO_SRGB_DOMAIN, _TRANSFER_LUT_SIZE, dtype=np.float64
+        )
+        lut = _linear_to_srgb(xs).astype(np.float32)
+        _linear_to_srgb_lut = lut
+    idx = np.clip(
+        x * np.float32((_TRANSFER_LUT_SIZE - 1) / _LINEAR_TO_SRGB_DOMAIN)
+        + np.float32(0.5),
+        0,
+        _TRANSFER_LUT_SIZE - 1,
+    ).astype(np.uint16)
+    return lut[idx]
+
+
 def _smoothstep01(x: np.ndarray) -> np.ndarray:
     """Hermite smoothstep: 0 at x<=0, 1 at x>=1, smooth S-curve between."""
     x = np.clip(x, 0.0, 1.0)
@@ -178,48 +239,61 @@ def _highlight_recover_linear(
     - By computing a single brightness metric and rescaling all channels equally,
       we preserve the original RGB color ratios (hue and relative saturation).
 
-    For 16-bit sources with headroom (values > 1.0), the curve compresses into
-    [pivot, headroom_ceiling] rather than [pivot, 1.0], preserving subtle tonal
-    separation above 1.0 that represents real recovered detail.
+    The curve keeps normal whites bright, avoids changing midtones, and rolls
+    over values above display white into visible highlight range instead of
+    crushing them toward the pivot.
 
     Args:
         rgb_linear: Float32 RGB array (H, W, 3) in linear light, may have values > 1.0
         amount: Recovery strength 0.0-1.0 (mapped from slider -100 to 0)
         pivot: Brightness threshold below which no recovery occurs
-        k: Compression factor (adaptive). Higher k = stronger shoulder.
+        k: Compression factor for values above display white.
         chroma_rolloff: Desaturation amount in extreme highlights (0-1)
-        headroom_ceiling: Maximum output brightness (> 1.0 preserves headroom detail)
+        headroom_ceiling: Estimated source headroom used to size the over-white shoulder
 
     Returns:
         Recovered float32 RGB array (linear)
     """
+    amount = float(np.clip(amount, 0.0, 1.0))
     if amount < 0.001:
         return rgb_linear
 
     eps = 1e-7
+    pivot = float(np.clip(pivot, 0.0, 0.95))
+    headroom_ceiling = max(float(headroom_ceiling), 1.0)
+    overwhite_k = max(float(k), eps)
 
     # Use max-channel as brightness metric - handles saturated highlights better than luminance
     brightness = rgb_linear.max(axis=2)
 
-    # Highlights recovery: we want to pull down highlights to reveal detail.
-    # Rational compression formula: y = x / (1 + kx).
-    # We apply this relative to the pivot.
-    # normalization: brightness is already linear.
-    x_norm = (brightness - pivot) / (headroom_ceiling - pivot + eps)
-    x_norm = np.clip(x_norm, 0.0, None)
+    # The old rational curve moved display white near the pivot at full strength,
+    # which made recovered highlights look dull. Use a bounded shoulder instead:
+    # 1. Below display white, subtract a small smooth rolloff that is strongest
+    #    at white and zero at the pivot.
+    # 2. Above display white, compress exposure/headroom overshoot back below
+    #    clipping while keeping tonal separation.
+    normal_range = max(1.0 - pivot, eps)
+    white_drop = min(0.20, normal_range * 0.45) * amount
+    target_at_white = 1.0 - white_drop
 
-    # Compressed value (normalized context)
-    # At amount=1, we use full rational compression.
-    # At amount=0, we use identity.
-    compressed_norm = x_norm / (1.0 + k * amount * x_norm)
+    highlight_mask = _smoothstep01((brightness - pivot) / normal_range)
+    target_brightness = brightness - white_drop * highlight_mask
 
-    # Map back to brightness scale
-    target_brightness = pivot + compressed_norm * (headroom_ceiling - pivot)
-    # Clamp to headroom_ceiling to satisfy docstring contract (small amount can cause overshoot)
-    target_brightness = np.minimum(target_brightness, headroom_ceiling)
-
-    # If brightness was below pivot, keep it as is
-    target_brightness = np.where(brightness > pivot, target_brightness, brightness)
+    overwhite_mask = brightness > 1.0
+    if np.any(overwhite_mask):
+        excess = brightness[overwhite_mask] - 1.0
+        retained_excess = (
+            excess * (1.0 - amount) / (1.0 + overwhite_k * amount * excess)
+        )
+        headroom_span = min(max(headroom_ceiling - 1.0, 0.0), 2.0)
+        visible_span = white_drop * (1.0 + 0.25 * headroom_span)
+        shoulder_width = 0.25 + 0.35 * (1.0 - amount) + 0.10 * headroom_span
+        visible_excess = visible_span * excess / (excess + shoulder_width + eps)
+        overwhite_target = target_at_white + retained_excess + visible_excess
+        target_brightness[overwhite_mask] = np.minimum(
+            overwhite_target,
+            brightness[overwhite_mask],
+        )
 
     # Rescale RGB to preserve hue/chroma
     # Protect against div-by-zero or huge scale factors for near-black pixels

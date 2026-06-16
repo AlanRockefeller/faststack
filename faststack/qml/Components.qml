@@ -73,9 +73,30 @@ Item {
         return true
     }
 
+    function cancelCropMode() {
+        if (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping || !loupeView.controllerRef) return false
+
+        mainMouseArea.clearPendingRotation(0)
+        mainMouseArea.endCropInteraction()
+        mainMouseArea.cropRotation = 0
+        mainMouseArea.isRotating = false
+        loupeView.controllerRef.cancel_crop_mode()
+        return true
+    }
+
     Connections {
         target: loupeView.uiStateRef
         function onCurrentIndexChanged() {
+            if (mainMouseArea && (
+                mainMouseArea.cropReleasePending
+                || mainMouseArea.isCropDragging
+                || mainMouseArea.cropDragMode !== "none"
+                || mainMouseArea.isRotating
+            )) {
+                mainMouseArea.endCropInteraction()
+                mainMouseArea.isRotating = false
+            }
+
             // Smart High-Res Logic:
             // Before the new image loads, decide if we should keep high-res mode.
             // Rule: Only keep high-res if we are currently "meaningfully zoomed" (> 1.1x fit).
@@ -112,12 +133,7 @@ Item {
             if (mainMouseArea.isRotating) {
                 loupeView.cancelActiveCropRotation()
                 event.accepted = true
-            } else if (loupeView.controllerRef) {
-                mainMouseArea.clearPendingRotation(0)
-                mainMouseArea.endCropInteraction()
-                loupeView.controllerRef.cancel_crop_mode()
-                mainMouseArea.cropRotation = 0
-                mainMouseArea.isRotating = false
+            } else if (loupeView.cancelCropMode()) {
                 event.accepted = true
             }
         }
@@ -365,8 +381,8 @@ Item {
                     id: darkenOverlay
                     anchors.fill: parent
                     z: 90
-                    visible: loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible
-                    source: (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible)
+                    visible: loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible && !loupeView.uiStateRef.originalCompareActive
+                    source: (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible && !loupeView.uiStateRef.originalCompareActive)
                             ? "image://provider/mask_overlay/" + loupeView.uiStateRef.darkenOverlayGeneration
                             : ""
                     fillMode: Image.Stretch
@@ -605,6 +621,47 @@ Item {
 
 
         }
+
+        // Alignment grid for rotate mode. Lives in the viewport (NOT inside
+        // imageRotator/mainImage) so the lines stay screen-horizontal and
+        // screen-vertical while the image rotates underneath them.
+        Item {
+            id: rotateAlignGrid
+            anchors.fill: parent
+            z: 10
+            visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping && mainMouseArea.isRotating
+            property real gridSpacing: 56
+            property color lineColor: "#59ffffff"
+            property color centerLineColor: "#b3ffffff"
+
+            Repeater {
+                id: rotateGridVLines
+                model: rotateAlignGrid.visible ? 2 * Math.ceil(rotateAlignGrid.width / (2 * rotateAlignGrid.gridSpacing)) + 1 : 0
+                Rectangle {
+                    required property int index
+                    property int centerIndex: (rotateGridVLines.count - 1) / 2
+                    x: rotateAlignGrid.width / 2 + (index - centerIndex) * rotateAlignGrid.gridSpacing - width / 2
+                    y: 0
+                    width: 1
+                    height: rotateAlignGrid.height
+                    color: index === centerIndex ? rotateAlignGrid.centerLineColor : rotateAlignGrid.lineColor
+                }
+            }
+
+            Repeater {
+                id: rotateGridHLines
+                model: rotateAlignGrid.visible ? 2 * Math.ceil(rotateAlignGrid.height / (2 * rotateAlignGrid.gridSpacing)) + 1 : 0
+                Rectangle {
+                    required property int index
+                    property int centerIndex: (rotateGridHLines.count - 1) / 2
+                    x: 0
+                    y: rotateAlignGrid.height / 2 + (index - centerIndex) * rotateAlignGrid.gridSpacing - height / 2
+                    width: rotateAlignGrid.width
+                    height: 1
+                    color: index === centerIndex ? rotateAlignGrid.centerLineColor : rotateAlignGrid.lineColor
+                }
+            }
+        }
     }
 
     // Zoom and Pan logic would go here
@@ -633,6 +690,14 @@ Item {
         property bool isDraggingOutside: false
         property int dragThreshold: 10  // Minimum distance before checking for outside drag
         property bool isCropDragging: false
+        // Flaky-trackpad tolerance: when a crop drag "ends", finalizing is
+        // deferred briefly (cropReleaseGraceTimer). Cheap trackpads emit
+        // spurious right-button release/press pairs while the user is still
+        // dragging; without this grace window each spurious release aborts the
+        // crop and the next press restarts a tiny box, so the user can never
+        // draw the box they intend. While true, a real release is pending and a
+        // fresh press will resume the in-progress drag instead of restarting.
+        property bool cropReleasePending: false
         property real cropStartX: 0
         property real cropStartY: 0
 
@@ -701,6 +766,24 @@ Item {
             setCropBoxStart(box[0], box[1], box[2], box[3])
         }
 
+        function hasRightButton(mouse) {
+            return mouse.button === Qt.RightButton || (mouse.buttons & Qt.RightButton)
+        }
+
+        function setInitialCropBoxAt(mx, my) {
+            if (!loupeView.uiStateRef) return
+
+            var left = Math.max(0, Math.min(999, mx))
+            var top = Math.max(0, Math.min(999, my))
+            var right = Math.min(1000, left + 10)
+            var bottom = Math.min(1000, top + 10)
+
+            if (right - left < 10) left = Math.max(0, right - 10)
+            if (bottom - top < 10) top = Math.max(0, bottom - 10)
+
+            loupeView.uiStateRef.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
+        }
+
         function beginNewCrop(mouseX, mouseY, mx, my) {
             var clampedMx = Math.max(0, Math.min(1000, mx))
             var clampedMy = Math.max(0, Math.min(1000, my))
@@ -719,6 +802,11 @@ Item {
         }
 
         function endCropInteraction() {
+            // Any definitive end (commit, escape, navigation, grace timeout)
+            // clears the pending-release guard so it can't leak across sessions.
+            cropReleaseGraceTimer.stop()
+            cropReleasePending = false
+
             isCropDragging = false
             cropDragMode = "none"
 
@@ -735,12 +823,36 @@ Item {
             }
         }
 
+        // Grace window after a crop drag release. A genuine release finalizes
+        // the crop when this fires; a spurious trackpad release that is quickly
+        // followed by another press cancels it (see onPressed) and the drag
+        // resumes seamlessly.
+        Timer {
+            id: cropReleaseGraceTimer
+            interval: 250
+            repeat: false
+            onTriggered: {
+                if (mainMouseArea.cropReleasePending) {
+                    mainMouseArea.cropReleasePending = false
+                    mainMouseArea.endCropInteraction()
+                }
+            }
+        }
+
         onPressed: function(mouse) {
             lastX = mouse.x
             lastY = mouse.y
             startX = mouse.x
             startY = mouse.y
             isDraggingOutside = false
+
+            // Flaky-trackpad tolerance: if a crop release is still within its
+            // grace window, finalize that deferred release before interpreting
+            // the new press. The crop hit-test below handles both normal follow-up
+            // drags and stuttered trackpad presses from the current visible box.
+            if (cropReleasePending) {
+                endCropInteraction()
+            }
 
             // Darken painting mode
             if (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && !loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
@@ -756,12 +868,12 @@ Item {
                 return
             }
 
-            if (mouse.button === Qt.RightButton) {
+            if (hasRightButton(mouse) && (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping)) {
                 // Activate drag guard BEFORE toggle_crop_mode so that any
                 // source/geometry changes it triggers are properly deferred.
                 beginCropInteraction()
 
-                if (!loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
+                if (loupeView.uiStateRef && !loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
                     loupeView.controllerRef.toggle_crop_mode() // Ensure mode is ON
                 }
 
@@ -779,6 +891,7 @@ Item {
                 var my = coords.y * 1000
 
                 beginNewCrop(mouse.x, mouse.y, mx, my)
+                setInitialCropBoxAt(mx, my)
                 return
             }
             
@@ -970,7 +1083,7 @@ Item {
                 return
             }
             
-            if (pressed && !isDraggingOutside) {
+            if (pressed && (pressedButtons & Qt.LeftButton) && !(pressedButtons & Qt.RightButton) && !isDraggingOutside) {
                 // Check if we've moved beyond the threshold
                 var dx = mouse.x - startX
                 var dy = mouse.y - startY
@@ -1009,7 +1122,13 @@ Item {
 
             isDraggingOutside = false
             if (loupeView.uiStateRef && loupeView.uiStateRef.isCropping && isCropDragging) {
-                endCropInteraction()
+                // Defer finalizing the crop briefly. Cheap trackpads emit
+                // spurious release/press pairs mid-drag; if another press
+                // arrives within the grace window we resume the drag instead of
+                // aborting it (see onPressed and cropReleaseGraceTimer).
+                cropReleasePending = true
+                isCropDragging = false
+                cropReleaseGraceTimer.restart()
             }
         }
 

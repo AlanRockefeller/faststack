@@ -41,6 +41,8 @@ Window {
         } else {
             positionAtRightGutter()
         }
+        compactEditor.keyboardHandlerReady = true
+        Qt.callLater(compactEditor.focusKeyboardHandler)
     }
 
     function positionAtRightGutter() {
@@ -53,6 +55,7 @@ Window {
 
     onXChanged: if (visible) compactSettings.savedX = x
     onYChanged: if (visible) compactSettings.savedY = y
+    onActiveChanged: if (active) compactEditor.focusKeyboardHandler()
 
     // --- Color Palette (matches full editor) ---
     readonly property color backgroundColor: "#1e1e1e"
@@ -69,8 +72,38 @@ Window {
     Material.accent: compactEditor.accentColor
 
     property int updatePulse: 0
+    readonly property bool cropActive: compactEditor.uiStateRef ? compactEditor.uiStateRef.isCropping : false
     property int lastLoadedIndex: -1
+    property bool lastLoadWasFull: false
+    property bool forceNextPreviewLoad: false
     property string closeTooltip: "Close editor"
+
+    // Key of the slider that the Up/Down arrow keys will adjust. The matching
+    // row is highlighted so the user can see which control is targeted. Click a
+    // slider's label (or value) to retarget. Defaults to the first slider so the
+    // arrow keys work immediately when the editor opens.
+    property string highlightedSliderKey: "exposure"
+    property bool keyboardHandlerReady: false
+
+    function focusKeyboardHandler() {
+        if (compactEditor.visible && compactEditor.keyboardHandlerReady) keyScope.forceActiveFocus()
+    }
+
+    // Adjust the currently highlighted slider by `delta` slider-space steps
+    // (the sliders all run -100..100). Driven by the Up/Down arrow keys.
+    function adjustHighlightedSlider(delta) {
+        if (compactEditor.cropActive) return
+        if (!compactEditor.controllerRef || !compactEditor.highlightedSliderKey) return
+        compactEditor.ensureEditorLoaded("slider-key")
+        var key = compactEditor.highlightedSliderKey
+        var scale = compactEditor.sliderEditScale(key)
+        // Convert the stored edit-space value into slider space, step it, clamp,
+        // then convert back to edit space the way the sliders do.
+        var sliderVal = compactEditor.getBackendValue(key) / scale * 100
+        sliderVal = Math.max(-100, Math.min(100, sliderVal + delta))
+        compactEditor.controllerRef.set_edit_parameter(key, sliderVal / 100 * scale)
+        compactEditor.updatePulse++  // refreshes sliders + histogram
+    }
 
     function refreshCloseTooltip() {
         if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits())
@@ -79,28 +112,86 @@ Window {
             compactEditor.closeTooltip = "Close editor"
     }
 
+    function requestClose() {
+        if (compactEditor.cropActive) {
+            if (compactEditor.controllerRef) compactEditor.controllerRef.cancel_crop_mode()
+            return
+        }
+        if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits()) {
+            if (!discardDialog.opened) discardDialog.open()
+        } else {
+            if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorOpen = false
+        }
+    }
+
+    function handleArrowKey(key) {
+        if (compactEditor.cropActive || discardDialog.opened) return false
+        if (key === Qt.Key_Left || key === Qt.Key_Right) {
+            if (compactEditor.controllerRef)
+                compactEditor.controllerRef.handle_key_from_compact_editor(key, Qt.NoModifier, "")
+            return true
+        }
+        if (key === Qt.Key_Up) {
+            compactEditor.adjustHighlightedSlider(1)
+            return true
+        }
+        if (key === Qt.Key_Down) {
+            compactEditor.adjustHighlightedSlider(-1)
+            return true
+        }
+        return false
+    }
+
     Timer {
         id: deferredLoadTimer
-        interval: 200
+        interval: 250
         repeat: false
         onTriggered: {
             if (!compactEditor.visible || !compactEditor.controllerRef || !compactEditor.uiStateRef) return
             var idx = compactEditor.uiStateRef.currentIndex
-            if (idx === compactEditor.lastLoadedIndex) return
+            var forceLoad = compactEditor.forceNextPreviewLoad
+            compactEditor.forceNextPreviewLoad = false
+            if (!forceLoad && idx === compactEditor.lastLoadedIndex) {
+                compactEditor.controllerRef.note_compact_editor_reload_skipped(idx, "already-loaded")
+                return
+            }
+            var loaded = compactEditor.controllerRef.load_image_for_editing_preview()
+            if (!loaded) {
+                compactEditor.lastLoadedIndex = -1
+                compactEditor.lastLoadWasFull = false
+                return
+            }
             compactEditor.lastLoadedIndex = idx
-            compactEditor.controllerRef.load_image_for_editing()
+            compactEditor.lastLoadWasFull = false
             compactEditor.controllerRef.update_histogram()
             compactEditor.updatePulse++
         }
     }
 
-    function ensureEditorLoaded() {
+    function schedulePreviewLoad(reason, forceLoad) {
+        if (!compactEditor.visible || !compactEditor.controllerRef || !compactEditor.uiStateRef) return
+        var idx = compactEditor.uiStateRef.currentIndex
+        var coalesced = deferredLoadTimer.running
+        compactEditor.forceNextPreviewLoad = compactEditor.forceNextPreviewLoad || !!forceLoad
+        if (idx !== compactEditor.lastLoadedIndex) compactEditor.lastLoadWasFull = false
+        compactEditor.controllerRef.note_compact_editor_reload_scheduled(idx, coalesced, deferredLoadTimer.interval, reason)
+        deferredLoadTimer.restart()
+    }
+
+    function ensureEditorLoaded(reason) {
         if (!compactEditor.controllerRef || !compactEditor.uiStateRef) return
         var idx = compactEditor.uiStateRef.currentIndex
-        if (idx !== compactEditor.lastLoadedIndex) {
+        if (idx !== compactEditor.lastLoadedIndex || !compactEditor.lastLoadWasFull) {
             deferredLoadTimer.stop()
+            compactEditor.controllerRef.note_compact_editor_full_load_required(idx, reason || "user-action")
+            var loaded = compactEditor.controllerRef.load_image_for_editing()
+            if (!loaded) {
+                compactEditor.lastLoadedIndex = -1
+                compactEditor.lastLoadWasFull = false
+                return
+            }
             compactEditor.lastLoadedIndex = idx
-            compactEditor.controllerRef.load_image_for_editing()
+            compactEditor.lastLoadWasFull = true
             compactEditor.controllerRef.update_histogram()
             compactEditor.updatePulse++
         }
@@ -109,15 +200,17 @@ Window {
     Connections {
         target: compactEditor.uiStateRef
         function onCurrentIndexChanged() {
-            if (!compactEditor.visible) return
-            deferredLoadTimer.restart()
+            compactEditor.schedulePreviewLoad("navigation")
         }
     }
 
     onVisibleChanged: {
         if (visible && compactEditor.controllerRef) {
-            ensureEditorLoaded()
+            compactEditor.schedulePreviewLoad("open", true)
             if (compactSettings.savedX < 0) positionAtRightGutter()
+            Qt.callLater(compactEditor.focusKeyboardHandler)
+        } else {
+            deferredLoadTimer.stop()
         }
     }
 
@@ -138,41 +231,90 @@ Window {
         return 0.0;
     }
 
+    function sliderEditScale(key) {
+        if (key === "contrast") return 0.5
+        return (key === "exposure" || key === "whites") ? 2.0 : 1.0
+    }
+
+    Shortcut {
+        sequence: "Left"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Left)
+    }
+
+    Shortcut {
+        sequence: "Right"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Right)
+    }
+
     onClosing: (close) => {
         if (compactEditor.uiStateRef && compactEditor.controllerRef) {
-            if (compactEditor.controllerRef.has_unsaved_edits()) {
-                close.accepted = false
-                discardDialog.open()
-                return
-            }
-            compactEditor.uiStateRef.isEditorOpen = false
+            close.accepted = false
+            compactEditor.requestClose()
         }
     }
 
-    // Forward navigation keys to main window
+    // Keyboard handling for the compact editor window.
+    //
+    // Arrow keys are handled by WindowShortcut entries above so they still work
+    // when a child control has focus:
+    //   - Left / Right     -> previous / next image
+    //   - Up / Down        -> raise / lower the highlighted slider
+    //
+    // This focus scope handles the remaining compact-editor keys:
+    //   - Esc / E / S / O  -> editor-local actions (close / save / crop)
+    //   - everything else  -> forwarded to the main window key bindings so
+    //                         keys like B (batch), F, D, I, etc. still work
+    //                         while the editor is focused.
     FocusScope {
         id: keyScope
         anchors.fill: parent
         focus: compactEditor.visible
 
         Keys.onPressed: function(event) {
-            if (event.key === Qt.Key_Escape) {
-                if (compactEditor.uiStateRef && compactEditor.controllerRef) {
-                    if (compactEditor.controllerRef.has_unsaved_edits()) {
-                        discardDialog.open()
-                    } else {
-                        compactEditor.uiStateRef.isEditorOpen = false
-                    }
+            if (compactEditor.cropActive) {
+                if (event.key === Qt.Key_Escape) {
+                    if (compactEditor.controllerRef) compactEditor.controllerRef.cancel_crop_mode()
+                    event.accepted = true
+                    return
+                } else if (event.key === Qt.Key_Enter || event.key === Qt.Key_Return) {
+                    if (compactEditor.controllerRef) compactEditor.controllerRef.execute_crop()
+                    event.accepted = true
+                    return
+                } else if (event.key === Qt.Key_O) {
+                    if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_crop_mode()
+                    event.accepted = true
+                    return
+                } else if (event.key === Qt.Key_S) {
+                    if (compactEditor.uiStateRef) compactEditor.uiStateRef.statusMessage = "Apply or cancel the crop before saving"
+                    event.accepted = true
+                    return
+                } else if (event.key === Qt.Key_Left || event.key === Qt.Key_Right || event.key === Qt.Key_Up || event.key === Qt.Key_Down) {
+                    event.accepted = true
+                    return
                 }
+            }
+
+            if (compactEditor.handleArrowKey(event.key)) {
+                event.accepted = true
+            } else if (event.key === Qt.Key_Escape) {
+                compactEditor.requestClose()
                 event.accepted = true
             } else if (event.key === Qt.Key_E && !(event.modifiers & Qt.ControlModifier)) {
-                if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorOpen = false
+                compactEditor.requestClose()
                 event.accepted = true
-            } else if (event.key === Qt.Key_S && !(event.modifiers & Qt.ControlModifier)) {
-                compactEditor.ensureEditorLoaded()
-                if (compactEditor.controllerRef) compactEditor.controllerRef.save_edited_image()
+            } else if (event.key === Qt.Key_S) {
+                // S or Ctrl+S both save the live edits from the compact editor.
+                compactEditor.ensureEditorLoaded("save")
+                if (compactEditor.uiStateRef && !compactEditor.uiStateRef.isSaving && compactEditor.controllerRef)
+                    compactEditor.controllerRef.save_edited_image()
                 event.accepted = true
-            } else if (event.key === Qt.Key_Left || event.key === Qt.Key_Right) {
+            } else {
+                // Forward every other key (B, F, D, I, G, etc.) to the main
+                // window's key bindings.
                 if (compactEditor.controllerRef)
                     compactEditor.controllerRef.handle_key_from_compact_editor(event.key, event.modifiers, event.text)
                 event.accepted = true
@@ -195,7 +337,7 @@ Window {
         }
 
         onAccepted: {
-            if (compactEditor.controllerRef) compactEditor.controllerRef.reset_edit_parameters()
+            if (compactEditor.controllerRef) compactEditor.controllerRef.discard_edit_parameters()
             if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorOpen = false
         }
     }
@@ -221,15 +363,73 @@ Window {
 
                 Item { Layout.fillWidth: true }
 
+                Button {
+                    id: rotateCcwBtn
+                    implicitWidth: 26; implicitHeight: 26
+                    Layout.minimumWidth: 26; Layout.preferredWidth: 26; Layout.maximumWidth: 26
+                    Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
+                    enabled: !compactEditor.cropActive
+                    padding: 0
+                    flat: true
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 500
+                    ToolTip.text: "Rotate counter-clockwise"
+                    onClicked: {
+                        compactEditor.ensureEditorLoaded("rotate-ccw")
+                        if (compactEditor.controllerRef) compactEditor.controllerRef.rotate_image_ccw()
+                    }
+                    contentItem: Text {
+                        text: "↺"
+                        font.pixelSize: 16
+                        color: rotateCcwBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 4
+                        color: rotateCcwBtn.hovered ? "#30ffffff" : "transparent"
+                    }
+                }
+
+                Button {
+                    id: rotateCwBtn
+                    implicitWidth: 26; implicitHeight: 26
+                    Layout.minimumWidth: 26; Layout.preferredWidth: 26; Layout.maximumWidth: 26
+                    Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
+                    enabled: !compactEditor.cropActive
+                    padding: 0
+                    flat: true
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 500
+                    ToolTip.text: "Rotate clockwise"
+                    onClicked: {
+                        compactEditor.ensureEditorLoaded("rotate-cw")
+                        if (compactEditor.controllerRef) compactEditor.controllerRef.rotate_image_cw()
+                    }
+                    contentItem: Text {
+                        text: "↻"
+                        font.pixelSize: 16
+                        color: rotateCwBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 4
+                        color: rotateCwBtn.hovered ? "#30ffffff" : "transparent"
+                    }
+                }
+
                 // Expand button
                 Button {
                     id: expandBtn
                     implicitWidth: 26; implicitHeight: 26
                     Layout.minimumWidth: 26; Layout.preferredWidth: 26; Layout.maximumWidth: 26
                     Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
+                    enabled: !compactEditor.cropActive
                     padding: 0
                     flat: true
                     onClicked: {
+                        compactEditor.ensureEditorLoaded("expand")
                         if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorExpanded = true
                     }
                     contentItem: Text {
@@ -257,13 +457,7 @@ Window {
                     ToolTip.delay: 500
                     ToolTip.text: compactEditor.closeTooltip
                     onHoveredChanged: if (hovered) compactEditor.refreshCloseTooltip()
-                    onClicked: {
-                        if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits()) {
-                            discardDialog.open()
-                        } else {
-                            if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorOpen = false
-                        }
-                    }
+                    onClicked: compactEditor.requestClose()
                     contentItem: Text {
                         text: "✕"
                         font.pixelSize: 13
@@ -454,10 +648,11 @@ Window {
                     implicitWidth: 36; implicitHeight: 16
                     Layout.minimumWidth: 36; Layout.preferredWidth: 36; Layout.maximumWidth: 36
                     Layout.minimumHeight: 16; Layout.preferredHeight: 16; Layout.maximumHeight: 16
+                    enabled: !compactEditor.cropActive
                     padding: 0
                     flat: true
                     onClicked: {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("auto-levels")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.auto_levels()
                         compactEditor.updatePulse++
                     }
@@ -479,6 +674,8 @@ Window {
             ListModel {
                 id: lightModel
                 ListElement { name: "Exposure"; key: "exposure"; min: -100; max: 100 }
+                ListElement { name: "Brightness"; key: "brightness"; min: -100; max: 100 }
+                ListElement { name: "Contrast"; key: "contrast"; min: -100; max: 100 }
                 ListElement { name: "Whites"; key: "whites"; min: -100; max: 100 }
                 ListElement { name: "Shadows"; key: "shadows"; min: -100; max: 100 }
                 ListElement { name: "Blacks"; key: "blacks"; min: -100; max: 100 }
@@ -508,10 +705,11 @@ Window {
                     implicitWidth: 36; implicitHeight: 16
                     Layout.minimumWidth: 36; Layout.preferredWidth: 36; Layout.maximumWidth: 36
                     Layout.minimumHeight: 16; Layout.preferredHeight: 16; Layout.maximumHeight: 16
+                    enabled: !compactEditor.cropActive
                     padding: 0
                     flat: true
                     onClicked: {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("auto-white-balance")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.auto_white_balance()
                         compactEditor.updatePulse++
                     }
@@ -550,10 +748,11 @@ Window {
                     flat: true
                     Layout.preferredWidth: 60
                     Layout.preferredHeight: 28
+                    enabled: !compactEditor.cropActive
                     font.pixelSize: 11
                     Material.foreground: compactEditor.mutedText
                     onClicked: {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("reset")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.reset_edit_parameters()
                         compactEditor.updatePulse++
                     }
@@ -574,13 +773,7 @@ Window {
                     ToolTip.delay: 500
                     ToolTip.text: compactEditor.closeTooltip
                     onHoveredChanged: if (hovered) compactEditor.refreshCloseTooltip()
-                    onClicked: {
-                        if (compactEditor.controllerRef && compactEditor.controllerRef.has_unsaved_edits()) {
-                            discardDialog.open()
-                        } else {
-                            if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorOpen = false
-                        }
-                    }
+                    onClicked: compactEditor.requestClose()
                     contentItem: Text {
                         text: closeBtn.text
                         font: closeBtn.font
@@ -602,9 +795,9 @@ Window {
                     Layout.preferredWidth: 80
                     Layout.preferredHeight: 28
                     font.pixelSize: 11
-                    enabled: compactEditor.uiStateRef ? !compactEditor.uiStateRef.isSaving : true
+                    enabled: compactEditor.uiStateRef ? (!compactEditor.uiStateRef.isSaving && !compactEditor.cropActive) : true
                     onClicked: {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("save")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.save_edited_image()
                     }
                     contentItem: Text {
@@ -639,25 +832,56 @@ Window {
             Layout.fillWidth: true
             spacing: 6
 
-            Text {
-                text: sliderRow.name
-                color: compactEditor.textColor
-                font.pixelSize: 11
-                font.weight: Font.Medium
+            // Clickable label. Clicking it makes this the slider that the
+            // Up/Down arrow keys adjust; the highlighted row is tinted.
+            Rectangle {
                 Layout.preferredWidth: 70
+                Layout.preferredHeight: 18
                 Layout.alignment: Qt.AlignVCenter
-                elide: Text.ElideRight
+                radius: 3
+                property bool isActive: compactEditor.highlightedSliderKey === sliderRow.key
+                color: isActive ? "#332f6df0" : "transparent"
+                border.color: isActive ? compactEditor.accentColor : "transparent"
+                border.width: 1
+
+                Text {
+                    anchors.fill: parent
+                    anchors.leftMargin: 4
+                    verticalAlignment: Text.AlignVCenter
+                    text: sliderRow.name
+                    color: parent.isActive ? compactEditor.accentColorHover : compactEditor.textColor
+                    font.pixelSize: 11
+                    font.weight: parent.isActive ? Font.DemiBold : Font.Medium
+                    elide: Text.ElideRight
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    enabled: !compactEditor.cropActive
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        compactEditor.highlightedSliderKey = sliderRow.key
+                        compactEditor.focusKeyboardHandler()
+                    }
+                }
             }
 
             Slider {
                 id: slider
                 Layout.fillWidth: true
                 Layout.alignment: Qt.AlignVCenter
+                enabled: !compactEditor.cropActive
+                focusPolicy: Qt.NoFocus
                 from: sliderRow.min
                 to: sliderRow.max
                 stepSize: 1
+                property real editScale: compactEditor.sliderEditScale(sliderRow.key)
 
-                property real backendValue: compactEditor.getBackendValue(sliderRow.key) * sliderRow.max
+                property real backendValue: compactEditor.getBackendValue(sliderRow.key) / slider.editScale * sliderRow.max
+
+                function editValueFromSliderValue(sliderValue) {
+                    return sliderValue / sliderRow.max * slider.editScale
+                }
 
                 Binding {
                     target: slider
@@ -674,7 +898,7 @@ Window {
                     repeat: true
                     onTriggered: {
                         if (Math.abs(slider._pendingValue - slider._lastSentValue) > 0.001) {
-                            if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, slider._pendingValue / sliderRow.max)
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(slider._pendingValue))
                             slider._lastSentValue = slider._pendingValue
                         }
                     }
@@ -697,7 +921,8 @@ Window {
                 }
 
                 function triggerReset() {
-                    compactEditor.ensureEditorLoaded()
+                    compactEditor.ensureEditorLoaded("slider-reset")
+                    compactEditor.highlightedSliderKey = sliderRow.key
                     slider.isResetting = true
                     sendTimer.stop()
                     if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
@@ -710,7 +935,9 @@ Window {
 
                 onPressedChanged: {
                     if (pressed) {
-                        compactEditor.ensureEditorLoaded()
+                        compactEditor.ensureEditorLoaded("slider-change")
+                        compactEditor.highlightedSliderKey = sliderRow.key
+                        compactEditor.focusKeyboardHandler()
                         compactEditor.slidersPressedCount++
                         if (!slider.isResetting) {
                             _pendingValue = value
@@ -723,7 +950,7 @@ Window {
                         if (slider.isResetting) {
                             if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
                         } else {
-                            if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, value / sliderRow.max)
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
                         }
                         if (compactEditor.controllerRef) compactEditor.controllerRef.update_histogram()
                     }
@@ -731,6 +958,7 @@ Window {
 
                 onMoved: {
                     if (slider.isResetting) return
+                    compactEditor.highlightedSliderKey = sliderRow.key
                     _pendingValue = value
                     if (!sendTimer.running) sendTimer.start()
                 }
@@ -791,8 +1019,11 @@ Window {
 
                 MouseArea {
                     anchors.fill: parent
+                    enabled: !compactEditor.cropActive
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
+                        compactEditor.highlightedSliderKey = sliderRow.key
+                        compactEditor.focusKeyboardHandler()
                         if (!slider.isResetting) slider.triggerReset()
                     }
                 }

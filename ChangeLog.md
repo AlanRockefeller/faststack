@@ -2,6 +2,60 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## Unreleased
+
+- Auto-levels and auto white balance produce noticeably better output:
+  - Auto-levels no longer gives up on an end of the histogram just because a tiny number of pixels is already clipped there (e.g. one small specular highlight used to disable the entire white-point stretch). The clip threshold now acts as a true budget: the stretch is chosen so the total clipped fraction — pre-existing plus new — stays within the threshold.
+  - Auto-levels endpoints are now luminance-driven with a per-channel clip budget (new "Channel Clip Budget" setting, default 3x the threshold), so a single saturated channel (blue sky, red flowers) no longer vetoes the whole stretch. Analysis histograms use 1024 bins instead of 256 for finer, more stable endpoint placement.
+  - New midtone correction (new "Midtone Correction" + "Midtone Target" settings, on by default, target 0.38): auto-levels also nudges brightness when a full-range image is under- or over-exposed. Images already within a dead band of the target are left alone, and corrected images recover only partway toward the band edge — so well-exposed photos and intentional low-key/high-key shots are preserved rather than normalized to one brightness. Full-range but underexposed images, which previously got "no change (already full range)", are now corrected. The nudge is conservative (-15%/+30% max) and is only auto-set when the brightness slider is untouched.
+  - The blacks/whites levels ramp rolls off smoothly near pure white and black instead of hard-clipping each channel independently (new "Highlight Soft Rolloff" setting, on by default). Stretched highlights keep tonal separation and hue — sunset clouds no longer color-shift when one channel clips before the others — and crushed shadows keep a hint of separation.
+  - Strong level stretches no longer band smooth gradients (skies) on export: a deterministic, imperceptible triangular-noise dither is applied during 8-bit quantization when the stretch gain reaches 1.2x (new "Export Dithering" setting, on by default). The levels uint8 fast-path save defers to the float pipeline in that case so the dither can be applied.
+  - Auto white balance now analyzes only the cropped area, so borders and backgrounds you have cropped away can no longer skew the color estimate (auto-levels already worked this way).
+  - Auto white balance scales its correction by confidence: few usable neutral pixels, or disagreement between its two estimators, fades the correction toward neutral instead of over-correcting scenes that lack true grays.
+  - Auto white balance blends a second, independent estimator (Shades-of-Gray, Minkowski p=6) with the neutral-pixel estimate; agreement between the two raises confidence and blending tempers each one's biases.
+  - Magenta/green (tint) corrections are damped relative to blue/yellow (new "Tint Correction" setting, default 60%): real light sources vary mostly along the blue/yellow axis, so a large tint component is usually subject color (foliage) rather than a cast — this prevents the classic "green forest turns magenta" failure.
+  - White-balance gains are now normalized to preserve luminance, so warming or cooling an image no longer slightly brightens or darkens it (applies to slider WB and AWB alike, including the uint8 fast-path save).
+  - Auto vibrance is now hue-aware: it backs off when a small subject is already vivid (90th-percentile saturation guard) and halves the boost when a meaningful share of pixels falls in the skin-tone envelope.
+  - The compact editor's Light section now includes a Brightness slider (the full editor already had one), so the midtone correction applied by auto-levels is visible and adjustable there. The soft highlight rolloff and luminance-preserving white balance apply to manual Blacks/Whites and Temp/Tint slider edits in both editors too, since they live in the shared render pipeline.
+- Applying a crop (and full-resolution renders generally) no longer copies the entire full-resolution float master before slicing out the crop — at 20MP that was a ~240MB copy on the UI thread per crop apply. The render now shares the master and copies only the cropped region, and skips even that when the display downscale already produced fresh memory. Preview-sized renders during crop drags get the same treatment. Output is bit-identical.
+- Rotate mode (crop straightening) now overlays a grid of horizontal and vertical reference lines. The lines stay screen-aligned while the image rotates underneath, so horizons and verticals can be lined up without guessing; the center lines are drawn brighter. The grid is only visible while rotate mode is active.
+- Image editing is much faster. Quick auto-adjust keys (`l`, `L`, `-`, `=`, `+`, `_`) and editor sliders now show results several times sooner:
+  - sRGB↔linear conversions in the edit pipeline use lookup tables (~3x faster, error under 0.03 of one 8-bit step).
+  - Preview renders skip the linear round-trip entirely when only sRGB-space edits (levels, brightness, contrast, saturation, vibrance, vignette) are active; the live clipping indicators are still computed from a downsampled view.
+  - Final display conversion uses a fused OpenCV pass (~5x faster).
+  - Quick auto-adjust loads the image preview-only, removing a ~400ms UI freeze on the first keypress; the full-resolution master is materialized in the background.
+  - Full-resolution live previews (after crop/rotate) now publish a fast preview-sized frame immediately, then replace it with the high-resolution frame, and the high-resolution render is capped at display size when not zoomed (it was processing 20MP for pixels the screen cannot show). Crop apply/cancel renders are capped the same way.
+  - The editor now decodes JPEG pixels with TurboJPEG (Pillow fallback) instead of Pillow, roughly halving image-load time on the first edit keypress; EXIF/ICC metadata is preserved via a lazy header read. Full editor loads of JPEGs also no longer decode the file a second time through OpenCV's 16-bit probe.
+  - More debug timing logs: `[RENDER_DECODED]` breaks down apply/u8/color time per preview render.
+- The batch-clear shortcut now uses `|` instead of plain `\`, so Shift must be held down.
+- Fixed re-editing a previously cropped (or otherwise edited) image showing a double-applied edit (e.g. crop-on-crop) in preview-sized renders: the editor seeded its preview buffer from the already-saved pixels while also replaying the saved edits on top. The preview is now rebuilt from the backup source pixels whenever edits are replayed.
+- EXIF orientation is now applied with OpenCV rotate/flip (bit-identical, ~5x faster): rotated camera images (orientation 3/6/8) were paying a ~244ms numpy transpose copy at 20MP on every editor load and prefetch decode.
+- A save no longer invalidates and re-decodes the displayed image two or three times: the save-completion handler and the watcher events it triggers now recognize (via an mtime+size fingerprint) that the file state was already invalidated. Single-file metadata changes (timestamp/backup flag after a save) also no longer cancel the whole prefetch generation, which was silently re-decoding the ±8 window in the background after every save.
+- Editor preview buffers are built with cv2.resize instead of a PIL thumbnail round-trip when the JPEG fast path is active (~4x faster at 20MP).
+- Fixed display-only oversaturation when editing a previously saved image in ICC color mode: editor preview buffers built from source pixels (backup re-edit loads, restored in-flight sessions, compare previews) were sRGB but displayed as monitor-space. They are now color-corrected to display space at build time, exactly like the prefetcher's cached previews. Saved files were never affected.
+- Navigating away from a just-edited image and back no longer flashes the original pixels while the background save is in flight: the last live preview is seeded into the decode cache when the session save is queued, then replaced by the real decode when the save completes (and dropped if the save fails).
+- Fixed a duplicate watcher-debounce fire (with an already-drained change set) falling back to a global cache invalidation, which re-decoded the whole prefetch window once after some saves.
+- Saving is much cheaper end to end:
+  - Adding an image to a batch (including the automatic add-on-first-edit) no longer rebuilds the entire grid model — batch badges are computed live, so the grid is just told to repaint them. This removes a ~1 second UI-thread stall after every save.
+  - Sidecar metadata lookups from grid refreshes no longer run the legacy-key migration scan (O(entries) filesystem checks per missing entry); measured 1184ms → 28ms for a 341-image folder with 300 sidecar entries. Migration still runs on user-action lookups, so old entries are still upgraded when an image is viewed or modified.
+  - The vibrance pipeline (active on every quick auto-adjust save and preview) avoids a hidden float64 promotion in the gray-blend math and uses OpenCV for channel max/min and luma (~3x faster at full resolution), and the save path's float→uint8 conversion is a fused OpenCV pass.
+- Navigation metadata lookups (filename/uploaded/stack/batch status shown per image) no longer run the sidecar legacy-key migration scan, which was doing hundreds of filesystem checks per navigated image on the GUI thread during fast arrow-key scrolling.
+- Saving an image no longer invalidates the entire decode cache. Saves, watcher-detected file changes, and edit-revert now invalidate only the files that actually changed, so navigation right after a save no longer hits a blocking re-decode and the prefetch window stays warm (previously every save re-decoded ~9 neighboring images and bumped the global cache generation several times). A per-path invalidation epoch makes this safe: decode results that started reading a file before it was replaced are discarded instead of re-inserting stale pixels. The global invalidation still applies for resize/zoom/color-mode changes and unattributable directory events.
+
+## 1.6.4 (2026-06-06)
+
+- Image editor exposure and whites slider changes now apply twice as much per slider unit without changing auto levels or other exposure logic.
+- Fixed crop geometry when rotating an already-cropped image in the editor, so preview and save now preserve the intended crop after 90-degree rotation.
+- Compact image editor now includes a contrast slider.
+- Right-click crop entry in loupe view is now reliable after panning and with trackpads that report mixed button state.
+- Loupe status bar EXIF details now show the distance in meters from the previous photo when both images have GPS coordinates.
+- Quick auto levels/auto color (`l` and `L`) now also raise the vibrance if FastStack thinks it should be raised. There is a setting to enable/disable this, enabled by default.
+- Holding Space in loupe view now shows the original source image with the current crop still applied, hiding other live edits until Space is released.
+- Crop mode now works while the compact image editor is open - it is still disabled if the expanded editor is open.
+- Highlights slider now recovers a broad range of bright tones with a smooth falloff, instead of only affecting near-white pixels, while leaving midtones unchanged.
+- Compact image editor keyboard handling reworked: Left/Right now navigate to the previous/next image even when the editor is focused, Up/Down raise/lower the highlighted slider, and clicking a slider's label highlights it as the Up/Down target. Other shortcuts (B to batch, F, D, I, G, etc.) now also work while the editor is focused. README gained a full Image Editor section.
+- Added Actions -> Duplicate Image, which copies the current visible image to a `_duplicate` filename and inserts it as the next image without copying backups or RAW pairs.
+
 ## 1.6.3 (2026-04-16)
 
 - Reworked quick auto-adjust and crop into one shared live edit session for the current image instead of saving on every keypress.
@@ -334,7 +388,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 ### Major Features
 
 - **Batch Selection System:** New batch selection mode for drag-and-drop operations
-  - `{` to begin batch, `}` to end batch, `\` to clear all batches
+  - `{` to begin batch, `}` to end batch, `|` to clear all batches
   - `X` or `S` keys remove individual images from batches/stacks (shrinks or splits ranges)
   - Batches automatically cleared after successful drag operation
   - Multiple files can now be dragged to browsers and external applications simultaneously
