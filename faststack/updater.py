@@ -89,6 +89,7 @@ def normalize_version(version: str) -> str:
     value = version.strip()
     if value.startswith(("v", "V")):
         value = value[1:]
+    value = re.sub(r"[-_.]?build\d+$", "", value, flags=re.IGNORECASE)
     return value
 
 
