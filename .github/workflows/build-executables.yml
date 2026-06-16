@@ -84,6 +84,8 @@ jobs:
     permissions:
       actions: read
       contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
 
     steps:
       - name: Download build artifacts
