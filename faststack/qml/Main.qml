@@ -1068,8 +1068,11 @@ ApplicationWindow {
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
                 onClicked: {
-                    if (root.uiStateRef) root.uiStateRef.jumpToLastUploaded()
+                    sortSubMenu.close()
                     actionsMenu.close()
+                    Qt.callLater(function() {
+                        if (root.uiStateRef) root.uiStateRef.jumpToLastUploaded()
+                    })
                 }
             }
             MenuActionItem {
@@ -1880,8 +1883,8 @@ ApplicationWindow {
                           "&nbsp;&nbsp;Ctrl+0: Reset zoom and pan to fit window<br>" +
                           "&nbsp;&nbsp;Ctrl+1/2/3/4: Zoom to 100%/200%/300%/400%<br><br>" +
                           "<b>Stacking:</b><br>" +
-                          "&nbsp;&nbsp;[: Begin new stack<br>" +
-                          "&nbsp;&nbsp;]: End current stack<br>" +
+                          "&nbsp;&nbsp;[: Mark stack start<br>" +
+                          "&nbsp;&nbsp;]: Mark stack end<br>" +
                           "&nbsp;&nbsp;C: Clear all stacks<br>" +
                           "&nbsp;&nbsp;S: Toggle current image in/out of stack<br>" +
                           "&nbsp;&nbsp;X: Remove current image from batch/stack"

@@ -33,6 +33,7 @@ class UIStateRestoration:
     saved_batch_start_index: Optional[int] = None
     saved_stacks: Optional[list] = None
     saved_stack_start_index: Optional[int] = None
+    saved_stack_end_index: Optional[int] = None
 
 
 @dataclass
