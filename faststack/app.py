@@ -7800,10 +7800,23 @@ class AppController(QObject):
 
     def _rollback_ui_items(self, items: List[Tuple[int, Any]], job: DeleteJob) -> None:
         """Restore items to the UI list in correct order."""
-        # Insert in ascending index order so each insertion shifts subsequent
-        # indices correctly, restoring the original list positions.
+        # Each saved idx is an ORIGINAL list position. During a partial rollback
+        # some earlier-deleted items stay removed, so a raw insert at idx would
+        # overshoot a still-missing lower position. Shift each idx left by the
+        # count of still-missing lower positions to land it in the compressed
+        # list. Insert in ascending index order so prior inserts settle first.
+        present_keys = {self._key(x.path) for x in self.image_files}
+        restoring_keys = {self._key(img.path) for _, img in items}
+        still_missing = sorted(
+            idx
+            for idx, img in job.removed_items
+            if self._key(img.path) not in present_keys
+            and self._key(img.path) not in restoring_keys
+        )
         for idx, img in sorted(items, key=lambda x: x[0]):
-            self.image_files.insert(min(idx, len(self.image_files)), img)
+            shift = sum(1 for m in still_missing if m < idx)
+            pos = min(max(idx - shift, 0), len(self.image_files))
+            self.image_files.insert(pos, img)
 
         # Restore selection/focus (approximated)
         self.current_index = min(job.previous_index, len(self.image_files) - 1)

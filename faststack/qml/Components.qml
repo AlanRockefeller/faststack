@@ -925,6 +925,9 @@ Item {
         // sync (missing a pivot reset leaks a stale off-center rotation origin
         // into the next crop session).
         function resetCropRotation() {
+            // Stop any in-flight throttle so a queued set_straighten_angle()
+            // can't apply a stale angle to the next crop / image after reset.
+            rotationThrottleTimer.stop()
             cropRotation = 0
             cropRotationPivotX = 0.5
             cropRotationPivotY = 0.5
@@ -1140,8 +1143,10 @@ Item {
                     }
                 }
                 
-                // If crop box is full image, always start a new crop
-                else if (isFullImage) {
+                // If crop box is full image, always start a new crop.
+                // Independent of the rotate-knob check above so crop hit-testing
+                // still runs when a knob click is missed in rotate mode.
+                if (isFullImage) {
                     // Start a new crop rectangle from the clicked point
                     beginNewCrop(mouse.x, mouse.y, mx, my)
                 } else if (inside) {
@@ -1454,6 +1459,11 @@ Item {
             // width_norm / height_norm = targetAspect * (imgH / imgW)
             
             var pixelAspect = ratioPair[0] / ratioPair[1];
+            // At an odd 90-degree straighten the committed output swaps width
+            // and height (editor.py _crop_box_canvas_rect), so a 16:9 lock must
+            // constrain the source box to 9:16 to land 16:9 after the swap.
+            // Mirror the swap cropViewRectForBox/cropBoxFromViewRect already do.
+            if (cropOverlay._dimensionsAreSwapped()) pixelAspect = 1.0 / pixelAspect;
             // Use mainImage (fixed canvas) for aspect ratio calculation
             var imageAspect = mainImage.width / mainImage.height;
             var targetAspect = pixelAspect * (1.0 / imageAspect); // Normalized aspect ratio
