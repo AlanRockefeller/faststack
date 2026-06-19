@@ -25,6 +25,10 @@ GITHUB_REPOSITORY = "AlanRockefeller/faststack"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 USER_AGENT = "FastStack Update Checker"
 FALLBACK_VERSION = "1.6.4"
+BUILD_SUFFIX_RE = re.compile(
+    r"[-_.+]?build[-_.]?\d+(?:[-_.].*)?$",
+    re.IGNORECASE,
+)
 
 
 class UpdateCheckError(RuntimeError):
@@ -89,12 +93,13 @@ def normalize_version(version: str) -> str:
     value = version.strip()
     if value.startswith(("v", "V")):
         value = value[1:]
-    value = re.sub(r"[-_.]?build\d+$", "", value, flags=re.IGNORECASE)
+    value = value.split("+", 1)[0]
+    value = BUILD_SUFFIX_RE.sub("", value)
     return value
 
 
 def is_newer_version(latest: str, current: str) -> bool:
-    """Return True when latest is newer than current."""
+    """Return True when latest has a newer public version than current."""
     if Version is None:
         return _fallback_version_key(latest) > _fallback_version_key(current)
 

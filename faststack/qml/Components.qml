@@ -78,7 +78,7 @@ Item {
 
         mainMouseArea.clearPendingRotation(0)
         mainMouseArea.endCropInteraction()
-        mainMouseArea.cropRotation = 0
+        mainMouseArea.resetCropRotation()
         mainMouseArea.isRotating = false
         loupeView.controllerRef.cancel_crop_mode()
         return true
@@ -120,7 +120,7 @@ Item {
                     mainMouseArea.clearPendingRotation(0)
                     mainMouseArea.endCropInteraction()
                     mainMouseArea.isRotating = false
-                    mainMouseArea.cropRotation = 0
+                    mainMouseArea.resetCropRotation()
                 }
                 if (loupeView.uiStateRef) loupeView.uiStateRef.isCropRotating = false
                 loupeView.releaseCropImageSource()
@@ -256,13 +256,14 @@ Item {
                isUpdatingGeometry = true
                
                var rad = mainMouseArea.cropRotation * (Math.PI / 180.0)
+               var cropModeActive = loupeView.uiStateRef && loupeView.uiStateRef.isCropping
                
                // Use base size if available (stable during zoom), otherwise sourceSize
                var w = (baseW > 0) ? baseW : mainImage.sourceSize.width
                var h = (baseH > 0) ? baseH : mainImage.sourceSize.height
                
-               var newW = Math.abs(w * Math.cos(rad)) + Math.abs(h * Math.sin(rad))
-               var newH = Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad))
+               var newW = cropModeActive ? w : Math.abs(w * Math.cos(rad)) + Math.abs(h * Math.sin(rad))
+               var newH = cropModeActive ? h : Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad))
                
                width = newW
                height = newH
@@ -272,7 +273,7 @@ Item {
                mainImage.height = h
                
                isUpdatingGeometry = false
-               recomputeFitScale()
+               if (!cropModeActive) recomputeFitScale()
             }
 
             Connections {
@@ -374,7 +375,22 @@ Item {
                 // width: sourceSize.width
                 // height: sourceSize.height
                 
-                rotation: mainMouseArea.cropRotation
+                function cropRotationOriginX() {
+                    if (loupeView.uiStateRef && loupeView.uiStateRef.isCropping) return mainMouseArea.cropRotationPivotX * mainImage.width
+                    return mainImage.width / 2
+                }
+
+                function cropRotationOriginY() {
+                    if (loupeView.uiStateRef && loupeView.uiStateRef.isCropping) return mainMouseArea.cropRotationPivotY * mainImage.height
+                    return mainImage.height / 2
+                }
+
+                transform: Rotation {
+                    id: imageStraightenRotation
+                    origin.x: mainImage.cropRotationOriginX()
+                    origin.y: mainImage.cropRotationOriginY()
+                    angle: mainMouseArea.cropRotation
+                }
                 
                 // Darken mask overlay - anchored to mainImage, rotates/scales with it
                 Image {
@@ -388,83 +404,6 @@ Item {
                     fillMode: Image.Stretch
                     cache: false
                     opacity: 1.0  // Opacity is baked into the ARGB32 image
-                }
-
-                // Crop overlay - anchored to mainImage to rotate with it
-                Item {
-                    id: cropOverlay
-                    property bool isFullImageCrop: {
-                        var b = _liveCropBox()
-                        return b && b.length === 4 && b[0]===0 && b[1]===0 && b[2]===1000 && b[3]===1000
-                    }
-                    property bool hasPositiveCrop: {
-                        var b = _liveCropBox()
-                        return b && b.length === 4 && (b[2] - b[0]) > 0 && (b[3] - b[1]) > 0
-                    }
-                    property bool hasDrawableCrop: hasPositiveCrop && !isFullImageCrop
-                    // Show visual content only for a real crop box or rotate mode.
-                    property bool showCropContent: hasDrawableCrop || mainMouseArea.isRotating
-
-                    property int _cropBoxRev: 0
-                    Connections {
-                        target: loupeView.uiStateRef
-                        function onCurrentCropBoxChanged() {
-                            cropOverlay._cropBoxRev += 1
-                        }
-                    }
-
-                    function _liveCropBox() {
-                        var _ = cropOverlay._cropBoxRev
-                        return loupeView.uiStateRef ? loupeView.uiStateRef.currentCropBox : null
-                    }
-
-                    visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping
-                    anchors.fill: parent // Fills mainImage
-                    z: 100
-
-                    // Dimmer Rectangles — only render when a real crop is active/being drawn
-                    Rectangle { visible: cropOverlay.hasDrawableCrop; x: 0; y: 0; width: parent.width; height: cropRect.y; color: "black"; opacity: 0.3 }
-                    Rectangle { visible: cropOverlay.hasDrawableCrop; x: 0; y: cropRect.y + cropRect.height; width: parent.width; height: parent.height - (cropRect.y + cropRect.height); color: "black"; opacity: 0.3 }
-                    Rectangle { visible: cropOverlay.hasDrawableCrop; x: 0; y: cropRect.y; width: cropRect.x; height: cropRect.height; color: "black"; opacity: 0.3 }
-                    Rectangle { visible: cropOverlay.hasDrawableCrop; x: cropRect.x + cropRect.width; y: cropRect.y; width: parent.width - (cropRect.x + cropRect.width); height: cropRect.height; color: "black"; opacity: 0.3 }
-                    
-                    Rectangle {
-                        id: cropRect
-                        x: { var b = cropOverlay._liveCropBox(); return (b && b.length === 4) ? (b[0] / 1000) * parent.width : 0 }
-                        y: { var b = cropOverlay._liveCropBox(); return (b && b.length === 4) ? (b[1] / 1000) * parent.height : 0 }
-                        width: { var b = cropOverlay._liveCropBox(); return (b && b.length === 4) ? ((b[2] - b[0]) / 1000) * parent.width : 0 }
-                        height: { var b = cropOverlay._liveCropBox(); return (b && b.length === 4) ? ((b[3] - b[1]) / 1000) * parent.height : 0 }
-                        visible: cropOverlay.showCropContent
-                        color: "transparent"
-                        border.color: "white"
-                        border.width: 3 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
-                        
-                        // Rotation Handle Line
-                        Rectangle {
-                            id: handleLine
-                            visible: cropOverlay.hasDrawableCrop && mainMouseArea.isRotating
-                            width: 2 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
-                            height: 25 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
-                            color: "white"
-                            anchors.top: parent.bottom
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-                        
-                        // Rotation Knob
-                        Rectangle {
-                            id: rotateKnob
-                            visible: cropOverlay.hasDrawableCrop && mainMouseArea.isRotating
-                            width: 12 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
-                            height: 12 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
-                            radius: width / 2
-                            color: "white"
-                            border.color: "black"
-                            border.width: 1 / ((scaleTransform && scaleTransform.xScale) ? scaleTransform.xScale : 1.0)
-                            anchors.verticalCenter: handleLine.bottom
-                            anchors.horizontalCenter: handleLine.horizontalCenter
-                        }
-                    }
-
                 }
 
                 source: loupeView.displayedImageSource
@@ -524,7 +463,7 @@ Item {
                     // If we intended to keep high-res (isZoomed is true), preserve capabilities.
                     // If not (isZoomed is false), reset to "fit" state for speed and consistency.
                     if (loupeView.uiStateRef && !loupeView.uiStateRef.isZoomed) {
-                        mainMouseArea.cropRotation = 0
+                        mainMouseArea.resetCropRotation()
                         mainMouseArea.isRotating = false
                         mainMouseArea.cropDragMode = "none"
                         
@@ -622,6 +561,227 @@ Item {
 
         }
 
+        // Crop overlay lives in viewport space so straighten rotates the image
+        // inside a fixed output window, matching Photoshop's crop behavior.
+        Item {
+            id: cropOverlay
+            anchors.fill: parent
+            z: 100
+            visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping
+
+            property int _cropBoxRev: 0
+            property bool isFullImageCrop: {
+                var b = _liveCropBox()
+                return b && b.length === 4 && b[0] === 0 && b[1] === 0 && b[2] === 1000 && b[3] === 1000
+            }
+            property bool hasPositiveCrop: {
+                var b = _liveCropBox()
+                return b && b.length === 4 && (b[2] - b[0]) > 0 && (b[3] - b[1]) > 0
+            }
+            property bool hasDrawableCrop: hasPositiveCrop && !isFullImageCrop
+            property bool showCropContent: hasDrawableCrop || mainMouseArea.isRotating
+
+            Connections {
+                target: loupeView.uiStateRef
+                function onCurrentCropBoxChanged() {
+                    cropOverlay._cropBoxRev += 1
+                }
+            }
+
+            function _liveCropBox() {
+                var _ = cropOverlay._cropBoxRev
+                return loupeView.uiStateRef ? loupeView.uiStateRef.currentCropBox : null
+            }
+
+            function _dimensionsAreSwapped() {
+                // Symmetric about zero so +/-45 behave identically; mirrors the
+                // backend's round(angle / 90) % 2 convention (editor.py).
+                return Math.round(Math.abs(mainMouseArea.cropRotation) / 90) % 2 === 1
+            }
+
+            function cropViewRectForBox(box) {
+                // Touch every input that affects the mainImage -> cropOverlay mapping
+                // so this binding re-evaluates when any changes (QML can't track
+                // dependencies through mapFromItem). The straighten Rotation pivot
+                // (cropRotationPivotX/Y) is included so a pivot-only change still
+                // invalidates the crop frame.
+                var _ = cropOverlay._cropBoxRev + mainMouseArea.cropRotation + mainMouseArea.cropRotationPivotX + mainMouseArea.cropRotationPivotY + imageRotator.zoomScale + panTransform.x + panTransform.y + mainImage.width + mainImage.height + cropOverlay.width + cropOverlay.height
+                if (!box || box.length !== 4 || !mainImage || mainImage.width <= 0 || mainImage.height <= 0) {
+                    return {x: 0, y: 0, width: 0, height: 0}
+                }
+
+                var centerX = ((box[0] + box[2]) / 2000) * mainImage.width
+                var centerY = ((box[1] + box[3]) / 2000) * mainImage.height
+                var center = cropOverlay.mapFromItem(mainImage, centerX, centerY)
+                var rectW = ((box[2] - box[0]) / 1000) * mainImage.width * imageRotator.zoomScale
+                var rectH = ((box[3] - box[1]) / 1000) * mainImage.height * imageRotator.zoomScale
+
+                if (_dimensionsAreSwapped()) {
+                    var tmp = rectW
+                    rectW = rectH
+                    rectH = tmp
+                }
+
+                return {
+                    x: center.x - rectW / 2,
+                    y: center.y - rectH / 2,
+                    width: rectW,
+                    height: rectH
+                }
+            }
+
+            function currentCropViewRect() {
+                return cropViewRectForBox(_liveCropBox())
+            }
+
+            // Convert a viewport-space rect to a normalized 0-1000 crop box.
+            //
+            // preserveSize=true keeps the box's size and slides it to stay inside
+            // the image (used for "move", which should translate without resizing).
+            // preserveSize=false clips each edge independently at the image boundary
+            // so the dragged edge stops at the edge while the anchored edge stays put
+            // (used for resize and new-crop drawing).
+            function cropBoxFromViewRect(left, top, right, bottom, preserveSize) {
+                if (!mainImage || mainImage.width <= 0 || mainImage.height <= 0 || imageRotator.zoomScale <= 0) {
+                    return [0, 0, 1000, 1000]
+                }
+
+                var rectLeft = Math.min(left, right)
+                var rectRight = Math.max(left, right)
+                var rectTop = Math.min(top, bottom)
+                var rectBottom = Math.max(top, bottom)
+
+                if (rectRight - rectLeft < 1) rectRight = rectLeft + 1
+                if (rectBottom - rectTop < 1) rectBottom = rectTop + 1
+
+                var center = mainImage.mapFromItem(cropOverlay, (rectLeft + rectRight) / 2, (rectTop + rectBottom) / 2)
+                var sourceW = (rectRight - rectLeft) / imageRotator.zoomScale
+                var sourceH = (rectBottom - rectTop) / imageRotator.zoomScale
+
+                if (_dimensionsAreSwapped()) {
+                    var tmp = sourceW
+                    sourceW = sourceH
+                    sourceH = tmp
+                }
+
+                var normW = sourceW * 1000 / mainImage.width
+                var normH = sourceH * 1000 / mainImage.height
+                var cx = center.x * 1000 / mainImage.width
+                var cy = center.y * 1000 / mainImage.height
+
+                var outLeft = cx - normW / 2
+                var outRight = cx + normW / 2
+                var outTop = cy - normH / 2
+                var outBottom = cy + normH / 2
+
+                if (preserveSize) {
+                    // Slide the whole box back inside [0,1000] without resizing it.
+                    if (outRight - outLeft >= 1000) {
+                        outLeft = 0
+                        outRight = 1000
+                    } else {
+                        if (outLeft < 0) {
+                            outRight -= outLeft
+                            outLeft = 0
+                        }
+                        if (outRight > 1000) {
+                            outLeft -= outRight - 1000
+                            outRight = 1000
+                        }
+                    }
+                    if (outBottom - outTop >= 1000) {
+                        outTop = 0
+                        outBottom = 1000
+                    } else {
+                        if (outTop < 0) {
+                            outBottom -= outTop
+                            outTop = 0
+                        }
+                        if (outBottom > 1000) {
+                            outTop -= outBottom - 1000
+                            outBottom = 1000
+                        }
+                    }
+                } else {
+                    // Clip each edge at the image boundary so the dragged edge stops
+                    // there while the anchored (opposite) edge stays fixed.
+                    outLeft = Math.max(0, Math.min(1000, outLeft))
+                    outRight = Math.max(0, Math.min(1000, outRight))
+                    outTop = Math.max(0, Math.min(1000, outTop))
+                    outBottom = Math.max(0, Math.min(1000, outBottom))
+                }
+
+                // Enforce a minimum crop extent in normalized units (~1% of the
+                // image), independent of zoom so a high-zoom drag can't create a
+                // degenerate crop.
+                var minNorm = 10
+                if (outRight - outLeft < minNorm) {
+                    if (outLeft + minNorm <= 1000) outRight = outLeft + minNorm
+                    else outLeft = outRight - minNorm
+                }
+                if (outBottom - outTop < minNorm) {
+                    if (outTop + minNorm <= 1000) outBottom = outTop + minNorm
+                    else outTop = outBottom - minNorm
+                }
+
+                outLeft = Math.max(0, Math.min(1000 - minNorm, outLeft))
+                outTop = Math.max(0, Math.min(1000 - minNorm, outTop))
+                outRight = Math.max(outLeft + minNorm, Math.min(1000, outRight))
+                outBottom = Math.max(outTop + minNorm, Math.min(1000, outBottom))
+
+                return [Math.round(outLeft), Math.round(outTop), Math.round(outRight), Math.round(outBottom)]
+            }
+
+            // Dimmer rectangles. The crop frame can extend past the viewport (for
+            // example while straightened), so clamp every edge to the overlay
+            // bounds to avoid negative/oversized dim regions.
+            readonly property real _dimLeft: Math.max(0, Math.min(width, cropRect.x))
+            readonly property real _dimRight: Math.max(0, Math.min(width, cropRect.x + cropRect.width))
+            readonly property real _dimTop: Math.max(0, Math.min(height, cropRect.y))
+            readonly property real _dimBottom: Math.max(0, Math.min(height, cropRect.y + cropRect.height))
+
+            Rectangle { visible: cropOverlay.hasDrawableCrop; x: 0; y: 0; width: parent.width; height: cropOverlay._dimTop; color: "black"; opacity: 0.3 }
+            Rectangle { visible: cropOverlay.hasDrawableCrop; x: 0; y: cropOverlay._dimBottom; width: parent.width; height: parent.height - cropOverlay._dimBottom; color: "black"; opacity: 0.3 }
+            Rectangle { visible: cropOverlay.hasDrawableCrop; x: 0; y: cropOverlay._dimTop; width: cropOverlay._dimLeft; height: cropOverlay._dimBottom - cropOverlay._dimTop; color: "black"; opacity: 0.3 }
+            Rectangle { visible: cropOverlay.hasDrawableCrop; x: cropOverlay._dimRight; y: cropOverlay._dimTop; width: parent.width - cropOverlay._dimRight; height: cropOverlay._dimBottom - cropOverlay._dimTop; color: "black"; opacity: 0.3 }
+
+            Rectangle {
+                id: cropRect
+                property var viewRect: cropOverlay.currentCropViewRect()
+                x: viewRect.x
+                y: viewRect.y
+                width: viewRect.width
+                height: viewRect.height
+                visible: cropOverlay.showCropContent
+                color: "transparent"
+                border.color: "white"
+                border.width: 3
+
+                Rectangle {
+                    id: handleLine
+                    visible: cropOverlay.hasDrawableCrop && mainMouseArea.isRotating
+                    width: 2
+                    height: 25
+                    color: "white"
+                    anchors.top: parent.bottom
+                    anchors.horizontalCenter: parent.horizontalCenter
+                }
+
+                Rectangle {
+                    id: rotateKnob
+                    visible: cropOverlay.hasDrawableCrop && mainMouseArea.isRotating
+                    width: 12
+                    height: 12
+                    radius: width / 2
+                    color: "white"
+                    border.color: "black"
+                    border.width: 1
+                    anchors.verticalCenter: handleLine.bottom
+                    anchors.horizontalCenter: handleLine.horizontalCenter
+                }
+            }
+        }
+
         // Alignment grid for rotate mode. Lives in the viewport (NOT inside
         // imageRotator/mainImage) so the lines stay screen-horizontal and
         // screen-vertical while the image rotates underneath them.
@@ -706,7 +866,13 @@ Item {
         property real cropBoxStartTop: 0
         property real cropBoxStartRight: 0
         property real cropBoxStartBottom: 0
+        property real cropViewStartLeft: 0
+        property real cropViewStartTop: 0
+        property real cropViewStartRight: 0
+        property real cropViewStartBottom: 0
         property real cropRotation: 0
+        property real cropRotationPivotX: 0.5
+        property real cropRotationPivotY: 0.5
         property bool isRotating: false
         property real cropStartAngle: 0
         property real cropStartRotation: 0
@@ -716,7 +882,7 @@ Item {
         Connections {
             target: loupeView.uiStateRef
             function onCurrentIndexChanged() {
-                mainMouseArea.cropRotation = 0
+                mainMouseArea.resetCropRotation()
             }
         }
 
@@ -754,6 +920,19 @@ Item {
             pendingAspect = -1
         }
 
+        // Reset the straighten angle and its rotation pivot to the centered
+        // defaults. Centralized so every crop-exit / image-change path stays in
+        // sync (missing a pivot reset leaks a stale off-center rotation origin
+        // into the next crop session).
+        function resetCropRotation() {
+            // Stop any in-flight throttle so a queued set_straighten_angle()
+            // can't apply a stale angle to the next crop / image after reset.
+            rotationThrottleTimer.stop()
+            cropRotation = 0
+            cropRotationPivotX = 0.5
+            cropRotationPivotY = 0.5
+        }
+
         function setCropBoxStart(left, top, right, bottom) {
             cropBoxStartLeft = left
             cropBoxStartTop = top
@@ -761,9 +940,18 @@ Item {
             cropBoxStartBottom = bottom
         }
 
+        function setCropViewStart(left, top, right, bottom) {
+            cropViewStartLeft = left
+            cropViewStartTop = top
+            cropViewStartRight = right
+            cropViewStartBottom = bottom
+        }
+
         function setCropBoxStartFromBox(box) {
             if (!box || box.length !== 4) return
             setCropBoxStart(box[0], box[1], box[2], box[3])
+            var r = cropOverlay.cropViewRectForBox(box)
+            setCropViewStart(r.x, r.y, r.x + r.width, r.y + r.height)
         }
 
         function hasRightButton(mouse) {
@@ -787,10 +975,12 @@ Item {
         function beginNewCrop(mouseX, mouseY, mx, my) {
             var clampedMx = Math.max(0, Math.min(1000, mx))
             var clampedMy = Math.max(0, Math.min(1000, my))
+            var p = cropOverlay.mapFromItem(mainMouseArea, mouseX, mouseY)
             cropDragMode = "new"
             cropStartX = mouseX
             cropStartY = mouseY
             setCropBoxStart(clampedMx, clampedMy, clampedMx, clampedMy)
+            setCropViewStart(p.x, p.y, p.x, p.y)
         }
 
         function beginCropInteraction() {
@@ -896,7 +1086,7 @@ Item {
             }
             
             if (loupeView.uiStateRef && loupeView.uiStateRef.isCropping) {
-                // Check if clicking on existing crop box - Using Image Space Hit Testing
+                // Check if clicking on existing crop box in viewport space.
                 var box = loupeView.uiStateRef.currentCropBox
                 if (box && box.length === 4) box = box.slice(0)
                 
@@ -905,28 +1095,21 @@ Item {
                 var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
                 var mx = coords.x * 1000
                 var my = coords.y * 1000
-                
-                // Calculate threshold in normalized units (approx 10 screen pixels)
-                var threshX = (10 / (scaleTransform.xScale * mainImage.width)) * 1000
-                var threshY = (10 / (scaleTransform.yScale * mainImage.height)) * 1000
-                
-                // Clamp threshold: min 5 normalized units (prevent too small), max 40 (prevent too large)
-                // This ensures handles remain usable at all zoom levels
-                var edgeThreshold = Math.max(5, Math.min(40, Math.max(threshX, threshY)))
+                var viewPoint = cropOverlay.mapFromItem(mainMouseArea, mouse.x, mouse.y)
+                var viewRect = cropOverlay.cropViewRectForBox(box)
+                var viewLeft = viewRect.x
+                var viewTop = viewRect.y
+                var viewRight = viewRect.x + viewRect.width
+                var viewBottom = viewRect.y + viewRect.height
+                // Scale grab tolerance with DPI to match the rotate-knob hit test
+                // (which uses Screen.devicePixelRatio) so edges and the knob feel
+                // equally forgiving on HiDPI displays.
+                var edgeThreshold = 10 * Screen.devicePixelRatio
 
-                // Make it so the user doesn't have to click exactly on the crop box to modify it
-                var inside = mx >= (box[0] - edgeThreshold) && mx <= (box[2] + edgeThreshold) && my >= (box[1] - edgeThreshold) && my <= (box[3] + edgeThreshold)
+                // Make it so the user doesn't have to click exactly on the crop box to modify it.
+                var inside = viewPoint.x >= (viewLeft - edgeThreshold) && viewPoint.x <= (viewRight + edgeThreshold) && viewPoint.y >= (viewTop - edgeThreshold) && viewPoint.y <= (viewBottom + edgeThreshold)
                 
                 if (mainMouseArea.isRotating && cropOverlay.visible && rotateKnob.visible) {
-                    // knob center in mainMouseArea coords (includes cropRect rotation)
-                    // Note: rotateKnob is now inside mainImage -> cropOverlay -> cropRect
-                    // But mapFromItem should still work if we target the object properly.
-                    // We need to resolve `rotateKnob` which is inside cropOverlay.
-                    // If cropOverlay moves, we need to ensure this binding works.
-                    // IMPORTANT: cropOverlay is not moved yet in this call.
-                    // Current logic relies on existing structure. I will defer logic update if structure changes.
-                    // But hit testing via mapFromItem(rotateKnob) is robust to hierarchy changes as long as rotateKnob exists.
-                    
                     var k = mainMouseArea.mapFromItem(rotateKnob, rotateKnob.width/2, rotateKnob.height/2)
                     var dxk = mouse.x - k.x
                     var dyk = mouse.y - k.y
@@ -935,8 +1118,14 @@ Item {
                     if (distk < 22 * Screen.devicePixelRatio) { // a little forgiving
                         cropDragMode = "rotate"
 
-                        // crop center in mainMouseArea coords -> Changed to IMAGE center to avoid feedback loop
-                        var c = mainMouseArea.mapFromItem(mainImage, mainImage.width/2, mainImage.height/2)
+                        // Seed cropBoxStart variables before deriving the fixed crop pivot.
+                        if (box && box.length === 4) {
+                            setCropBoxStartFromBox(box)
+                            cropRotationPivotX = ((box[0] + box[2]) / 2000)
+                            cropRotationPivotY = ((box[1] + box[3]) / 2000)
+                        }
+
+                        var c = mainMouseArea.mapFromItem(cropOverlay, (cropViewStartLeft + cropViewStartRight) / 2, (cropViewStartTop + cropViewStartBottom) / 2)
                         cropStartAngle = Math.atan2(mouse.y - c.y, mouse.x - c.x) * 180 / Math.PI
                         cropStartRotation = cropRotation
                         
@@ -949,27 +1138,23 @@ Item {
                             }
                         }
 
-
-                        // Seed cropBoxStart variables
-                        if (box && box.length === 4) {
-                            setCropBoxStartFromBox(box)
-                        }
-
                         beginCropInteraction()
                         return
                     }
                 }
                 
-                // If crop box is full image, always start a new crop
-                else if (isFullImage) {
+                // If crop box is full image, always start a new crop.
+                // Independent of the rotate-knob check above so crop hit-testing
+                // still runs when a knob click is missed in rotate mode.
+                if (isFullImage) {
                     // Start a new crop rectangle from the clicked point
                     beginNewCrop(mouse.x, mouse.y, mx, my)
                 } else if (inside) {
-                    // Determine which edge/corner is being dragged (Image Space)
-                    var nearLeft = Math.abs(mx - box[0]) < edgeThreshold
-                    var nearRight = Math.abs(mx - box[2]) < edgeThreshold
-                    var nearTop = Math.abs(my - box[1]) < edgeThreshold
-                    var nearBottom = Math.abs(my - box[3]) < edgeThreshold
+                    // Determine which edge/corner is being dragged in viewport space.
+                    var nearLeft = Math.abs(viewPoint.x - viewLeft) < edgeThreshold
+                    var nearRight = Math.abs(viewPoint.x - viewRight) < edgeThreshold
+                    var nearTop = Math.abs(viewPoint.y - viewTop) < edgeThreshold
+                    var nearBottom = Math.abs(viewPoint.y - viewBottom) < edgeThreshold
                     
                     if (nearLeft && nearTop) cropDragMode = "topleft"
                     else if (nearRight && nearTop) cropDragMode = "topright"
@@ -981,7 +1166,12 @@ Item {
                     else if (nearBottom) cropDragMode = "bottom"
                     else cropDragMode = "move"
 
-                    setCropBoxStartFromBox(box)
+                    cropStartX = mouse.x
+                    cropStartY = mouse.y
+                    // Reuse the viewRect already computed above instead of
+                    // recomputing cropViewRectForBox inside setCropBoxStartFromBox.
+                    setCropBoxStart(box[0], box[1], box[2], box[3])
+                    setCropViewStart(viewLeft, viewTop, viewRight, viewBottom)
                 } else {
                     // Start new crop rectangle
                     beginNewCrop(mouse.x, mouse.y, mx, my)
@@ -989,8 +1179,7 @@ Item {
                 beginCropInteraction()
             }
         }        
-        // Legacy getCropRect removed - using Image Space hit testing instead.
-        // mapToImageCoordinates maps directly to mainImage
+        // mapToImageCoordinates maps directly to mainImage for image-local tools.
         function mapToImageCoordinates(screenPoint) {
             if (!mainImage) return {x:0, y:0}
             var w = mainImage.width > 0 ? mainImage.width : mainImage.sourceSize.width
@@ -1014,7 +1203,7 @@ Item {
                     // Update crop rectangle while dragging
                     updateCropBox(cropStartX, cropStartY, mouse.x, mouse.y, true)
                 } else if (cropDragMode === "rotate") {
-                    var c = mainMouseArea.mapFromItem(mainImage, mainImage.width/2, mainImage.height/2)
+                    var c = mainMouseArea.mapFromItem(cropOverlay, (cropViewStartLeft + cropViewStartRight) / 2, (cropViewStartTop + cropViewStartBottom) / 2)
                     var currentAngle = Math.atan2(mouse.y - c.y, mouse.x - c.x) * 180 / Math.PI
                     var delta = currentAngle - cropStartAngle
                     // Handle wrap-around
@@ -1025,7 +1214,13 @@ Item {
 
                     // Update rotation state
                     cropRotation = newRotation
-                    
+
+                    // The crop box is intentionally left unchanged while straightening:
+                    // the image rotates under a fixed crop frame. This matches the
+                    // backend (_crop_box_canvas_rect), which preserves the box and lets
+                    // rotation introduce black fill at the corners instead of silently
+                    // shrinking the user's crop.
+
                     // Update rotation in backend live (throttled)
                     if (loupeView.controllerRef) {
                         pendingRotation = cropRotation
@@ -1038,47 +1233,40 @@ Item {
                     // Return early to prevent overwriting crop box during rotation
                     return
                 } else {
-                    // Handle move/resize (edge dragging)
-                    var coords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
-
-                    // Clamp to image bounds and convert to 0-1000 range
-                    var mouseX = Math.max(0, Math.min(1, coords.x)) * 1000
-                    var mouseY = Math.max(0, Math.min(1, coords.y)) * 1000
-                    
-                    var left = cropBoxStartLeft
-                    var top = cropBoxStartTop
-                    var right = cropBoxStartRight
-                    var bottom = cropBoxStartBottom
+                    // Handle move/resize against the fixed viewport crop frame.
+                    var startPoint = cropOverlay.mapFromItem(mainMouseArea, cropStartX, cropStartY)
+                    var currentPoint = cropOverlay.mapFromItem(mainMouseArea, mouse.x, mouse.y)
+                    var left = cropViewStartLeft
+                    var top = cropViewStartTop
+                    var right = cropViewStartRight
+                    var bottom = cropViewStartBottom
                     
                     // Adjust based on drag mode
                     if (cropDragMode === "move") {
-                        var startCenterX = (cropBoxStartLeft + cropBoxStartRight) / 2
-                        var startCenterY = (cropBoxStartTop + cropBoxStartBottom) / 2
-                        
-                        var dx = mouseX - startCenterX
-                        var dy = mouseY - startCenterY
+                        var dx = currentPoint.x - startPoint.x
+                        var dy = currentPoint.y - startPoint.y
 
-                        var width = cropBoxStartRight - cropBoxStartLeft
-                        var height = cropBoxStartBottom - cropBoxStartTop
+                        var width = cropViewStartRight - cropViewStartLeft
+                        var height = cropViewStartBottom - cropViewStartTop
 
-                        left = Math.max(0, Math.min(1000 - width, cropBoxStartLeft + dx))
-                        top = Math.max(0, Math.min(1000 - height, cropBoxStartTop + dy))
+                        left = cropViewStartLeft + dx
+                        top = cropViewStartTop + dy
                         right = left + width
                         bottom = top + height
                     } else {
-                        if (cropDragMode.includes("left")) left = mouseX;
-                        if (cropDragMode.includes("right")) right = mouseX;
-                        if (cropDragMode.includes("top")) top = mouseY;
-                        if (cropDragMode.includes("bottom")) bottom = mouseY;
-
-                        var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom, cropDragMode)
-                        left = constrainedBox[0]
-                        top = constrainedBox[1]
-                        right = constrainedBox[2]
-                        bottom = constrainedBox[3]
+                        if (cropDragMode.includes("left")) left = currentPoint.x;
+                        if (cropDragMode.includes("right")) right = currentPoint.x;
+                        if (cropDragMode.includes("top")) top = currentPoint.y;
+                        if (cropDragMode.includes("bottom")) bottom = currentPoint.y;
                     }
-                    
-                    loupeView.uiStateRef.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
+
+                    var nextBox = cropOverlay.cropBoxFromViewRect(left, top, right, bottom, cropDragMode === "move")
+                    if (cropDragMode !== "move") {
+                        var constrainedBox = applyAspectRatioConstraint(nextBox[0], nextBox[1], nextBox[2], nextBox[3], cropDragMode)
+                        nextBox = [constrainedBox[0], constrainedBox[1], constrainedBox[2], constrainedBox[3]]
+                    }
+
+                    loupeView.uiStateRef.currentCropBox = nextBox
                 }
                 return
             }
@@ -1197,20 +1385,12 @@ Item {
         function updateCropBox(x1, y1, x2, y2, applyAspectRatio = false) {
             if (!loupeView.uiStateRef || !mainImage.source) return
 
-            var imgCoord1 = mapToImageCoordinates(Qt.point(x1, y1))
-            var imgCoord2 = mapToImageCoordinates(Qt.point(x2, y2))
-            
-            // Clamp to image bounds (normalized 0-1)
-            var imgCoordX1 = Math.max(0, Math.min(1, imgCoord1.x))
-            var imgCoordY1 = Math.max(0, Math.min(1, imgCoord1.y))
-            var imgCoordX2 = Math.max(0, Math.min(1, imgCoord2.x))
-            var imgCoordY2 = Math.max(0, Math.min(1, imgCoord2.y))
-            
-            // Calculate raw box in 0-1000 space
-            var left = Math.min(imgCoordX1, imgCoordX2) * 1000
-            var right = Math.max(imgCoordX1, imgCoordX2) * 1000
-            var top = Math.min(imgCoordY1, imgCoordY2) * 1000
-            var bottom = Math.max(imgCoordY1, imgCoordY2) * 1000
+            var p1 = cropOverlay.mapFromItem(mainMouseArea, x1, y1)
+            var p2 = cropOverlay.mapFromItem(mainMouseArea, x2, y2)
+            var left = Math.min(p1.x, p2.x)
+            var right = Math.max(p1.x, p2.x)
+            var top = Math.min(p1.y, p2.y)
+            var bottom = Math.max(p1.y, p2.y)
             
             // Determine primary drag direction for "new" mode (from anchor x1,y1 to mouse x2,y2)
             // We need to know which corner is the anchor to apply aspect ratio correctly
@@ -1225,29 +1405,23 @@ Item {
                 else if (x2 >= x1 && y2 < y1) mode = "topright"
                 else if (x2 < x1 && y2 < y1) mode = "topleft"
                 
-                // Pass the raw coordinates of the "mouse" corner (x2, y2) and the "anchor" corner (x1, y1)
-                // But applyAspectRatioConstraint expects left, top, right, bottom.
-                // It assumes one corner is fixed based on mode.
-                // So we pass the current box, and it will adjust the moving corner.
-                
-                var constrainedBox = applyAspectRatioConstraint(left, top, right, bottom, mode)
-                left = constrainedBox[0]
-                top = constrainedBox[1]
-                right = constrainedBox[2]
-                bottom = constrainedBox[3]
+                var nextBox = cropOverlay.cropBoxFromViewRect(left, top, right, bottom)
+                var constrainedBox = applyAspectRatioConstraint(nextBox[0], nextBox[1], nextBox[2], nextBox[3], mode)
+                loupeView.uiStateRef.currentCropBox = [constrainedBox[0], constrainedBox[1], constrainedBox[2], constrainedBox[3]]
+                return
             } else {
                 // Just ensure minimum size
                 if (right - left < 10) {
-                    if (right < 1000) right = Math.min(1000, left + 10)
-                    else left = Math.max(0, right - 10)
+                    if (p2.x >= p1.x) right = left + 10
+                    else left = right - 10
                 }
                 if (bottom - top < 10) {
-                    if (bottom < 1000) bottom = Math.min(1000, top + 10)
-                    else top = Math.max(0, bottom - 10)
+                    if (p2.y >= p1.y) bottom = top + 10
+                    else top = bottom - 10
                 }
             }
             
-            loupeView.uiStateRef.currentCropBox = [Math.round(left), Math.round(top), Math.round(right), Math.round(bottom)]
+            loupeView.uiStateRef.currentCropBox = cropOverlay.cropBoxFromViewRect(left, top, right, bottom)
         }
         
         function getAspectRatio(name) {
@@ -1285,6 +1459,11 @@ Item {
             // width_norm / height_norm = targetAspect * (imgH / imgW)
             
             var pixelAspect = ratioPair[0] / ratioPair[1];
+            // At an odd 90-degree straighten the committed output swaps width
+            // and height (editor.py _crop_box_canvas_rect), so a 16:9 lock must
+            // constrain the source box to 9:16 to land 16:9 after the swap.
+            // Mirror the swap cropViewRectForBox/cropBoxFromViewRect already do.
+            if (cropOverlay._dimensionsAreSwapped()) pixelAspect = 1.0 / pixelAspect;
             // Use mainImage (fixed canvas) for aspect ratio calculation
             var imageAspect = mainImage.width / mainImage.height;
             var targetAspect = pixelAspect * (1.0 / imageAspect); // Normalized aspect ratio

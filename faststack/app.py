@@ -512,6 +512,7 @@ class AppController(QObject):
 
         # -- Stacking State --
         self.stack_start_index: Optional[int] = None
+        self.stack_end_index: Optional[int] = None
         self.stacks: List[List[int]] = []
 
         # -- Batch Selection State (for drag-and-drop) --
@@ -896,6 +897,13 @@ class AppController(QObject):
             and 0 <= self.stack_start_index < len(self.image_files)
             else None
         )
+        old_stack_end_path = (
+            self.image_files[self.stack_end_index].path
+            if not clear_stacks
+            and self.stack_end_index is not None
+            and 0 <= self.stack_end_index < len(self.image_files)
+            else None
+        )
         old_batch_start_path = (
             self.image_files[self.batch_start_index].path
             if self.batch_start_index is not None
@@ -917,6 +925,7 @@ class AppController(QObject):
         if clear_stacks:
             self.stacks = []
             self.stack_start_index = None
+            self.stack_end_index = None
             self.sidecar.data.stacks = []
             self.sidecar.save()
         elif have_stacks:
@@ -931,6 +940,9 @@ class AppController(QObject):
         if not clear_stacks and old_stack_start_path:
             key = self._key(old_stack_start_path)
             self.stack_start_index = self._path_to_index.get(key)
+        if not clear_stacks and old_stack_end_path:
+            key = self._key(old_stack_end_path)
+            self.stack_end_index = self._path_to_index.get(key)
 
         if self.image_files and preserved_path:
             target_key = self._key(preserved_path)
@@ -4429,8 +4441,13 @@ class AppController(QObject):
         # for idx in range(last_index, -1, -1)
         for idx in range(len(self.image_files) - 1, -1, -1):
             img = self.image_files[idx]
-            # Dynamic look-up of self.sidecar as requested (important for mocks in tests)
-            meta = self.sidecar.get_metadata(img.path, create=False)
+            # This is a read-only sweep across the folder. Skipping migration
+            # avoids an O(images x sidecar entries) filesystem scan on misses.
+            meta = self.sidecar.get_metadata(
+                img.path,
+                create=False,
+                migrate=False,
+            )
 
             uploaded = meta.uploaded if meta else False
 
@@ -4763,6 +4780,8 @@ class AppController(QObject):
             and self.stack_start_index >= insert_index
         ):
             self.stack_start_index += 1
+        if self.stack_end_index is not None and self.stack_end_index >= insert_index:
+            self.stack_end_index += 1
         if stacks_changed:
             self.sidecar.data.stacks = self.stacks
             self.sidecar.save()
@@ -5286,32 +5305,48 @@ class AppController(QObject):
             if self.ui_state:
                 self.ui_state.metadataChanged.emit()
 
+    def _define_pending_stack(self) -> bool:
+        if self.stack_start_index is None or self.stack_end_index is None:
+            return False
+
+        start = min(self.stack_start_index, self.stack_end_index)
+        end = max(self.stack_start_index, self.stack_end_index)
+        self.stacks.append([start, end])
+        self.stacks.sort()  # Keep stacks sorted by start index
+        self.sidecar.data.stacks = self.stacks
+        self.sidecar.save()
+        log.info("Defined new stack: [%d, %d]", start, end)
+        self.stack_start_index = None
+        self.stack_end_index = None
+        self._metadata_cache_index = (-1, -1)  # Invalidate cache
+        self.dataChanged.emit()  # Notify QML of data change
+        self.ui_state.stackSummaryChanged.emit()  # Update stack summary in dialog
+        self.sync_ui_state()
+        count = end - start + 1
+        self.update_status_message(
+            f"Stack defined: {count} image{'' if count == 1 else 's'}"
+        )
+        return True
+
     def begin_new_stack(self):
         self.stack_start_index = self.current_index
         log.info("Stack start marked at index %d", self.stack_start_index)
+        if self._define_pending_stack():
+            return
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
         self.dataChanged.emit()  # Update UI to show start marker
         self.sync_ui_state()
+        self.update_status_message("Stack start marked")
 
     def end_current_stack(self):
-        log.info(
-            "end_current_stack called. stack_start_index: %s", self.stack_start_index
-        )
-        if self.stack_start_index is not None:
-            start = min(self.stack_start_index, self.current_index)
-            end = max(self.stack_start_index, self.current_index)
-            self.stacks.append([start, end])
-            self.stacks.sort()  # Keep stacks sorted by start index
-            self.sidecar.data.stacks = self.stacks
-            self.sidecar.save()
-            log.info("Defined new stack: [%d, %d]", start, end)
-            self.stack_start_index = None
-            self._metadata_cache_index = (-1, -1)  # Invalidate cache
-            self.dataChanged.emit()  # Notify QML of data change
-            self.ui_state.stackSummaryChanged.emit()  # Update stack summary in dialog
-            self.sync_ui_state()
-        else:
-            log.warning("No stack start marked. Press '[' first.")
+        self.stack_end_index = self.current_index
+        log.info("Stack end marked at index %d", self.stack_end_index)
+        if self._define_pending_stack():
+            return
+        self._metadata_cache_index = (-1, -1)  # Invalidate cache
+        self.dataChanged.emit()  # Update UI to show end marker
+        self.sync_ui_state()
+        self.update_status_message("Stack end marked")
 
     def begin_new_batch(self):
         """Mark the start of a new batch for drag-and-drop."""
@@ -6091,6 +6126,7 @@ class AppController(QObject):
         log.info("Clearing all defined stacks.")
         self.stacks = []
         self.stack_start_index = None
+        self.stack_end_index = None
         # Do NOT clear batches here
 
         self.sidecar.data.stacks = self.stacks
@@ -6996,6 +7032,7 @@ class AppController(QObject):
         self.batches = []
         self.batch_start_index = None
         self.stack_start_index = None
+        self.stack_end_index = None
 
         # Clear caches since they reference old directory's images
         with self._last_image_lock:
@@ -7763,10 +7800,23 @@ class AppController(QObject):
 
     def _rollback_ui_items(self, items: List[Tuple[int, Any]], job: DeleteJob) -> None:
         """Restore items to the UI list in correct order."""
-        # Insert in ascending index order so each insertion shifts subsequent
-        # indices correctly, restoring the original list positions.
+        # Each saved idx is an ORIGINAL list position. During a partial rollback
+        # some earlier-deleted items stay removed, so a raw insert at idx would
+        # overshoot a still-missing lower position. Shift each idx left by the
+        # count of still-missing lower positions to land it in the compressed
+        # list. Insert in ascending index order so prior inserts settle first.
+        present_keys = {self._key(x.path) for x in self.image_files}
+        restoring_keys = {self._key(img.path) for _, img in items}
+        still_missing = sorted(
+            idx
+            for idx, img in job.removed_items
+            if self._key(img.path) not in present_keys
+            and self._key(img.path) not in restoring_keys
+        )
         for idx, img in sorted(items, key=lambda x: x[0]):
-            self.image_files.insert(min(idx, len(self.image_files)), img)
+            shift = sum(1 for m in still_missing if m < idx)
+            pos = min(max(idx - shift, 0), len(self.image_files))
+            self.image_files.insert(pos, img)
 
         # Restore selection/focus (approximated)
         self.current_index = min(job.previous_index, len(self.image_files) - 1)
@@ -7815,6 +7865,7 @@ class AppController(QObject):
             if restored == original:
                 self.stacks = [s[:] for s in ui.saved_stacks]
                 self.stack_start_index = ui.saved_stack_start_index
+                self.stack_end_index = ui.saved_stack_end_index
             else:
                 still_deleted = sorted(original - restored)
                 self.stacks = self._recompute_batches_after_deletions(
@@ -7822,6 +7873,9 @@ class AppController(QObject):
                 )
                 self.stack_start_index = self._shift_start_index(
                     ui.saved_stack_start_index, still_deleted
+                )
+                self.stack_end_index = self._shift_start_index(
+                    ui.saved_stack_end_index, still_deleted
                 )
             self.sidecar.data.stacks = self.stacks
             self._metadata_cache_index = (-1, -1)
@@ -7944,6 +7998,7 @@ class AppController(QObject):
         pre_batch_start_snapshot = self.batch_start_index
         pre_stack_snapshot = [s[:] for s in self.stacks]
         pre_stack_start_snapshot = self.stack_start_index
+        pre_stack_end_snapshot = self.stack_end_index
 
         # Shared helper: compute post-deletion index for a surviving index.
         deleted_ascending = sorted(validated_sorted)
@@ -8017,6 +8072,11 @@ class AppController(QObject):
                 self.stack_start_index = None
             else:
                 self.stack_start_index = _shift(pre_stack_start_snapshot)
+        if pre_stack_end_snapshot is not None:
+            if pre_stack_end_snapshot in deleted_set:
+                self.stack_end_index = None
+            else:
+                self.stack_end_index = _shift(pre_stack_end_snapshot)
 
         # Update UI immediately - this is fast since it just reads from memory
         # Check for existence, not truthiness (empty cache is falsy)
@@ -8100,6 +8160,7 @@ class AppController(QObject):
                 saved_batch_start_index=pre_batch_start_snapshot,
                 saved_stacks=pre_stack_snapshot,
                 saved_stack_start_index=pre_stack_start_snapshot,
+                saved_stack_end_index=pre_stack_end_snapshot,
             ),
         )
 
@@ -8453,6 +8514,7 @@ class AppController(QObject):
                 if ui is not None and ui.saved_stacks is not None and removed_items:
                     self.stacks = ui.saved_stacks
                     self.stack_start_index = ui.saved_stack_start_index
+                    self.stack_end_index = ui.saved_stack_end_index
                     self.sidecar.data.stacks = self.stacks
                     self._metadata_cache_index = (-1, -1)
                 self.sync_ui_state()
@@ -12107,6 +12169,12 @@ class AppController(QObject):
             and self.stack_start_index == index
         ):
             info = "Stack Start Marked"
+        elif (
+            not info
+            and self.stack_end_index is not None
+            and self.stack_end_index == index
+        ):
+            info = "Stack End Marked"
         log.debug("_get_stack_info for index %d: %s", index, info)
         return info
 
