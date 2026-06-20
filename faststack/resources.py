@@ -31,6 +31,53 @@ def faststack_qml_dir() -> Path:
     return qml_dir
 
 
+def faststack_readme_path() -> Optional[Path]:
+    """Return the bundled README.md path across source and frozen layouts.
+
+    In a source/installed checkout the README lives at the repo root (the
+    parent of the package directory). In a PyInstaller build it is bundled
+    next to the package. Return the first candidate that exists, else None.
+    """
+    package_dir = faststack_package_dir()
+    for candidate in (
+        package_dir / "README.md",
+        package_dir.parent / "README.md",
+    ):
+        if candidate.is_file():
+            return candidate
+
+    log.warning("FastStack README.md was not found near %s", package_dir)
+    return None
+
+
+def readme_from_metadata() -> Optional[str]:
+    """Return the README text embedded in the installed package metadata.
+
+    Non-editable wheel installs do not ship README.md as a file, but setuptools
+    embeds the project ``readme`` into the distribution metadata, so this lets
+    Help > View Readme still work there. Returns None if unavailable.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, metadata
+    except ImportError:
+        return None
+
+    try:
+        meta = metadata("faststack")
+    except PackageNotFoundError:
+        return None
+
+    payload = meta.get_payload()
+    if isinstance(payload, str) and payload.strip():
+        return payload
+
+    description = meta.get("Description")
+    if description and description.strip():
+        return description
+
+    return None
+
+
 def pyside_qml_dir() -> Optional[Path]:
     """Return the PySide6 Qt QML import directory when it is available."""
     pyside_dir = Path(PySide6.__file__).resolve().parent

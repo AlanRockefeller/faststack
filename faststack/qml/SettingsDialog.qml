@@ -109,16 +109,16 @@ Window {
         }
     }
 
-    function openFileDialog() {
-        return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.open_file_dialog() : ""
+    function openFileDialog(currentPath) {
+        return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.open_file_dialog(currentPath || "") : ""
     }
 
-    function openDirectoryDialog() {
-        return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.open_directory_dialog() : ""
+    function openDirectoryDialog(currentPath) {
+        return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.open_directory_dialog(currentPath || "") : ""
     }
 
-    function pathExists(path) {
-        return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.check_path_exists(path) : false
+    function pathIsExecutable(path) {
+        return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.check_executable_path(path) : false
     }
 
     function refreshTextFields() {
@@ -516,7 +516,7 @@ Window {
                                 text: "Browse"
                                 flat: true
                                 onClicked: {
-                                    var path = settingsDialog.openFileDialog()
+                                    var path = settingsDialog.openFileDialog(settingsDialog.loaderProperty(heliconField, "text", settingsDialog.heliconPath))
                                     if (path) {
                                         settingsDialog.heliconPath = path
                                         settingsDialog.setLoaderProperty(heliconField, "text", path)
@@ -528,7 +528,7 @@ Window {
                             Label {
                                 text: "✔"
                                 color: "#4ade80"
-                                visible: settingsDialog.pathExists(settingsDialog.heliconPath)
+                                visible: settingsDialog.pathIsExecutable(settingsDialog.heliconPath)
                             }
                         }
 
@@ -552,7 +552,7 @@ Window {
                                 text: "Browse"
                                 flat: true
                                 onClicked: {
-                                    var path = settingsDialog.openFileDialog()
+                                    var path = settingsDialog.openFileDialog(settingsDialog.loaderProperty(photoshopField, "text", settingsDialog.photoshopPath))
                                     if (path) {
                                         settingsDialog.photoshopPath = path
                                         settingsDialog.setLoaderProperty(photoshopField, "text", path)
@@ -564,7 +564,7 @@ Window {
                             Label {
                                 text: "✔"
                                 color: "#4ade80"
-                                visible: settingsDialog.pathExists(settingsDialog.photoshopPath)
+                                visible: settingsDialog.pathIsExecutable(settingsDialog.photoshopPath)
                             }
                         }
 
@@ -588,7 +588,7 @@ Window {
                                 text: "Browse"
                                 flat: true
                                 onClicked: {
-                                    var path = settingsDialog.openFileDialog()
+                                    var path = settingsDialog.openFileDialog(settingsDialog.loaderProperty(rawtherapeeField, "text", settingsDialog.rawtherapeePath))
                                     if (path) {
                                         settingsDialog.rawtherapeePath = path
                                         settingsDialog.setLoaderProperty(rawtherapeeField, "text", path)
@@ -600,7 +600,7 @@ Window {
                             Label {
                                 text: "✔"
                                 color: "#4ade80"
-                                visible: settingsDialog.pathExists(settingsDialog.rawtherapeePath)
+                                visible: settingsDialog.pathIsExecutable(settingsDialog.rawtherapeePath)
                             }
                         }
 
@@ -624,7 +624,7 @@ Window {
                                 text: "Browse"
                                 flat: true
                                 onClicked: {
-                                    var path = settingsDialog.openDirectoryDialog()
+                                    var path = settingsDialog.openDirectoryDialog(settingsDialog.loaderProperty(defaultDirField, "text", settingsDialog.defaultDirectory))
                                     if (path) {
                                         settingsDialog.defaultDirectory = path
                                         settingsDialog.setLoaderProperty(defaultDirField, "text", path)

@@ -44,9 +44,10 @@ Dialog {
             placeholderText: "Enter text to filter (e.g., 'stacked', 'IMG_001')..."
             width: parent.width - parent.padding * 2
             height: 50
+            clip: true
             selectByMouse: true
             focus: true
-            font.pixelSize: 16
+            font.pixelSize: 14
             verticalAlignment: TextInput.AlignVCenter
             color: filterDialog.textColor
             background: Rectangle {

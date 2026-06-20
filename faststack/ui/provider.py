@@ -1033,13 +1033,13 @@ class UIState(QObject):
     def set_rawtherapee_path(self, path):
         self.app_controller.set_rawtherapee_path(path)
 
-    @Slot(result=str)
-    def open_file_dialog(self):
-        return self.app_controller.open_file_dialog()
+    @Slot(str, result=str)
+    def open_file_dialog(self, current_path):
+        return self.app_controller.open_file_dialog(current_path)
 
     @Slot(str, result=bool)
-    def check_path_exists(self, path):
-        return self.app_controller.check_path_exists(path)
+    def check_executable_path(self, path):
+        return self.app_controller.check_executable_path(path)
 
     @Slot(result=float)
     def get_cache_size(self):
@@ -1087,13 +1087,17 @@ class UIState(QObject):
     def set_optimize_for(self, optimize_for):
         self.app_controller.set_optimize_for(optimize_for)
 
-    @Slot(result=str)
-    def open_directory_dialog(self):
-        return self.app_controller.open_directory_dialog()
+    @Slot(str, result=str)
+    def open_directory_dialog(self, current_path):
+        return self.app_controller.open_directory_dialog(current_path)
 
     @Slot(result=str)
     def get_current_version(self):
         return self.app_controller.get_current_version()
+
+    @Slot(result=str)
+    def get_readme_text(self):
+        return self.app_controller.get_readme_text()
 
     @Slot(result=bool)
     def get_update_check_enabled(self):

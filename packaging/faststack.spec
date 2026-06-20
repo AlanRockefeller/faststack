@@ -32,6 +32,9 @@ def existing_binary(
 
 datas = [
     (str(ROOT / "faststack" / "qml"), "faststack/qml"),
+    # Bundle the README next to the package so Help > View Readme works in
+    # the frozen macOS/Windows builds (see resources.faststack_readme_path).
+    (str(ROOT / "README.md"), "faststack"),
 ]
 datas += collect_data_files(
     "PySide6",

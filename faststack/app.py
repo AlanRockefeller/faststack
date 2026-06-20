@@ -86,7 +86,12 @@ from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, _safe_replace
 from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
 from faststack.imaging.mask_engine import inverse_transform
 from faststack.imaging.metadata import get_exif_data
-from faststack.resources import faststack_qml_dir, pyside_qml_dir
+from faststack.resources import (
+    faststack_qml_dir,
+    faststack_readme_path,
+    pyside_qml_dir,
+    readme_from_metadata,
+)
 from faststack.updater import check_for_update, get_current_version
 from faststack.thumbnail_view import (
     DEFAULT_THUMBNAIL_CACHE_BYTES,
@@ -885,8 +890,7 @@ class AppController(QObject):
         if self.image_files and 0 <= self.current_index < len(self.image_files):
             preserved_path = self.image_files[self.current_index].path
 
-        # Snapshot paths referenced by batches (and stacks if preserving)
-        old_batch_paths = self._resolve_ranges_to_paths(self.batches)
+        # Snapshot paths referenced by stacks if preserving.
         old_stack_paths = (
             self._resolve_ranges_to_paths(self.stacks) if not clear_stacks else []
         )
@@ -914,9 +918,6 @@ class AppController(QObject):
         self._apply_filter_to_cached_list()
         self._bump_display_generation()
 
-        # Remap batches (splitting is acceptable)
-        self.batches = self._rebuild_ranges_from_paths(old_batch_paths)
-        self._invalidate_batch_cache()
         if old_batch_start_path:
             key = self._key(old_batch_start_path)
             self.batch_start_index = self._path_to_index.get(key)
@@ -1646,8 +1647,21 @@ class AppController(QObject):
 
     def _apply_filter_to_cached_list(self):
         """Applies current filter to cached image list without disk I/O."""
+        old_batch_start_path = (
+            self.image_files[self.batch_start_index].path
+            if self.batch_start_index is not None
+            and 0 <= self.batch_start_index < len(self.image_files)
+            else None
+        )
         self.image_files = self._filtered_sorted_copy(self.sort_mode)
         self._rebuild_path_to_index()
+        self._restore_batches_from_sidecar_flags()
+        if old_batch_start_path:
+            self.batch_start_index = self._path_to_index.get(
+                self._key(old_batch_start_path)
+            )
+        else:
+            self.batch_start_index = None
         self.prefetcher.set_image_files(self.image_files)
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
         self.ui_state.imageCountChanged.emit()
@@ -1698,6 +1712,115 @@ class AppController(QObject):
             ranges.append([run_start, run_end])
         ranges.sort()
         return ranges
+
+    @staticmethod
+    def _ranges_from_indices(indices: List[int]) -> List[List[int]]:
+        """Convert sorted or unsorted indices into normalized contiguous ranges."""
+        if not indices:
+            return []
+
+        unique_indices = sorted(set(indices))
+        ranges: List[List[int]] = []
+        run_start = unique_indices[0]
+        run_end = unique_indices[0]
+        for idx in unique_indices[1:]:
+            if idx == run_end + 1:
+                run_end = idx
+            else:
+                ranges.append([run_start, run_end])
+                run_start = idx
+                run_end = idx
+        ranges.append([run_start, run_end])
+        return ranges
+
+    def _batch_metadata_key(self, path: Path) -> str:
+        """Return the sidecar key used for persistent batch membership."""
+        try:
+            return self.sidecar.metadata_key_for_path(path)
+        except (OSError, TypeError, ValueError):
+            log.debug("Could not build batch metadata key for %s", path)
+            return ""
+
+    def _current_batch_metadata_keys(self) -> set[str]:
+        """Return sidecar keys for the current runtime batch selection."""
+        keys: set[str] = set()
+        max_index = len(self.image_files)
+        for idx in self._get_batch_indices():
+            if not 0 <= idx < max_index:
+                continue
+            key = self._batch_metadata_key(self.image_files[idx].path)
+            if key:
+                keys.add(key)
+        return keys
+
+    def _persist_batch_flags(self) -> None:
+        """Write the current runtime batch selection to per-entry sidecar flags."""
+        active_keys = self._current_batch_metadata_keys()
+        images_to_update = list(self._all_images or self.image_files)
+
+        seen_keys: set[str] = set()
+        changed = False
+        for img in images_to_update:
+            key = self._batch_metadata_key(img.path)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            should_be_batched = key in active_keys
+            meta = self.sidecar.get_metadata(
+                img.path,
+                create=should_be_batched,
+                migrate=should_be_batched,
+            )
+            if meta is None:
+                continue
+            if bool(getattr(meta, "batch", False)) != should_be_batched:
+                meta.batch = should_be_batched
+                changed = True
+
+        if changed:
+            self.sidecar.save()
+
+    def _restore_batches_from_sidecar_flags(self) -> None:
+        """Rebuild runtime batch ranges from sidecar flags for image_files order."""
+        batched_indices = []
+        for idx, img in enumerate(self.image_files):
+            meta = self.sidecar.get_metadata(
+                img.path,
+                create=False,
+                migrate=False,
+            )
+            if meta is not None and bool(getattr(meta, "batch", False)):
+                batched_indices.append(idx)
+
+        self.batches = self._ranges_from_indices(batched_indices)
+        self._finalize_batch_state(
+            persist=False,
+            emit=False,
+            sync=False,
+            notify_model=False,
+        )
+
+    def _finalize_batch_state(
+        self,
+        *,
+        persist: bool = True,
+        emit: bool = True,
+        sync: bool = True,
+        notify_model: bool = True,
+    ) -> None:
+        """Normalize batch state and fan out persistence/UI invalidations."""
+        self._normalize_batches()
+        self._invalidate_batch_cache()
+        if persist:
+            self._persist_batch_flags()
+        self._metadata_cache_index = (-1, -1)
+        if emit:
+            self.dataChanged.emit()
+        if notify_model and getattr(self, "_thumbnail_model", None):
+            self._thumbnail_model.notify_batch_state_changed()
+        if sync:
+            self.sync_ui_state()
 
     @staticmethod
     def _shift_ranges_after_insert(
@@ -4761,14 +4884,18 @@ class AppController(QObject):
                 break
         self._all_images.insert(all_insert_index, duplicate_image)
 
+        batch_changed = False
         if self.batches:
             self.batches = self._shift_ranges_after_insert(self.batches, insert_index)
-            self._invalidate_batch_cache()
+            batch_changed = True
         if (
             self.batch_start_index is not None
             and self.batch_start_index >= insert_index
         ):
             self.batch_start_index += 1
+            batch_changed = True
+        if batch_changed:
+            self._finalize_batch_state(emit=False, sync=False, notify_model=False)
 
         stacks_changed = False
         if self.stacks:
@@ -4877,6 +5004,7 @@ class AppController(QObject):
                     "restacked": False,
                     "favorite": False,
                     "todo": False,
+                    "batch": False,
                 }
             return {
                 "stacked": meta.stacked,
@@ -4885,6 +5013,7 @@ class AppController(QObject):
                 "restacked": meta.restacked,
                 "favorite": meta.favorite,
                 "todo": meta.todo,
+                "batch": meta.batch,
             }
         except Exception as e:  # Broad catch for UI plumbing - don't crash grid view
             log.debug("Failed to get metadata for %s: %s", image_path, e)
@@ -4895,6 +5024,7 @@ class AppController(QObject):
                 "restacked": False,
                 "favorite": False,
                 "todo": False,
+                "batch": False,
             }
 
     def _get_bulk_metadata_map(self, images=None) -> Dict[str, dict]:
@@ -4924,6 +5054,7 @@ class AppController(QObject):
                     "restacked": getattr(meta, "restacked", False),
                     "favorite": getattr(meta, "favorite", False),
                     "todo": getattr(meta, "todo", False),
+                    "batch": getattr(meta, "batch", False),
                 }
             except Exception as e:
                 log.warning(
@@ -5205,6 +5336,7 @@ class AppController(QObject):
             "favorite": meta.favorite if meta else False,
             "todo": meta.todo if meta else False,
             "todo_date": (meta.todo_date or "") if meta else "",
+            "batch": meta.batch if meta else False,
             "stack_info_text": stack_info,
             "batch_info_text": batch_info,
         }
@@ -5329,6 +5461,16 @@ class AppController(QObject):
         return True
 
     def begin_new_stack(self):
+        # Pressing [ again on the image that already holds the pending start
+        # marker toggles it off, so an accidental press can be undone.
+        if self.stack_start_index == self.current_index:
+            self.stack_start_index = None
+            log.info("Stack start cleared at index %d", self.current_index)
+            self._metadata_cache_index = (-1, -1)  # Invalidate cache
+            self.dataChanged.emit()  # Update UI to remove start marker
+            self.sync_ui_state()
+            self.update_status_message("Stack start cleared")
+            return
         self.stack_start_index = self.current_index
         log.info("Stack start marked at index %d", self.stack_start_index)
         if self._define_pending_stack():
@@ -5339,6 +5481,16 @@ class AppController(QObject):
         self.update_status_message("Stack start marked")
 
     def end_current_stack(self):
+        # Pressing ] again on the image that already holds the pending end
+        # marker toggles it off, so an accidental press can be undone.
+        if self.stack_end_index == self.current_index:
+            self.stack_end_index = None
+            log.info("Stack end cleared at index %d", self.current_index)
+            self._metadata_cache_index = (-1, -1)  # Invalidate cache
+            self.dataChanged.emit()  # Update UI to remove end marker
+            self.sync_ui_state()
+            self.update_status_message("Stack end cleared")
+            return
         self.stack_end_index = self.current_index
         log.info("Stack end marked at index %d", self.stack_end_index)
         if self._define_pending_stack():
@@ -5366,13 +5518,9 @@ class AppController(QObject):
             start = min(self.batch_start_index, self.current_index)
             end = max(self.batch_start_index, self.current_index)
             self.batches.append([start, end])
-            self._normalize_batches()
-            self._invalidate_batch_cache()
             log.info("Defined new batch: [%d, %d]", start, end)
             self.batch_start_index = None
-            self._metadata_cache_index = (-1, -1)  # Invalidate cache
-            self.dataChanged.emit()
-            self.sync_ui_state()
+            self._finalize_batch_state()
             count = self.get_batch_count_for_current_image()
             self.update_status_message(
                 f"Batch defined: {count} image{'' if count == 1 else 's'}"
@@ -5424,15 +5572,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._normalize_batches()
-            self._invalidate_batch_cache()
-            self._metadata_cache_index = (-1, -1)
-            self.dataChanged.emit()
-            self.sync_ui_state()
-
-            # Re-announce batch badges (no model reset needed)
-            self._thumbnail_model.notify_batch_state_changed()
-
+            self._finalize_batch_state()
             self.update_status_message(f"Added {added_count} image(s) to batch")
             log.info("Added %d image(s) to batch from grid selection", added_count)
         else:
@@ -5464,15 +5604,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._normalize_batches()
-            self._invalidate_batch_cache()
-            self._metadata_cache_index = (-1, -1)
-            self.dataChanged.emit()
-            self.sync_ui_state()
-
-            if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
-                self._thumbnail_model.notify_batch_state_changed()
-
+            self._finalize_batch_state()
             self.update_status_message(
                 f"Added {added_count} favorite(s) to batch ({len(indices_to_add)} total favorites)"
             )
@@ -5508,15 +5640,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._normalize_batches()
-            self._invalidate_batch_cache()
-            self._metadata_cache_index = (-1, -1)
-            self.dataChanged.emit()
-            self.sync_ui_state()
-
-            if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
-                self._thumbnail_model.notify_batch_state_changed()
-
+            self._finalize_batch_state()
             self.update_status_message(
                 f"Added {added_count} uploaded image(s) to batch ({len(indices_to_add)} total uploaded)"
             )
@@ -5550,15 +5674,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._normalize_batches()
-            self._invalidate_batch_cache()
-            self._metadata_cache_index = (-1, -1)
-            self.dataChanged.emit()
-            self.sync_ui_state()
-
-            if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
-                self._thumbnail_model.notify_batch_state_changed()
-
+            self._finalize_batch_state()
             self.update_status_message(
                 f"Added {added_count} edited image(s) to batch ({len(indices_to_add)} total edited)"
             )
@@ -5601,15 +5717,7 @@ class AppController(QObject):
                 in_batch = any(start <= i <= end for start, end in self.batches)
                 if not in_batch:
                     self.batches.append([i, i])
-                    self._normalize_batches()
-                    self._invalidate_batch_cache()
-                    self._metadata_cache_index = (-1, -1)
-                    self.dataChanged.emit()
-                    self.sync_ui_state()
-
-                    if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
-                        self._thumbnail_model.notify_batch_state_changed()
-
+                    self._finalize_batch_state()
                     log.info("Auto-added edited image to batch: %s", image_path.name)
                 break
 
@@ -5655,7 +5763,7 @@ class AppController(QObject):
 
         if batch_modified:
             self.batches = new_batches
-            self._invalidate_batch_cache()
+            self._finalize_batch_state(emit=False, sync=False)
 
         # Check and remove from stacks
         # Check and remove from stacks
@@ -5737,7 +5845,6 @@ class AppController(QObject):
         else:
             had_batches = bool(self.batches)
             self.batches.append([index_to_toggle, index_to_toggle])
-            self._normalize_batches()
             if not had_batches:
                 self.update_status_message("Created new batch with current image.")
                 log.info(
@@ -5748,10 +5855,7 @@ class AppController(QObject):
                 self.update_status_message("Added image to batch")
                 log.info("Added index %d to batch.", index_to_toggle)
 
-        self._invalidate_batch_cache()
-        self._metadata_cache_index = (-1, -1)
-        self.dataChanged.emit()
-        self.sync_ui_state()
+        self._finalize_batch_state()
 
     def toggle_stack_membership(self):
         """Toggles the current image's inclusion in a stack."""
@@ -6143,11 +6247,7 @@ class AppController(QObject):
         log.info("Clearing all defined batches.")
         self.batches = []
         self.batch_start_index = None
-        self._invalidate_batch_cache()
-
-        self._metadata_cache_index = (-1, -1)
-        self.dataChanged.emit()
-        self.sync_ui_state()
+        self._finalize_batch_state()
         self.update_status_message("All batches cleared")
 
     def get_helicon_path(self):
@@ -6171,16 +6271,52 @@ class AppController(QObject):
         config.set("rawtherapee", "exe", path)
         config.save()
 
-    def open_file_dialog(self):
+    def _dialog_start_directory(self, current_path: str) -> str:
+        cleaned = current_path.strip().strip('"') if current_path else ""
+        if not cleaned:
+            return ""
+
+        try:
+            candidate = Path(os.path.expanduser(os.path.expandvars(cleaned)))
+        except (OSError, ValueError):
+            return ""
+
+        if candidate.is_file():
+            return str(candidate.parent)
+        if candidate.is_dir():
+            return str(candidate)
+
+        for parent in candidate.parents:
+            if parent.is_dir():
+                return str(parent)
+
+        return ""
+
+    def open_file_dialog(self, current_path: str = ""):
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter("Executables (*.exe)")
+        # On Windows tool executables end in .exe, so lead with that filter.
+        # On macOS/Linux the binaries are extensionless (e.g. inside a .app
+        # bundle), so default to All Files or the dialog would appear empty.
+        if os.name == "nt":
+            dialog.setNameFilter("Executables (*.exe);;All Files (*)")
+        else:
+            dialog.setNameFilter("All Files (*);;Executables (*.exe)")
+        start_dir = self._dialog_start_directory(current_path)
+        if start_dir:
+            dialog.setDirectory(start_dir)
         if dialog.exec():
             return dialog.selectedFiles()[0]
         return ""
 
-    def check_path_exists(self, path):
-        return os.path.exists(path)
+    def check_executable_path(self, path):
+        if not path:
+            return False
+        # Reuse the same validation the launcher uses so the settings checkmark
+        # never disagrees with whether the tool can actually be launched.
+        expanded = os.path.expanduser(os.path.expandvars(path.strip().strip('"')))
+        is_valid, _ = validate_executable_path(expanded, allow_custom_paths=True)
+        return is_valid
 
     def get_cache_size(self):
         return config.getfloat("core", "cache_size_gb")
@@ -6252,6 +6388,23 @@ class AppController(QObject):
     @Slot(result=str)
     def get_current_version(self):
         return get_current_version()
+
+    @Slot(result=str)
+    def get_readme_text(self):
+        """Return the bundled README.md contents for the Help > View Readme view."""
+        readme_path = faststack_readme_path()
+        if readme_path is not None:
+            try:
+                return readme_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                log.warning("Failed to read README at %s: %s", readme_path, exc)
+                return f"# Unable to read README\n\n{exc}"
+        # Wheel installs don't ship README.md as a file; fall back to the copy
+        # setuptools embeds in the package metadata.
+        text = readme_from_metadata()
+        if text:
+            return text
+        return "# README not found\n\nThe README.md file could not be located."
 
     @Slot(result=bool)
     def get_update_check_enabled(self):
@@ -6987,9 +7140,12 @@ class AppController(QObject):
         )
         config.save()
 
-    def open_directory_dialog(self):
+    def open_directory_dialog(self, current_path: str = ""):
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.FileMode.Directory)
+        start_dir = self._dialog_start_directory(current_path)
+        if start_dir:
+            dialog.setDirectory(start_dir)
         if dialog.exec():
             return dialog.selectedFiles()[0]
         return ""
@@ -7856,7 +8012,7 @@ class AppController(QObject):
                 self.batch_start_index = self._shift_start_index(
                     ui.saved_batch_start_index, still_deleted
                 )
-            self._invalidate_batch_cache()
+            self._finalize_batch_state(emit=False, sync=False)
 
         # Restore saved stack state if present
         if ui is not None and ui.saved_stacks is not None and items:
@@ -8009,6 +8165,7 @@ class AppController(QObject):
         # Adjust batch index ranges to account for removed entries.
         # Deleting index d shifts every index > d down by one.  Without this,
         # batches that sit above any deleted image reference the wrong files.
+        batch_changed = False
         if self.batches:
             new_batches = []
             for b_start, b_end in self.batches:
@@ -8031,17 +8188,21 @@ class AppController(QObject):
                     new_batches.append([ns, ne])
             if new_batches != self.batches:
                 self.batches = new_batches
-                self._invalidate_batch_cache()
+                batch_changed = True
 
-            # Adjust batch_start_index for removed entries
-            if pre_batch_start_snapshot is not None:
-                if pre_batch_start_snapshot in deleted_set:
-                    self.batch_start_index = None
-                else:
-                    shifted = _shift(pre_batch_start_snapshot)
-                    if shifted != self.batch_start_index:
-                        self.batch_start_index = shifted
-                        self._invalidate_batch_cache()
+        # Adjust batch_start_index for removed entries.
+        if pre_batch_start_snapshot is not None:
+            if pre_batch_start_snapshot in deleted_set:
+                self.batch_start_index = None
+                batch_changed = True
+            else:
+                shifted = _shift(pre_batch_start_snapshot)
+                if shifted != self.batch_start_index:
+                    self.batch_start_index = shifted
+                    batch_changed = True
+
+        if batch_changed:
+            self._finalize_batch_state(emit=False, sync=False, notify_model=False)
 
         # Adjust stack index ranges (same algorithm as batches).
         if self.stacks:
@@ -8271,7 +8432,7 @@ class AppController(QObject):
 
         self.batches = []
         self.batch_start_index = None
-        self._invalidate_batch_cache()
+        self._finalize_batch_state(emit=False, sync=False, notify_model=False)
         log.info("Batch state cleared optimistically for delete job %d.", job_id)
 
     def _restore_backup_safe(self, saved_path_str: str, backup_path_str: str) -> bool:
@@ -8509,7 +8670,7 @@ class AppController(QObject):
                 if ui is not None and ui.saved_batches is not None and removed_items:
                     self.batches = ui.saved_batches
                     self.batch_start_index = ui.saved_batch_start_index
-                    self._invalidate_batch_cache()
+                    self._finalize_batch_state(emit=False, sync=False)
                 # Restore stack state that was shifted during _delete_indices
                 if ui is not None and ui.saved_stacks is not None and removed_items:
                     self.stacks = ui.saved_stacks
@@ -9372,11 +9533,7 @@ class AppController(QObject):
             # Clear all batches after successful drag (like pressing \)
             self.batches = []
             self.batch_start_index = None
-            self._invalidate_batch_cache()
-
-            self._metadata_cache_index = (-1, -1)
-            self.dataChanged.emit()
-            self.sync_ui_state()
+            self._finalize_batch_state()
             log.info(
                 "Marked %d file(s) as uploaded on %s. Cleared all batches.",
                 len(existing_indices),
