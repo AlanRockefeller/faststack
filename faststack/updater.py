@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 GITHUB_REPOSITORY = "AlanRockefeller/faststack"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 USER_AGENT = "FastStack Update Checker"
-FALLBACK_VERSION = "1.6.4"
+FALLBACK_VERSION = "unknown"
 BUILD_SUFFIX_RE = re.compile(
     r"[-_.+]?build[-_.]?\d+(?:[-_.].*)?$",
     re.IGNORECASE,
@@ -67,8 +67,9 @@ def get_current_version() -> str:
     """Return the installed FastStack version.
 
     Installed packages expose metadata. Running directly from a source checkout
-    usually does not, so fall back to pyproject.toml and then a release-time
-    constant as a last resort for frozen builds.
+    usually does not, so fall back to pyproject.toml and then "unknown" as a
+    last resort. Frozen builds include package metadata from the installed
+    project, so they should normally use the metadata path.
     """
     try:
         return metadata.version("faststack")
