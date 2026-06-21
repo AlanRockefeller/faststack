@@ -1756,7 +1756,10 @@ class AppController(QObject):
     def _persist_batch_flags(self) -> None:
         """Write the current runtime batch selection to per-entry sidecar flags."""
         active_keys = self._current_batch_metadata_keys()
-        images_to_update = list(self._all_images or self.image_files)
+        # Only touch entries in the current (possibly filtered) view. active_keys
+        # is derived from self.image_files, so iterating _all_images here would
+        # write batch=False to hidden entries and drop their batch membership.
+        images_to_update = list(self.image_files)
 
         seen_keys: set[str] = set()
         changed = False

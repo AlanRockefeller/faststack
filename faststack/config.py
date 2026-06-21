@@ -382,7 +382,11 @@ def detect_external_tool_path(tool_name: str) -> str | None:
         )
         return matches[0]
     except (OSError, RuntimeError) as e:
-        log.warning("Error detecting %s path: %s", _TOOL_LABELS[tool_name], e)
+        log.warning(
+            "Error detecting %s path: %s",
+            _TOOL_LABELS.get(tool_name, tool_name),
+            e,
+        )
         return None
 
 
