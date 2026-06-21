@@ -1,6 +1,6 @@
 # FastStack
 
-# Version 1.6.4 - June 7, 2026
+# Version 1.6.5 - June 20, 2026
 
 # By Alan Rockefeller
 
@@ -16,13 +16,12 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Spark Line**: In grid view, a spark line is visible on each folder, so you can see how far you have gotten in uploading photos in each directory.
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
 - **Instant Navigation:** Sub-10ms next/previous image switching, high performance decoding via `PyTurboJPEG`.
+- **Drag & Drop:** Drag images to external applications. Press { and } to batch files to drag & drop multiple images.
 - **Image Editor:** Built-in editor with exposure, contrast, white balance, sharpness, and more (E key)
 - **Background Darkening:** Mask-based background darkening tool (K key) with smart edge detection, subject protection, and multiple modes. Paint rough background hints and the tool refines them into natural-looking dark backgrounds.
 - **Quick Auto Adjust:** Press `l` for quick auto-levels, `L` for auto white balance + auto-levels together, `A` for auto white balance, `-`/`_` to keep adjusting the highlight/white side in 14-point steps, and `=`/`+` to adjust the shadow/black side in 7-point steps. These update the live in-memory edit session immediately and save once when you navigate away, start a drag, or explicitly save. Auto-levels treats its clip threshold as a budget (a few already-clipped specular pixels won't disable the stretch), brightens underexposed midtones toward a configurable target, and rolls off stretched highlights smoothly instead of hard-clipping them. Auto white balance analyzes only the cropped area, fades its correction when the scene lacks reliable neutrals, and damps magenta/green corrections so foliage isn't mistaken for a color cast. The midtone target, channel clip budget, highlight rolloff, export dithering, and tint correction strength are all adjustable in Settings.
 - **Photoshop / Gimp Integration:** Edit current image in Photoshop or Gimp (P key) - always uses RAW files when available.
-- **Clipboard Support:** Copy image path to clipboard (Ctrl+C)
 - **Image Filtering:** Filter images by filename
-- **Drag & Drop:** Drag images to external applications. Press { and } to batch files to drag & drop multiple images.
 - **Theme Support:** Toggle between light and dark themes
 - **Delete & Undo:** Move images to recycle bin (Delete/Backspace) with undo support (Ctrl+Z)
 - **Has Memory:** Starts where you left off, tells you which images have been edited, stacked and uploaded.
@@ -34,9 +33,26 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 
 ## Installation
 
-### macOS (Recommended)
+### Download a build (Recommended)
 
-FastStack performs best on Python 3.12 due to PySide6 compatibility.
+Most users should grab a prebuilt **Windows** or **macOS** build — no Python
+setup required. Download the latest release for your platform from the
+[GitHub Releases](https://github.com/AlanRockefeller/faststack/releases) page:
+
+- **Windows:** Download the Windows build, unzip it, and run
+  `FastStack.exe`.
+- **macOS:** Download the macOS build, open the `.dmg`, and drag FastStack to
+  your Applications folder. On first launch you need to right-click the app
+  and choose **Open** to bypass Gatekeeper.
+
+FastStack checks GitHub Releases for newer versions when update checks are enabled in Settings.
+
+### Install from source
+
+Power users and Linux users can install from source. FastStack performs best on
+Python 3.12 due to PySide6 compatibility.
+
+#### macOS
 
 1.  **Install Python 3.12 (via Homebrew):**
 
@@ -67,7 +83,7 @@ FastStack performs best on Python 3.12 due to PySide6 compatibility.
     faststack --loupe /path/to/photos  # start in loupe view, skip initial thumbnails
     ```
 
-### Windows / Linux
+#### Windows / Linux
 
 ```bash
 python -m venv venv
@@ -104,19 +120,6 @@ python -m pip install -e .
 Automatic installation is intentionally disabled for source/virtualenv installs
 because a running Python app cannot reliably replace its own environment across
 Windows, Linux, and macOS.
-
-### Maintainer Release Builds
-
-Windows and macOS binaries are built by GitHub Actions from `v*` tags. From a
-clean checkout after the intended changes are merged to `main`, run:
-
-```bash
-./build-release.sh
-```
-
-The script creates the next `v<version>-buildN` tag on `origin/main`, pushes it,
-and the workflow publishes the Windows and macOS ZIP files to the GitHub Release
-for that tag.
 
 ### Command Line Options
 
@@ -158,29 +161,6 @@ Example:
 set FASTSTACK_TURBOJPEG_LIB=C:\path\to\turbojpeg.dll
 faststack "C:\path\to\photos"
 ```
-
-### Troubleshooting on Windows
-
-If startup logs mention:
-
-```text
-TurboJPEG initialization failed (N location(s) tried). Falling back to Pillow for JPEG decoding.
-```
-
-that means the Python package is installed but FastStack could not initialize TurboJPEG from any discovered location and is using Pillow instead.
-
-Fastest fixes:
-
-1. Install `libjpeg-turbo` for Windows x64 so that this file exists:
-   `C:\libjpeg-turbo64\bin\turbojpeg.dll`
-2. Or point FastStack to the dll explicitly:
-
-```cmd
-set FASTSTACK_TURBOJPEG_LIB=C:\path\to\turbojpeg.dll
-faststack "C:\path\to\photos"
-```
-
-If you do nothing, FastStack will still run, but JPEG decoding and thumbnail generation will use Pillow instead of `libjpeg-turbo`, which is slower.
 
 ## Keyboard Shortcuts
 
