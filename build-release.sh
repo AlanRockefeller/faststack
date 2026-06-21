@@ -37,6 +37,14 @@ tag=""
 target_ref="origin/main"
 dry_run=false
 skip_ruff=false
+temp_dir=""
+
+cleanup() {
+  if [ -n "$temp_dir" ] && [ -d "$temp_dir" ]; then
+    rm -rf "$temp_dir"
+  fi
+}
+trap cleanup EXIT
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -68,9 +76,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml | head -n 1)"
-[ -n "$version" ] || die "could not read project version from pyproject.toml"
-
 find_venv_python() {
   local candidate
   for candidate in \
@@ -88,6 +93,18 @@ find_venv_python() {
   return 1
 }
 
+show_target_file() {
+  local path="$1"
+  git show "${target_sha}:${path}" 2>/dev/null \
+    || die "target commit does not contain required file: $path"
+}
+
+target_file_contains() {
+  local path="$1"
+  local needle="$2"
+  show_target_file "$path" | grep -Fq "$needle"
+}
+
 if [ -n "$(git status --porcelain)" ]; then
   die "working tree has uncommitted changes; commit or stash before building a release"
 fi
@@ -99,6 +116,10 @@ git fetch origin +main:refs/remotes/origin/main --tags
 
 git rev-parse --verify "$target_ref^{commit}" >/dev/null 2>&1 \
   || die "target ref does not resolve to a commit: $target_ref"
+target_sha="$(git rev-parse "$target_ref^{commit}")"
+
+version="$(show_target_file pyproject.toml | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n 1)"
+[ -n "$version" ] || die "could not read project version from target pyproject.toml"
 
 if [ -z "$tag" ]; then
   prefix="v${version}-build"
@@ -134,25 +155,39 @@ if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; the
   die "remote tag already exists: $tag"
 fi
 
-grep -Fq 'from faststack.app import cli' faststack/__main__.py \
-  || die "faststack/__main__.py must use an absolute import for PyInstaller"
-grep -Fq 'ROOT = Path(SPECPATH).parent' packaging/faststack.spec \
-  || die "packaging/faststack.spec has an unexpected ROOT path"
-grep -Fq "FALLBACK_VERSION = \"$version\"" faststack/updater.py \
-  || die "faststack/updater.py FALLBACK_VERSION does not match pyproject version $version"
-grep -Fq 'gh release create' .github/workflows/build-executables.yml \
-  || die "build workflow is not configured to publish GitHub Release assets"
+target_file_contains faststack/__main__.py 'from faststack.app import cli' \
+  || die "target faststack/__main__.py must use an absolute import for PyInstaller"
+target_file_contains packaging/faststack.spec 'ROOT = Path(SPECPATH).parent' \
+  || die "target packaging/faststack.spec has an unexpected ROOT path"
+target_file_contains packaging/faststack.spec 'tomllib.load(f)["project"]["version"]' \
+  || die "target packaging/faststack.spec must derive bundle version from pyproject.toml"
+target_file_contains faststack/updater.py 'metadata.version("faststack")' \
+  || die "target faststack/updater.py must read installed package metadata"
+target_file_contains faststack/updater.py 'pyproject.toml' \
+  || die "target faststack/updater.py must fall back to pyproject.toml for source checkouts"
+if show_target_file faststack/updater.py | grep -Eq 'FALLBACK_VERSION = "[0-9]'; then
+  die "target faststack/updater.py must not duplicate the project version in FALLBACK_VERSION"
+fi
+target_file_contains .github/workflows/build-executables.yml 'gh release create' \
+  || die "target build workflow is not configured to publish GitHub Release assets"
 
 if [ "$skip_ruff" = false ]; then
   python_bin="$(find_venv_python)" \
     || die "no project virtualenv Python found; expected .venv or venv"
-  note "Running Ruff with $python_bin"
-  "$python_bin" -m ruff check faststack/
+  head_sha="$(git rev-parse HEAD^{commit})"
+  if [ "$target_sha" = "$head_sha" ]; then
+    ruff_dir="$repo_root"
+  else
+    temp_dir="$(mktemp -d)"
+    git archive "$target_sha" | tar -x -C "$temp_dir"
+    ruff_dir="$temp_dir"
+  fi
+  note "Running Ruff with $python_bin against $target_sha"
+  (cd "$ruff_dir" && "$repo_root/$python_bin" -m ruff check faststack/)
 else
   note "Skipping Ruff"
 fi
 
-target_sha="$(git rev-parse "$target_ref^{commit}")"
 remote_url="$(git remote get-url origin)"
 repo_slug="$(printf '%s\n' "$remote_url" \
   | sed -E 's#^git@github.com:##; s#^https://github.com/##; s#\.git$##')"
@@ -161,6 +196,7 @@ repo_url="https://github.com/${repo_slug}"
 note "Release tag: $tag"
 note "Target ref:  $target_ref"
 note "Target SHA:  $target_sha"
+note "Version:     $version"
 
 if [ "$dry_run" = true ]; then
   note "Dry run complete; no tag was created or pushed"
