@@ -5,50 +5,411 @@ import glob
 import logging
 import os
 import re
+import shutil
 import sys
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 
 from faststack.logging_setup import get_app_data_dir
 
 log = logging.getLogger(__name__)
 
 
-def detect_rawtherapee_path():
-    """Attempts to find the RawTherapee executable on Windows."""
-    if sys.platform != "win32":
+_TOOL_LABELS = {
+    "helicon": "Helicon Focus",
+    "photoshop": "Photoshop",
+    "rawtherapee": "RawTherapee",
+}
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    for path in paths:
+        if not path:
+            continue
+        normalized = os.path.normcase(
+            os.path.normpath(os.path.expanduser(os.path.expandvars(path)))
+        )
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(path)
+    return result
+
+
+def _existing_file(path: str | None) -> str | None:
+    if not path:
         return None
 
-    # Pattern to match RawTherapee CLI installations in Program Files (both x64 and x86)
-    # The CLI version (rawtherapee-cli.exe) is required for batch processing with -t -Y -o -c flags
-    # Finds paths like C:\Program Files\RawTherapee\5.9\rawtherapee-cli.exe
-    base_patterns = [
-        r"C:\Program Files\RawTherapee*\**\rawtherapee-cli.exe",
-        r"C:\Program Files (x86)\RawTherapee*\**\rawtherapee-cli.exe",
-    ]
+    cleaned = path.strip().strip('"')
+    if not cleaned:
+        return None
+
+    expanded = os.path.expanduser(os.path.expandvars(cleaned))
+    if os.path.isfile(expanded):
+        return expanded
+    return None
+
+
+def _is_wsl_linux() -> bool:
+    if sys.platform != "linux":
+        return False
 
     try:
-        matches = []
-        for pattern in base_patterns:
-            matches.extend(glob.glob(pattern, recursive=True))
+        version = Path("/proc/version").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "microsoft" in version.lower()
 
+
+def _runtime_os() -> str:
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    if _is_wsl_linux():
+        return "wsl"
+    return "linux"
+
+
+def _join(root: str, *parts: str) -> str:
+    return os.path.join(root, *parts)
+
+
+def _windows_program_roots() -> list[str]:
+    return _dedupe_paths(
+        [
+            os.environ.get("ProgramW6432", ""),
+            os.environ.get("ProgramFiles", ""),
+            r"C:\Program Files",
+            os.environ.get("ProgramFiles(x86)", ""),
+            r"C:\Program Files (x86)",
+        ]
+    )
+
+
+def _windows_local_program_roots() -> list[str]:
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if not local_app_data:
+        return []
+    return _dedupe_paths([_join(local_app_data, "Programs")])
+
+
+def _wsl_windows_program_roots() -> list[str]:
+    return _dedupe_paths(["/mnt/c/Program Files", "/mnt/c/Program Files (x86)"])
+
+
+def _wsl_local_program_roots() -> list[str]:
+    return glob.glob("/mnt/c/Users/*/AppData/Local/Programs")
+
+
+def _application_dirs() -> list[str]:
+    # /Applications is normally a firmlink to /System/Volumes/Data/Applications,
+    # so globbing /Applications already reaches apps on the Data volume. The
+    # /System/Volumes/Data/... entries are a belt-and-suspenders fallback for the
+    # rare case that firmlink is missing. Detection prefers the /Applications/...
+    # form via _install_preference when both resolve to the same app.
+    return _dedupe_paths(
+        [
+            "/Applications",
+            "/Applications/Utilities",
+            str(Path.home() / "Applications"),
+            "/System/Volumes/Data/Applications",
+            "/System/Volumes/Data/Applications/Utilities",
+        ]
+    )
+
+
+def _which_candidates(names: list[str]) -> list[str]:
+    matches = []
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            matches.append(found)
+    return _dedupe_paths(matches)
+
+
+def _windows_tool_patterns(tool_name: str, *, wsl: bool = False) -> list[str]:
+    program_roots = _wsl_windows_program_roots() if wsl else _windows_program_roots()
+    local_roots = _wsl_local_program_roots() if wsl else _windows_local_program_roots()
+
+    if tool_name == "photoshop":
+        patterns = []
+        for root in program_roots:
+            patterns.extend(
+                [
+                    _join(root, "Adobe", "Adobe Photoshop*", "Photoshop.exe"),
+                    _join(root, "Adobe", "*Photoshop*", "Photoshop.exe"),
+                ]
+            )
+        return patterns
+
+    if tool_name == "helicon":
+        patterns = []
+        for root in program_roots:
+            patterns.extend(
+                [
+                    _join(
+                        root,
+                        "Helicon Software",
+                        "Helicon Focus*",
+                        "HeliconFocus.exe",
+                    ),
+                    _join(root, "Helicon Software", "*", "HeliconFocus.exe"),
+                ]
+            )
+        return patterns
+
+    if tool_name == "rawtherapee":
+        patterns = []
+        for root in [*program_roots, *local_roots]:
+            patterns.append(_join(root, "RawTherapee*", "**", "rawtherapee-cli.exe"))
+        return patterns
+
+    return []
+
+
+def _macos_tool_patterns(tool_name: str) -> list[str]:
+    patterns = []
+    for applications_dir in _application_dirs():
+        if tool_name == "photoshop":
+            patterns.extend(
+                [
+                    _join(
+                        applications_dir,
+                        "Adobe Photoshop*.app",
+                        "Contents",
+                        "MacOS",
+                        "Adobe Photoshop*",
+                    ),
+                    _join(
+                        applications_dir,
+                        "Adobe Photoshop*",
+                        "Adobe Photoshop*.app",
+                        "Contents",
+                        "MacOS",
+                        "Adobe Photoshop*",
+                    ),
+                ]
+            )
+        elif tool_name == "helicon":
+            patterns.extend(
+                [
+                    _join(
+                        applications_dir,
+                        "Helicon Focus*.app",
+                        "Contents",
+                        "MacOS",
+                        "Helicon*",
+                    ),
+                    _join(
+                        applications_dir,
+                        "Helicon Focus*",
+                        "Helicon Focus*.app",
+                        "Contents",
+                        "MacOS",
+                        "Helicon*",
+                    ),
+                    _join(
+                        applications_dir,
+                        "HeliconFocus*.app",
+                        "Contents",
+                        "MacOS",
+                        "Helicon*",
+                    ),
+                ]
+            )
+        elif tool_name == "rawtherapee":
+            patterns.extend(
+                [
+                    _join(
+                        applications_dir,
+                        "RawTherapee*.app",
+                        "Contents",
+                        "MacOS",
+                        "rawtherapee-cli",
+                    ),
+                    _join(
+                        applications_dir,
+                        "RawTherapee*",
+                        "RawTherapee*.app",
+                        "Contents",
+                        "MacOS",
+                        "rawtherapee-cli",
+                    ),
+                ]
+            )
+    return patterns
+
+
+def _linux_tool_patterns(tool_name: str) -> list[str]:
+    home = str(Path.home())
+
+    if tool_name == "photoshop":
+        return [
+            _join(
+                home,
+                ".wine",
+                "drive_c",
+                "Program Files",
+                "Adobe",
+                "Adobe Photoshop*",
+                "Photoshop.exe",
+            ),
+            _join(
+                home,
+                ".wine",
+                "drive_c",
+                "Program Files (x86)",
+                "Adobe",
+                "Adobe Photoshop*",
+                "Photoshop.exe",
+            ),
+        ]
+
+    if tool_name == "helicon":
+        return [
+            "/opt/HeliconFocus*/HeliconFocus",
+            "/opt/Helicon Focus*/HeliconFocus",
+            "/opt/Helicon*/HeliconFocus",
+            "/usr/local/bin/HeliconFocus",
+            "/usr/local/bin/heliconfocus",
+            "/usr/bin/HeliconFocus",
+            "/usr/bin/heliconfocus",
+        ]
+
+    if tool_name == "rawtherapee":
+        return [
+            "/opt/homebrew/bin/rawtherapee-cli",
+            "/usr/local/bin/rawtherapee-cli",
+            "/usr/bin/rawtherapee-cli",
+            "/bin/rawtherapee-cli",
+            "/snap/bin/rawtherapee-cli",
+        ]
+
+    return []
+
+
+def _tool_candidates(tool_name: str, os_name: str) -> tuple[list[str], list[str]]:
+    if tool_name == "photoshop":
+        path_candidates = _which_candidates(["Photoshop.exe", "photoshop"])
+    elif tool_name == "helicon":
+        path_candidates = _which_candidates(
+            ["HeliconFocus.exe", "HeliconFocus", "heliconfocus"]
+        )
+    elif tool_name == "rawtherapee":
+        path_candidates = _which_candidates(["rawtherapee-cli", "rawtherapee-cli.exe"])
+    else:
+        return [], []
+
+    if os_name == "windows":
+        patterns = _windows_tool_patterns(tool_name)
+    elif os_name == "macos":
+        patterns = _macos_tool_patterns(tool_name)
+        if tool_name == "rawtherapee":
+            path_candidates.extend(
+                [
+                    "/opt/homebrew/bin/rawtherapee-cli",
+                    "/usr/local/bin/rawtherapee-cli",
+                    "/usr/bin/rawtherapee-cli",
+                ]
+            )
+    elif os_name == "wsl":
+        patterns = [
+            *_windows_tool_patterns(tool_name, wsl=True),
+            *_linux_tool_patterns(tool_name),
+        ]
+    else:
+        patterns = _linux_tool_patterns(tool_name)
+
+    return _dedupe_paths(path_candidates), _dedupe_paths(patterns)
+
+
+def _version_sort_key(path: str) -> list[int]:
+    path_parts = (
+        PureWindowsPath(path).parts if "\\" in path or ":" in path else Path(path).parts
+    )
+    for part in reversed(path_parts):
+        if re.fullmatch(r"\d+(?:\.\d+)*", part):
+            return [int(n) for n in part.split(".")]
+        match = re.search(
+            r"(?:^|[^\dA-Za-z])(\d+(?:\.\d+)*)(?:$|[^\dA-Za-z])",
+            part,
+        )
+        if match:
+            return [int(n) for n in match.group(1).split(".")]
+        match = re.search(r"(?:19|20)\d{2}", part)
+        if match:
+            return [int(match.group(0))]
+    return [0]
+
+
+def _install_preference(path: str) -> int:
+    lower_path = path.lower()
+    if "program files (x86)" in lower_path:
+        return 1
+    if "program files" in lower_path or lower_path.startswith("/applications/"):
+        return 2
+    return 0
+
+
+def detect_external_tool_path(tool_name: str) -> str | None:
+    """Return a likely executable path for a supported external tool."""
+    os_name = _runtime_os()
+    try:
+        path_candidates, patterns = _tool_candidates(tool_name, os_name)
+        matches = []
+
+        for candidate in path_candidates:
+            existing = _existing_file(candidate)
+            if existing:
+                matches.append(existing)
+
+        for pattern in patterns:
+            expanded_pattern = os.path.expanduser(os.path.expandvars(pattern))
+            for match in glob.glob(expanded_pattern, recursive=True):
+                existing = _existing_file(match)
+                if existing:
+                    matches.append(existing)
+
+        matches = _dedupe_paths(matches)
         if not matches:
             return None
 
-        # Helper to extract version numbers for natural sorting
-        # e.g., "5.10" -> [5, 10]
-        def version_sort_key(path):
-            for part in reversed(PureWindowsPath(path).parts):
-                if re.fullmatch(r"\d+(?:\.\d+)*", part):
-                    return [int(n) for n in part.split(".")]
-            return [0]
-
-        # Sort matches to try and get the latest version (by path name)
-        # 5.10 > 5.9
-        matches.sort(key=version_sort_key, reverse=True)
+        matches.sort(
+            key=lambda path: (_version_sort_key(path), _install_preference(path)),
+            reverse=True,
+        )
         return matches[0]
     except (OSError, RuntimeError) as e:
-        log.warning("Error detecting RawTherapee path: %s", e)
+        log.warning(
+            "Error detecting %s path: %s",
+            _TOOL_LABELS.get(tool_name, tool_name),
+            e,
+        )
         return None
+
+
+def detect_photoshop_path():
+    """Attempts to find the Photoshop executable for the current OS."""
+    return detect_external_tool_path("photoshop")
+
+
+def detect_helicon_path():
+    """Attempts to find the Helicon Focus executable for the current OS."""
+    return detect_external_tool_path("helicon")
+
+
+def detect_rawtherapee_path():
+    """Attempts to find the RawTherapee CLI executable for the current OS."""
+    return detect_external_tool_path("rawtherapee")
+
+
+_TOOL_DETECTORS = {
+    "helicon": detect_helicon_path,
+    "photoshop": detect_photoshop_path,
+    "rawtherapee": detect_rawtherapee_path,
+}
 
 
 # Determine default RawTherapee CLI path based on OS
@@ -67,6 +428,9 @@ DEFAULT_CONFIG = {
         "theme": "dark",
         "default_directory": "",
         "optimize_for": "speed",  # "speed" or "quality"
+        # Set once external-tool auto-detection has run, so we don't re-scan the
+        # filesystem for Helicon/Photoshop/RawTherapee on every launch.
+        "external_tools_detected": "False",
         # --- Auto Levels Configuration ---
         #
         # Behavior:
@@ -147,32 +511,66 @@ class AppConfig:
         if not self.config_path.exists():
             log.info("Creating default config at %s", self.config_path)
             self.config.read_dict(DEFAULT_CONFIG)
-            self.save()
+            config_changed = True
+            newly_created = True
         else:
             log.info("Loading config from %s", self.config_path)
             self.config.read(self.config_path)
+            config_changed = False
+            newly_created = False
             # Ensure all sections and keys exist
             for section, keys in DEFAULT_CONFIG.items():
                 if not self.config.has_section(section):
                     self.config.add_section(section)
+                    config_changed = True
                 for key, value in keys.items():
                     if not self.config.has_option(section, key):
                         self.config.set(section, key, value)
-            self.save()  # Save to add any missing keys
+                        config_changed = True
 
-            # Validate RawTherapee path (re-detect if missing)
-            if sys.platform == "win32":
-                current_rt_path = self.get("rawtherapee", "exe")
-                if not os.path.exists(current_rt_path):
-                    log.warning(
-                        "Configured RawTherapee path not found: %s. Attempting re-detection...",
-                        current_rt_path,
-                    )
-                    new_path = detect_rawtherapee_path()
-                    if new_path and new_path != current_rt_path:
-                        log.info("Found new RawTherapee path: %s", new_path)
-                        self.set("rawtherapee", "exe", new_path)
-                        self.save()
+        # Auto-detect external tool paths only once: on first run, or a one-time
+        # migration for configs created before detection existed. Doing this on
+        # every launch would re-scan the filesystem (slow on WSL/network mounts)
+        # and could silently replace a path the user configured.
+        detection_needed = newly_created or not self.getboolean(
+            "core", "external_tools_detected", fallback=False
+        )
+        if detection_needed:
+            if self._detect_external_tool_paths():
+                config_changed = True
+            self.set("core", "external_tools_detected", "True")
+            config_changed = True
+
+        if config_changed:
+            self.save()
+
+    def _detect_external_tool_paths(self) -> bool:
+        """Fill in external tool paths that are not configured yet.
+
+        Only a tool whose configured value is empty or still the bundled default
+        placeholder is auto-detected. A path the user set is never overwritten,
+        even when it is currently missing (e.g. on an unplugged drive).
+        """
+        changed = False
+
+        for section, detector in _TOOL_DETECTORS.items():
+            current_path = self.get(section, "exe")
+            if _existing_file(current_path):
+                continue  # configured path resolves; leave it untouched
+
+            default_path = DEFAULT_CONFIG.get(section, {}).get("exe", "")
+            if current_path and current_path != default_path:
+                # User configured a custom path that is currently missing —
+                # respect it rather than silently replacing it.
+                continue
+
+            detected_path = detector()
+            if detected_path and detected_path != current_path:
+                log.info("Detected %s path: %s", _TOOL_LABELS[section], detected_path)
+                self.set(section, "exe", detected_path)
+                changed = True
+
+        return changed
 
     def save(self):
         """Saves the current configuration to the INI file."""

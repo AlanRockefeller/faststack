@@ -78,6 +78,7 @@ class EntryMetadata:
     favorite: bool = False
     todo: bool = False
     todo_date: Optional[str] = None
+    batch: bool = False
 
 
 @dataclasses.dataclass

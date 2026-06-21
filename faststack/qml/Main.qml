@@ -19,7 +19,6 @@ ApplicationWindow {
     property var uiStateRef: null
     property var controllerRef: null
     property bool allowCloseWithRecycleBins: false
-    property bool allowCloseWithBatches: false
     property bool fullScreenLoupe: false
     property var savedWindowGeometry: ({})
 
@@ -91,16 +90,6 @@ ApplicationWindow {
     }
 
     onClosing: function(close) {
-        if (!root.allowCloseWithBatches && root.controllerRef) {
-            var definedBatchCount = root.controllerRef.get_defined_batch_count()
-            if (definedBatchCount > 0) {
-                close.accepted = false
-                quitBatchesDialog.batchCount = definedBatchCount
-                root.openDialogSafely(quitBatchesDialog)
-                return
-            }
-        }
-
         if (!root.allowCloseWithRecycleBins
                 && root.uiStateRef
                 && root.uiStateRef.hasRecycleBinItems) {
@@ -112,7 +101,6 @@ ApplicationWindow {
 
         if (root.controllerRef && !root.controllerRef.prepare_for_app_close()) {
             close.accepted = false
-            root.allowCloseWithBatches = false
             return
         }
 
@@ -164,6 +152,13 @@ ApplicationWindow {
     function openUpdateDialog(info) {
         updateDialog.updateInfo = info
         root.openDialogSafely(updateDialog)
+    }
+
+    function openReadmeDialog() {
+        if (root.uiStateRef) {
+            readmeDialog.readmeText = root.uiStateRef.get_readme_text()
+        }
+        root.openDialogSafely(readmeDialog)
     }
 
     function setGridPrefetch(item, enabled) {
@@ -1227,6 +1222,13 @@ ApplicationWindow {
             }
             MenuActionItem {
                 width: 200
+                text: "View Readme"
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                onClicked: { root.openReadmeDialog(); helpMenu.close() }
+            }
+            MenuActionItem {
+                width: 200
                 text: "Check for Updates"
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
@@ -1947,6 +1949,47 @@ ApplicationWindow {
     }
 
     Dialog {
+        id: readmeDialog
+        title: "FastStack Readme"
+        standardButtons: Dialog.Ok
+        modal: true
+        closePolicy: Popup.CloseOnEscape
+        focus: true
+        width: Math.min(900, root.width - 100)
+        height: Math.min(820, root.height - 100)
+
+        property string readmeText: ""
+
+        background: Rectangle {
+            color: root.currentBackgroundColor
+            border.color: root.isDarkTheme ? "#444444" : "#cccccc"
+            radius: 4
+        }
+
+        contentItem: ScrollView {
+            id: readmeScroll
+            clip: true
+            ScrollBar.vertical.policy: ScrollBar.AlwaysOn
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+            TextEdit {
+                width: readmeScroll.availableWidth
+                text: readmeDialog.readmeText
+                textFormat: TextEdit.MarkdownText
+                wrapMode: TextEdit.WordWrap
+                readOnly: true
+                selectByMouse: true
+                persistentSelection: true
+                padding: 16
+                color: root.currentTextColor
+                font.family: "Segoe UI Variable"
+                font.pixelSize: 14
+                onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+            }
+        }
+    }
+
+    Dialog {
         id: showStacksDialog
         title: "Stack Information"
         standardButtons: Dialog.Ok
@@ -1994,25 +2037,6 @@ ApplicationWindow {
         textColor: root.currentTextColor
     }
 
-    QuitBatchesDialog {
-        id: quitBatchesDialog
-        backgroundColor: root.currentBackgroundColor
-        textColor: root.currentTextColor
-        darkTheme: root.isDarkTheme
-        frameBorderColor: root.isDarkTheme ? "#404040" : "#d0d0d0"
-        cancelBgColor: root.isDarkTheme ? "#444444" : "#f0f0f0"
-        cancelHoverColor: root.isDarkTheme ? "#666666" : "#e0e0e0"
-        cancelPressedColor: root.isDarkTheme ? "#555555" : "#d0d0d0"
-        quitBgColor: root.isDarkTheme ? "#aa0000" : "#c62828"
-        quitHoverColor: root.isDarkTheme ? "#ff0000" : "#d32f2f"
-        quitPressedColor: root.isDarkTheme ? "#cc0000" : "#b71c1c"
-        controllerRef: root.controllerRef
-        onQuitConfirmed: {
-            root.allowCloseWithBatches = true
-            Qt.quit()
-        }
-    }
-    
     HistogramWindow {
         id: histogramWindow
         windowBackgroundColor: root.currentBackgroundColor
@@ -2231,11 +2255,6 @@ ApplicationWindow {
         }
 
         onOpened: refreshBinInfo()
-        onClosed: {
-            if (!root.allowCloseWithRecycleBins) {
-                root.allowCloseWithBatches = false
-            }
-        }
 
         // Ensure the dialog is fully opaque and has a solid background
         background: Rectangle {
@@ -2523,7 +2542,6 @@ ApplicationWindow {
                         anchors.fill: parent
                         hoverEnabled: true
                         onClicked: {
-                            root.allowCloseWithBatches = false
                             recycleBinCleanupDialog.close()
                         }
                         cursorShape: Qt.PointingHandCursor
