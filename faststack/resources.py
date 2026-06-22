@@ -50,6 +50,20 @@ def faststack_readme_path() -> Optional[Path]:
     return None
 
 
+def faststack_changelog_path() -> Optional[Path]:
+    """Return the bundled ChangeLog.md path across source and frozen layouts."""
+    package_dir = faststack_package_dir()
+    for candidate in (
+        package_dir / "ChangeLog.md",
+        package_dir.parent / "ChangeLog.md",
+    ):
+        if candidate.is_file():
+            return candidate
+
+    log.warning("FastStack ChangeLog.md was not found near %s", package_dir)
+    return None
+
+
 def readme_from_metadata() -> Optional[str]:
     """Return the README text embedded in the installed package metadata.
 

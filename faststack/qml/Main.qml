@@ -2101,7 +2101,7 @@ ApplicationWindow {
         modal: true
         standardButtons: Dialog.NoButton
         closePolicy: Popup.CloseOnEscape
-        width: Math.min(580, parent ? parent.width * 0.9 : 580)
+        width: Math.min(640, parent ? parent.width * 0.9 : 640)
         height: Math.min(520, parent ? parent.height * 0.86 : 520)
         x: parent ? (parent.width - width) / 2 : 0
         y: parent ? (parent.height - height) / 2 : 0
@@ -2185,7 +2185,7 @@ ApplicationWindow {
 
                 Button {
                     text: "Skip This Version"
-                    Layout.preferredWidth: 150
+                    Layout.preferredWidth: 140
                     onClicked: {
                         if (root.controllerRef) root.controllerRef.skip_update_version(updateDialog.latestVersion)
                         updateDialog.close()
@@ -2196,14 +2196,22 @@ ApplicationWindow {
 
                 Button {
                     text: "Remind Me Later"
-                    Layout.preferredWidth: 140
+                    Layout.preferredWidth: 130
                     onClicked: updateDialog.close()
+                }
+
+                Button {
+                    text: "View Changelog"
+                    Layout.preferredWidth: 140
+                    onClicked: {
+                        if (root.controllerRef) root.controllerRef.open_changelog()
+                    }
                 }
 
                 Button {
                     text: "Open Release"
                     highlighted: true
-                    Layout.preferredWidth: 130
+                    Layout.preferredWidth: 120
                     onClicked: {
                         if (root.controllerRef) root.controllerRef.open_update_release(updateDialog.releaseUrl)
                         updateDialog.close()

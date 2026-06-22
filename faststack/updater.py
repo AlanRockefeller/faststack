@@ -63,28 +63,54 @@ class UpdateInfo:
         }
 
 
-def get_current_version() -> str:
-    """Return the installed FastStack version.
-
-    Installed packages expose metadata. Running directly from a source checkout
-    usually does not, so fall back to pyproject.toml and then "unknown" as a
-    last resort. Frozen builds include package metadata from the installed
-    project, so they should normally use the metadata path.
-    """
-    try:
-        return metadata.version("faststack")
-    except metadata.PackageNotFoundError:
-        pass
-
-    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+def _read_pyproject_version(pyproject_path: Path) -> str | None:
+    """Return ``[project].version`` from pyproject.toml when available."""
     try:
         with pyproject_path.open("rb") as f:
             data = tomllib.load(f)
-        version = data.get("project", {}).get("version")
-        if isinstance(version, str) and version.strip():
-            return version.strip()
     except (OSError, tomllib.TOMLDecodeError):
         log.debug("Could not read version from %s", pyproject_path, exc_info=True)
+        return None
+
+    version = data.get("project", {}).get("version")
+    if isinstance(version, str) and version.strip():
+        return version.strip()
+
+    log.debug("No [project].version found in %s", pyproject_path)
+    return None
+
+
+def get_current_version() -> str:
+    """Return the current FastStack version.
+
+    Source-tree runs should trust the nearby pyproject.toml first because
+    editable-install metadata can go stale. Installed and frozen builds usually
+    do not have the repository pyproject nearby, so they fall back to package
+    metadata.
+    """
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    pyproject_version = (
+        _read_pyproject_version(pyproject_path) if pyproject_path.is_file() else None
+    )
+
+    metadata_version = None
+    try:
+        metadata_version = metadata.version("faststack")
+    except metadata.PackageNotFoundError:
+        pass
+
+    if pyproject_version:
+        if metadata_version and metadata_version != pyproject_version:
+            log.debug(
+                "FastStack version mismatch: pyproject.toml has %s, "
+                "package metadata has %s",
+                pyproject_version,
+                metadata_version,
+            )
+        return pyproject_version
+
+    if metadata_version:
+        return metadata_version
 
     return FALLBACK_VERSION
 

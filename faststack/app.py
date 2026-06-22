@@ -87,12 +87,13 @@ from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
 from faststack.imaging.mask_engine import inverse_transform
 from faststack.imaging.metadata import get_exif_data
 from faststack.resources import (
+    faststack_changelog_path,
     faststack_qml_dir,
     faststack_readme_path,
     pyside_qml_dir,
     readme_from_metadata,
 )
-from faststack.updater import check_for_update, get_current_version
+from faststack.updater import GITHUB_REPOSITORY, check_for_update, get_current_version
 from faststack.thumbnail_view import (
     DEFAULT_THUMBNAIL_CACHE_BYTES,
     ThumbnailModel,
@@ -6571,6 +6572,29 @@ class AppController(QObject):
             return
         if not QDesktopServices.openUrl(QUrl(url)):
             self.update_status_message("Could not open update release page", 5000)
+
+    @Slot()
+    def open_changelog(self):
+        changelog_path = faststack_changelog_path()
+        if changelog_path is not None:
+            if QDesktopServices.openUrl(QUrl.fromLocalFile(str(changelog_path))):
+                return
+            log.warning("Could not open local changelog: %s", changelog_path)
+
+        changelog_url = f"https://github.com/{GITHUB_REPOSITORY}/blob/main/ChangeLog.md"
+        if QDesktopServices.openUrl(QUrl(changelog_url)):
+            message = (
+                "Could not open local changelog; opened online changelog"
+                if changelog_path is not None
+                else "Local changelog not found; opened online changelog"
+            )
+            self.update_status_message(message, 5000)
+            return
+
+        self.update_status_message(
+            "Could not open changelog locally or in browser",
+            5000,
+        )
 
     @Slot(result=str)
     def get_color_mode(self):
