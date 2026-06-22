@@ -1033,6 +1033,22 @@ class UIState(QObject):
     def set_rawtherapee_path(self, path):
         self.app_controller.set_rawtherapee_path(path)
 
+    @Slot(result=str)
+    def get_raw_source_dir(self):
+        return self.app_controller.get_raw_source_dir()
+
+    @Slot(str)
+    def set_raw_source_dir(self, path):
+        self.app_controller.set_raw_source_dir(path)
+
+    @Slot(result=str)
+    def get_secondary_raw_source_dir(self):
+        return self.app_controller.get_secondary_raw_source_dir()
+
+    @Slot(str)
+    def set_secondary_raw_source_dir(self, path):
+        self.app_controller.set_secondary_raw_source_dir(path)
+
     @Slot(str, result=str)
     def open_file_dialog(self, current_path):
         return self.app_controller.open_file_dialog(current_path)

@@ -124,11 +124,12 @@ Window {
         }
     }
 
-    function handleArrowKey(key) {
+    function handleArrowKey(key, modifiers) {
+        if (modifiers === undefined) modifiers = Qt.NoModifier
         if (compactEditor.cropActive || discardDialog.opened) return false
         if (key === Qt.Key_Left || key === Qt.Key_Right) {
             if (compactEditor.controllerRef)
-                compactEditor.controllerRef.handle_key_from_compact_editor(key, Qt.NoModifier, "")
+                compactEditor.controllerRef.handle_key_from_compact_editor(key, modifiers, "")
             return true
         }
         if (key === Qt.Key_Up) {
@@ -240,14 +241,28 @@ Window {
         sequence: "Left"
         context: Qt.WindowShortcut
         enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
-        onActivated: compactEditor.handleArrowKey(Qt.Key_Left)
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Left, Qt.NoModifier)
     }
 
     Shortcut {
         sequence: "Right"
         context: Qt.WindowShortcut
         enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
-        onActivated: compactEditor.handleArrowKey(Qt.Key_Right)
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Right, Qt.NoModifier)
+    }
+
+    Shortcut {
+        sequence: "Shift+Left"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Left, Qt.ShiftModifier)
+    }
+
+    Shortcut {
+        sequence: "Shift+Right"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Right, Qt.ShiftModifier)
     }
 
     onClosing: (close) => {
@@ -298,7 +313,7 @@ Window {
                 }
             }
 
-            if (compactEditor.handleArrowKey(event.key)) {
+            if (compactEditor.handleArrowKey(event.key, event.modifiers)) {
                 event.accepted = true
             } else if (event.key === Qt.Key_Escape) {
                 compactEditor.requestClose()

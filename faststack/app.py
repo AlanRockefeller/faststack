@@ -4526,6 +4526,11 @@ class AppController(QObject):
                 f"[DBGCACHE] {_t_end*1000:.3f} next_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
             )
 
+    def next_image_by_10(self):
+        target_index = min(self.current_index + 10, len(self.image_files) - 1)
+        if target_index != self.current_index:
+            self._set_current_index(target_index, direction=1)
+
     def prev_image(self):
         if self.debug_cache:
             _t_start = time.perf_counter()
@@ -4541,6 +4546,11 @@ class AppController(QObject):
             print(
                 f"[DBGCACHE] {_t_end*1000:.3f} prev_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
             )
+
+    def prev_image_by_10(self):
+        target_index = max(self.current_index - 10, 0)
+        if target_index != self.current_index:
+            self._set_current_index(target_index, direction=-1)
 
     @Slot(int)
     def jump_to_image(self, index: int):
@@ -6273,6 +6283,20 @@ class AppController(QObject):
 
     def set_rawtherapee_path(self, path):
         config.set("rawtherapee", "exe", path)
+        config.save()
+
+    def get_raw_source_dir(self):
+        return config.get("raw", "source_dir", fallback="")
+
+    def set_raw_source_dir(self, path):
+        config.set("raw", "source_dir", path)
+        config.save()
+
+    def get_secondary_raw_source_dir(self):
+        return config.get("raw", "secondary_source_dir", fallback="")
+
+    def set_secondary_raw_source_dir(self, path):
+        config.set("raw", "secondary_source_dir", path)
         config.save()
 
     def _dialog_start_directory(self, current_path: str) -> str:
@@ -11201,6 +11225,18 @@ class AppController(QObject):
         if hasattr(self.ui_state, "originalCompareActive"):
             self.ui_state.originalCompareActive = False
         self.ui_refresh_generation += 1
+        # Re-point the live edited preview to the freshly bumped generation so
+        # the provider's gen-gated editor-preview path stays valid when space is
+        # released. Without this the loupe (at fit) fails has_valid_preview_buffer
+        # and falls back to the un-edited decode, leaving the original on screen.
+        # Mirrors the same fix-up done in sync_ui_state().
+        if (
+            self._last_rendered_preview is not None
+            and self._last_rendered_preview_index == self.current_index
+            and self._last_rendered_preview_session_key
+            == self._get_current_live_preview_session_key()
+        ):
+            self._last_rendered_preview_gen = self.ui_refresh_generation
         self.ui_state.currentImageSourceChanged.emit()
 
     @staticmethod
@@ -11374,38 +11410,29 @@ class AppController(QObject):
         base_number_str = match.group(2)  # e.g., "210633"
         base_number = int(base_number_str)
 
-        # Determine the RAW source directory
-        raw_source_dir_str = config.get("raw", "source_dir")
-        if not raw_source_dir_str:
-            self.update_status_message(
-                "RAW source directory not configured in settings."
-            )
-            log.warning("RAW source directory (raw.source_dir) is not set in config.")
-            return
-
-        raw_base_dir = Path(raw_source_dir_str)
-        if not raw_base_dir.is_dir():
-            self.update_status_message(
-                f"RAW source directory not found: {raw_base_dir}"
-            )
-            log.warning(
-                "Configured RAW source directory does not exist: %s", raw_base_dir
-            )
-            return
-
         # Get the mirror base from config
         mirror_base_str = config.get("raw", "mirror_base")
         if not mirror_base_str:
-            self.update_status_message(
-                "RAW mirror base directory not configured in settings."
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason="The RAW mirror base directory is not configured.",
             )
             log.warning("RAW mirror base (raw.mirror_base) is not set in config.")
             return
 
         mirror_base_dir = Path(mirror_base_str)
         if not mirror_base_dir.is_dir():
-            self.update_status_message(
-                f"RAW mirror base directory not found: {mirror_base_dir}"
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason=f"The RAW mirror base directory does not exist: {mirror_base_dir}",
             )
             log.warning(
                 "Configured RAW mirror base directory does not exist: %s",
@@ -11417,8 +11444,16 @@ class AppController(QObject):
         try:
             relative_part = current_image_path.parent.relative_to(mirror_base_dir)
         except ValueError:
-            self.update_status_message(
-                "Current image is not in the configured mirror base directory."
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason=(
+                    "The current image folder is not inside the configured RAW "
+                    f"mirror base directory: {mirror_base_dir}"
+                ),
             )
             log.error(
                 "Could not find relative path for '%s' from base '%s'. Check 'mirror_base' config.",
@@ -11427,57 +11462,52 @@ class AppController(QObject):
             )
             return
 
-        raw_search_dir = raw_base_dir / relative_part
-
-        if not raw_search_dir.is_dir():
-            self.update_status_message(
-                f"RAW directory for this date not found: {raw_search_dir}"
+        raw_locations = self._configured_restack_raw_locations()
+        search_locations = [
+            (label, base_dir, base_dir / relative_part)
+            for label, base_dir in raw_locations
+        ]
+        if not search_locations:
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason="No primary or secondary RAW source directory is configured.",
             )
-            log.warning("RAW search directory does not exist: %s", raw_search_dir)
             return
 
-        # Find RAW files by decrementing the number
         found_raw_files: List[Path] = []
-        # Start one number less than the stacked image number
-        current_raw_number = base_number - 1
-
-        # Limit to reasonable number of RAWs to avoid infinite loop or too many files
-        max_raw_search = 15  # As per user request, typically between 3 and 15
-        search_count = 0
-
-        while current_raw_number >= 0 and search_count < max_raw_search:
-            raw_filename_stem = (
-                f"{base_prefix}{current_raw_number:06d}"  # e.g., PB210632
+        found_label = ""
+        found_search_dir = None
+        for label, _base_dir, raw_search_dir in search_locations:
+            if not raw_search_dir.is_dir():
+                log.warning("RAW search directory does not exist: %s", raw_search_dir)
+                continue
+            found_raw_files = self._find_restack_raws_in_dir(
+                raw_search_dir,
+                base_prefix,
+                base_number,
             )
-
-            # Look for any of the common RAW extensions
-            potential_raw_paths = []
-            for ext in RAW_EXTENSIONS:
-                potential_raw_paths.append(raw_search_dir / f"{raw_filename_stem}{ext}")
-
-            found_this_number = False
-            for p in potential_raw_paths:
-                if p.is_file():
-                    found_raw_files.append(p)
-                    found_this_number = True
-                    break
-
-            if not found_this_number:
-                # User specified "continue until there is a gap in the numbers"
-                # If we don't find any RAW for a number, assume it's a gap and stop
-                if (
-                    found_raw_files
-                ):  # Only break if we've found at least one file before this gap
-                    break
-
-            current_raw_number -= 1
-            search_count += 1
+            if found_raw_files:
+                found_label = label
+                found_search_dir = raw_search_dir
+                break
 
         if not found_raw_files:
-            self.update_status_message(
-                f"No source RAW files found in {raw_search_dir} for {filename}."
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=search_locations,
             )
-            log.info("No source RAWs found for %s in %s", filename, raw_search_dir)
+            log.info(
+                "No source RAWs found for %s in %s",
+                filename,
+                [str(location[2]) for location in search_locations],
+            )
             return
 
         # Sort the files by name to ensure Helicon Focus receives them in sequence
@@ -11487,8 +11517,10 @@ class AppController(QObject):
             f"Launching Helicon Focus with {len(found_raw_files)} RAWs..."
         )
         log.info(
-            "Launching Helicon Focus for %s with RAWs: %s",
+            "Launching Helicon Focus for %s with RAWs from %s (%s): %s",
             filename,
+            found_label,
+            found_search_dir,
             [str(p) for p in found_raw_files],
         )
         success = self._launch_helicon_with_files(found_raw_files)
@@ -11507,6 +11539,122 @@ class AppController(QObject):
             self.update_status_message("Helicon Focus launched successfully.")
         else:
             self.update_status_message("Failed to launch Helicon Focus.")
+
+    def _configured_restack_raw_locations(self) -> list[tuple[str, Path]]:
+        raw_source_dir = config.get("raw", "source_dir", fallback="")
+        secondary_source_dir = config.get("raw", "secondary_source_dir", fallback="")
+        configured = (
+            ("Primary", raw_source_dir),
+            ("Secondary", secondary_source_dir),
+        )
+        locations: list[tuple[str, Path]] = []
+        seen: set[str] = set()
+        for label, raw_path in configured:
+            cleaned = str(raw_path or "").strip().strip('"')
+            if not cleaned:
+                continue
+            expanded = os.path.expanduser(os.path.expandvars(cleaned))
+            normalized = os.path.normcase(os.path.normpath(expanded))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            locations.append((label, Path(expanded)))
+        return locations
+
+    def _expected_restack_raw_stems(
+        self,
+        base_prefix: str,
+        base_number: int,
+        *,
+        max_raw_search: int = 15,
+    ) -> list[str]:
+        return [
+            f"{base_prefix}{raw_number:06d}"
+            for raw_number in range(
+                base_number - 1,
+                max(base_number - max_raw_search - 1, -1),
+                -1,
+            )
+        ]
+
+    def _find_restack_raws_in_dir(
+        self,
+        raw_search_dir: Path,
+        base_prefix: str,
+        base_number: int,
+        *,
+        max_raw_search: int = 15,
+    ) -> list[Path]:
+        found_raw_files: list[Path] = []
+        for raw_stem in self._expected_restack_raw_stems(
+            base_prefix,
+            base_number,
+            max_raw_search=max_raw_search,
+        ):
+            found_this_number = False
+            for ext in RAW_EXTENSIONS:
+                potential_raw = raw_search_dir / f"{raw_stem}{ext}"
+                if potential_raw.is_file():
+                    found_raw_files.append(potential_raw)
+                    found_this_number = True
+                    break
+
+            if not found_this_number and found_raw_files:
+                break
+
+        return found_raw_files
+
+    def _show_missing_restack_raws_dialog(
+        self,
+        *,
+        filename: str,
+        expected_stems: list[str],
+        search_locations: list[tuple[str, Path, Path]],
+        reason: str = "",
+    ) -> None:
+        raw_extensions = ", ".join(sorted(ext.upper() for ext in RAW_EXTENSIONS))
+        expected_preview = ", ".join(expected_stems[:5])
+        if len(expected_stems) > 5:
+            expected_preview += ", ..."
+
+        location_lines = []
+        for label, base_dir, search_dir in search_locations:
+            status = "found folder" if search_dir.is_dir() else "folder missing"
+            location_lines.append(
+                f"- {label}: {search_dir}\n  source root: {base_dir}\n  status: {status}"
+            )
+        if not location_lines:
+            location_lines.append("- No RAW source folders were available to search.")
+
+        details = (
+            f"Stacked image: {filename}\n\n"
+            "FastStack is trying to reopen the original RAW capture sequence in "
+            "Helicon Focus. The stacked JPG is only the finished output; the RAW "
+            "frames are needed so Helicon can rebuild the stack.\n\n"
+        )
+        if reason:
+            details += f"Problem:\n{reason}\n\n"
+        details += (
+            "What it looked for:\n"
+            f"- RAW filenames starting before the stacked image number: {expected_preview}\n"
+            f"- Extensions: {raw_extensions}\n"
+            "- Up to 15 previous frame numbers, stopping after the first gap once "
+            "frames are found.\n\n"
+            "Where it looked:\n"
+            + "\n".join(location_lines)
+            + "\n\nConfigure these folders in Settings > General > Restack RAW Locations. "
+            "Set the primary and secondary RAW source directories to folders that "
+            "mirror the same date/subfolder structure as the configured RAW mirror base."
+        )
+
+        msg_box = QMessageBox()
+        msg_box.setIcon(QMessageBox.Icon.Warning)
+        msg_box.setWindowTitle("Source RAW Files Not Found")
+        msg_box.setText("FastStack could not find the RAW files needed for restacking.")
+        msg_box.setInformativeText(details)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg_box.exec()
+        self.update_status_message("Source RAW files not found for restacking.", 6000)
 
     @Slot()
     def execute_crop(self):

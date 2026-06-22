@@ -37,6 +37,8 @@ Window {
     property string defaultDirectory: ""
     property string photoshopPath: ""
     property string rawtherapeePath: ""
+    property string rawSourceDir: ""
+    property string secondaryRawSourceDir: ""
     property string optimizeFor: "speed"
     property bool updateCheckEnabled: true
     property bool autoUpdateEnabled: false
@@ -125,6 +127,8 @@ Window {
         settingsDialog.setLoaderProperty(heliconField, "text", settingsDialog.heliconPath)
         settingsDialog.setLoaderProperty(photoshopField, "text", settingsDialog.photoshopPath)
         settingsDialog.setLoaderProperty(rawtherapeeField, "text", settingsDialog.rawtherapeePath)
+        settingsDialog.setLoaderProperty(rawSourceDirField, "text", settingsDialog.rawSourceDir)
+        settingsDialog.setLoaderProperty(secondaryRawSourceDirField, "text", settingsDialog.secondaryRawSourceDir)
         settingsDialog.setLoaderProperty(defaultDirField, "text", settingsDialog.defaultDirectory)
         settingsDialog.setLoaderProperty(cacheSizeField, "text", settingsDialog.cacheSize.toFixed(1))
         settingsDialog.setLoaderProperty(prefetchRadiusLoader, "value", settingsDialog.prefetchRadius)
@@ -139,6 +143,8 @@ Window {
             settingsDialog.heliconPath = settingsDialog.uiStateRef.get_helicon_path()
             settingsDialog.photoshopPath = settingsDialog.uiStateRef.get_photoshop_path()
             settingsDialog.rawtherapeePath = settingsDialog.uiStateRef.get_rawtherapee_path()
+            settingsDialog.rawSourceDir = settingsDialog.uiStateRef.get_raw_source_dir()
+            settingsDialog.secondaryRawSourceDir = settingsDialog.uiStateRef.get_secondary_raw_source_dir()
             settingsDialog.cacheSize = settingsDialog.uiStateRef.get_cache_size()
             settingsDialog.prefetchRadius = settingsDialog.uiStateRef.get_prefetch_radius()
             settingsDialog.theme = settingsDialog.uiStateRef.theme
@@ -200,6 +206,8 @@ Window {
         state.set_helicon_path(settingsDialog.heliconPath)
         state.set_photoshop_path(settingsDialog.photoshopPath)
         state.set_rawtherapee_path(settingsDialog.rawtherapeePath)
+        state.set_raw_source_dir(settingsDialog.rawSourceDir)
+        state.set_secondary_raw_source_dir(settingsDialog.secondaryRawSourceDir)
         state.set_cache_size(settingsDialog.cacheSize)
         state.set_prefetch_radius(settingsDialog.prefetchRadius)
         state.set_theme(settingsDialog.theme)
@@ -632,6 +640,73 @@ Window {
                                 }
                                 background: Rectangle { color: defaultDirBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
                                 contentItem: Text { text: defaultDirBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            }
+                        }
+
+                        Loader { sourceComponent: sectionSeparator }
+
+                        Loader {
+                            sourceComponent: sectionHeader
+                            onLoaded: item.text = "Restack RAW Locations"
+                        }
+
+                        Label { text: "Primary RAW Source Directory"; color: "#aaaaaa"; font.pixelSize: 12 }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Loader {
+                                id: rawSourceDirField
+                                sourceComponent: styledTextField
+                                Layout.fillWidth: true
+                                onLoaded: {
+                                    settingsDialog.setLoaderProperty(rawSourceDirField, "text", settingsDialog.rawSourceDir)
+                                    settingsDialog.connectLoaderSignal(rawSourceDirField, "textEdited", function() {
+                                        settingsDialog.rawSourceDir = settingsDialog.loaderProperty(rawSourceDirField, "text", settingsDialog.rawSourceDir)
+                                    })
+                                }
+                            }
+                            Button {
+                                id: rawSourceDirBrowseButton
+                                text: "Browse"
+                                flat: true
+                                onClicked: {
+                                    var path = settingsDialog.openDirectoryDialog(settingsDialog.loaderProperty(rawSourceDirField, "text", settingsDialog.rawSourceDir))
+                                    if (path) {
+                                        settingsDialog.rawSourceDir = path
+                                        settingsDialog.setLoaderProperty(rawSourceDirField, "text", path)
+                                    }
+                                }
+                                background: Rectangle { color: rawSourceDirBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: rawSourceDirBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            }
+                        }
+
+                        Label { text: "Secondary RAW Source Directory"; color: "#aaaaaa"; font.pixelSize: 12; Layout.topMargin: 5 }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Loader {
+                                id: secondaryRawSourceDirField
+                                sourceComponent: styledTextField
+                                Layout.fillWidth: true
+                                onLoaded: {
+                                    settingsDialog.setLoaderProperty(secondaryRawSourceDirField, "text", settingsDialog.secondaryRawSourceDir)
+                                    settingsDialog.connectLoaderSignal(secondaryRawSourceDirField, "textEdited", function() {
+                                        settingsDialog.secondaryRawSourceDir = settingsDialog.loaderProperty(secondaryRawSourceDirField, "text", settingsDialog.secondaryRawSourceDir)
+                                    })
+                                }
+                            }
+                            Button {
+                                id: secondaryRawSourceDirBrowseButton
+                                text: "Browse"
+                                flat: true
+                                onClicked: {
+                                    var path = settingsDialog.openDirectoryDialog(settingsDialog.loaderProperty(secondaryRawSourceDirField, "text", settingsDialog.secondaryRawSourceDir))
+                                    if (path) {
+                                        settingsDialog.secondaryRawSourceDir = path
+                                        settingsDialog.setLoaderProperty(secondaryRawSourceDirField, "text", path)
+                                    }
+                                }
+                                background: Rectangle { color: secondaryRawSourceDirBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: secondaryRawSourceDirBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                             }
                         }
 

@@ -2,6 +2,11 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## Unreleased (2026-06-21)
+
+- Location of the stack inputs (for the restack feature) is now configurable.
+- If you hold down shift when navigating through photos with right or left arrow, it jumps by 10 images.
+
 ## 1.6.5 (2026-06-20)
 
 - Better automatic photo adjustments. Auto-levels, auto white balance, brightness, highlights, shadows, and vibrance now produce more natural results.
