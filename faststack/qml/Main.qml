@@ -2242,7 +2242,7 @@ ApplicationWindow {
     }
     Dialog {
         id: recycleBinCleanupDialog
-        title: "Clean up Recycle Bins?"
+        title: recycleBinCleanupDialog.singleBin ? "Clean up Recycle Bin?" : "Clean up Recycle Bins?"
         x: (parent.width - width) / 2
         y: (parent.height - height) / 2
         width: Math.min(600, parent.width * 0.9)
@@ -2255,6 +2255,9 @@ ApplicationWindow {
         property var binInfoItems: root.toArray(binInfo)
         property var restorableBins: root.itemsWithStatus(binInfoItems, "restorable")
         property var unavailableBins: root.itemsWithStatus(binInfoItems, "unavailable")
+        // Treat a single recycle-bin directory as just "Recycle Bin" (singular).
+        // Plural "Recycle Bins" only when files were deleted across multiple dirs.
+        property bool singleBin: binInfoItems.length === 1
 
         function refreshBinInfo() {
             if (root.uiStateRef) {
@@ -2285,7 +2288,7 @@ ApplicationWindow {
             }
             Text {
                 anchors.centerIn: parent
-                text: "Clean up Recycle Bins?"
+                text: recycleBinCleanupDialog.singleBin ? "Clean up Recycle Bin?" : "Clean up Recycle Bins?"
                 color: root.currentTextColor
                 font.bold: true
                 font.pixelSize: 20
@@ -2453,7 +2456,7 @@ ApplicationWindow {
                 spacing: 12
 
                 Label {
-                    text: "All files in recycle bins:"
+                    text: recycleBinCleanupDialog.singleBin ? "All files in recycle bin:" : "All files in recycle bins:"
                     color: "#81C784"
                     font.pixelSize: 15
                     font.bold: true
