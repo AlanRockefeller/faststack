@@ -870,6 +870,11 @@ class UIState(QObject):
         """Returns the current filter string (empty if no filter active)."""
         return self.app_controller.get_filter_string()
 
+    @Property(bool, notify=filterStringChanged)
+    def favoritesOnly(self):
+        """True when the favorites-only view filter is active."""
+        return "favorite" in self.app_controller.get_filter_flags()
+
     @Property(str, notify=colorModeChanged)
     def colorMode(self):
         """Returns the current color mode."""
@@ -1241,6 +1246,21 @@ class UIState(QObject):
     def applyFilter(self, filter_string: str, filter_flags=None):
         """Applies a filter string and/or flag filters to the image list."""
         flags = list(filter_flags) if filter_flags else []
+        self.app_controller.apply_filter(filter_string, filter_flags=flags)
+
+    @Slot()
+    def toggleFavoritesOnly(self):
+        """Toggle the favorites-only view filter (for slideshow/presentation use).
+
+        Preserves any active filter string and other flag filters; only the
+        "favorite" flag is added or removed.
+        """
+        flags = list(self.app_controller.get_filter_flags())
+        filter_string = self.app_controller.get_filter_string()
+        if "favorite" in flags:
+            flags.remove("favorite")
+        else:
+            flags.append("favorite")
         self.app_controller.apply_filter(filter_string, filter_flags=flags)
 
     @Slot(int, int)

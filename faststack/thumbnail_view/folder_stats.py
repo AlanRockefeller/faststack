@@ -21,6 +21,8 @@ class FolderStats:
     stacked_count: int
     uploaded_count: int
     edited_count: int
+    # Number of entries currently flagged as part of a batch.
+    batch_count: int = 0
     # Count of image-like files (JPG, JPEG, PNG, GIF, BMP, TIFF, TIF, WEBP)
     # Named 'jpg_count' for historical reasons; displayed as "IMG" in UI
     jpg_count: int = 0
@@ -31,6 +33,8 @@ class FolderStats:
     coverage_buckets: list[tuple[float, float, float, float]] = field(
         default_factory=list
     )
+    # Batch coverage sparkline data aligned with coverage_buckets.
+    batch_coverage_buckets: list[float] = field(default_factory=list)
 
 
 # Cache by (folder_path, json_mtime_ns, folder_mtime_ns) to avoid re-parsing during scroll
@@ -185,6 +189,7 @@ def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
     stacked_count = 0
     uploaded_count = 0
     edited_count = 0
+    batch_count = 0
 
     for stem, meta in entries.items():
         if not isinstance(meta, dict):
@@ -196,22 +201,28 @@ def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
             uploaded_count += 1
         if meta.get("edited", False):
             edited_count += 1
+        if meta.get("batch", False):
+            batch_count += 1
 
     # Single-pass scan: count file types AND collect JPG filenames for sparkline
     folder_path = json_path.parent
     jpg_count, raw_count, jpg_files = _scan_folder_files(folder_path)
 
     # Compute coverage buckets for sparkline (using pre-collected JPG list)
-    coverage_buckets = _compute_coverage_buckets(jpg_files, entries)
+    coverage_buckets, batch_coverage_buckets = _compute_folder_coverage(
+        jpg_files, entries
+    )
 
     return FolderStats(
         total_images=total_images,
         stacked_count=stacked_count,
         uploaded_count=uploaded_count,
         edited_count=edited_count,
+        batch_count=batch_count,
         jpg_count=jpg_count,
         raw_count=raw_count,
         coverage_buckets=coverage_buckets,
+        batch_coverage_buckets=batch_coverage_buckets,
     )
 
 
@@ -232,16 +243,24 @@ def _compute_coverage_buckets(
     Returns:
         List of (upload_ratio, edited_ratio, stack_ratio, todo_ratio) tuples.
     """
+    coverage_buckets, _ = _compute_folder_coverage(jpg_files, entries, num_buckets)
+    return coverage_buckets
+
+
+def _compute_folder_coverage(
+    jpg_files: list, entries: Dict[str, dict], num_buckets: int = 40
+) -> tuple[list[tuple[float, float, float, float]], list[float]]:
+    """Compute aligned coverage buckets for the folder sparkline."""
     if not jpg_files:
-        return []
+        return [], []
 
     total_files = len(jpg_files)
     if total_files < num_buckets:
         num_buckets = total_files
 
-    # Single-pass accumulation into buckets to avoid redundant list processing
-    # Each entry is [uploaded_count, edited_count, stacked_count, todo_count, total_in_bucket]
-    accumulators = [[0, 0, 0, 0, 0] for _ in range(num_buckets)]
+    # Single-pass accumulation into buckets to avoid redundant list processing.
+    # Each entry is [uploaded, edited, stacked, todo, batch, total_in_bucket].
+    accumulators = [[0, 0, 0, 0, 0, 0] for _ in range(num_buckets)]
 
     # Lazy dictionary for case-insensitive lookup (only built if direct matching fails)
     entries_lower = None
@@ -276,20 +295,25 @@ def _compute_coverage_buckets(
                 accumulators[bucket_idx][2] += 1
             if meta.get("todo", False):
                 accumulators[bucket_idx][3] += 1
+            if meta.get("batch", False):
+                accumulators[bucket_idx][4] += 1
 
-        accumulators[bucket_idx][4] += 1
+        accumulators[bucket_idx][5] += 1
 
     # Convert counts to ratios
-    buckets = []
-    for uploaded, edited, stacked, todo, count in accumulators:
+    coverage_buckets = []
+    batch_coverage_buckets = []
+    for uploaded, edited, stacked, todo, batch, count in accumulators:
         if count == 0:
-            buckets.append((0.0, 0.0, 0.0, 0.0))
+            coverage_buckets.append((0.0, 0.0, 0.0, 0.0))
+            batch_coverage_buckets.append(0.0)
         else:
-            buckets.append(
+            coverage_buckets.append(
                 (uploaded / count, edited / count, stacked / count, todo / count)
             )
+            batch_coverage_buckets.append(batch / count)
 
-    return buckets
+    return coverage_buckets, batch_coverage_buckets
 
 
 def clear_stats_cache():

@@ -8,6 +8,7 @@ import re
 import shutil
 import sys
 from pathlib import Path, PureWindowsPath
+from typing import overload
 
 from faststack.logging_setup import get_app_data_dir
 
@@ -583,17 +584,37 @@ class AppConfig:
         except IOError as e:
             log.error("Failed to save config to %s: %s", self.config_path, e)
 
+    @overload
+    def get(self, section, key, fallback: None = None) -> str | None: ...
+    @overload
+    def get(self, section, key, fallback: str) -> str: ...
+
     def get(self, section, key, fallback=None):
         """Return a config value as a string."""
         return self.config.get(section, key, fallback=fallback)
+
+    @overload
+    def getint(self, section, key, fallback: None = None) -> int | None: ...
+    @overload
+    def getint(self, section, key, fallback: int) -> int: ...
 
     def getint(self, section, key, fallback=None):
         """Return a config value as an integer."""
         return self.config.getint(section, key, fallback=fallback)
 
+    @overload
+    def getfloat(self, section, key, fallback: None = None) -> float | None: ...
+    @overload
+    def getfloat(self, section, key, fallback: float) -> float: ...
+
     def getfloat(self, section, key, fallback=None):
         """Return a config value as a float."""
         return self.config.getfloat(section, key, fallback=fallback)
+
+    @overload
+    def getboolean(self, section, key, fallback: None = None) -> bool | None: ...
+    @overload
+    def getboolean(self, section, key, fallback: bool) -> bool: ...
 
     def getboolean(self, section, key, fallback=None):
         """Return a config value as a boolean."""

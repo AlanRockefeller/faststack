@@ -36,9 +36,11 @@ def _empty_folder_stats_payload() -> dict:
         "stacked_count": 0,
         "uploaded_count": 0,
         "edited_count": 0,
+        "batch_count": 0,
         "jpg_count": 0,
         "raw_count": 0,
         "coverage_buckets": [],
+        "batch_coverage_buckets": [],
     }
 
 
@@ -227,12 +229,16 @@ class ThumbnailModel(QAbstractListModel):
                     "stacked_count": entry.folder_stats.stacked_count,
                     "uploaded_count": entry.folder_stats.uploaded_count,
                     "edited_count": entry.folder_stats.edited_count,
+                    "batch_count": entry.folder_stats.batch_count,
                     "jpg_count": entry.folder_stats.jpg_count,  # Actually image-like files: JPG, PNG, etc.
                     "raw_count": entry.folder_stats.raw_count,
                     # Convert tuples to lists for safer QML type conversion
                     "coverage_buckets": [
                         list(t) for t in entry.folder_stats.coverage_buckets
                     ],
+                    "batch_coverage_buckets": list(
+                        entry.folder_stats.batch_coverage_buckets
+                    ),
                 }
             return _empty_folder_stats_payload()
         elif role == self.IsSelectedRole:

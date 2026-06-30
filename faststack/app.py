@@ -372,9 +372,9 @@ class AppController(QObject):
         self.image_dir = image_dir
         self.image_files: List[ImageFile] = []  # Filtered list for display
         self._all_images: List[ImageFile] = []  # Cached full list from disk
-        self._path_to_index: Dict[Path, int] = (
+        self._path_to_index: Dict[str, int] = (
             {}
-        )  # Resolved path -> index for O(1) lookup
+        )  # Normalized path key -> index for O(1) lookup
         self.current_index: int = 0
         self.ui_refresh_generation = 0
         self.main_window: Optional[QObject] = None
@@ -12893,6 +12893,14 @@ def main(
 
     if debug:
         log.info("Startup: after QApplication: %.3fs", time.perf_counter() - t0)
+
+    # Windows shells escape a trailing backslash before the closing quote
+    # (e.g. `faststack "C:\dir\"`), leaking a literal double-quote into argv so
+    # the path arrives as `C:\dir"`. Double-quotes are never valid in a Windows
+    # path, so strip stray quotes and surrounding whitespace defensively rather
+    # than rejecting an otherwise-correct directory.
+    if image_dir:
+        image_dir = image_dir.strip().strip('"').strip()
 
     if not image_dir:
         image_dir_str = config.get("core", "default_directory")

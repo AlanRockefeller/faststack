@@ -81,6 +81,7 @@ Item {
     property color counterUploadedCol: "#4CAF50"   // Bright green (matches badge)
     property color counterStackedCol: "#FF9800"    // Bright orange (matches badge)
     property color counterEditedCol: "#FFEB3B"     // Bright yellow (matches badge)
+    property color counterBatchCol: "#FF1744"      // Bright red for folder batch coverage
     property color emptyTextColor: tile.isDarkTheme ? "#888888" : "#666666"
 
     // Background
@@ -457,7 +458,7 @@ Item {
                 anchors.bottom: parent.bottom
                 anchors.left: parent.left
                 anchors.right: parent.right
-                height: 34
+                height: 38
                 visible: tile.tileIsFolder && tile.tileFolderStats && tile.tileFolderStats.total_images > 0
 
                 // Subtle 3-stop gradient scrim (starts at ~70%)
@@ -474,12 +475,12 @@ Item {
                 property string numFont: "Consolas, Monaco, monospace"
                 property int numSize: 11
 
-                // Coverage sparkline (4 separate lanes: green, yellow, orange, blue)
+                // Coverage sparkline (5 separate lanes: green, yellow, orange, blue, red)
                 Column {
                     id: sparklineStack
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.bottom: countsRow.top
-                    anchors.bottomMargin: 4
+                    anchors.bottomMargin: 2
                     spacing: 0  // No gap between lanes
                     visible: tile.tileFolderStats && tile.tileFolderStats.coverage_buckets && tile.tileFolderStats.coverage_buckets.length > 0
 
@@ -547,6 +548,22 @@ Item {
                             }
                         }
                     }
+
+                    // Lane 5: Batch (Red)
+                    Row {
+                        spacing: 1
+                        Repeater {
+                            model: tile.tileFolderStats ? (tile.tileFolderStats.batch_coverage_buckets || []) : []
+                            delegate: Rectangle {
+                                required property var modelData
+                                width: 3
+                                height: 3
+                                radius: 0.5
+                                color: tile.counterBatchCol
+                                opacity: modelData > 0 ? Math.max(0.5, modelData) : 0
+                            }
+                        }
+                    }
                 }
 
                 // File counts: "{jpg_count} JPG · {raw_count} RAW" (centered, always show both)
@@ -554,7 +571,7 @@ Item {
                     id: countsRow
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.bottom: parent.bottom
-                    anchors.bottomMargin: 6
+                    anchors.bottomMargin: 4
                     spacing: 0
 
                     Text {

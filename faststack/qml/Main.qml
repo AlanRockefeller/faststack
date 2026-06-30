@@ -4,11 +4,12 @@ import QtQuick.Window
 import QtQuick.Controls 2.15
 import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
+import QtCore
 import "."
 
 ApplicationWindow {
     id: root
-    visible: true
+    visible: false
     width: 1200
     height: 800
     minimumWidth: 800
@@ -21,6 +22,18 @@ ApplicationWindow {
     property bool allowCloseWithRecycleBins: false
     property bool fullScreenLoupe: false
     property var savedWindowGeometry: ({})
+    property bool windowGeometryReady: false
+    property bool suppressWindowGeometrySave: false
+
+    Settings {
+        id: mainWindowSettings
+        category: "mainWindow"
+        property real savedX: 0
+        property real savedY: 0
+        property real savedWidth: -1
+        property real savedHeight: -1
+        property bool savedMaximized: false
+    }
 
     function enterFullScreenLoupe() {
         if (!root.uiStateRef || root.uiStateRef.isGridViewActive) return
@@ -40,8 +53,9 @@ ApplicationWindow {
     function exitFullScreenLoupe() {
         if (!fullScreenLoupe) return
 
+        root.suppressWindowGeometrySave = true
         fullScreenLoupe = false
-        
+
         if (savedWindowGeometry.visibility === Window.Maximized) {
             root.showMaximized()
         } else {
@@ -53,6 +67,8 @@ ApplicationWindow {
                 root.height = savedWindowGeometry.height
             }
         }
+        root.suppressWindowGeometrySave = false
+        root.saveWindowPlacement(true)
         root.requestActivate()
     }
 
@@ -64,8 +80,13 @@ ApplicationWindow {
         }
     }
 
-    function clampWindowToVisibleScreen() {
-        if (root.visibility !== Window.Windowed || !root.screen) return
+    function hasSavedMainWindowGeometry() {
+        return mainWindowSettings.savedWidth > 0 && mainWindowSettings.savedHeight > 0
+    }
+
+    function clampWindowToVisibleScreen(force) {
+        if (!force && root.visibility !== Window.Windowed) return
+        if (!root.screen) return
 
         var screenX = root.screen.virtualX
         var screenY = root.screen.virtualY
@@ -73,10 +94,18 @@ ApplicationWindow {
         var screenHeight = root.screen.desktopAvailableHeight
         if (screenWidth <= 0 || screenHeight <= 0) return
 
-        var newWidth = Math.min(root.width, screenWidth)
-        var newHeight = Math.min(root.height, screenHeight)
-        var newX = Math.max(screenX, Math.min(root.x, screenX + screenWidth - newWidth))
-        var newY = Math.max(screenY, Math.min(root.y, screenY + screenHeight - newHeight))
+        var minWidth = root.minimumWidth > 0 ? root.minimumWidth : 1
+        var minHeight = root.minimumHeight > 0 ? root.minimumHeight : 1
+        var newWidth = Math.max(minWidth, root.width)
+        var newHeight = Math.max(minHeight, root.height)
+
+        if (screenWidth >= minWidth) newWidth = Math.min(newWidth, screenWidth)
+        if (screenHeight >= minHeight) newHeight = Math.min(newHeight, screenHeight)
+
+        var maxX = Math.max(screenX, screenX + screenWidth - newWidth)
+        var maxY = Math.max(screenY, screenY + screenHeight - newHeight)
+        var newX = Math.max(screenX, Math.min(root.x, maxX))
+        var newY = Math.max(screenY, Math.min(root.y, maxY))
 
         root.x = newX
         root.y = newY
@@ -84,10 +113,51 @@ ApplicationWindow {
         root.height = newHeight
     }
 
+    function restoreWindowPlacement() {
+        root.suppressWindowGeometrySave = true
+
+        if (root.hasSavedMainWindowGeometry()) {
+            root.width = mainWindowSettings.savedWidth
+            root.height = mainWindowSettings.savedHeight
+            root.x = mainWindowSettings.savedX
+            root.y = mainWindowSettings.savedY
+        }
+
+        root.clampWindowToVisibleScreen(true)
+        root.visible = true
+        root.clampWindowToVisibleScreen(true)
+
+        if (mainWindowSettings.savedMaximized) {
+            root.showMaximized()
+        }
+
+        root.suppressWindowGeometrySave = false
+    }
+
+    function saveWindowPlacement(force) {
+        if (!root.windowGeometryReady || root.suppressWindowGeometrySave) return
+        if (!force && !root.visible) return
+        if (root.fullScreenLoupe || root.visibility === Window.Minimized) return
+
+        mainWindowSettings.savedMaximized = root.isMaximized
+        if (root.visibility === Window.Windowed) {
+            mainWindowSettings.savedX = root.x
+            mainWindowSettings.savedY = root.y
+            mainWindowSettings.savedWidth = root.width
+            mainWindowSettings.savedHeight = root.height
+        }
+    }
+
     function openDialogSafely(dialog) {
         root.clampWindowToVisibleScreen()
         dialog.open()
     }
+
+    onXChanged: root.saveWindowPlacement()
+    onYChanged: root.saveWindowPlacement()
+    onWidthChanged: root.saveWindowPlacement()
+    onHeightChanged: root.saveWindowPlacement()
+    onVisibilityChanged: root.saveWindowPlacement()
 
     onClosing: function(close) {
         if (!root.allowCloseWithRecycleBins
@@ -104,14 +174,20 @@ ApplicationWindow {
             return
         }
 
+        root.saveWindowPlacement(true)
         close.accepted = true
     }
 
     Component.onCompleted: {
         root.uiStateRef = uiState
         root.controllerRef = controller
+        root.restoreWindowPlacement()
+        root.windowGeometryReady = true
+        root.saveWindowPlacement(true)
         // Initialization complete
     }
+
+    Component.onDestruction: root.saveWindowPlacement(true)
 
     Material.theme: (root.uiStateRef && root.uiStateRef.theme === 0) ? Material.Dark : Material.Light
     Material.accent: "#4fb360"
@@ -949,6 +1025,18 @@ ApplicationWindow {
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
                 onClicked: { root.openDialogSafely(filterDialog); actionsMenu.close() }
+            }
+            MenuActionItem {
+                width: 220
+                text: "Show Only Favorites"
+                showCheckbox: true
+                checkboxChecked: root.uiStateRef ? root.uiStateRef.favoritesOnly : false
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                onClicked: {
+                    if (root.uiStateRef) root.uiStateRef.toggleFavoritesOnly()
+                    actionsMenu.close()
+                }
             }
 
             // Separator before Sort options

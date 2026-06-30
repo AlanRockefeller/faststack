@@ -19,6 +19,9 @@ Window {
 
     property var uiStateRef: null
     property var controllerRef: null
+    property bool windowGeometryReady: false
+    property bool suppressWindowGeometrySave: false
+    property bool windowWasVisible: false
 
     visible: compactEditor.uiStateRef
              ? (compactEditor.uiStateRef.isEditorOpen && !compactEditor.uiStateRef.isEditorExpanded)
@@ -30,19 +33,25 @@ Window {
         property bool overlaidHistogram: true
         property real savedX: -1
         property real savedY: -1
+        property real savedWidth: -1
+        property real savedHeight: -1
     }
 
     Component.onCompleted: {
-        compactEditor.uiStateRef = uiState
         compactEditor.controllerRef = controller
-        if (compactSettings.savedX >= 0 && compactSettings.savedY >= 0) {
-            compactEditor.x = compactSettings.savedX
-            compactEditor.y = compactSettings.savedY
-        } else {
-            positionAtRightGutter()
-        }
+        compactEditor.restoreWindowPlacement()
+        compactEditor.windowGeometryReady = true
+        compactEditor.uiStateRef = uiState
         compactEditor.keyboardHandlerReady = true
         Qt.callLater(compactEditor.focusKeyboardHandler)
+    }
+
+    function hasSavedPosition() {
+        return compactSettings.savedX !== -1 && compactSettings.savedY !== -1
+    }
+
+    function hasSavedSize() {
+        return compactSettings.savedWidth > 0 && compactSettings.savedHeight > 0
     }
 
     function positionAtRightGutter() {
@@ -53,9 +62,73 @@ Window {
         }
     }
 
-    onXChanged: if (visible) compactSettings.savedX = x
-    onYChanged: if (visible) compactSettings.savedY = y
+    function clampWindowToVisibleScreen(force) {
+        if (!force && !compactEditor.visible) return
+        if (!compactEditor.screen) return
+
+        var screenX = compactEditor.screen.virtualX
+        var screenY = compactEditor.screen.virtualY
+        var screenWidth = compactEditor.screen.desktopAvailableWidth
+        var screenHeight = compactEditor.screen.desktopAvailableHeight
+        if (screenWidth <= 0 || screenHeight <= 0) return
+
+        var minWidth = compactEditor.minimumWidth > 0 ? compactEditor.minimumWidth : 1
+        var maxWidth = compactEditor.maximumWidth > 0 ? compactEditor.maximumWidth : screenWidth
+        var minHeight = compactEditor.minimumHeight > 0 ? compactEditor.minimumHeight : 1
+        var newWidth = Math.max(minWidth, Math.min(compactEditor.width, maxWidth))
+        var newHeight = Math.max(minHeight, compactEditor.height)
+
+        if (screenWidth >= minWidth) newWidth = Math.min(newWidth, screenWidth)
+        if (screenHeight >= minHeight) newHeight = Math.min(newHeight, screenHeight)
+
+        var maxX = Math.max(screenX, screenX + screenWidth - newWidth)
+        var maxY = Math.max(screenY, screenY + screenHeight - newHeight)
+        var newX = Math.max(screenX, Math.min(compactEditor.x, maxX))
+        var newY = Math.max(screenY, Math.min(compactEditor.y, maxY))
+
+        compactEditor.x = newX
+        compactEditor.y = newY
+        compactEditor.width = newWidth
+        compactEditor.height = newHeight
+    }
+
+    function restoreWindowPlacement() {
+        compactEditor.suppressWindowGeometrySave = true
+
+        if (compactEditor.hasSavedSize()) {
+            compactEditor.width = compactSettings.savedWidth
+            compactEditor.height = compactSettings.savedHeight
+        }
+
+        if (compactEditor.hasSavedPosition()) {
+            compactEditor.x = compactSettings.savedX
+            compactEditor.y = compactSettings.savedY
+        } else {
+            compactEditor.positionAtRightGutter()
+        }
+
+        compactEditor.clampWindowToVisibleScreen(true)
+        compactEditor.suppressWindowGeometrySave = false
+    }
+
+    function saveWindowPlacement(force) {
+        if (!compactEditor.windowGeometryReady || compactEditor.suppressWindowGeometrySave) return
+        if (!compactEditor.windowWasVisible && !compactEditor.hasSavedPosition()) return
+        if (!force && !compactEditor.visible) return
+        if (compactEditor.visibility === Window.Minimized) return
+
+        compactSettings.savedX = compactEditor.x
+        compactSettings.savedY = compactEditor.y
+        compactSettings.savedWidth = compactEditor.width
+        compactSettings.savedHeight = compactEditor.height
+    }
+
+    onXChanged: compactEditor.saveWindowPlacement()
+    onYChanged: compactEditor.saveWindowPlacement()
+    onWidthChanged: compactEditor.saveWindowPlacement()
+    onHeightChanged: compactEditor.saveWindowPlacement()
     onActiveChanged: if (active) compactEditor.focusKeyboardHandler()
+    Component.onDestruction: compactEditor.saveWindowPlacement(true)
 
     // --- Color Palette (matches full editor) ---
     readonly property color backgroundColor: "#1e1e1e"
@@ -207,10 +280,13 @@ Window {
 
     onVisibleChanged: {
         if (visible && compactEditor.controllerRef) {
+            compactEditor.windowWasVisible = true
             compactEditor.schedulePreviewLoad("open", true)
-            if (compactSettings.savedX < 0) positionAtRightGutter()
+            if (!compactEditor.hasSavedPosition()) positionAtRightGutter()
+            compactEditor.clampWindowToVisibleScreen(true)
             Qt.callLater(compactEditor.focusKeyboardHandler)
         } else {
+            compactEditor.saveWindowPlacement(true)
             deferredLoadTimer.stop()
         }
     }

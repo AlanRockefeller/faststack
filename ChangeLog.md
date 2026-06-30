@@ -6,6 +6,9 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 
 - Location of the stack inputs (for the restack feature) is now configurable.
 - If you hold down shift when navigating through photos with right or left arrow, it jumps by 10 images.
+- New "Show Only Favorites" toggle in the Actions menu. Favorite a bunch of photos and flip through just those - handy for slideshows on a projector.
+- Folder thumbnails now show a bright red square on the sparkline if anything is still sitting in a batch, so you don't forget to upload stuff. Even one photo lights it up.
+- Fixed opening a folder on Windows when the quoted path had a trailing backslash (like `"...\upload\"`), which used to fail. Stray quotes are now stripped.
 
 ## 1.6.5 (2026-06-20)
 
