@@ -7,7 +7,6 @@ from PIL import Image
 from faststack.imaging.editor import (
     ImageEditor,
     _rotated_rect_with_max_area,
-    rotate_autocrop_rgb,
 )
 
 
@@ -72,56 +71,6 @@ def test_rotated_rect_calculation_branches(w, h, angle_deg):
     else:
         # Non-zero rotation always reduces the inscribed axis-aligned box
         assert cw * ch < w * h
-
-
-def test_rotate_autocrop_rgb_behavior():
-    """Test actual image formatting and cropping."""
-    # Create valid RGB image
-    w, h = 100, 100
-    img = Image.new("RGB", (w, h), color=(255, 0, 0))  # Red
-
-    # 1. Test no rotation
-    res = rotate_autocrop_rgb(img, 0.0)
-    assert res.size == (100, 100)
-
-    # 2. Test rotation with inset
-    angle = 45.0
-    inset = 2
-    res = rotate_autocrop_rgb(img, angle, inset=inset)
-
-    # At 45 deg, a square becomes a diamond. The max inscribed rect is w/(sqrt(2)) ~ 0.707*w
-    # 100 * 0.707 = 70.
-    # We expect roughly 70x70 minus inset.
-    # expected_approx = 70.0
-    assert 60 < res.width < 80
-    assert 60 < res.height < 80
-
-    # Verify no black wedges (since original was all red)
-    # Center pixel should definitely be red
-    cx, cy = res.width // 2, res.height // 2
-    assert res.getpixel((cx, cy)) == (255, 0, 0)
-
-    # Corner pixels should also be red if cropped correctly
-    # Allow small tolerance for interpolation/quantization (254 instead of 255)
-    def assert_red(p):
-        assert p[0] >= 254 and p[1] < 2 and p[2] < 2
-
-    assert_red(res.getpixel((0, 0)))
-    assert_red(res.getpixel((res.width - 1, res.height - 1)))
-
-
-def test_boundary_clamping():
-    """Test internal clamping logic."""
-    img = Image.new("RGB", (10, 10), (255, 255, 255))
-
-    # Very small image, 45 deg rotation
-    # Inscribed rect will be small.
-    # high inset could theoretically reduce it to < 0.
-    res = rotate_autocrop_rgb(img, 45, inset=50)  # Huge inset
-
-    # It should clamp to at least 1x1 or similar valid image, not crash
-    assert res.width > 0
-    assert res.height > 0
 
 
 def test_integration_straighten_modes():

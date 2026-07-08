@@ -428,6 +428,10 @@ DEFAULT_CONFIG = {
         "prefetch_radius": "6",
         "theme": "dark",
         "default_directory": "",
+        # Last directory that was open, persisted across clean exits so that
+        # launching with no argument resumes where you left off. Falls back to
+        # default_directory if unset or no longer present.
+        "last_directory": "",
         "optimize_for": "speed",  # "speed" or "quality"
         # Set once external-tool auto-detection has run, so we don't re-scan the
         # filesystem for Helicon/Photoshop/RawTherapee on every launch.

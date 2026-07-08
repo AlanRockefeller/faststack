@@ -134,6 +134,10 @@ class SidecarManager:
                     "stacks": self.data.stacks,
                 }
                 json.dump(serializable_data, f, indent=2)
+                # Force the bytes to disk before the rename so an unexpected
+                # reboot/power-loss can't leave the temp file's contents unflushed.
+                f.flush()
+                os.fsync(f.fileno())
 
             # Atomic rename
             temp_path.replace(self.path)

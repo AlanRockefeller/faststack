@@ -6,6 +6,7 @@ import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import QtCore
 import "."
+import "WindowPlacement.js" as WP
 
 ApplicationWindow {
     id: root
@@ -68,7 +69,9 @@ ApplicationWindow {
             }
         }
         root.suppressWindowGeometrySave = false
-        root.saveWindowPlacement(true)
+        // showNormal()/showMaximized() above are async; let the window settle
+        // before persisting so we don't capture the transient FullScreen state.
+        saveGeometryTimer.restart()
         root.requestActivate()
     }
 
@@ -86,31 +89,16 @@ ApplicationWindow {
 
     function clampWindowToVisibleScreen(force) {
         if (!force && root.visibility !== Window.Windowed) return
-        if (!root.screen) return
-
-        var screenX = root.screen.virtualX
-        var screenY = root.screen.virtualY
-        var screenWidth = root.screen.desktopAvailableWidth
-        var screenHeight = root.screen.desktopAvailableHeight
-        if (screenWidth <= 0 || screenHeight <= 0) return
-
-        var minWidth = root.minimumWidth > 0 ? root.minimumWidth : 1
-        var minHeight = root.minimumHeight > 0 ? root.minimumHeight : 1
-        var newWidth = Math.max(minWidth, root.width)
-        var newHeight = Math.max(minHeight, root.height)
-
-        if (screenWidth >= minWidth) newWidth = Math.min(newWidth, screenWidth)
-        if (screenHeight >= minHeight) newHeight = Math.min(newHeight, screenHeight)
-
-        var maxX = Math.max(screenX, screenX + screenWidth - newWidth)
-        var maxY = Math.max(screenY, screenY + screenHeight - newHeight)
-        var newX = Math.max(screenX, Math.min(root.x, maxX))
-        var newY = Math.max(screenY, Math.min(root.y, maxY))
-
-        root.x = newX
-        root.y = newY
-        root.width = newWidth
-        root.height = newHeight
+        // Clamp against the monitor the window's coordinates actually fall on
+        // (falling back to the current screen). Using root.screen alone would
+        // pull a window restored onto a secondary monitor back to the primary,
+        // because root.screen is the primary until the window is mapped.
+        var screen = WP.screenContaining(Application.screens, root.x, root.y)
+                     || root.screen
+        WP.clampToScreen(root, screen, {
+            minWidth: root.minimumWidth,
+            minHeight: root.minimumHeight
+        })
     }
 
     function restoreWindowPlacement() {
@@ -121,14 +109,28 @@ ApplicationWindow {
             root.height = mainWindowSettings.savedHeight
             root.x = mainWindowSettings.savedX
             root.y = mainWindowSettings.savedY
-        }
-
-        root.clampWindowToVisibleScreen(true)
-        root.visible = true
-        root.clampWindowToVisibleScreen(true)
-
-        if (mainWindowSettings.savedMaximized) {
-            root.showMaximized()
+            // Clamp against the saved monitor before showing, so a window saved
+            // on a secondary screen comes back there instead of the primary.
+            root.clampWindowToVisibleScreen(true)
+            root.visible = true
+            if (mainWindowSettings.savedMaximized) {
+                root.showMaximized()
+            }
+        } else {
+            // First run: center on the active screen rather than pinning the
+            // window to (0, 0). Retry after showing in case no screen was
+            // available yet.
+            var centered = WP.centerOnScreen(root, root.screen)
+            root.visible = true
+            if (!centered) WP.centerOnScreen(root, root.screen)
+            root.clampWindowToVisibleScreen(true)
+            // Persist the initial centered placement so the next launch
+            // restores it instead of treating geometry as unsaved.
+            mainWindowSettings.savedX = root.x
+            mainWindowSettings.savedY = root.y
+            mainWindowSettings.savedWidth = root.width
+            mainWindowSettings.savedHeight = root.height
+            mainWindowSettings.savedMaximized = false
         }
 
         root.suppressWindowGeometrySave = false
@@ -138,6 +140,10 @@ ApplicationWindow {
         if (!root.windowGeometryReady || root.suppressWindowGeometrySave) return
         if (!force && !root.visible) return
         if (root.fullScreenLoupe || root.visibility === Window.Minimized) return
+        // Don't capture state while the window is hidden / mid-teardown:
+        // visibility is unreliable there and isMaximized would read false,
+        // clobbering the real value saved on close (Component.onDestruction).
+        if (root.visibility === Window.Hidden) return
 
         mainWindowSettings.savedMaximized = root.isMaximized
         if (root.visibility === Window.Windowed) {
@@ -153,11 +159,21 @@ ApplicationWindow {
         dialog.open()
     }
 
-    onXChanged: root.saveWindowPlacement()
-    onYChanged: root.saveWindowPlacement()
-    onWidthChanged: root.saveWindowPlacement()
-    onHeightChanged: root.saveWindowPlacement()
-    onVisibilityChanged: root.saveWindowPlacement()
+    // Debounce continuous geometry changes (drags/resizes) and let the window
+    // settle after maximize/un-maximize transitions before persisting, so we
+    // never store a transient size/visibility. Authoritative saves on close go
+    // through saveWindowPlacement(true) directly.
+    Timer {
+        id: saveGeometryTimer
+        interval: 400
+        onTriggered: root.saveWindowPlacement()
+    }
+
+    onXChanged: saveGeometryTimer.restart()
+    onYChanged: saveGeometryTimer.restart()
+    onWidthChanged: saveGeometryTimer.restart()
+    onHeightChanged: saveGeometryTimer.restart()
+    onVisibilityChanged: saveGeometryTimer.restart()
 
     onClosing: function(close) {
         if (!root.allowCloseWithRecycleBins
@@ -183,8 +199,9 @@ ApplicationWindow {
         root.controllerRef = controller
         root.restoreWindowPlacement()
         root.windowGeometryReady = true
-        root.saveWindowPlacement(true)
-        // Initialization complete
+        // No forced save here: restoreWindowPlacement already persisted the
+        // first-run placement, and saving now would read a transient
+        // visibility while showMaximized() is still in flight.
     }
 
     Component.onDestruction: root.saveWindowPlacement(true)
@@ -908,7 +925,7 @@ ApplicationWindow {
         id: actionsMenu
         parent: Overlay.overlay
         implicitWidth: 220
-        onClosed: sortSubMenu.close()
+        onClosed: { sortSubMenu.close(); showOnlySubMenu.close() }
 
         background: Rectangle {
             implicitWidth: 220
@@ -1026,17 +1043,48 @@ ApplicationWindow {
                 defaultTextColor: root.currentTextColor
                 onClicked: { root.openDialogSafely(filterDialog); actionsMenu.close() }
             }
-            MenuActionItem {
+            ItemDelegate {
+                id: showOnlyLauncher
                 width: 220
-                text: "Show Only Favorites"
-                showCheckbox: true
-                checkboxChecked: root.uiStateRef ? root.uiStateRef.favoritesOnly : false
-                hoverFillColor: root.menuHoverColor
-                defaultTextColor: root.currentTextColor
-                onClicked: {
-                    if (root.uiStateRef) root.uiStateRef.toggleFavoritesOnly()
-                    actionsMenu.close()
+                height: 36
+                hoverEnabled: true
+                background: Rectangle {
+                    color: showOnlyLauncher.hovered ? root.menuHoverColor : "transparent"
                 }
+                contentItem: Item {
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Show Only"
+                        color: root.currentTextColor
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    Text {
+                        anchors.right: parent.right
+                        anchors.rightMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "▶" // Right-pointing triangle
+                        font.pixelSize: 10
+                        color: root.currentTextColor
+                        opacity: 0.6
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                onHoveredChanged: {
+                    if (hovered) {
+                        sortSubMenu.close()
+                        showOnlySubMenu.popupAt(showOnlyLauncher, showOnlyLauncher.width - 4, 0)
+                    }
+                }
+                onClicked: {
+                    sortSubMenu.close()
+                    showOnlySubMenu.popupAt(showOnlyLauncher, showOnlyLauncher.width - 4, 0)
+                }
+                // Ensure keyboard activation works reliably
+                Keys.onReturnPressed: clicked()
+                Keys.onEnterPressed: clicked()
+                Keys.onSpacePressed: clicked()
             }
 
             // Separator before Sort options
@@ -1076,10 +1124,12 @@ ApplicationWindow {
                 }
                 onHoveredChanged: {
                     if (hovered) {
+                        showOnlySubMenu.close()
                         sortSubMenu.popupAt(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
                     }
                 }
                 onClicked: {
+                    showOnlySubMenu.close()
                     sortSubMenu.popupAt(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
                 }
                 // Ensure keyboard activation works reliably
@@ -1280,6 +1330,69 @@ ApplicationWindow {
                     if (root.controllerRef) root.controllerRef.set_sort_mode("date_reverse")
                     sortSubMenu.close()
                     actionsMenu.close()
+                }
+            }
+        }
+    }
+
+    // "Show Only" submenu: checkboxes for each metadata state stored in the
+    // sidecar json. Toggling a checkbox adds/removes that flag from the active
+    // view filter (AND logic). A Popup, not a Menu — see sortSubMenu above.
+    Popup {
+        id: showOnlySubMenu
+        parent: Overlay.overlay
+        implicitWidth: 180
+        padding: 0
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+        // Position relative to a source item, mapped into the overlay.
+        function popupAt(item, dx, dy) {
+            var p = item.mapToItem(Overlay.overlay, dx, dy)
+            x = p.x
+            y = p.y
+            open()
+        }
+
+        // Label -> metadata flag name (attributes on EntryMetadata).
+        readonly property var flagItems: [
+            { label: "Favorites", flag: "favorite" },
+            { label: "Batch",     flag: "batch" },
+            { label: "Uploaded",  flag: "uploaded" },
+            { label: "Stacked",   flag: "stacked" },
+            { label: "Restacked", flag: "restacked" },
+            { label: "Edited",    flag: "edited" },
+            { label: "Todo",      flag: "todo" }
+        ]
+
+        background: Rectangle {
+            implicitWidth: 180
+            implicitHeight: showOnlySubMenuColumn.implicitHeight
+            color: root.currentBackgroundColor
+            border.color: root.isDarkTheme ? "#666666" : "#cccccc"
+            radius: 4
+        }
+
+        contentItem: Column {
+            id: showOnlySubMenuColumn
+
+            Repeater {
+                model: showOnlySubMenu.flagItems
+                delegate: MenuActionItem {
+                    id: showOnlyFlagItem
+                    required property var modelData
+
+                    width: 180
+                    text: showOnlyFlagItem.modelData.label
+                    showCheckbox: true
+                    checkboxChecked: root.uiStateRef
+                        ? root.uiStateRef.filterFlags.indexOf(showOnlyFlagItem.modelData.flag) >= 0
+                        : false
+                    hoverFillColor: root.menuHoverColor
+                    defaultTextColor: root.currentTextColor
+                    // Keep the submenu open so multiple states can be toggled.
+                    onClicked: {
+                        if (root.uiStateRef) root.uiStateRef.toggleFilterFlag(showOnlyFlagItem.modelData.flag)
+                    }
                 }
             }
         }
@@ -2330,7 +2443,7 @@ ApplicationWindow {
     }
     Dialog {
         id: recycleBinCleanupDialog
-        title: recycleBinCleanupDialog.singleBin ? "Clean up Recycle Bin?" : "Clean up Recycle Bins?"
+        title: recycleBinCleanupDialog.cleanupTitle
         x: (parent.width - width) / 2
         y: (parent.height - height) / 2
         width: Math.min(600, parent.width * 0.9)
@@ -2346,6 +2459,8 @@ ApplicationWindow {
         // Treat a single recycle-bin directory as just "Recycle Bin" (singular).
         // Plural "Recycle Bins" only when files were deleted across multiple dirs.
         property bool singleBin: binInfoItems.length === 1
+        readonly property string cleanupTitle: recycleBinCleanupDialog.singleBin
+            ? "Clean up Recycle Bin?" : "Clean up Recycle Bins?"
 
         function refreshBinInfo() {
             if (root.uiStateRef) {
@@ -2376,7 +2491,7 @@ ApplicationWindow {
             }
             Text {
                 anchors.centerIn: parent
-                text: recycleBinCleanupDialog.singleBin ? "Clean up Recycle Bin?" : "Clean up Recycle Bins?"
+                text: recycleBinCleanupDialog.cleanupTitle
                 color: root.currentTextColor
                 font.bold: true
                 font.pixelSize: 20

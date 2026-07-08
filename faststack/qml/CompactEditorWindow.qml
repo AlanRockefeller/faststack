@@ -6,6 +6,7 @@ import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import QtCore
+import "WindowPlacement.js" as WP
 
 Window {
     id: compactEditor
@@ -20,7 +21,6 @@ Window {
     property var uiStateRef: null
     property var controllerRef: null
     property bool windowGeometryReady: false
-    property bool suppressWindowGeometrySave: false
     property bool windowWasVisible: false
 
     visible: compactEditor.uiStateRef
@@ -64,37 +64,22 @@ Window {
 
     function clampWindowToVisibleScreen(force) {
         if (!force && !compactEditor.visible) return
-        if (!compactEditor.screen) return
-
-        var screenX = compactEditor.screen.virtualX
-        var screenY = compactEditor.screen.virtualY
-        var screenWidth = compactEditor.screen.desktopAvailableWidth
-        var screenHeight = compactEditor.screen.desktopAvailableHeight
-        if (screenWidth <= 0 || screenHeight <= 0) return
-
-        var minWidth = compactEditor.minimumWidth > 0 ? compactEditor.minimumWidth : 1
-        var maxWidth = compactEditor.maximumWidth > 0 ? compactEditor.maximumWidth : screenWidth
-        var minHeight = compactEditor.minimumHeight > 0 ? compactEditor.minimumHeight : 1
-        var newWidth = Math.max(minWidth, Math.min(compactEditor.width, maxWidth))
-        var newHeight = Math.max(minHeight, compactEditor.height)
-
-        if (screenWidth >= minWidth) newWidth = Math.min(newWidth, screenWidth)
-        if (screenHeight >= minHeight) newHeight = Math.min(newHeight, screenHeight)
-
-        var maxX = Math.max(screenX, screenX + screenWidth - newWidth)
-        var maxY = Math.max(screenY, screenY + screenHeight - newHeight)
-        var newX = Math.max(screenX, Math.min(compactEditor.x, maxX))
-        var newY = Math.max(screenY, Math.min(compactEditor.y, maxY))
-
-        compactEditor.x = newX
-        compactEditor.y = newY
-        compactEditor.width = newWidth
-        compactEditor.height = newHeight
+        // Clamp against the monitor the coordinates fall on (not just the
+        // current screen), so a window saved on a secondary monitor is not
+        // dragged back to the primary before it has been mapped.
+        var screen = WP.screenContaining(Application.screens, compactEditor.x, compactEditor.y)
+                     || compactEditor.screen
+        WP.clampToScreen(compactEditor, screen, {
+            minWidth: compactEditor.minimumWidth,
+            maxWidth: compactEditor.maximumWidth,
+            minHeight: compactEditor.minimumHeight
+        })
     }
 
     function restoreWindowPlacement() {
-        compactEditor.suppressWindowGeometrySave = true
-
+        // No suppress flag needed: this only runs from Component.onCompleted
+        // before windowGeometryReady is set, and saveWindowPlacement bails out
+        // until then.
         if (compactEditor.hasSavedSize()) {
             compactEditor.width = compactSettings.savedWidth
             compactEditor.height = compactSettings.savedHeight
@@ -108,11 +93,10 @@ Window {
         }
 
         compactEditor.clampWindowToVisibleScreen(true)
-        compactEditor.suppressWindowGeometrySave = false
     }
 
     function saveWindowPlacement(force) {
-        if (!compactEditor.windowGeometryReady || compactEditor.suppressWindowGeometrySave) return
+        if (!compactEditor.windowGeometryReady) return
         if (!compactEditor.windowWasVisible && !compactEditor.hasSavedPosition()) return
         if (!force && !compactEditor.visible) return
         if (compactEditor.visibility === Window.Minimized) return
@@ -123,10 +107,17 @@ Window {
         compactSettings.savedHeight = compactEditor.height
     }
 
-    onXChanged: compactEditor.saveWindowPlacement()
-    onYChanged: compactEditor.saveWindowPlacement()
-    onWidthChanged: compactEditor.saveWindowPlacement()
-    onHeightChanged: compactEditor.saveWindowPlacement()
+    // Debounce continuous geometry changes during drags/resizes.
+    Timer {
+        id: saveGeometryTimer
+        interval: 400
+        onTriggered: compactEditor.saveWindowPlacement()
+    }
+
+    onXChanged: saveGeometryTimer.restart()
+    onYChanged: saveGeometryTimer.restart()
+    onWidthChanged: saveGeometryTimer.restart()
+    onHeightChanged: saveGeometryTimer.restart()
     onActiveChanged: if (active) compactEditor.focusKeyboardHandler()
     Component.onDestruction: compactEditor.saveWindowPlacement(true)
 
@@ -145,6 +136,8 @@ Window {
     Material.accent: compactEditor.accentColor
 
     property int updatePulse: 0
+    // Whether the per-hue COLOR MIX section is expanded (collapsed by default).
+    property bool colorMixExpanded: false
     readonly property bool cropActive: compactEditor.uiStateRef ? compactEditor.uiStateRef.isCropping : false
     property int lastLoadedIndex: -1
     property bool lastLoadWasFull: false
@@ -298,9 +291,6 @@ Window {
     }
 
     property int slidersPressedCount: 0
-    onSlidersPressedCountChanged: {
-        if (compactEditor.uiStateRef) compactEditor.uiStateRef.setAnySliderPressed(slidersPressedCount > 0)
-    }
 
     function getBackendValue(key) {
         var _dependency = updatePulse;
@@ -826,6 +816,42 @@ Window {
                 ListElement { name: "Vibrance"; key: "vibrance"; min: -100; max: 100 }
             }
             Repeater { model: colorModel; delegate: compactSlider }
+
+            // --- COLOR MIX Section (per-hue saturation) ---
+            // Eight hue bands; collapsed by default to keep the narrow panel tidy.
+            MouseArea {
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                implicitHeight: 16
+                cursorShape: Qt.PointingHandCursor
+                onClicked: compactEditor.colorMixExpanded = !compactEditor.colorMixExpanded
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: (compactEditor.colorMixExpanded ? "▾ " : "▸ ") + "COLOR MIX"
+                    font.pixelSize: 9
+                    font.weight: Font.DemiBold
+                    font.letterSpacing: 1.0
+                    color: "#9a9795"
+                }
+            }
+
+            ListModel {
+                id: colorMixModel
+                ListElement { name: "Red"; key: "color_sat_red"; min: -100; max: 100 }
+                ListElement { name: "Orange"; key: "color_sat_orange"; min: -100; max: 100 }
+                ListElement { name: "Yellow"; key: "color_sat_yellow"; min: -100; max: 100 }
+                ListElement { name: "Green"; key: "color_sat_green"; min: -100; max: 100 }
+                ListElement { name: "Aqua"; key: "color_sat_aqua"; min: -100; max: 100 }
+                ListElement { name: "Blue"; key: "color_sat_blue"; min: -100; max: 100 }
+                ListElement { name: "Purple"; key: "color_sat_purple"; min: -100; max: 100 }
+                ListElement { name: "Magenta"; key: "color_sat_magenta"; min: -100; max: 100 }
+            }
+            Repeater {
+                model: compactEditor.colorMixExpanded ? colorMixModel : 0
+                delegate: compactSlider
+            }
 
             // --- Footer Buttons ---
             Item { Layout.fillHeight: true; Layout.minimumHeight: 10 }

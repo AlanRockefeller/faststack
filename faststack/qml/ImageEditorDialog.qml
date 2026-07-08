@@ -63,9 +63,6 @@ Window {
     }
 
     property int slidersPressedCount: 0
-    onSlidersPressedCountChanged: {
-        if (imageEditorDialog.uiStateRef) imageEditorDialog.uiStateRef.setAnySliderPressed(slidersPressedCount > 0)
-    }
 
     function getBackendValue(key) {
         var _dependency = updatePulse;
@@ -452,6 +449,25 @@ Window {
                         }
                     }
                 }
+
+                // --- Color Mix Group (per-hue saturation) ---
+                Loader {
+                    sourceComponent: sectionHeader
+                    Layout.topMargin: 5
+                    onLoaded: item.text = "COLOR MIX"
+                }
+                ListModel {
+                    id: colorMixModel
+                    ListElement { name: "Red"; key: "color_sat_red"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Orange"; key: "color_sat_orange"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Yellow"; key: "color_sat_yellow"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Green"; key: "color_sat_green"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Aqua"; key: "color_sat_aqua"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Blue"; key: "color_sat_blue"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Purple"; key: "color_sat_purple"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Magenta"; key: "color_sat_magenta"; reverse: false; min: -100; max: 100 }
+                }
+                Repeater { model: colorMixModel; delegate: editSlider }
 
                 Loader { sourceComponent: sectionSeparator }
 

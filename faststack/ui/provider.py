@@ -4,6 +4,7 @@ import collections
 import logging
 import math
 import threading
+import time
 from numbers import Real
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtQuick import QQuickImageProvider
 
 from faststack.config import config
-from faststack.imaging.optional_deps import HAS_OPENCV
+from faststack.imaging.cache import build_cache_key
 
 # Try to import QColorSpace if available (Qt 6+)
 try:
@@ -29,7 +30,6 @@ class ImageProvider(QQuickImageProvider):
     def __init__(self, app_controller):
         super().__init__(QQuickImageProvider.ImageType.Image)
         self.app_controller = app_controller
-        self._app_controller = app_controller  # Backward compatibility alias
         self.placeholder = QImage(256, 256, QImage.Format.Format_RGB888)
         self.placeholder.fill(Qt.GlobalColor.darkGray)
         # Transparent 1x1 fallback for mask overlays (prevents grey-screen bug)
@@ -41,9 +41,48 @@ class ImageProvider(QQuickImageProvider):
         self._keepalive = collections.deque(maxlen=128)
         # Lock to protect keepalive deque from concurrent access by QML rendering threads
         self._keepalive_lock = threading.Lock()
+        # Pre-built sRGB color space, reused across requests instead of
+        # constructing a new QColorSpace on every requestImage() call.
+        self._srgb_color_space = (
+            QColorSpace(QColorSpace.NamedColorSpace.SRgb) if HAS_COLOR_SPACE else None
+        )
 
     def _fallback_image(self) -> QImage:
         return self.placeholder.copy()
+
+    def _last_image_fallback(self) -> QImage:
+        """Return the last successfully displayed image instead of gray.
+
+        Used for terminal failures on a CURRENT (non-stale) request, so a
+        transient decode error never paints a gray placeholder over a
+        perfectly good previous frame. Falls back to the gray placeholder
+        only if no previous frame is available or it can't be rebuilt.
+        """
+        try:
+            with self.app_controller._last_image_lock:
+                last = self.app_controller.last_displayed_image
+        except Exception:
+            last = None
+        if last is None:
+            return self._fallback_image()
+        try:
+            fmt = getattr(last, "format", None)
+            if fmt is None:
+                fmt = QImage.Format.Format_RGB888
+            qimg = QImage(
+                last.buffer,
+                last.width,
+                last.height,
+                last.bytes_per_line,
+                fmt,
+            )
+            if qimg.isNull():
+                return self._fallback_image()
+            # Copy so this rarely-hit fallback path never needs keepalive
+            # bookkeeping for a buffer we don't otherwise track here.
+            return qimg.copy()
+        except Exception:
+            return self._fallback_image()
 
     def _log_provider_fallback(
         self,
@@ -67,8 +106,6 @@ class ImageProvider(QQuickImageProvider):
 
     def requestImage(self, id: str, size: object, requestedSize: object) -> QImage:
         """Handles image requests from QML."""
-        import time
-
         _debug = getattr(self.app_controller, "debug_cache", False)
         if _debug:
             _t_start = time.perf_counter()
@@ -84,8 +121,8 @@ class ImageProvider(QQuickImageProvider):
                 overlay = getattr(
                     self.app_controller.ui_state, "_darken_overlay_image", None
                 )
-                if overlay is not None:
-                    return overlay
+                if overlay is not None and not overlay.isNull():
+                    return overlay.copy()
                 return self._transparent
 
             # Parse index and optional generation
@@ -121,9 +158,7 @@ class ImageProvider(QQuickImageProvider):
 
             image_files = getattr(self.app_controller, "image_files", None)
             image_count = len(image_files) if isinstance(image_files, list) else None
-            if image_count is not None and (
-                index < 0 or index >= image_count or image_count == 0
-            ):
+            if image_count is not None and (index < 0 or index >= image_count):
                 stale_bounds_request = request_is_stale or image_count == 0
                 self._log_provider_fallback(
                     id,
@@ -132,16 +167,31 @@ class ImageProvider(QQuickImageProvider):
                 )
                 return self._fallback_image()
 
+            # For a stale request, a provider URL still fully identifies its
+            # content by index, so serving the real pixels for the requested
+            # index is always correct — QML discards the reply if it no
+            # longer wants it. Try a non-blocking cache lookup first; only
+            # fall back to gray if nothing is cached. Never decode here.
+            stale_cached_image_data = None
             if request_is_stale:
-                self._log_provider_fallback(
-                    id,
-                    (
-                        "request no longer matches current image source "
-                        f"(current index={current_index}, generation={current_generation})"
-                    ),
-                    stale=True,
-                )
-                return self._fallback_image()
+                try:
+                    path = image_files[index].path
+                    _, _, display_gen = self.app_controller.get_display_info()
+                    stale_cached_image_data = self.app_controller.image_cache.get(
+                        build_cache_key(path, display_gen)
+                    )
+                except Exception:
+                    stale_cached_image_data = None
+                if stale_cached_image_data is None:
+                    self._log_provider_fallback(
+                        id,
+                        (
+                            "request no longer matches current image source "
+                            f"(current index={current_index}, generation={current_generation})"
+                        ),
+                        stale=True,
+                    )
+                    return self._fallback_image()
 
             # If editor is open, use the background-rendered preview buffer
             # BUT only if the requested index matches the currently edited index!
@@ -227,6 +277,11 @@ class ImageProvider(QQuickImageProvider):
                 and has_valid_preview_buffer
             )
 
+            # Unlike use_editor_preview above, this intentionally has no
+            # isZoomed check: while comparing against the original, showing
+            # the low-res original preview is semantically correct even when
+            # zoomed in, since the user is explicitly asking to see the
+            # pre-edit image rather than a zoomed detail of the edited one.
             use_original_compare_preview = (
                 getattr(self.app_controller, "_original_compare_active", False)
                 and index == self.app_controller.current_index
@@ -253,6 +308,10 @@ class ImageProvider(QQuickImageProvider):
                 image_data = self.app_controller._original_compare_preview
             elif use_editor_preview:
                 image_data = self.app_controller._last_rendered_preview
+            elif stale_cached_image_data is not None:
+                # Stale request with a cache hit found above: use it directly
+                # rather than triggering a (possibly blocking) decode.
+                image_data = stale_cached_image_data
             else:
                 image_data = self.app_controller.get_decoded_image(index)
 
@@ -281,7 +340,11 @@ class ImageProvider(QQuickImageProvider):
                         "decoded buffer produced a null QImage",
                         stale=request_is_stale,
                     )
-                    return self._fallback_image()
+                    return (
+                        self._fallback_image()
+                        if request_is_stale
+                        else self._last_image_fallback()
+                    )
 
                 # Detach from Python buffer to prevent ownership issues and force proper texture upload
                 # OPTIMIZATION: Only do this expensive copy when serving the live editor preview,
@@ -306,10 +369,7 @@ class ImageProvider(QQuickImageProvider):
                 color_mode = config.get("color", "mode", fallback="none").lower()
                 if HAS_COLOR_SPACE and color_mode != "icc":
                     try:
-                        # Create sRGB color space using constructor with NamedColorSpace enum
-                        cs = QColorSpace(QColorSpace.NamedColorSpace.SRgb)
-                        qimg.setColorSpace(cs)
-                        log.debug("Applied sRGB color space to image")
+                        qimg.setColorSpace(self._srgb_color_space)
                     except (RuntimeError, ValueError) as e:
                         log.warning(f"Failed to set color space: {e}")
                 elif color_mode == "icc":
@@ -323,13 +383,18 @@ class ImageProvider(QQuickImageProvider):
                         f"[DBGCACHE] {_t_end*1000:.3f} requestImage: DONE id={id} total={(_t_end - _t_start)*1000:.2f}ms"
                     )
 
-                # Buffer is now safe to release (handled by copy), but original_buffer ref in Python object stays
-                # We don't need to manually attach original_buffer to qimg anymore since we copied.
+                # When we took the copy() branch above, qimg owns its own
+                # buffer and the source buffer needs no further protection.
+                # Otherwise the keepalive append above keeps it alive.
                 return qimg
 
         except (ValueError, IndexError) as e:
             log.warning("Invalid image ID requested from QML: %s. Error: %s", id, e)
-            return self._fallback_image()
+            return (
+                self._fallback_image()
+                if request_is_stale
+                else self._last_image_fallback()
+            )
         except Exception:
             self._log_provider_fallback(
                 id,
@@ -337,14 +402,20 @@ class ImageProvider(QQuickImageProvider):
                 stale=request_is_stale,
                 exc_info=True,
             )
-            return self._fallback_image()
+            return (
+                self._fallback_image()
+                if request_is_stale
+                else self._last_image_fallback()
+            )
 
         self._log_provider_fallback(
             id,
             "decode returned no image data",
             stale=request_is_stale,
         )
-        return self._fallback_image()
+        return (
+            self._fallback_image() if request_is_stale else self._last_image_fallback()
+        )
 
 
 class UIState(QObject):
@@ -383,9 +454,7 @@ class UIState(QObject):
     awbLumaUpperBoundChanged = Signal()
     awbRgbLowerBoundChanged = Signal()
     awbRgbUpperBoundChanged = Signal()
-    default_directory_changed = Signal(str)
     currentDirectoryChanged = Signal()  # Signal when working directory changes
-    isStackedJpgChanged = Signal()  # New signal for isStackedJpg
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
@@ -420,7 +489,6 @@ class UIState(QObject):
         tuple
     )  # (left, top, right, bottom) normalized to 0-1000
     crop_rotation_changed = Signal(float)
-    anySliderPressedChanged = Signal(bool)
     sharpness_changed = Signal(float)
     rotation_changed = Signal(int)
     exposure_changed = Signal(float)
@@ -432,6 +500,16 @@ class UIState(QObject):
     whites_changed = Signal(float)
     clarity_changed = Signal(float)
     texture_changed = Signal(float)
+
+    # Per-hue saturation (color mix) signals
+    color_sat_red_changed = Signal(float)
+    color_sat_orange_changed = Signal(float)
+    color_sat_yellow_changed = Signal(float)
+    color_sat_green_changed = Signal(float)
+    color_sat_aqua_changed = Signal(float)
+    color_sat_blue_changed = Signal(float)
+    color_sat_purple_changed = Signal(float)
+    color_sat_magenta_changed = Signal(float)
 
     # Background Darkening Signals
     is_darkening_changed = Signal(bool)
@@ -470,8 +548,7 @@ class UIState(QObject):
     def __init__(self, app_controller, clock_func=None):
         super().__init__()
         self.app_controller = app_controller
-        self._app_controller = app_controller  # Backward compatibility alias
-        self._clock = clock_func or (lambda: __import__("time").monotonic())
+        self._clock = clock_func or time.monotonic
         self._last_prefetch_data = (
             None  # (startIndex, endIndex, maxCount, visibleStartIndex, visibleEndIndex)
         )
@@ -506,7 +583,6 @@ class UIState(QObject):
             "9:16 (Story)",
         ]
         self._current_aspect_ratio_index = 0
-        self._any_slider_pressed = False
         self._sharpness = 0.0
         self._rotation = 0
         self._exposure = 0.0
@@ -518,6 +594,14 @@ class UIState(QObject):
         self._whites = 0.0
         self._clarity = 0.0
         self._texture = 0.0
+        self._color_sat_red = 0.0
+        self._color_sat_orange = 0.0
+        self._color_sat_yellow = 0.0
+        self._color_sat_green = 0.0
+        self._color_sat_aqua = 0.0
+        self._color_sat_blue = 0.0
+        self._color_sat_purple = 0.0
+        self._color_sat_magenta = 0.0
 
         # Background Darkening State
         self._is_darkening = False
@@ -772,25 +856,19 @@ class UIState(QObject):
 
     @Property(bool, notify=metadataChanged)
     def hasRaw(self):
-        if (
-            not self.app_controller.image_files
-            or self.app_controller.current_index >= len(self.app_controller.image_files)
-        ):
+        files = self.app_controller.image_files
+        idx = self.app_controller.current_index
+        if not files or not (0 <= idx < len(files)):
             return False
-        return self.app_controller.image_files[
-            self.app_controller.current_index
-        ].has_raw
+        return files[idx].has_raw
 
     @Property(bool, notify=metadataChanged)
     def hasWorkingTif(self):
-        if (
-            not self.app_controller.image_files
-            or self.app_controller.current_index >= len(self.app_controller.image_files)
-        ):
+        files = self.app_controller.image_files
+        idx = self.app_controller.current_index
+        if not files or not (0 <= idx < len(files)):
             return False
-        return self.app_controller.image_files[
-            self.app_controller.current_index
-        ].has_working_tif
+        return files[idx].has_working_tif
 
     @Slot()
     def enableRawEditing(self):
@@ -825,11 +903,11 @@ class UIState(QObject):
     def stackSummary(self):
         if not self.app_controller.stacks:
             return "No stacks defined."
-        summary = f"Found {len(self.app_controller.stacks)} stacks:\n\n"
+        lines = [f"Found {len(self.app_controller.stacks)} stacks:", ""]
         for i, (start, end) in enumerate(self.app_controller.stacks):
             count = end - start + 1
-            summary += f"Stack {i + 1}: {count} photos (indices {start}-{end})\n"
-        return summary
+            lines.append(f"Stack {i + 1}: {count} photos (indices {start}-{end})")
+        return "\n".join(lines) + "\n"
 
     @Property(str, notify=saveBehaviorMessageChanged)
     def saveBehaviorMessage(self):
@@ -870,10 +948,10 @@ class UIState(QObject):
         """Returns the current filter string (empty if no filter active)."""
         return self.app_controller.get_filter_string()
 
-    @Property(bool, notify=filterStringChanged)
-    def favoritesOnly(self):
-        """True when the favorites-only view filter is active."""
-        return "favorite" in self.app_controller.get_filter_flags()
+    @Property("QVariantList", notify=filterStringChanged)
+    def filterFlags(self):
+        """The list of currently active flag filters (e.g. ["favorite"])."""
+        return list(self.app_controller.get_filter_flags())
 
     @Property(str, notify=colorModeChanged)
     def colorMode(self):
@@ -896,6 +974,8 @@ class UIState(QObject):
 
     @awbMode.setter
     def awbMode(self, mode: str):
+        if self.app_controller.get_awb_mode() == mode:
+            return
         self.app_controller.set_awb_mode(mode)
         self.awbModeChanged.emit()
 
@@ -905,6 +985,8 @@ class UIState(QObject):
 
     @awbStrength.setter
     def awbStrength(self, value: float):
+        if self.app_controller.get_awb_strength() == value:
+            return
         self.app_controller.set_awb_strength(value)
         self.awbStrengthChanged.emit()
 
@@ -914,6 +996,8 @@ class UIState(QObject):
 
     @awbWarmBias.setter
     def awbWarmBias(self, value: int):
+        if self.app_controller.get_awb_warm_bias() == value:
+            return
         self.app_controller.set_awb_warm_bias(value)
         self.awbWarmBiasChanged.emit()
 
@@ -923,6 +1007,8 @@ class UIState(QObject):
 
     @awbTintBias.setter
     def awbTintBias(self, value: int):
+        if self.app_controller.get_awb_tint_bias() == value:
+            return
         self.app_controller.set_awb_tint_bias(value)
         self.awbTintBiasChanged.emit()
 
@@ -932,6 +1018,8 @@ class UIState(QObject):
 
     @awbLumaLowerBound.setter
     def awbLumaLowerBound(self, value: int):
+        if self.app_controller.get_awb_luma_lower_bound() == value:
+            return
         self.app_controller.set_awb_luma_lower_bound(value)
         self.awbLumaLowerBoundChanged.emit()
 
@@ -941,6 +1029,8 @@ class UIState(QObject):
 
     @awbLumaUpperBound.setter
     def awbLumaUpperBound(self, value: int):
+        if self.app_controller.get_awb_luma_upper_bound() == value:
+            return
         self.app_controller.set_awb_luma_upper_bound(value)
         self.awbLumaUpperBoundChanged.emit()
 
@@ -950,6 +1040,8 @@ class UIState(QObject):
 
     @awbRgbLowerBound.setter
     def awbRgbLowerBound(self, value: int):
+        if self.app_controller.get_awb_rgb_lower_bound() == value:
+            return
         self.app_controller.set_awb_rgb_lower_bound(value)
         self.awbRgbLowerBoundChanged.emit()
 
@@ -959,6 +1051,8 @@ class UIState(QObject):
 
     @awbRgbUpperBound.setter
     def awbRgbUpperBound(self, value: int):
+        if self.app_controller.get_awb_rgb_upper_bound() == value:
+            return
         self.app_controller.set_awb_rgb_upper_bound(value)
         self.awbRgbUpperBoundChanged.emit()
 
@@ -971,11 +1065,6 @@ class UIState(QObject):
     def isStackedJpg(self):
         """Returns True if the current image is a stacked JPG."""
         return self.currentFilename.lower().endswith(" stacked.jpg")
-
-    @Property(bool, constant=True)
-    def hasOpenCV(self):
-        """Returns True if OpenCV is available."""
-        return HAS_OPENCV
 
     # --- Slots for QML to call ---
     @Slot()
@@ -1146,6 +1235,8 @@ class UIState(QObject):
 
     @autoLevelClippingThreshold.setter
     def autoLevelClippingThreshold(self, value):
+        if self.app_controller.get_auto_level_clipping_threshold() == value:
+            return
         self.app_controller.set_auto_level_clipping_threshold(value)
         self.autoLevelClippingThresholdChanged.emit(value)
 
@@ -1155,6 +1246,8 @@ class UIState(QObject):
 
     @autoLevelStrength.setter
     def autoLevelStrength(self, value):
+        if self.app_controller.get_auto_level_strength() == value:
+            return
         self.app_controller.set_auto_level_strength(value)
         self.autoLevelStrengthChanged.emit(value)
 
@@ -1164,6 +1257,8 @@ class UIState(QObject):
 
     @autoLevelStrengthAuto.setter
     def autoLevelStrengthAuto(self, value):
+        if self.app_controller.get_auto_level_strength_auto() == value:
+            return
         self.app_controller.set_auto_level_strength_auto(value)
         self.autoLevelStrengthAutoChanged.emit(value)
 
@@ -1173,6 +1268,8 @@ class UIState(QObject):
 
     @autoVibranceEnabled.setter
     def autoVibranceEnabled(self, value):
+        if self.app_controller.get_auto_vibrance_enabled() == value:
+            return
         self.app_controller.set_auto_vibrance_enabled(value)
         self.autoVibranceEnabledChanged.emit(value)
 
@@ -1182,6 +1279,8 @@ class UIState(QObject):
 
     @autoLevelMidtone.setter
     def autoLevelMidtone(self, value):
+        if self.app_controller.get_auto_level_midtone() == value:
+            return
         self.app_controller.set_auto_level_midtone(value)
         self.autoLevelMidtoneChanged.emit(value)
 
@@ -1191,6 +1290,8 @@ class UIState(QObject):
 
     @autoLevelMidtoneTarget.setter
     def autoLevelMidtoneTarget(self, value):
+        if self.app_controller.get_auto_level_midtone_target() == value:
+            return
         self.app_controller.set_auto_level_midtone_target(value)
         self.autoLevelMidtoneTargetChanged.emit(value)
 
@@ -1200,6 +1301,8 @@ class UIState(QObject):
 
     @autoLevelChannelBudget.setter
     def autoLevelChannelBudget(self, value):
+        if self.app_controller.get_auto_level_channel_budget() == value:
+            return
         self.app_controller.set_auto_level_channel_budget(value)
         self.autoLevelChannelBudgetChanged.emit(value)
 
@@ -1209,6 +1312,8 @@ class UIState(QObject):
 
     @levelsSoftKnee.setter
     def levelsSoftKnee(self, value):
+        if self.app_controller.get_levels_soft_knee() == value:
+            return
         self.app_controller.set_levels_soft_knee(value)
         self.levelsSoftKneeChanged.emit(value)
 
@@ -1218,6 +1323,8 @@ class UIState(QObject):
 
     @exportDither.setter
     def exportDither(self, value):
+        if self.app_controller.get_export_dither() == value:
+            return
         self.app_controller.set_export_dither(value)
         self.exportDitherChanged.emit(value)
 
@@ -1227,6 +1334,8 @@ class UIState(QObject):
 
     @awbTintDamp.setter
     def awbTintDamp(self, value):
+        if self.app_controller.get_awb_tint_damp() == value:
+            return
         self.app_controller.set_awb_tint_damp(value)
         self.awbTintDampChanged.emit(value)
 
@@ -1248,19 +1357,19 @@ class UIState(QObject):
         flags = list(filter_flags) if filter_flags else []
         self.app_controller.apply_filter(filter_string, filter_flags=flags)
 
-    @Slot()
-    def toggleFavoritesOnly(self):
-        """Toggle the favorites-only view filter (for slideshow/presentation use).
+    @Slot(str)
+    def toggleFilterFlag(self, flag: str):
+        """Toggle a single flag in the "Show Only" view filter.
 
         Preserves any active filter string and other flag filters; only the
-        "favorite" flag is added or removed.
+        given *flag* is added or removed.
         """
         flags = list(self.app_controller.get_filter_flags())
         filter_string = self.app_controller.get_filter_string()
-        if "favorite" in flags:
-            flags.remove("favorite")
+        if flag in flags:
+            flags.remove(flag)
         else:
-            flags.append("favorite")
+            flags.append(flag)
         self.app_controller.apply_filter(filter_string, filter_flags=flags)
 
     @Slot(int, int)
@@ -1306,9 +1415,7 @@ class UIState(QObject):
 
     @originalCompareActive.setter
     def originalCompareActive(self, new_value: bool):
-        active = bool(
-            getattr(self.app_controller, "_original_compare_active", new_value)
-        )
+        active = bool(new_value)
         if self._original_compare_active != active:
             self._original_compare_active = active
             self.originalCompareActiveChanged.emit(active)
@@ -1375,20 +1482,6 @@ class UIState(QObject):
     def cancelBatchAutoLevels(self):
         self.app_controller.cancel_batch_auto_levels()
 
-    @Property(bool, notify=anySliderPressedChanged)
-    def anySliderPressed(self):
-        return self._any_slider_pressed
-
-    @anySliderPressed.setter
-    def anySliderPressed(self, value):
-        if self._any_slider_pressed != value:
-            self._any_slider_pressed = value
-            self.anySliderPressedChanged.emit(value)
-
-    @Slot(bool)
-    def setAnySliderPressed(self, pressed: bool):
-        self.anySliderPressed = pressed
-
     @Property(bool, notify=is_cropping_changed)
     def isCropping(self) -> bool:
         return self._is_cropping
@@ -1445,6 +1538,14 @@ class UIState(QObject):
         self.whites = 0.0
         self.clarity = 0.0
         self.texture = 0.0
+        self.color_sat_red = 0.0
+        self.color_sat_orange = 0.0
+        self.color_sat_yellow = 0.0
+        self.color_sat_green = 0.0
+        self.color_sat_aqua = 0.0
+        self.color_sat_blue = 0.0
+        self.color_sat_purple = 0.0
+        self.color_sat_magenta = 0.0
         self.cropRotation = 0.0
         self.currentCropBox = (0, 0, 1000, 1000)
         self.currentAspectRatioIndex = 0
@@ -1504,7 +1605,6 @@ class UIState(QObject):
                 state = dict(editor._last_highlight_state)
 
         # Normalize for QML robustness: ensure stable keys exist regardless of internal naming
-        # Normalize for QML robustness: ensure stable keys exist
         return {
             "headroom_pct": state.get("headroom_pct", 0.0),
             "source_clipped_pct": state.get("source_clipped_pct", 0.0),
@@ -1542,33 +1642,14 @@ class UIState(QObject):
             self.saturation_changed.emit(new_value)
 
     @Property(float, notify=white_balance_by_changed)
-    def whiteBalanceBY(self) -> float:
-        return self._white_balance_by
-
-    @whiteBalanceBY.setter
-    def whiteBalanceBY(self, new_value: float):
-        if self._white_balance_by != new_value:
-            self._white_balance_by = new_value
-            self.white_balance_by_changed.emit(new_value)
-
-    @Property(float, notify=white_balance_mg_changed)
-    def whiteBalanceMG(self) -> float:
-        return self._white_balance_mg
-
-    @whiteBalanceMG.setter
-    def whiteBalanceMG(self, new_value: float):
-        if self._white_balance_mg != new_value:
-            self._white_balance_mg = new_value
-            self.white_balance_mg_changed.emit(new_value)
-
-    # Snake_case aliases for QML bracket notation access
-    @Property(float, notify=white_balance_by_changed)
     def white_balance_by(self) -> float:
         return self._white_balance_by
 
     @white_balance_by.setter
     def white_balance_by(self, new_value: float):
-        self.whiteBalanceBY = new_value
+        if self._white_balance_by != new_value:
+            self._white_balance_by = new_value
+            self.white_balance_by_changed.emit(new_value)
 
     @Property(float, notify=white_balance_mg_changed)
     def white_balance_mg(self) -> float:
@@ -1576,7 +1657,9 @@ class UIState(QObject):
 
     @white_balance_mg.setter
     def white_balance_mg(self, new_value: float):
-        self.whiteBalanceMG = new_value
+        if self._white_balance_mg != new_value:
+            self._white_balance_mg = new_value
+            self.white_balance_mg_changed.emit(new_value)
 
     @Property("QVariantList", notify=aspect_ratio_names_changed)
     def aspectRatioNames(self) -> list:
@@ -1646,9 +1729,8 @@ class UIState(QObject):
             return None
 
         try:
-            values = tuple(new_value)
-            left, top, right, bottom = values
-            finite_values = tuple(float(v) for v in values)
+            left, top, right, bottom = new_value
+            finite_values = tuple(float(v) for v in new_value)
         except (TypeError, ValueError) as e:
             log.warning(
                 "UIState.currentCropBox: failed to validate crop box %r: %s",
@@ -1703,7 +1785,7 @@ class UIState(QObject):
         if self._set_current_crop_box_value(new_value):
             # During crop mode this is draft overlay state only; the committed
             # crop box is applied explicitly on Enter.
-            if getattr(self.app_controller.ui_state, "isCropping", False):
+            if self._is_cropping:
                 try:
                     left, top, right, bottom = new_value
                     if (right - left) < 20 or (bottom - top) < 20:
@@ -1793,6 +1875,87 @@ class UIState(QObject):
         if self._vibrance != new_value:
             self._vibrance = new_value
             self.vibrance_changed.emit(new_value)
+
+    # --- Per-hue saturation (color mix) bank ---
+    @Property(float, notify=color_sat_red_changed)
+    def color_sat_red(self) -> float:
+        return self._color_sat_red
+
+    @color_sat_red.setter
+    def color_sat_red(self, new_value: float):
+        if self._color_sat_red != new_value:
+            self._color_sat_red = new_value
+            self.color_sat_red_changed.emit(new_value)
+
+    @Property(float, notify=color_sat_orange_changed)
+    def color_sat_orange(self) -> float:
+        return self._color_sat_orange
+
+    @color_sat_orange.setter
+    def color_sat_orange(self, new_value: float):
+        if self._color_sat_orange != new_value:
+            self._color_sat_orange = new_value
+            self.color_sat_orange_changed.emit(new_value)
+
+    @Property(float, notify=color_sat_yellow_changed)
+    def color_sat_yellow(self) -> float:
+        return self._color_sat_yellow
+
+    @color_sat_yellow.setter
+    def color_sat_yellow(self, new_value: float):
+        if self._color_sat_yellow != new_value:
+            self._color_sat_yellow = new_value
+            self.color_sat_yellow_changed.emit(new_value)
+
+    @Property(float, notify=color_sat_green_changed)
+    def color_sat_green(self) -> float:
+        return self._color_sat_green
+
+    @color_sat_green.setter
+    def color_sat_green(self, new_value: float):
+        if self._color_sat_green != new_value:
+            self._color_sat_green = new_value
+            self.color_sat_green_changed.emit(new_value)
+
+    @Property(float, notify=color_sat_aqua_changed)
+    def color_sat_aqua(self) -> float:
+        return self._color_sat_aqua
+
+    @color_sat_aqua.setter
+    def color_sat_aqua(self, new_value: float):
+        if self._color_sat_aqua != new_value:
+            self._color_sat_aqua = new_value
+            self.color_sat_aqua_changed.emit(new_value)
+
+    @Property(float, notify=color_sat_blue_changed)
+    def color_sat_blue(self) -> float:
+        return self._color_sat_blue
+
+    @color_sat_blue.setter
+    def color_sat_blue(self, new_value: float):
+        if self._color_sat_blue != new_value:
+            self._color_sat_blue = new_value
+            self.color_sat_blue_changed.emit(new_value)
+
+    @Property(float, notify=color_sat_purple_changed)
+    def color_sat_purple(self) -> float:
+        return self._color_sat_purple
+
+    @color_sat_purple.setter
+    def color_sat_purple(self, new_value: float):
+        if self._color_sat_purple != new_value:
+            self._color_sat_purple = new_value
+            self.color_sat_purple_changed.emit(new_value)
+
+    @Property(float, notify=color_sat_magenta_changed)
+    def color_sat_magenta(self) -> float:
+        return self._color_sat_magenta
+
+    @color_sat_magenta.setter
+    def color_sat_magenta(self, new_value: float):
+        if self._color_sat_magenta != new_value:
+            self._color_sat_magenta = new_value
+            self.color_sat_magenta_changed.emit(new_value)
 
     @Property(float, notify=vignette_changed)
     def vignette(self) -> float:
