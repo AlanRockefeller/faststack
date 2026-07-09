@@ -2094,16 +2094,33 @@ class AppController(QObject):
         emit: bool = True,
         sync: bool = True,
         notify_model: bool = True,
+        reapply_filter: bool = False,
+        preserved_path: Optional[Path] = None,
     ) -> None:
         """Normalize batch state and fan out persistence/UI invalidations."""
         self._normalize_batches()
         self._invalidate_batch_cache()
         if persist:
             self._persist_batch_flags()
+        filter_reapplied = False
+        if reapply_filter and persist:
+            if (
+                preserved_path is None
+                and self.image_files
+                and 0 <= self.current_index < len(self.image_files)
+            ):
+                preserved_path = self.image_files[self.current_index].path
+            filter_reapplied = self._reapply_flag_filter_after_metadata_change(
+                "batch", preserved_path
+            )
         self._metadata_cache_index = (-1, -1)
         if emit:
             self.dataChanged.emit()
-        if notify_model and getattr(self, "_thumbnail_model", None):
+        if (
+            notify_model
+            and not filter_reapplied
+            and getattr(self, "_thumbnail_model", None)
+        ):
             self._thumbnail_model.notify_batch_state_changed()
         if sync:
             self.sync_ui_state()
@@ -5811,14 +5828,14 @@ class AppController(QObject):
 
     @staticmethod
     def _merge_stack_ranges(ranges: List[List[int]]) -> List[List[int]]:
-        """Sort ranges and merge overlapping ones."""
+        """Sort ranges and merge overlapping or adjacent ones."""
         if not ranges:
             return []
         ranges = sorted([int(start), int(end)] for start, end in ranges)
         merged = [ranges[0]]
         for current_start, current_end in ranges[1:]:
             last_start, last_end = merged[-1]
-            if current_start <= last_end:
+            if current_start <= last_end + 1:
                 merged[-1] = [last_start, max(last_end, current_end)]
             else:
                 merged.append([current_start, current_end])
@@ -5907,7 +5924,7 @@ class AppController(QObject):
             self.batches.append([start, end])
             log.info("Defined new batch: [%d, %d]", start, end)
             self.batch_start_index = None
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             count = self.get_batch_count_for_current_image()
             self.update_status_message(
                 f"Batch defined: {count} image{'' if count == 1 else 's'}"
@@ -5959,7 +5976,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             self.update_status_message(f"Added {added_count} image(s) to batch")
             log.info("Added %d image(s) to batch from grid selection", added_count)
         else:
@@ -5991,7 +6008,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             self.update_status_message(
                 f"Added {added_count} favorite(s) to batch ({len(indices_to_add)} total favorites)"
             )
@@ -6027,7 +6044,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             self.update_status_message(
                 f"Added {added_count} uploaded image(s) to batch ({len(indices_to_add)} total uploaded)"
             )
@@ -6061,7 +6078,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             self.update_status_message(
                 f"Added {added_count} edited image(s) to batch ({len(indices_to_add)} total edited)"
             )
@@ -6104,7 +6121,7 @@ class AppController(QObject):
                 in_batch = any(start <= i <= end for start, end in self.batches)
                 if not in_batch:
                     self.batches.append([i, i])
-                    self._finalize_batch_state()
+                    self._finalize_batch_state(reapply_filter=True)
                     log.info("Auto-added edited image to batch: %s", image_path.name)
                 break
 
@@ -6150,7 +6167,7 @@ class AppController(QObject):
 
         if batch_modified:
             self.batches = new_batches
-            self._finalize_batch_state(emit=False, sync=False)
+            self._finalize_batch_state(emit=False, sync=False, reapply_filter=True)
 
         # Check and remove from stacks
         # Check and remove from stacks
@@ -6242,7 +6259,7 @@ class AppController(QObject):
                 self.update_status_message("Added image to batch")
                 log.info("Added index %d to batch.", index_to_toggle)
 
-        self._finalize_batch_state()
+        self._finalize_batch_state(reapply_filter=True)
 
     def toggle_stack_membership(self):
         """Toggles the current image's inclusion in a stack."""
@@ -6332,7 +6349,7 @@ class AppController(QObject):
                         max(end, index_to_toggle),
                     ]
 
-                    # Merge overlapping stacks
+                    # Merge overlapping or adjacent stacks
                     self.stacks = self._merge_stack_ranges(self.stacks)
 
                     # Find the new stack index for the status message
@@ -6625,7 +6642,7 @@ class AppController(QObject):
         log.info("Clearing all defined batches.")
         self.batches = []
         self.batch_start_index = None
-        self._finalize_batch_state()
+        self._finalize_batch_state(reapply_filter=True)
         self.update_status_message("All batches cleared")
 
     def get_helicon_path(self):
@@ -9314,6 +9331,8 @@ class AppController(QObject):
             self._exif_debounce_timer.stop()
             self._watcher_debounce_timer.stop()
             self._auto_adjust_save_timer.stop()
+            self._quality_decode_timer.stop()
+            self._session_save_timer.stop()
             self.histogram_timer.stop()
             self.resize_timer.stop()
             if hasattr(self, "_thumb_summary_timer"):
@@ -10064,7 +10083,7 @@ class AppController(QObject):
             # Clear all batches after successful drag (like pressing \)
             self.batches = []
             self.batch_start_index = None
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             log.info(
                 "Marked %d file(s) as uploaded on %s. Cleared all batches.",
                 len(existing_indices),

@@ -127,8 +127,12 @@ class ImageProvider(QQuickImageProvider):
 
             # Parse index and optional generation
             parts = id.split("/")
-            index = int(parts[0])
-            gen = int(parts[1]) if len(parts) > 1 else None
+            try:
+                index = int(parts[0])
+                gen = int(parts[1]) if len(parts) > 1 else None
+            except ValueError as e:
+                log.warning("Invalid image ID requested from QML: %s. Error: %s", id, e)
+                return self._fallback_image()
 
             current_index = getattr(self.app_controller, "current_index", None)
             current_generation = getattr(

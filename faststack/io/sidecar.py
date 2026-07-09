@@ -16,6 +16,22 @@ KNOWN_IMAGE_EXTENSIONS = frozenset(
 )
 
 
+def _fsync_directory(path: Path) -> None:
+    """Best-effort fsync for a directory entry update."""
+    fd: Optional[int] = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        os.fsync(fd)
+    except OSError as e:
+        log.debug("Failed to fsync sidecar directory %s: %s", path, e)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
     """
     Helper to create EntryMetadata from JSON dict, handling legacy fields
@@ -141,6 +157,7 @@ class SidecarManager:
 
             # Atomic rename
             temp_path.replace(self.path)
+            _fsync_directory(self.path.parent)
             log.debug(f"Saved sidecar file to {self.path}")
 
         except (IOError, TypeError) as e:

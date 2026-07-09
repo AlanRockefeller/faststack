@@ -844,7 +844,7 @@ class ImageEditor:
             source_exif: Optional EXIF bytes from original source (preserve camera metadata)
             preview_only: If True and image is 8-bit, skip cv2 and float32 conversion.
                           Loads only PIL image + float_preview for histogram analysis.
-                          float_image stays None.  Ignored for 16-bit (TIFF) files.
+                          float_image stays None.  Ignored for 16-bit TIFF/PNG files.
         """
         if not filepath or not Path(filepath).exists():
             with self._lock:
@@ -882,6 +882,7 @@ class ImageEditor:
             self._mask_raster_cache.clear()
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
+        _is_png = load_filepath.suffix.lower() == ".png"
         _is_jpeg = load_filepath.suffix.lower() in (".jpg", ".jpeg")
 
         try:
@@ -954,8 +955,7 @@ class ImageEditor:
                 # --- Convert to Float32 (standard path) ---
                 # Use OpenCV for reliable 16-bit loading as Pillow often
                 # downsamples to 8-bit RGB
-                _is_png = load_filepath.suffix.lower() == ".png"
-                if preview_only and not _is_tiff:
+                if preview_only and not (_is_tiff or _is_png):
                     cv_img = None
                 elif not (_is_tiff or _is_png):
                     # Only TIFF/PNG can carry >8-bit data through this path;
@@ -1908,11 +1908,12 @@ class ImageEditor:
                 # separate contiguity check is needed for cv2.cvtColor.
                 hue = cv2.cvtColor(np.clip(arr, 0.0, 1.0), cv2.COLOR_RGB2HSV)[:, :, 0]
             else:
-                cmax = arr.max(axis=2)
-                cmin = arr.min(axis=2)
+                hue_source = np.clip(arr, 0.0, 1.0)
+                cmax = hue_source.max(axis=2)
+                cmin = hue_source.min(axis=2)
                 delta = cmax - cmin
                 safe = delta > 1e-6
-                r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+                r, g, b = hue_source[:, :, 0], hue_source[:, :, 1], hue_source[:, :, 2]
                 hue = np.zeros_like(cmax)
                 # Standard HSV hue (degrees), guarding the achromatic case.
                 rmax = safe & (cmax == r)

@@ -49,7 +49,9 @@ def _current_boot_id() -> str:
     windll = getattr(ctypes, "windll", None)
     if windll is not None:
         try:
-            ticks_ms = windll.kernel32.GetTickCount64()
+            get_tick_count64 = windll.kernel32.GetTickCount64
+            get_tick_count64.restype = ctypes.c_ulonglong
+            ticks_ms = get_tick_count64()
             return f"boot:{int(time.time() - ticks_ms / 1000.0)}"
         except (AttributeError, OSError):
             pass
@@ -93,6 +95,62 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     tmp_path.replace(path)
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort fsync for a directory entry update."""
+    fd: Optional[int] = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        os.fsync(fd)
+    except OSError as e:
+        log.debug("Failed to fsync session directory %s: %s", path, e)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _validated_session_payload(data: object) -> Optional[dict]:
+    """Return a normalized session dict, or None for malformed payloads."""
+    if not isinstance(data, dict):
+        return None
+
+    directory = data.get("dir")
+    if not isinstance(directory, str):
+        return None
+
+    index = data.get("index", 0)
+    if isinstance(index, bool) or not isinstance(index, int):
+        return None
+
+    grid = data.get("grid")
+    if grid is not None and not isinstance(grid, bool):
+        return None
+
+    pid = data.get("pid", -1)
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+
+    boot_id = data.get("boot_id", "")
+    if not isinstance(boot_id, str):
+        return None
+
+    updated = data.get("updated", 0.0)
+    if isinstance(updated, bool) or not isinstance(updated, (int, float)):
+        return None
+
+    normalized = dict(data)
+    normalized["dir"] = directory
+    normalized["index"] = index
+    normalized["grid"] = grid
+    normalized["pid"] = pid
+    normalized["boot_id"] = boot_id
+    normalized["updated"] = float(updated)
+    return normalized
 
 
 class SessionRegistry:
@@ -147,14 +205,19 @@ class SessionRegistry:
 
         for file in files:
             try:
-                data = json.loads(file.read_text())
+                raw_data = json.loads(file.read_text())
             except (OSError, ValueError):
                 # Unreadable/corrupt — treat as a prunable orphan.
                 stale_paths.append(file)
                 continue
 
-            boot_id = data.get("boot_id", "")
-            pid = data.get("pid", -1)
+            data = _validated_session_payload(raw_data)
+            if data is None:
+                stale_paths.append(file)
+                continue
+
+            boot_id = data["boot_id"]
+            pid = data["pid"]
             # Live sibling: same boot and process still running. If this
             # platform has no stable boot id, fall back to the PID check so we
             # do not offer or prune another active FastStack window.

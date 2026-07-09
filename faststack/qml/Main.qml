@@ -154,6 +154,11 @@ ApplicationWindow {
         }
     }
 
+    function queueWindowPlacementSave() {
+        if (!root.windowGeometryReady || root.suppressWindowGeometrySave) return
+        saveGeometryTimer.restart()
+    }
+
     function openDialogSafely(dialog) {
         root.clampWindowToVisibleScreen()
         dialog.open()
@@ -169,11 +174,11 @@ ApplicationWindow {
         onTriggered: root.saveWindowPlacement()
     }
 
-    onXChanged: saveGeometryTimer.restart()
-    onYChanged: saveGeometryTimer.restart()
-    onWidthChanged: saveGeometryTimer.restart()
-    onHeightChanged: saveGeometryTimer.restart()
-    onVisibilityChanged: saveGeometryTimer.restart()
+    onXChanged: root.queueWindowPlacementSave()
+    onYChanged: root.queueWindowPlacementSave()
+    onWidthChanged: root.queueWindowPlacementSave()
+    onHeightChanged: root.queueWindowPlacementSave()
+    onVisibilityChanged: root.queueWindowPlacementSave()
 
     onClosing: function(close) {
         if (!root.allowCloseWithRecycleBins
