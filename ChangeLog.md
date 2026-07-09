@@ -2,6 +2,19 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## 1.6.6 (2026-07-08)
+
+- Added a new color-mix adjustment section in the editor with per-hue saturation controls
+- Location of the stack inputs (for the restack feature) is now configurable.
+- If you hold down shift when navigating through photos with right or left arrow, it jumps by 10 images.
+- New "Show Only" submenu in the Actions menu. Pick any mix of Favorites, Batch, Uploaded, Stacked, Restacked, Edited, or Todo and flip through just those photos - handy for slideshows on a projector.
+- Folder thumbnails now show a bright red square on the sparkline if anything is still sitting in a batch, so you don't forget to upload stuff. Even one photo lights it up.
+- Files that are in the batch now show up in the sparkline in red.
+- Windows now start with the same position and geometry that they had when you last closed Faststack.
+- If the computer crashes, faststack offers to restore the windows that were open so you don't lose any work.
+- Starting FastStack without picking a folder now reopens the folder you had open last time.
+- The image no longer shifts slightly a half second after you adjust an editor slider. Same fix for holding Space to compare with the original, which is also much faster now on large images.
+
 ## 1.6.5 (2026-06-20)
 
 - Better automatic photo adjustments. Auto-levels, auto white balance, brightness, highlights, shadows, and vibrance now produce more natural results.

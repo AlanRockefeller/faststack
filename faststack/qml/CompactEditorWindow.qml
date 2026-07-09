@@ -6,6 +6,7 @@ import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import QtCore
+import "WindowPlacement.js" as WP
 
 Window {
     id: compactEditor
@@ -19,6 +20,8 @@ Window {
 
     property var uiStateRef: null
     property var controllerRef: null
+    property bool windowGeometryReady: false
+    property bool windowWasVisible: false
 
     visible: compactEditor.uiStateRef
              ? (compactEditor.uiStateRef.isEditorOpen && !compactEditor.uiStateRef.isEditorExpanded)
@@ -30,19 +33,25 @@ Window {
         property bool overlaidHistogram: true
         property real savedX: -1
         property real savedY: -1
+        property real savedWidth: -1
+        property real savedHeight: -1
     }
 
     Component.onCompleted: {
-        compactEditor.uiStateRef = uiState
         compactEditor.controllerRef = controller
-        if (compactSettings.savedX >= 0 && compactSettings.savedY >= 0) {
-            compactEditor.x = compactSettings.savedX
-            compactEditor.y = compactSettings.savedY
-        } else {
-            positionAtRightGutter()
-        }
+        compactEditor.restoreWindowPlacement()
+        compactEditor.windowGeometryReady = true
+        compactEditor.uiStateRef = uiState
         compactEditor.keyboardHandlerReady = true
         Qt.callLater(compactEditor.focusKeyboardHandler)
+    }
+
+    function hasSavedPosition() {
+        return compactSettings.savedX !== -1 && compactSettings.savedY !== -1
+    }
+
+    function hasSavedSize() {
+        return compactSettings.savedWidth > 0 && compactSettings.savedHeight > 0
     }
 
     function positionAtRightGutter() {
@@ -53,9 +62,64 @@ Window {
         }
     }
 
-    onXChanged: if (visible) compactSettings.savedX = x
-    onYChanged: if (visible) compactSettings.savedY = y
+    function clampWindowToVisibleScreen(force) {
+        if (!force && !compactEditor.visible) return
+        // Clamp against the monitor the coordinates fall on (not just the
+        // current screen), so a window saved on a secondary monitor is not
+        // dragged back to the primary before it has been mapped.
+        var screen = WP.screenContaining(Application.screens, compactEditor.x, compactEditor.y)
+                     || compactEditor.screen
+        WP.clampToScreen(compactEditor, screen, {
+            minWidth: compactEditor.minimumWidth,
+            maxWidth: compactEditor.maximumWidth,
+            minHeight: compactEditor.minimumHeight
+        })
+    }
+
+    function restoreWindowPlacement() {
+        // No suppress flag needed: this only runs from Component.onCompleted
+        // before windowGeometryReady is set, and saveWindowPlacement bails out
+        // until then.
+        if (compactEditor.hasSavedSize()) {
+            compactEditor.width = compactSettings.savedWidth
+            compactEditor.height = compactSettings.savedHeight
+        }
+
+        if (compactEditor.hasSavedPosition()) {
+            compactEditor.x = compactSettings.savedX
+            compactEditor.y = compactSettings.savedY
+        } else {
+            compactEditor.positionAtRightGutter()
+        }
+
+        compactEditor.clampWindowToVisibleScreen(true)
+    }
+
+    function saveWindowPlacement(force) {
+        if (!compactEditor.windowGeometryReady) return
+        if (!compactEditor.windowWasVisible && !compactEditor.hasSavedPosition()) return
+        if (!force && !compactEditor.visible) return
+        if (compactEditor.visibility === Window.Minimized) return
+
+        compactSettings.savedX = compactEditor.x
+        compactSettings.savedY = compactEditor.y
+        compactSettings.savedWidth = compactEditor.width
+        compactSettings.savedHeight = compactEditor.height
+    }
+
+    // Debounce continuous geometry changes during drags/resizes.
+    Timer {
+        id: saveGeometryTimer
+        interval: 400
+        onTriggered: compactEditor.saveWindowPlacement()
+    }
+
+    onXChanged: saveGeometryTimer.restart()
+    onYChanged: saveGeometryTimer.restart()
+    onWidthChanged: saveGeometryTimer.restart()
+    onHeightChanged: saveGeometryTimer.restart()
     onActiveChanged: if (active) compactEditor.focusKeyboardHandler()
+    Component.onDestruction: compactEditor.saveWindowPlacement(true)
 
     // --- Color Palette (matches full editor) ---
     readonly property color backgroundColor: "#1e1e1e"
@@ -72,6 +136,8 @@ Window {
     Material.accent: compactEditor.accentColor
 
     property int updatePulse: 0
+    // Whether the per-hue COLOR MIX section is expanded (collapsed by default).
+    property bool colorMixExpanded: false
     readonly property bool cropActive: compactEditor.uiStateRef ? compactEditor.uiStateRef.isCropping : false
     property int lastLoadedIndex: -1
     property bool lastLoadWasFull: false
@@ -124,11 +190,12 @@ Window {
         }
     }
 
-    function handleArrowKey(key) {
+    function handleArrowKey(key, modifiers) {
+        if (modifiers === undefined) modifiers = Qt.NoModifier
         if (compactEditor.cropActive || discardDialog.opened) return false
         if (key === Qt.Key_Left || key === Qt.Key_Right) {
             if (compactEditor.controllerRef)
-                compactEditor.controllerRef.handle_key_from_compact_editor(key, Qt.NoModifier, "")
+                compactEditor.controllerRef.handle_key_from_compact_editor(key, modifiers, "")
             return true
         }
         if (key === Qt.Key_Up) {
@@ -206,10 +273,13 @@ Window {
 
     onVisibleChanged: {
         if (visible && compactEditor.controllerRef) {
+            compactEditor.windowWasVisible = true
             compactEditor.schedulePreviewLoad("open", true)
-            if (compactSettings.savedX < 0) positionAtRightGutter()
+            if (!compactEditor.hasSavedPosition()) positionAtRightGutter()
+            compactEditor.clampWindowToVisibleScreen(true)
             Qt.callLater(compactEditor.focusKeyboardHandler)
         } else {
+            compactEditor.saveWindowPlacement(true)
             deferredLoadTimer.stop()
         }
     }
@@ -221,9 +291,6 @@ Window {
     }
 
     property int slidersPressedCount: 0
-    onSlidersPressedCountChanged: {
-        if (compactEditor.uiStateRef) compactEditor.uiStateRef.setAnySliderPressed(slidersPressedCount > 0)
-    }
 
     function getBackendValue(key) {
         var _dependency = updatePulse;
@@ -240,14 +307,28 @@ Window {
         sequence: "Left"
         context: Qt.WindowShortcut
         enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
-        onActivated: compactEditor.handleArrowKey(Qt.Key_Left)
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Left, Qt.NoModifier)
     }
 
     Shortcut {
         sequence: "Right"
         context: Qt.WindowShortcut
         enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
-        onActivated: compactEditor.handleArrowKey(Qt.Key_Right)
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Right, Qt.NoModifier)
+    }
+
+    Shortcut {
+        sequence: "Shift+Left"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Left, Qt.ShiftModifier)
+    }
+
+    Shortcut {
+        sequence: "Shift+Right"
+        context: Qt.WindowShortcut
+        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
+        onActivated: compactEditor.handleArrowKey(Qt.Key_Right, Qt.ShiftModifier)
     }
 
     onClosing: (close) => {
@@ -298,7 +379,7 @@ Window {
                 }
             }
 
-            if (compactEditor.handleArrowKey(event.key)) {
+            if (compactEditor.handleArrowKey(event.key, event.modifiers)) {
                 event.accepted = true
             } else if (event.key === Qt.Key_Escape) {
                 compactEditor.requestClose()
@@ -735,6 +816,42 @@ Window {
                 ListElement { name: "Vibrance"; key: "vibrance"; min: -100; max: 100 }
             }
             Repeater { model: colorModel; delegate: compactSlider }
+
+            // --- COLOR MIX Section (per-hue saturation) ---
+            // Eight hue bands; collapsed by default to keep the narrow panel tidy.
+            MouseArea {
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                implicitHeight: 16
+                cursorShape: Qt.PointingHandCursor
+                onClicked: compactEditor.colorMixExpanded = !compactEditor.colorMixExpanded
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: (compactEditor.colorMixExpanded ? "▾ " : "▸ ") + "COLOR MIX"
+                    font.pixelSize: 9
+                    font.weight: Font.DemiBold
+                    font.letterSpacing: 1.0
+                    color: "#9a9795"
+                }
+            }
+
+            ListModel {
+                id: colorMixModel
+                ListElement { name: "Red"; key: "color_sat_red"; min: -100; max: 100 }
+                ListElement { name: "Orange"; key: "color_sat_orange"; min: -100; max: 100 }
+                ListElement { name: "Yellow"; key: "color_sat_yellow"; min: -100; max: 100 }
+                ListElement { name: "Green"; key: "color_sat_green"; min: -100; max: 100 }
+                ListElement { name: "Aqua"; key: "color_sat_aqua"; min: -100; max: 100 }
+                ListElement { name: "Blue"; key: "color_sat_blue"; min: -100; max: 100 }
+                ListElement { name: "Purple"; key: "color_sat_purple"; min: -100; max: 100 }
+                ListElement { name: "Magenta"; key: "color_sat_magenta"; min: -100; max: 100 }
+            }
+            Repeater {
+                model: compactEditor.colorMixExpanded ? colorMixModel : 0
+                delegate: compactSlider
+            }
 
             // --- Footer Buttons ---
             Item { Layout.fillHeight: true; Layout.minimumHeight: 10 }

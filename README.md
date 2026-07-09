@@ -166,6 +166,8 @@ faststack "C:\path\to\photos"
 
 - `Right Arrow`: Next Image
 - `Left Arrow`: Previous Image
+- `Shift+Right Arrow`: Jump forward 10 images in loupe view
+- `Shift+Left Arrow`: Jump back 10 images in loupe view
 - `K`: Mask-based background darkening (smart edge detection, subject protection, multiple modes)
 - `G`: Jump to Image Number
 - `I`: Show EXIF Data
@@ -238,6 +240,7 @@ browse and adjust without reaching for the mouse:
 
 - `Left` / `Right` — go to the previous / next image. (Any unsaved edits on the
   current image are committed first — see _Saving_ below.)
+- `Shift+Left` / `Shift+Right` — jump backward / forward 10 images.
 - `Up` / `Down` — raise / lower the **highlighted** slider. The highlighted row
   is tinted and outlined; Exposure is highlighted by default.
 - **Click a slider's label** (or its value) to make it the highlighted slider

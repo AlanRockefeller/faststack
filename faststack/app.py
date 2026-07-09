@@ -44,7 +44,18 @@ from PySide6.QtCore import (
     QPoint,
     QCoreApplication,  # noqa: F401 — patched by tests
 )
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QLabel,
+    QMessageBox,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 from PySide6.QtQml import QQmlApplicationEngine
 from PIL import Image
 
@@ -64,6 +75,7 @@ from faststack.io.variants import (
     norm_path,
 )
 from faststack.io.sidecar import SidecarManager
+from faststack.io.session import SessionRegistry, respawn_for_directory
 from faststack.io.watcher import Watcher
 from faststack.io.helicon import launch_helicon_focus
 from faststack.io.executable_validator import validate_executable_path
@@ -87,12 +99,13 @@ from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
 from faststack.imaging.mask_engine import inverse_transform
 from faststack.imaging.metadata import get_exif_data
 from faststack.resources import (
+    faststack_changelog_path,
     faststack_qml_dir,
     faststack_readme_path,
     pyside_qml_dir,
     readme_from_metadata,
 )
-from faststack.updater import check_for_update, get_current_version
+from faststack.updater import GITHUB_REPOSITORY, check_for_update, get_current_version
 from faststack.thumbnail_view import (
     DEFAULT_THUMBNAIL_CACHE_BYTES,
     ThumbnailModel,
@@ -237,6 +250,7 @@ class AppController(QObject):
     )  # Signal for async delete completion (result dict from worker)
     _exifBriefReady = Signal(object, str)  # (cache_key, brief) from background thread
     _updateCheckFinished = Signal(object)  # Update check result from background thread
+    _qualityDecodeFinished = Signal(object)  # Settled cover-quality decode result
 
     def __init__(
         self,
@@ -302,11 +316,19 @@ class AppController(QObject):
             max_workers=1, thread_name_prefix="UpdateCheck"
         )
         self._updateCheckFinished.connect(self._on_update_check_finished)
+        self._qualityDecodeFinished.connect(self._on_quality_decode_finished)
         self._update_check_token = 0
         self._update_check_inflight = False
         self._preview_inflight = False
         self._preview_pending = False
         self._preview_token = 0
+        # Token of the last display-capped full-resolution kick; its accepted
+        # final frame defines _live_preview_target_dims for quick renders.
+        self._preview_full_res_token = -1
+        self._live_preview_target_dims: Optional[Tuple[int, int]] = None
+        self._live_preview_target_session_key: Optional[tuple[str, Optional[str]]] = (
+            None
+        )
         self._preview_lock = threading.Lock()
         self._last_rendered_preview = None  # Store latest valid render
         self._last_rendered_preview_session_key: Optional[tuple[str, Optional[str]]] = (
@@ -329,6 +351,7 @@ class AppController(QObject):
         self._last_auto_levels_msg: str = (
             ""  # Detail message from last auto_levels() call
         )
+        self._status_message_token = 0
         self._active_auto_adjust_state: Optional[ActiveAutoAdjustState] = None
         self._auto_adjust_save_pending_action: Optional[str] = None
         self._auto_adjust_save_in_progress: bool = False
@@ -368,12 +391,12 @@ class AppController(QObject):
         self.view_override_path: Optional[str] = None  # normalized absolute string
         self.view_override_kind: Optional[str] = None  # "main"|"developed"|"backup"
 
-        self.image_dir = image_dir
+        self.image_dir = Path(image_dir).expanduser().resolve()
         self.image_files: List[ImageFile] = []  # Filtered list for display
         self._all_images: List[ImageFile] = []  # Cached full list from disk
-        self._path_to_index: Dict[Path, int] = (
+        self._path_to_index: Dict[str, int] = (
             {}
-        )  # Resolved path -> index for O(1) lookup
+        )  # Normalized path key -> index for O(1) lookup
         self.current_index: int = 0
         self.ui_refresh_generation = 0
         self.main_window: Optional[QObject] = None
@@ -387,6 +410,7 @@ class AppController(QObject):
         self.display_generation = 0
         self._display_lock = threading.Lock()
         self._is_decoding = False
+        self._quality_decode_token = 0
 
         # Cache Warning State
         self._last_cache_warning_time = 0
@@ -442,6 +466,8 @@ class AppController(QObject):
             prefetch_radius=config.getint("core", "prefetch_radius", 12),
             get_display_info=self.get_display_info,
             debug=_debug_mode,
+            cache_contains=self.image_cache.__contains__,
+            cache_get_quality=self._cache_decode_quality,
         )
         self.last_displayed_image: Optional[DecodedImage] = (
             None  # Cache last image to avoid grey squares
@@ -545,6 +571,12 @@ class AppController(QObject):
         self._metadata_cache_index = (-1, -1)
         self._exif_brief_cache: dict = {}  # EXIF context key → formatted EXIF string
         self._native_image_size_cache: Dict[str, tuple[float, int, int]] = {}
+        # Per-navigation memo for get_current_display_native_size(): keyed by
+        # (current_index, ui_refresh_generation) so the two QML property reads
+        # per navigation (width + height) share one stat()/decode instead of
+        # each doing their own. Excludes the live-preview branch, which can
+        # change without a generation bump.
+        self._native_size_memo: tuple = ((-1, -1), (0, 0))
         self._exif_pending_path: Optional[tuple[str, str]] = (
             None  # current/previous source keys awaiting EXIF read
         )
@@ -585,6 +617,14 @@ class AppController(QObject):
         self._hq_preview_timer.setInterval(350)
         self._hq_preview_timer.timeout.connect(self._refine_preview_resolution)
 
+        # Settled navigation quality upgrade: arrow-key browsing uses cheap
+        # fit-within decodes, then the current image alone is re-decoded at
+        # cover quality after input pauses.
+        self._quality_decode_timer = QTimer(self)
+        self._quality_decode_timer.setSingleShot(True)
+        self._quality_decode_timer.setInterval(275)
+        self._quality_decode_timer.timeout.connect(self._submit_settled_quality_decode)
+
         # Preview refresh uses a gate pattern instead of a timer:
         # - _kick_preview_worker() runs immediately if not inflight
         # - If inflight, it sets _preview_pending and returns
@@ -610,10 +650,12 @@ class AppController(QObject):
             self._thumb_summary_timer.start()
 
         # Debounce timer for metadata/highlight signals during rapid navigation
-        # Only emits these signals once user stops navigating (16ms = 1 frame debounce)
+        # Only emits these signals once user stops navigating (150ms, matching
+        # the EXIF debounce timer). Keyboard auto-repeat fires every ~30ms, so a
+        # 16ms timer fired between every repeat and never actually debounced.
         self._metadata_debounce_timer = QTimer(self)
         self._metadata_debounce_timer.setSingleShot(True)
-        self._metadata_debounce_timer.setInterval(16)  # 16ms debounce (1 frame)
+        self._metadata_debounce_timer.setInterval(150)  # 150ms debounce
         self._metadata_debounce_timer.timeout.connect(
             self._emit_debounced_metadata_signals
         )
@@ -627,6 +669,19 @@ class AppController(QObject):
         self._auto_adjust_save_timer.timeout.connect(
             self._fire_auto_adjust_save_debounce
         )
+
+        # Debounce timer for crash-recovery session persistence. Flushes the
+        # current image index to the folder sidecar and refreshes this
+        # instance's session record ~1s after the user settles, so an
+        # unexpected reboot can resume close to where they left off.
+        self._session_registry = SessionRegistry()
+        # Tracks the directory last written to config.last_directory so we only
+        # rewrite the INI when the open folder actually changes.
+        self._last_persisted_dir = None
+        self._session_save_timer = QTimer(self)
+        self._session_save_timer.setSingleShot(True)
+        self._session_save_timer.setInterval(1000)
+        self._session_save_timer.timeout.connect(self._persist_session_state)
 
         # Debounce timer for EXIF reads — only fires after user stops scrolling
         self._exif_debounce_timer = QTimer(self)
@@ -1067,7 +1122,151 @@ class AppController(QObject):
         with self._display_lock:
             self.display_generation += 1
 
-    def _prefetch_cache_put(self, cache_key, decoded, path=None, decode_started=None):
+    def _cache_decode_quality(self, cache_key: str) -> Optional[str]:
+        """Return cached display quality for ``cache_key`` without changing key format."""
+        decoded = self.image_cache.get(cache_key)
+        if decoded is None:
+            return None
+        return getattr(decoded, "quality", "cover")
+
+    def _quality_upgrade_still_current(
+        self,
+        *,
+        index: int,
+        display_generation: int,
+        token: int,
+    ) -> bool:
+        """Return True if a settled quality decode still targets the visible image."""
+        if token != self._quality_decode_token:
+            return False
+        if not self._loupe_decode_allowed():
+            return False
+        if index != self.current_index:
+            return False
+        if not self.image_files or index < 0 or index >= len(self.image_files):
+            return False
+        if self.view_override_path is not None:
+            return False
+        if self._has_current_live_preview_for_index(index):
+            return False
+        _, _, current_display_gen = self.get_display_info()
+        return display_generation == current_display_gen
+
+    def _restart_quality_decode_timer(self) -> None:
+        """Restart the settled-image quality debounce for the current index."""
+        self._quality_decode_token += 1
+        self.prefetcher.cancel_pending_cover_tasks()
+        if (
+            not self._loupe_decode_allowed()
+            or not self.display_ready
+            or not self.image_files
+            or self.view_override_path is not None
+        ):
+            self._quality_decode_timer.stop()
+            return
+        self._quality_decode_timer.start()
+
+    def _submit_settled_quality_decode(self) -> None:
+        """Submit one cover-quality decode for the current image after navigation settles."""
+        if not self.image_files or self.current_index >= len(self.image_files):
+            return
+        index = self.current_index
+        if self.view_override_path is not None:
+            return
+        if self._has_current_live_preview_for_index(index):
+            return
+
+        _, _, display_gen = self.get_display_info()
+        image_path = self.image_files[index].path
+        cache_key = build_cache_key(image_path, display_gen)
+        decoded = self.image_cache.get(cache_key)
+        if decoded is not None and getattr(decoded, "quality", "cover") == "cover":
+            return
+
+        token = self._quality_decode_token
+        if self.debug_cache:
+            print(
+                f"[DBGCACHE] {time.perf_counter()*1000:.3f} quality_decode: SUBMIT index={index} gen={display_gen} cached={getattr(decoded, 'quality', None)}"
+            )
+
+        future = self.prefetcher.submit_task(
+            index,
+            self.prefetcher.generation,
+            priority=True,
+            quality="cover",
+            quality_token=token,
+            quality_index=index,
+        )
+        if future is None:
+            return
+
+        def _on_done(fut, *, idx=index, gen=display_gen, tok=token):
+            try:
+                result = fut.result()
+                error = None
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                result = None
+                error = exc
+            self._qualityDecodeFinished.emit(
+                {
+                    "index": idx,
+                    "display_generation": gen,
+                    "token": tok,
+                    "result": result,
+                    "error": error,
+                }
+            )
+
+        future.add_done_callback(_on_done)
+
+    @Slot(object)
+    def _on_quality_decode_finished(self, payload) -> None:
+        """Refresh QML if the settled quality decode still matches the current view."""
+        if not payload or payload.get("result") is None:
+            error = payload.get("error") if payload else None
+            if error is not None:
+                log.debug("Settled quality decode failed: %s", error)
+            return
+
+        index = int(payload.get("index", -1))
+        display_generation = int(payload.get("display_generation", -1))
+        token = int(payload.get("token", -1))
+        if not self._quality_upgrade_still_current(
+            index=index,
+            display_generation=display_generation,
+            token=token,
+        ):
+            return
+
+        path, decoded_display_gen = payload["result"]
+        if decoded_display_gen != display_generation:
+            return
+        cache_key = build_cache_key(path, decoded_display_gen)
+        decoded = self.image_cache.get(cache_key)
+        if decoded is None or getattr(decoded, "quality", "cover") != "cover":
+            return
+
+        with self._last_image_lock:
+            self.last_displayed_image = decoded
+        self.ui_refresh_generation += 1
+        self.ui_state.currentImageSourceChanged.emit()
+        if self.debug_cache:
+            print(
+                f"[DBGCACHE] {time.perf_counter()*1000:.3f} quality_decode: REFRESH index={index} gen={display_generation}"
+            )
+
+    def _prefetch_cache_put(
+        self,
+        cache_key,
+        decoded,
+        path=None,
+        decode_started=None,
+        *,
+        quality: str = "fast",
+        quality_token: Optional[int] = None,
+        quality_index: int = -1,
+        quality_display_generation: int = -1,
+    ):
         """Cache insert for prefetch decode results, with staleness guard.
 
         A decode that STARTED before its path's invalidation epoch read pixels
@@ -1075,6 +1274,13 @@ class AppController(QObject):
         resurrect stale pixels right after the targeted pop_path. Reject it —
         the next update_prefetch/blocking decode re-reads the new file.
         """
+        if quality == "cover" and quality_token is not None:
+            if not self._quality_upgrade_still_current(
+                index=quality_index,
+                display_generation=quality_display_generation,
+                token=quality_token,
+            ):
+                return
         if path is not None and decode_started is not None:
             try:
                 epoch_key = self._key(Path(path))
@@ -1098,6 +1304,20 @@ class AppController(QObject):
                         path,
                     )
                     return
+        existing = self.image_cache.get(cache_key)
+        # A stale fast prefetch can finish after the settled cover decode for
+        # the same path/generation. Cache keys intentionally do not include
+        # quality, so ordering is enforced here instead.
+        if (
+            existing is not None
+            and getattr(existing, "quality", "cover") == "cover"
+            and quality != "cover"
+        ):
+            log.debug(
+                "Refusing to replace cover-quality decode with fast decode: %s",
+                cache_key,
+            )
+            return
         self.image_cache[cache_key] = decoded
 
     @staticmethod
@@ -1213,6 +1433,7 @@ class AppController(QObject):
                 self.prefetcher.update_prefetch(self.current_index)
 
         self.sync_ui_state()  # To refresh the image
+        self._restart_quality_decode_timer()
 
     @Slot(bool)
     def set_zoomed(self, zoomed: bool):
@@ -1234,6 +1455,7 @@ class AppController(QObject):
                 self.current_index,
                 self.prefetcher.generation,
                 priority=True,
+                quality="fast",
             )
             self.prefetcher.update_prefetch(self.current_index)
 
@@ -1242,6 +1464,7 @@ class AppController(QObject):
             self.ui_refresh_generation += 1
             self.ui_state.currentImageSourceChanged.emit()
             self.main_window.update()  # Force repaint
+        self._restart_quality_decode_timer()
 
     # -- Zoom Shortcuts --
     def zoom_100(self):
@@ -1263,19 +1486,6 @@ class AppController(QObject):
         log.info("Zoom 400% requested")
         self.ui_state.request_absolute_zoom(4.0)
         # self.set_zoomed(True) - Handled by QML smart zoom logic
-        # NOTE: We don't clear the cache here. The generation increment is enough.
-        # Cache keys include display_generation, so zoomed/unzoomed images become
-        # naturally unreachable and LRU will evict them. This lets us instantly
-        # reuse cached images if user toggles zoom on/off repeatedly.
-        self.prefetcher.cancel_all()  # Cancel stale tasks to avoid wasted work
-        self.prefetcher.submit_task(
-            self.current_index,
-            self.prefetcher.generation,
-            priority=True,
-        )
-        self.prefetcher.update_prefetch(self.current_index)
-        self.sync_ui_state()
-        self.ui_state.isZoomedChanged.emit()
 
     @Slot(int, int, str)
     def handle_key_from_histogram(self, key: int, modifiers: int, text: str):
@@ -1425,6 +1635,7 @@ class AppController(QObject):
                 self.prefetcher.generation,
                 priority=True,
                 override_path=override_path,
+                quality="fast",
             )
             return  # Skip adjacent prefetch when viewing a variant override
 
@@ -1473,6 +1684,11 @@ class AppController(QObject):
             )
         self.stacks = self.sidecar.data.stacks  # Load stacks from sidecar
         self.dataChanged.emit()  # Emit after stacks are loaded
+        # Register this instance for crash recovery as soon as a folder is open.
+        self._session_registry.update(
+            self.image_dir, self.current_index, self._is_grid_view_active
+        )
+        self._remember_last_directory()
         self.watcher.start()
         self._do_prefetch(self.current_index)
 
@@ -1493,6 +1709,7 @@ class AppController(QObject):
 
         if not self._is_grid_view_active:
             self._maybe_decode_current_image("startup-loupe")
+            self._restart_quality_decode_timer()
 
         log.info(
             "Load summary: scans=variant:%d grid_refreshes:%d",
@@ -1666,6 +1883,72 @@ class AppController(QObject):
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
         self.ui_state.imageCountChanged.emit()
 
+    def _reapply_flag_filter_after_metadata_change(
+        self, flag_attr: str, preserved_path: Optional[Path]
+    ) -> bool:
+        """Rebuild the visible list if an active flag filter depends on ``flag_attr``."""
+        if not (
+            self._filter_enabled
+            and self._filter_flags
+            and flag_attr in self._filter_flags
+        ):
+            return False
+
+        old_index = self.current_index
+        old_stack_paths = self._resolve_ranges_to_paths(self.stacks)
+        old_stack_start_path = (
+            self.image_files[self.stack_start_index].path
+            if self.stack_start_index is not None
+            and 0 <= self.stack_start_index < len(self.image_files)
+            else None
+        )
+        old_stack_end_path = (
+            self.image_files[self.stack_end_index].path
+            if self.stack_end_index is not None
+            and 0 <= self.stack_end_index < len(self.image_files)
+            else None
+        )
+
+        self._apply_filter_to_cached_list()
+        self._bump_display_generation()
+
+        self.stacks = self._merge_stack_ranges(
+            self._rebuild_ranges_from_paths(old_stack_paths)
+        )
+        self.stack_start_index = (
+            self._path_to_index.get(self._key(old_stack_start_path))
+            if old_stack_start_path
+            else None
+        )
+        self.stack_end_index = (
+            self._path_to_index.get(self._key(old_stack_end_path))
+            if old_stack_end_path
+            else None
+        )
+
+        if self.image_files and preserved_path:
+            target_key = self._key(preserved_path)
+            new_idx = self._path_to_index.get(target_key)
+            if new_idx is not None:
+                self.current_index = new_idx
+            else:
+                self._clear_variant_override()
+                self.current_index = min(old_index, len(self.image_files) - 1)
+        else:
+            self._clear_variant_override()
+            self.current_index = 0
+
+        if self._is_grid_view_active:
+            self._thumbnail_prefetcher.cancel_all()
+
+        if self._is_grid_view_active and self._thumbnail_model:
+            self._refresh_thumbnail_model_from_controller()
+        else:
+            self._grid_model_dirty = True
+
+        self._do_prefetch(self.current_index)
+        return True
+
     def _rebuild_path_to_index(self):
         """Rebuild path-to-index dict for O(1) lookup in grid_open_index.
 
@@ -1811,16 +2094,33 @@ class AppController(QObject):
         emit: bool = True,
         sync: bool = True,
         notify_model: bool = True,
+        reapply_filter: bool = False,
+        preserved_path: Optional[Path] = None,
     ) -> None:
         """Normalize batch state and fan out persistence/UI invalidations."""
         self._normalize_batches()
         self._invalidate_batch_cache()
         if persist:
             self._persist_batch_flags()
+        filter_reapplied = False
+        if reapply_filter and persist:
+            if (
+                preserved_path is None
+                and self.image_files
+                and 0 <= self.current_index < len(self.image_files)
+            ):
+                preserved_path = self.image_files[self.current_index].path
+            filter_reapplied = self._reapply_flag_filter_after_metadata_change(
+                "batch", preserved_path
+            )
         self._metadata_cache_index = (-1, -1)
         if emit:
             self.dataChanged.emit()
-        if notify_model and getattr(self, "_thumbnail_model", None):
+        if (
+            notify_model
+            and not filter_reapplied
+            and getattr(self, "_thumbnail_model", None)
+        ):
             self._thumbnail_model.notify_batch_state_changed()
         if sync:
             self.sync_ui_state()
@@ -2028,11 +2328,12 @@ class AppController(QObject):
         path_str = image_path.as_posix()
         cache_key = build_cache_key(image_path, display_gen)
 
-        # Check cache
-        if cache_key in self.image_cache:
+        # Check cache. Use a single get() instead of `in` + `[]` so a concurrent
+        # LRU eviction between the two lookups can't raise a KeyError here.
+        decoded = self.image_cache.get(cache_key)
+        if decoded is not None:
             self.image_cache.hits += 1  # Increment hit counter
             self._update_cache_stats()  # Update UI with new stats
-            decoded = self.image_cache[cache_key]
             with self._last_image_lock:
                 self.last_displayed_image = decoded
 
@@ -2090,6 +2391,7 @@ class AppController(QObject):
                 self.prefetcher.generation,
                 priority=True,
                 override_path=current_override,
+                quality="fast",
             )
             if not future:
                 with self._last_image_lock:
@@ -2146,9 +2448,6 @@ class AppController(QObject):
             if self.debug_cache:
                 self.ui_state.isDecoding = False
 
-        with self._last_image_lock:
-            return self.last_displayed_image
-
     def _get_decoded_image_safe(self, index: int) -> Optional[DecodedImage]:
         """Thread-safe version of get_decoded_image for background workers.
 
@@ -2185,7 +2484,10 @@ class AppController(QObject):
             # But usually submitting to Executor is thread safe.
             # The danger is 'self.futures' management in Prefetcher.
             future = self.prefetcher.submit_task(
-                index, self.prefetcher.generation, priority=True
+                index,
+                self.prefetcher.generation,
+                priority=True,
+                quality="fast",
             )
             if future:
                 try:
@@ -2252,8 +2554,11 @@ class AppController(QObject):
         self.ui_state.currentImageSourceChanged.emit()
 
         # Debounce non-essential signals during rapid navigation
-        # These will emit once after user stops navigating (16ms)
+        # These will emit once after user stops navigating (150ms)
         self._metadata_debounce_timer.start()
+
+        # Coalesced crash-recovery persistence (~1s after navigation settles)
+        self._session_save_timer.start()
 
         if self.debug_cache:
             _t_end = time.perf_counter()
@@ -2266,6 +2571,44 @@ class AppController(QObject):
             self.ui_state.currentIndex,
             self.ui_state.imageCount,
         )
+
+    def _persist_session_state(self):
+        """Flush the current position for crash/reboot recovery.
+
+        Writes the current index to the folder sidecar (so it survives an
+        unexpected reboot, not just a clean shutdown) and refreshes this
+        instance's session record. Best-effort: a transient I/O error must
+        never disrupt navigation.
+        """
+        try:
+            self.sidecar.set_last_index(self.current_index)
+            self.sidecar.save()
+        except Exception as e:
+            log.warning("Error persisting sidecar position: %s", e)
+        try:
+            self._session_registry.update(
+                self.image_dir, self.current_index, self._is_grid_view_active
+            )
+        except Exception as e:
+            log.warning("Error updating session record: %s", e)
+        self._remember_last_directory()
+
+    def _remember_last_directory(self):
+        """Persist the open folder so a no-argument launch resumes here.
+
+        Unlike the per-instance session record (which is removed on clean
+        exit), this lives in the INI config and survives a clean shutdown, so
+        it is the fallback when there is no crash to recover from. Only writes
+        when the folder actually changes to avoid needless INI churn.
+        """
+        try:
+            current = str(Path(self.image_dir).expanduser().resolve())
+            if current and current != self._last_persisted_dir:
+                config.set("core", "last_directory", current)
+                config.save()
+                self._last_persisted_dir = current
+        except Exception as e:
+            log.warning("Error persisting last directory: %s", e)
 
     def _emit_debounced_metadata_signals(self):
         """Emit deferred metadata/highlight signals after navigation stops."""
@@ -2317,6 +2660,21 @@ class AppController(QObject):
                 int(self._last_rendered_preview.height),
             )
 
+        # QML's currentNativeImageWidth/Height both notify on
+        # currentImageSourceChanged and each call this method, so every
+        # navigation would otherwise do this twice (two path.stat() calls,
+        # plus a synchronous Image.open()/EXIF parse on the main thread for
+        # the first visit). Memoize per navigation so the second call is free.
+        memo_key = (self.current_index, self.ui_refresh_generation)
+        if self._native_size_memo[0] == memo_key:
+            return self._native_size_memo[1]
+
+        result = self._compute_current_display_native_size()
+        self._native_size_memo = (memo_key, result)
+        return result
+
+    def _compute_current_display_native_size(self) -> Tuple[int, int]:
+        """Stat/decode path backing get_current_display_native_size()'s memo."""
         if not self.image_files or not (
             0 <= self.current_index < len(self.image_files)
         ):
@@ -2523,6 +2881,7 @@ class AppController(QObject):
             "clarity",
             "texture",
             "straighten_angle",
+            *ImageEditor._COLOR_MIX_KEYS,
         )
         for key in numeric_keys:
             try:
@@ -2637,6 +2996,7 @@ class AppController(QObject):
             "clarity",
             "texture",
             "straighten_angle",
+            *ImageEditor._COLOR_MIX_KEYS,
         }
         for key in edits:
             if key not in serialized:
@@ -3719,12 +4079,16 @@ class AppController(QObject):
         save_target_path = self._get_save_target_path_for_current_view()
 
         try:
-            # Safe optimization only for true levels-only sessions. If AWB, crop,
-            # rotate, or any other edit is active, the helper declines by
-            # returning None and we fall back to the general save path.
+            # Safe optimizations only for true levels-only or WB-only sessions.
+            # If crop, rotate, or any other edit is active, both helpers decline
+            # by returning None and we fall back to the general save path.
             save_result = self.image_editor.save_image_uint8_levels(
                 save_target_path=save_target_path
             )
+            if save_result is None:
+                save_result = self.image_editor.save_image_uint8_white_balance(
+                    save_target_path=save_target_path
+                )
             if save_result is None:
                 save_result = self.image_editor.save_image(
                     save_target_path=save_target_path
@@ -4008,7 +4372,12 @@ class AppController(QObject):
             try:
                 result = future.result()
             except Exception as e:
-                result = {"success": False, "error": str(e), **context}
+                result = {
+                    "success": False,
+                    "error": str(e),
+                    "request": request,
+                    **context,
+                }
             self._saveFinished.emit(result)
 
         try:
@@ -4503,6 +4872,8 @@ class AppController(QObject):
         if self.ui_state.isHistogramVisible:
             self.update_histogram()
 
+        self._restart_quality_decode_timer()
+
         if self.debug_cache:
             _t_end = time.perf_counter()
             print(
@@ -4525,6 +4896,11 @@ class AppController(QObject):
                 f"[DBGCACHE] {_t_end*1000:.3f} next_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
             )
 
+    def next_image_by_10(self):
+        target_index = min(self.current_index + 10, len(self.image_files) - 1)
+        if target_index != self.current_index:
+            self._set_current_index(target_index, direction=1)
+
     def prev_image(self):
         if self.debug_cache:
             _t_start = time.perf_counter()
@@ -4540,6 +4916,11 @@ class AppController(QObject):
             print(
                 f"[DBGCACHE] {_t_end*1000:.3f} prev_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
             )
+
+    def prev_image_by_10(self):
+        target_index = max(self.current_index - 10, 0)
+        if target_index != self.current_index:
+            self._set_current_index(target_index, direction=-1)
 
     @Slot(int)
     def jump_to_image(self, index: int):
@@ -4670,6 +5051,8 @@ class AppController(QObject):
         if active:
             # Entering grid view
             self.pending_prefetch_index = None
+            self._quality_decode_token += 1
+            self._quality_decode_timer.stop()
             # Cancel inflight full-res decode jobs to free up resources
             self.prefetcher.cancel_all()
             # Cancel stale thumbnail jobs (e.g. from transient top-of-list state)
@@ -4700,6 +5083,7 @@ class AppController(QObject):
             log.info("Switched to loupe view")
             # Trigger exactly one decode for the current index
             self._maybe_decode_current_image("enter-loupe")
+            self._restart_quality_decode_timer()
 
         # Notify UI state via signal
         self.ui_state.isGridViewActiveChanged.emit(active)
@@ -5178,6 +5562,7 @@ class AppController(QObject):
 
         self.sidecar.save()
         self._metadata_cache_index = (-1, -1)
+        self._reapply_flag_filter_after_metadata_change(flag_attr, current_path)
         self.dataChanged.emit()
         self.sync_ui_state()
 
@@ -5253,6 +5638,7 @@ class AppController(QObject):
 
         self.sidecar.save()
         self._metadata_cache_index = (-1, -1)
+        self._reapply_flag_filter_after_metadata_change("restacked", image_path)
         self.dataChanged.emit()
         self.sync_ui_state()
         status = "restacked" if meta.restacked else "not restacked"
@@ -5440,6 +5826,21 @@ class AppController(QObject):
             if self.ui_state:
                 self.ui_state.metadataChanged.emit()
 
+    @staticmethod
+    def _merge_stack_ranges(ranges: List[List[int]]) -> List[List[int]]:
+        """Sort ranges and merge overlapping or adjacent ones."""
+        if not ranges:
+            return []
+        ranges = sorted([int(start), int(end)] for start, end in ranges)
+        merged = [ranges[0]]
+        for current_start, current_end in ranges[1:]:
+            last_start, last_end = merged[-1]
+            if current_start <= last_end + 1:
+                merged[-1] = [last_start, max(last_end, current_end)]
+            else:
+                merged.append([current_start, current_end])
+        return merged
+
     def _define_pending_stack(self) -> bool:
         if self.stack_start_index is None or self.stack_end_index is None:
             return False
@@ -5447,7 +5848,7 @@ class AppController(QObject):
         start = min(self.stack_start_index, self.stack_end_index)
         end = max(self.stack_start_index, self.stack_end_index)
         self.stacks.append([start, end])
-        self.stacks.sort()  # Keep stacks sorted by start index
+        self.stacks = self._merge_stack_ranges(self.stacks)
         self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
         log.info("Defined new stack: [%d, %d]", start, end)
@@ -5523,7 +5924,7 @@ class AppController(QObject):
             self.batches.append([start, end])
             log.info("Defined new batch: [%d, %d]", start, end)
             self.batch_start_index = None
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             count = self.get_batch_count_for_current_image()
             self.update_status_message(
                 f"Batch defined: {count} image{'' if count == 1 else 's'}"
@@ -5575,7 +5976,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             self.update_status_message(f"Added {added_count} image(s) to batch")
             log.info("Added %d image(s) to batch from grid selection", added_count)
         else:
@@ -5607,7 +6008,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             self.update_status_message(
                 f"Added {added_count} favorite(s) to batch ({len(indices_to_add)} total favorites)"
             )
@@ -5643,7 +6044,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             self.update_status_message(
                 f"Added {added_count} uploaded image(s) to batch ({len(indices_to_add)} total uploaded)"
             )
@@ -5677,7 +6078,7 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             self.update_status_message(
                 f"Added {added_count} edited image(s) to batch ({len(indices_to_add)} total edited)"
             )
@@ -5720,7 +6121,7 @@ class AppController(QObject):
                 in_batch = any(start <= i <= end for start, end in self.batches)
                 if not in_batch:
                     self.batches.append([i, i])
-                    self._finalize_batch_state()
+                    self._finalize_batch_state(reapply_filter=True)
                     log.info("Auto-added edited image to batch: %s", image_path.name)
                 break
 
@@ -5766,7 +6167,7 @@ class AppController(QObject):
 
         if batch_modified:
             self.batches = new_batches
-            self._finalize_batch_state(emit=False, sync=False)
+            self._finalize_batch_state(emit=False, sync=False, reapply_filter=True)
 
         # Check and remove from stacks
         # Check and remove from stacks
@@ -5858,7 +6259,7 @@ class AppController(QObject):
                 self.update_status_message("Added image to batch")
                 log.info("Added index %d to batch.", index_to_toggle)
 
-        self._finalize_batch_state()
+        self._finalize_batch_state(reapply_filter=True)
 
     def toggle_stack_membership(self):
         """Toggles the current image's inclusion in a stack."""
@@ -5948,17 +6349,8 @@ class AppController(QObject):
                         max(end, index_to_toggle),
                     ]
 
-                    # Merge overlapping stacks
-                    self.stacks.sort()
-                    merged_stacks = [self.stacks[0]] if self.stacks else []
-                    for i in range(1, len(self.stacks)):
-                        last_start, last_end = merged_stacks[-1]
-                        current_start, current_end = self.stacks[i]
-                        if current_start <= last_end + 1:
-                            merged_stacks[-1] = [last_start, max(last_end, current_end)]
-                        else:
-                            merged_stacks.append([current_start, current_end])
-                    self.stacks = merged_stacks
+                    # Merge overlapping or adjacent stacks
+                    self.stacks = self._merge_stack_ranges(self.stacks)
 
                     # Find the new stack index for the status message
                     new_stack_idx = -1
@@ -6250,7 +6642,7 @@ class AppController(QObject):
         log.info("Clearing all defined batches.")
         self.batches = []
         self.batch_start_index = None
-        self._finalize_batch_state()
+        self._finalize_batch_state(reapply_filter=True)
         self.update_status_message("All batches cleared")
 
     def get_helicon_path(self):
@@ -6272,6 +6664,20 @@ class AppController(QObject):
 
     def set_rawtherapee_path(self, path):
         config.set("rawtherapee", "exe", path)
+        config.save()
+
+    def get_raw_source_dir(self):
+        return config.get("raw", "source_dir", fallback="")
+
+    def set_raw_source_dir(self, path):
+        config.set("raw", "source_dir", path)
+        config.save()
+
+    def get_secondary_raw_source_dir(self):
+        return config.get("raw", "secondary_source_dir", fallback="")
+
+    def set_secondary_raw_source_dir(self, path):
+        config.set("raw", "secondary_source_dir", path)
         config.save()
 
     def _dialog_start_directory(self, current_path: str) -> str:
@@ -6571,6 +6977,29 @@ class AppController(QObject):
             return
         if not QDesktopServices.openUrl(QUrl(url)):
             self.update_status_message("Could not open update release page", 5000)
+
+    @Slot()
+    def open_changelog(self):
+        changelog_path = faststack_changelog_path()
+        if changelog_path is not None:
+            if QDesktopServices.openUrl(QUrl.fromLocalFile(str(changelog_path))):
+                return
+            log.warning("Could not open local changelog: %s", changelog_path)
+
+        changelog_url = f"https://github.com/{GITHUB_REPOSITORY}/blob/main/ChangeLog.md"
+        if QDesktopServices.openUrl(QUrl(changelog_url)):
+            message = (
+                "Could not open local changelog; opened online changelog"
+                if changelog_path is not None
+                else "Local changelog not found; opened online changelog"
+            )
+            self.update_status_message(message, 5000)
+            return
+
+        self.update_status_message(
+            "Could not open changelog locally or in browser",
+            5000,
+        )
 
     @Slot(result=str)
     def get_color_mode(self):
@@ -7169,7 +7598,7 @@ class AppController(QObject):
             self.watcher.stop()
 
         # Update the directory path
-        self.image_dir = folder_path
+        self.image_dir = Path(folder_path).expanduser().resolve()
 
         # Reinitialize directory-bound components
         self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
@@ -7301,8 +7730,12 @@ class AppController(QObject):
         # to ensure they are moved to the front of the LRU queue.
         nearby_radius = self.prefetcher.prefetch_radius * 2
 
+        skipped_count = 0
         for i, dist in all_images_with_dist:
             if i >= len(self.image_files):
+                # Out-of-range index (image list shrank underneath us); still
+                # needs to be accounted for so `completed` can reach `total_images`.
+                skipped_count += 1
                 continue
             image_path = self.image_files[i].path
             cache_key = build_cache_key(image_path, display_gen)
@@ -7326,20 +7759,27 @@ class AppController(QObject):
             return
 
         # --- Setup progress tracking ---
-        # `completed` starts at the number of images already cached (that we are skipping).
-        completed = already_cached_count
+        # `completed` starts at the number of images already cached (that we are skipping)
+        # plus any out-of-range indices we could not submit at all.
+        completed = already_cached_count + skipped_count
+        completed_lock = threading.Lock()
+        finished_emitted = False
 
         # Update initial progress
         initial_progress = int((completed / total_images) * 100)
         self._update_preload_progress(initial_progress)
 
         def _on_done(_future):
-            nonlocal completed
-            completed += 1
-            progress = int((completed / total_images) * 100)
+            nonlocal completed, finished_emitted
+            with completed_lock:
+                completed += 1
+                progress = int((completed / total_images) * 100)
+                # Check if all images (including cached/skipped ones) are accounted for.
+                should_finish = completed >= total_images and not finished_emitted
+                if should_finish:
+                    finished_emitted = True
             self.reporter.progress_updated.emit(progress)
-            # Check if all images (including cached ones) are accounted for
-            if completed == total_images:
+            if should_finish:
                 self.reporter.finished.emit()
 
         # --- Submit tasks ---
@@ -7351,9 +7791,17 @@ class AppController(QObject):
             # But we need to make sure we don't skip the task in prefetcher if it thinks it's already done.
             # The prefetcher checks self.futures, but we are submitting new ones.
 
-            future = self.prefetcher.submit_task(i, self.prefetcher.generation)
+            future = self.prefetcher.submit_task(
+                i,
+                self.prefetcher.generation,
+                quality="fast",
+            )
             if future:
                 future.add_done_callback(_on_done)
+            else:
+                # submit_task can return None (executor stopping, index out of
+                # bounds); still account for the image so preloading can finish.
+                _on_done(None)
 
     def _update_preload_progress(self, progress: int):
         log.debug("Updating preload progress in UI: %d%%", progress)
@@ -8730,6 +9178,13 @@ class AppController(QObject):
                 log.warning(
                     "Restore skipped for %s: destination already exists", jpg_src.name
                 )
+            elif reason == "missing_in_bin":
+                # The recycled file is gone (e.g. recycle bin was emptied) —
+                # retrying this undo can never succeed, so don't re-append it.
+                self.update_status_message(
+                    f"Cannot undo: {jpg_src.name} is no longer in the recycle bin"
+                )
+                return
             else:
                 self.update_status_message(f"Undo failed: {reason} for {jpg_src.name}")
                 self.undo_history.append(("delete", action_data, timestamp))
@@ -8749,6 +9204,19 @@ class AppController(QObject):
                         raw_src.name,
                     )
                     restored_files.append(f"{raw_src.name} (existed)")
+                elif reason == "missing_in_bin":
+                    # The RAW is gone from the bin and can never be restored.
+                    # Rolling the JPG back into the (possibly emptied) bin
+                    # would strand it, so leave the JPG restored in place
+                    # and don't re-append this dead entry.
+                    self.update_status_message(
+                        f"Restored {jpg_src.name}; RAW was no longer in the "
+                        "recycle bin"
+                    )
+                    self._post_undo_refresh_and_select(jpg_src, update_hist=False)
+                    if self._thumbnail_model and self._is_grid_view_active:
+                        self._thumbnail_model.refresh()
+                    return
                 else:
                     if jpg_res_ok:
                         log.warning(
@@ -8863,6 +9331,8 @@ class AppController(QObject):
             self._exif_debounce_timer.stop()
             self._watcher_debounce_timer.stop()
             self._auto_adjust_save_timer.stop()
+            self._quality_decode_timer.stop()
+            self._session_save_timer.stop()
             self.histogram_timer.stop()
             self.resize_timer.stop()
             if hasattr(self, "_thumb_summary_timer"):
@@ -9028,6 +9498,13 @@ class AppController(QObject):
         except Exception as e:
             log.warning("Error saving sidecar during shutdown: %s", e)
 
+        # Clean shutdown — remove this instance's crash-recovery record so it is
+        # not offered for reopening on the next launch.
+        try:
+            self._session_registry.close()
+        except Exception as e:
+            log.warning("Error removing session record during shutdown: %s", e)
+
         # Clean up temporary files (e.g. Helicon Focus lists)
         if self._temp_files_to_clean:
             log.debug(
@@ -9048,6 +9525,44 @@ class AppController(QObject):
         self.shutdown_qt()
         self.shutdown_nonqt()
 
+    def _prune_delete_history_for_bins(self, bin_dirs: Set[Path]) -> None:
+        """Drop delete/undo records whose recycled files lived in *bin_dirs*.
+
+        Called after recycle bins are removed so Ctrl+Z cannot get stuck
+        retrying restores that can never succeed.
+        """
+        if not bin_dirs:
+            return
+        resolved_bins = set()
+        for d in bin_dirs:
+            try:
+                resolved_bins.add(d.resolve())
+            except OSError:
+                resolved_bins.add(d)
+
+        def _record_gone(record) -> bool:
+            try:
+                (_, jpg_bin), (_, raw_bin) = record
+            except (TypeError, ValueError):
+                return False
+            for bin_path in (jpg_bin, raw_bin):
+                if bin_path is None:
+                    continue
+                try:
+                    parent = Path(bin_path).parent.resolve()
+                except OSError:
+                    parent = Path(bin_path).parent
+                if parent in resolved_bins:
+                    return True
+            return False
+
+        self.delete_history = [r for r in self.delete_history if not _record_gone(r)]
+        self.undo_history = [
+            (atype, adata, ts)
+            for atype, adata, ts in self.undo_history
+            if atype != "delete" or not _record_gone(adata)
+        ]
+
     def empty_recycle_bin(self):
         """Permanently deletes all files in all tracked recycle bins."""
         # Clean up tracked bins
@@ -9058,13 +9573,16 @@ class AppController(QObject):
         except Exception:
             pass
 
+        removed_bins: Set[Path] = set()
         for bin_path in bins_to_clean:
             if bin_path.exists():
                 try:
                     shutil.rmtree(bin_path)
+                    removed_bins.add(bin_path)
                 except OSError:
                     log.exception("Failed to empty recycle bin %s", bin_path)
 
+        self._prune_delete_history_for_bins(removed_bins)
         self.active_recycle_bins.clear()
         self.delete_history.clear()
         clear_raw_count_cache()
@@ -9093,6 +9611,26 @@ class AppController(QObject):
                     key,
                 )
             return
+
+        # Let the prefetcher know this path's cached bytes are gone, so its
+        # `_scheduled` bookkeeping doesn't permanently treat the index as
+        # "already decoded" (which would silently stop prefetching it for
+        # the rest of the generation). "replace"/"manual" evictions are
+        # already handled by invalidate_path()/pop_path() at the call site
+        # that caused them, so only do this for capacity-pressure evictions.
+        # NOTE: this callback can run outside the cache's own lock, possibly
+        # on a prefetch worker thread; unschedule_path() only takes
+        # Prefetcher._futures_lock (never the cache lock), so there is no
+        # lock-ordering hazard here.
+        prefetcher = getattr(self, "prefetcher", None)
+        if prefetcher is not None:
+            try:
+                path_str = str(key).rsplit("::", 1)[0]
+                prefetcher.unschedule_path(path_str)
+            except Exception:
+                log.debug(
+                    "unschedule_path failed for evicted key=%s", key, exc_info=True
+                )
 
         # Use usage captured at eviction time (inside the lock), not current
         # currsize which may be stale if clear()/evict_paths() ran between
@@ -9238,6 +9776,13 @@ class AppController(QObject):
                 close_fds=True,  # Close unused file descriptors
             )
 
+            jpg_clipboard_path = str(jpg_path)
+            QApplication.clipboard().setText(jpg_clipboard_path)
+            log.info(
+                "Copied JPG path to clipboard after Photoshop launch: %s",
+                jpg_clipboard_path,
+            )
+
             # Mark as edited on successful launch
             today = datetime.now().strftime("%Y-%m-%d")
             meta = self.sidecar.get_metadata(image_file.path)
@@ -9248,11 +9793,8 @@ class AppController(QObject):
             self.dataChanged.emit()
             self.sync_ui_state()
 
-            # Auto-add to batch if enabled
-            self._auto_add_edited_to_batch_if_enabled(image_file.path)
-
             self.update_status_message(
-                f"Opened {current_image_path.name} in Photoshop."
+                f"Opened {current_image_path.name} in Photoshop. Copied JPG path."
             )
             log.info("Launched Photoshop with: %s", command)
         except FileNotFoundError as e:
@@ -9288,9 +9830,14 @@ class AppController(QObject):
         """
         Updates the UI status message and clears it after a timeout.
         """
+        self._status_message_token += 1
+        token = self._status_message_token
 
         def clear_message():
-            if self.ui_state.statusMessage == message:
+            if (
+                self._status_message_token == token
+                and self.ui_state.statusMessage == message
+            ):
                 self.ui_state.statusMessage = ""
 
         self.ui_state.statusMessage = message
@@ -9536,7 +10083,7 @@ class AppController(QObject):
             # Clear all batches after successful drag (like pressing \)
             self.batches = []
             self.batch_start_index = None
-            self._finalize_batch_state()
+            self._finalize_batch_state(reapply_filter=True)
             log.info(
                 "Marked %d file(s) as uploaded on %s. Cleared all batches.",
                 len(existing_indices),
@@ -10171,6 +10718,33 @@ class AppController(QObject):
         because navigation while the editor is open does NOT call
         editor.load_image().
         """
+        # This runs on every navigation keypress, but the overwhelmingly
+        # common case is that there is no darken state to reset at all: no
+        # mask assets/raster cache, no darken_settings, no in-progress
+        # stroke/tool mode, no overlay image, and every slider already at its
+        # reset value. Skip the UI property writes and signal emit in that
+        # case instead of redoing a no-op reset on every keypress.
+        if (
+            not self.image_editor._mask_assets
+            and not self.image_editor._mask_raster_cache
+            and self.image_editor.current_edits.get("darken_settings") is None
+            and self._current_darken_stroke is None
+            and not self.ui_state.isDarkening
+            and self.ui_state._darken_overlay_image is None
+            and self.ui_state.darkenOverlayVisible is True
+            and self.ui_state.darkenAmount == 0.5
+            and self.ui_state.darkenEdgeProtection == 0.5
+            and self.ui_state.darkenSubjectProtection == 0.5
+            and self.ui_state.darkenFeather == 0.5
+            and self.ui_state.darkenDarkRange == 0.5
+            and self.ui_state.darkenNeutrality == 0.5
+            and self.ui_state.darkenExpandContract == 0.0
+            and self.ui_state.darkenAutoEdges == 0.0
+            and self.ui_state.darkenMode == "assisted"
+            and self.ui_state.darkenBrushRadius == 0.03
+        ):
+            return
+
         # Editor-level: clear mask assets, raster cache, and darken settings
         self.image_editor._mask_assets.clear()
         self.image_editor._mask_raster_cache.clear()
@@ -10824,6 +11398,56 @@ class AppController(QObject):
             return max(int(display_w), int(display_h))
         return None
 
+    def _live_preview_quick_target_size(self) -> Optional[Tuple[int, int]]:
+        """Output size for quick (preview-master) live renders.
+
+        Sizing quick frames to what the display-capped full-resolution
+        refinement will produce keeps the loupe's sourceSize stable across
+        the swap, so the refinement sharpens in place. Left unmatched, the
+        rounding differences between the two render paths give the frames
+        slightly different aspect ratios and every refinement nudges the
+        fitted image.
+        """
+        cap = self._display_preview_long_edge()
+        if not cap:
+            return None
+
+        # Prefer the recorded size of the last display-capped full-resolution
+        # frame for this session: ground truth, exact for tonal-only edits.
+        if (
+            self._live_preview_target_dims is not None
+            and self._live_preview_target_session_key is not None
+            and self._live_preview_target_session_key
+            == self._get_current_live_preview_session_key()
+        ):
+            return self._live_preview_target_dims
+
+        # Cold start. Without geometry edits the refinement is the native
+        # frame downscaled with the same rounding as _apply_edits, so its
+        # size is predictable. With geometry edits the crop/straighten
+        # rounding happens at master resolution; don't guess.
+        if self._current_live_session_has_geometry_edits():
+            return None
+        native_w, native_h = self.get_current_display_native_size()
+        if native_w <= 0 or native_h <= 0:
+            return None
+        long_edge = max(native_w, native_h)
+        if long_edge <= cap:
+            return (native_w, native_h)
+        scale = cap / long_edge
+        return (max(1, round(native_w * scale)), max(1, round(native_h * scale)))
+
+    def _store_live_preview_target_dims(self, decoded: DecodedImage) -> None:
+        """Record a display-capped full-res frame's size as the quick-render target."""
+        if self._display_preview_long_edge() is None:
+            # Uncapped render (display size unknown / zoomed): master-sized
+            # dims must not become the quick-frame target.
+            return
+        self._live_preview_target_dims = (int(decoded.width), int(decoded.height))
+        self._live_preview_target_session_key = (
+            self._get_current_live_preview_session_key()
+        )
+
     def _build_live_crop_preview_edits_override(self) -> Optional[dict]:
         """Snapshot a temporary crop override for live crop preview rendering."""
         if not getattr(self.ui_state, "isCropping", False):
@@ -10892,6 +11516,18 @@ class AppController(QObject):
             self._display_preview_long_edge() if render_full_resolution else None
         )
         preview_edits_override = self._build_live_crop_preview_edits_override()
+        # Crop-mode overrides change the framing per frame; only steady-state
+        # quick renders get sized to match the full-resolution refinement.
+        quick_output_size = (
+            self._live_preview_quick_target_size()
+            if preview_edits_override is None
+            else None
+        )
+        if render_full_resolution and display_long_edge:
+            # This kick's accepted final frame defines the quick-render target
+            # size. Uncapped (zoomed) full-res renders must not: quick frames
+            # would then be upscaled to master resolution.
+            self._preview_full_res_token = token
 
         # Submit task to dedicated preview executor
         try:
@@ -10904,6 +11540,7 @@ class AppController(QObject):
                 display_long_edge,
                 preview_edits_override,
                 self.previewReady.emit,
+                quick_output_size,
             )
             fut.add_done_callback(self._on_preview_done)
         except RuntimeError:
@@ -10963,6 +11600,7 @@ class AppController(QObject):
         display_long_edge=None,
         preview_edits_override=None,
         emit_intermediate=None,
+        quick_output_size=None,
     ):
         # Heavy work (PIL apply_edits) happens here off-thread
         try:
@@ -10976,6 +11614,7 @@ class AppController(QObject):
                     quick = image_editor.get_preview_data_cached(
                         allow_compute=True,
                         edits_override=preview_edits_override,
+                        output_size=quick_output_size,
                     )
                     if quick is not None:
                         emit_intermediate((token, session_key, quick, False))
@@ -10988,6 +11627,7 @@ class AppController(QObject):
                 decoded = image_editor.get_preview_data_cached(
                     allow_compute=True,
                     edits_override=preview_edits_override,
+                    output_size=quick_output_size,
                 )
             return token, session_key, decoded
         except Exception:
@@ -11058,6 +11698,11 @@ class AppController(QObject):
                 and session_key == self._get_current_live_preview_session_key()
             ):
                 self._publish_last_rendered_preview_locked(decoded, session_key)
+                if is_final and token == self._preview_full_res_token:
+                    # Display-capped full-res frame: its size becomes the
+                    # target quick renders are matched to (shift-free swap).
+                    self._live_preview_target_dims = (decoded.width, decoded.height)
+                    self._live_preview_target_session_key = session_key
                 self.ui_refresh_generation += 1
                 self._last_rendered_preview_index = self.current_index
                 self._last_rendered_preview_gen = self.ui_refresh_generation
@@ -11149,6 +11794,13 @@ class AppController(QObject):
             token = self._original_compare_token
             index = self.current_index
 
+        # Match the compare frame's dimensions to the live preview it swaps
+        # with, so toggling space cannot nudge the fitted image. Both are
+        # None while zoomed (display size reports 0x0), preserving the
+        # uncapped native render zoom needs.
+        compare_long_edge = self._display_preview_long_edge()
+        compare_output_size = self._live_preview_quick_target_size()
+
         try:
             future = self._preview_executor.submit(
                 self._render_original_compare_worker,
@@ -11157,6 +11809,8 @@ class AppController(QObject):
                 index,
                 self.image_editor,
                 render_full_resolution,
+                compare_long_edge,
+                compare_output_size,
             )
             future.add_done_callback(self._on_original_compare_done)
         except RuntimeError:
@@ -11177,6 +11831,18 @@ class AppController(QObject):
         if hasattr(self.ui_state, "originalCompareActive"):
             self.ui_state.originalCompareActive = False
         self.ui_refresh_generation += 1
+        # Re-point the live edited preview to the freshly bumped generation so
+        # the provider's gen-gated editor-preview path stays valid when space is
+        # released. Without this the loupe (at fit) fails has_valid_preview_buffer
+        # and falls back to the un-edited decode, leaving the original on screen.
+        # Mirrors the same fix-up done in sync_ui_state().
+        if (
+            self._last_rendered_preview is not None
+            and self._last_rendered_preview_index == self.current_index
+            and self._last_rendered_preview_session_key
+            == self._get_current_live_preview_session_key()
+        ):
+            self._last_rendered_preview_gen = self.ui_refresh_generation
         self.ui_state.currentImageSourceChanged.emit()
 
     @staticmethod
@@ -11186,10 +11852,14 @@ class AppController(QObject):
         index: int,
         image_editor,
         full_resolution: bool,
+        max_long_edge=None,
+        output_size=None,
     ):
         try:
             decoded = image_editor.get_original_compare_preview_data(
-                full_resolution=full_resolution
+                full_resolution=full_resolution,
+                max_long_edge=max_long_edge,
+                output_size=output_size,
             )
             return token, session_key, index, decoded
         except Exception:
@@ -11264,6 +11934,7 @@ class AppController(QObject):
                     self._preview_token += 1
                     self._preview_pending = False
                     self._publish_last_rendered_preview_locked(decoded)
+                    self._store_live_preview_target_dims(decoded)
                     self.ui_refresh_generation += 1
                     self._last_rendered_preview_index = self.current_index
                     self._last_rendered_preview_gen = self.ui_refresh_generation
@@ -11350,38 +12021,29 @@ class AppController(QObject):
         base_number_str = match.group(2)  # e.g., "210633"
         base_number = int(base_number_str)
 
-        # Determine the RAW source directory
-        raw_source_dir_str = config.get("raw", "source_dir")
-        if not raw_source_dir_str:
-            self.update_status_message(
-                "RAW source directory not configured in settings."
-            )
-            log.warning("RAW source directory (raw.source_dir) is not set in config.")
-            return
-
-        raw_base_dir = Path(raw_source_dir_str)
-        if not raw_base_dir.is_dir():
-            self.update_status_message(
-                f"RAW source directory not found: {raw_base_dir}"
-            )
-            log.warning(
-                "Configured RAW source directory does not exist: %s", raw_base_dir
-            )
-            return
-
         # Get the mirror base from config
         mirror_base_str = config.get("raw", "mirror_base")
         if not mirror_base_str:
-            self.update_status_message(
-                "RAW mirror base directory not configured in settings."
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason="The RAW mirror base directory is not configured.",
             )
             log.warning("RAW mirror base (raw.mirror_base) is not set in config.")
             return
 
         mirror_base_dir = Path(mirror_base_str)
         if not mirror_base_dir.is_dir():
-            self.update_status_message(
-                f"RAW mirror base directory not found: {mirror_base_dir}"
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason=f"The RAW mirror base directory does not exist: {mirror_base_dir}",
             )
             log.warning(
                 "Configured RAW mirror base directory does not exist: %s",
@@ -11393,8 +12055,16 @@ class AppController(QObject):
         try:
             relative_part = current_image_path.parent.relative_to(mirror_base_dir)
         except ValueError:
-            self.update_status_message(
-                "Current image is not in the configured mirror base directory."
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason=(
+                    "The current image folder is not inside the configured RAW "
+                    f"mirror base directory: {mirror_base_dir}"
+                ),
             )
             log.error(
                 "Could not find relative path for '%s' from base '%s'. Check 'mirror_base' config.",
@@ -11403,57 +12073,52 @@ class AppController(QObject):
             )
             return
 
-        raw_search_dir = raw_base_dir / relative_part
-
-        if not raw_search_dir.is_dir():
-            self.update_status_message(
-                f"RAW directory for this date not found: {raw_search_dir}"
+        raw_locations = self._configured_restack_raw_locations()
+        search_locations = [
+            (label, base_dir, base_dir / relative_part)
+            for label, base_dir in raw_locations
+        ]
+        if not search_locations:
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason="No primary or secondary RAW source directory is configured.",
             )
-            log.warning("RAW search directory does not exist: %s", raw_search_dir)
             return
 
-        # Find RAW files by decrementing the number
         found_raw_files: List[Path] = []
-        # Start one number less than the stacked image number
-        current_raw_number = base_number - 1
-
-        # Limit to reasonable number of RAWs to avoid infinite loop or too many files
-        max_raw_search = 15  # As per user request, typically between 3 and 15
-        search_count = 0
-
-        while current_raw_number >= 0 and search_count < max_raw_search:
-            raw_filename_stem = (
-                f"{base_prefix}{current_raw_number:06d}"  # e.g., PB210632
+        found_label = ""
+        found_search_dir = None
+        for label, _base_dir, raw_search_dir in search_locations:
+            if not raw_search_dir.is_dir():
+                log.info("RAW search directory does not exist: %s", raw_search_dir)
+                continue
+            found_raw_files = self._find_restack_raws_in_dir(
+                raw_search_dir,
+                base_prefix,
+                base_number,
             )
-
-            # Look for any of the common RAW extensions
-            potential_raw_paths = []
-            for ext in RAW_EXTENSIONS:
-                potential_raw_paths.append(raw_search_dir / f"{raw_filename_stem}{ext}")
-
-            found_this_number = False
-            for p in potential_raw_paths:
-                if p.is_file():
-                    found_raw_files.append(p)
-                    found_this_number = True
-                    break
-
-            if not found_this_number:
-                # User specified "continue until there is a gap in the numbers"
-                # If we don't find any RAW for a number, assume it's a gap and stop
-                if (
-                    found_raw_files
-                ):  # Only break if we've found at least one file before this gap
-                    break
-
-            current_raw_number -= 1
-            search_count += 1
+            if found_raw_files:
+                found_label = label
+                found_search_dir = raw_search_dir
+                break
 
         if not found_raw_files:
-            self.update_status_message(
-                f"No source RAW files found in {raw_search_dir} for {filename}."
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=search_locations,
             )
-            log.info("No source RAWs found for %s in %s", filename, raw_search_dir)
+            log.info(
+                "No source RAWs found for %s in %s",
+                filename,
+                [str(location[2]) for location in search_locations],
+            )
             return
 
         # Sort the files by name to ensure Helicon Focus receives them in sequence
@@ -11463,8 +12128,10 @@ class AppController(QObject):
             f"Launching Helicon Focus with {len(found_raw_files)} RAWs..."
         )
         log.info(
-            "Launching Helicon Focus for %s with RAWs: %s",
+            "Launching Helicon Focus for %s with RAWs from %s (%s): %s",
             filename,
+            found_label,
+            found_search_dir,
             [str(p) for p in found_raw_files],
         )
         success = self._launch_helicon_with_files(found_raw_files)
@@ -11483,6 +12150,144 @@ class AppController(QObject):
             self.update_status_message("Helicon Focus launched successfully.")
         else:
             self.update_status_message("Failed to launch Helicon Focus.")
+
+    def _configured_restack_raw_locations(self) -> list[tuple[str, Path]]:
+        raw_source_dir = config.get("raw", "source_dir", fallback="")
+        secondary_source_dir = config.get("raw", "secondary_source_dir", fallback="")
+        configured = (
+            ("Primary", raw_source_dir),
+            ("Secondary", secondary_source_dir),
+        )
+        locations: list[tuple[str, Path]] = []
+        seen: set[str] = set()
+        for label, raw_path in configured:
+            cleaned = str(raw_path or "").strip().strip('"')
+            if not cleaned:
+                continue
+            expanded = os.path.expanduser(os.path.expandvars(cleaned))
+            normalized = os.path.normcase(os.path.normpath(expanded))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            locations.append((label, Path(expanded)))
+        return locations
+
+    def _expected_restack_raw_stems(
+        self,
+        base_prefix: str,
+        base_number: int,
+        *,
+        max_raw_search: int = 15,
+    ) -> list[str]:
+        return [
+            f"{base_prefix}{raw_number:06d}"
+            for raw_number in range(
+                base_number - 1,
+                max(base_number - max_raw_search - 1, -1),
+                -1,
+            )
+        ]
+
+    def _find_restack_raws_in_dir(
+        self,
+        raw_search_dir: Path,
+        base_prefix: str,
+        base_number: int,
+        *,
+        max_raw_search: int = 15,
+    ) -> list[Path]:
+        found_raw_files: list[Path] = []
+        for raw_stem in self._expected_restack_raw_stems(
+            base_prefix,
+            base_number,
+            max_raw_search=max_raw_search,
+        ):
+            found_this_number = False
+            for ext in RAW_EXTENSIONS:
+                potential_raw = raw_search_dir / f"{raw_stem}{ext}"
+                if potential_raw.is_file():
+                    found_raw_files.append(potential_raw)
+                    found_this_number = True
+                    break
+
+            if not found_this_number and found_raw_files:
+                break
+
+        return found_raw_files
+
+    def _show_missing_restack_raws_dialog(
+        self,
+        *,
+        filename: str,
+        expected_stems: list[str],
+        search_locations: list[tuple[str, Path, Path]],
+        reason: str = "",
+    ) -> None:
+        raw_extensions = ", ".join(sorted(ext.upper() for ext in RAW_EXTENSIONS))
+        expected_preview = ", ".join(expected_stems[:5])
+        if len(expected_stems) > 5:
+            expected_preview += ", ..."
+
+        location_lines = []
+        location_detail_lines = []
+        for label, base_dir, search_dir in search_locations:
+            if search_dir.is_dir():
+                status = "searched, no matching stack input RAWs found"
+            else:
+                status = "folder missing or drive not available"
+            location_lines.append(f"- {label}: {search_dir}\n  status: {status}")
+            location_detail_lines.append(
+                f"{label}\n"
+                f"  Source root: {base_dir}\n"
+                f"  Searched folder: {search_dir}\n"
+                f"  Status: {status}"
+            )
+        if not location_lines:
+            location_lines.append("- No RAW source folders were available to search.")
+            location_detail_lines.append(
+                "No RAW source folders were available to search."
+            )
+
+        summary = (
+            f"Stacked image: {filename}\n\n"
+            "The stack input RAW files could not be found. FastStack needs those "
+            "original RAW frames to reopen this stack in Helicon Focus.\n\n"
+        )
+        if reason:
+            summary += f"Problem:\n{reason}\n\n"
+        summary += (
+            "What it looked for:\n"
+            f"- RAW filenames starting before the stacked image number: {expected_preview}\n"
+            f"- Extensions: {raw_extensions}\n"
+            "- Up to 15 previous frame numbers, stopping after the first gap once "
+            "frames are found.\n\n"
+            "Where it looked:\n" + "\n".join(location_lines)
+        )
+        details = (
+            summary
+            + "\n\nConfigure these folders in Settings > General > Restack RAW Locations. "
+            "Set the primary and secondary RAW source directories to folders that "
+            "mirror the same date/subfolder structure as the configured RAW mirror base."
+        )
+        detailed_locations = (
+            f"Stacked image: {filename}\n\n"
+            "Search locations:\n"
+            + "\n\n".join(location_detail_lines)
+            + "\n\nExpected RAW stems:\n"
+            + "\n".join(expected_stems)
+            + "\n\nRAW extensions:\n"
+            + raw_extensions
+        )
+
+        msg_box = QMessageBox()
+        msg_box.setIcon(QMessageBox.Icon.Warning)
+        msg_box.setWindowTitle("Stack Input RAWs Not Found")
+        msg_box.setText("FastStack could not find the stack input RAW files.")
+        msg_box.setInformativeText(details)
+        msg_box.setDetailedText(detailed_locations)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg_box.exec()
+        self.update_status_message("Stack input RAW files not found.", 6000)
 
     @Slot()
     def execute_crop(self):
@@ -11635,6 +12440,7 @@ class AppController(QObject):
                 self._preview_token += 1
                 self._preview_pending = False
                 self._publish_last_rendered_preview_locked(decoded)
+                self._store_live_preview_target_dims(decoded)
                 self.ui_refresh_generation += 1
                 self._last_rendered_preview_index = self.current_index
                 self._last_rendered_preview_gen = self.ui_refresh_generation
@@ -12009,6 +12815,10 @@ class AppController(QObject):
                 save_result = self.image_editor.save_image_uint8_levels(
                     save_target_path=save_target_path
                 )
+                if save_result is None:
+                    save_result = self.image_editor.save_image_uint8_white_balance(
+                        save_target_path=save_target_path
+                    )
                 if save_result is None:
                     save_result = self.image_editor.save_image(
                         save_target_path=save_target_path
@@ -12438,13 +13248,16 @@ class AppController(QObject):
         """Delete all tracked recycle bins."""
         active_bins = {p for p in self.active_recycle_bins if p.exists() and p.is_dir()}
 
+        removed_bins: Set[Path] = set()
         for bin_path in active_bins:
             try:
                 shutil.rmtree(bin_path)
                 log.info("Cleaned up recycle bin: %s", bin_path)
+                removed_bins.add(bin_path)
             except OSError as e:
                 log.error("Failed to delete recycle bin %s: %s", bin_path, e)
 
+        self._prune_delete_history_for_bins(removed_bins)
         self.active_recycle_bins.clear()
 
         # Clear stats cache since we deleted files/folders
@@ -12675,6 +13488,56 @@ class AppController(QObject):
         return result
 
 
+def _prompt_reopen_sessions(records):
+    """Ask the user which crash-survivor folders to reopen.
+
+    ``records`` are stale session dicts (see ``SessionRegistry.scan_stale``).
+    Returns the list of selected ``(directory, grid)`` tuples, or an empty list
+    if the user opts to skip (cancel / "Open default instead").
+    """
+    dialog = QDialog()
+    dialog.setWindowTitle("Resume FastStack sessions")
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(
+        QLabel("FastStack didn't shut down cleanly. Reopen these folders?")
+    )
+
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    container = QWidget()
+    container_layout = QVBoxLayout(container)
+    checkboxes = []
+    for rec in records:
+        directory = rec.get("dir", "")
+        checkbox = QCheckBox(directory)
+        checkbox.setChecked(True)
+        container_layout.addWidget(checkbox)
+        checkboxes.append((checkbox, rec))
+    container_layout.addStretch(1)
+    scroll.setWidget(container)
+    layout.addWidget(scroll)
+
+    buttons = QDialogButtonBox()
+    open_btn = buttons.addButton(
+        "Reopen Selected", QDialogButtonBox.ButtonRole.AcceptRole
+    )
+    buttons.addButton("Open default instead", QDialogButtonBox.ButtonRole.RejectRole)
+    open_btn.setDefault(True)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+
+    dialog.resize(520, 320)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return []
+
+    return [
+        (rec.get("dir", ""), rec.get("grid"))
+        for checkbox, rec in checkboxes
+        if checkbox.isChecked()
+    ]
+
+
 def main(
     image_dir: Optional[str] = None,
     debug: bool = False,
@@ -12722,8 +13585,57 @@ def main(
     if debug:
         log.info("Startup: after QApplication: %.3fs", time.perf_counter() - t0)
 
+    # Windows shells escape a trailing backslash before the closing quote
+    # (e.g. `faststack "C:\dir\"`), leaking a literal double-quote into argv so
+    # the path arrives as `C:\dir"`. Double-quotes are never valid in a Windows
+    # path, so strip stray quotes and surrounding whitespace defensively rather
+    # than rejecting an otherwise-correct directory. This is gated to Windows:
+    # on POSIX, quotes and leading/trailing spaces are legal in directory names.
+    if image_dir and os.name == "nt":
+        image_dir = image_dir.strip().strip('"').strip()
+
     if not image_dir:
-        image_dir_str = config.get("core", "default_directory")
+        image_dir_str = ""
+        recovery_prompt_rejected = False
+
+        # Crash/reboot recovery: offer to reopen folders that were open when a
+        # previous run died without a clean shutdown. An explicit CLI folder
+        # skips this entirely (handled by the outer branch).
+        try:
+            stale_records, stale_paths = SessionRegistry.scan_stale()
+        except Exception as e:
+            log.warning("Failed to scan for previous sessions: %s", e)
+            stale_records, stale_paths = [], []
+
+        if stale_records:
+            chosen = _prompt_reopen_sessions(stale_records)
+            if chosen:
+                first_dir, first_grid = chosen[0]
+                # Reopen the rest as separate windows (one process each).
+                for other_dir, other_grid in chosen[1:]:
+                    respawn_for_directory(other_dir, other_grid)
+                image_dir_str = first_dir
+                # Restore the first folder's view mode in this process.
+                if first_grid is False:
+                    start_in_loupe = True
+            else:
+                recovery_prompt_rejected = True
+
+        # Consume stale records and orphan files regardless of whether any were
+        # reopenable; reopened instances create fresh session files of their own.
+        if stale_paths:
+            SessionRegistry.prune(stale_paths)
+
+        # Resume the last folder only when no recovery prompt was declined,
+        # then fall back to the static default.
+        if not image_dir_str and not recovery_prompt_rejected:
+            last_dir = config.get("core", "last_directory")
+            if last_dir:
+                last_dir_path = Path(last_dir).expanduser()
+                if last_dir_path.is_absolute() and last_dir_path.is_dir():
+                    image_dir_str = str(last_dir_path.resolve())
+        if not image_dir_str:
+            image_dir_str = config.get("core", "default_directory")
         if not image_dir_str:
             log.warning(
                 "No image directory provided and no default directory set. Opening directory selection dialog."
@@ -12739,6 +13651,7 @@ def main(
     else:
         image_dir_path = Path(image_dir)
 
+    image_dir_path = image_dir_path.expanduser()
     if not image_dir_path.is_dir():
         print(f"\nDirectory not found: {image_dir_path}\n")
         # Show which part of the path exists to help the user spot the typo
@@ -12750,6 +13663,7 @@ def main(
             check = check.parent
         print("\nUsage: faststack [--loupe] <directory>")
         sys.exit(1)
+    image_dir_path = image_dir_path.resolve()
     app.setOrganizationName("FastStack")
     app.setOrganizationDomain("faststack.dev")
     app.setApplicationName("FastStack")
@@ -12798,11 +13712,11 @@ def main(
     controller.main_window = main_window
     main_window.installEventFilter(controller)
 
-    # Defer heavy loading to after event loop starts so the window appears instantly.
-    # controller.load() does disk scanning, image decode, and thumbnail model refresh —
-    # all of which can run after the first event loop iteration.
+    # Defer heavy loading long enough for the mapped QML window to paint first.
+    # A 0ms timer can run before the first frame is drawn, making slow folder
+    # scans look like the window itself is delayed.
     QTimer.singleShot(
-        0,
+        50,
         lambda: controller.load(skip_thumbnail_refresh=start_in_loupe),
     )
     QTimer.singleShot(2000, controller.maybe_check_for_updates)

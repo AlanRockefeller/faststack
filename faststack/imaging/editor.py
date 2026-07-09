@@ -1,5 +1,6 @@
 """Non-destructive image editor: crop, rotate, exposure, contrast, WB, sharpness."""
 
+import copy
 import io
 import logging
 import math
@@ -85,6 +86,29 @@ _EXPORT_DITHER_MIN_GAIN = 1.2
 # are stable under uniform downsampling, so bounding the resolution keeps the
 # several _apply_edits passes cheap on the UI thread (Shift+L is synchronous).
 _AUTO_VIBRANCE_ANALYSIS_MAX_EDGE = 640
+
+
+# Per-hue saturation ("color mix") bands. Eight Lightroom-style bands, each an
+# edit key ``color_sat_<name>`` paired with its center hue in HSV degrees. A
+# raised-cosine weight (see _apply_edits) falls off either side of the center
+# with deliberate overlap so adjacent bands blend instead of banding; red wraps
+# across 360->0. Centers are tunable.
+_COLOR_MIX_BANDS: Tuple[Tuple[str, float], ...] = (
+    ("red", 0.0),
+    ("orange", 30.0),
+    ("yellow", 60.0),
+    ("green", 120.0),
+    ("aqua", 180.0),
+    ("blue", 240.0),
+    ("purple", 285.0),
+    ("magenta", 320.0),
+)
+# Half-width of each band's cosine falloff in degrees. Wider than the mean band
+# spacing so neighboring bands overlap and sum smoothly.
+_COLOR_MIX_HALF_WIDTH = 45.0
+# Sensitivity scaling, matching the global saturation slider (see step 16).
+_COLOR_MIX_GAIN = 0.5
+_COLOR_MIX_KEYS: Tuple[str, ...] = tuple(f"color_sat_{n}" for n, _ in _COLOR_MIX_BANDS)
 
 
 _REC601_LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
@@ -286,8 +310,12 @@ def _gaussian_blur_float(arr: np.ndarray, radius: float) -> np.ndarray:
         return arr
 
     if cv2 is None:
-        # Fallback: Use Pillow's GaussianBlur in 'F' mode (float32) per channel
-        # This preserves values > 1.0 (headroom) which is critical for highlight recovery.
+        # Fallback (only used when OpenCV is unavailable): Pillow's GaussianBlur
+        # doesn't support float32 ('F' mode isn't supported by its filters), so we
+        # rescale each channel's actual [min, max] span (including any headroom
+        # above 1.0) into 8-bit, blur, then rescale back. This keeps values
+        # outside [0, 1] in range, but it is an 8-bit-quantized approximation of
+        # the true float blur, not a lossless one.
         try:
             c = arr.shape[2]
             blurred_channels = []
@@ -530,73 +558,11 @@ def _crop_box_canvas_rect(
     return left_i, top_i, right_i, bottom_i
 
 
-def rotate_autocrop_rgb(
-    img: Image.Image, angle_deg: float, inset: int = 2
-) -> Image.Image:
-    """
-    Rotate by any angle and then crop to the largest axis-aligned rectangle that contains
-    ONLY valid pixels (no wedges). Works for large angles.
-    """
-    if abs(angle_deg) < 0.01:
-        return img.convert("RGB")
-
-    img = img.convert("RGB")
-    w, h = img.size
-
-    # Reduce angle for rectangle math (rotation by 120° has same inscribed rect as 60°)
-    a = abs(angle_deg) % 180.0
-    if a > 90.0:
-        a = 180.0 - a
-    angle_rad = math.radians(a)
-
-    # Largest rectangle inside the rotated original (in original pixel coordinates)
-    crop_w, crop_h = _rotated_rect_with_max_area(w, h, angle_rad)
-    crop_w = max(1, min(w, crop_w))
-    crop_h = max(1, min(h, crop_h))
-
-    # Rotate with expand so content is preserved
-    rot = img.rotate(
-        -angle_deg,
-        resample=Image.Resampling.BICUBIC,
-        expand=True,
-        fillcolor=(0, 0, 0),
-    )
-
-    # Center-crop to the inscribed rectangle
-    cx = rot.width / 2.0
-    cy = rot.height / 2.0
-    left = math.floor(cx - crop_w / 2.0)
-    top = math.floor(cy - crop_h / 2.0)
-    right = left + crop_w
-    bottom = top + crop_h
-
-    # Small inset to remove any bicubic edge contamination
-    # We skip this for exact 90-degree increments as there is no edge contamination.
-    is_exact_90 = abs(angle_deg % 90.0) < 0.01
-    actual_inset = 0 if is_exact_90 else inset
-
-    if (
-        actual_inset > 0
-        and (right - left) > 2 * actual_inset
-        and (bottom - top) > 2 * actual_inset
-    ):
-        left += actual_inset
-        top += actual_inset
-        right -= actual_inset
-        bottom -= actual_inset
-
-    # Clamp defensively
-    left = max(0, min(rot.width - 1, left))
-    top = max(0, min(rot.height - 1, top))
-    right = max(left + 1, min(rot.width, right))
-    bottom = max(top + 1, min(rot.height, bottom))
-
-    out = rot.crop((left, top, right, bottom)).convert("RGB")
-    return out
-
-
 class ImageEditor:
     """Handles core image manipulation using PIL."""
+
+    _COLOR_MIX_BANDS = _COLOR_MIX_BANDS
+    _COLOR_MIX_KEYS = _COLOR_MIX_KEYS
 
     def __init__(self):
         # Stores the currently loaded PIL Image object (original)
@@ -631,17 +597,12 @@ class ImageEditor:
         # Timestamp of the currently loaded file (for cache invalidation)
         self.current_mtime: float = 0.0
 
-        # Caching for expensive percentile calculation in highlight recovery
-        # Stores: {'rev': int, 'max_brightness': float}
-        # We rely on _edits_rev to invalidate, but strictly we also need to check if
-        # edits that affect 'upstream' data (exposure, wb, crop) have changed vs just 'highlights' slider.
-        # For simplicity/robustness, we just cache per full edit revision + a check on upstream params?
-        # Actually, simpler: just cache the result for a given (image_id/path) + (upstream_params_hash).
-        # But wait, self._edits_rev increments on ANY edit.
-        # If I change "highlights" slider, _edits_rev increments.
-        # But input to _apply_highlights_shadows depends on Exposure, WB, etc.
-        # So if I only change Highlights, the input ARR is largely same (ignoring previous stages being re-run).
-        # We need to cache the 'max_brightness' of 'arr' entering the function.
+        # Caching for expensive percentile calculation in highlight recovery.
+        # Stores: {'hash': int, 'frozen': tuple, 'max_brightness': float}. Keyed
+        # on _get_upstream_edits_hash() rather than _edits_rev, because the
+        # input to highlight recovery only depends on geometry/WB/exposure
+        # (plus file/mtime), not on the highlights slider itself — moving
+        # just that slider must not invalidate this cache.
         self._cached_max_brightness_state: Optional[Dict[str, Any]] = None
         self._cached_highlight_analysis: Optional[Dict[str, Any]] = None
 
@@ -673,6 +634,29 @@ class ImageEditor:
     def clear(self):
         """Clear all editor state so the next edit starts from a clean slate."""
         with self._lock:
+            # Called on every navigation keypress (even when idle), so skip
+            # the reset entirely if we're already in the cleared state.
+            if (
+                self.original_image is None
+                and self.current_filepath is None
+                and self.source_filepath is None
+                and self.session_id is None
+                and self.float_image is None
+                and self.float_preview is None
+                and self._cached_preview is None
+                and self._cached_rev == -1
+                and self.bit_depth == 8
+                and self._source_exif_bytes is None
+                and self._last_highlight_state is None
+                and self._cached_highlight_analysis is None
+                and self._cached_detail_bands is None
+                and self._cached_max_brightness_state is None
+                and self._cached_u8_lut is None
+                and self._cached_u8_wb_lut is None
+                and not self._mask_assets
+                and not self._mask_raster_cache
+            ):
+                return
             self.original_image = None
             self.current_filepath = None
             self.source_filepath = None
@@ -687,12 +671,11 @@ class ImageEditor:
             self._last_highlight_state = None  # Explicit reset
             self._cached_highlight_analysis = None
             self._cached_detail_bands = None
+            self._cached_max_brightness_state = None
             self._cached_u8_lut = None
             self._cached_u8_wb_lut = None
             self._mask_assets.clear()
             self._mask_raster_cache.clear()
-        # Optionally also reset edits if that matches your mental model:
-        # self.current_edits = self._initial_edits()
 
     def set_source_exif(self, exif_bytes: Optional[bytes]):
         """Store EXIF bytes from the original source (e.g., paired JPEG).
@@ -729,6 +712,8 @@ class ImageEditor:
             "texture": 0.0,
             "straighten_angle": 0.0,
             "darken_settings": None,  # DarkenSettings or None
+            # Per-hue saturation bank (color mix); see _COLOR_MIX_BANDS.
+            **{key: 0.0 for key in _COLOR_MIX_KEYS},
         }
 
     @staticmethod
@@ -859,7 +844,7 @@ class ImageEditor:
             source_exif: Optional EXIF bytes from original source (preserve camera metadata)
             preview_only: If True and image is 8-bit, skip cv2 and float32 conversion.
                           Loads only PIL image + float_preview for histogram analysis.
-                          float_image stays None.  Ignored for 16-bit (TIFF) files.
+                          float_image stays None.  Ignored for 16-bit TIFF/PNG files.
         """
         if not filepath or not Path(filepath).exists():
             with self._lock:
@@ -897,6 +882,7 @@ class ImageEditor:
             self._mask_raster_cache.clear()
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
+        _is_png = load_filepath.suffix.lower() == ".png"
         _is_jpeg = load_filepath.suffix.lower() in (".jpg", ".jpeg")
 
         try:
@@ -969,7 +955,14 @@ class ImageEditor:
                 # --- Convert to Float32 (standard path) ---
                 # Use OpenCV for reliable 16-bit loading as Pillow often
                 # downsamples to 8-bit RGB
-                if preview_only and not _is_tiff:
+                if preview_only and not (_is_tiff or _is_png):
+                    cv_img = None
+                elif not (_is_tiff or _is_png):
+                    # Only TIFF/PNG can carry >8-bit data through this path;
+                    # for every other non-JPEG format (BMP, WEBP, GIF, ...)
+                    # Pillow already decoded the file above, so probing with
+                    # cv2.imread here would just decode the whole file a
+                    # second time for nothing.
                     cv_img = None
                 elif cv2 is None:
                     log.warning(
@@ -1033,8 +1026,32 @@ class ImageEditor:
                             "Loaded 8-bit image via Pillow (OpenCV fallback): %s",
                             load_filepath,
                         )
+                elif (
+                    cv_img_valid
+                    and cv_img.dtype == np.uint8
+                    and cv_img.ndim == 3
+                    and cv_img.shape[2] == 3
+                ):
+                    # cv2 already decoded a usable 8-bit RGB image (probing
+                    # for 16-bit TIFF/PNG data above) -- reuse those pixels
+                    # instead of decoding the same file again via Pillow.
+                    loaded_bit_depth = 8
+                    # Apply EXIF orientation on PIL image so loaded_original
+                    # matches the 8-bit Pillow fallback's behavior.
+                    if orientation > 1:
+                        loaded_original = ImageOps.exif_transpose(loaded_original)
+                        float_image_orientation_applied = True
+                    if not preview_only:
+                        rgb_arr = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+                        if orientation > 1:
+                            rgb_arr = np.ascontiguousarray(
+                                apply_orientation_to_np(rgb_arr, orientation)
+                            )
+                        loaded_float_image = rgb_arr.astype(np.float32)
+                        loaded_float_image *= np.float32(1.0 / 255.0)
+                    log.info("Loaded 8-bit image via OpenCV: %s", load_filepath)
                 else:
-                    # Fallback to Pillow logic for 8-bit or if OpenCV failed/returned 8-bit
+                    # Fallback to Pillow logic for 8-bit or if OpenCV failed/returned unexpected channels
                     loaded_bit_depth = 8
                     # Apply EXIF orientation on PIL image BEFORE float conversion.
                     # Rotating uint8 PIL is ~5x faster than rotating float32 numpy.
@@ -1054,7 +1071,8 @@ class ImageEditor:
             # --- Apply EXIF Orientation ---
             # For 16-bit CV2 path, orientation was not applied during float
             # conversion, so apply it to the numpy array now.
-            # For 8-bit PIL path, float_image is already oriented.
+            # For 8-bit PIL path and 8-bit CV2 path, float_image is already
+            # oriented (float_image_orientation_applied is set to True).
             if orientation > 1:
                 if float_image_orientation_applied:
                     log.debug(
@@ -1103,9 +1121,12 @@ class ImageEditor:
                     h, w = jpeg_arr.shape[:2]
                     scale = min(1920.0 / w, 1080.0 / h, 1.0)
                     if scale < 1.0:
+                        # round(), not int(): truncation skews the preview
+                        # master's aspect ratio relative to the display-size
+                        # downscale in _apply_edits, which uses round().
                         preview_u8 = cv2.resize(
                             jpeg_arr,
-                            (max(1, int(w * scale)), max(1, int(h * scale))),
+                            (max(1, round(w * scale)), max(1, round(h * scale))),
                             interpolation=cv2.INTER_AREA,
                         )
                     else:
@@ -1173,9 +1194,13 @@ class ImageEditor:
                 self.current_filepath = None
                 self.source_filepath = None
                 self.session_id = None
+                self.current_mtime = 0.0
                 self._edits_rev += 1
                 self._cached_preview = None
                 self._cached_rev = -1
+                self._cached_max_brightness_state = None
+                self._cached_highlight_analysis = None
+                self._cached_detail_bands = None
                 self._mask_assets.clear()
                 self._mask_raster_cache.clear()
             return False
@@ -1183,10 +1208,46 @@ class ImageEditor:
     def _rotate_float_image(
         self, img_arr: np.ndarray, angle_deg: float, expand: bool = False
     ) -> np.ndarray:
-        """Rotates a float32 RGB image using PIL 'F' mode per channel to preserve precision."""
+        """Rotates a float32 RGB image, matching PIL's
+        ``Image.rotate(angle_deg, resample=BICUBIC, expand=expand, fillcolor=0.0)``
+        geometry (same output shape, content aligned to within a fraction of
+        a pixel). Uses a single cv2.warpAffine over all channels at once when
+        OpenCV is available (~3x faster than PIL's per-channel 'F' mode
+        rotate + np.stack); falls back to the PIL per-channel path when
+        OpenCV is not installed.
+        """
         if abs(angle_deg) < 0.01:
             return img_arr
 
+        h, w = img_arr.shape[:2]
+        if expand:
+            new_w, new_h = _expanded_canvas_size(w, h, angle_deg)
+        else:
+            new_w, new_h = w, h
+
+        if cv2 is not None:
+            # PIL rotates counterclockwise (for positive angle_deg) about the
+            # image center in a coordinate system where pixel centers sit at
+            # integer coordinates offset by 0.5; cv2.getRotationMatrix2D is
+            # also counterclockwise for positive angles in image coordinates,
+            # and matches PIL's geometry (empirically verified, see
+            # imaging/editor.py Fix 2 rotate rewrite) when the center is
+            # placed at ((w-1)/2, (h-1)/2).
+            cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+            rot_matrix = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+            if expand:
+                rot_matrix[0, 2] += (new_w - w) / 2.0
+                rot_matrix[1, 2] += (new_h - h) / 2.0
+            return cv2.warpAffine(
+                img_arr,
+                rot_matrix,
+                (new_w, new_h),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+
+        # Fallback: PIL 'F' mode per-channel rotation when OpenCV is unavailable.
         c = img_arr.shape[2]
         channels = []
         for i in range(c):
@@ -1254,25 +1315,15 @@ class ImageEditor:
         # ENSURE we are working with a float32 numpy array
         if isinstance(arr, Image.Image):
             arr = np.array(arr.convert("RGB")).astype(np.float32) / 255.0
-        elif not isinstance(arr, np.ndarray):
-            arr = np.array(arr)
+        else:
+            if not isinstance(arr, np.ndarray):
+                arr = np.asarray(arr)
             if arr.dtype == np.uint8:
                 arr = arr.astype(np.float32) / 255.0
             elif arr.dtype == np.uint16:
                 arr = arr.astype(np.float32) / 65535.0
             else:
-                arr = arr.astype(np.float32)
-                # Heuristic: only scan for max if necessary, or use a sample for speed
-                # If the first few thousand pixels are > 1.0, it's likely 8-bit data.
-                if arr.size > 0:
-                    sample = arr.reshape(-1)[:2000]
-                    s_max = sample.max()
-                    if 1.0 < s_max <= 255.0:
-                        arr /= 255.0
-                    elif s_max <= 1.0:
-                        # Double check full array only if sample was small or ambiguous
-                        # but typically 0.0-1.0 images stay 0.0-1.0.
-                        pass
+                arr = arr.astype(np.float32, copy=False)
 
         # NOTE: For UI analysis, we want to capture the state AFTER White Balance and Exposure
         # but BEFORE Highlights/Shadows/ToneMapping, so the indicators reflect the
@@ -1288,15 +1339,14 @@ class ImageEditor:
 
         # 2. Straighten (Free Rotation)
         straighten_angle = float(edits.get("straighten_angle", 0.0))
-        has_crop_box = "crop_box" in edits and edits.get("crop_box", 0.0)
 
         # Effective crop selection in source space (post-90, pre-straighten).
         # A full-frame box selects everything, so it gets the same fill-free
         # autocrop geometry as "no crop" — rotate-only commits must not keep
         # the whole expanded canvas with its four black wedges.
         crop_box_vals: Optional[tuple] = None
-        if has_crop_box:
-            crop_box_edit = edits.get("crop_box")
+        crop_box_edit = edits.get("crop_box")
+        if crop_box_edit:
             try:
                 if len(crop_box_edit) == 4:
                     crop_box_vals = tuple(float(v) for v in crop_box_edit)
@@ -1305,25 +1355,18 @@ class ImageEditor:
             if crop_box_vals == (0.0, 0.0, 1000.0, 1000.0):
                 crop_box_vals = None
 
-        # Apply rotation if significant
-        # During preview (for_export=False), we might skip this if QML handles visuals,
-        # BUT current QML implementation likely expects the buffer to be pre-transformed?
-        # Actually `editor.py` says "During preview (for_export=False), QML handles the visual rotation."
-        # If so, we skip free rotation here for speed?
-        # But if we crop, we MUST rotate first.
-        # Let's preserve logic: if only straightening and not exporting, maybe skip?
-        # The previous code skipped it if NOT for_export?
-        # "Only apply rotation if... and we are exporting" was the comment. implies preview logic handles it.
-        # However, for accurate cropping, we need to rotate.
-
-        apply_rotation = abs(straighten_angle) > 0.001 and (for_export or has_crop_box)
+        # Straighten is baked into the buffer only for export, or when a crop
+        # box must be sliced in straightened space; plain previews leave
+        # free-rotation display to the QML layer.
+        apply_rotation = abs(straighten_angle) > 0.001 and (
+            for_export or crop_box_vals is not None
+        )
 
         # Capture dimensions after 90-degree rotation and before free rotation.
         orig_h, orig_w = arr.shape[:2]
 
         if apply_rotation:
             # Use the float rotation helper
-            # Note: rotate_autocrop_rgb logic was complex.
             # If we have crop box, we manually crop later.
             # If no crop box, we might auto-crop (remove wedges).
             # For floating point, standard 'expand' rotation + manual crop is best.
@@ -1364,10 +1407,10 @@ class ImageEditor:
             else:
                 # No rotation - use current dimensions directly
                 h, w = arr.shape[:2]
-                left = int(crop_box_vals[0] * w / 1000)
-                t = int(crop_box_vals[1] * h / 1000)
-                r = int(crop_box_vals[2] * w / 1000)
-                b = int(crop_box_vals[3] * h / 1000)
+                left = int(round(crop_box_vals[0] * w / 1000))
+                t = int(round(crop_box_vals[1] * h / 1000))
+                r = int(round(crop_box_vals[2] * w / 1000))
+                b = int(round(crop_box_vals[3] * h / 1000))
 
                 left = max(0, left)
                 t = max(0, t)
@@ -1391,7 +1434,7 @@ class ImageEditor:
 
         _mark("geometry")
 
-        # 3.5. Display-size downscale (display-only renders)
+        # 4. Display-size downscale (display-only renders)
         # Tonal edits below are per-pixel, so applying them to an INTER_AREA
         # downscale of the cropped master is visually equivalent to rendering
         # at full resolution and letting the GPU scale it down — and several
@@ -1416,7 +1459,7 @@ class ImageEditor:
         if protect_input and np.may_share_memory(arr, img_arr):
             arr = arr.copy()
 
-        # 4. Conversion to Linear Light
+        # 5. Conversion to Linear Light
         # Cache sRGB u8 BEFORE linearization for accurate JPEG clipping detection.
         # JPEG clipping happens in sRGB after gamma/quantization, so we need the
         # original sRGB values to detect flat-top clipping correctly.
@@ -1435,7 +1478,7 @@ class ImageEditor:
             log.debug("_apply_edits for_export: skip_linear=%s", _skip_linear)
 
         if _skip_linear and not for_export:
-            upstream_hash = self._get_upstream_edits_hash(edits)
+            upstream_hash, upstream_frozen = self._get_upstream_edits_hash(edits)
             analysis_state = None
             with self._lock:
                 cached_dict = (
@@ -1443,7 +1486,11 @@ class ImageEditor:
                     if cache_context is not None
                     else self._cached_highlight_analysis
                 )
-                if cached_dict and cached_dict["hash"] == upstream_hash:
+                if (
+                    cached_dict
+                    and cached_dict["hash"] == upstream_hash
+                    and cached_dict["frozen"] == upstream_frozen
+                ):
                     analysis_state = cached_dict["state"]
 
             if analysis_state is None:
@@ -1465,6 +1512,7 @@ class ImageEditor:
                 with self._lock:
                     entry = {
                         "hash": upstream_hash,
+                        "frozen": upstream_frozen,
                         "state": analysis_state,
                     }
                     if cache_context is not None:
@@ -1510,7 +1558,7 @@ class ImageEditor:
             arr = _srgb_to_linear_fast(arr)
             _mark("linear_convert")
 
-            # 5. White Balance (Multipliers in Linear Space)
+            # 6. White Balance (Multipliers in Linear Space)
             by = edits.get("white_balance_by", 0.0) * 0.5
             mg = edits.get("white_balance_mg", 0.0) * 0.5
             if abs(by) > 0.001 or abs(mg) > 0.001:
@@ -1525,7 +1573,7 @@ class ImageEditor:
             if should_analyze:
                 pre_exposure_linear_stride = arr[::4, ::4, :]
 
-            # 6. Exposure (Linear Gain for True Headroom)
+            # 7. Exposure (Linear Gain for True Headroom)
             exposure = edits.get("exposure", 0.0)
             if abs(exposure) > 0.001:
                 # EV units: 2^exposure
@@ -1539,7 +1587,7 @@ class ImageEditor:
 
             if should_analyze:
                 # Check cache for analysis state to avoid expensive re-computation on downstream edits
-                upstream_hash = self._get_upstream_edits_hash(edits)
+                upstream_hash, upstream_frozen = self._get_upstream_edits_hash(edits)
 
                 cached_analysis = None
                 with self._lock:
@@ -1548,7 +1596,11 @@ class ImageEditor:
                         if cache_context is not None
                         else self._cached_highlight_analysis
                     )
-                    if cached_dict and cached_dict["hash"] == upstream_hash:
+                    if (
+                        cached_dict
+                        and cached_dict["hash"] == upstream_hash
+                        and cached_dict["frozen"] == upstream_frozen
+                    ):
                         cached_analysis = cached_dict["state"]
 
                 if cached_analysis:
@@ -1568,6 +1620,7 @@ class ImageEditor:
                     with self._lock:
                         entry = {
                             "hash": upstream_hash,
+                            "frozen": upstream_frozen,
                             "state": analysis_state,
                         }
                         if cache_context is not None:
@@ -1579,7 +1632,7 @@ class ImageEditor:
                 with self._lock:
                     self._last_highlight_state = analysis_state
 
-            # 7. Highlights/Shadows - Using linear light and brightness-based processing
+            # 8. Highlights/Shadows - Using linear light and brightness-based processing
             if abs(highlights) > 0.001 or abs(shadows) > 0.001:
                 arr = self._apply_highlights_shadows(
                     arr,
@@ -1593,7 +1646,7 @@ class ImageEditor:
 
             _mark("linear_tone")
 
-            # 8-10. Clarity / Texture / Sharpness (Unified Pyramid Detail Bands)
+            # 9-11. Clarity / Texture / Sharpness (Unified Pyramid Detail Bands)
             #
             # Uses a hierarchical luma-only pyramid decomposition to avoid:
             # - Triple-amplifying the same edges (halo stacking)
@@ -1660,7 +1713,7 @@ class ImageEditor:
 
                 # Compute exposure scale factor for reusing cached blurs
                 # blur(k*Y) = k*blur(Y) is exact only if Y scales linearly with exposure.
-                # Since highlights/shadows recovery (step 7) is non-linear and sits between
+                # Since highlights/shadows recovery (step 8) is non-linear and sits between
                 # exposure and detail bands, this scaling is APPROXIMATE when h/s is active.
                 # The approximation is good enough for smooth 60fps dragging; exact render
                 # happens when upstream params (WB/crop/rotate) change and cache invalidates.
@@ -1778,14 +1831,14 @@ class ImageEditor:
 
             _mark("detail_bands")
 
-            # 11. Global Headroom Shoulder (safety net for values > 1.0)
+            # 12. Global Headroom Shoulder (safety net for values > 1.0)
             # This ONLY affects values above 1.0, compressing headroom smoothly.
             # It does NOT interfere with normal highlight slider work below 1.0.
             # Applied here in linear space before gamma conversion.
             # Use small max_overshoot (0.05) to keep values very close to 1.0
             arr = _apply_headroom_shoulder(arr, max_overshoot=0.05)
 
-            # --- Conversion back to sRGB ---
+            # 13. Conversion back to sRGB
             # The headroom shoulder above caps values at 1.05, inside the LUT
             # domain, so the fast version is exact here (within quantization).
             arr = _linear_to_srgb_fast(arr)
@@ -1796,22 +1849,20 @@ class ImageEditor:
         # _skip_linear=True and for_export=True to avoid corrupting self.float_image.
         # Vignette is excluded from the no-copy path because it uses in-place math.
 
-        # 11. Brightness / Contrast (sRGB Space)
-        # 7. Brightness
+        # 14. Brightness (sRGB Space)
         b_val = edits.get("brightness", 0.0)
         if abs(b_val) > 0.001:
             factor = 1.0 + b_val
             arr = arr * factor
 
-        # 8. Contrast
+        # 15. Contrast (sRGB Space)
         c_val = edits.get("contrast", 0.0)
         if abs(c_val) > 0.001:
             # Scale effect to reduce sensitivity (0.4x)
             factor = 1.0 + c_val * 0.4
             arr = (arr - 0.5) * factor + 0.5
 
-        # 12. Saturation / Vibrance (sRGB Space)
-        # 10. Saturation
+        # 16. Saturation (sRGB Space)
         sat_val = edits.get("saturation", 0.0)
         if abs(sat_val) > 0.001:
             # Scale effect to reduce sensitivity (0.5x)
@@ -1819,7 +1870,7 @@ class ImageEditor:
             gray = _rec601_gray(arr)[..., None]
             arr = gray + (arr - gray) * factor
 
-        # 12. Vibrance (Smart Saturation)
+        # 17. Vibrance (Smart Saturation)
         vibrance = edits.get("vibrance", 0.0)
         if abs(vibrance) > 0.001:
             if cv2 is not None:
@@ -1839,7 +1890,59 @@ class ImageEditor:
             gray = _rec601_gray(arr)[..., None]
             arr = gray + (arr - gray) * np.expand_dims(factor, axis=2)
 
-        # 13. Levels (Blacks/Whites)
+        # 18. Per-hue saturation (color mix bank)
+        # Eight hue bands each scale chroma toward Rec.601 gray, hue-targeted via
+        # a raised-cosine weight on the pixel's HSV hue. All active bands are
+        # accumulated into a single per-pixel factor and applied in one
+        # gray-blend pass; the whole block is skipped when every band is ~0 so
+        # default images pay nothing.
+        color_mix_vals = [
+            (center, float(edits.get(key, 0.0)))
+            for key, (_name, center) in zip(_COLOR_MIX_KEYS, _COLOR_MIX_BANDS)
+        ]
+        if any(abs(v) > 0.001 for _c, v in color_mix_vals):
+            if cv2 is not None:
+                # Clip first: arr can hold out-of-[0,1] values here (headroom from
+                # earlier contrast/brightness overshoot), where HSV hue is
+                # ill-defined. np.clip also returns a C-contiguous copy, so no
+                # separate contiguity check is needed for cv2.cvtColor.
+                hue = cv2.cvtColor(np.clip(arr, 0.0, 1.0), cv2.COLOR_RGB2HSV)[:, :, 0]
+            else:
+                hue_source = np.clip(arr, 0.0, 1.0)
+                cmax = hue_source.max(axis=2)
+                cmin = hue_source.min(axis=2)
+                delta = cmax - cmin
+                safe = delta > 1e-6
+                r, g, b = hue_source[:, :, 0], hue_source[:, :, 1], hue_source[:, :, 2]
+                hue = np.zeros_like(cmax)
+                # Standard HSV hue (degrees), guarding the achromatic case.
+                rmax = safe & (cmax == r)
+                gmax = safe & (cmax == g) & ~rmax
+                bmax = safe & (cmax == b) & ~rmax & ~gmax
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    hue[rmax] = (60.0 * ((g - b)[rmax] / delta[rmax]) + 360.0) % 360.0
+                    hue[gmax] = 60.0 * ((b - r)[gmax] / delta[gmax]) + 120.0
+                    hue[bmax] = 60.0 * ((r - g)[bmax] / delta[bmax]) + 240.0
+
+            factor = np.zeros(arr.shape[:2], dtype=np.float32)
+            for center, value in color_mix_vals:
+                if abs(value) <= 0.001:
+                    continue
+                # Smallest angular distance to the band center (wrap-aware).
+                dist = np.abs(((hue - center + 180.0) % 360.0) - 180.0)
+                near = dist < _COLOR_MIX_HALF_WIDTH
+                if not np.any(near):
+                    continue
+                weight = np.zeros_like(factor)
+                weight[near] = 0.5 * (
+                    1.0 + np.cos(np.pi * dist[near] / _COLOR_MIX_HALF_WIDTH)
+                )
+                factor += np.float32(value * _COLOR_MIX_GAIN) * weight
+
+            gray = _rec601_gray(arr)[..., None]
+            arr = gray + (arr - gray) * (1.0 + factor)[..., None]
+
+        # 19. Levels (Blacks/Whites)
         blacks = edits.get("blacks", 0.0)
         whites = edits.get("whites", 0.0)
         if abs(blacks) > 0.001 or abs(whites) > 0.001:
@@ -1852,7 +1955,7 @@ class ImageEditor:
                 # The ramp above allocates, so in-place soft clip is safe.
                 arr = _apply_levels_soft_clip(arr)
 
-        # 13.5. Background Darkening (masked, after levels, before vignette)
+        # 19.5. Background Darkening (masked, after levels, before vignette)
         darken = edits.get("darken_settings")
         if darken is not None and getattr(darken, "enabled", False):
             # Use override assets/cache if provided (export snapshot), else live state
@@ -1888,7 +1991,7 @@ class ImageEditor:
 
         _mark("srgb_ops")
 
-        # 14. Vignette
+        # 20. Vignette
         vignette = edits.get("vignette", 0.0)
         if abs(vignette) > 0.001:
             h, w = arr.shape[:2]
@@ -2025,9 +2128,17 @@ class ImageEditor:
 
         # Render the current edited baseline first so auto-levels sees any
         # already-active adjustments such as WB, crop, rotation, or tone edits.
+        # This renders a downsampled scratch buffer, so it must not publish
+        # live highlight telemetry or pollute the shared preview cache.
         if _debug:
             t_arr = time.perf_counter()
-        edited_arr = self._apply_edits(img_arr, edits=edits_snapshot, for_export=False)
+        edited_arr = self._apply_edits(
+            img_arr,
+            edits=edits_snapshot,
+            for_export=False,
+            cache_context={},
+            update_highlight_state=False,
+        )
 
         # Quantize the float render to 10-bit bins for percentile analysis.
         # 1024 bins resolve the endpoints ~4x finer than the legacy uint8
@@ -2149,7 +2260,7 @@ class ImageEditor:
         # Downsample the source before copying so full-resolution masters stay
         # cheap while _apply_edits still receives a private mutable array.
         longest_edge = max(source_arr.shape[0], source_arr.shape[1])
-        stride = max(1, longest_edge // _AUTO_VIBRANCE_ANALYSIS_MAX_EDGE)
+        stride = max(1, math.ceil(longest_edge / _AUTO_VIBRANCE_ANALYSIS_MAX_EDGE))
         analysis_source = (
             source_arr[::stride, ::stride, :] if stride > 1 else source_arr
         )
@@ -2526,8 +2637,14 @@ class ImageEditor:
             "confidence": confidence,
         }
 
-    def _get_upstream_edits_hash(self, edits: Dict[str, Any]) -> int:
-        """Returns a hash of edit parameters that affect the input to highlight recovery."""
+    def _get_upstream_edits_hash(self, edits: Dict[str, Any]) -> tuple:
+        """Returns (hash, frozen_values) of edit parameters that affect the
+        input to highlight recovery.
+
+        Mirrors ``_get_detail_upstream_hash``: callers must verify both the
+        hash AND the frozen tuple before trusting a cache hit, since a bare
+        hash has no collision protection.
+        """
         # Parameters that affect the image BEFORE highlight recovery:
         # bit_depth (implicit), crop_box, rotation, straighten_angle,
         # white_balance_by, white_balance_mg, exposure.
@@ -2555,7 +2672,8 @@ class ImageEditor:
         values.append(str(self.current_filepath))
         # Include float_image ID to catch reload-in-place or content changes (e.g. forced reload)
         values.append(self.current_mtime)
-        return hash(tuple(values))
+        frozen = tuple(values)
+        return (hash(frozen), frozen)
 
     def _get_detail_upstream_hash(self, edits: Dict[str, Any]) -> tuple:
         """Returns a frozen tuple of edit parameters that affect the input to detail bands.
@@ -2601,12 +2719,18 @@ class ImageEditor:
         self,
         allow_compute: bool = True,
         edits_override: Optional[Dict[str, Any]] = None,
+        output_size: Optional[Tuple[int, int]] = None,
     ) -> Optional[DecodedImage]:
         """Return cached preview if available, otherwise compute and cache.
 
         Args:
             allow_compute: If False, returns None immediately if cache is stale (avoids blocking).
+            output_size: Optional (width, height) the returned frame is resized
+                to (aspect-guarded). Keeps live-preview dimensions stable across
+                the full-resolution refinement swap so it cannot nudge the
+                fitted image. The unresized render is what gets cached.
         """
+        cached: Optional[DecodedImage] = None
         with self._lock:
             # Check cache validity
             if (
@@ -2614,26 +2738,28 @@ class ImageEditor:
                 and self._cached_preview is not None
                 and self._cached_rev == self._edits_rev
             ):
-                return self._cached_preview
-
-            if not allow_compute:
+                cached = self._cached_preview
+            elif not allow_compute:
                 return None
+            else:
+                # Prepare for computation - snapshot data under lock. float_preview
+                # is only ever reassigned, never mutated in place, so the render
+                # can share it; protect_input copies only the post-crop region.
+                base = self.float_preview
+                edits = (
+                    dict(self.current_edits)
+                    if edits_override is None
+                    else dict(edits_override)
+                )
+                icc_bytes = (
+                    self.original_image.info.get("icc_profile")
+                    if self.original_image is not None
+                    else None
+                )
+                rev = self._edits_rev
 
-            # Prepare for computation - snapshot data under lock. float_preview
-            # is only ever reassigned, never mutated in place, so the render
-            # can share it; protect_input copies only the post-crop region.
-            base = self.float_preview
-            edits = (
-                dict(self.current_edits)
-                if edits_override is None
-                else dict(edits_override)
-            )
-            icc_bytes = (
-                self.original_image.info.get("icc_profile")
-                if self.original_image is not None
-                else None
-            )
-            rev = self._edits_rev
+        if cached is not None:
+            return self._resize_decoded_for_display(cached, output_size)
 
         if base is None:
             return None
@@ -2652,7 +2778,47 @@ class ImageEditor:
                 self._cached_preview = decoded
                 self._cached_rev = rev
 
-        return decoded
+        return self._resize_decoded_for_display(decoded, output_size)
+
+    @staticmethod
+    def _resize_decoded_for_display(
+        decoded: Optional[DecodedImage],
+        output_size: Optional[Tuple[int, int]],
+    ) -> Optional[DecodedImage]:
+        """Resize a packaged RGB888 frame to ``output_size`` when safe.
+
+        Skips when cv2 is unavailable or the aspect ratios diverge (a stale
+        target recorded before a geometry edit must not distort the frame);
+        the unresized frame is always correct, just at other dimensions.
+        """
+        if decoded is None or output_size is None or cv2 is None:
+            return decoded
+        if QImage is None or decoded.format != QImage.Format.Format_RGB888:
+            return decoded
+        target_w, target_h = int(output_size[0]), int(output_size[1])
+        if target_w <= 0 or target_h <= 0 or decoded.width <= 0 or decoded.height <= 0:
+            return decoded
+        if target_w == decoded.width and target_h == decoded.height:
+            return decoded
+        target_aspect = target_w / target_h
+        if abs(decoded.width / decoded.height - target_aspect) > 0.005 * target_aspect:
+            return decoded
+        arr = (
+            np.frombuffer(decoded.buffer, dtype=np.uint8)
+            .reshape(decoded.height, decoded.bytes_per_line)[:, : decoded.width * 3]
+            .reshape(decoded.height, decoded.width, 3)
+        )
+        interpolation = cv2.INTER_AREA if target_w < decoded.width else cv2.INTER_LINEAR
+        resized = np.ascontiguousarray(
+            cv2.resize(arr, (target_w, target_h), interpolation=interpolation)
+        )
+        return DecodedImage(
+            buffer=memoryview(resized.tobytes()),
+            width=target_w,
+            height=target_h,
+            bytes_per_line=resized.strides[0],
+            format=decoded.format,
+        )
 
     def _render_decoded_from_float(
         self,
@@ -2821,9 +2987,19 @@ class ImageEditor:
         return preview
 
     def get_original_compare_preview_data(
-        self, *, full_resolution: bool = False
+        self,
+        *,
+        full_resolution: bool = False,
+        max_long_edge: Optional[int] = None,
+        output_size: Optional[Tuple[int, int]] = None,
     ) -> Optional[DecodedImage]:
-        """Render the source image with only crop framing applied."""
+        """Render the source image with only crop framing applied.
+
+        ``max_long_edge`` caps the full-resolution render at display size,
+        and ``output_size`` resizes the preview-sized render (aspect-guarded),
+        so the compare frame matches the live preview's dimensions and
+        toggling compare cannot nudge the fitted image.
+        """
         if full_resolution:
             try:
                 self._ensure_float_image()
@@ -2834,13 +3010,13 @@ class ImageEditor:
             if full_resolution and self.float_image is None:
                 return None
             # Share the master (never mutated in place) and let protect_input
-            # copy only the cropped region; the preview branch already returns
-            # a private array, so it needs no protection.
-            base = (
-                self.float_image
-                if full_resolution
-                else self._float_preview_from_master()
-            )
+            # copy only the cropped region; the preview branch builds its own
+            # private array outside the lock, so it needs no protection.
+            # Only cheap references are snapshotted here -- the actual preview
+            # render happens after the lock is released (see below), since it
+            # does a full thumbnail resize + color correction and must not
+            # block other threads that need self._lock.
+            base = self.float_image if full_resolution else None
             edits = self._crop_only_edits(dict(self.current_edits))
             icc_bytes = (
                 self.original_image.info.get("icc_profile")
@@ -2848,18 +3024,23 @@ class ImageEditor:
                 else None
             )
 
+        if not full_resolution:
+            base = self._float_preview_from_master()
+
         if base is None:
             return None
 
-        return self._render_decoded_from_float(
+        decoded = self._render_decoded_from_float(
             base,
             edits=edits,
             for_export=full_resolution,
             apply_loupe_color=full_resolution,
             icc_bytes=icc_bytes,
             cache_context={},
+            downscale_long_edge=max_long_edge if full_resolution else None,
             protect_input=full_resolution,
         )
+        return self._resize_decoded_for_display(decoded, output_size)
 
     def get_preview_data(self) -> Optional[DecodedImage]:
         """Apply current edits and return the data as a DecodedImage."""
@@ -2882,6 +3063,12 @@ class ImageEditor:
                     val_deg = float(value)
                     rounded_deg = round(val_deg / 90.0) * 90
                     final_val = int(rounded_deg) % 360
+
+                    # Called on every navigation keypress (even when idle),
+                    # so bail out before touching crop_box/_edits_rev if the
+                    # rotation isn't actually changing.
+                    if final_val == current_val:
+                        return False
 
                     if abs(val_deg - rounded_deg) > 1.0:
                         log.warning(
@@ -2933,7 +3120,6 @@ class ImageEditor:
         shadows: float,
         *,
         srgb_u8_stride: Optional[np.ndarray] = None,
-        srgb_u8: Optional[np.ndarray] = None,  # Planned future alias for srgb_u8_stride
         analysis_state: Optional[Dict[str, float]] = None,
         edits: Optional[Dict[str, Any]] = None,
         cache_context: Optional[dict] = None,
@@ -2954,26 +3140,24 @@ class ImageEditor:
             shadows: -1.0 to 1.0, positive lifts shadows, negative crushes
             srgb_u8_stride: Optional uint8 sRGB array (strided) for accurate JPEG clipping detection
                      (should be the image BEFORE linearization)
-            srgb_u8: Keyword-only alias for srgb_u8_stride (not yet active in call site).
             analysis_state: Optional pre-computed analysis state to avoid re-work.
 
         Returns:
             Adjusted float32 RGB array (linear)
         """
         arr = linear
-        effective_srgb_u8 = srgb_u8 if srgb_u8 is not None else srgb_u8_stride
 
         # Analyze highlight state if needed
         # If caller passed analysis_state, usage that.
         state = analysis_state
         if state is None:
             # Re-compute locally if not provided
-            # We assume effective_srgb_u8 is ALREADY STRIDED if passed
+            # We assume srgb_u8_stride is ALREADY STRIDED if passed
             arr_stride = arr[::4, ::4, :]
-            # If effective_srgb_u8 was passed, use it directly (it's already small).
+            # If srgb_u8_stride was passed, use it directly (it's already small).
             # If it wasn't passed, we can't easily recreate the source state here without the original source buffer.
             # But the caller (_apply_edits) usually provides it.
-            state = _analyze_highlight_state(arr_stride, srgb_u8=effective_srgb_u8)
+            state = _analyze_highlight_state(arr_stride, srgb_u8=srgb_u8_stride)
 
         # Ensure we have edits dict to check upstream hash
         if edits is None:
@@ -3038,10 +3222,8 @@ class ImageEditor:
                 # Robustify: use percentile to ignore hot pixels, clamped to valid range
                 if headroom_pct > 0.01:
                     # Check cache for max_brightness
-                    max_brightness = 1.0
-
                     # Compute hash of upstream params
-                    current_hash = self._get_upstream_edits_hash(edits)
+                    current_hash, current_frozen = self._get_upstream_edits_hash(edits)
 
                     max_brightness = 1.0
                     hit = False
@@ -3051,7 +3233,11 @@ class ImageEditor:
                             if cache_context is not None
                             else self._cached_max_brightness_state
                         )
-                        if cached and cached.get("hash") == current_hash:
+                        if (
+                            cached
+                            and cached.get("hash") == current_hash
+                            and cached.get("frozen") == current_frozen
+                        ):
                             max_brightness = cached["value"]
                             hit = True
 
@@ -3081,6 +3267,7 @@ class ImageEditor:
                         with self._lock:
                             entry = {
                                 "hash": current_hash,
+                                "frozen": current_frozen,
                                 "value": max_brightness,
                             }
                             if cache_context is not None:
@@ -3131,11 +3318,23 @@ class ImageEditor:
         return arr
 
     def set_crop_box(self, crop_box: Tuple[int, int, int, int]):
-        """Set the normalized crop box (left, top, right, bottom) from 0-1000."""
+        """Set the normalized crop box (left, top, right, bottom) from 0-1000.
+
+        A full-frame box (0, 0, 1000, 1000) is normalized to ``None`` here so
+        every caller sees the same "no crop" representation that
+        ``_apply_edits`` treats as fill-free autocrop geometry.
+        """
+        normalized: Optional[Tuple[int, int, int, int]] = crop_box
+        if crop_box is not None:
+            try:
+                if tuple(float(v) for v in crop_box) == (0.0, 0.0, 1000.0, 1000.0):
+                    normalized = None
+            except (TypeError, ValueError):
+                pass
         with self._lock:
-            if self.current_edits.get("crop_box") == crop_box:
+            if self.current_edits.get("crop_box") == normalized:
                 return False
-            self.current_edits["crop_box"] = crop_box
+            self.current_edits["crop_box"] = normalized
             self._edits_rev += 1
             return True
 
@@ -3437,8 +3636,6 @@ class ImageEditor:
             # Always deepcopy DarkenSettings when present so the background
             # thread never reads the live object (which the main thread can
             # mutate, e.g. enabling/disabling or changing params).
-            import copy
-
             ds = edits_snapshot.get("darken_settings")
             if ds is not None:
                 edits_snapshot["darken_settings"] = copy.deepcopy(ds)

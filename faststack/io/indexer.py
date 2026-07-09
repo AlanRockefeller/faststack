@@ -2,7 +2,6 @@
 
 import logging
 import os
-import re
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -20,13 +19,13 @@ log = logging.getLogger(__name__)
 RAW_EXTENSIONS = {".orf", ".rw2", ".cr2", ".cr3", ".arw", ".nef", ".raf", ".dng"}
 
 JPG_EXTENSIONS = {".jpg", ".jpeg", ".jpe"}
-
-# Matches FastStack backup stems: name-backup, name-backup2, name-backup33, etc.
-_BACKUP_STEM_RE = re.compile(r"-backup\d*$", re.IGNORECASE)
+_BASE_SUFFIX_PREFERENCE = (".jpg", ".jpeg", ".jpe")
 
 
 def _scan_directory(
     directory: Path,
+    *,
+    include_visible_jpgs: bool = True,
 ) -> Tuple[
     List[Tuple[Path, os.stat_result]],
     List[Tuple[Path, os.stat_result]],
@@ -34,7 +33,7 @@ def _scan_directory(
 ]:
     """Single os.scandir pass, returns (visible_jpgs, all_jpgs, raws).
 
-    visible_jpgs: JPGs excluding backups (legacy behavior).
+    visible_jpgs: JPGs excluding backups when include_visible_jpgs is True.
     all_jpgs: ALL JPGs including backups (for variant grouping).
     raws: keyed by stem.casefold().
     """
@@ -42,20 +41,28 @@ def _scan_directory(
     all_jpgs: List[Tuple[Path, os.stat_result]] = []
     raws: Dict[str, List[Tuple[Path, os.stat_result]]] = {}
 
-    for entry in os.scandir(directory):
-        if entry.is_file():
-            p = Path(entry.path)
-            ext = p.suffix.lower()
-            if ext in JPG_EXTENSIONS:
-                stat = entry.stat()
-                all_jpgs.append((p, stat))
-                if not _BACKUP_STEM_RE.search(p.stem):
-                    visible_jpgs.append((p, stat))
-            elif ext in RAW_EXTENSIONS:
-                stem = p.stem.casefold()
-                if stem not in raws:
-                    raws[stem] = []
-                raws[stem].append((p, entry.stat()))
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            try:
+                if not entry.is_file():
+                    continue
+
+                p = Path(entry.path)
+                ext = p.suffix.lower()
+                if ext in JPG_EXTENSIONS:
+                    stat = entry.stat()
+                    all_jpgs.append((p, stat))
+                    if include_visible_jpgs and not _is_backup_variant(p):
+                        visible_jpgs.append((p, stat))
+                elif ext in RAW_EXTENSIONS:
+                    stat = entry.stat()
+                    raws.setdefault(p.stem.casefold(), []).append((p, stat))
+            except OSError as exc:
+                log.debug(
+                    "Skipping unreadable or vanished directory entry %s: %s",
+                    entry.path,
+                    exc,
+                )
 
     return visible_jpgs, all_jpgs, raws
 
@@ -75,7 +82,9 @@ def _build_image_list(
         if is_dev:
             developed_candidates.append((p, stat, base_stem))
         else:
-            base_map[p.name.casefold()] = (stat.st_mtime, p.name)
+            # For casefold-colliding base names, keep the first timestamp/sort
+            # source for developed files; base files are already added above.
+            base_map.setdefault(p.name.casefold(), (stat.st_mtime, p.name))
             raw_pair = _find_raw_pair(p, stat, raws.get(p.stem.casefold(), []))
             if raw_pair:
                 used_raws.add(raw_pair)
@@ -85,8 +94,7 @@ def _build_image_list(
     for p, stat, base_stem in developed_candidates:
         effective_ts = stat.st_mtime
         effective_name = p.name.casefold()
-        for ext in sorted(JPG_EXTENSIONS):
-            candidate = (base_stem + ext).casefold()
+        for candidate in _base_name_candidates(base_stem, p.suffix):
             if candidate in base_map:
                 base_ts, base_name = base_map[candidate]
                 effective_ts = base_ts
@@ -100,7 +108,7 @@ def _build_image_list(
         )
         image_entries.append((image_sort_key(img), img))
 
-    for stem, raw_list in raws.items():
+    for raw_list in raws.values():
         for raw_path, raw_stat in raw_list:
             if raw_path not in used_raws:
                 img = ImageFile(
@@ -110,6 +118,58 @@ def _build_image_list(
 
     image_entries.sort(key=lambda x: x[0])
     return [x[1] for x in image_entries]
+
+
+def _is_backup_variant(path: Path) -> bool:
+    """Return True when the shared variant parser classifies a path as backup."""
+    _, _, backup_number = parse_variant_stem(path.stem)
+    return backup_number is not None
+
+
+def _base_name_candidates(base_stem: str, developed_suffix: str) -> List[str]:
+    """Return base filename candidates, preferring the developed file's suffix."""
+    candidates = []
+    seen = set()
+    for ext in (developed_suffix.lower(), *_BASE_SUFFIX_PREFERENCE):
+        if ext not in JPG_EXTENSIONS or ext in seen:
+            continue
+        seen.add(ext)
+        candidates.append((base_stem + ext).casefold())
+    return candidates
+
+
+def _variant_groups_by_path(
+    variant_map: Dict[str, VariantGroup],
+) -> Dict[Path, VariantGroup]:
+    groups_by_path = {}
+    for group in variant_map.values():
+        for info in group.all_files:
+            groups_by_path[info.path] = group
+    return groups_by_path
+
+
+def _is_hidden_variant_path(path: Path, group: VariantGroup) -> bool:
+    if path == group.main_path:
+        return False
+    return path == group.developed_path or path in group.backup_paths.values()
+
+
+def _log_scan_result(image_files: List[ImageFile], elapsed: float) -> None:
+    paired_count = sum(
+        1
+        for im in image_files
+        if im.raw_pair and im.path.suffix.lower() in JPG_EXTENSIONS
+    )
+    raw_only_count = sum(
+        1 for im in image_files if im.path.suffix.lower() not in JPG_EXTENSIONS
+    )
+    log.info(
+        "Found %d images (%d paired, %d raw-only) in %.2fs.",
+        len(image_files),
+        paired_count,
+        raw_only_count,
+        elapsed,
+    )
 
 
 def find_images(directory: Path) -> List[ImageFile]:
@@ -130,21 +190,7 @@ def find_images(directory: Path) -> List[ImageFile]:
     image_files = _build_image_list(visible_jpgs, raws)
 
     elapsed = time.perf_counter() - t_start
-    paired_count = sum(
-        1
-        for im in image_files
-        if im.raw_pair and im.path.suffix.lower() in JPG_EXTENSIONS
-    )
-    raw_only_count = sum(
-        1 for im in image_files if im.path.suffix.lower() not in JPG_EXTENSIONS
-    )
-    log.info(
-        "Found %d images (%d paired, %d raw-only) in %.2fs.",
-        len(image_files),
-        paired_count,
-        raw_only_count,
-        elapsed,
-    )
+    _log_scan_result(image_files, elapsed)
     return image_files
 
 
@@ -161,55 +207,38 @@ def find_images_with_variants(
     log.info("Scanning directory for images: %s", directory)
 
     try:
-        visible_jpgs, all_jpgs, raws = _scan_directory(directory)
+        _, all_jpgs, raws = _scan_directory(directory, include_visible_jpgs=False)
     except OSError:
         log.exception("Error scanning directory %s", directory)
         return [], {}
 
-    # Build the visible image list (legacy behavior)
-    image_files = _build_image_list(visible_jpgs, raws)
-
     # Build variant map from ALL jpgs (including backups)
     all_jpg_paths = [p for p, _ in all_jpgs]
     variant_map = build_variant_map(all_jpg_paths)
+    groups_by_path = _variant_groups_by_path(variant_map)
 
-    # Filter visible list: keep only entries whose path equals their group's main_path.
-    # This removes developed files that are reachable via badges while keeping
-    # orphan developed files that ARE their group's main.
-    filtered = []
+    # Hide only files that are actually exposed by a group's variant badges.
+    # Same-stem JPGs that are not selected as developed/backups stay visible.
+    visible_variant_jpgs = []
+    for p, stat in all_jpgs:
+        p_norm = Path(norm_path(p))
+        group = groups_by_path.get(p_norm)
+        if group and _is_hidden_variant_path(p_norm, group):
+            log.debug(
+                "Filtering out variant %s (main=%s)",
+                p.name,
+                group.main_path.name if group.main_path else "?",
+            )
+            continue
+        visible_variant_jpgs.append((p, stat))
+
+    image_files = _build_image_list(visible_variant_jpgs, raws)
+
     for img in image_files:
         ext = img.path.suffix.lower()
         if ext not in JPG_EXTENSIONS:
-            # RAW-only: always keep
-            filtered.append(img)
             continue
-
-        group_key, _, _ = parse_variant_stem(img.path.stem)
-        key_cf = group_key.casefold()
-        group = variant_map.get(key_cf)
-        img_norm = Path(norm_path(img.path))
-        if group is None or len(group.all_files) <= 1:
-            # No variant group or singleton: keep as-is
-            filtered.append(img)
-        elif group.main_path == img_norm:
-            # This IS the main: keep it (normalize to match build_variant_map)
-            filtered.append(img)
-        else:
-            # This is a developed file reachable via badge: remove from visible list
-            log.debug(
-                "Filtering out variant %s (main=%s)",
-                img.path.name,
-                group.main_path.name if group.main_path else "?",
-            )
-
-    # Annotate images with variant flags
-    for img in filtered:
-        ext = img.path.suffix.lower()
-        if ext not in JPG_EXTENSIONS:
-            continue
-        group_key, _, _ = parse_variant_stem(img.path.stem)
-        key_cf = group_key.casefold()
-        group = variant_map.get(key_cf)
+        group = groups_by_path.get(Path(norm_path(img.path)))
         if group:
             img.has_backups = bool(group.backup_paths)
             img.has_developed = (
@@ -217,25 +246,8 @@ def find_images_with_variants(
                 and group.developed_path != group.main_path
             )
 
-    image_files = filtered
-
     elapsed = time.perf_counter() - t_start
-    paired_count = sum(
-        1
-        for im in image_files
-        if im.raw_pair and im.path.suffix.lower() in JPG_EXTENSIONS
-    )
-    raw_only_count = sum(
-        1 for im in image_files if im.path.suffix.lower() not in JPG_EXTENSIONS
-    )
-
-    log.info(
-        "Found %d images (%d paired, %d raw-only) in %.2fs.",
-        len(image_files),
-        paired_count,
-        raw_only_count,
-        elapsed,
-    )
+    _log_scan_result(image_files, elapsed)
     return image_files, variant_map
 
 

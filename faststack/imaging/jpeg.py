@@ -4,7 +4,7 @@ import logging
 import time
 import warnings
 from io import BytesIO
-from typing import Any, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -126,7 +126,14 @@ def decode_jpeg_thumb_rgb(
 def _get_turbojpeg_scaling_factor(
     width: int, height: int, max_dim: int
 ) -> Optional[Tuple[int, int]]:
-    """Finds the best libjpeg-turbo scaling factor to get a thumbnail <= max_dim."""
+    """Finds the best libjpeg-turbo scaling factor to get a thumbnail <= max_dim.
+
+    "Fit within" semantics: returns the LARGEST factor whose scaled
+    dimensions are both <= ``max_dim``, falling back to the smallest
+    available factor if nothing fits. For display decodes that must
+    never come out undersized, use
+    :func:`_get_turbojpeg_covering_factor` instead.
+    """
     if not TURBO_AVAILABLE or not JPEG_DECODER:
         return None
 
@@ -145,14 +152,55 @@ def _get_turbojpeg_scaling_factor(
     return supported_factors[-1] if supported_factors else None
 
 
+def _get_turbojpeg_covering_factor(
+    constraining_dim: int, target: int
+) -> Optional[Tuple[int, int]]:
+    """Finds the smallest libjpeg-turbo factor that keeps the decode >= target.
+
+    "Never undersized" semantics for the display path: given the image's
+    CONSTRAINING dimension (the one that bounds the aspect-preserving
+    fit into the viewport — the caller must determine which dimension
+    that is), returns the SMALLEST non-upscaling factor (``num <= den``)
+    such that ``constraining_dim * num / den >= target``. A subsequent
+    high-quality downscale can then hit the exact target without ever
+    handing an undersized image to a caller that would upscale it
+    (e.g. nearest-neighbor QML display). Only the constraining dimension
+    matters: the other dimension needs fewer pixels than the viewport
+    offers, so requiring it to reach the target too would only force a
+    needlessly large decode.
+
+    Upscaling factors (num > den) are never selected. If even the
+    full-size image (1/1) is smaller than ``target``, returns (1, 1) —
+    native size is the best available source and no scaling factor can
+    help.
+    """
+    if not TURBO_AVAILABLE or not JPEG_DECODER:
+        return None
+
+    # Only consider non-upscaling factors, smallest-first, so we pick
+    # the smallest one that still meets or exceeds the target.
+    no_upscale = sorted(
+        (f for f in JPEG_DECODER.scaling_factors if f[0] <= f[1]),
+        key=lambda x: x[0] / x[1],
+    )
+    for num, den in no_upscale:
+        if (constraining_dim * num / den) >= target:
+            return (num, den)
+    return (1, 1)
+
+
 def decode_jpeg_resized(
     jpeg_bytes: bytes,
     width: int,
     height: int,
     fast_dct: bool = False,
     source_path: Optional[str] = None,
+    mode: Literal["fast", "cover"] = "cover",
 ) -> Optional[np.ndarray]:
     """Decodes and resizes a JPEG to fit within the given dimensions."""
+    if mode not in ("fast", "cover"):
+        raise ValueError(f"Unknown JPEG resize mode: {mode}")
+
     if width <= 0 or height <= 0:
         return decode_jpeg_rgb(jpeg_bytes, fast_dct=fast_dct, source_path=source_path)
 
@@ -160,12 +208,29 @@ def decode_jpeg_resized(
         try:
             img_width, img_height, _, _ = JPEG_DECODER.decode_header(jpeg_bytes)
 
-            if img_width * height > img_height * width:
-                max_dim = width
-            else:
-                max_dim = height
+            if mode == "cover":
+                # The constraining dimension is the one that bounds the
+                # aspect-preserving fit into the viewport; only it needs to
+                # reach max_dim after scaling (the other dimension needs
+                # fewer pixels than the viewport provides).
+                if img_width * height > img_height * width:
+                    max_dim = width
+                    constraining_dim = img_width
+                else:
+                    max_dim = height
+                    constraining_dim = img_height
 
-            scale_factor = _get_turbojpeg_scaling_factor(img_width, img_height, max_dim)
+                scale_factor = _get_turbojpeg_covering_factor(constraining_dim, max_dim)
+            else:
+                if img_width * height > img_height * width:
+                    max_dim = width
+                else:
+                    max_dim = height
+                scale_factor = _get_turbojpeg_scaling_factor(
+                    img_width,
+                    img_height,
+                    max_dim,
+                )
 
             if scale_factor:
                 flags = 0

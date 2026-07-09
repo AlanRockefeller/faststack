@@ -100,6 +100,7 @@ class DecodedImage:
     height: int
     bytes_per_line: int
     format: Any  # QImage.Format
+    quality: str = "cover"  # "fast" navigation decode or settled "cover" decode
 
     def __sizeof__(self) -> int:
         """Returns the size of the image buffer in bytes."""

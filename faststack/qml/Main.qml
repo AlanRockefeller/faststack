@@ -4,11 +4,13 @@ import QtQuick.Window
 import QtQuick.Controls 2.15
 import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
+import QtCore
 import "."
+import "WindowPlacement.js" as WP
 
 ApplicationWindow {
     id: root
-    visible: true
+    visible: false
     width: 1200
     height: 800
     minimumWidth: 800
@@ -21,6 +23,18 @@ ApplicationWindow {
     property bool allowCloseWithRecycleBins: false
     property bool fullScreenLoupe: false
     property var savedWindowGeometry: ({})
+    property bool windowGeometryReady: false
+    property bool suppressWindowGeometrySave: false
+
+    Settings {
+        id: mainWindowSettings
+        category: "mainWindow"
+        property real savedX: 0
+        property real savedY: 0
+        property real savedWidth: -1
+        property real savedHeight: -1
+        property bool savedMaximized: false
+    }
 
     function enterFullScreenLoupe() {
         if (!root.uiStateRef || root.uiStateRef.isGridViewActive) return
@@ -40,8 +54,9 @@ ApplicationWindow {
     function exitFullScreenLoupe() {
         if (!fullScreenLoupe) return
 
+        root.suppressWindowGeometrySave = true
         fullScreenLoupe = false
-        
+
         if (savedWindowGeometry.visibility === Window.Maximized) {
             root.showMaximized()
         } else {
@@ -53,6 +68,10 @@ ApplicationWindow {
                 root.height = savedWindowGeometry.height
             }
         }
+        root.suppressWindowGeometrySave = false
+        // showNormal()/showMaximized() above are async; let the window settle
+        // before persisting so we don't capture the transient FullScreen state.
+        saveGeometryTimer.restart()
         root.requestActivate()
     }
 
@@ -64,30 +83,102 @@ ApplicationWindow {
         }
     }
 
-    function clampWindowToVisibleScreen() {
-        if (root.visibility !== Window.Windowed || !root.screen) return
+    function hasSavedMainWindowGeometry() {
+        return mainWindowSettings.savedWidth > 0 && mainWindowSettings.savedHeight > 0
+    }
 
-        var screenX = root.screen.virtualX
-        var screenY = root.screen.virtualY
-        var screenWidth = root.screen.desktopAvailableWidth
-        var screenHeight = root.screen.desktopAvailableHeight
-        if (screenWidth <= 0 || screenHeight <= 0) return
+    function clampWindowToVisibleScreen(force) {
+        if (!force && root.visibility !== Window.Windowed) return
+        // Clamp against the monitor the window's coordinates actually fall on
+        // (falling back to the current screen). Using root.screen alone would
+        // pull a window restored onto a secondary monitor back to the primary,
+        // because root.screen is the primary until the window is mapped.
+        var screen = WP.screenContaining(Application.screens, root.x, root.y)
+                     || root.screen
+        WP.clampToScreen(root, screen, {
+            minWidth: root.minimumWidth,
+            minHeight: root.minimumHeight
+        })
+    }
 
-        var newWidth = Math.min(root.width, screenWidth)
-        var newHeight = Math.min(root.height, screenHeight)
-        var newX = Math.max(screenX, Math.min(root.x, screenX + screenWidth - newWidth))
-        var newY = Math.max(screenY, Math.min(root.y, screenY + screenHeight - newHeight))
+    function restoreWindowPlacement() {
+        root.suppressWindowGeometrySave = true
 
-        root.x = newX
-        root.y = newY
-        root.width = newWidth
-        root.height = newHeight
+        if (root.hasSavedMainWindowGeometry()) {
+            root.width = mainWindowSettings.savedWidth
+            root.height = mainWindowSettings.savedHeight
+            root.x = mainWindowSettings.savedX
+            root.y = mainWindowSettings.savedY
+            // Clamp against the saved monitor before showing, so a window saved
+            // on a secondary screen comes back there instead of the primary.
+            root.clampWindowToVisibleScreen(true)
+            root.visible = true
+            if (mainWindowSettings.savedMaximized) {
+                root.showMaximized()
+            }
+        } else {
+            // First run: center on the active screen rather than pinning the
+            // window to (0, 0). Retry after showing in case no screen was
+            // available yet.
+            var centered = WP.centerOnScreen(root, root.screen)
+            root.visible = true
+            if (!centered) WP.centerOnScreen(root, root.screen)
+            root.clampWindowToVisibleScreen(true)
+            // Persist the initial centered placement so the next launch
+            // restores it instead of treating geometry as unsaved.
+            mainWindowSettings.savedX = root.x
+            mainWindowSettings.savedY = root.y
+            mainWindowSettings.savedWidth = root.width
+            mainWindowSettings.savedHeight = root.height
+            mainWindowSettings.savedMaximized = false
+        }
+
+        root.suppressWindowGeometrySave = false
+    }
+
+    function saveWindowPlacement(force) {
+        if (!root.windowGeometryReady || root.suppressWindowGeometrySave) return
+        if (!force && !root.visible) return
+        if (root.fullScreenLoupe || root.visibility === Window.Minimized) return
+        // Don't capture state while the window is hidden / mid-teardown:
+        // visibility is unreliable there and isMaximized would read false,
+        // clobbering the real value saved on close (Component.onDestruction).
+        if (root.visibility === Window.Hidden) return
+
+        mainWindowSettings.savedMaximized = root.isMaximized
+        if (root.visibility === Window.Windowed) {
+            mainWindowSettings.savedX = root.x
+            mainWindowSettings.savedY = root.y
+            mainWindowSettings.savedWidth = root.width
+            mainWindowSettings.savedHeight = root.height
+        }
+    }
+
+    function queueWindowPlacementSave() {
+        if (!root.windowGeometryReady || root.suppressWindowGeometrySave) return
+        saveGeometryTimer.restart()
     }
 
     function openDialogSafely(dialog) {
         root.clampWindowToVisibleScreen()
         dialog.open()
     }
+
+    // Debounce continuous geometry changes (drags/resizes) and let the window
+    // settle after maximize/un-maximize transitions before persisting, so we
+    // never store a transient size/visibility. Authoritative saves on close go
+    // through saveWindowPlacement(true) directly.
+    Timer {
+        id: saveGeometryTimer
+        interval: 400
+        onTriggered: root.saveWindowPlacement()
+    }
+
+    onXChanged: root.queueWindowPlacementSave()
+    onYChanged: root.queueWindowPlacementSave()
+    onWidthChanged: root.queueWindowPlacementSave()
+    onHeightChanged: root.queueWindowPlacementSave()
+    onVisibilityChanged: root.queueWindowPlacementSave()
 
     onClosing: function(close) {
         if (!root.allowCloseWithRecycleBins
@@ -104,14 +195,21 @@ ApplicationWindow {
             return
         }
 
+        root.saveWindowPlacement(true)
         close.accepted = true
     }
 
     Component.onCompleted: {
         root.uiStateRef = uiState
         root.controllerRef = controller
-        // Initialization complete
+        root.restoreWindowPlacement()
+        root.windowGeometryReady = true
+        // No forced save here: restoreWindowPlacement already persisted the
+        // first-run placement, and saving now would read a transient
+        // visibility while showMaximized() is still in flight.
     }
+
+    Component.onDestruction: root.saveWindowPlacement(true)
 
     Material.theme: (root.uiStateRef && root.uiStateRef.theme === 0) ? Material.Dark : Material.Light
     Material.accent: "#4fb360"
@@ -832,7 +930,7 @@ ApplicationWindow {
         id: actionsMenu
         parent: Overlay.overlay
         implicitWidth: 220
-        onClosed: sortSubMenu.close()
+        onClosed: { sortSubMenu.close(); showOnlySubMenu.close() }
 
         background: Rectangle {
             implicitWidth: 220
@@ -950,6 +1048,49 @@ ApplicationWindow {
                 defaultTextColor: root.currentTextColor
                 onClicked: { root.openDialogSafely(filterDialog); actionsMenu.close() }
             }
+            ItemDelegate {
+                id: showOnlyLauncher
+                width: 220
+                height: 36
+                hoverEnabled: true
+                background: Rectangle {
+                    color: showOnlyLauncher.hovered ? root.menuHoverColor : "transparent"
+                }
+                contentItem: Item {
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Show Only"
+                        color: root.currentTextColor
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    Text {
+                        anchors.right: parent.right
+                        anchors.rightMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "▶" // Right-pointing triangle
+                        font.pixelSize: 10
+                        color: root.currentTextColor
+                        opacity: 0.6
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                onHoveredChanged: {
+                    if (hovered) {
+                        sortSubMenu.close()
+                        showOnlySubMenu.popupAt(showOnlyLauncher, showOnlyLauncher.width - 4, 0)
+                    }
+                }
+                onClicked: {
+                    sortSubMenu.close()
+                    showOnlySubMenu.popupAt(showOnlyLauncher, showOnlyLauncher.width - 4, 0)
+                }
+                // Ensure keyboard activation works reliably
+                Keys.onReturnPressed: clicked()
+                Keys.onEnterPressed: clicked()
+                Keys.onSpacePressed: clicked()
+            }
 
             // Separator before Sort options
             Rectangle {
@@ -988,10 +1129,12 @@ ApplicationWindow {
                 }
                 onHoveredChanged: {
                     if (hovered) {
+                        showOnlySubMenu.close()
                         sortSubMenu.popupAt(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
                     }
                 }
                 onClicked: {
+                    showOnlySubMenu.close()
                     sortSubMenu.popupAt(sortPhotosLauncher, sortPhotosLauncher.width - 4, 0)
                 }
                 // Ensure keyboard activation works reliably
@@ -1192,6 +1335,69 @@ ApplicationWindow {
                     if (root.controllerRef) root.controllerRef.set_sort_mode("date_reverse")
                     sortSubMenu.close()
                     actionsMenu.close()
+                }
+            }
+        }
+    }
+
+    // "Show Only" submenu: checkboxes for each metadata state stored in the
+    // sidecar json. Toggling a checkbox adds/removes that flag from the active
+    // view filter (AND logic). A Popup, not a Menu — see sortSubMenu above.
+    Popup {
+        id: showOnlySubMenu
+        parent: Overlay.overlay
+        implicitWidth: 180
+        padding: 0
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+        // Position relative to a source item, mapped into the overlay.
+        function popupAt(item, dx, dy) {
+            var p = item.mapToItem(Overlay.overlay, dx, dy)
+            x = p.x
+            y = p.y
+            open()
+        }
+
+        // Label -> metadata flag name (attributes on EntryMetadata).
+        readonly property var flagItems: [
+            { label: "Favorites", flag: "favorite" },
+            { label: "Batch",     flag: "batch" },
+            { label: "Uploaded",  flag: "uploaded" },
+            { label: "Stacked",   flag: "stacked" },
+            { label: "Restacked", flag: "restacked" },
+            { label: "Edited",    flag: "edited" },
+            { label: "Todo",      flag: "todo" }
+        ]
+
+        background: Rectangle {
+            implicitWidth: 180
+            implicitHeight: showOnlySubMenuColumn.implicitHeight
+            color: root.currentBackgroundColor
+            border.color: root.isDarkTheme ? "#666666" : "#cccccc"
+            radius: 4
+        }
+
+        contentItem: Column {
+            id: showOnlySubMenuColumn
+
+            Repeater {
+                model: showOnlySubMenu.flagItems
+                delegate: MenuActionItem {
+                    id: showOnlyFlagItem
+                    required property var modelData
+
+                    width: 180
+                    text: showOnlyFlagItem.modelData.label
+                    showCheckbox: true
+                    checkboxChecked: root.uiStateRef
+                        ? root.uiStateRef.filterFlags.indexOf(showOnlyFlagItem.modelData.flag) >= 0
+                        : false
+                    hoverFillColor: root.menuHoverColor
+                    defaultTextColor: root.currentTextColor
+                    // Keep the submenu open so multiple states can be toggled.
+                    onClicked: {
+                        if (root.uiStateRef) root.uiStateRef.toggleFilterFlag(showOnlyFlagItem.modelData.flag)
+                    }
                 }
             }
         }
@@ -2101,7 +2307,7 @@ ApplicationWindow {
         modal: true
         standardButtons: Dialog.NoButton
         closePolicy: Popup.CloseOnEscape
-        width: Math.min(580, parent ? parent.width * 0.9 : 580)
+        width: Math.min(640, parent ? parent.width * 0.9 : 640)
         height: Math.min(520, parent ? parent.height * 0.86 : 520)
         x: parent ? (parent.width - width) / 2 : 0
         y: parent ? (parent.height - height) / 2 : 0
@@ -2185,7 +2391,7 @@ ApplicationWindow {
 
                 Button {
                     text: "Skip This Version"
-                    Layout.preferredWidth: 150
+                    Layout.preferredWidth: 140
                     onClicked: {
                         if (root.controllerRef) root.controllerRef.skip_update_version(updateDialog.latestVersion)
                         updateDialog.close()
@@ -2196,14 +2402,22 @@ ApplicationWindow {
 
                 Button {
                     text: "Remind Me Later"
-                    Layout.preferredWidth: 140
+                    Layout.preferredWidth: 130
                     onClicked: updateDialog.close()
+                }
+
+                Button {
+                    text: "View Changelog"
+                    Layout.preferredWidth: 140
+                    onClicked: {
+                        if (root.controllerRef) root.controllerRef.open_changelog()
+                    }
                 }
 
                 Button {
                     text: "Open Release"
                     highlighted: true
-                    Layout.preferredWidth: 130
+                    Layout.preferredWidth: 120
                     onClicked: {
                         if (root.controllerRef) root.controllerRef.open_update_release(updateDialog.releaseUrl)
                         updateDialog.close()
@@ -2234,7 +2448,7 @@ ApplicationWindow {
     }
     Dialog {
         id: recycleBinCleanupDialog
-        title: "Clean up Recycle Bins?"
+        title: recycleBinCleanupDialog.cleanupTitle
         x: (parent.width - width) / 2
         y: (parent.height - height) / 2
         width: Math.min(600, parent.width * 0.9)
@@ -2247,6 +2461,11 @@ ApplicationWindow {
         property var binInfoItems: root.toArray(binInfo)
         property var restorableBins: root.itemsWithStatus(binInfoItems, "restorable")
         property var unavailableBins: root.itemsWithStatus(binInfoItems, "unavailable")
+        // Treat a single recycle-bin directory as just "Recycle Bin" (singular).
+        // Plural "Recycle Bins" only when files were deleted across multiple dirs.
+        property bool singleBin: binInfoItems.length === 1
+        readonly property string cleanupTitle: recycleBinCleanupDialog.singleBin
+            ? "Clean up Recycle Bin?" : "Clean up Recycle Bins?"
 
         function refreshBinInfo() {
             if (root.uiStateRef) {
@@ -2277,7 +2496,7 @@ ApplicationWindow {
             }
             Text {
                 anchors.centerIn: parent
-                text: "Clean up Recycle Bins?"
+                text: recycleBinCleanupDialog.cleanupTitle
                 color: root.currentTextColor
                 font.bold: true
                 font.pixelSize: 20
@@ -2445,7 +2664,7 @@ ApplicationWindow {
                 spacing: 12
 
                 Label {
-                    text: "All files in recycle bins:"
+                    text: recycleBinCleanupDialog.singleBin ? "All files in recycle bin:" : "All files in recycle bins:"
                     color: "#81C784"
                     font.pixelSize: 15
                     font.bold: true

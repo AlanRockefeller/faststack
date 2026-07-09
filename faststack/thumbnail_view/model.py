@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -36,9 +36,11 @@ def _empty_folder_stats_payload() -> dict:
         "stacked_count": 0,
         "uploaded_count": 0,
         "edited_count": 0,
+        "batch_count": 0,
         "jpg_count": 0,
         "raw_count": 0,
         "coverage_buckets": [],
+        "batch_coverage_buckets": [],
     }
 
 
@@ -222,18 +224,16 @@ class ThumbnailModel(QAbstractListModel):
             return self._get_thumbnail_source(entry, reason=reason)
         elif role == self.FolderStatsRole:
             if entry.folder_stats:
-                return {
-                    "total_images": entry.folder_stats.total_images,
-                    "stacked_count": entry.folder_stats.stacked_count,
-                    "uploaded_count": entry.folder_stats.uploaded_count,
-                    "edited_count": entry.folder_stats.edited_count,
-                    "jpg_count": entry.folder_stats.jpg_count,  # Actually image-like files: JPG, PNG, etc.
-                    "raw_count": entry.folder_stats.raw_count,
-                    # Convert tuples to lists for safer QML type conversion
-                    "coverage_buckets": [
-                        list(t) for t in entry.folder_stats.coverage_buckets
-                    ],
-                }
+                # Derive the payload from the dataclass so new fields don't have
+                # to be added in three synchronized places. (jpg_count is
+                # actually image-like files: JPG, PNG, etc.)
+                payload = asdict(entry.folder_stats)
+                # asdict preserves the tuple type; convert to lists for safer
+                # QML type conversion.
+                payload["coverage_buckets"] = [
+                    list(t) for t in payload["coverage_buckets"]
+                ]
+                return payload
             return _empty_folder_stats_payload()
         elif role == self.IsSelectedRole:
             return row in self._selected_indices

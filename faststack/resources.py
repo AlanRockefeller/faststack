@@ -31,6 +31,18 @@ def faststack_qml_dir() -> Path:
     return qml_dir
 
 
+def _faststack_file_path(filename: str) -> Optional[Path]:
+    """Return the first bundled/source file match for ``filename``."""
+    package_dir = faststack_package_dir()
+    for candidate in (
+        package_dir / filename,
+        package_dir.parent / filename,
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def faststack_readme_path() -> Optional[Path]:
     """Return the bundled README.md path across source and frozen layouts.
 
@@ -38,15 +50,21 @@ def faststack_readme_path() -> Optional[Path]:
     parent of the package directory). In a PyInstaller build it is bundled
     next to the package. Return the first candidate that exists, else None.
     """
-    package_dir = faststack_package_dir()
-    for candidate in (
-        package_dir / "README.md",
-        package_dir.parent / "README.md",
-    ):
-        if candidate.is_file():
-            return candidate
+    path = _faststack_file_path("README.md")
+    if path is not None:
+        return path
 
-    log.warning("FastStack README.md was not found near %s", package_dir)
+    log.warning("FastStack README.md was not found near %s", faststack_package_dir())
+    return None
+
+
+def faststack_changelog_path() -> Optional[Path]:
+    """Return the bundled ChangeLog.md path across source and frozen layouts."""
+    path = _faststack_file_path("ChangeLog.md")
+    if path is not None:
+        return path
+
+    log.warning("FastStack ChangeLog.md was not found near %s", faststack_package_dir())
     return None
 
 

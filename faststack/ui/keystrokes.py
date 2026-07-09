@@ -53,6 +53,8 @@ class Keybinder:
 
         self.modifier_key_map = {
             (Qt.Key_C, Qt.ControlModifier): "copy_path_to_clipboard",
+            (Qt.Key_Right, Qt.ShiftModifier): "next_image_by_10",
+            (Qt.Key_Left, Qt.ShiftModifier): "prev_image_by_10",
             (Qt.Key_0, Qt.ControlModifier): "reset_zoom_pan",
             (Qt.Key_Z, Qt.ControlModifier): "undo_delete",
             (Qt.Key_E, Qt.ControlModifier): "toggle_edited",

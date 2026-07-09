@@ -532,6 +532,9 @@ class MaskRasterCache:
         self._resolved_key: Optional[tuple] = None
         self._resolved_mask: Optional[np.ndarray] = None
 
+    def __bool__(self) -> bool:
+        return self._stroke_maps is not None or self._resolved_mask is not None
+
     def clear(self) -> None:
         self._stroke_key = None
         self._stroke_maps = None
