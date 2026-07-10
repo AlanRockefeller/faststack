@@ -444,6 +444,9 @@ class AppController(QObject):
         self._decode_invalidation_lock = threading.Lock()
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
         self.image_editor = ImageEditor()  # Initialize the editor
+        # In-progress background-darkening brush stroke; must exist before
+        # the first navigation because _reset_darken_on_navigation reads it.
+        self._current_darken_stroke: Optional[dict] = None
         self._dialog_open_count = 0  # Track nested dialogs
         self._temp_files_to_clean: List[Path] = (
             []
@@ -13553,7 +13556,7 @@ def main(
     _debug_thumb_trace = debug_thumb_trace
 
     t0 = time.perf_counter()
-    setup_logging(debug)
+    log_file = setup_logging(debug)
     if debug:
         log.info("Startup: after setup_logging: %.3fs", time.perf_counter() - t0)
     log.info("Starting FastStack")
@@ -13572,6 +13575,43 @@ def main(
     app = QApplication(
         sys.argv
     )  # QApplication is correct for desktop apps with widgets
+
+    # PyInstaller's windowed Windows build has no stdout/stderr console. Make
+    # debug mode discoverable when launched by double-clicking the executable.
+    debug_requested = debug or debug_cache or debug_thumb_timing or debug_thumb_trace
+    if debug_requested and (sys.stdout is None or sys.stderr is None):
+        if log_file is not None:
+            if os.name == "nt":
+                # PowerShell single-quoted strings escape apostrophes by
+                # doubling them. LiteralPath also avoids wildcard expansion.
+                quoted_log_file = str(log_file).replace("'", "''")
+                tail_command = f"Get-Content -LiteralPath '{quoted_log_file}' -Wait"
+            else:
+                tail_command = f"tail -f {shlex.quote(str(log_file))}"
+            message = (
+                "FastStack is running without a console, so debug output is "
+                f"being written to:\n\n{log_file}\n\n"
+                "You can view it while FastStack is running with this command:\n\n"
+                f"{tail_command}"
+            )
+        else:
+            tail_command = ""
+            message = (
+                "FastStack is running without a console, and no log file "
+                "could be created."
+            )
+        debug_message_box = QMessageBox(
+            QMessageBox.Icon.Information, "FastStack Debug Logging", message
+        )
+        if tail_command:
+            copy_button = debug_message_box.addButton(
+                "Copy command", QMessageBox.ButtonRole.ActionRole
+            )
+            copy_button.clicked.connect(
+                lambda: QApplication.clipboard().setText(tail_command)
+            )
+        debug_message_box.addButton(QMessageBox.StandardButton.Ok)
+        debug_message_box.exec()
 
     # Enable Ctrl-C to terminate the application
     import signal

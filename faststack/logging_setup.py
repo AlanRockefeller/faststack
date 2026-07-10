@@ -70,7 +70,7 @@ def get_app_data_dir() -> Path:
     return fallback
 
 
-def setup_logging(debug: bool = False):
+def setup_logging(debug: bool = False) -> Path | None:
     """Sets up logging to a rotating file in the app data directory.
 
     Args:
@@ -125,3 +125,4 @@ def setup_logging(debug: bool = False):
         logging.getLogger("faststack.imaging.cache").setLevel(logging.ERROR)
         logging.getLogger("faststack.imaging.prefetch").setLevel(logging.ERROR)
     logging.getLogger("PIL").setLevel(logging.INFO)
+    return log_file
