@@ -75,6 +75,9 @@ def setup_logging(debug: bool = False) -> Path | None:
 
     Args:
         debug: If True, sets log level to DEBUG. Otherwise, sets to WARNING to reduce noise.
+
+    Returns:
+        The log file path, or None when file logging is unavailable.
     """
     log_dir = get_app_data_dir() / "logs"
     log_file = None
@@ -87,7 +90,8 @@ def setup_logging(debug: bool = False) -> Path | None:
         except OSError:
             log_dir = None
 
-    if log_dir is None:
+    # Windowed PyInstaller builds run with sys.stderr set to None.
+    if log_dir is None and sys.stderr is not None:
         sys.stderr.write(
             "WARNING: Could not create log directory; logs will not be persisted.\n"
         )
@@ -99,22 +103,32 @@ def setup_logging(debug: bool = False) -> Path | None:
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    # Console handler (for seeing logs in terminal)
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-
     root_logger = logging.getLogger()
     # Set log level based on debug flag
     root_logger.setLevel(logging.DEBUG if debug else logging.WARNING)
     root_logger.handlers.clear()
-    root_logger.addHandler(console_handler)
+
+    # Console handler (for seeing logs in terminal). Windowed builds have no
+    # stderr stream; a handler attached to None would raise on every record.
+    if sys.stderr is not None:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
 
     if log_file is not None:
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file, maxBytes=10 * 1024 * 1024, backupCount=5
-        )
-        file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
+        try:
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=10 * 1024 * 1024, backupCount=5
+            )
+        except OSError as exc:
+            # The file itself can be unopenable even when the directory exists
+            # (locked by another process, a directory named app.log, ACLs).
+            # Return None so main() can tell the user no log file is available.
+            log.warning("Could not open log file %s: %s", log_file, exc)
+            log_file = None
+        else:
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
 
     # Configure logging for key modules
     if debug:

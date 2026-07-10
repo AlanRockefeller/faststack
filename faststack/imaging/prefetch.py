@@ -634,7 +634,7 @@ class Prefetcher:
         """
         if self.debug:
             _t_start = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} update_prefetch: START index={current_index} dir={direction}"
             )
 
@@ -704,7 +704,7 @@ class Prefetcher:
             if n == 0:
                 if self.debug:
                     _t_end = time.perf_counter()
-                    print(
+                    log.info(
                         f"[DBGCACHE] {_t_end*1000:.3f} update_prefetch: DONE submitted=0 empty=True total={(_t_end - _t_start)*1000:.2f}ms"
                     )
                 return
@@ -761,7 +761,7 @@ class Prefetcher:
 
         if self.debug:
             _t_end = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} update_prefetch: DONE submitted={tasks_submitted} total={(_t_end - _t_start)*1000:.2f}ms"
             )
 
@@ -781,7 +781,7 @@ class Prefetcher:
 
         if self.debug and priority:
             _t_start = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} submit_task: PRIORITY index={index} gen={generation} override={override_path} quality={quality}"
             )
 
