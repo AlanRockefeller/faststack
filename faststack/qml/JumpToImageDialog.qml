@@ -14,7 +14,7 @@ Dialog {
     property int maxImageCount: 0
     property color backgroundColor: "red" // Placeholder, will be set from Main.qml
     property color textColor: "white" // Placeholder, will be set from Main.qml
-    property var controllerRef: typeof controller !== "undefined" ? controller : null
+    property var controllerRef: null
 
 
     // Inherit Material theme from parent
