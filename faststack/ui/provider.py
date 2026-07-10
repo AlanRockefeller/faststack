@@ -109,7 +109,7 @@ class ImageProvider(QQuickImageProvider):
         _debug = getattr(self.app_controller, "debug_cache", False)
         if _debug:
             _t_start = time.perf_counter()
-            print(f"[DBGCACHE] {_t_start*1000:.3f} requestImage: START id={id}")
+            log.info(f"[DBGCACHE] {_t_start*1000:.3f} requestImage: START id={id}")
 
         if not id:
             return self._fallback_image()
@@ -321,7 +321,7 @@ class ImageProvider(QQuickImageProvider):
 
             if _debug:
                 _t_got = time.perf_counter()
-                print(
+                log.info(
                     f"[DBGCACHE] {_t_got*1000:.3f} requestImage: got image_data in {(_t_got - _t_get)*1000:.2f}ms"
                 )
 
@@ -383,7 +383,7 @@ class ImageProvider(QQuickImageProvider):
 
                 if _debug:
                     _t_end = time.perf_counter()
-                    print(
+                    log.info(
                         f"[DBGCACHE] {_t_end*1000:.3f} requestImage: DONE id={id} total={(_t_end - _t_start)*1000:.2f}ms"
                     )
 

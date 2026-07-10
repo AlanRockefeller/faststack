@@ -444,6 +444,9 @@ class AppController(QObject):
         self._decode_invalidation_lock = threading.Lock()
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
         self.image_editor = ImageEditor()  # Initialize the editor
+        # In-progress background-darkening brush stroke; must exist before
+        # the first navigation because _reset_darken_on_navigation reads it.
+        self._current_darken_stroke: Optional[dict] = None
         self._dialog_open_count = 0  # Track nested dialogs
         self._temp_files_to_clean: List[Path] = (
             []
@@ -1185,7 +1188,7 @@ class AppController(QObject):
 
         token = self._quality_decode_token
         if self.debug_cache:
-            print(
+            log.info(
                 f"[DBGCACHE] {time.perf_counter()*1000:.3f} quality_decode: SUBMIT index={index} gen={display_gen} cached={getattr(decoded, 'quality', None)}"
             )
 
@@ -1251,7 +1254,7 @@ class AppController(QObject):
         self.ui_refresh_generation += 1
         self.ui_state.currentImageSourceChanged.emit()
         if self.debug_cache:
-            print(
+            log.info(
                 f"[DBGCACHE] {time.perf_counter()*1000:.3f} quality_decode: REFRESH index={index} gen={display_generation}"
             )
 
@@ -2297,7 +2300,7 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} get_decoded_image: START index={index}"
             )
 
@@ -2339,7 +2342,7 @@ class AppController(QObject):
 
             if self.debug_cache:
                 _t_end = time.perf_counter()
-                print(
+                log.info(
                     f"[DBGCACHE] {_t_end*1000:.3f} get_decoded_image: CACHE HIT index={index} total={(_t_end - _t_start)*1000:.2f}ms"
                 )
 
@@ -2356,7 +2359,7 @@ class AppController(QObject):
             ]
             cache_usage_gb = self.image_cache.currsize / (1024**3)
             _t_miss = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_miss*1000:.3f} get_decoded_image: CACHE MISS index={index} gen={display_gen} (after {(_t_miss - _t_start)*1000:.2f}ms)"
             )
             log.info(
@@ -2430,7 +2433,7 @@ class AppController(QObject):
                     log.info("Decoded image %d in %.3fs", index, elapsed)
                 if self.debug_cache:
                     _t_decoded = time.perf_counter()
-                    print(
+                    log.info(
                         f"[DBGCACHE] {_t_decoded*1000:.3f} get_decoded_image: DECODED index={index} total={(_t_decoded - _t_start)*1000:.2f}ms"
                     )
                 return decoded
@@ -2523,7 +2526,7 @@ class AppController(QObject):
         """
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} sync_ui_state: START gen={self.ui_refresh_generation + 1}"
             )
 
@@ -2562,7 +2565,7 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} sync_ui_state: DONE signals emitted, total={(_t_end - _t_start)*1000:.2f}ms"
             )
 
@@ -2617,7 +2620,7 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} _emit_debounced_metadata_signals: emitting deferred signals"
             )
 
@@ -2628,7 +2631,7 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} _emit_debounced_metadata_signals: DONE total={(_t_end - _t_start)*1000:.2f}ms"
             )
 
@@ -4814,7 +4817,7 @@ class AppController(QObject):
         """Centralized method to change current image index and reset state."""
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} _set_current_index: START index={index} dir={direction}"
             )
 
@@ -4852,7 +4855,7 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_prefetch = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_prefetch*1000:.3f} _set_current_index: calling _do_prefetch"
             )
 
@@ -4862,7 +4865,7 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_sync = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_sync*1000:.3f} _set_current_index: calling sync_ui_state (prefetch took {(_t_sync - _t_prefetch)*1000:.2f}ms)"
             )
 
@@ -4876,14 +4879,14 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} _set_current_index: DONE total={(_t_end - _t_start)*1000:.2f}ms"
             )
 
     def next_image(self):
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} next_image: START from index={self.current_index}"
             )
 
@@ -4892,7 +4895,7 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} next_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
             )
 
@@ -4904,7 +4907,7 @@ class AppController(QObject):
     def prev_image(self):
         if self.debug_cache:
             _t_start = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} prev_image: START from index={self.current_index}"
             )
 
@@ -4913,7 +4916,7 @@ class AppController(QObject):
 
         if self.debug_cache:
             _t_end = time.perf_counter()
-            print(
+            log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} prev_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
             )
 
@@ -13553,7 +13556,10 @@ def main(
     _debug_thumb_trace = debug_thumb_trace
 
     t0 = time.perf_counter()
-    setup_logging(debug)
+    # Any diagnostic flag needs debug-level logging: in windowed builds the
+    # console is gone, so the log file is the only place their output lands.
+    debug_requested = debug or debug_cache or debug_thumb_timing or debug_thumb_trace
+    log_file = setup_logging(debug_requested)
     if debug:
         log.info("Startup: after setup_logging: %.3fs", time.perf_counter() - t0)
     log.info("Starting FastStack")
@@ -13572,6 +13578,42 @@ def main(
     app = QApplication(
         sys.argv
     )  # QApplication is correct for desktop apps with widgets
+
+    # PyInstaller's windowed Windows build has no stdout/stderr console. Make
+    # debug mode discoverable when launched by double-clicking the executable.
+    if debug_requested and (sys.stdout is None or sys.stderr is None):
+        if log_file is not None:
+            if os.name == "nt":
+                # PowerShell single-quoted strings escape apostrophes by
+                # doubling them. LiteralPath also avoids wildcard expansion.
+                quoted_log_file = str(log_file).replace("'", "''")
+                tail_command = f"Get-Content -LiteralPath '{quoted_log_file}' -Wait"
+            else:
+                tail_command = f"tail -f {shlex.quote(str(log_file))}"
+            message = (
+                "FastStack is running without a console, so debug output is "
+                f"being written to:\n\n{log_file}\n\n"
+                "You can view it while FastStack is running with this command:\n\n"
+                f"{tail_command}"
+            )
+        else:
+            tail_command = ""
+            message = (
+                "FastStack is running without a console, and no log file "
+                "could be created."
+            )
+        debug_message_box = QMessageBox(
+            QMessageBox.Icon.Information, "FastStack Debug Logging", message
+        )
+        if tail_command:
+            copy_button = debug_message_box.addButton(
+                "Copy command", QMessageBox.ButtonRole.ActionRole
+            )
+            copy_button.clicked.connect(
+                lambda: QApplication.clipboard().setText(tail_command)
+            )
+        debug_message_box.addButton(QMessageBox.StandardButton.Ok)
+        debug_message_box.exec()
 
     # Enable Ctrl-C to terminate the application
     import signal
