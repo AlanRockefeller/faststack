@@ -1448,6 +1448,12 @@ ApplicationWindow {
 
     property int footerHeight: 60
     property int effectiveFooterHeight: fullScreenLoupe ? 0 : footerHeight
+    readonly property bool loupeNavigationShortcutsEnabled: root.uiStateRef
+        ? root.uiStateRef.imageCount > 0
+          && !root.uiStateRef.isGridViewActive
+          && !root.uiStateRef.isDialogOpen
+          && !(root.uiStateRef.isEditorOpen && root.uiStateRef.isEditorExpanded)
+        : false
 
     Shortcut {
         sequence: "F11"
@@ -1519,6 +1525,34 @@ ApplicationWindow {
         onActivated: {
             if (root.uiStateRef) root.uiStateRef.toggleGridView()
         }
+    }
+
+    Shortcut {
+        sequence: "Left"
+        context: Qt.WindowShortcut
+        enabled: root.loupeNavigationShortcutsEnabled
+        onActivated: root.uiStateRef.prevImage()
+    }
+
+    Shortcut {
+        sequence: "Right"
+        context: Qt.WindowShortcut
+        enabled: root.loupeNavigationShortcutsEnabled
+        onActivated: root.uiStateRef.nextImage()
+    }
+
+    Shortcut {
+        sequence: "Shift+Left"
+        context: Qt.WindowShortcut
+        enabled: root.loupeNavigationShortcutsEnabled
+        onActivated: root.uiStateRef.prevImageBy10()
+    }
+
+    Shortcut {
+        sequence: "Shift+Right"
+        context: Qt.WindowShortcut
+        enabled: root.loupeNavigationShortcutsEnabled
+        onActivated: root.uiStateRef.nextImageBy10()
     }
 
     // Handle View Switching and Prefetch Gating
@@ -2235,6 +2269,7 @@ ApplicationWindow {
         backgroundColor: root.currentBackgroundColor
         textColor: root.currentTextColor
         maxImageCount: root.uiStateRef ? root.uiStateRef.imageCount : 0
+        controllerRef: root.controllerRef
     }
 
     DeleteBatchDialog {

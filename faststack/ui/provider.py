@@ -1076,8 +1076,16 @@ class UIState(QObject):
         self.app_controller.next_image()
 
     @Slot()
+    def nextImageBy10(self):
+        self.app_controller.next_image_by_10()
+
+    @Slot()
     def prevImage(self):
         self.app_controller.prev_image()
+
+    @Slot()
+    def prevImageBy10(self):
+        self.app_controller.prev_image_by_10()
 
     @Slot(bool)
     def launch_helicon(self, use_raw: bool = True):
