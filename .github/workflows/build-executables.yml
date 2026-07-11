@@ -61,7 +61,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts
-          Compress-Archive -Path dist\FastStack -DestinationPath artifacts\FastStack-${{ matrix.artifact }}.zip -Force
+          Compress-Archive -Path dist\FastStack\* -DestinationPath artifacts\FastStack-${{ matrix.artifact }}.zip -Force
 
       - name: Package macOS artifact
         if: runner.os == 'macOS'

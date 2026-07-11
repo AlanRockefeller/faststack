@@ -19,7 +19,7 @@ This is the Windows 64-bit build. Most modern Windows computers are 64-bit.
 ## Install FastStack
 
 FastStack does not use a setup wizard. You install it by extracting the zip file
-and keeping the extracted FastStack folder.
+and keeping the extracted `FastStack-windows-x64` folder.
 
 1. Download `FastStack-windows-x64.zip` from the FastStack release page.
 2. Open your `Downloads` folder.
@@ -27,12 +27,11 @@ and keeping the extracted FastStack folder.
 4. Click `Extract All`.
 5. Click `Extract`.
 6. When extraction finishes, open the extracted folder.
-7. Open the `FastStack` folder inside it.
-8. Double-click `FastStack.exe`.
+7. Double-click `FastStack.exe`.
 
-Important: keep `FastStack.exe` inside the `FastStack` folder. The other files
-in that folder are required. If you move only `FastStack.exe` somewhere else,
-the app may not start.
+Important: keep `FastStack.exe` inside the extracted `FastStack-windows-x64`
+folder. The other files in that folder are required. If you move only
+`FastStack.exe` somewhere else, the app may not start.
 
 ## If Windows Shows "Windows Protected Your PC"
 
@@ -73,7 +72,7 @@ Do not turn off Windows security features for software you do not trust.
 
 If FastStack opened correctly, make a shortcut so it is easier to launch later:
 
-1. Go back to the `FastStack` folder.
+1. Go back to the extracted `FastStack-windows-x64` folder.
 2. Right-click `FastStack.exe`.
 3. Click `Show more options` if you see it.
 4. Click `Send to`.
@@ -97,17 +96,17 @@ matching RAW files automatically when they are in the same folder.
 3. Right-click the new zip file.
 4. Click `Extract All`.
 5. Extract it to a new folder.
-6. Open the new `FastStack` folder.
+6. Open the new extracted folder.
 7. Double-click `FastStack.exe`.
 8. If the new version opens correctly, you can delete the old extracted
-   FastStack folder.
+   folder.
 9. If you made a desktop shortcut before, delete the old shortcut and create a
    new one from the new `FastStack.exe`.
 
 ## Uninstalling FastStack
 
 1. Quit FastStack if it is open.
-2. Delete the extracted `FastStack` folder.
+2. Delete the extracted `FastStack-windows-x64` folder.
 3. Delete any desktop shortcut you created.
 
 FastStack settings may remain in your Windows user account so they can be reused
