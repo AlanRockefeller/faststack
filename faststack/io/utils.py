@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Union
 
@@ -31,7 +32,7 @@ def fsync_directory(path: Path) -> None:
 
 def atomic_write_json(path: Path, payload: object) -> None:
     """Write JSON atomically and flush the file and directory to disk."""
-    temp_path = path.with_suffix(f".{os.getpid()}.tmp")
+    temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
     with temp_path.open("w") as f:
         json.dump(payload, f, indent=2)
         f.flush()

@@ -4153,8 +4153,6 @@ class ImageEditor:
         save_result = self._save_u8_pil_image(
             img_u8, original_path, log_prefix="[SAVE_IMAGE_U8_LEVELS]"
         )
-        if save_result is None:
-            return None
 
         if _debug:
             t_write = time.perf_counter()
@@ -4250,8 +4248,6 @@ class ImageEditor:
         save_result = self._save_u8_pil_image(
             img_u8, original_path, log_prefix="[SAVE_IMAGE_U8_WB]"
         )
-        if save_result is None:
-            return None
 
         if _debug:
             t_write = time.perf_counter()
