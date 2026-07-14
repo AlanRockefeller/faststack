@@ -317,8 +317,6 @@ Window {
         }
     }
 
-    property int slidersPressedCount: 0
-
     function getBackendValue(key) {
         var _dependency = updatePulse;
         if (compactEditor.uiStateRef && key in compactEditor.uiStateRef) return compactEditor.uiStateRef[key];
@@ -1072,14 +1070,12 @@ Window {
                         compactEditor.ensureEditorLoaded("slider-change")
                         compactEditor.highlightedSliderKey = sliderRow.key
                         compactEditor.focusKeyboardHandler()
-                        compactEditor.slidersPressedCount++
                         if (!slider.isResetting) {
                             _pendingValue = value
                             slider._lastSentValue = value
                             if (!sendTimer.running) sendTimer.start()
                         }
                     } else {
-                        compactEditor.slidersPressedCount--
                         sendTimer.stop()
                         if (slider.isResetting) {
                             if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, 0.0)

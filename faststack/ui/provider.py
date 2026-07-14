@@ -840,6 +840,9 @@ class UIState(QObject):
                 self.rawDevelopmentStateChanged
             )
             self.app_controller.rawDevelopmentStateChanged.connect(
+                self.metadataChanged.emit
+            )
+            self.app_controller.rawDevelopmentStateChanged.connect(
                 self.saveBehaviorMessageChanged.emit
             )
 

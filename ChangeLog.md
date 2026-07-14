@@ -5,6 +5,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 ## 1.6.7 (2026-07-13)
 
 - Flipping through images by holding down the arrow key is now faster and smoother.
+- If a stack input directory is detected, the Action menu now has a menuitem to switch to the stack input directory. If you switch, that menu item becomes a switch back to main photo directory menu item.
 
 ## 1.6.6 (2026-07-08)
 

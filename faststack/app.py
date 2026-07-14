@@ -89,7 +89,6 @@ from faststack.imaging.prefetch import (
     DEFAULT_HELD_NAVIGATION_QUALITY,
     HELD_NAVIGATION_QUALITY_DIMENSIONS,
     Prefetcher,
-    apply_loupe_color_correction,
     clear_icc_caches,
     get_icc_profile_description,
     get_icc_profile_details,
@@ -924,7 +923,8 @@ class AppController(QObject):
                 elif keep_preview:
                     log.debug("Editor closed with unsaved live edits; keeping preview")
                 else:
-                    log.debug("Editor closed, preserving live editor session")
+                    log.debug("Editor closed with a clean session; releasing buffers")
+                    self.image_editor.clear()
 
             if not keep_preview:
                 with self._preview_lock:
@@ -1770,12 +1770,6 @@ class AppController(QObject):
     @Slot(int, int, str)
     def handle_key_from_histogram(self, key: int, modifiers: int, text: str):
         """Forward key presses from the histogram window through eventFilter."""
-        if key in (Qt.Key_Left, Qt.Key_Right) and not (
-            Qt.KeyboardModifier(modifiers)
-            & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier)
-        ):
-            self._request_paced_navigation_step(1 if key == Qt.Key_Right else -1)
-            return
         from PySide6.QtGui import QKeyEvent
 
         event = QKeyEvent(
@@ -1786,12 +1780,6 @@ class AppController(QObject):
     @Slot(int, int, str)
     def handle_key_from_compact_editor(self, key: int, modifiers: int, text: str):
         """Forward navigation keys from the compact editor through eventFilter."""
-        if key in (Qt.Key_Left, Qt.Key_Right) and not (
-            Qt.KeyboardModifier(modifiers)
-            & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier)
-        ):
-            self._request_paced_navigation_step(1 if key == Qt.Key_Right else -1)
-            return
         from PySide6.QtGui import QKeyEvent
 
         event = QKeyEvent(
@@ -3823,26 +3811,6 @@ class AppController(QObject):
         edit_state = self._get_pending_edit_state_for_loaded_path(active_path)
         return self._edit_source_path_from_state(edit_state, active_path), edit_state
 
-    def _cached_preview_for_load(
-        self, load_path: Path, active_path: Path
-    ) -> Optional[DecodedImage]:
-        """Display-cache buffer for seeding the editor's float_preview, or None.
-
-        The decode cache holds the SAVED file's pixels. When the editor loads
-        from a distinct source (the backup) to replay persisted edits, seeding
-        float_preview from the saved pixels would apply the restored edits a
-        second time in every preview-sized render (e.g. crop-on-crop). In that
-        case load_image must rebuild the preview from the pixels it actually
-        loads, so return None.
-        """
-        try:
-            same = self._key(load_path) == self._key(active_path)
-        except (OSError, TypeError, ValueError):
-            same = str(load_path) == str(active_path)
-        if not same:
-            return None
-        return self.get_decoded_image(self.current_index)
-
     def _bind_loaded_editor_output_path(self, active_path: Path) -> None:
         try:
             active_mtime = active_path.stat().st_mtime
@@ -3876,13 +3844,9 @@ class AppController(QObject):
 
         thumb = restored_original.copy()
         thumb.thumbnail((1920, 1080))
-        # float_preview is display-space by contract; cook the rebuilt preview
-        # like the prefetcher cooks cached previews (sRGB assumed when the
-        # snapshot carries no ICC profile).
-        preview_u8 = apply_loupe_color_correction(
-            np.asarray(thumb.convert("RGB"), dtype=np.uint8),
-            icc_bytes=restored_original.info.get("icc_profile"),
-        )
+        # Editor preview masters stay in source space. The display-only ICC or
+        # saturation transform is applied after edits during preview rendering.
+        preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
         restored_preview = preview_u8.astype(np.float32)
         restored_preview *= np.float32(1.0 / 255.0)
 
@@ -4270,13 +4234,12 @@ class AppController(QObject):
                 return active_path
 
         load_path, _edit_state = self._active_edit_load_path(active_path)
-        cached_preview = self._cached_preview_for_load(load_path, active_path)
         # preview_only skips the ~400ms full-resolution float conversion that
         # would otherwise block the UI thread on the first auto-adjust
         # keypress; analysis only needs the preview-sized buffer.
         if self.image_editor.load_image(
             str(load_path),
-            cached_preview=cached_preview,
+            cached_preview=None,
             source_exif=self._capture_source_exif_for_active_image(),
             preview_only=True,
         ):
@@ -4587,102 +4550,6 @@ class AppController(QObject):
             base_brightness=base_brightness,
             auto_brightness_delta=auto_brightness_delta,
         )
-
-    def _save_current_auto_adjust(
-        self,
-        *,
-        action_type: str,
-        detail_msg: str,
-    ) -> bool:
-        """Save the current auto-adjusted image once and keep the session alive."""
-        t_start = time.perf_counter()
-        save_target_path = self._get_save_target_path_for_current_view()
-
-        try:
-            # Safe optimizations only for true levels-only or WB-only sessions.
-            # If crop, rotate, or any other edit is active, both helpers decline
-            # by returning None and we fall back to the general save path.
-            save_result = self.image_editor.save_image_uint8_levels(
-                save_target_path=save_target_path
-            )
-            if save_result is None:
-                save_result = self.image_editor.save_image_uint8_white_balance(
-                    save_target_path=save_target_path
-                )
-            if save_result is None:
-                save_result = self.image_editor.save_image(
-                    save_target_path=save_target_path
-                )
-        except RuntimeError as e:
-            log.warning("save_current_auto_adjust: Save failed: %s", e)
-            self.update_status_message(f"Failed to save image: {e}")
-            return False
-        except Exception as e:
-            log.exception(
-                "save_current_auto_adjust: Unexpected error during save: %s", e
-            )
-            self.update_status_message("Failed to save image")
-            return False
-
-        if not save_result:
-            self.update_status_message("Failed to save image")
-            return False
-
-        saved_path, backup_path = save_result
-        metadata_path = (
-            self.image_files[self.current_index].path
-            if 0 <= self.current_index < len(self.image_files)
-            else saved_path
-        )
-        metadata_before = self._mark_image_edited_in_sidecar(
-            self.sidecar,
-            metadata_path,
-            saved_edit_state=self._build_saved_edit_state_from_editor(
-                saved_path=saved_path,
-                backup_path=backup_path,
-            ),
-        )
-        self.undo_history.append(
-            (
-                action_type,
-                self._build_edit_undo_data(
-                    saved_path,
-                    backup_path,
-                    metadata_path=metadata_path,
-                    metadata_before=metadata_before,
-                    sidecar=self.sidecar,
-                ),
-                time.time(),
-            )
-        )
-
-        editor_path = getattr(self.image_editor, "current_filepath", None)
-        if editor_path is not None:
-            try:
-                if Path(editor_path).resolve() == saved_path.resolve():
-                    self.image_editor.current_mtime = saved_path.stat().st_mtime
-            except (OSError, ValueError):
-                pass
-
-        self.refresh_image_list()
-        self._reindex_after_save(saved_path)
-        # Only the saved file's pixels changed; per-path invalidation keeps
-        # the rest of the decode cache and the in-flight prefetch window warm.
-        self._invalidate_decoded_path(saved_path, force=True)
-        self.prefetcher.update_prefetch(self.current_index)
-        self.sync_ui_state()
-
-        if self.ui_state.isHistogramVisible:
-            self.update_histogram()
-
-        total_ms = int((time.perf_counter() - t_start) * 1000)
-        saved_msg = (
-            f"{detail_msg} — saved ({total_ms} ms)"
-            if detail_msg
-            else f"Auto-adjust saved ({total_ms} ms)"
-        )
-        self.update_status_message(saved_msg, timeout=9000)
-        return True
 
     # --- Image Editor Integration ---
 
@@ -5136,6 +5003,24 @@ class AppController(QObject):
             and current_session_token[3] == save_session_token[3]
         )
         save_revision = save_result.get("save_revision")
+
+        reported_result = save_result.get("result")
+        valid_result = (
+            isinstance(reported_result, tuple)
+            and len(reported_result) == 2
+            and reported_result[0] is not None
+            and reported_result[1] is not None
+        )
+        if save_result.get("success") and not valid_result:
+            # A save is not successful until both the output and its backup
+            # exist as a valid result. Route malformed/empty payloads through
+            # the regular failure path so submitted revisions are rolled back
+            # and the captured snapshot can be retried safely.
+            log.error(
+                "Save reported success with an invalid result: %r", reported_result
+            )
+            save_result["success"] = False
+            save_result["error"] = "Save did not produce a valid output and backup"
 
         if not save_result.get("success"):
             if still_on_same_session and save_revision is not None:
@@ -12800,11 +12685,6 @@ class AppController(QObject):
                 self._sync_editor_state_from_session()
                 return self._REUSED
 
-            # Fetch cached preview if available for faster initial display
-            # (declined when loading from a backup source — see
-            # _cached_preview_for_load for the double-applied-edits hazard).
-            cached_preview = self._cached_preview_for_load(load_path, active_path)
-
             # Determine if we should capture source EXIF (e.g., for RAW mode)
             source_exif = None
             if self.current_edit_source_mode == "raw":
@@ -12827,7 +12707,7 @@ class AppController(QObject):
             # Load into editor
             if self.image_editor.load_image(
                 load_filepath,
-                cached_preview=cached_preview,
+                cached_preview=None,
                 source_exif=source_exif,
                 preview_only=preview_only,
             ):
@@ -14691,10 +14571,9 @@ class AppController(QObject):
             log.debug(
                 f"execute_crop reloading image due to path mismatch. Editor: {editor_path}, File: {filepath}"
             )
-            cached_preview = self.get_decoded_image(self.current_index)
             if not self.image_editor.load_image(
                 str(filepath),
-                cached_preview=cached_preview,
+                cached_preview=None,
                 source_exif=self._capture_source_exif_for_active_image(),
             ):
                 self.update_status_message("Failed to load image for cropping")
@@ -14901,62 +14780,6 @@ class AppController(QObject):
         self._active_auto_adjust_state = state
         return state
 
-    def _apply_and_save_active_auto_adjust(
-        self,
-        *,
-        action_type: str,
-        force_save: bool = False,
-    ) -> bool:
-        """Apply the transient auto-adjust state to edits and save once.
-
-        When ``force_save`` is True, always save even if the editor already
-        reflects the target levels. This is the path used by the debounced
-        '-' / '=' flow, where the preview step has already applied the edits
-        to the editor before the save fires.
-        """
-        state = self._active_auto_adjust_state
-        if state is None:
-            return False
-
-        blacks, whites = self._derive_auto_adjust_levels(state)
-        changed = self._apply_levels_to_editor(
-            blacks=blacks,
-            whites=whites,
-            kick_preview=False,
-        )
-        changed_vibrance = self._apply_vibrance_to_editor(
-            vibrance=state.base_vibrance,
-        )
-        changed_brightness = self._apply_brightness_to_editor(
-            brightness=state.base_brightness,
-        )
-        changed = changed or changed_vibrance or changed_brightness
-        detail = self._format_auto_levels_detail(
-            p_low=state.p_low,
-            p_high=state.p_high,
-            blacks=blacks,
-            whites=whites,
-            extra_highlight_steps=state.extra_highlight_steps,
-            extra_black_steps=state.extra_black_steps,
-            auto_vibrance_delta=state.auto_vibrance_delta,
-            auto_brightness_delta=state.auto_brightness_delta,
-        )
-        self._last_auto_levels_msg = detail
-
-        if not changed and not force_save:
-            self.update_status_message(detail, timeout=9000)
-            return False
-
-        if not self._save_current_auto_adjust(
-            action_type=action_type, detail_msg=detail
-        ):
-            self._clear_active_auto_adjust_state(
-                "auto-adjust save failed",
-                clear_editor=True,
-            )
-            return False
-        return True
-
     @Slot()
     def quick_auto_levels(self):
         """Apply auto levels to the live session without saving yet."""
@@ -15129,9 +14952,8 @@ class AppController(QObject):
             not self.image_editor.current_filepath
             or str(self.image_editor.current_filepath) != filepath
         ):
-            cached_preview = self.get_decoded_image(index)
             self.image_editor.load_image(
-                filepath, cached_preview=cached_preview, preview_only=True
+                filepath, cached_preview=None, preview_only=True
             )
 
         # Save current_index, temporarily set to target index for auto_levels()
