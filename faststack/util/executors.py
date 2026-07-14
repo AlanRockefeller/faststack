@@ -97,8 +97,9 @@ class PriorityExecutor:
     """A thread pool executor that uses a priority queue for task scheduling.
 
     Tasks are processed in order of:
-      1) priority (lower number = higher priority)
-      2) -seq (higher seq = more recent = more negative = higher priority among same priority)
+      1) queue group (lower number = earlier scheduling class)
+      2) priority (lower number = higher priority within the group)
+      3) explicit queue order, or -seq by default (LIFO within ties)
 
     Workers are daemon threads.
     """
@@ -112,7 +113,16 @@ class PriorityExecutor:
         self._max_workers = max_workers
         self._thread_name_prefix = thread_name_prefix
         self._queue: queue.PriorityQueue[
-            tuple[int, int, Callable[..., Any], tuple[Any, ...], dict[str, Any], Future]
+            tuple[
+                int,
+                int,
+                int,
+                int,
+                Callable[..., Any],
+                tuple[Any, ...],
+                dict[str, Any],
+                Future,
+            ]
         ] = queue.PriorityQueue(maxsize=maxsize)
         self._workers: list[threading.Thread] = []
         self._stop_event = threading.Event()
@@ -143,7 +153,7 @@ class PriorityExecutor:
             except queue.Empty:
                 continue
 
-            priority, neg_seq, fn, args, kwargs, fut = item
+            _queue_group, _priority, _order, _neg_seq, fn, args, kwargs, fut = item
             try:
                 if fut.set_running_or_notify_cancel():
                     try:
@@ -165,13 +175,23 @@ class PriorityExecutor:
                     pass
 
     def submit(
-        self, fn: Callable[..., Any], *args: Any, priority: int = 1, **kwargs: Any
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        priority: int = 1,
+        queue_group: int = 0,
+        queue_order: int | None = None,
+        **kwargs: Any,
     ) -> Future:
         """Submit a task to the priority queue.
 
         Args:
             fn: Function to execute
-            priority: Lower number means higher priority
+            priority: Lower number means higher priority within a queue group.
+            queue_group: Lower groups run first. The default preserves existing
+                scheduling; background bulk work may opt into a later group.
+            queue_order: Explicit lower-first ordering within a group/priority.
+                When omitted, the existing newest-first (LIFO) ordering applies.
             *args, **kwargs: Passed to fn
 
         Returns:
@@ -186,13 +206,36 @@ class PriorityExecutor:
             self._count += 1
             seq = self._count
 
+        order = -seq if queue_order is None else int(queue_order)
         try:
-            self._queue.put((priority, -seq, fn, args, kwargs, fut), block=False)
+            self._queue.put(
+                (
+                    int(queue_group),
+                    priority,
+                    order,
+                    -seq,
+                    fn,
+                    args,
+                    kwargs,
+                    fut,
+                ),
+                block=False,
+            )
         except queue.Full:
             fut.set_exception(RuntimeError("PriorityQueue full"))
         return fut
 
-    def bump_priority(self, future: Future, priority: int) -> bool:
+    def qsize(self) -> int:
+        """Approximate number of queued (not-yet-started) tasks. Diagnostics only."""
+        return self._queue.qsize()
+
+    def bump_priority(
+        self,
+        future: Future,
+        priority: int,
+        *,
+        queue_group: int = 0,
+    ) -> bool:
         """Raise the priority of a queued task if it has not started yet.
 
         Returns True when the task was still queued and its queue ordering was
@@ -207,14 +250,32 @@ class PriorityExecutor:
         # recheck this on major Python upgrades.
         with self._queue.mutex:
             for idx, item in enumerate(self._queue.queue):
-                current_priority, _old_neg_seq, fn, args, kwargs, fut = item
+                (
+                    current_group,
+                    current_priority,
+                    _old_order,
+                    _old_neg_seq,
+                    fn,
+                    args,
+                    kwargs,
+                    fut,
+                ) = item
                 if fut is not future:
                     continue
                 if fut.cancelled() or fut.running() or fut.done():
                     return False
-                if priority >= current_priority:
+                if (queue_group, priority) >= (current_group, current_priority):
                     return False
-                self._queue.queue[idx] = (priority, neg_seq, fn, args, kwargs, fut)
+                self._queue.queue[idx] = (
+                    queue_group,
+                    priority,
+                    neg_seq,
+                    neg_seq,
+                    fn,
+                    args,
+                    kwargs,
+                    fut,
+                )
                 heapq.heapify(self._queue.queue)
                 return True
         return False
@@ -231,9 +292,16 @@ class PriorityExecutor:
             # Cancel queued work so workers can exit once queue empties.
             while True:
                 try:
-                    _priority, _neg_seq, _fn, _args, _kwargs, fut = (
-                        self._queue.get_nowait()
-                    )
+                    (
+                        _queue_group,
+                        _priority,
+                        _order,
+                        _neg_seq,
+                        _fn,
+                        _args,
+                        _kwargs,
+                        fut,
+                    ) = self._queue.get_nowait()
                 except queue.Empty:
                     break
                 try:

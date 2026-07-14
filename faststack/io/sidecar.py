@@ -18,6 +18,11 @@ KNOWN_IMAGE_EXTENSIONS = frozenset(
 
 def _fsync_directory(path: Path) -> None:
     """Best-effort fsync for a directory entry update."""
+    # Windows does not support opening a directory this way; the file itself
+    # was already flushed above, so avoid a guaranteed EACCES and log entry.
+    if os.name == "nt":
+        return
+
     fd: Optional[int] = None
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -129,15 +134,7 @@ class SidecarManager:
     def save(self):
         """Saves the sidecar data to disk atomically."""
         temp_path = self.path.with_suffix(".tmp")
-        was_watcher_running = False
         try:
-            if (
-                self.watcher
-                and hasattr(self.watcher, "is_alive")
-                and self.watcher.is_alive()
-            ):
-                self.stop_watcher()
-                was_watcher_running = True
             with temp_path.open("w") as f:
                 # Convert to a dict that json.dump can handle
                 serializable_data = {
@@ -162,9 +159,6 @@ class SidecarManager:
 
         except (IOError, TypeError) as e:
             log.error(f"Failed to save sidecar file {self.path}: {e}")
-        finally:
-            if was_watcher_running:
-                self.start_watcher()
 
     @overload
     def get_metadata(

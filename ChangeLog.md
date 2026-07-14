@@ -2,6 +2,10 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## 1.6.7 (2026-07-13)
+
+- Flipping through images by holding down the arrow key is now faster and smoother.
+
 ## 1.6.6 (2026-07-08)
 
 - Added a new color-mix adjustment section in the editor with per-hue saturation controls

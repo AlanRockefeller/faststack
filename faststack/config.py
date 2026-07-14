@@ -425,7 +425,18 @@ else:
 DEFAULT_CONFIG = {
     "core": {
         "cache_size_gb": "1.5",
-        "prefetch_radius": "6",
+        "prefetch_radius": "20",
+        "navigation_rate_fps": "15.0",
+        # Stretch the held-key cadence when decoding falls behind (and relax
+        # back to navigation_rate_fps once the look-ahead buffer refills) so
+        # motion slows smoothly instead of hitching on decode waits.
+        "navigation_adaptive_pacing": "True",
+        # Total decode workers (speculative + 1 reserved demand worker).
+        # 0 = auto: ~3/4 of logical cores, clamped to [2, 16]. Override for
+        # throughput tuning; decode and color transforms release the GIL.
+        "prefetch_workers": "0",
+        "held_navigation_quality": "balanced",
+        "navigation_repeat_delay_ms": "500",
         "theme": "dark",
         "default_directory": "",
         # Last directory that was open, persisted across clean exits so that

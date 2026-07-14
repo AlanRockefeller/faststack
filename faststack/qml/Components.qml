@@ -36,7 +36,7 @@ Item {
     // starts. Zoom-triggered high-res swaps stay blocked until crop mode exits,
     // because any async source swap during cropping can rescale the image and
     // invalidate the crop box's visual alignment.
-    readonly property string requestedImageSource: loupeView.uiStateRef && loupeView.uiStateRef.imageCount > 0 ? loupeView.uiStateRef.currentImageSource : ""
+    readonly property string requestedImageSource: loupeView.uiStateRef && loupeView.uiStateRef.isFolderLoaded && loupeView.uiStateRef.imageCount > 0 ? loupeView.uiStateRef.currentImageSource : ""
     property string cropDragImageSource: ""
     readonly property bool isCropSourceFrozen: cropDragImageSource !== "" && ((mainMouseArea && mainMouseArea.isCropDragging) || (loupeView.uiStateRef && loupeView.uiStateRef.isCropping))
     readonly property string displayedImageSource: isCropSourceFrozen ? cropDragImageSource : requestedImageSource
@@ -436,18 +436,46 @@ Item {
                     imageRotator.recomputeFitScale(true)
                 }
 
-                onSourceSizeChanged: { handleSourceSizeChange() }
+                property bool _geometryUpdatePending: false
+
+                function scheduleSourceGeometryUpdate() {
+                    if (_geometryUpdatePending) return
+                    _geometryUpdatePending = true
+                    Qt.callLater(function() {
+                        _geometryUpdatePending = false
+                        mainImage.handleSourceSizeChange()
+                    })
+                }
+
+                onSourceSizeChanged: { scheduleSourceGeometryUpdate() }
+
+                // Navigation correlation id captured when the source binds, so
+                // the render acknowledgement below reports the frame that
+                // actually became Ready (see UIState.currentNavSeq).
+                property int _presentSeq: -1
+                property int _presentGeneration: -1
 
                 onStatusChanged: {
                    if (status === Image.Ready) {
-                       // Some backends update sourceSize right as status flips
-                       mainImage.handleSourceSizeChange()
-                       imageRotator.updateRotatorGeometry()
+                       // sourceSize and Ready commonly change in the same event
+                       // turn; coalesce their geometry/layout work.
+                       mainImage.scheduleSourceGeometryUpdate()
+                       if (loupeView.uiStateRef) {
+                           loupeView.uiStateRef.notifyImageReady(
+                               mainImage._presentSeq,
+                               mainImage._presentGeneration
+                           )
+                       }
                    }
                 }
 
                 // Force reset when source changes (existing logic)
                 onSourceChanged: {
+                    // Bind the current navigation seq to THIS source so the
+                    // Ready handler acknowledges the correct frame.
+                    mainImage._presentSeq = loupeView.uiStateRef ? loupeView.uiStateRef.currentNavSeq : -1
+                    mainImage._presentGeneration = loupeView.uiStateRef ? loupeView.uiStateRef.currentImageGeneration : -1
+
                     if (mainMouseArea.isCropDragging) {
                         // Source changed mid-drag (e.g. high-res edit buffer loading).
                         // Defer ALL visual/geometry resets so the coordinate system
@@ -474,7 +502,10 @@ Item {
                 }
                 fillMode: Image.PreserveAspectFit
                 cache: false // We do our own caching in Python
-                smooth: false // Crisp rendering for technical accuracy
+                // Fast navigation may intentionally use the nearest smaller
+                // JPEG DCT scale. Let the GPU smooth that small upscale; at
+                // 1:1 settled resolution this has no visible effect.
+                smooth: true
                 mipmap: false // Crisp rendering
                 
                 property bool _sourceSizeStale: false

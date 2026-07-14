@@ -9,14 +9,14 @@ import shlex
 import time
 import argparse
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple, Set
+from typing import Optional, List, Dict, Any, Tuple, Set, NamedTuple
 from datetime import date, datetime, timezone
 import os
 import re
 import shutil
 import uuid
 import functools
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from itertools import pairwise
 
@@ -86,12 +86,16 @@ from faststack.imaging.cache import (
     build_cache_key,
 )
 from faststack.imaging.prefetch import (
+    DEFAULT_HELD_NAVIGATION_QUALITY,
+    HELD_NAVIGATION_QUALITY_DIMENSIONS,
     Prefetcher,
     apply_loupe_color_correction,
     clear_icc_caches,
     get_icc_profile_description,
     get_icc_profile_details,
     get_monitor_profile,
+    held_navigation_quality_max_dimension,
+    normalize_held_navigation_quality,
 )
 from faststack.ui.keystrokes import Keybinder
 from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, _safe_replace
@@ -184,6 +188,14 @@ class LiveEditSessionState:
     submitted_revision: int
 
 
+class PreviewSessionProvenance(NamedTuple):
+    """Canonical identity of pixels backing the active editor session."""
+
+    source_path_key: str
+    session_id: Optional[str]
+    revision: int
+
+
 def make_hdrop(paths):
     """
     Build a real CF_HDROP (DROPFILES) payload for Windows drag-and-drop.
@@ -202,6 +214,34 @@ def make_hdrop(paths):
 
 
 log = logging.getLogger(__name__)
+
+
+def _keyboard_repeat_delay_ms() -> int:
+    """Return the OS keyboard-repeat delay, with a portable config fallback."""
+    fallback = config.getint(
+        "core",
+        "navigation_repeat_delay_ms",
+        fallback=500,
+    )
+    if sys.platform != "win32":
+        return max(100, int(fallback))
+
+    try:
+        import ctypes
+
+        # SPI_GETKEYBOARDDELAY returns 0..3, representing 250 ms increments.
+        delay_setting = ctypes.c_uint()
+        if ctypes.windll.user32.SystemParametersInfoW(
+            0x0016,
+            0,
+            ctypes.byref(delay_setting),
+            0,
+        ):
+            return (min(3, int(delay_setting.value)) + 1) * 250
+    except (AttributeError, OSError, ValueError):
+        log.debug("Could not read the Windows keyboard repeat delay", exc_info=True)
+    return max(100, int(fallback))
+
 
 # Global flags for debug modes - set by main()
 _debug_mode = False
@@ -251,15 +291,19 @@ class AppController(QObject):
     _exifBriefReady = Signal(object, str)  # (cache_key, brief) from background thread
     _updateCheckFinished = Signal(object)  # Update check result from background thread
     _qualityDecodeFinished = Signal(object)  # Settled cover-quality decode result
+    _pacedNavigationReady = Signal(object)  # Exact fast-tier target is cache-ready
+    _frameSwapObserved = Signal(float)  # render-thread timestamp -> GUI thread
 
     def __init__(
         self,
         image_dir: Path,
         engine: QQmlApplicationEngine,
         debug_cache: bool = False,
+        debug_cache_trace: bool = False,
         debug_thumb_timing: bool = False,
         debug_thumb_trace: bool = False,
         start_in_loupe: bool = False,
+        app_start_t: Optional[float] = None,
     ):
         super().__init__()
         self.debug_thumb_timing = debug_thumb_timing
@@ -317,6 +361,7 @@ class AppController(QObject):
         )
         self._updateCheckFinished.connect(self._on_update_check_finished)
         self._qualityDecodeFinished.connect(self._on_quality_decode_finished)
+        self._pacedNavigationReady.connect(self._on_paced_navigation_ready)
         self._update_check_token = 0
         self._update_check_inflight = False
         self._preview_inflight = False
@@ -401,7 +446,56 @@ class AppController(QObject):
         self.ui_refresh_generation = 0
         self.main_window: Optional[QObject] = None
         self.engine = engine
-        self.debug_cache = debug_cache  # New debug_cache flag
+        # Trace is a strict superset even when AppController is constructed
+        # directly instead of through main()/cli().
+        self.debug_cache_trace = bool(debug_cache_trace)
+        self.debug_cache = bool(debug_cache or self.debug_cache_trace)
+
+        # Navigation correlation ("seq"): one id minted per target-index change
+        # and carried keypress -> prefetch/decode -> provider -> QML render ack,
+        # so a single line reports target-index-changed -> frame-actually-rendered.
+        self._nav_seq = 0
+        self._current_nav_seq = 0
+        self._nav_target_index: Optional[int] = None
+        self._nav_target_path_key: Optional[str] = None
+        # seq -> partial timing record, filled in layers (mint/worker/provider/present).
+        self._nav_records: "OrderedDict[int, dict]" = OrderedDict()
+        self._nav_trace_lock = threading.Lock()
+        # Startup milestones fire once each.
+        self._app_start_t = (
+            app_start_t if app_start_t is not None else time.perf_counter()
+        )
+        self._nav_first_fast_logged = False
+        self._nav_first_settled_logged = False
+        # Burst summary: stats accumulated across a run of navigations and
+        # emitted once the user stops (settle timer). None when no burst active.
+        self._burst: Optional[dict] = None
+        self._nav_settle_timer: Optional[QTimer] = None
+        self._nav_summary_deadline_timer: Optional[QTimer] = None
+        # Ready image requests awaiting scene-graph synchronization and then a
+        # later frame swap: (seq, UI generation, ready time, sync time). Merely
+        # seeing Image.Ready before a swap is insufficient: that swap may belong
+        # to a frame whose scene graph was synchronized before Ready fired.
+        self._nav_pending_present: list[tuple[int, int, float, Optional[float]]] = []
+        # Set once the root window's frameSwapped is connected; until then the
+        # Ready callback emits at ready time (labeled ready=, not presented=).
+        self._frame_swapped_connected = False
+        self._frame_sync_connected = False
+        self._frameSwapObserved.connect(
+            self._on_frame_swapped,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._held_navigation_direction = 0
+        self._navigation_hold_source: Optional[QObject] = None
+        self._auxiliary_navigation_windows: Dict[int, QObject] = {}
+        self._last_navigation_direction = 1
+        self._paced_navigation_epoch = 0
+        self._paced_navigation_pending: Optional[dict] = None
+        self._paced_navigation_queue: deque[int] = deque()
+        self._paced_present_gate: Optional[dict] = None
+        self._paced_present_ready = False
+        self._navigation_repeat_started = False
+        self._navigation_underflow_count = 0
 
         # Shutdown is handled in main() via aboutToQuit connection
 
@@ -414,6 +508,7 @@ class AppController(QObject):
 
         # Cache Warning State
         self._last_cache_warning_time = 0
+        self._last_cache_stats_update = 0.0
         self._eviction_lock = threading.Lock()
         self._eviction_timestamps: deque[float] = (
             deque()
@@ -463,14 +558,31 @@ class AppController(QObject):
         )
         self.image_cache.hits = 0  # Initialize cache hit counter
         self.image_cache.misses = 0  # Initialize cache miss counter
+        self._held_navigation_quality = normalize_held_navigation_quality(
+            config.get(
+                "core",
+                "held_navigation_quality",
+                fallback=DEFAULT_HELD_NAVIGATION_QUALITY,
+            )
+        )
         self.prefetcher = Prefetcher(
             image_files=self.image_files,
             cache_put=self._prefetch_cache_put,
-            prefetch_radius=config.getint("core", "prefetch_radius", 12),
+            prefetch_radius=config.getint("core", "prefetch_radius", 20),
             get_display_info=self.get_display_info,
-            debug=_debug_mode,
+            debug=_debug_mode or self.debug_cache_trace,
             cache_contains=self.image_cache.__contains__,
             cache_get_quality=self._cache_decode_quality,
+            quality_is_current=self._quality_upgrade_still_current,
+            nav_trace=(self._record_nav_worker_timing if self.debug_cache else None),
+            fast_decode_max_dimension=held_navigation_quality_max_dimension(
+                self._held_navigation_quality
+            ),
+            configured_workers=config.getint(
+                "core",
+                "prefetch_workers",
+                fallback=0,
+            ),
         )
         self.last_displayed_image: Optional[DecodedImage] = (
             None  # Cache last image to avoid grey squares
@@ -574,6 +686,7 @@ class AppController(QObject):
         self._metadata_cache_index = (-1, -1)
         self._exif_brief_cache: dict = {}  # EXIF context key → formatted EXIF string
         self._native_image_size_cache: Dict[str, tuple[float, int, int]] = {}
+        self._native_image_size_lock = threading.Lock()
         # Per-navigation memo for get_current_display_native_size(): keyed by
         # (current_index, ui_refresh_generation) so the two QML property reads
         # per navigation (width + height) share one stat()/decode instead of
@@ -627,6 +740,38 @@ class AppController(QObject):
         self._quality_decode_timer.setSingleShot(True)
         self._quality_decode_timer.setInterval(275)
         self._quality_decode_timer.timeout.connect(self._submit_settled_quality_decode)
+        self._quality_decode_immediate_pending = False
+
+        # Reproduce normal keyboard behavior (one immediate action, then the OS
+        # repeat delay) while replacing the platform's variable repeat cadence
+        # with a stable, user-configurable rate. The timer changes the visible
+        # target only after the exact fast-tier buffer is ready.
+        navigation_fps = config.getfloat(
+            "core",
+            "navigation_rate_fps",
+            fallback=15.0,
+        )
+        navigation_fps = max(1.0, min(navigation_fps, 30.0))
+        self._navigation_rate_fps = navigation_fps
+        self._navigation_interval_ms = max(1, round(1000.0 / navigation_fps))
+        # Adaptive cadence governor: when the decoded look-ahead buffer runs
+        # low during a held key, stretch the interval multiplicatively so
+        # motion slows smoothly instead of hitching on a demand-decode wait;
+        # relax back toward navigation_rate_fps once the buffer refills.
+        # navigation_rate_fps stays the ceiling — pacing never speeds past it.
+        self._navigation_adaptive_pacing = config.getboolean(
+            "core",
+            "navigation_adaptive_pacing",
+            fallback=True,
+        )
+        self._paced_interval_ms = float(self._navigation_interval_ms)
+        self._paced_interval_max_ms = float(self._navigation_interval_ms) * 4.0
+        self._navigation_repeat_delay_ms = _keyboard_repeat_delay_ms()
+        self._navigation_hold_timer = QTimer(self)
+        self._navigation_hold_timer.setSingleShot(True)
+        self._navigation_hold_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._navigation_hold_timer.setInterval(self._navigation_interval_ms)
+        self._navigation_hold_timer.timeout.connect(self._paced_navigation_tick)
 
         # Preview refresh uses a gate pattern instead of a timer:
         # - _kick_preview_worker() runs immediately if not inflight
@@ -746,7 +891,7 @@ class AppController(QObject):
             keep_preview = False
             # Cleanup large memory buffers when editor closes
             if self.image_editor:
-                session_info = self._get_current_live_edit_session_info()
+                session_info = self._get_current_preview_session_provenance()
                 # If a save is active for this session, preserve the memory
                 # so the user can re-open/retry if the background task fails.
                 current_key = None
@@ -848,7 +993,7 @@ class AppController(QObject):
         self._filter_string = filter_string
         self._filter_flags = flags
         self._filter_enabled = True
-        self._apply_filter_to_cached_list()  # Fast in-memory filtering
+        self._apply_filter_to_cached_list(notify=False)  # Fast in-memory filtering
         self._bump_display_generation()
         self.dataChanged.emit()
         self.ui_state.filterStringChanged.emit()  # Notify UI of filter change
@@ -869,8 +1014,8 @@ class AppController(QObject):
 
         # reset to start of filtered list
         self.current_index = 0
-        self.sync_ui_state()
         self._do_prefetch(self.current_index)
+        self.sync_ui_state(image_count_changed=True)
 
     @Slot(result=str)
     def get_filter_string(self):
@@ -893,7 +1038,7 @@ class AppController(QObject):
         self._filter_enabled = False
         self._filter_string = ""
         self._filter_flags = []
-        self._apply_filter_to_cached_list()  # Fast in-memory filtering
+        self._apply_filter_to_cached_list(notify=False)  # Fast in-memory filtering
         self._bump_display_generation()
         self.dataChanged.emit()
         self.ui_state.filterStringChanged.emit()  # Notify UI of filter change
@@ -913,8 +1058,8 @@ class AppController(QObject):
             self._grid_model_dirty = True
 
         self.current_index = min(self.current_index, max(0, len(self.image_files) - 1))
-        self.sync_ui_state()
         self._do_prefetch(self.current_index)
+        self.sync_ui_state(image_count_changed=True)
 
     @Slot(result=str)
     def get_sort_mode(self):
@@ -973,7 +1118,7 @@ class AppController(QObject):
             else None
         )
 
-        self._apply_filter_to_cached_list()
+        self._apply_filter_to_cached_list(notify=False)
         self._bump_display_generation()
 
         if old_batch_start_path:
@@ -1023,8 +1168,8 @@ class AppController(QObject):
         else:
             self._grid_model_dirty = True
 
-        self.sync_ui_state()
         self._do_prefetch(self.current_index)
+        self.sync_ui_state(image_count_changed=True)
         self.dataChanged.emit()
         if hasattr(self, "ui_state") and self.ui_state:
             self.ui_state.sortModeChanged.emit()
@@ -1132,6 +1277,15 @@ class AppController(QObject):
             return None
         return getattr(decoded, "quality", "cover")
 
+    def _navigation_fast_mode_active(self) -> bool:
+        """Whether source requests should consistently use scrub-quality buffers."""
+        return bool(
+            getattr(self, "_held_navigation_direction", 0)
+            or getattr(self, "_paced_navigation_pending", None) is not None
+            or getattr(self, "_paced_navigation_queue", ())
+            or getattr(self, "_paced_present_gate", None) is not None
+        )
+
     def _quality_upgrade_still_current(
         self,
         *,
@@ -1155,22 +1309,40 @@ class AppController(QObject):
         _, _, current_display_gen = self.get_display_info()
         return display_generation == current_display_gen
 
-    def _restart_quality_decode_timer(self) -> None:
-        """Restart the settled-image quality debounce for the current index."""
+    def _restart_quality_decode_timer(self, *, immediate: bool = False) -> None:
+        """Schedule settled quality, bypassing debounce after an explicit release."""
+        immediate = immediate or self._quality_decode_immediate_pending
         self._quality_decode_token += 1
         self.prefetcher.cancel_pending_cover_tasks()
         if (
-            not self._loupe_decode_allowed()
+            self._held_navigation_direction != 0
+            or self._paced_navigation_pending is not None
+            or self._paced_navigation_queue
+            or self._paced_present_gate is not None
+            or not self._loupe_decode_allowed()
             or not self.display_ready
             or not self.image_files
             or self.view_override_path is not None
         ):
+            self._quality_decode_immediate_pending = immediate
             self._quality_decode_timer.stop()
             return
-        self._quality_decode_timer.start()
+        self._quality_decode_immediate_pending = False
+        if immediate:
+            self._quality_decode_timer.stop()
+            self._submit_settled_quality_decode()
+        else:
+            self._quality_decode_timer.start()
 
     def _submit_settled_quality_decode(self) -> None:
         """Submit one cover-quality decode for the current image after navigation settles."""
+        if (
+            self._held_navigation_direction != 0
+            or self._paced_navigation_pending is not None
+            or self._paced_navigation_queue
+            or self._paced_present_gate is not None
+        ):
+            return
         if not self.image_files or self.current_index >= len(self.image_files):
             return
         index = self.current_index
@@ -1179,26 +1351,31 @@ class AppController(QObject):
         if self._has_current_live_preview_for_index(index):
             return
 
-        _, _, display_gen = self.get_display_info()
+        display_width, display_height, display_gen = self.get_display_info()
         image_path = self.image_files[index].path
-        cache_key = build_cache_key(image_path, display_gen)
-        decoded = self.image_cache.get(cache_key)
-        if decoded is not None and getattr(decoded, "quality", "cover") == "cover":
+        cover_key = build_cache_key(image_path, display_gen, "cover")
+        decoded = self.image_cache.get(cover_key)
+        if decoded is not None:
             return
 
+        fast_decoded = self.image_cache.get(
+            build_cache_key(image_path, display_gen, "fast")
+        )
+
         token = self._quality_decode_token
-        if self.debug_cache:
+        if self.debug_cache_trace:
             log.info(
-                f"[DBGCACHE] {time.perf_counter()*1000:.3f} quality_decode: SUBMIT index={index} gen={display_gen} cached={getattr(decoded, 'quality', None)}"
+                f"[DBGCACHE] {time.perf_counter()*1000:.3f} quality_decode: SUBMIT index={index} gen={display_gen} cached={getattr(fast_decoded, 'quality', None)}"
             )
 
         future = self.prefetcher.submit_task(
             index,
             self.prefetcher.generation,
-            priority=True,
+            priority=False,
             quality="cover",
             quality_token=token,
             quality_index=index,
+            nav_seq=self._current_nav_seq if self.debug_cache else None,
         )
         if future is None:
             return
@@ -1244,16 +1421,21 @@ class AppController(QObject):
         path, decoded_display_gen = payload["result"]
         if decoded_display_gen != display_generation:
             return
-        cache_key = build_cache_key(path, decoded_display_gen)
+        cache_key = build_cache_key(path, decoded_display_gen, "cover")
         decoded = self.image_cache.get(cache_key)
         if decoded is None or getattr(decoded, "quality", "cover") != "cover":
             return
+
+        # Keep the small scrub frame adjacent to its settled counterpart in
+        # LRU order. Returning to this photo should not require re-decoding a
+        # fast tier merely because the later cover access made it look old.
+        self.image_cache.get(build_cache_key(path, decoded_display_gen, "fast"))
 
         with self._last_image_lock:
             self.last_displayed_image = decoded
         self.ui_refresh_generation += 1
         self.ui_state.currentImageSourceChanged.emit()
-        if self.debug_cache:
+        if self.debug_cache_trace:
             log.info(
                 f"[DBGCACHE] {time.perf_counter()*1000:.3f} quality_decode: REFRESH index={index} gen={display_generation}"
             )
@@ -1283,7 +1465,12 @@ class AppController(QObject):
                 display_generation=quality_display_generation,
                 token=quality_token,
             ):
-                return
+                self._note_cache_reject(
+                    "stale cover upgrade",
+                    cache_key,
+                    decoded=decoded,
+                )
+                return False
         if path is not None and decode_started is not None:
             try:
                 epoch_key = self._key(Path(path))
@@ -1299,29 +1486,49 @@ class AppController(QObject):
                         "live-preview seed is active",
                         path,
                     )
-                    return
+                    self._note_cache_reject(
+                        "live-preview seed active",
+                        cache_key,
+                        decoded=decoded,
+                    )
+                    return False
                 if decode_started < epoch_time:
                     log.debug(
                         "Discarding stale prefetch decode for %s "
                         "(file replaced while decode was in flight)",
                         path,
                     )
-                    return
-        existing = self.image_cache.get(cache_key)
-        # A stale fast prefetch can finish after the settled cover decode for
-        # the same path/generation. Cache keys intentionally do not include
-        # quality, so ordering is enforced here instead.
-        if (
-            existing is not None
-            and getattr(existing, "quality", "cover") == "cover"
-            and quality != "cover"
-        ):
-            log.debug(
-                "Refusing to replace cover-quality decode with fast decode: %s",
-                cache_key,
-            )
-            return
+                    self._note_cache_reject(
+                        "file replaced mid-decode",
+                        cache_key,
+                        decoded=decoded,
+                    )
+                    return False
         self.image_cache[cache_key] = decoded
+        if self.image_cache.get(cache_key) is not decoded:
+            self._note_cache_reject(
+                "cache declined insertion",
+                cache_key,
+                decoded=decoded,
+            )
+            return False
+        native_width = int(getattr(decoded, "native_width", 0))
+        native_height = int(getattr(decoded, "native_height", 0))
+        if path is not None and native_width > 0 and native_height > 0:
+            try:
+                native_path = Path(path)
+                native_key = self._key(native_path)
+                native_mtime = native_path.stat().st_mtime
+                if native_key is not None:
+                    with self._native_image_size_lock:
+                        self._native_image_size_cache[native_key] = (
+                            native_mtime,
+                            native_width,
+                            native_height,
+                        )
+            except (OSError, TypeError, ValueError):
+                pass
+        return True
 
     @staticmethod
     def _file_state_fingerprint(p: Path) -> Optional[tuple]:
@@ -1407,6 +1614,29 @@ class AppController(QObject):
         self.pending_height = height
         self.resize_timer.start(150)  # 150ms debounce
 
+    def _commit_pending_display_size(self) -> tuple[bool, bool]:
+        """Commit the latest reported viewport without triggering a UI refresh.
+
+        Returns ``(changed, first_report)``. Keeping this separate lets folder
+        startup commit the size before its first decode, instead of letting a
+        synchronous provider request delay the resize timer and cause a full-
+        resolution generation-0 decode followed by an immediate re-decode.
+        """
+        if self.pending_width is None or self.pending_height is None:
+            return False, False
+
+        width = int(self.pending_width)
+        height = int(self.pending_height)
+        with self._display_lock:
+            first_report = not self.display_ready
+            changed = width != self.display_width or height != self.display_height
+            self.display_width = width
+            self.display_height = height
+            self.display_ready = True
+            if changed:
+                self.display_generation += 1
+        return changed, first_report
+
     def _handle_resize(self):
         """Actual resize handler, called after debounce period."""
         log.info(
@@ -1414,18 +1644,18 @@ class AppController(QObject):
             self.pending_width,
             self.pending_height,
         )
-        with self._display_lock:
-            self.display_width = self.pending_width
-            self.display_height = self.pending_height
-            self.display_generation += 1  # Invalidates old entries via cache key
+        changed, is_first_resize = self._commit_pending_display_size()
+        if not changed and not is_first_resize:
+            return
 
-        # Mark display as ready after first size report
-        is_first_resize = not self.display_ready
+        self._cancel_paced_navigation()
         if is_first_resize:
-            self.display_ready = True
             log.info("Display size now stable, enabling prefetch")
 
         self.prefetcher.cancel_all()  # Cancel stale tasks to avoid wasted work
+        # Cache keys include the monotonically increasing display generation;
+        # older sizes can never be reused and otherwise consume the byte budget.
+        self.image_cache.clear()
 
         if self._loupe_decode_allowed():
             # On first resize, execute deferred prefetch; on subsequent resizes, do normal prefetch
@@ -1453,6 +1683,7 @@ class AppController(QObject):
         # Cancel stale prefetch tasks and restart at the new resolution,
         # mirroring what _handle_resize() does.
         self.prefetcher.cancel_all()
+        self.image_cache.clear()
         if self._loupe_decode_allowed():
             self.prefetcher.submit_task(
                 self.current_index,
@@ -1490,9 +1721,61 @@ class AppController(QObject):
         self.ui_state.request_absolute_zoom(4.0)
         # self.set_zoomed(True) - Handled by QML smart zoom logic
 
+    def _is_auxiliary_navigation_window(self, watched: QObject) -> bool:
+        key = id(watched)
+        return self._auxiliary_navigation_windows.get(key) is watched
+
+    @Slot(QObject)
+    def register_auxiliary_navigation_window(self, window: QObject) -> None:
+        """Observe physical arrow press/release events from a QML tool window."""
+        if window is None:
+            return
+        key = id(window)
+        if self._auxiliary_navigation_windows.get(key) is window:
+            return
+        self._auxiliary_navigation_windows[key] = window
+        window.installEventFilter(self)
+        window.destroyed.connect(
+            lambda _object=None, window_key=key: self._on_auxiliary_navigation_window_destroyed(
+                window_key
+            )
+        )
+
+    @Slot(QObject)
+    def unregister_auxiliary_navigation_window(self, window: QObject) -> None:
+        """Stop and detach navigation input from a QML tool window."""
+        if window is None:
+            return
+        key = id(window)
+        if self._auxiliary_navigation_windows.get(key) is not window:
+            return
+        self._end_navigation_hold(0, source=window)
+        self._auxiliary_navigation_windows.pop(key, None)
+        try:
+            window.removeEventFilter(self)
+        except RuntimeError:
+            pass
+
+    @Slot(QObject)
+    def release_auxiliary_navigation_hold(self, window: QObject) -> None:
+        """Release a hold when QML state disables a registered tool window."""
+        if window is not None and self._is_auxiliary_navigation_window(window):
+            self._end_navigation_hold(0, source=window)
+
+    def _on_auxiliary_navigation_window_destroyed(self, window_key: int) -> None:
+        window = self._auxiliary_navigation_windows.pop(window_key, None)
+        if window is not None:
+            self._end_navigation_hold(0, source=window)
+
     @Slot(int, int, str)
     def handle_key_from_histogram(self, key: int, modifiers: int, text: str):
         """Forward key presses from the histogram window through eventFilter."""
+        if key in (Qt.Key_Left, Qt.Key_Right) and not (
+            Qt.KeyboardModifier(modifiers)
+            & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier)
+        ):
+            self._request_paced_navigation_step(1 if key == Qt.Key_Right else -1)
+            return
         from PySide6.QtGui import QKeyEvent
 
         event = QKeyEvent(
@@ -1503,6 +1786,12 @@ class AppController(QObject):
     @Slot(int, int, str)
     def handle_key_from_compact_editor(self, key: int, modifiers: int, text: str):
         """Forward navigation keys from the compact editor through eventFilter."""
+        if key in (Qt.Key_Left, Qt.Key_Right) and not (
+            Qt.KeyboardModifier(modifiers)
+            & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier)
+        ):
+            self._request_paced_navigation_step(1 if key == Qt.Key_Right else -1)
+            return
         from PySide6.QtGui import QKeyEvent
 
         event = QKeyEvent(
@@ -1511,11 +1800,61 @@ class AppController(QObject):
         self.eventFilter(self.main_window, event)
 
     def eventFilter(self, watched, event) -> bool:
-        if watched == self.main_window and event.type() == QEvent.Type.KeyRelease:
-            if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+        is_main_window = watched == self.main_window
+        is_auxiliary_window = self._is_auxiliary_navigation_window(watched)
+        is_navigation_window = is_main_window or is_auxiliary_window
+
+        if is_navigation_window and event.type() in {
+            QEvent.Type.WindowDeactivate,
+            QEvent.Type.FocusOut,
+            QEvent.Type.Close,
+            QEvent.Type.Hide,
+            QEvent.Type.Destroy,
+        }:
+            self._end_navigation_hold(0, source=watched)
+
+        if is_navigation_window and event.type() == QEvent.Type.KeyRelease:
+            if (
+                is_main_window
+                and event.key() == Qt.Key_Space
+                and not event.isAutoRepeat()
+            ):
                 was_active = self._original_compare_active
                 self.stop_original_compare_preview()
                 return was_active
+            if (
+                event.key() in (Qt.Key_Left, Qt.Key_Right)
+                and not event.isAutoRepeat()
+                and not self._is_grid_view_active
+            ):
+                direction = 1 if event.key() == Qt.Key_Right else -1
+                ended = self._end_navigation_hold(direction, source=watched)
+                if ended or is_main_window:
+                    return True
+
+        if (
+            is_auxiliary_window
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() in (Qt.Key_Left, Qt.Key_Right)
+        ):
+            blocked_modifiers = event.modifiers() & (
+                Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier
+            )
+            if not blocked_modifiers:
+                navigation_enabled = bool(
+                    watched.property("plainArrowNavigationEnabled")
+                ) and not (
+                    self._dialog_open or getattr(self.ui_state, "isCropping", False)
+                )
+                if navigation_enabled:
+                    if not event.isAutoRepeat():
+                        direction = 1 if event.key() == Qt.Key_Right else -1
+                        self._begin_navigation_hold(direction, source=watched)
+                else:
+                    self._end_navigation_hold(0, source=watched)
+                # Physical auto-repeat is intentionally consumed. The precise
+                # controller timer owns repeat cadence after the initial press.
+                return True
 
         # Don't handle key events when a dialog is open
         if self._dialog_open:
@@ -1529,7 +1868,7 @@ class AppController(QObject):
         # branch below handles deterministically. Rotate mode is excluded:
         # there Esc must reach the loupe's QML key handler to exit rotation.
         if (
-            watched == self.main_window
+            is_main_window
             and event.type() == QEvent.Type.ShortcutOverride
             and event.key() == Qt.Key_Escape
             and getattr(self.ui_state, "isCropping", False)
@@ -1538,7 +1877,7 @@ class AppController(QObject):
             event.accept()
             return True
 
-        if watched == self.main_window and event.type() == QEvent.Type.KeyPress:
+        if is_main_window and event.type() == QEvent.Type.KeyPress:
             if event.key() == Qt.Key_Space and self._can_show_original_compare(event):
                 if not event.isAutoRepeat():
                     self.start_original_compare_preview()
@@ -1596,6 +1935,19 @@ class AppController(QObject):
                 }
                 if key in grid_keys:
                     return False  # Let QML handle it
+
+            if event.key() in (Qt.Key_Left, Qt.Key_Right):
+                blocked_modifiers = event.modifiers() & (
+                    Qt.ControlModifier
+                    | Qt.AltModifier
+                    | Qt.MetaModifier
+                    | Qt.ShiftModifier
+                )
+                if not blocked_modifiers:
+                    if not event.isAutoRepeat():
+                        direction = 1 if event.key() == Qt.Key_Right else -1
+                        self._begin_navigation_hold(direction, source=watched)
+                    return True
 
             handled = self.keybinder.handle_key_press(event)
             if handled:
@@ -1673,12 +2025,16 @@ class AppController(QObject):
 
     def load(self, skip_thumbnail_refresh: bool = False):
         """Loads images, sidecar data, and starts services."""
+        self._cancel_paced_navigation()
         # Reset instrumentation for this load operation
         self._scan_count_variant = 0
         self._grid_refreshes = 0
         self._grid_model_dirty = True
 
-        self.refresh_image_list()  # Initial scan from disk
+        # Publish the new list only after its restored current index and decode
+        # state are ready. An early imageCountChanged used to make QML request
+        # index 0 while the real saved index was still being restored.
+        self.refresh_image_list(notify=False)  # Initial scan from disk
         if not self.image_files:
             self.current_index = 0
         else:
@@ -1693,10 +2049,30 @@ class AppController(QObject):
         )
         self._remember_last_directory()
         self.watcher.start()
+
+        # A pending resize timer cannot fire while requestImage() is blocking.
+        # Commit its latest dimensions now so the first decode is display-sized.
+        if self.resize_timer.isActive():
+            self.resize_timer.stop()
+        display_changed, first_display_report = self._commit_pending_display_size()
+        if first_display_report:
+            log.info("Display size now stable, enabling prefetch")
+        if display_changed:
+            self.prefetcher.cancel_all()
+
+        # Make decoding internally legal before prefetch, but defer the folder
+        # readiness notification until the complete list/index state is emitted.
+        folder_loaded_changed = False
+        if not self._is_grid_view_active:
+            folder_loaded_changed = self._set_folder_loaded(True, notify=False)
         self._do_prefetch(self.current_index)
 
-        # Defer initial UI sync until after images are loaded
-        self.sync_ui_state()
+        # Publish count, index, and source from one generation. imageCountChanged
+        # may synchronously evaluate the source binding, so generation/index must
+        # already be final before this call.
+        self.sync_ui_state(image_count_changed=True)
+        if folder_loaded_changed:
+            self.ui_state.isFolderLoadedChanged.emit()
 
         if self._is_grid_view_active and not skip_thumbnail_refresh:
 
@@ -1708,7 +2084,8 @@ class AppController(QObject):
             ):
                 self._refresh_thumbnail_model_from_controller()
 
-        self._set_folder_loaded(True)
+        if self._is_grid_view_active:
+            self._set_folder_loaded(True)
 
         if not self._is_grid_view_active:
             self._maybe_decode_current_image("startup-loupe")
@@ -1783,7 +2160,7 @@ class AppController(QObject):
         """
         self._watcher_debounce_timer.start()
 
-    def refresh_image_list(self):
+    def refresh_image_list(self, *, notify: bool = True):
         """Rescans the directory for images from disk and updates cache.
 
         This does a full disk scan and should only be called when:
@@ -1800,7 +2177,7 @@ class AppController(QObject):
         images, variant_map = find_images_with_variants(self.image_dir)
         self._all_images = images
         self._variant_map = variant_map
-        self._apply_filter_to_cached_list()
+        self._apply_filter_to_cached_list(notify=notify)
 
         # Mark model as dirty since the underlying directory was rescanned
         self._grid_model_dirty = True
@@ -1826,7 +2203,7 @@ class AppController(QObject):
             changed_paths = self._watcher_changed_paths
             self._watcher_changed_paths = set()
 
-        self.refresh_image_list()
+        self.refresh_image_list(notify=False)
 
         # Bust decode caches so modified-on-disk files are re-decoded.
         # Invalidate only the files the watcher reported (a save produces a
@@ -1863,9 +2240,9 @@ class AppController(QObject):
             )
 
         self._do_prefetch(self.current_index)
-        self.sync_ui_state()
+        self.sync_ui_state(image_count_changed=True)
 
-    def _apply_filter_to_cached_list(self):
+    def _apply_filter_to_cached_list(self, *, notify: bool = True):
         """Applies current filter to cached image list without disk I/O."""
         old_batch_start_path = (
             self.image_files[self.batch_start_index].path
@@ -1884,7 +2261,8 @@ class AppController(QObject):
             self.batch_start_index = None
         self.prefetcher.set_image_files(self.image_files)
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
-        self.ui_state.imageCountChanged.emit()
+        if notify:
+            self.ui_state.imageCountChanged.emit()
 
     def _reapply_flag_filter_after_metadata_change(
         self, flag_attr: str, preserved_path: Optional[Path]
@@ -1912,7 +2290,7 @@ class AppController(QObject):
             else None
         )
 
-        self._apply_filter_to_cached_list()
+        self._apply_filter_to_cached_list(notify=False)
         self._bump_display_generation()
 
         self.stacks = self._merge_stack_ranges(
@@ -2126,7 +2504,7 @@ class AppController(QObject):
         ):
             self._thumbnail_model.notify_batch_state_changed()
         if sync:
-            self.sync_ui_state()
+            self.sync_ui_state(image_count_changed=filter_reapplied)
 
     @staticmethod
     def _shift_ranges_after_insert(
@@ -2283,7 +2661,13 @@ class AppController(QObject):
         # Trigger prefetch/decode for current index
         self._do_prefetch(self.current_index, override_path=override_path)
 
-    def get_decoded_image(self, index: int) -> Optional[DecodedImage]:
+    def get_decoded_image(
+        self,
+        index: int,
+        nav_seq: Optional[int] = None,
+        request_generation: Optional[int] = None,
+        requested_path: Optional[Path | str] = None,
+    ) -> Optional[DecodedImage]:
         """Retrieves a decoded image, blocking until ready to ensure correct display.
 
         This blocks the UI thread on cache miss, but that's acceptable for an image viewer
@@ -2298,8 +2682,8 @@ class AppController(QObject):
                 )
             return None
 
-        if self.debug_cache:
-            _t_start = time.perf_counter()
+        _t_start = time.perf_counter() if self.debug_cache_trace else 0.0
+        if self.debug_cache_trace:
             log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} get_decoded_image: START index={index}"
             )
@@ -2311,13 +2695,24 @@ class AppController(QObject):
             return None
 
         if self._has_current_live_preview_for_index(index):
+            self._record_nav_cache_outcome(
+                nav_seq,
+                request_generation,
+                "live-preview",
+            )
             return self._last_rendered_preview
 
-        _, _, display_gen = self.get_display_info()
+        display_width, display_height, display_gen = self.get_display_info()
 
-        # Variant override: use override path for current index
+        # The provider passes the immutable path captured for this navigation.
+        # If a watcher/sort/delete shifts the list while the request is in
+        # flight, decode that exact file rather than whatever now occupies the
+        # same numeric index. The provider still verifies returned provenance.
         current_override = None
-        if self.view_override_path and index == self.current_index:
+        if requested_path is not None:
+            image_path = Path(requested_path)
+            current_override = image_path
+        elif self.view_override_path and index == self.current_index:
             if _debug_mode:
                 log.debug(
                     "DISPLAY OVERRIDE kind=%s path=%s",
@@ -2329,18 +2724,38 @@ class AppController(QObject):
         else:
             image_path = self.image_files[index].path
         path_str = image_path.as_posix()
-        cache_key = build_cache_key(image_path, display_gen)
+        preferred_quality = "fast" if self._navigation_fast_mode_active() else "cover"
+        quality_order = (
+            ("fast", "cover") if preferred_quality == "fast" else ("cover", "fast")
+        )
 
         # Check cache. Use a single get() instead of `in` + `[]` so a concurrent
         # LRU eviction between the two lookups can't raise a KeyError here.
-        decoded = self.image_cache.get(cache_key)
+        decoded = None
+        cache_key = None
+        for candidate_quality in quality_order:
+            candidate_key = build_cache_key(
+                image_path,
+                display_gen,
+                candidate_quality,
+            )
+            decoded = self.image_cache.get(candidate_key)
+            if decoded is not None:
+                cache_key = candidate_key
+                break
         if decoded is not None:
+            self._record_nav_cache_outcome(
+                nav_seq,
+                request_generation,
+                "hit",
+                cache_key,
+            )
             self.image_cache.hits += 1  # Increment hit counter
             self._update_cache_stats()  # Update UI with new stats
             with self._last_image_lock:
                 self.last_displayed_image = decoded
 
-            if self.debug_cache:
+            if self.debug_cache_trace:
                 _t_end = time.perf_counter()
                 log.info(
                     f"[DBGCACHE] {_t_end*1000:.3f} get_decoded_image: CACHE HIT index={index} total={(_t_end - _t_start)*1000:.2f}ms"
@@ -2348,13 +2763,30 @@ class AppController(QObject):
 
             return decoded
 
+        # A miss always requests the inexpensive display tier. Cover quality is
+        # an asynchronous settled-image upgrade and never blocks navigation.
+        decode_result_quality = (
+            "fast" if display_width > 0 and display_height > 0 else "cover"
+        )
+        cache_key = build_cache_key(
+            image_path,
+            display_gen,
+            decode_result_quality,
+        )
+
         self.image_cache.misses += 1  # Increment miss counter
+        self._record_nav_cache_outcome(
+            nav_seq,
+            request_generation,
+            "miss",
+            cache_key,
+        )
         self._update_cache_stats()  # Update UI with new stats
-        if self.debug_cache:
+        if self.debug_cache_trace:
             prefix = f"{path_str}::"
-            cached_gens = [
-                key.split("::", 1)[1]
-                for key in self.image_cache.keys()
+            cached_variants = [
+                key[len(prefix) :]
+                for key in self.image_cache.keys_snapshot()
                 if key.startswith(prefix)
             ]
             cache_usage_gb = self.image_cache.currsize / (1024**3)
@@ -2363,11 +2795,11 @@ class AppController(QObject):
                 f"[DBGCACHE] {_t_miss*1000:.3f} get_decoded_image: CACHE MISS index={index} gen={display_gen} (after {(_t_miss - _t_start)*1000:.2f}ms)"
             )
             log.info(
-                "Cache miss for %s (index=%d gen=%d). Cached gens: %s. Cache usage=%.2fGB entries=%d",
+                "Cache miss for %s (index=%d gen=%d). Cached variants: %s. Cache usage=%.2fGB entries=%d",
                 image_path.name,
                 index,
                 display_gen,
-                cached_gens or "none",
+                cached_variants or "none",
                 cache_usage_gb,
                 len(self.image_cache),
             )
@@ -2388,64 +2820,122 @@ class AppController(QObject):
             # QCoreApplication.processEvents()
 
         try:
-            # Submit with priority=True to cancel pending prefetch tasks and free up workers
+            # A prefetch worker can populate the key between the first lookup
+            # and this demand path (especially while debug logging is active).
+            # Recheck synchronously so an already-ready image never waits
+            # behind another executor queue item.
+            decoded = self.image_cache.get(cache_key)
+            if decoded is not None:
+                self._record_nav_cache_outcome(
+                    nav_seq,
+                    request_generation,
+                    "late-hit",
+                    cache_key,
+                )
+                with self._last_image_lock:
+                    self.last_displayed_image = decoded
+                if self.debug_cache_trace:
+                    _t_decoded = time.perf_counter()
+                    log.info(
+                        f"[DBGCACHE] {_t_decoded*1000:.3f} get_decoded_image: LATE CACHE HIT index={index} total={(_t_decoded - _t_start)*1000:.2f}ms"
+                    )
+                return decoded
+
+            # Submit with priority=True to cancel pending prefetch tasks and free up workers.
+            # nav_seq threads this demand decode's navigation correlation id to
+            # the worker so its timing attaches to the exact frame, not by index.
             future = self.prefetcher.submit_task(
                 index,
                 self.prefetcher.generation,
                 priority=True,
                 override_path=current_override,
                 quality="fast",
+                nav_seq=nav_seq,
             )
             if not future:
-                with self._last_image_lock:
-                    return self.last_displayed_image
+                self._record_nav_cache_outcome(
+                    nav_seq,
+                    request_generation,
+                    "miss-submit-failed",
+                    cache_key,
+                )
+                return None
 
             try:
-                # Wait for decode to complete (blocking but fast for JPEGs)
-                result = future.result(timeout=5.0)  # 5 second timeout as safety
-            except concurrent.futures.TimeoutError:
-                log.warning("Timeout decoding image at index %d", index)
-                with self._last_image_lock:
-                    return self.last_displayed_image
+                # The existing frame remains on screen while this synchronous
+                # provider request is in progress. Do not time out and publish
+                # a placeholder (or the wrong previous image) while the target
+                # decode is still legitimately running.
+                result = future.result()
             except concurrent.futures.CancelledError:
+                self._record_nav_cache_outcome(
+                    nav_seq,
+                    request_generation,
+                    "miss-canceled",
+                    cache_key,
+                )
                 log.debug("Decode cancelled for index %d", index)
-                with self._last_image_lock:
-                    return self.last_displayed_image
+                return None
             except Exception:
+                self._record_nav_cache_outcome(
+                    nav_seq,
+                    request_generation,
+                    "miss-error",
+                    cache_key,
+                )
                 log.exception("Error decoding image at index %d", index)
-                with self._last_image_lock:
-                    return self.last_displayed_image
+                return None
 
             if not result:
+                self._record_nav_cache_outcome(
+                    nav_seq,
+                    request_generation,
+                    "miss-no-result",
+                    cache_key,
+                )
                 if _debug_mode:
                     log.debug("Decode returned no result for index %d", index)
-                with self._last_image_lock:
-                    return self.last_displayed_image
+                return None
 
             decoded_path, decoded_display_gen = result
-            cache_key = build_cache_key(decoded_path, decoded_display_gen)
-            if cache_key in self.image_cache:
-                decoded = self.image_cache[cache_key]
+            cache_key = build_cache_key(
+                decoded_path,
+                decoded_display_gen,
+                decode_result_quality,
+            )
+            decoded = self.image_cache.get(cache_key)
+            if decoded is not None:
+                self._record_nav_cache_outcome(
+                    nav_seq,
+                    request_generation,
+                    "miss-decoded",
+                    cache_key,
+                )
                 with self._last_image_lock:
                     self.last_displayed_image = decoded
                 if _debug_mode:
                     elapsed = time.perf_counter() - decode_start
                     log.info("Decoded image %d in %.3fs", index, elapsed)
-                if self.debug_cache:
+                if self.debug_cache_trace:
                     _t_decoded = time.perf_counter()
                     log.info(
                         f"[DBGCACHE] {_t_decoded*1000:.3f} get_decoded_image: DECODED index={index} total={(_t_decoded - _t_start)*1000:.2f}ms"
                     )
                 return decoded
             else:
+                self._record_nav_cache_outcome(
+                    nav_seq,
+                    request_generation,
+                    "miss-cache-rejected",
+                    cache_key,
+                )
                 if _debug_mode:
                     log.debug(
                         "Decode finished but cache_key missing (index=%d, key=%s)",
                         index,
                         cache_key,
                     )
-                with self._last_image_lock:
-                    return self.last_displayed_image
+                return None
         finally:
             # Hide decoding indicator
             if self.debug_cache:
@@ -2472,12 +2962,14 @@ class AppController(QObject):
         except IndexError:
             return None
 
-        cache_key = build_cache_key(image_path, display_gen)
-
-        # Check cache (thread-safe read)
-        if cache_key in self.image_cache:
-            # We don't update stats/hits here to avoid race conditions on those counters
-            return self.image_cache[cache_key]
+        # Check cache (thread-safe read). We don't update stats/hits here to
+        # avoid racing the GUI-thread counters.
+        for quality in ("fast", "cover"):
+            decoded = self.image_cache.get(
+                build_cache_key(image_path, display_gen, quality)
+            )
+            if decoded is not None:
+                return decoded
 
         # Cache miss: decode synchronously (in this worker thread)
         try:
@@ -2509,22 +3001,29 @@ class AppController(QObject):
                 if result:
                     decoded_path, decoded_display_gen = result
                     # Re-verify key
-                    cache_key = build_cache_key(decoded_path, decoded_display_gen)
-                    if cache_key in self.image_cache:
-                        return self.image_cache[cache_key]
+                    for quality in ("fast", "cover"):
+                        decoded = self.image_cache.get(
+                            build_cache_key(
+                                decoded_path,
+                                decoded_display_gen,
+                                quality,
+                            )
+                        )
+                        if decoded is not None:
+                            return decoded
         except Exception:
             log.exception("_get_decoded_image_safe failed for index %d", index)
 
         return None
 
-    def sync_ui_state(self):
+    def sync_ui_state(self, *, image_count_changed: bool = False):
         """Forces the UI to update by emitting all state change signals.
 
         Essential signals (currentIndexChanged, currentImageSourceChanged) are emitted
         immediately. Non-essential signals (highlightStateChanged, metadataChanged) are
         debounced to reduce overhead during rapid navigation.
         """
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_start = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} sync_ui_state: START gen={self.ui_refresh_generation + 1}"
@@ -2553,6 +3052,8 @@ class AppController(QObject):
             self._original_compare_gen = self.ui_refresh_generation
 
         # Essential signals - emit immediately for responsive image display
+        if image_count_changed:
+            self.ui_state.imageCountChanged.emit()
         self.ui_state.currentIndexChanged.emit()
         self.ui_state.currentImageSourceChanged.emit()
 
@@ -2563,7 +3064,7 @@ class AppController(QObject):
         # Coalesced crash-recovery persistence (~1s after navigation settles)
         self._session_save_timer.start()
 
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_end = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} sync_ui_state: DONE signals emitted, total={(_t_end - _t_start)*1000:.2f}ms"
@@ -2618,7 +3119,7 @@ class AppController(QObject):
         if not self.ui_state:
             return
 
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_start = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} _emit_debounced_metadata_signals: emitting deferred signals"
@@ -2629,7 +3130,7 @@ class AppController(QObject):
         self.ui_state.variantBadgesChanged.emit()
         self.ui_state.variantSaveHintChanged.emit()
 
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_end = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} _emit_debounced_metadata_signals: DONE total={(_t_end - _t_start)*1000:.2f}ms"
@@ -2694,7 +3195,8 @@ class AppController(QObject):
             if key is None:
                 return (0, 0)
 
-            cached = self._native_image_size_cache.get(key)
+            with self._native_image_size_lock:
+                cached = self._native_image_size_cache.get(key)
             if cached is not None and cached[0] == mtime:
                 return (cached[1], cached[2])
 
@@ -2704,7 +3206,12 @@ class AppController(QObject):
             if orientation in (5, 6, 7, 8):
                 width, height = height, width
 
-            self._native_image_size_cache[key] = (mtime, int(width), int(height))
+            with self._native_image_size_lock:
+                self._native_image_size_cache[key] = (
+                    mtime,
+                    int(width),
+                    int(height),
+                )
             return (int(width), int(height))
         except (OSError, TypeError, ValueError):
             return (0, 0)
@@ -2747,19 +3254,23 @@ class AppController(QObject):
     def _fire_auto_adjust_save_debounce(self) -> None:
         self._auto_adjust_save_pending_action = None
 
-    def _get_current_live_edit_session_info(
+    def _get_current_preview_session_provenance(
         self,
-    ) -> Optional[tuple[str, Optional[str], int]]:
-        """Return the active path key, session id, and edit revision for the live editor session."""
-        if self.image_editor is None or self.image_editor.current_filepath is None:
+    ) -> Optional[PreviewSessionProvenance]:
+        """Return normalized source/session/revision identity for active previews."""
+        editor = self.image_editor
+        if editor is None:
             return None
-        if self.image_editor.original_image is None:
-            return None
-
-        editor_path = Path(self.image_editor.current_filepath)
         active_path = self._get_current_auto_adjust_path()
         if active_path is None:
             return None
+
+        with editor._lock:
+            if editor.current_filepath is None or editor.original_image is None:
+                return None
+            editor_path = Path(editor.current_filepath)
+            session_id = getattr(editor, "session_id", None)
+            revision = int(getattr(editor, "_edits_rev", 0))
 
         try:
             active_key = self._key(active_path)
@@ -2770,17 +3281,17 @@ class AppController(QObject):
         if active_key != editor_key:
             return None
 
-        return (
+        return PreviewSessionProvenance(
             active_key,
-            getattr(self.image_editor, "session_id", None),
-            int(getattr(self.image_editor, "_edits_rev", 0)),
+            session_id,
+            revision,
         )
 
     def _get_current_live_preview_session_key(
         self,
     ) -> Optional[tuple[str, Optional[str]]]:
         """Return the path/session identity for the active live preview."""
-        info = self._get_current_live_edit_session_info()
+        info = self._get_current_preview_session_provenance()
         if info is None:
             return None
         active_path_key, session_id, _revision = info
@@ -2790,7 +3301,7 @@ class AppController(QObject):
         self,
     ) -> Optional[tuple[str, Optional[str], int]]:
         """Return the path/session/revision identity for held-space compare."""
-        info = self._get_current_live_edit_session_info()
+        info = self._get_current_preview_session_provenance()
         if info is None:
             return None
         active_path_key, session_id, revision = info
@@ -2802,12 +3313,18 @@ class AppController(QObject):
         session_key: Optional[tuple[str, Optional[str]]] = None,
     ) -> None:
         """Publish a rendered preview while holding _preview_lock."""
-        self._last_rendered_preview = decoded
-        self._last_rendered_preview_session_key = (
+        resolved_session_key = (
             session_key
             if session_key is not None
             else self._get_current_live_preview_session_key()
         )
+        # Editor renders do not pass through Prefetcher, so stamp their exact
+        # session path here. The provider can then enforce the same wrong-image
+        # invariant for previews as it does for cached JPEG decodes.
+        if resolved_session_key is not None:
+            decoded.source_path = resolved_session_key[0]
+        self._last_rendered_preview = decoded
+        self._last_rendered_preview_session_key = resolved_session_key
 
     def _clear_last_rendered_preview_locked(self) -> None:
         """Clear rendered preview state while holding _preview_lock."""
@@ -2831,7 +3348,7 @@ class AppController(QObject):
 
     def _ensure_live_edit_session_state(self, *, force_reset: bool = False) -> None:
         """Bind dirty-session tracking to the currently loaded editor session."""
-        info = self._get_current_live_edit_session_info()
+        info = self._get_current_preview_session_provenance()
         if info is None:
             if force_reset:
                 self._live_edit_session_state = None
@@ -3506,7 +4023,7 @@ class AppController(QObject):
     def _is_current_live_edit_session_dirty(self) -> bool:
         """Return True when the current session has unsaved edits beyond the latest submitted save."""
         state = self._live_edit_session_state
-        info = self._get_current_live_edit_session_info()
+        info = self._get_current_preview_session_provenance()
         if state is None or info is None:
             return False
 
@@ -3525,7 +4042,7 @@ class AppController(QObject):
     def _mark_current_live_edit_session_submitted(self, revision: int) -> None:
         """Record that a save request has been queued for the current session revision."""
         state = self._live_edit_session_state
-        info = self._get_current_live_edit_session_info()
+        info = self._get_current_preview_session_provenance()
         if state is None or info is None:
             return
 
@@ -3536,7 +4053,7 @@ class AppController(QObject):
     def _mark_current_live_edit_session_persisted(self, revision: int) -> None:
         """Record that the current session revision has been written to disk."""
         state = self._live_edit_session_state
-        info = self._get_current_live_edit_session_info()
+        info = self._get_current_preview_session_provenance()
         if state is None or info is None:
             return
 
@@ -3550,7 +4067,7 @@ class AppController(QObject):
 
     def _mark_current_live_edit_session_clean(self) -> None:
         """Treat the current revision as clean without writing a file."""
-        info = self._get_current_live_edit_session_info()
+        info = self._get_current_preview_session_provenance()
         if info is None:
             self._live_edit_session_state = None
             return
@@ -3565,7 +4082,7 @@ class AppController(QObject):
     def _mark_current_live_edit_session_save_failed(self, revision: int) -> None:
         """Rollback the submitted revision watermark when the latest save fails."""
         state = self._live_edit_session_state
-        info = self._get_current_live_edit_session_info()
+        info = self._get_current_preview_session_provenance()
         if state is None or info is None:
             return
 
@@ -4223,7 +4740,7 @@ class AppController(QObject):
             return None
 
         self._ensure_live_edit_session_state()
-        session_info = self._get_current_live_edit_session_info()
+        session_info = self._get_current_preview_session_provenance()
         if session_info is None:
             return None
 
@@ -4505,7 +5022,10 @@ class AppController(QObject):
         self._mark_optimistic_decode_seed_epoch(path)
         self.prefetcher.invalidate_path(path)
         _, _, display_gen = self.get_display_info()
-        self.image_cache[build_cache_key(path, display_gen)] = decoded
+        seed_quality = getattr(decoded, "quality", "cover")
+        if seed_quality not in {"fast", "cover"}:
+            seed_quality = "cover"
+        self.image_cache[build_cache_key(path, display_gen, seed_quality)] = decoded
 
     def _flush_current_live_edit_session_for_navigation(self) -> bool:
         """Queue a background save for the current dirty session before switching images."""
@@ -4811,18 +5331,1615 @@ class AppController(QObject):
 
     # --- Actions ---
 
+    # ---- Navigation trace (seq correlation) --------------------------------
+    #
+    # One seq is minted per target change. Every provider request also has a UI
+    # generation, because a single navigation can display a fast frame and then
+    # a cover-quality replacement. Correlation is therefore (seq, generation),
+    # never "whatever index happens to be current when a worker finishes".
+
+    _NAV_RECORDS_MAX = 96
+    _NAV_SETTLE_MS = 400
+    _NAV_SUMMARY_DEADLINE_MS = 1800
+
+    def _fast_buffer_depth(self, index: int, direction: int) -> int:
+        """Count consecutive cache-ready fast frames ahead of ``index``."""
+        if direction not in (-1, 1) or not self.image_files:
+            return 0
+        _, _, display_generation = self.get_display_info()
+        depth = 0
+        candidate = index + direction
+        max_probe = max(1, int(getattr(self.prefetcher, "prefetch_radius", 20)))
+        while 0 <= candidate < len(self.image_files) and depth < max_probe:
+            path = self.image_files[candidate].path
+            key = build_cache_key(path, display_generation, "fast")
+            # Telemetry must not reorder the LRU: otherwise probing nearest to
+            # farthest would make the least urgent frame the most recent one.
+            if key not in self.image_cache:
+                break
+            depth += 1
+            candidate += direction
+        return depth
+
+    def _record_navigation_underflow(
+        self,
+        target_index: int,
+        direction: int,
+        buffer_depth: int,
+    ) -> None:
+        """Record a cadence tick whose exact next fast frame was not ready."""
+        self._navigation_underflow_count += 1
+        if not self.debug_cache:
+            return
+        with self._nav_trace_lock:
+            if self._burst is None:
+                self._burst = self._new_burst(time.perf_counter())
+            self._burst["underflow_count"] += 1
+        self._restart_nav_settle_timer()
+        if self.debug_cache_trace:
+            log.info(
+                "[NAVTRACE] underflow target=%d direction=%d fast_buffer=%d total=%d",
+                target_index,
+                direction,
+                buffer_depth,
+                self._navigation_underflow_count,
+            )
+
+    def _seed_nav_record(
+        self,
+        index: int,
+        *,
+        direction: int = 0,
+    ) -> int:
+        """Mint an exact navigation id and seed its expected-file provenance."""
+        # Paced navigation may mint this before changing current_index so an
+        # underflow wait remains part of request-to-present latency. Direct
+        # jumps still mint immediately after changing current_index.
+        now = time.perf_counter()
+        depth_direction = (
+            direction if direction in (-1, 1) else self._last_navigation_direction
+        )
+        depth_origin = index - direction if direction in (-1, 1) else index
+        fast_buffer_depth = self._fast_buffer_depth(depth_origin, depth_direction)
+        try:
+            path = (
+                Path(self.view_override_path)
+                if self.view_override_path and index == self.current_index
+                else self.image_files[index].path
+            )
+        except (IndexError, AttributeError):
+            path = None
+        with self._nav_trace_lock:
+            previous = self._nav_records.get(self._current_nav_seq)
+            if previous is not None and previous.get("summary_complete"):
+                self._nav_records.pop(self._current_nav_seq, None)
+            self._nav_seq += 1
+            seq = self._nav_seq
+            self._current_nav_seq = seq
+            self._nav_target_index = index
+            self._nav_target_path_key = self._key(path)
+            self._nav_records[seq] = {
+                "seq": seq,
+                "index": index,
+                "path_key": self._key(path),
+                "path": str(path) if path is not None else None,
+                "filename": path.name if path is not None else "n/a",
+                "t_mint": now,
+                "fast_buffer_depth": fast_buffer_depth,
+                "requests": {},
+                "first_source_presented": False,
+                "first_real_presented": False,
+                "first_placeholder_presented": False,
+                "settled_presented": False,
+                "terminal": False,
+            }
+            while len(self._nav_records) > self._NAV_RECORDS_MAX:
+                self._nav_records.popitem(last=False)
+
+            if self._burst is None:
+                self._burst = self._new_burst(now)
+            self._burst["nav_count"] += 1
+            self._burst["t_last"] = now
+            self._burst["seqs"].append(seq)
+            self._burst["seq_set"].add(seq)
+            self._burst["input_settled"] = False
+            self._burst["deadline_reached"] = False
+            self._burst["buffer_depths"].append(fast_buffer_depth)
+
+        self._restart_nav_settle_timer()
+        return seq
+
+    def _ensure_nav_record_for_current_target(self) -> None:
+        """Mint a seq for displayed target changes outside _set_current_index."""
+        if (
+            not self.debug_cache
+            or self._is_grid_view_active
+            or not self.image_files
+            or not (0 <= self.current_index < len(self.image_files))
+        ):
+            return
+        path = (
+            Path(self.view_override_path)
+            if self.view_override_path
+            else self.image_files[self.current_index].path
+        )
+        path_key = self._key(path)
+        with self._nav_trace_lock:
+            target_matches = (
+                self._nav_target_index == self.current_index
+                and self._nav_target_path_key == path_key
+            )
+        if not target_matches:
+            self._seed_nav_record(self.current_index)
+
+    @staticmethod
+    def _nav_request_key(generation: Optional[int]) -> int:
+        return generation if isinstance(generation, int) else -1
+
+    def _nav_request_record(self, record: dict, generation: Optional[int]) -> dict:
+        """Return the per-source-request record. Caller holds _nav_trace_lock."""
+        key = self._nav_request_key(generation)
+        requests = record.setdefault("requests", {})
+        return requests.setdefault(key, {"generation": generation})
+
+    def _new_burst(self, now: float) -> dict:
+        return {
+            "t_first": now,
+            "t_last": now,
+            "nav_count": 0,
+            "seqs": [],
+            "seq_set": set(),
+            "input_settled": False,
+            "deadline_reached": False,
+            "presented_count": 0,
+            "coalesced_count": 0,
+            "placeholder_count": 0,
+            "t_first_present": None,
+            "t_last_present": None,
+            "present_latencies": [],
+            "frame_intervals": [],
+            "image_dwells": [],
+            "t_last_frame_present": None,
+            "t_last_image_present": None,
+            "queue_waits": [],
+            "decode_times": [],
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "late_cache_hits": 0,
+            "canceled": 0,
+            "wasted_ms": 0.0,
+            "fast_to_full": [],
+            "buffer_depths": [],
+            "underflow_count": 0,
+            "pace_intervals": [],
+        }
+
+    def _restart_nav_settle_timer(self) -> None:
+        if self._nav_settle_timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self._NAV_SETTLE_MS)
+            timer.timeout.connect(self._on_nav_input_settled)
+            self._nav_settle_timer = timer
+        if self._nav_summary_deadline_timer is None:
+            deadline = QTimer(self)
+            deadline.setSingleShot(True)
+            deadline.setInterval(self._NAV_SUMMARY_DEADLINE_MS)
+            deadline.timeout.connect(self._on_nav_summary_deadline)
+            self._nav_summary_deadline_timer = deadline
+        self._nav_summary_deadline_timer.stop()
+        self._nav_settle_timer.start()
+
+    def _on_nav_input_settled(self) -> None:
+        if (
+            self._held_navigation_direction
+            or self._paced_navigation_pending is not None
+            or self._paced_navigation_queue
+            or self._paced_present_gate is not None
+        ):
+            self._restart_nav_settle_timer()
+            return
+        with self._nav_trace_lock:
+            if self._burst is None:
+                return
+            self._burst["input_settled"] = True
+        if self._nav_summary_deadline_timer is not None:
+            self._nav_summary_deadline_timer.start()
+        self._maybe_emit_burst_summary()
+
+    def _on_nav_summary_deadline(self) -> None:
+        with self._nav_trace_lock:
+            if self._burst is None:
+                return
+            self._burst["deadline_reached"] = True
+        self._maybe_emit_burst_summary(force=True)
+
+    def _record_nav_cache_outcome(
+        self,
+        seq: Optional[int],
+        generation: Optional[int],
+        outcome: str,
+        cache_key: Optional[str] = None,
+    ) -> None:
+        if not self.debug_cache or seq is None:
+            return
+        with self._nav_trace_lock:
+            record = self._nav_records.get(seq)
+            if record is None and seq == 0:
+                try:
+                    expected = str(self.image_files[self.current_index].path)
+                except (IndexError, AttributeError):
+                    expected = None
+                record = self._ensure_startup_nav_record(
+                    seq,
+                    self.current_index,
+                    expected,
+                )
+            if record is None:
+                return
+            request = self._nav_request_record(record, generation)
+            request["cache_outcome"] = outcome
+            if cache_key is not None:
+                request["cache_key"] = cache_key
+
+    def _note_burst_canceled(
+        self,
+        wasted_ms: float,
+        *,
+        seq: Optional[int],
+    ) -> None:
+        with self._nav_trace_lock:
+            if (
+                self._burst is not None
+                and seq is not None
+                and seq in self._burst["seq_set"]
+            ):
+                self._burst["canceled"] += 1
+                self._burst["wasted_ms"] += max(0.0, wasted_ms)
+
+    def _note_cache_reject(
+        self,
+        reason: str,
+        cache_key,
+        *,
+        decoded: Optional[DecodedImage] = None,
+    ) -> None:
+        if not self.debug_cache:
+            return
+        trace = getattr(decoded, "decode_trace", None)
+        seq = trace.get("seq") if isinstance(trace, dict) else None
+        worker_start = trace.get("worker_start_t") if isinstance(trace, dict) else None
+        wasted_ms = (
+            (time.perf_counter() - worker_start) * 1000.0
+            if isinstance(worker_start, (int, float))
+            else 0.0
+        )
+        self._note_burst_canceled(wasted_ms, seq=seq)
+        log.info(
+            "[NAVTRACE] cache_reject seq=%s task=%s reason=%s key=%s wasted=%.1fms",
+            seq,
+            trace.get("task_id", "?") if isinstance(trace, dict) else "?",
+            reason,
+            cache_key,
+            wasted_ms,
+        )
+
+    @staticmethod
+    def _percentile(values: list, pct: float) -> Optional[float]:
+        if not values:
+            return None
+        ordered = sorted(values)
+        rank = math.ceil((pct / 100.0) * len(ordered)) - 1
+        return ordered[max(0, min(len(ordered) - 1, rank))]
+
+    def _maybe_emit_burst_summary(self, *, force: bool = False) -> None:
+        with self._nav_trace_lock:
+            burst = self._burst
+            if burst is None or not burst["input_settled"]:
+                return
+            final_seq = burst["seqs"][-1] if burst["seqs"] else None
+            final_record = self._nav_records.get(final_seq)
+            final_done = bool(
+                final_record
+                and (
+                    final_record.get("settled_presented")
+                    or (
+                        final_record.get("terminal")
+                        and final_record.get("first_source_presented")
+                    )
+                )
+            )
+            if not force and not final_done:
+                return
+        self._emit_burst_summary()
+
+    def _emit_burst_summary(self) -> None:
+        single_unpresented = None
+        single_pending = None
+        with self._nav_trace_lock:
+            burst = self._burst
+            self._burst = None
+            if burst is None:
+                return
+            seqs = burst["seq_set"]
+            final_seq = burst["seqs"][-1] if burst["seqs"] else None
+            final_record = self._nav_records.get(final_seq)
+            upgrade_pending = bool(
+                final_record
+                and final_record.get("first_real_presented")
+                and not final_record.get("settled_presented")
+                and not final_record.get("terminal")
+            )
+            image_pending = bool(
+                final_record
+                and not final_record.get("first_real_presented")
+                and not final_record.get("terminal")
+            )
+            pending_work = upgrade_pending or image_pending
+            if burst["nav_count"] == 1 and final_record is not None:
+                requests = list(final_record.get("requests", {}).values())
+                latest = requests[-1] if requests else {}
+                if not final_record.get("first_source_presented"):
+                    if latest.get("ready_t") is not None:
+                        reason = "no frame swap after Image.Ready"
+                    elif latest.get("outcome"):
+                        reason = "provider completed but QML did not become Ready"
+                    else:
+                        reason = "provider was not called"
+                    single_unpresented = {
+                        "seq": final_seq,
+                        "index": final_record.get("index"),
+                        "filename": final_record.get("filename", "n/a"),
+                        "generation": latest.get("generation"),
+                        "outcome": latest.get("outcome", "n/a"),
+                        "reason": reason,
+                    }
+                elif pending_work:
+                    single_pending = {
+                        "seq": final_seq,
+                        "index": final_record.get("index"),
+                        "filename": final_record.get("filename", "n/a"),
+                        "generation": latest.get("generation"),
+                        "frame": (
+                            "upgrade_pending" if upgrade_pending else "image_pending"
+                        ),
+                        "initial_quality": final_record.get("initial_quality", "n/a"),
+                    }
+            if final_record is not None:
+                final_record["summary_complete"] = True
+                final_record["summary_emitted_pending"] = pending_work
+            for seq in seqs:
+                # Keep the current target's record after the summary so later
+                # same-target refreshes and grid/loupe round trips retain exact
+                # provenance. _seed_nav_record removes it on the next target.
+                if seq != final_seq:
+                    self._nav_records.pop(seq, None)
+            self._nav_pending_present = [
+                pending
+                for pending in self._nav_pending_present
+                if pending[0] not in seqs or (pending_work and pending[0] == final_seq)
+            ]
+        if self._nav_summary_deadline_timer is not None:
+            self._nav_summary_deadline_timer.stop()
+        if single_unpresented is not None:
+            log.warning(
+                "[NAVTRACE] seq=%s gen=%s index=%s file=%r frame=not_presented "
+                "outcome=%s reason=%s",
+                single_unpresented["seq"],
+                single_unpresented["generation"],
+                single_unpresented["index"],
+                single_unpresented["filename"],
+                single_unpresented["outcome"],
+                single_unpresented["reason"],
+            )
+        if single_pending is not None:
+            log.warning(
+                "[NAVTRACE] seq=%s gen=%s index=%s file=%r frame=%s "
+                "initial_quality=%s reason=summary deadline reached",
+                single_pending["seq"],
+                single_pending["generation"],
+                single_pending["index"],
+                single_pending["filename"],
+                single_pending["frame"],
+                single_pending["initial_quality"],
+            )
+        if not self.debug_cache or burst["nav_count"] < 2:
+            return
+
+        presented = burst["presented_count"]
+        first_p = burst["t_first_present"]
+        last_p = burst["t_last_present"]
+        if (
+            presented >= 2
+            and first_p is not None
+            and last_p is not None
+            and last_p > first_p
+        ):
+            # N samples span N-1 presentation intervals.
+            imgs_per_s = f"{(presented - 1) / (last_p - first_p):.1f} img/s"
+        else:
+            imgs_per_s = "n/a"
+        input_span = burst["t_last"] - burst["t_first"]
+        input_rate = (
+            f"{(burst['nav_count'] - 1) / input_span:.1f} nav/s"
+            if burst["nav_count"] >= 2 and input_span > 0
+            else "n/a"
+        )
+
+        cache_total = burst["cache_hits"] + burst["cache_misses"]
+        hit_rate = (
+            f"{burst['cache_hits'] / cache_total * 100.0:.0f}%"
+            if cache_total
+            else "n/a"
+        )
+
+        def pp(values: list) -> str:
+            p50 = self._percentile(values, 50)
+            p95 = self._percentile(values, 95)
+            if p50 is None:
+                return "p50=n/a/p95=n/a"
+            return f"p50={p50:.1f}ms/p95={p95:.1f}ms"
+
+        def pp_count(values: list) -> str:
+            p50 = self._percentile(values, 50)
+            p95 = self._percentile(values, 95)
+            if p50 is None:
+                return "p50=n/a/p95=n/a"
+            return f"p50={p50:.0f}/p95={p95:.0f}"
+
+        f2f = self._percentile(burst["fast_to_full"], 50)
+        # A placeholder is a displayed source, but it is not the requested
+        # image. Keep it visible in its own count and in `not_presented`.
+        not_presented = max(0, burst["nav_count"] - burst["presented_count"])
+        log.info(
+            "[NAVTRACE] burst navs=%d presented=%d not_presented=%d "
+            "coalesced=%d placeholders=%d "
+            "input_rate=%s present_rate=%s hit_rate=%s "
+            "target_to_present(%s) frame_interval(%s) image_dwell(%s) "
+            "fast_buffer(%s) underflows=%d underflows_total=%d "
+            "pace_interval(%s) demand_queue(%s) "
+            "demand_decode(%s) late_hits=%d canceled=%d wasted=%.0fms "
+            "fast_to_full=%s image_pending=%d upgrade_pending=%d",
+            burst["nav_count"],
+            presented,
+            not_presented,
+            burst["coalesced_count"],
+            burst["placeholder_count"],
+            input_rate,
+            imgs_per_s,
+            hit_rate,
+            pp(burst["present_latencies"]),
+            pp(burst["frame_intervals"]),
+            pp(burst["image_dwells"]),
+            pp_count(burst["buffer_depths"]),
+            burst["underflow_count"],
+            self._navigation_underflow_count,
+            pp(burst["pace_intervals"]),
+            pp(burst["queue_waits"]),
+            pp(burst["decode_times"]),
+            burst["late_cache_hits"],
+            burst["canceled"],
+            burst["wasted_ms"],
+            f"{f2f:.1f}ms" if f2f is not None else "n/a",
+            int(image_pending),
+            int(upgrade_pending),
+        )
+
+    def _record_nav_worker_timing(self, payload: dict) -> None:
+        """Receive task telemetry; never infer a displayed frame by index."""
+        event = payload.get("event")
+        if event in {"adopted", "migrated"}:
+            if self.debug_cache_trace:
+                log.info(
+                    "[NAVTRACE] task_%s task=%s index=%s file=%r prior_seq=%s "
+                    "seq=%s state=%s priority=%s bumped=%d",
+                    event,
+                    payload.get("task_id", "?"),
+                    payload.get("index"),
+                    (
+                        Path(payload["source_path"]).name
+                        if payload.get("source_path")
+                        else "n/a"
+                    ),
+                    payload.get("prior_seq"),
+                    payload.get("seq"),
+                    payload.get("state"),
+                    payload.get("priority"),
+                    int(bool(payload.get("priority_bumped"))),
+                )
+            return
+        if payload.get("canceled"):
+            wasted = float(payload.get("wasted_ms", 0.0) or 0.0)
+            seq = payload.get("seq")
+            self._note_burst_canceled(wasted, seq=seq)
+            with self._nav_trace_lock:
+                record = self._nav_records.get(seq)
+                post_summary_pending = bool(
+                    record and record.get("summary_emitted_pending")
+                )
+            if self.debug_cache_trace or post_summary_pending:
+                log.info(
+                    "[NAVTRACE] task_canceled task=%s seq=%s index=%s file=%r "
+                    "quality=%s stage=%s wasted=%.1fms",
+                    payload.get("task_id", "?"),
+                    seq,
+                    payload.get("index"),
+                    (
+                        Path(payload["source_path"]).name
+                        if payload.get("source_path")
+                        else "n/a"
+                    ),
+                    payload.get("quality"),
+                    payload.get("stage"),
+                    wasted,
+                )
+            if post_summary_pending:
+                with self._nav_trace_lock:
+                    record = self._nav_records.get(seq)
+                    if record is not None:
+                        record["summary_emitted_pending"] = False
+            return
+        if self.debug_cache_trace:
+            log.info("[NAVTRACE] worker %s", self._format_worker_stats(payload))
+
+    def _ensure_startup_nav_record(
+        self,
+        seq: int,
+        index: int,
+        expected_path: Optional[str],
+    ) -> dict:
+        """Create seq 0 lazily so startup placeholders cannot masquerade as pixels."""
+        record = self._nav_records.get(seq)
+        if record is not None:
+            return record
+        path = Path(expected_path) if expected_path else None
+        record = {
+            "seq": seq,
+            "index": index,
+            "path_key": self._key(path),
+            "path": expected_path,
+            "filename": path.name if path is not None else "n/a",
+            "t_mint": self._app_start_t,
+            "requests": {},
+            "first_source_presented": False,
+            "first_real_presented": False,
+            "first_placeholder_presented": False,
+            "settled_presented": False,
+            "terminal": False,
+        }
+        self._nav_records[seq] = record
+        return record
+
+    def _record_provider_timing(
+        self,
+        seq: Optional[int],
+        index: int,
+        generation: Optional[int],
+        provider_ms: float,
+        *,
+        outcome: str,
+        expected_path: Optional[str] = None,
+        provenance_kind: str = "display",
+        served_quality: Optional[str] = None,
+        served_path: Optional[str] = None,
+        placeholder_reason: Optional[str] = None,
+        future_active: bool = False,
+        worker: Optional[dict] = None,
+    ) -> None:
+        if not self.debug_cache or seq is None:
+            return
+        anomaly = None
+        with self._nav_trace_lock:
+            record = self._nav_records.get(seq)
+            if record is None and seq == 0:
+                record = self._ensure_startup_nav_record(seq, index, expected_path)
+            if record is None:
+                return
+            request = self._nav_request_record(record, generation)
+            request.pop("provenance_error", None)
+            request.pop("provenance_unknown", None)
+            request.update(
+                {
+                    "provider_ms": provider_ms,
+                    "outcome": outcome,
+                    "expected_path": expected_path,
+                    "provenance_kind": provenance_kind,
+                    "served_quality": served_quality,
+                    "served_path": served_path,
+                    "placeholder_reason": placeholder_reason,
+                    "future_active": future_active,
+                    "worker": worker or {},
+                    "provider_t": time.perf_counter(),
+                }
+            )
+            # Until the navigation's first frame is actually presented, the
+            # immutable path captured at mint is authoritative. This catches a
+            # delete/sort/filter shifting index N to different pixels while its
+            # request is in flight. Later same-seq requests may intentionally
+            # target a variant/editor source and use their explicit path.
+            preview_provenance = provenance_kind in {
+                "editor-preview",
+                "original-compare-preview",
+            }
+            if preview_provenance and expected_path is not None:
+                expected_key = self._key(Path(expected_path))
+                expected_display = expected_path
+            elif not record.get("first_real_presented"):
+                expected_key = record.get("path_key")
+                expected_display = record.get("path")
+            else:
+                expected_key = (
+                    self._key(Path(expected_path))
+                    if expected_path is not None
+                    else record.get("path_key")
+                )
+                expected_display = expected_path or record.get("path")
+            served_key = self._key(Path(served_path)) if served_path else None
+            if index != record.get("index"):
+                anomaly = f"index requested={record.get('index')} served={index}"
+            elif outcome == "wrong-image-blocked":
+                anomaly = f"path requested={expected_display} " f"served={served_path}"
+            elif outcome == "image" and served_key is None:
+                request["provenance_unknown"] = True
+            elif outcome == "image" and expected_key and served_key != expected_key:
+                anomaly = f"path requested={expected_display} " f"served={served_path}"
+            if anomaly:
+                request["provenance_error"] = anomaly
+            if outcome == "image" or future_active:
+                record["terminal"] = False
+            elif outcome != "image":
+                record["terminal"] = True
+        if anomaly:
+            log.error(
+                "[NAVTRACE] WRONG_IMAGE_BLOCKED seq=%s gen=%s index=%s %s",
+                seq,
+                generation,
+                index,
+                anomaly,
+            )
+        if future_active:
+            log.error(
+                "[NAVTRACE] PLACEHOLDER_WHILE_DECODING seq=%s gen=%s index=%s reason=%s",
+                seq,
+                generation,
+                index,
+                placeholder_reason,
+            )
+
+    def _nav_expected_path(
+        self,
+        seq: Optional[int],
+        fallback: object = None,
+    ) -> object:
+        """Immutable target path for an unpresented navigation frame."""
+        if not self.debug_cache or seq is None:
+            return fallback
+        with self._nav_trace_lock:
+            record = self._nav_records.get(seq)
+            if record is not None and not record.get("first_real_presented"):
+                return record.get("path") or fallback
+        return fallback
+
+    @Slot(int, int)
+    def _on_frame_ready(self, seq: int, generation: int) -> None:
+        # QML may finish an asynchronous source after a direct jump has minted
+        # a newer navigation sequence. Such a Ready belongs to pixels that are
+        # no longer eligible to release pacing or enter presentation tracing.
+        if seq != self._current_nav_seq:
+            return
+        now = time.perf_counter()
+        fallback_due_t = None
+        with self._nav_trace_lock:
+            gate = self._paced_present_gate
+            if gate is not None and gate.get("seq") == seq:
+                self._paced_present_ready = True
+                if not self._frame_sync_connected:
+                    gate["sync_t"] = now
+                if not self._frame_swapped_connected:
+                    fallback_due_t = gate.get("due_t")
+                    self._paced_present_gate = None
+                    self._paced_present_ready = False
+        if fallback_due_t is not None:
+            if self._paced_navigation_queue or self._held_navigation_direction:
+                if (
+                    self._held_navigation_direction
+                    and not self._navigation_repeat_started
+                ):
+                    remaining_ms = self._navigation_repeat_delay_ms
+                    self._navigation_repeat_started = True
+                else:
+                    remaining_ms = max(
+                        1,
+                        round((fallback_due_t - now) * 1000.0),
+                    )
+                self._navigation_hold_timer.setInterval(remaining_ms)
+                self._navigation_hold_timer.start()
+            else:
+                self._restart_quality_decode_timer()
+        if not self.debug_cache:
+            return
+        with self._nav_trace_lock:
+            record = self._nav_records.get(seq)
+            if record is None:
+                return
+            request = self._nav_request_record(record, generation)
+            # QML should emit Ready once per source. Ignore a duplicate rather
+            # than replacing the timestamp while retaining the original item
+            # in _nav_pending_present, which would make ready/present fields
+            # describe two different Ready events.
+            if request.get("ready_t") is not None:
+                return
+            request["ready_t"] = now
+            request["ready_ms"] = (now - record["t_mint"]) * 1000.0
+            marker = (seq, generation)
+            if not any(
+                (item[0], item[1]) == marker for item in self._nav_pending_present
+            ):
+                sync_t = None if self._frame_sync_connected else now
+                self._nav_pending_present.append((seq, generation, now, sync_t))
+        if not self._frame_swapped_connected:
+            with self._nav_trace_lock:
+                self._nav_pending_present = [
+                    item
+                    for item in self._nav_pending_present
+                    if (item[0], item[1]) != (seq, generation)
+                ]
+            self._present_nav_request(seq, generation, now, rendered=False)
+
+    @Slot()
+    def _capture_frame_sync(self) -> None:
+        """Mark sources included in this render-thread scene-graph sync."""
+        if not self.debug_cache and not self._paced_present_ready:
+            return
+        sync_t = time.perf_counter()
+        with self._nav_trace_lock:
+            gate = self._paced_present_gate
+            if (
+                self._paced_present_ready
+                and gate is not None
+                and gate.get("sync_t") is None
+            ):
+                gate["sync_t"] = sync_t
+            if not self.debug_cache:
+                return
+            if not self._nav_pending_present:
+                return
+            self._nav_pending_present = [
+                (
+                    seq,
+                    generation,
+                    ready_t,
+                    (
+                        sync_t
+                        if prior_sync_t is None and ready_t <= sync_t
+                        else prior_sync_t
+                    ),
+                )
+                for seq, generation, ready_t, prior_sync_t in self._nav_pending_present
+            ]
+
+    @Slot()
+    def _capture_frame_swap(self) -> None:
+        """Capture the swap timestamp on the emitting/render thread."""
+        if not self.debug_cache and not self._paced_present_ready:
+            return
+        with self._nav_trace_lock:
+            gate = self._paced_present_gate
+            paced_synced = bool(
+                self._paced_present_ready
+                and gate is not None
+                and gate.get("sync_t") is not None
+            )
+            if not self._nav_pending_present and not paced_synced:
+                return
+        self._frameSwapObserved.emit(time.perf_counter())
+
+    @Slot(float)
+    def _on_frame_swapped(self, swap_t: float) -> None:
+        """Present only the newest Ready source eligible for this exact swap."""
+        pace_due_t = None
+        with self._nav_trace_lock:
+            gate = self._paced_present_gate
+            gate_sync_t = gate.get("sync_t") if gate is not None else None
+            if (
+                self._paced_present_ready
+                and gate is not None
+                and gate_sync_t is not None
+                and gate_sync_t <= swap_t
+            ):
+                pace_due_t = gate.get("due_t")
+                self._paced_present_gate = None
+                self._paced_present_ready = False
+        if pace_due_t is not None:
+            if self._paced_navigation_queue or self._held_navigation_direction:
+                if (
+                    self._held_navigation_direction
+                    and not self._navigation_repeat_started
+                ):
+                    # Match normal keyboard behavior: one immediate action,
+                    # then the OS repeat delay before continuous movement.
+                    remaining_ms = self._navigation_repeat_delay_ms
+                    self._navigation_repeat_started = True
+                else:
+                    # There is never more than one published frame in flight,
+                    # so a late swap cannot create a catch-up burst.
+                    remaining_ms = max(
+                        1,
+                        round((pace_due_t - swap_t) * 1000.0),
+                    )
+                self._navigation_hold_timer.setInterval(remaining_ms)
+                self._navigation_hold_timer.start()
+            else:
+                self._restart_quality_decode_timer()
+
+        if not self.debug_cache:
+            return
+        with self._nav_trace_lock:
+            eligible = [
+                item
+                for item in self._nav_pending_present
+                if item[3] is not None and item[3] <= swap_t
+            ]
+            self._nav_pending_present = [
+                item
+                for item in self._nav_pending_present
+                if item[3] is None or item[3] > swap_t
+            ]
+        if not eligible:
+            return
+        presented = eligible[-1]
+        for seq, generation, _ready_t, _sync_t in eligible[:-1]:
+            self._mark_nav_request_coalesced(
+                seq,
+                generation,
+                superseded_by=(presented[0], presented[1]),
+            )
+        self._present_nav_request(
+            presented[0],
+            presented[1],
+            swap_t,
+            rendered=True,
+        )
+
+    def _mark_nav_request_coalesced(
+        self,
+        seq: int,
+        generation: int,
+        *,
+        superseded_by: tuple[int, int],
+    ) -> None:
+        warning = None
+        with self._nav_trace_lock:
+            record = self._nav_records.get(seq)
+            if record is None:
+                return
+            request = self._nav_request_record(record, generation)
+            if request.get("presented") or request.get("coalesced"):
+                return
+            request["coalesced"] = True
+            is_initial = not record.get("first_source_presented")
+            if is_initial and self._burst is not None and seq in self._burst["seq_set"]:
+                self._burst["coalesced_count"] += 1
+                warning = (
+                    record.get("index"),
+                    record.get("filename", "n/a"),
+                    request.get("ready_ms"),
+                )
+        if warning is not None:
+            log.warning(
+                "[NAVTRACE] seq=%s gen=%s index=%s file=%r NOT_PRESENTED "
+                "superseded_by=%s/%s ready=%s",
+                seq,
+                generation,
+                warning[0],
+                warning[1],
+                superseded_by[0],
+                superseded_by[1],
+                (
+                    f"{warning[2]:.1f}ms"
+                    if isinstance(warning[2], (int, float))
+                    else "n/a"
+                ),
+            )
+
+    def _present_nav_request(
+        self,
+        seq: int,
+        generation: int,
+        present_t: float,
+        *,
+        rendered: bool,
+    ) -> None:
+        log_data = None
+        first_milestone = False
+        settled_milestone = False
+        became_settled = False
+        with self._nav_trace_lock:
+            record = self._nav_records.get(seq)
+            if record is None:
+                return
+            request = self._nav_request_record(record, generation)
+            if request.get("presented") or request.get("coalesced"):
+                return
+            request["presented"] = True
+            request["rendered"] = rendered
+            request["present_t"] = present_t
+            present_ms = (present_t - record["t_mint"]) * 1000.0
+            outcome = request.get("outcome", "unknown")
+            quality = request.get("served_quality") or "unknown"
+            is_real = outcome == "image" and not request.get("provenance_error")
+            is_first_source = not record.get("first_source_presented")
+            is_initial_real = is_real and not record.get("first_real_presented")
+            is_first_placeholder = not is_real and not record.get(
+                "first_placeholder_presented"
+            )
+            worker = request.get("worker") or {}
+
+            burst_for_frame = (
+                self._burst
+                if self._burst is not None and seq in self._burst["seq_set"]
+                else None
+            )
+            if is_real and burst_for_frame is not None:
+                prior_frame_t = burst_for_frame["t_last_frame_present"]
+                if isinstance(prior_frame_t, (int, float)):
+                    burst_for_frame["frame_intervals"].append(
+                        (present_t - prior_frame_t) * 1000.0
+                    )
+                burst_for_frame["t_last_frame_present"] = present_t
+
+            if is_first_source:
+                record["first_source_presented"] = True
+
+            if is_initial_real:
+                record["first_real_presented"] = True
+                record["terminal"] = False
+                record["initial_quality"] = quality
+                record["first_present_t"] = present_t
+                if is_real and quality == "cover":
+                    record["settled_presented"] = True
+                first_milestone = not self._nav_first_fast_logged
+                if first_milestone:
+                    self._nav_first_fast_logged = True
+
+                if self._burst is not None and seq in self._burst["seq_set"]:
+                    burst = self._burst
+                    prior_image_t = burst["t_last_image_present"]
+                    if isinstance(prior_image_t, (int, float)):
+                        burst["image_dwells"].append(
+                            (present_t - prior_image_t) * 1000.0
+                        )
+                    burst["t_last_image_present"] = present_t
+                    burst["presented_count"] += 1
+                    burst["present_latencies"].append(present_ms)
+                    if burst["t_first_present"] is None:
+                        burst["t_first_present"] = present_t
+                    burst["t_last_present"] = present_t
+                    cache_outcome = request.get("cache_outcome", "unknown")
+                    if cache_outcome in {"hit", "late-hit"}:
+                        burst["cache_hits"] += 1
+                    elif cache_outcome.startswith("miss"):
+                        burst["cache_misses"] += 1
+                    if cache_outcome == "late-hit":
+                        burst["late_cache_hits"] += 1
+                    if worker.get("seq") == seq and worker.get("role") in {
+                        "demand",
+                        "demand-reused",
+                        "demand-migrated",
+                    }:
+                        queue_ms = worker.get("queue_ms")
+                        decode_ms = worker.get("decode_ms")
+                        if isinstance(queue_ms, (int, float)):
+                            burst["queue_waits"].append(queue_ms)
+                        if isinstance(decode_ms, (int, float)):
+                            burst["decode_times"].append(decode_ms)
+            elif not is_real:
+                if is_first_placeholder:
+                    record["first_placeholder_presented"] = True
+                    if self._burst is not None and seq in self._burst["seq_set"]:
+                        self._burst["placeholder_count"] += 1
+                if not bool(request.get("future_active")):
+                    record["terminal"] = True
+            elif is_real and quality == "cover" and not record.get("settled_presented"):
+                record["settled_presented"] = True
+                became_settled = True
+                first_t = record.get("first_present_t")
+                fast_to_full = (
+                    (present_t - first_t) * 1000.0
+                    if isinstance(first_t, (int, float))
+                    else None
+                )
+                request["fast_to_full_ms"] = fast_to_full
+                if (
+                    self._burst is not None
+                    and seq in self._burst["seq_set"]
+                    and isinstance(fast_to_full, (int, float))
+                ):
+                    self._burst["fast_to_full"].append(fast_to_full)
+
+            settled_milestone = (
+                is_real and quality == "cover" and not self._nav_first_settled_logged
+            )
+            if settled_milestone:
+                self._nav_first_settled_logged = True
+            log_data = {
+                "index": record.get("index"),
+                "filename": record.get("filename", "n/a"),
+                "is_initial_real": is_initial_real,
+                "is_real": is_real,
+                "outcome": outcome,
+                "quality": quality,
+                "present_ms": present_ms,
+                "ready_ms": request.get("ready_ms"),
+                "ready_to_present_ms": (
+                    (present_t - request["ready_t"]) * 1000.0
+                    if rendered and isinstance(request.get("ready_t"), (int, float))
+                    else None
+                ),
+                "provider_ms": request.get("provider_ms"),
+                "cache_outcome": request.get("cache_outcome", "unknown"),
+                "worker": worker,
+                "placeholder_reason": request.get("placeholder_reason"),
+                "future_active": bool(request.get("future_active")),
+                "fast_to_full_ms": request.get("fast_to_full_ms"),
+                "rendered": rendered,
+                "sync_barrier": self._frame_sync_connected,
+                "post_summary_pending": bool(record.get("summary_emitted_pending")),
+                "terminal": bool(record.get("terminal")),
+                "became_settled": became_settled,
+                "fast_buffer_depth": record.get("fast_buffer_depth"),
+            }
+
+        if first_milestone:
+            log.info(
+                "[NAVTRACE] startup first_image_presented=%.1fms",
+                (present_t - self._app_start_t) * 1000.0,
+            )
+        if settled_milestone:
+            log.info(
+                "[NAVTRACE] startup first_cover_presented=%.1fms",
+                (present_t - self._app_start_t) * 1000.0,
+            )
+        if log_data is None:
+            return
+        if not log_data["is_real"]:
+            log.warning(
+                "[NAVTRACE] seq=%s gen=%s index=%s file=%r frame=placeholder "
+                "outcome=%s reason=%s active_future=%d ready=%s %s",
+                seq,
+                generation,
+                log_data["index"],
+                log_data["filename"],
+                log_data["outcome"],
+                log_data["placeholder_reason"],
+                int(log_data["future_active"]),
+                self._format_ms(log_data["ready_ms"]),
+                self._present_field(log_data),
+            )
+        elif log_data["is_initial_real"]:
+            worker = log_data["worker"]
+            log.info(
+                "[NAVTRACE] seq=%s gen=%s index=%s file=%r "
+                "frame=initial quality=%s "
+                "cache=%s task=%s producer_seq=%s role=%s priority=%s %s "
+                "fast_buffer=%s provider=%s ready=%s ready_to_present=%s %s",
+                seq,
+                generation,
+                log_data["index"],
+                log_data["filename"],
+                log_data["quality"],
+                log_data["cache_outcome"],
+                worker.get("task_id", "n/a"),
+                worker.get("seq") if worker.get("seq") is not None else "n/a",
+                worker.get("role", "n/a"),
+                worker.get("priority", "n/a"),
+                self._format_worker_stats(
+                    worker,
+                    include_index=False,
+                    include_identity=False,
+                ),
+                log_data["fast_buffer_depth"],
+                self._format_ms(log_data["provider_ms"]),
+                self._format_ms(log_data["ready_ms"]),
+                self._format_ms(log_data["ready_to_present_ms"]),
+                self._present_field(log_data),
+            )
+        elif self.debug_cache_trace or log_data["became_settled"]:
+            frame_kind = (
+                "upgrade_late"
+                if log_data["post_summary_pending"] and log_data["became_settled"]
+                else "upgrade" if log_data["became_settled"] else "refresh"
+            )
+            log.info(
+                "[NAVTRACE] seq=%s gen=%s index=%s file=%r frame=%s quality=%s "
+                "fast_to_full=%s provider=%s ready=%s %s",
+                seq,
+                generation,
+                log_data["index"],
+                log_data["filename"],
+                frame_kind,
+                log_data["quality"],
+                self._format_ms(log_data["fast_to_full_ms"]),
+                self._format_ms(log_data["provider_ms"]),
+                self._format_ms(log_data["ready_ms"]),
+                self._present_field(log_data),
+            )
+        if log_data["post_summary_pending"] and (
+            log_data["quality"] == "cover"
+            or (not log_data["is_real"] and log_data["terminal"])
+        ):
+            with self._nav_trace_lock:
+                record = self._nav_records.get(seq)
+                if record is not None:
+                    record["summary_emitted_pending"] = False
+                self._nav_pending_present = [
+                    pending
+                    for pending in self._nav_pending_present
+                    if pending[0] != seq
+                ]
+        self._maybe_emit_burst_summary()
+
+    @staticmethod
+    def _format_ms(value: object) -> str:
+        return f"{value:.1f}ms" if isinstance(value, (int, float)) else "n/a"
+
+    @staticmethod
+    def _present_field(data: dict) -> str:
+        if data.get("rendered") and data.get("sync_barrier"):
+            name = "presented"
+        elif data.get("rendered"):
+            name = "swap_after_ready"
+        else:
+            name = "ready_fallback"
+        return f"{name}={data['present_ms']:.1f}ms"
+
+    @staticmethod
+    def _format_worker_stats(
+        stats: dict,
+        *,
+        include_index: bool = True,
+        include_identity: bool = True,
+    ) -> str:
+        if not stats:
+            return "worker=n/a"
+
+        def ms(key: str) -> str:
+            value = stats.get(key)
+            return f"{value:.1f}ms" if isinstance(value, (int, float)) else "n/a"
+
+        parts = []
+        if include_index and "index" in stats:
+            parts.append(f"index={stats['index']}")
+        if include_identity:
+            if stats.get("task_id") is not None:
+                parts.append(f"task={stats['task_id']}")
+            parts.append(
+                f"seq={stats['seq'] if stats.get('seq') is not None else 'n/a'}"
+            )
+            if stats.get("role"):
+                parts.append(f"role={stats['role']}")
+            if stats.get("quality"):
+                parts.append(f"quality={stats['quality']}")
+            if stats.get("priority") is not None:
+                parts.append(f"priority={stats['priority']}")
+            if stats.get("display_generation") is not None:
+                parts.append(f"display_gen={stats['display_generation']}")
+            if stats.get("source_path"):
+                parts.append(f"path={stats['source_path']!r}")
+        parts.append(f"queue={ms('queue_ms')}")
+        if stats.get("read_ms") is not None:
+            # Diagnostic page-fault pass: file I/O + antivirus cost, split out
+            # of jpeg_ms (decode_ms still contains both).
+            parts.append(f"read={ms('read_ms')}")
+        parts.extend(
+            [
+                f"decode={ms('decode_ms')}",
+                f"jpeg={ms('jpeg_ms')}",
+                f"resize={ms('resize_ms')}",
+                f"meta={ms('metadata_ms')}",
+                f"icc={ms('icc_ms')}",
+                f"cache={ms('cache_ms')}",
+                f"total={ms('total_ms')}",
+            ]
+        )
+        if stats.get("running_before_demand_ms", 0.0) > 0:
+            parts.append(f"running_before_demand={ms('running_before_demand_ms')}")
+        if stats.get("dependency_ms") is not None:
+            parts.append(f"dependency={ms('dependency_ms')}")
+        source = stats.get("source")
+        if source:
+            parts.append(f"source={source[0]}x{source[1]}")
+        target = stats.get("target")
+        if target:
+            parts.append(f"target={target[0]}x{target[1]}")
+        decode_target = stats.get("decode_target")
+        if decode_target and decode_target != target:
+            parts.append(f"decode_target={decode_target[0]}x{decode_target[1]}")
+        source_bytes = stats.get("source_bytes")
+        if isinstance(source_bytes, (int, float)):
+            parts.append(f"input={source_bytes / 1024**2:.1f}MB")
+        if stats.get("decoder"):
+            parts.append(f"decoder={stats['decoder']}")
+        dct = stats.get("dct")
+        if dct:
+            parts.append(f"dct={dct[0]}/{dct[1]}")
+        output = stats.get("output")
+        if output:
+            parts.append(f"output={output[0]}x{output[1]}")
+        if stats.get("queue_depth") is not None:
+            parts.append(f"qdepth_submit={stats['queue_depth']}")
+        if stats.get("inflight") is not None:
+            parts.append(f"inflight_submit={stats['inflight']}")
+        if stats.get("cache_accepted") is False:
+            parts.append("cache_accepted=0")
+        return " ".join(parts)
+
+    def _begin_navigation_hold(
+        self,
+        direction: int,
+        *,
+        source: Optional[QObject] = None,
+    ) -> None:
+        """Move once, then enter stable-rate navigation after the repeat delay."""
+        if direction not in (-1, 1) or self._is_grid_view_active:
+            return
+        if (
+            self._held_navigation_direction == direction
+            and self._navigation_hold_source is source
+        ):
+            return
+        if self._held_navigation_direction:
+            self._abandon_paced_navigation_state("navigation hold direction changed")
+
+        self._held_navigation_direction = direction
+        self._navigation_hold_source = source
+        self._last_navigation_direction = direction
+        self._navigation_repeat_started = False
+        self._quality_decode_immediate_pending = False
+        self._quality_decode_token += 1
+        self._quality_decode_timer.stop()
+        self.prefetcher.cancel_pending_cover_tasks()
+
+        self._navigation_hold_timer.stop()
+        self._request_paced_navigation_step(direction)
+
+    def _abandon_paced_navigation_state(self, reason: str) -> None:
+        """Invalidate every state item owned by a prior paced target.
+
+        The epoch rejects decode completions, while clearing the presentation
+        gate under the trace lock prevents late Ready/swap acknowledgements from
+        releasing or re-establishing pacing for a newer source.
+        """
+        gate_seq = None
+        self._paced_navigation_epoch += 1
+        self._paced_navigation_pending = None
+        self._paced_navigation_queue.clear()
+        self._held_navigation_direction = 0
+        self._navigation_hold_source = None
+        self._navigation_repeat_started = False
+        self._quality_decode_immediate_pending = False
+        self._navigation_hold_timer.stop()
+        with self._nav_trace_lock:
+            if self._paced_present_gate is not None:
+                gate_seq = self._paced_present_gate.get("seq")
+            self._paced_present_gate = None
+            self._paced_present_ready = False
+        if gate_seq is not None and self.debug_cache:
+            log.debug(
+                "[NAVTRACE] abandoned stale presentation gate seq=%s reason=%s",
+                gate_seq,
+                reason,
+            )
+
+    def _cancel_paced_navigation(self) -> None:
+        """Invalidate pending navigation during view or generation changes."""
+        self._abandon_paced_navigation_state("paced navigation cancelled")
+
+    def _end_navigation_hold(
+        self,
+        direction: int,
+        *,
+        source: Optional[QObject] = None,
+    ) -> bool:
+        """Stop held navigation; an already-requested exact step may still land."""
+        if direction not in (-1, 0, 1):
+            return False
+        if source is not None and self._navigation_hold_source is not source:
+            return False
+        if direction and self._held_navigation_direction != direction:
+            return False
+        if self._held_navigation_direction == 0:
+            return False
+        self._held_navigation_direction = 0
+        self._navigation_hold_source = None
+        self._paced_navigation_queue.clear()
+        self._navigation_repeat_started = False
+        self._navigation_hold_timer.stop()
+        if direction:
+            # A real key release identifies the final target precisely. If its
+            # frame is still decoding/presenting, preserve this request until
+            # that frame swaps; otherwise submit cover quality immediately.
+            self._restart_quality_decode_timer(immediate=True)
+        elif (
+            self._paced_navigation_pending is None and not self._paced_navigation_queue
+        ):
+            self._restart_quality_decode_timer()
+        return True
+
+    @Slot()
+    def _paced_navigation_tick(self) -> None:
+        direction = (
+            self._paced_navigation_queue.popleft()
+            if self._paced_navigation_queue
+            else self._held_navigation_direction
+        )
+        if direction:
+            if self.debug_cache:
+                self._restart_nav_settle_timer()
+            started = self._request_paced_navigation_step(direction)
+            if (
+                not started
+                and self._paced_navigation_pending is None
+                and self._paced_present_gate is None
+            ):
+                self._resume_paced_navigation()
+
+    # Adaptive-cadence governor tuning: grow the interval while the decoded
+    # look-ahead buffer is at or below LOW, relax while at or above HIGH, and
+    # hold steady in between (the hysteresis band prevents oscillation).
+    _PACING_LOW_DEPTH = 2
+    _PACING_HIGH_DEPTH = 6
+    _PACING_GROW = 1.25
+    _PACING_RELAX = 0.85
+
+    def _effective_navigation_interval_ms(self) -> float:
+        """Current held-navigation cadence, including any adaptive stretch."""
+        if not self._navigation_adaptive_pacing:
+            return float(self._navigation_interval_ms)
+        return self._paced_interval_ms
+
+    def _update_adaptive_navigation_pacing(self, direction: int) -> None:
+        """Adjust the held-key cadence from decoded look-ahead feedback."""
+        if not self._navigation_adaptive_pacing or not self._held_navigation_direction:
+            # Single taps are human-paced; only a held key follows the timer.
+            return
+        depth = self._fast_buffer_depth(self.current_index, direction)
+        previous = self._paced_interval_ms
+        if depth <= self._PACING_LOW_DEPTH:
+            self._paced_interval_ms = min(
+                self._paced_interval_max_ms,
+                previous * self._PACING_GROW,
+            )
+        elif depth >= self._PACING_HIGH_DEPTH:
+            self._paced_interval_ms = max(
+                float(self._navigation_interval_ms),
+                previous * self._PACING_RELAX,
+            )
+        if not self.debug_cache:
+            return
+        with self._nav_trace_lock:
+            if self._burst is not None:
+                self._burst["pace_intervals"].append(self._paced_interval_ms)
+        if self.debug_cache_trace and abs(self._paced_interval_ms - previous) >= 0.05:
+            log.info(
+                "[NAVTRACE] pacing interval=%.1fms->%.1fms depth=%d",
+                previous,
+                self._paced_interval_ms,
+                depth,
+            )
+
+    def _resume_paced_navigation(self) -> None:
+        """Continue queued/held input after a request could not be published."""
+        if self._paced_navigation_queue or self._held_navigation_direction:
+            self._navigation_hold_timer.setInterval(
+                max(1, round(self._effective_navigation_interval_ms()))
+            )
+            self._navigation_hold_timer.start()
+        else:
+            self._restart_quality_decode_timer()
+
+    def _request_paced_navigation_step(self, direction: int) -> bool:
+        """Request one adjacent image without exposing an unready source to QML."""
+        if direction not in (-1, 1) or not self._loupe_decode_allowed():
+            return False
+        if (
+            self._paced_navigation_pending is not None
+            or self._paced_present_gate is not None
+        ):
+            # At most one superseding direct step is useful while a frame is in
+            # flight. Physical key repeat never reaches this path; coalescing is
+            # a defensive bound for forwarded/programmatic activations.
+            if not self._paced_navigation_queue:
+                self._paced_navigation_queue.append(direction)
+            elif self._paced_navigation_queue[-1] != direction:
+                self._paced_navigation_queue.clear()
+                self._paced_navigation_queue.append(direction)
+            return False
+
+        target_index = self.current_index + direction
+        if target_index < 0 or target_index >= len(self.image_files):
+            return False
+
+        if self._held_navigation_direction == 0:
+            self._quality_decode_token += 1
+            self._quality_decode_timer.stop()
+            self.prefetcher.cancel_pending_cover_tasks()
+
+        self._update_adaptive_navigation_pacing(direction)
+        self._last_navigation_direction = direction
+        nav_seq = None
+        if self.debug_cache:
+            nav_seq = self._seed_nav_record(target_index, direction=direction)
+        else:
+            self._nav_seq += 1
+            nav_seq = self._nav_seq
+            self._current_nav_seq = nav_seq
+        # Shift directly to the target window before checking its cache entry.
+        # The later commit reuses this update instead of repeating the same
+        # scheduling work after current_index changes.
+        self._do_prefetch(
+            target_index,
+            is_navigation=True,
+            direction=direction,
+        )
+
+        display_width, display_height, display_generation = self.get_display_info()
+        target_path = self.image_files[target_index].path
+        cache_quality = "fast" if display_width > 0 and display_height > 0 else "cover"
+        target_key = build_cache_key(
+            target_path,
+            display_generation,
+            cache_quality,
+        )
+        if self.image_cache.get(target_key) is not None:
+            self._commit_paced_navigation(target_index, direction)
+            return True
+
+        buffer_depth = self._fast_buffer_depth(self.current_index, direction)
+        self._record_navigation_underflow(
+            target_index,
+            direction,
+            buffer_depth,
+        )
+        epoch = self._paced_navigation_epoch
+        future = self.prefetcher.submit_task(
+            target_index,
+            self.prefetcher.generation,
+            priority=True,
+            quality="fast",
+            nav_seq=nav_seq,
+            window_bound=False,
+        )
+        if future is None:
+            self._resume_paced_navigation()
+            return False
+
+        pending = {
+            "future": future,
+            "epoch": epoch,
+            "index": target_index,
+            "direction": direction,
+            "path_key": self._key(target_path),
+            "display_generation": display_generation,
+            "cache_quality": cache_quality,
+            "nav_seq": nav_seq,
+        }
+        self._paced_navigation_pending = pending
+
+        def _on_done(fut, *, request=pending):
+            try:
+                result = fut.result()
+                error = None
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                result = None
+                error = exc
+            self._pacedNavigationReady.emit(
+                {
+                    **request,
+                    "result": result,
+                    "error": error,
+                }
+            )
+
+        future.add_done_callback(_on_done)
+        return False
+
+    @Slot(object)
+    def _on_paced_navigation_ready(self, payload) -> None:
+        """Commit a worker-completed adjacent image on the GUI thread."""
+        pending = self._paced_navigation_pending
+        if not payload or pending is None:
+            return
+        if payload.get("future") is not pending.get("future"):
+            return
+        self._paced_navigation_pending = None
+
+        if payload.get("epoch") != self._paced_navigation_epoch:
+            return
+        error = payload.get("error")
+        result = payload.get("result")
+        if error is not None:
+            log.debug("Paced navigation decode failed: %s", error)
+        if result is None:
+            # Decode failures normally yield a cached broken-image placeholder.
+            # A None here represents cancellation/shutdown; a held key may retry
+            # on its next cadence tick without ever changing the visible source.
+            self._resume_paced_navigation()
+            return
+
+        target_index = int(payload.get("index", -1))
+        direction = int(payload.get("direction", 0))
+        if target_index != self.current_index + direction:
+            self._resume_paced_navigation()
+            return
+        if not (0 <= target_index < len(self.image_files)):
+            self._resume_paced_navigation()
+            return
+
+        decoded_path, decoded_generation = result
+        if decoded_generation != payload.get("display_generation"):
+            self._resume_paced_navigation()
+            return
+        if self._key(Path(decoded_path)) != payload.get("path_key"):
+            self._resume_paced_navigation()
+            return
+        result_key = build_cache_key(
+            decoded_path,
+            decoded_generation,
+            payload.get("cache_quality", "fast"),
+        )
+        if self.image_cache.get(result_key) is None:
+            self._resume_paced_navigation()
+            return
+
+        self._commit_paced_navigation(target_index, direction)
+
+    def _commit_paced_navigation(self, target_index: int, direction: int) -> None:
+        """Publish a cache-ready adjacent target without catch-up acceleration."""
+        if target_index != self.current_index + direction:
+            return
+        commit_started = time.perf_counter()
+        self._navigation_hold_timer.stop()
+        with self._nav_trace_lock:
+            self._paced_present_gate = {
+                "seq": self._current_nav_seq,
+                "due_t": commit_started
+                + self._effective_navigation_interval_ms() / 1000.0,
+                "sync_t": None,
+            }
+            self._paced_present_ready = False
+        self._set_current_index(
+            target_index,
+            direction=direction,
+            prefetch_already_updated=True,
+            paced_presentation=True,
+        )
+        if self.current_index != target_index:
+            with self._nav_trace_lock:
+                self._paced_present_gate = None
+                self._paced_present_ready = False
+            self._resume_paced_navigation()
+
     def _set_current_index(
-        self, index: int, direction: int = 0, is_navigation: bool = True
+        self,
+        index: int,
+        direction: int = 0,
+        is_navigation: bool = True,
+        prefetch_already_updated: bool = False,
+        paced_presentation: bool = False,
     ):
         """Centralized method to change current image index and reset state."""
-        if self.debug_cache:
-            _t_start = time.perf_counter()
+        _trace_started = time.perf_counter() if self.debug_cache_trace else 0.0
+        if self.debug_cache_trace:
             log.info(
-                f"[DBGCACHE] {_t_start*1000:.3f} _set_current_index: START index={index} dir={direction}"
+                f"[DBGCACHE] {_trace_started*1000:.3f} _set_current_index: START index={index} dir={direction}"
             )
 
         if index < 0 or index >= len(self.image_files):
             return
+
+        if not paced_presentation and index != self.current_index:
+            self._abandon_paced_navigation_state("direct index change")
 
         if not self._flush_current_live_edit_session_for_navigation():
             return
@@ -4837,6 +6954,20 @@ class AppController(QObject):
         self._reset_darken_on_navigation()
 
         self.current_index = index  # Set index first so signals pick up correct image
+        if direction in (-1, 1):
+            self._last_navigation_direction = direction
+
+        # Mint the navigation correlation id for this target-index change. This
+        # is the anchor for "target index changed -> frame actually rendered".
+        if self.debug_cache and not self._is_grid_view_active:
+            path_key = self._key(self.image_files[index].path)
+            with self._nav_trace_lock:
+                target_already_seeded = (
+                    self._nav_target_index == index
+                    and self._nav_target_path_key == path_key
+                )
+            if not target_already_seeded:
+                self._seed_nav_record(index, direction=direction)
 
         # Reset source mode to JPEG unless new image is strictly RAW-only
         # (This implements the "Default state on navigation" requirement)
@@ -4853,17 +6984,20 @@ class AppController(QObject):
             self.editSourceModeChanged.emit(new_mode)
         self.rawDevelopmentStateChanged.emit()
 
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_prefetch = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_prefetch*1000:.3f} _set_current_index: calling _do_prefetch"
             )
 
-        self._do_prefetch(
-            self.current_index, is_navigation=is_navigation, direction=direction
-        )
+        if not prefetch_already_updated:
+            self._do_prefetch(
+                self.current_index,
+                is_navigation=is_navigation,
+                direction=direction,
+            )
 
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_sync = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_sync*1000:.3f} _set_current_index: calling sync_ui_state (prefetch took {(_t_sync - _t_prefetch)*1000:.2f}ms)"
@@ -4877,23 +7011,23 @@ class AppController(QObject):
 
         self._restart_quality_decode_timer()
 
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_end = time.perf_counter()
             log.info(
-                f"[DBGCACHE] {_t_end*1000:.3f} _set_current_index: DONE total={(_t_end - _t_start)*1000:.2f}ms"
+                f"[DBGCACHE] {_t_end*1000:.3f} _set_current_index: DONE total={(_t_end - _trace_started)*1000:.2f}ms"
             )
 
     def next_image(self):
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_start = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} next_image: START from index={self.current_index}"
             )
 
         if self.current_index < len(self.image_files) - 1:
-            self._set_current_index(self.current_index + 1, direction=1)
+            self._request_paced_navigation_step(1)
 
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_end = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} next_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
@@ -4905,16 +7039,16 @@ class AppController(QObject):
             self._set_current_index(target_index, direction=1)
 
     def prev_image(self):
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_start = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} prev_image: START from index={self.current_index}"
             )
 
         if self.current_index > 0:
-            self._set_current_index(self.current_index - 1, direction=-1)
+            self._request_paced_navigation_step(-1)
 
-        if self.debug_cache:
+        if self.debug_cache_trace:
             _t_end = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} prev_image: DONE total={(_t_end - _t_start)*1000:.2f}ms"
@@ -5053,6 +7187,7 @@ class AppController(QObject):
 
         if active:
             # Entering grid view
+            self._cancel_paced_navigation()
             self.pending_prefetch_index = None
             self._quality_decode_token += 1
             self._quality_decode_timer.stop()
@@ -5565,9 +7700,12 @@ class AppController(QObject):
 
         self.sidecar.save()
         self._metadata_cache_index = (-1, -1)
-        self._reapply_flag_filter_after_metadata_change(flag_attr, current_path)
+        filter_reapplied = self._reapply_flag_filter_after_metadata_change(
+            flag_attr,
+            current_path,
+        )
         self.dataChanged.emit()
-        self.sync_ui_state()
+        self.sync_ui_state(image_count_changed=filter_reapplied)
 
         if len(indices) == 1:
             self.update_status_message(
@@ -5641,9 +7779,12 @@ class AppController(QObject):
 
         self.sidecar.save()
         self._metadata_cache_index = (-1, -1)
-        self._reapply_flag_filter_after_metadata_change("restacked", image_path)
+        filter_reapplied = self._reapply_flag_filter_after_metadata_change(
+            "restacked",
+            image_path,
+        )
         self.dataChanged.emit()
-        self.sync_ui_state()
+        self.sync_ui_state(image_count_changed=filter_reapplied)
         status = "restacked" if meta.restacked else "not restacked"
         self.update_status_message(f"Marked as {status}")
         log.info("Toggled restacked flag to %s for %s", meta.restacked, image_path)
@@ -6683,6 +8824,105 @@ class AppController(QObject):
         config.set("raw", "secondary_source_dir", path)
         config.save()
 
+    @staticmethod
+    def _resolve_configured_directory(path_value: str | Path | None) -> Path | None:
+        """Expand and resolve a configured directory path without requiring it to exist."""
+        cleaned = str(path_value or "").strip().strip('"')
+        if not cleaned:
+            return None
+
+        expanded = os.path.expanduser(os.path.expandvars(cleaned))
+        try:
+            return Path(expanded).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def _main_photo_directory(self) -> Path | None:
+        return self._resolve_configured_directory(
+            config.get("raw", "mirror_base", fallback="")
+        )
+
+    def _current_stack_input_context(self) -> tuple[Path, Path] | None:
+        """Return the matching stack-input root and current relative directory."""
+        current_directory = self.image_dir.resolve()
+        for _label, configured_root in self._configured_restack_raw_locations():
+            root = self._resolve_configured_directory(configured_root)
+            if root is None:
+                continue
+            try:
+                relative_directory = current_directory.relative_to(root)
+            except ValueError:
+                continue
+            return root, relative_directory
+        return None
+
+    def _matching_stack_input_directory(self) -> Path | None:
+        """Find the first available stack-input directory matching the current one."""
+        main_photo_directory = self._main_photo_directory()
+        if main_photo_directory is None:
+            return None
+
+        try:
+            relative_directory = self.image_dir.resolve().relative_to(
+                main_photo_directory
+            )
+        except ValueError:
+            return None
+
+        for _label, configured_root in self._configured_restack_raw_locations():
+            stack_input_root = self._resolve_configured_directory(configured_root)
+            if stack_input_root is None:
+                continue
+            candidate = stack_input_root / relative_directory
+            if candidate.is_dir():
+                return candidate
+        return None
+
+    def is_in_stack_input_directory(self) -> bool:
+        return self._current_stack_input_context() is not None
+
+    def stack_directory_switch_visible(self) -> bool:
+        """Whether the Actions menu should include a photo-directory switch."""
+        if self.is_in_stack_input_directory():
+            return True
+        return self._matching_stack_input_directory() is not None
+
+    def switch_stack_input_directory(self):
+        """Switch between matching main-photo and stack-input directories."""
+        stack_input_context = self._current_stack_input_context()
+        switching_to_main = stack_input_context is not None
+
+        if switching_to_main:
+            _stack_input_root, relative_directory = stack_input_context
+            main_photo_directory = self._main_photo_directory()
+            if main_photo_directory is None:
+                self.update_status_message(
+                    "The main photo directory is not configured or available"
+                )
+                return
+            target_directory = main_photo_directory / relative_directory
+            if not target_directory.is_dir():
+                self.update_status_message(
+                    f"Matching main photo directory is not available: {target_directory}"
+                )
+                return
+        else:
+            target_directory = self._matching_stack_input_directory()
+            if target_directory is None:
+                self.update_status_message(
+                    "No matching stack input directory is available"
+                )
+                return
+
+        log.info(
+            "Switching photo directory from %s to %s",
+            self.image_dir,
+            target_directory,
+        )
+        self._switch_to_directory(target_directory, update_base_directory=True)
+        destination_label = "main photo" if switching_to_main else "stack input"
+        self.update_status_message(f"Switched to {destination_label} directory")
+
     def _dialog_start_directory(self, current_path: str) -> str:
         cleaned = current_path.strip().strip('"') if current_path else ""
         if not cleaned:
@@ -6774,6 +9014,74 @@ class AppController(QObject):
         config.save()
         self.prefetcher.prefetch_radius = radius
         self.prefetcher.update_prefetch(self.current_index)
+
+    def get_navigation_rate_fps(self) -> int:
+        """Return the configured steady held-key navigation rate."""
+        fps = config.getfloat("core", "navigation_rate_fps", fallback=15.0)
+        return round(max(1.0, min(fps, 30.0)))
+
+    def set_navigation_rate_fps(self, fps: int) -> None:
+        """Persist and immediately apply the held-key navigation rate."""
+        bounded_fps = max(1, min(int(fps), 30))
+        config.set("core", "navigation_rate_fps", bounded_fps)
+        config.save()
+        self._navigation_rate_fps = float(bounded_fps)
+        self._navigation_interval_ms = max(1, round(1000.0 / bounded_fps))
+        # Re-base the adaptive governor so a stale stretched (or relaxed)
+        # interval from the previous rate cannot out-pace the new one.
+        self._paced_interval_ms = float(self._navigation_interval_ms)
+        self._paced_interval_max_ms = float(self._navigation_interval_ms) * 4.0
+        self._navigation_hold_timer.setInterval(self._navigation_interval_ms)
+
+    def get_held_navigation_quality(self) -> str:
+        """Return the configured held-key browsing quality tier."""
+        return self._held_navigation_quality
+
+    def set_held_navigation_quality(self, quality: str) -> None:
+        """Persist and immediately apply the held-key browsing quality tier."""
+        requested = str(quality or "").strip().lower()
+        if requested not in HELD_NAVIGATION_QUALITY_DIMENSIONS:
+            log.warning("Ignoring invalid held navigation quality: %r", quality)
+            return
+
+        config.set("core", "held_navigation_quality", requested)
+        config.save()
+        if requested == self._held_navigation_quality:
+            return
+
+        old_quality = self._held_navigation_quality
+        self._held_navigation_quality = requested
+        max_dimension = held_navigation_quality_max_dimension(requested)
+        self.prefetcher.fast_decode_max_dimension = max_dimension
+
+        # Cached ``fast`` keys do not encode the browsing tier. Advance both
+        # generations and clear the display cache so no buffer decoded at the
+        # previous size can satisfy a request for the newly selected tier.
+        self._cancel_paced_navigation()
+        self._quality_decode_immediate_pending = False
+        self._quality_decode_token += 1
+        self._quality_decode_timer.stop()
+        self.prefetcher.cancel_all()
+        self._bump_display_generation()
+        self.image_cache.clear()
+
+        if self._loupe_decode_allowed() and self.image_files:
+            self.prefetcher.update_prefetch(
+                self.current_index,
+                direction=self._last_navigation_direction,
+            )
+            self.sync_ui_state()
+            self._restart_quality_decode_timer()
+
+        log.info(
+            "Held navigation quality changed from %s to %s (max dimension %dpx)",
+            old_quality,
+            requested,
+            max_dimension,
+        )
+        self.update_status_message(
+            f"Held-key image quality: {requested.title()}",
+        )
 
     def get_theme(self):
         return 0 if config.get("core", "theme") == "dark" else 1
@@ -7671,15 +9979,16 @@ class AppController(QObject):
         # Load images from new directory (thumbnail model already refreshed above)
         self.load(skip_thumbnail_refresh=True)
 
-    def _set_folder_loaded(self, loaded: bool) -> None:
+    def _set_folder_loaded(self, loaded: bool, *, notify: bool = True) -> bool:
         """Update the current-folder load state and notify QML when it changes."""
         if self._folder_loaded == loaded:
-            return
+            return False
 
         self._folder_loaded = loaded
         # Defensive for initialization and tests that may not have bound UIState yet.
-        if hasattr(self, "ui_state") and self.ui_state:
+        if notify and hasattr(self, "ui_state") and self.ui_state:
             self.ui_state.isFolderLoadedChanged.emit()
+        return True
 
     @Slot()
     def open_folder(self):
@@ -7732,6 +10041,11 @@ class AppController(QObject):
         # We will FORCE these to be re-cached even if they are already in cache,
         # to ensure they are moved to the front of the LRU queue.
         nearby_radius = self.prefetcher.prefetch_radius * 2
+        nearby_paths = [
+            self.image_files[i].path
+            for i, dist in all_images_with_dist
+            if i < len(self.image_files) and dist <= nearby_radius
+        ]
 
         skipped_count = 0
         for i, dist in all_images_with_dist:
@@ -7741,7 +10055,7 @@ class AppController(QObject):
                 skipped_count += 1
                 continue
             image_path = self.image_files[i].path
-            cache_key = build_cache_key(image_path, display_gen)
+            cache_key = build_cache_key(image_path, display_gen, "fast")
             is_cached = cache_key in self.image_cache
             is_nearby = dist <= nearby_radius
 
@@ -7783,11 +10097,27 @@ class AppController(QObject):
                     finished_emitted = True
             self.reporter.progress_updated.emit(progress)
             if should_finish:
+                # Decode durations can finish out of order even though execution
+                # starts farthest-first. Once every logical task is terminal,
+                # touch surviving nearby entries farthest-to-nearest so the
+                # nearest buffers have deterministic MRU order without copying
+                # or decoding them again.
+                _, _, current_display_gen = self.get_display_info()
+                if current_display_gen == display_gen:
+                    for path in nearby_paths:
+                        for cache_quality in ("cover", "fast"):
+                            self.image_cache.get(
+                                build_cache_key(
+                                    path,
+                                    display_gen,
+                                    cache_quality,
+                                )
+                            )
                 self.reporter.finished.emit()
 
         # --- Submit tasks ---
         # images_to_preload is already sorted furthest -> nearest
-        for i in images_to_preload:
+        for preload_order, i in enumerate(images_to_preload):
             # For nearby images that we are forcing to re-cache, we might need to remove them first
             # to ensure the cache actually updates the LRU position (depending on cache implementation).
             # ByteLRUCache (cachetools) updates LRU on access (get/set), so just overwriting is fine.
@@ -7798,6 +10128,7 @@ class AppController(QObject):
                 i,
                 self.prefetcher.generation,
                 quality="fast",
+                preload_order=preload_order,
             )
             if future:
                 future.add_done_callback(_on_done)
@@ -9628,7 +11959,7 @@ class AppController(QObject):
         prefetcher = getattr(self, "prefetcher", None)
         if prefetcher is not None:
             try:
-                path_str = str(key).rsplit("::", 1)[0]
+                path_str = str(key).rsplit("::", 2)[0]
                 prefetcher.unschedule_path(path_str)
             except Exception:
                 log.debug(
@@ -11899,6 +14230,7 @@ class AppController(QObject):
                 and session_key is not None
                 and session_key == self._get_current_original_compare_session_key()
             ):
+                decoded.source_path = session_key[0]
                 self._original_compare_preview = decoded
                 self._original_compare_session_key = session_key
                 self._original_compare_index = index
@@ -13189,12 +15521,22 @@ class AppController(QObject):
 
     def _update_cache_stats(self):
         if self.debug_cache:
+            now = time.monotonic()
+            if now - self._last_cache_stats_update < 0.1:
+                return
+            self._last_cache_stats_update = now
             hits = self.image_cache.hits
             misses = self.image_cache.misses
             total = hits + misses
             hit_rate = (hits / total * 100) if total > 0 else 0
             size_mb = self.image_cache.currsize / (1024 * 1024)
-            self.ui_state.cacheStats = f"Cache: {hits} hits, {misses} misses ({hit_rate:.1f}%), {size_mb:.1f} MB"
+            # Speculative + the reserved demand decoder, matching the
+            # decode_workers=N(1 demand) notation in the NAVTRACE header.
+            speculative = self.prefetcher.total_decode_workers - 1
+            self.ui_state.cacheStats = (
+                f"Cache: {hits} hits, {misses} misses ({hit_rate:.1f}%), "
+                f"{size_mb:.1f} MB, workers {speculative}+1"
+            )
 
     def get_recycle_bin_stats(self) -> List[Dict[str, Any]]:
         """Get stats for all tracked recycle bins.
@@ -13545,6 +15887,7 @@ def main(
     image_dir: Optional[str] = None,
     debug: bool = False,
     debug_cache: bool = False,
+    debug_cache_trace: bool = False,
     debug_thumb_timing: bool = False,
     debug_thumb_trace: bool = False,
     start_in_loupe: bool = False,
@@ -13555,12 +15898,19 @@ def main(
     _debug_thumb_timing = debug_thumb_timing
     _debug_thumb_trace = debug_thumb_trace
 
+    # The per-stage trace level is a strict superset of the cache summary level.
+    if debug_cache_trace:
+        debug_cache = True
+
     t0 = time.perf_counter()
-    # Any diagnostic flag needs debug-level logging: in windowed builds the
-    # console is gone, so the log file is the only place their output lands.
+    # Base cache diagnostics are deliberately concise. The explicit trace and
+    # the other debug modes retain verbose per-stage records.
     debug_requested = debug or debug_cache or debug_thumb_timing or debug_thumb_trace
-    log_file = setup_logging(debug_requested)
-    if debug:
+    verbose_debug = (
+        debug or debug_cache_trace or debug_thumb_timing or debug_thumb_trace
+    )
+    log_file = setup_logging(verbose_debug, diagnostic=debug_requested)
+    if debug_requested:
         log.info("Startup: after setup_logging: %.3fs", time.perf_counter() - t0)
     log.info("Starting FastStack")
 
@@ -13624,7 +15974,7 @@ def main(
     timer.start(500)  # Check for signals every 500ms
     timer.timeout.connect(lambda: None)
 
-    if debug:
+    if debug_requested:
         log.info("Startup: after QApplication: %.3fs", time.perf_counter() - t0)
 
     # Windows shells escape a trailing backslash before the closing quote
@@ -13723,11 +16073,13 @@ def main(
         image_dir=image_dir_path,
         engine=engine,
         debug_cache=debug_cache,
+        debug_cache_trace=debug_cache_trace,
         debug_thumb_timing=debug_thumb_timing,
         debug_thumb_trace=debug_thumb_trace,
         start_in_loupe=start_in_loupe,
+        app_start_t=t0,
     )
-    if debug:
+    if debug_requested:
         log.info("Startup: after AppController: %.3fs", time.perf_counter() - t0)
     image_provider = ImageProvider(controller)
     engine.addImageProvider("provider", image_provider)
@@ -13742,7 +16094,7 @@ def main(
 
     qml_file = app_qml_dir / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_file)))
-    if debug:
+    if debug_requested:
         log.info("Startup: after engine.load(QML): %.3fs", time.perf_counter() - t0)
 
     if not engine.rootObjects():
@@ -13754,6 +16106,71 @@ def main(
     controller.main_window = main_window
     main_window.installEventFilter(controller)
 
+    # Frame swaps also release the held-navigation presentation gate, so this
+    # lightweight connection is required in normal (non-diagnostic) runs.
+    if hasattr(main_window, "frameSwapped"):
+        try:
+            main_window.frameSwapped.connect(
+                controller._capture_frame_swap,
+                Qt.ConnectionType.DirectConnection,
+            )
+            controller._frame_swapped_connected = True
+        except Exception:
+            log.debug("Could not connect frameSwapped", exc_info=True)
+
+    if hasattr(main_window, "afterSynchronizing"):
+        try:
+            main_window.afterSynchronizing.connect(
+                controller._capture_frame_sync,
+                Qt.ConnectionType.DirectConnection,
+            )
+            controller._frame_sync_connected = True
+        except Exception:
+            log.debug("Could not connect afterSynchronizing", exc_info=True)
+
+    # A source is credited only after it was Ready for a render-thread scene
+    # graph synchronization and the synchronized frame was subsequently
+    # swapped. This avoids attributing an already-rendering old frame to a
+    # source whose Image.Ready signal happened just before that old swap.
+    if debug_cache:
+        if hasattr(main_window, "frameSwapped"):
+            if not controller._frame_sync_connected:
+                log.warning(
+                    "[NAVTRACE] render synchronization signal unavailable; "
+                    "presentation timings will use swap-after-Ready fallback"
+                )
+        else:
+            log.warning(
+                "[NAVTRACE] frame swap signal unavailable; presentation timings "
+                "will stop at Image.Ready"
+            )
+        present_mode = (
+            "scene_sync+swap"
+            if controller._frame_sync_connected and controller._frame_swapped_connected
+            else (
+                "swap_after_ready"
+                if controller._frame_swapped_connected
+                else "image_ready_fallback"
+            )
+        )
+        log.info(
+            "[NAVTRACE] enabled schema=2 mode=%s correlation=seq+generation "
+            "presentation=%s navigation_fps=%.1f repeat_delay=%dms "
+            "pacing=%s held_quality=%s fast_decode_max=%dpx "
+            "decode_workers=%d(1 demand) input_settle=%dms "
+            "summary_deadline=%dms",
+            "trace" if debug_cache_trace else "summary",
+            present_mode,
+            controller._navigation_rate_fps,
+            controller._navigation_repeat_delay_ms,
+            "adaptive" if controller._navigation_adaptive_pacing else "fixed",
+            controller._held_navigation_quality,
+            controller.prefetcher.fast_decode_max_dimension,
+            controller.prefetcher.total_decode_workers,
+            controller._NAV_SETTLE_MS,
+            controller._NAV_SUMMARY_DEADLINE_MS,
+        )
+
     # Defer heavy loading long enough for the mapped QML window to paint first.
     # A 0ms timer can run before the first frame is drawn, making slow folder
     # scans look like the window itself is delayed.
@@ -13762,7 +16179,7 @@ def main(
         lambda: controller.load(skip_thumbnail_refresh=start_in_loupe),
     )
     QTimer.singleShot(2000, controller.maybe_check_for_updates)
-    if debug:
+    if debug_requested:
         log.info(
             "Startup: controller.load() deferred to event loop (%.3fs to window)",
             time.perf_counter() - t0,
@@ -13843,7 +16260,14 @@ def cli():
         help="Enable debug logging and timing information",
     )
     parser.add_argument(
-        "--debugcache", action="store_true", help="Enable debug cache features"
+        "--debugcache",
+        action="store_true",
+        help="Log concise navigation/cache summaries and invariant violations",
+    )
+    parser.add_argument(
+        "--debugcache-trace",
+        action="store_true",
+        help="Enable per-image/per-stage navigation trace records (implies --debugcache)",
     )
     parser.add_argument(
         "--loupe",
@@ -13863,10 +16287,13 @@ def cli():
     args = parser.parse_args()
     if args.debug_thumbtiming or args.debug_thumbtrace:
         args.debug = True
+    if args.debugcache_trace:
+        args.debugcache = True
     main(
         image_dir=args.image_dir,
         debug=args.debug,
         debug_cache=args.debugcache,
+        debug_cache_trace=args.debugcache_trace,
         debug_thumb_timing=args.debug_thumbtiming,
         debug_thumb_trace=args.debug_thumbtrace,
         start_in_loupe=args.loupe,

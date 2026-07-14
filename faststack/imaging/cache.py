@@ -196,9 +196,12 @@ class ByteLRUCache(LRUCache):
                 self._pending_callbacks = None
                 self._pending_callbacks_owner = None
 
-            log.debug(
-                "Cached item '%s'. Cache size: %.2f MB", key, self.currsize / 1024**2
-            )
+            cache_size_mb = self.currsize / 1024**2
+
+        # Console debug output can be comparatively slow on Windows. Never
+        # hold the cache lock while formatting or emitting it, or foreground
+        # lookups can stall behind diagnostic I/O from a prefetch worker.
+        log.debug("Cached item '%s'. Cache size: %.2f MB", key, cache_size_mb)
 
         # Execute all captured eviction callbacks OUTSIDE the lock
         for callback in pending_callbacks:
@@ -279,6 +282,11 @@ class ByteLRUCache(LRUCache):
         """Thread-safe get."""
         with self._lock:
             return super().get(key, default)
+
+    def keys_snapshot(self) -> list:
+        """Return a stable key snapshot for diagnostics."""
+        with self._lock:
+            return list(self.keys())
 
     def clear(self):
         """Clear cache without triggering eviction callbacks.
@@ -422,10 +430,21 @@ class ByteLRUCache(LRUCache):
             )
 
 
-def build_cache_key(image_path: Union[Path, str], display_generation: int) -> str:
-    """Builds a stable cache key that survives list reordering."""
+def build_cache_key(
+    image_path: Union[Path, str],
+    display_generation: int,
+    quality: str = "fast",
+) -> str:
+    """Build a stable, quality-specific key that survives list reordering.
+
+    Navigation and settled display buffers intentionally coexist. Keeping the
+    inexpensive ``fast`` buffer after a ``cover`` upgrade prevents later held-key
+    navigation from uploading a mixture of small and large textures.
+    """
+    if quality not in {"fast", "cover"}:
+        raise ValueError(f"Unknown decoded-image cache quality: {quality}")
     if isinstance(image_path, Path):
         path_str = image_path.as_posix()
     else:
         path_str = str(image_path).replace("\\", "/")
-    return f"{path_str}::{display_generation}"
+    return f"{path_str}::{display_generation}::{quality}"

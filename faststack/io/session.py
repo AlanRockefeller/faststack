@@ -100,6 +100,9 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 def _fsync_directory(path: Path) -> None:
     """Best-effort fsync for a directory entry update."""
+    if os.name == "nt":
+        return
+
     fd: Optional[int] = None
     try:
         fd = os.open(path, os.O_RDONLY)

@@ -9,7 +9,7 @@ import threading
 import time
 from concurrent.futures import Future
 from pathlib import Path
-from typing import Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 import numpy as np
 from PIL import Image as PILImage
@@ -24,18 +24,230 @@ from faststack.config import config
 from faststack.imaging.cache import build_cache_key
 from faststack.imaging.jpeg import decode_jpeg_resized, decode_jpeg_rgb
 from faststack.imaging.orientation import apply_orientation_to_np
+from faststack.io.utils import normalize_path_key
 from faststack.models import DecodedImage, ImageFile
-from faststack.util.executors import create_daemon_threadpool_executor
+from faststack.util.executors import (
+    create_daemon_threadpool_executor,
+    create_priority_executor,
+)
 
 log = logging.getLogger(__name__)
 
 DecodeQuality = Literal["fast", "cover"]
+
+_PRIORITY_DEMAND = 0
+_PRIORITY_COVER = 5
+_PRIORITY_PREFETCH_BASE = 10
+_PRIORITY_PREWARM = 100
+_QUEUE_GROUP_INTERACTIVE = 0
+_QUEUE_GROUP_PRELOAD = 1
+
+# Held-key browsing deliberately uses a much smaller source than the physical
+# viewport. The settled cover decode replaces it visually after navigation
+# stops, while the small buffer remains cached for the next browsing burst.
+DEFAULT_HELD_NAVIGATION_QUALITY = "balanced"
+HELD_NAVIGATION_QUALITY_DIMENSIONS = {
+    "performance": 800,
+    "balanced": 1600,
+    "detailed": 2400,
+    "highest": 3200,
+}
+_MIN_DIRECTION_TAIL = 4
+
+
+class _DecodeTaskFuture(Future):
+    """Stable logical future whose physical executor work may be replaced.
+
+    Callers and Prefetcher bookkeeping retain this future for the lifetime of a
+    logical decode. A queued speculative execution can therefore be cancelled
+    and moved to the reserved demand executor without cancelling callbacks or
+    leaving a waiter attached to the obsolete queue entry.
+    """
+
+    def __init__(self, worker: Callable[..., Any], worker_args: tuple[Any, ...]):
+        super().__init__()
+        self._worker = worker
+        self._worker_args = worker_args
+        self._execution_lock = threading.RLock()
+        self._execution_future: Optional[Future] = None
+        self._execution_executor: object = None
+        self._completion_claimed = False
+
+    def submit_execution(
+        self,
+        executor,
+        *,
+        priority: int,
+        queue_group: int = _QUEUE_GROUP_INTERACTIVE,
+        queue_order: Optional[int] = None,
+    ) -> None:
+        """Bind the initial physical execution to this logical future."""
+        execution = executor.submit(
+            self._worker,
+            *self._worker_args,
+            priority=priority,
+            queue_group=queue_group,
+            queue_order=queue_order,
+        )
+        with self._execution_lock:
+            if self.done() or self._completion_claimed:
+                execution.cancel()
+                return
+            self._execution_future = execution
+            self._execution_executor = executor
+        # A completed Future invokes callbacks synchronously. Register outside
+        # _execution_lock so logical completion callbacks are never run while
+        # holding the migration lock.
+        execution.add_done_callback(self._execution_done)
+
+    def migrate_queued_execution(
+        self,
+        source_executor,
+        target_executor,
+        *,
+        priority: int,
+    ) -> str:
+        """Move queued work between executors without changing logical identity.
+
+        Future.cancel() and Future.set_running_or_notify_cancel() serialize the
+        queued-versus-running race. A failed cancellation means the source work
+        has started (or just completed) and remains the sole accepted execution.
+        """
+        replacement = None
+        completed_execution = None
+        submit_error = None
+        with self._execution_lock:
+            if self.done() or self._completion_claimed:
+                return "complete"
+            execution = self._execution_future
+            if execution is None or self._execution_executor is not source_executor:
+                return "not-source"
+
+            # Detach before cancel(): cancellation invokes callbacks
+            # synchronously. The obsolete execution callback must see that it no
+            # longer owns this logical future and do nothing.
+            self._execution_future = None
+            self._execution_executor = None
+            if not execution.cancel():
+                # The worker won the race. Restore ownership and, if it also
+                # completed while detached, transfer its result explicitly.
+                self._execution_future = execution
+                self._execution_executor = source_executor
+                if execution.done():
+                    completed_execution = execution
+                    state = "complete"
+                else:
+                    state = "running"
+            else:
+                try:
+                    replacement = target_executor.submit(
+                        self._worker,
+                        *self._worker_args,
+                        priority=priority,
+                        queue_group=_QUEUE_GROUP_INTERACTIVE,
+                    )
+                except BaseException as exc:
+                    self._completion_claimed = True
+                    submit_error = exc
+                    state = "failed"
+                else:
+                    self._execution_future = replacement
+                    self._execution_executor = target_executor
+                    state = "migrated"
+
+        if completed_execution is not None:
+            self._execution_done(completed_execution)
+        if replacement is not None:
+            replacement.add_done_callback(self._execution_done)
+        if submit_error is not None:
+            self.set_exception(submit_error)
+        return state
+
+    def execution_for(self, executor) -> Optional[Future]:
+        """Return the currently bound physical future for an executor."""
+        with self._execution_lock:
+            if self._execution_executor is executor:
+                return self._execution_future
+            return None
+
+    def running(self) -> bool:
+        """Mirror the physical execution's running state."""
+        with self._execution_lock:
+            if self.done():
+                return False
+            if self._completion_claimed:
+                return True
+            if self._execution_future is None:
+                return False
+            return self._execution_future.running()
+
+    def cancel(self) -> bool:
+        """Cancel queued physical work and this logical future together."""
+        completed_execution = None
+        with self._execution_lock:
+            if self.done() or self._completion_claimed:
+                return False
+            execution = self._execution_future
+            executor = self._execution_executor
+            if execution is not None:
+                self._execution_future = None
+                self._execution_executor = None
+                if not execution.cancel():
+                    self._execution_future = execution
+                    self._execution_executor = executor
+                    if execution.done():
+                        completed_execution = execution
+                    else:
+                        return False
+        if completed_execution is not None:
+            self._execution_done(completed_execution)
+            return False
+        return super().cancel()
+
+    def _execution_done(self, execution: Future) -> None:
+        with self._execution_lock:
+            if (
+                execution is not self._execution_future
+                or self.done()
+                or self._completion_claimed
+            ):
+                return
+            # Claim terminal ownership before releasing the lock. cancel() and
+            # migration must now reuse this result rather than racing its
+            # transfer. Future callbacks run only after the lock is released,
+            # avoiding an execution-lock -> Prefetcher-lock inversion.
+            self._completion_claimed = True
+            self._execution_future = None
+            self._execution_executor = None
+        if execution.cancelled():
+            super().cancel()
+            return
+        try:
+            result = execution.result()
+        except BaseException as exc:
+            self.set_exception(exc)
+        else:
+            self.set_result(result)
+
 
 # RAW extensions that Pillow typically cannot decode (no embedded JPEG preview).
 # When decode fails for these, we generate a placeholder instead of returning None.
 _RAW_EXTENSIONS = frozenset(
     {".orf", ".rw2", ".cr2", ".cr3", ".arw", ".nef", ".raf", ".dng"}
 )
+
+
+def normalize_held_navigation_quality(value: object) -> str:
+    """Return a supported held-navigation quality name."""
+    normalized = str(value or "").strip().lower()
+    if normalized in HELD_NAVIGATION_QUALITY_DIMENSIONS:
+        return normalized
+    return DEFAULT_HELD_NAVIGATION_QUALITY
+
+
+def held_navigation_quality_max_dimension(value: object) -> int:
+    """Resolve a held-navigation quality name to its decode-size ceiling."""
+    return HELD_NAVIGATION_QUALITY_DIMENSIONS[normalize_held_navigation_quality(value)]
 
 
 def _make_raw_placeholder(width: int, height: int) -> np.ndarray:
@@ -234,6 +446,76 @@ def get_monitor_profile() -> Optional[ImageCms.ImageCmsProfile]:
             _monitor_profile_cache[monitor_icc_path] = None
 
         return _monitor_profile_cache[monitor_icc_path]
+
+
+def _prewarm_common_icc_transform() -> None:
+    """Build the common sRGB-to-monitor transform before the first image."""
+    if config.get("color", "mode", fallback="none").lower() != "icc":
+        return
+    monitor_profile = get_monitor_profile()
+    if monitor_profile is None:
+        return
+    monitor_icc_path = config.get("color", "monitor_icc_path", fallback="").strip()
+    try:
+        get_icc_transform(
+            SRGB_PROFILE,
+            monitor_profile,
+            "srgb_builtin",
+            monitor_icc_path,
+        )
+    except Exception:
+        log.debug("Could not prewarm the display ICC transform", exc_info=True)
+
+
+# Strip-parallel ICC apply. An lcms transform is immutable once built, so the
+# same transform can convert independent row bands concurrently; measured
+# byte-identical to the single-shot path and ~3x faster on a 6MP cover
+# (tools/bench_decode.py). Small (fast-tier) frames stay single-shot: the
+# fan-out overhead and contention with busy decode workers outweigh the win,
+# and their latency is hidden by the look-ahead buffer anyway.
+_ICC_STRIP_MIN_PIXELS = 2_000_000
+_ICC_STRIP_COUNT = 4
+_icc_strip_pool = None
+_icc_strip_pool_lock = threading.Lock()
+
+
+def _get_icc_strip_pool():
+    global _icc_strip_pool
+    if _icc_strip_pool is None:
+        with _icc_strip_pool_lock:
+            if _icc_strip_pool is None:
+                _icc_strip_pool = create_daemon_threadpool_executor(
+                    max_workers=_ICC_STRIP_COUNT,
+                    thread_name_prefix="IccStrip",
+                )
+    return _icc_strip_pool
+
+
+def apply_icc_transform_to_buffer(
+    buffer: np.ndarray,
+    transform: ImageCms.ImageCmsTransform,
+) -> np.ndarray:
+    """Convert RGB pixels to monitor space, strip-parallel for large frames."""
+    height = int(buffer.shape[0])
+    pixels = height * int(buffer.shape[1])
+    if pixels < _ICC_STRIP_MIN_PIXELS or height < _ICC_STRIP_COUNT:
+        img = PILImage.fromarray(buffer)
+        ImageCms.applyTransform(img, transform, inPlace=True)
+        return np.array(img, dtype=np.uint8)
+
+    bounds = np.linspace(0, height, _ICC_STRIP_COUNT + 1).astype(int)
+
+    def convert(start: int, stop: int) -> np.ndarray:
+        strip = PILImage.fromarray(np.ascontiguousarray(buffer[start:stop]))
+        ImageCms.applyTransform(strip, transform, inPlace=True)
+        return np.asarray(strip, dtype=np.uint8)
+
+    pool = _get_icc_strip_pool()
+    futures = [
+        pool.submit(convert, int(start), int(stop))
+        for start, stop in zip(bounds[:-1], bounds[1:])
+    ]
+    return np.vstack([future.result() for future in futures])
 
 
 def get_icc_profile_description(profile: ImageCms.ImageCmsProfile) -> str:
@@ -446,18 +728,34 @@ def _decode_buffer(
     want_icc: bool,
     decode_quality: DecodeQuality,
     index: int,
-) -> tuple[Optional[np.ndarray], int, Optional[bytes]]:
-    """Decode an image to RGB pixels, returning EXIF orientation and optional ICC."""
+    stats: Optional[dict] = None,
+) -> tuple[Optional[np.ndarray], int, Optional[bytes], int, int, Optional[str]]:
+    """Decode an image to RGB pixels, returning EXIF orientation and optional ICC.
+
+    When ``stats`` is provided it is populated in-place with decode/resize and
+    metadata timing for the navigation trace.
+    """
     buffer = None
     icc_bytes = None
     orientation = 1
+    native_width = 0
+    native_height = 0
+    placeholder_reason = None
     is_jpeg = target_path.suffix.lower() in {".jpg", ".jpeg", ".jpe"}
 
     if is_jpeg:
         icc_metadata_read = False
         try:
+            _t_read = time.perf_counter() if stats is not None else None
             with open(target_path, "rb") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                    if stats is not None and _t_read is not None:
+                        # Diagnostic-only (nav trace active): fault every page
+                        # in sequentially so file I/O and antivirus scan cost
+                        # land in read_ms instead of inflating jpeg_ms through
+                        # page faults taken inside the decoder.
+                        _faulted = mmapped[:: mmap.PAGESIZE]
+                        stats["read_ms"] = (time.perf_counter() - _t_read) * 1000.0
                     if use_resized and should_resize:
                         buffer = decode_jpeg_resized(
                             mmapped,
@@ -466,31 +764,51 @@ def _decode_buffer(
                             fast_dct=fast_dct,
                             source_path=str(target_path),
                             mode=decode_quality,
+                            stats=stats,
                         )
                     else:
+                        _t_decode = time.perf_counter() if stats is not None else None
                         buffer = decode_jpeg_rgb(
                             mmapped,
                             fast_dct=fast_dct,
                             source_path=str(target_path),
+                            stats=stats,
                         )
+                        if stats is not None and _t_decode is not None:
+                            stats["jpeg_ms"] = (
+                                time.perf_counter() - _t_decode
+                            ) * 1000.0
                         if buffer is not None and should_resize:
+                            _t_resize = (
+                                time.perf_counter() if stats is not None else None
+                            )
                             img = PILImage.fromarray(buffer)
                             img.thumbnail(
                                 (display_width, display_height),
                                 PILImage.Resampling.LANCZOS,
                             )
                             buffer = np.array(img)
+                            if stats is not None and _t_resize is not None:
+                                stats["resize_ms"] = (
+                                    time.perf_counter() - _t_resize
+                                ) * 1000.0
 
                     if buffer is not None:
                         try:
+                            _t_meta = time.perf_counter() if stats is not None else None
                             mmapped.seek(0)
                             with PILImage.open(mmapped) as pil_img:
+                                native_width, native_height = pil_img.size
                                 if want_icc:
                                     icc_bytes = pil_img.info.get("icc_profile")
                                 orientation = pil_img.getexif().get(
                                     _EXIF_ORIENTATION_TAG, 1
                                 )
                                 icc_metadata_read = want_icc
+                            if stats is not None and _t_meta is not None:
+                                stats["metadata_ms"] = (
+                                    time.perf_counter() - _t_meta
+                                ) * 1000.0
                         except Exception:
                             log.debug(
                                 "Failed to read EXIF from mmap for %s",
@@ -510,6 +828,7 @@ def _decode_buffer(
         if buffer is not None and want_icc and not icc_metadata_read:
             try:
                 with PILImage.open(target_path) as orig:
+                    native_width, native_height = orig.size
                     icc_bytes = orig.info.get("icc_profile")
                     if orientation == 1:
                         orientation = orig.getexif().get(_EXIF_ORIENTATION_TAG, 1)
@@ -519,6 +838,7 @@ def _decode_buffer(
     if buffer is None:
         try:
             with PILImage.open(target_path) as img:
+                native_width, native_height = img.size
                 orientation = img.getexif().get(_EXIF_ORIENTATION_TAG, 1)
                 if want_icc:
                     icc_bytes = img.info.get("icc_profile")
@@ -531,12 +851,25 @@ def _decode_buffer(
                 buffer = np.array(img)
         except Exception as e:
             log.warning("Decode failed index=%d path=%s: %s", index, target_path, e)
-            if target_path.suffix.lower() in _RAW_EXTENSIONS:
-                buffer = _make_raw_placeholder(display_width, display_height)
-            else:
-                return None, orientation, icc_bytes
+            buffer = _make_raw_placeholder(display_width, display_height)
+            placeholder_reason = (
+                "RAW preview could not be decoded"
+                if target_path.suffix.lower() in _RAW_EXTENSIONS
+                else "Image could not be decoded"
+            )
+            if stats is not None:
+                stats["placeholder_reason"] = placeholder_reason
 
-    return buffer, orientation, icc_bytes
+    if buffer is not None and (native_width <= 0 or native_height <= 0):
+        native_height, native_width = buffer.shape[:2]
+    return (
+        buffer,
+        orientation,
+        icc_bytes,
+        native_width,
+        native_height,
+        placeholder_reason,
+    )
 
 
 class Prefetcher:
@@ -549,46 +882,83 @@ class Prefetcher:
         debug: bool = False,
         cache_contains: Optional[Callable[[str], bool]] = None,
         cache_get_quality: Optional[Callable[[str], Optional[str]]] = None,
+        quality_is_current: Optional[Callable[..., bool]] = None,
+        nav_trace: Optional[Callable[[dict], None]] = None,
+        fast_decode_max_dimension: int = HELD_NAVIGATION_QUALITY_DIMENSIONS[
+            DEFAULT_HELD_NAVIGATION_QUALITY
+        ],
+        configured_workers: int = 0,
     ):
         self.image_files = image_files
         self.cache_put = cache_put
         self.prefetch_radius = prefetch_radius
         self.get_display_info = get_display_info
         self.debug = debug
+        # Optional per-decode telemetry sink (navigation trace). Called from a
+        # worker thread with a plain dict of stage timings + decode details;
+        # must not touch Qt. See AppController._record_nav_worker_timing.
+        self.nav_trace = nav_trace
         # Optional fast-path: lets _decode_and_cache short-circuit when the
         # target cache key is already present, so a resubmit that races a
         # completed decode (or a resubmit after unschedule_path()) is cheap
         # instead of re-decoding the file.
         self.cache_contains = cache_contains
         self.cache_get_quality = cache_get_quality
-        # Use CPU count for I/O-bound JPEG decoding
-        # Rule of thumb: 2x CPU cores for I/O bound, 1x for CPU bound
-        optimal_workers = min(
-            (os.cpu_count() or 1) * 2, 8
-        )  # Cap at 8 for fast navigation
+        self.quality_is_current = quality_is_current
+        self.fast_decode_max_dimension = max(1, int(fast_decode_max_dimension))
+        # Reserve one worker for an exact demand miss. Speculative TurboJPEG,
+        # resize, and ICC work otherwise occupies every worker and a priority
+        # bump cannot preempt a decode that has already started.
+        # Auto-size the total to ~3/4 of the logical cores, clamped to
+        # [2, 16]: decode throughput still scales at 11 speculative workers
+        # on a 16-thread machine (tools/bench_decode.py), while the previous
+        # flat cap of 8 both left fast machines idle and oversubscribed
+        # 4-thread ones, inflating the latency of the one demand decode the
+        # UI may be waiting on. core.prefetch_workers overrides the total
+        # (speculative + the one reserved demand worker); 0 keeps auto.
+        optimal_workers = min(16, max(2, ((os.cpu_count() or 4) * 3) // 4))
+        if configured_workers > 0:
+            optimal_workers = max(2, min(int(configured_workers), 32))
+        self.total_decode_workers = optimal_workers
+        speculative_workers = max(1, optimal_workers - 1)
 
-        self.executor = create_daemon_threadpool_executor(
-            max_workers=optimal_workers,
+        self.executor = create_priority_executor(
+            max_workers=speculative_workers,
             thread_name_prefix="Prefetcher",
+        )
+        self.demand_executor = create_priority_executor(
+            max_workers=1,
+            thread_name_prefix="DemandDecoder",
+        )
+        # The configured monitor profile is known before QML finishes loading.
+        # Build its overwhelmingly common sRGB transform during that otherwise
+        # idle time instead of adding ~200 ms to the first visible image.
+        self.executor.submit(
+            _prewarm_common_icc_transform,
+            priority=_PRIORITY_PREWARM,
         )
         self._futures_lock = threading.RLock()
         self.futures: Dict[int, Future] = {}
         self.future_paths: Dict[int, Path] = {}
         self.future_quality: Dict[int, DecodeQuality] = {}
+        self._demand_indices: set[int] = set()
         self.generation = 0
         self._scheduled: Dict[int, set] = {}  # generation -> set of scheduled indices
+        self._active_window: set[int] = set()
+        self._next_trace_task_id = 0
 
         # Cooperative cancellation flag for shutdown
         self._stop_event = threading.Event()
 
-        # Adaptive prefetch: start with smaller radius, expand after user navigates
-        self._initial_radius = 4  # Increased for faster initial responsiveness
+        # The display-size gate already prevents premature work. Warm the full
+        # configured window while the user is idle instead of waiting until the
+        # held-key burst has already begun.
+        self._initial_radius = self.prefetch_radius
         self._navigation_count = 0  # Track how many times user has navigated
-        self._radius_expanded = False
+        self._radius_expanded = True
 
         # Directional prefetching
         self._last_navigation_direction: int = 1  # 1 = forward, -1 = backward
-        self._direction_bias: float = 0.85  # 85% of radius in travel direction
 
     def set_image_files(self, image_files: List[ImageFile]):
         with self._futures_lock:
@@ -613,11 +983,30 @@ class Prefetcher:
                         self.futures.pop(i, None)
                         self.future_paths.pop(i, None)
                         self.future_quality.pop(i, None)
+                        self._demand_indices.discard(i)
                         for scheduled in self._scheduled.values():
                             scheduled.discard(i)
                     return
 
             self._cancel_all_locked()
+
+    @staticmethod
+    def _bump_executor_priority(executor, future: Future, priority: int) -> bool:
+        """Raise a logical task's queued physical execution priority."""
+        execution = (
+            future.execution_for(executor)
+            if isinstance(future, _DecodeTaskFuture)
+            else future
+        )
+        if execution is None:
+            return False
+        return bool(
+            executor.bump_priority(
+                execution,
+                priority,
+                queue_group=_QUEUE_GROUP_INTERACTIVE,
+            )
+        )
 
     def update_prefetch(
         self,
@@ -679,17 +1068,17 @@ class Prefetcher:
             behind = 0
             ahead = 0
         elif self._last_navigation_direction > 0:  # Moving forward
-            behind = max(1, int(effective_radius * (1 - self._direction_bias)))
-            ahead = effective_radius - behind + 1
-            if ahead < 1:
-                ahead = 1
-                behind = effective_radius
+            behind = min(
+                effective_radius,
+                max(_MIN_DIRECTION_TAIL, 1),
+            )
+            ahead = effective_radius
         else:  # Moving backward
-            ahead = max(1, int(effective_radius * (1 - self._direction_bias)))
-            behind = effective_radius - ahead + 1
-            if behind < 1:
-                behind = 1
-                ahead = effective_radius
+            ahead = min(
+                effective_radius,
+                max(_MIN_DIRECTION_TAIL, 1),
+            )
+            behind = effective_radius
 
         # Invariant: All reads/writes of self.futures, self._scheduled, self.generation,
         # and self.image_files that participate in scheduling or cancellation MUST
@@ -713,6 +1102,7 @@ class Prefetcher:
 
             start = max(0, safe_current - behind)
             end = min(n, safe_current + ahead + 1)
+            self._active_window = set(range(start, end))
 
             log.debug(
                 "Prefetch range: [%d, %d) for index %d (direction=%d, behind=%d, ahead=%d)",
@@ -745,17 +1135,52 @@ class Prefetcher:
 
             for index, future in list(self.futures.items()):
                 if index < start or index >= end:
+                    task_quality = self.future_quality.get(index)
                     if future.cancel():
+                        if task_quality == "cover":
+                            self._report_queued_cancellation(
+                                index,
+                                future,
+                                "outside-prefetch-window",
+                            )
                         self.futures.pop(index, None)
                         self.future_paths.pop(index, None)
                         self.future_quality.pop(index, None)
+                        self._demand_indices.discard(index)
                         scheduled.discard(index)
 
-            for i in priority_order:
+            for rank, i in enumerate(priority_order):
                 if i < 0 or i >= n:
                     continue
-                if i not in scheduled and i not in self.futures:
-                    self.submit_task(i, self.generation, quality="fast")
+                desired_priority = _PRIORITY_PREFETCH_BASE + rank
+                future = self.futures.get(i)
+                if (
+                    future is not None
+                    and not future.running()
+                    and not future.done()
+                    and self.future_quality.get(i) == "fast"
+                    and self._bump_executor_priority(
+                        self.executor,
+                        future,
+                        desired_priority,
+                    )
+                ):
+                    # A far-edge task starts at low urgency, but becomes one of
+                    # the next contiguous frames as navigation advances. Raise
+                    # its queued priority now so newer far-edge submissions do
+                    # not jump ahead through the executor's LIFO tie ordering.
+                    trace_meta = getattr(future, "_faststack_trace_meta", None)
+                    if isinstance(trace_meta, dict):
+                        trace_meta["priority"] = desired_priority
+                        trace_meta["queue_group"] = _QUEUE_GROUP_INTERACTIVE
+                elif i not in scheduled and future is None:
+                    self.submit_task(
+                        i,
+                        self.generation,
+                        quality="fast",
+                        queue_priority=desired_priority,
+                        window_bound=True,
+                    )
                     scheduled.add(i)
                     tasks_submitted += 1
 
@@ -774,6 +1199,12 @@ class Prefetcher:
         quality: DecodeQuality = "fast",
         quality_token: Optional[int] = None,
         quality_index: Optional[int] = None,
+        queue_priority: Optional[int] = None,
+        queue_group: int = _QUEUE_GROUP_INTERACTIVE,
+        queue_order: Optional[int] = None,
+        preload_order: Optional[int] = None,
+        nav_seq: Optional[int] = None,
+        window_bound: bool = False,
     ) -> Optional[Future]:
         """Submits a decoding task for a given index."""
         if self._stop_event.is_set():
@@ -796,6 +1227,9 @@ class Prefetcher:
                 if override_path is not None
                 else self.image_files[index].path
             )
+            if preload_order is not None:
+                queue_group = _QUEUE_GROUP_PRELOAD
+                queue_order = preload_order
 
             existing_future = self.futures.get(index)
             existing_same_path_future = None
@@ -810,15 +1244,23 @@ class Prefetcher:
                 current_quality = self.future_quality.get(index, "fast")
                 if current_path != requested_path:
                     # Force cancel the old one to switch paths
-                    existing_future.cancel()
+                    canceled = existing_future.cancel()
+                    if canceled and current_quality == "cover":
+                        self._report_queued_cancellation(
+                            index,
+                            existing_future,
+                            "path-superseded",
+                        )
                     self.futures.pop(index, None)
                     self.future_paths.pop(index, None)
                     self.future_quality.pop(index, None)
+                    self._demand_indices.discard(index)
                 elif quality == "cover" and current_quality == "fast":
                     if existing_future.cancel():
                         self.futures.pop(index, None)
                         self.future_paths.pop(index, None)
                         self.future_quality.pop(index, None)
+                        self._demand_indices.discard(index)
                     else:
                         # The fast decode is already running. Chain the
                         # settled cover decode after it so a running fast
@@ -827,9 +1269,15 @@ class Prefetcher:
                         decode_after_future = existing_future
                 elif quality == "fast" and current_quality == "cover":
                     if existing_future.cancel():
+                        self._report_queued_cancellation(
+                            index,
+                            existing_future,
+                            "demand-fast-superseded-cover",
+                        )
                         self.futures.pop(index, None)
                         self.future_paths.pop(index, None)
                         self.future_quality.pop(index, None)
+                        self._demand_indices.discard(index)
                     else:
                         # The cover decode is already running. Stop tracking it
                         # so this index can submit and wait on a fresh fast
@@ -838,6 +1286,7 @@ class Prefetcher:
                         self.futures.pop(index, None)
                         self.future_paths.pop(index, None)
                         self.future_quality.pop(index, None)
+                        self._demand_indices.discard(index)
                 else:
                     existing_same_path_future = existing_future
 
@@ -856,11 +1305,19 @@ class Prefetcher:
                     if direction < 0 and task_index < index:
                         continue
 
+                    task_quality = self.future_quality.get(task_index)
                     if not future.done() and future.cancel():
+                        if task_quality == "cover":
+                            self._report_queued_cancellation(
+                                task_index,
+                                future,
+                                "demand-priority",
+                            )
                         cancelled_count += 1
                         self.futures.pop(task_index, None)
                         self.future_paths.pop(task_index, None)
                         self.future_quality.pop(task_index, None)
+                        self._demand_indices.discard(task_index)
                         # This index is no longer decoded/queued -- allow it
                         # to be resubmitted, mirroring update_prefetch()'s
                         # own out-of-window cancel loop.
@@ -874,10 +1331,173 @@ class Prefetcher:
                     )
 
             if existing_same_path_future is not None:
+                # A navigation can adopt a queued/running look-ahead decode.
+                # Update the mutable logical-task metadata so its eventual
+                # pixels retain the demand seq and the wait experienced *after*
+                # the user targeted the image.
+                existing_meta = getattr(
+                    existing_same_path_future,
+                    "_faststack_trace_meta",
+                    None,
+                )
+                prior_seq = (
+                    existing_meta.get("seq")
+                    if isinstance(existing_meta, dict)
+                    else None
+                )
+                migration_state = "reused"
+                priority_bumped = False
+                if priority and quality == "fast":
+                    demand_t = time.perf_counter()
+                    self._demand_indices.add(index)
+                    if isinstance(existing_meta, dict):
+                        if nav_seq is not None:
+                            existing_meta["seq"] = nav_seq
+                        existing_meta["demand_t"] = demand_t
+                        existing_meta["role"] = "demand-reused"
+                        worker_start_t = existing_meta.get("worker_start_t")
+                        if isinstance(worker_start_t, (int, float)):
+                            existing_meta["queue_ms"] = max(
+                                0.0,
+                                (worker_start_t - demand_t) * 1000.0,
+                            )
+                            existing_meta["running_before_demand_ms"] = max(
+                                0.0,
+                                (demand_t - worker_start_t) * 1000.0,
+                            )
+
+                    if isinstance(existing_same_path_future, _DecodeTaskFuture):
+                        demand_queue_depth = self.demand_executor.qsize()
+                        migration_state = (
+                            existing_same_path_future.migrate_queued_execution(
+                                self.executor,
+                                self.demand_executor,
+                                priority=_PRIORITY_DEMAND,
+                            )
+                        )
+                        if migration_state == "migrated":
+                            if isinstance(existing_meta, dict):
+                                existing_meta["role"] = "demand-migrated"
+                                existing_meta["priority"] = _PRIORITY_DEMAND
+                                existing_meta["queue_group"] = _QUEUE_GROUP_INTERACTIVE
+                                existing_meta["migrated_to_demand"] = True
+                                existing_meta["migration_t"] = demand_t
+                                existing_meta["prefetch_queue_depth"] = (
+                                    existing_meta.get("queue_depth")
+                                )
+                                existing_meta["queue_depth"] = demand_queue_depth
+                            log.debug(
+                                "Migrated queued speculative decode to reserved "
+                                "demand executor: index=%d path=%s",
+                                index,
+                                requested_path,
+                            )
+                    else:
+                        priority_bumped = self._bump_executor_priority(
+                            self.executor,
+                            existing_same_path_future,
+                            _PRIORITY_DEMAND,
+                        )
+
+                    if isinstance(existing_meta, dict) and priority_bumped:
+                        existing_meta["priority"] = _PRIORITY_DEMAND
+                        existing_meta["queue_group"] = _QUEUE_GROUP_INTERACTIVE
+                        existing_meta["priority_bumped"] = True
+
+                elif isinstance(existing_meta, dict) and nav_seq is not None:
+                    existing_meta["seq"] = nav_seq
+
+                if (
+                    self.nav_trace is not None
+                    and isinstance(existing_meta, dict)
+                    and (nav_seq is not None or priority)
+                ):
+                    try:
+                        self.nav_trace(
+                            {
+                                "event": (
+                                    "migrated"
+                                    if migration_state == "migrated"
+                                    else "adopted"
+                                ),
+                                "task_id": existing_meta.get("task_id"),
+                                "index": index,
+                                "source_path": existing_meta.get("source_path"),
+                                "prior_seq": prior_seq,
+                                "seq": existing_meta.get("seq"),
+                                "state": migration_state,
+                                "priority": existing_meta.get("priority"),
+                                "priority_bumped": bool(
+                                    existing_meta.get("priority_bumped")
+                                ),
+                                "migrated_to_demand": bool(
+                                    existing_meta.get("migrated_to_demand")
+                                ),
+                            }
+                        )
+                    except Exception:
+                        log.debug("nav_trace adoption sink raised", exc_info=True)
                 return existing_same_path_future
+
+            if queue_priority is None:
+                if priority and quality == "fast":
+                    queue_priority = _PRIORITY_DEMAND
+                elif quality == "cover":
+                    queue_priority = _PRIORITY_COVER
+                else:
+                    queue_priority = _PRIORITY_PREFETCH_BASE
 
             image_file = self.image_files[index]
             display_width, display_height, display_generation = self.get_display_info()
+
+            # Submit-time metadata: the nav seq the demand belongs to, the queue
+            # priority actually used, the enqueue timestamp (for queue_wait), and
+            # the queue depth / in-flight count AT SUBMIT (not after decoding).
+            target_executor = (
+                self.demand_executor
+                if priority and quality == "fast"
+                else self.executor
+            )
+
+            role = (
+                "cover"
+                if quality == "cover"
+                else (
+                    "demand"
+                    if priority
+                    else "preload" if preload_order is not None else "prefetch"
+                )
+            )
+            if self.nav_trace is not None:
+                self._next_trace_task_id += 1
+                enqueue_t = time.perf_counter()
+                submit_meta = {
+                    "task_id": self._next_trace_task_id,
+                    "seq": nav_seq,
+                    "role": role,
+                    "quality": quality,
+                    "priority": queue_priority,
+                    "queue_group": queue_group,
+                    "queue_order": queue_order,
+                    "source_path": str(requested_path),
+                    "display_generation": display_generation,
+                    "enqueue_t": enqueue_t,
+                    "demand_t": enqueue_t if nav_seq is not None else None,
+                    "queue_depth": target_executor.qsize(),
+                    "inflight": len(self.futures),
+                    "window_bound": window_bound,
+                }
+            else:
+                # Role is correctness metadata as well as telemetry: an
+                # adopted window-bound prefetch must remain eligible after it
+                # becomes exact demand, even when tracing is disabled.
+                submit_meta = {
+                    "seq": nav_seq,
+                    "role": role,
+                    "quality": quality,
+                    "source_path": str(requested_path),
+                    "window_bound": window_bound,
+                }
 
             decode_args = (
                 image_file,
@@ -890,18 +1510,39 @@ class Prefetcher:
                 quality,
                 quality_token,
                 quality_index if quality_index is not None else index,
+                window_bound,
+                submit_meta,
             )
             if decode_after_future is not None:
-                future = self.executor.submit(
-                    self._decode_after_future,
-                    decode_after_future,
-                    *decode_args,
-                )
+                worker = self._decode_after_future
+                worker_args = (decode_after_future, *decode_args)
             else:
-                future = self.executor.submit(self._decode_and_cache, *decode_args)
+                worker = self._decode_and_cache
+                worker_args = decode_args
+            future = _DecodeTaskFuture(worker, worker_args)
+            # Future safely carries mutable diagnostics shared with the worker.
+            # This is also the stable identity returned to every caller.
+            setattr(future, "_faststack_trace_meta", submit_meta)
+            try:
+                future.submit_execution(
+                    target_executor,
+                    priority=queue_priority,
+                    queue_group=(
+                        queue_group
+                        if target_executor is self.executor
+                        else _QUEUE_GROUP_INTERACTIVE
+                    ),
+                    queue_order=(
+                        queue_order if target_executor is self.executor else None
+                    ),
+                )
+            except RuntimeError:
+                return None
             self.futures[index] = future
             self.future_paths[index] = requested_path
             self.future_quality[index] = quality
+            if priority and quality == "fast":
+                self._demand_indices.add(index)
             future.add_done_callback(lambda f, idx=index: self._cleanup_future(idx, f))
             return future
 
@@ -918,12 +1559,24 @@ class Prefetcher:
         quality: DecodeQuality,
         quality_token: Optional[int],
         quality_index: int,
+        window_bound: bool,
+        submit_meta: Optional[dict] = None,
     ) -> Optional[tuple[Path, int]]:
         """Run a decode after a same-index lower-quality decode has finished."""
+        dependency_started = time.perf_counter() if submit_meta else None
         try:
             previous_future.result()
         except Exception:
             pass
+        chained_meta = dict(submit_meta or {})
+        if dependency_started is not None:
+            chained_meta["dependency_ms"] = (
+                time.perf_counter() - dependency_started
+            ) * 1000.0
+        # The cover decode itself starts now. Preserve dependency_ms separately
+        # rather than pretending that dependency time was executor queue time.
+        if chained_meta:
+            chained_meta["enqueue_t"] = time.perf_counter()
         return self._decode_and_cache(
             image_file,
             index,
@@ -935,6 +1588,8 @@ class Prefetcher:
             quality,
             quality_token,
             quality_index,
+            window_bound,
+            submit_meta=chained_meta,
         )
 
     def _decode_and_cache(
@@ -949,15 +1604,95 @@ class Prefetcher:
         quality: DecodeQuality = "fast",
         quality_token: Optional[int] = None,
         quality_index: int = -1,
+        window_bound: bool = False,
+        submit_meta: Optional[dict] = None,
     ) -> Optional[tuple[Path, int]]:
         """The actual work done by the thread pool."""
         if generation != self.generation or self._stop_event.is_set():
             return None
 
+        # Navigation trace is intentionally zero-cost outside diagnostic runs.
+        _t_worker_start = time.perf_counter() if self.nav_trace is not None else None
+        _meta = submit_meta or {}
+        if self.nav_trace is not None and _t_worker_start is not None:
+            _meta["worker_start_t"] = _t_worker_start
+        enqueue_t = _meta.get("enqueue_t")
+        # In diagnostic runs the decoded buffer retains this exact mutable
+        # dictionary. If a demand adopts a running prefetch, submit_task updates
+        # seq/role/priority in-place and the pixels keep that exact history.
+        _stats: dict = _meta if self.nav_trace is not None else {}
+
+        def quality_work_is_current() -> bool:
+            if (
+                quality != "cover"
+                or quality_token is None
+                or self.quality_is_current is None
+            ):
+                return True
+            return bool(
+                self.quality_is_current(
+                    index=quality_index,
+                    display_generation=display_generation,
+                    token=quality_token,
+                )
+            )
+
+        def fast_work_is_relevant() -> bool:
+            if quality != "fast" or not window_bound:
+                return True
+            # A queued/running look-ahead task can be adopted by an exact
+            # demand request. Its mutable trace role changes at adoption, so it
+            # must finish even if navigation has already shifted the window.
+            if _meta.get("role") in {
+                "demand",
+                "demand-reused",
+                "demand-migrated",
+            }:
+                return True
+            with self._futures_lock:
+                return index in self._active_window or index in self._demand_indices
+
+        def bail_stale(stage: str) -> None:
+            """Report a stale-cover cancellation (stage + wasted work), return None."""
+            if self.nav_trace is not None and _t_worker_start is not None:
+                try:
+                    self.nav_trace(
+                        {
+                            "canceled": True,
+                            "stage": stage,
+                            "wasted_ms": (time.perf_counter() - _t_worker_start)
+                            * 1000.0,
+                            "index": index,
+                            "source_path": _meta.get("source_path"),
+                            "quality": quality,
+                            "seq": _meta.get("seq"),
+                            "task_id": _meta.get("task_id"),
+                            "role": _meta.get("role"),
+                            "priority": _meta.get("priority"),
+                        }
+                    )
+                except Exception:
+                    log.debug("nav_trace sink raised", exc_info=True)
+            return None
+
+        # Drop stale cover work and out-of-window speculative work before
+        # touching the file. Running jobs check again between expensive stages.
+        if not quality_work_is_current():
+            return bail_stale("queued")
+        if not fast_work_is_relevant():
+            return bail_stale("queued-outside-window")
+
         # Use override path if provided, otherwise default to image_file.path
         target_path = override_path if override_path is not None else image_file.path
 
-        cache_key = build_cache_key(target_path, display_generation)
+        cache_quality: DecodeQuality = (
+            quality if display_width > 0 and display_height > 0 else "cover"
+        )
+        cache_key = build_cache_key(
+            target_path,
+            display_generation,
+            cache_quality,
+        )
         if self.cache_get_quality is not None:
             cached_quality = self.cache_get_quality(cache_key)
             if cached_quality == "cover" or (
@@ -980,15 +1715,31 @@ class Prefetcher:
         decode_started = time.monotonic()
 
         try:
-            if os.path.getsize(target_path) == 0:
-                log.warning("Skipping empty image file: %s", target_path)
-                return None
+            source_bytes = os.path.getsize(target_path)
+            if source_bytes == 0:
+                log.warning(
+                    "Empty image file will display a decode placeholder: %s",
+                    target_path,
+                )
+            if self.nav_trace is not None:
+                _stats["source_bytes"] = source_bytes
 
             color_mode = config.get("color", "mode", fallback="none").lower()
             optimize_for = config.get("core", "optimize_for", fallback="speed").lower()
-            fast_dct = optimize_for == "speed"
+            fast_dct = optimize_for == "speed" and quality == "fast"
             use_resized = optimize_for == "speed"
+            if quality == "fast":
+                # Held-key quality controls the decode size independently of
+                # the global decoder preference. ``optimize_for`` may still
+                # select fast-vs-accurate DCT, but it must not silently turn a
+                # configured browsing tier into a full-resolution decode.
+                use_resized = True
             should_resize = display_width > 0 and display_height > 0
+            decode_width = display_width
+            decode_height = display_height
+            if quality == "fast" and should_resize:
+                decode_width = min(display_width, self.fast_decode_max_dimension)
+                decode_height = min(display_height, self.fast_decode_max_dimension)
 
             monitor_profile = None
             monitor_icc_path = ""
@@ -1000,23 +1751,41 @@ class Prefetcher:
                 ).strip()
                 want_icc = monitor_profile is not None
 
-            buffer, orientation, icc_bytes = _decode_buffer(
+            _t_decode_buffer = (
+                time.perf_counter() if self.nav_trace is not None else None
+            )
+            (
+                buffer,
+                orientation,
+                icc_bytes,
+                native_width,
+                native_height,
+                placeholder_reason,
+            ) = _decode_buffer(
                 target_path,
-                display_width,
-                display_height,
+                decode_width,
+                decode_height,
                 use_resized,
                 should_resize,
                 fast_dct,
                 want_icc,
                 quality,
                 index,
+                stats=_stats if self.nav_trace is not None else None,
             )
+            if _t_decode_buffer is not None:
+                _stats["decode_ms"] = (time.perf_counter() - _t_decode_buffer) * 1000.0
 
             if buffer is None:
                 return None
 
+            if not quality_work_is_current():
+                return bail_stale("post-decode")
+            if not fast_work_is_relevant():
+                return bail_stale("post-decode-outside-window")
+
+            _t_icc = time.perf_counter() if self.nav_trace is not None else None
             if want_icc and monitor_profile is not None:
-                img = PILImage.fromarray(buffer)
                 src_profile, src_profile_key = _get_source_profile(icc_bytes)
 
                 try:
@@ -1026,10 +1795,16 @@ class Prefetcher:
                         src_profile_key,
                         monitor_icc_path,
                     )
-                    ImageCms.applyTransform(img, transform, inPlace=True)
-                    buffer = np.array(img, dtype=np.uint8)
+                    buffer = apply_icc_transform_to_buffer(buffer, transform)
                 except Exception as e:
                     log.warning("ICC conversion failed: %s", e)
+            if _t_icc is not None:
+                _stats["icc_ms"] = (time.perf_counter() - _t_icc) * 1000.0
+
+            if not quality_work_is_current():
+                return bail_stale("post-icc")
+            if not fast_work_is_relevant():
+                return bail_stale("post-icc-outside-window")
 
             buffer = np.ascontiguousarray(buffer)
 
@@ -1037,6 +1812,8 @@ class Prefetcher:
             try:
                 if orientation > 1:
                     buffer = apply_orientation_to_np(buffer, orientation)
+                if orientation in (5, 6, 7, 8):
+                    native_width, native_height = native_height, native_width
             except Exception as e:
                 log.warning("Failed to apply EXIF orientation: %s", e)
 
@@ -1047,6 +1824,55 @@ class Prefetcher:
                 bytes_per_line = buffer.strides[0]
 
             decoded_quality = quality if should_resize else "cover"
+            if self.nav_trace is not None:
+                _stats.setdefault("source", (native_width, native_height))
+                _stats.setdefault("output", (buffer.shape[1], buffer.shape[0]))
+                demand_t = _meta.get("demand_t")
+                if isinstance(demand_t, (int, float)):
+                    # An adopted task that was already running had no executor
+                    # queue wait after the user targeted it.
+                    demand_queue_ms = max(
+                        0.0,
+                        (_t_worker_start - demand_t) * 1000.0,
+                    )
+                    running_before_demand_ms = max(
+                        0.0,
+                        (demand_t - _t_worker_start) * 1000.0,
+                    )
+                else:
+                    demand_queue_ms = (
+                        (_t_worker_start - enqueue_t) * 1000.0
+                        if isinstance(enqueue_t, (int, float))
+                        else None
+                    )
+                    running_before_demand_ms = 0.0
+                _stats.update(
+                    {
+                        "task_id": _meta.get("task_id"),
+                        "seq": _meta.get("seq"),
+                        "role": _meta.get("role"),
+                        "index": index,
+                        "display_generation": display_generation,
+                        "quality": decoded_quality,
+                        "priority": _meta.get("priority"),
+                        "priority_bumped": bool(_meta.get("priority_bumped")),
+                        "queue_ms": demand_queue_ms,
+                        "prequeue_ms": (
+                            (_t_worker_start - enqueue_t) * 1000.0
+                            if isinstance(enqueue_t, (int, float))
+                            else None
+                        ),
+                        "running_before_demand_ms": running_before_demand_ms,
+                        "dependency_ms": _meta.get("dependency_ms"),
+                        "native": (native_width, native_height),
+                        "target": (display_width, display_height),
+                        "decode_target": (decode_width, decode_height),
+                        "queue_depth": _meta.get("queue_depth"),
+                        "inflight": _meta.get("inflight"),
+                        "source_path": str(target_path),
+                        "cache_key": cache_key,
+                    }
+                )
             mv = memoryview(buffer).cast("B")
             decoded = DecodedImage(
                 buffer=mv,
@@ -1055,12 +1881,20 @@ class Prefetcher:
                 bytes_per_line=bytes_per_line,
                 format=QImage.Format.Format_RGB888 if QImage else None,
                 quality=decoded_quality,
+                native_width=native_width,
+                native_height=native_height,
+                source_path=str(target_path),
+                cache_key=cache_key,
+                decode_trace=_stats if self.nav_trace is not None else None,
+                is_placeholder=placeholder_reason is not None,
+                placeholder_reason=placeholder_reason,
             )
 
             if generation != self.generation or self._stop_event.is_set():
                 return None
 
-            self.cache_put(
+            _t_cache = time.perf_counter() if self.nav_trace is not None else None
+            cache_result = self.cache_put(
                 cache_key,
                 decoded,
                 target_path,
@@ -1070,6 +1904,19 @@ class Prefetcher:
                 quality_index=quality_index,
                 quality_display_generation=display_generation,
             )
+            if _t_cache is not None:
+                _stats["cache_ms"] = (time.perf_counter() - _t_cache) * 1000.0
+                _stats["cache_accepted"] = cache_result is not False
+
+            if self.nav_trace is not None:
+                now = time.perf_counter()
+                _stats["total_ms"] = (now - _t_worker_start) * 1000.0
+                _stats["completed_t"] = now
+                try:
+                    self.nav_trace(_stats)
+                except Exception:
+                    log.debug("nav_trace sink raised", exc_info=True)
+
             return (target_path, display_generation)
 
         except Exception as e:
@@ -1077,8 +1924,61 @@ class Prefetcher:
             log.warning("Error in _decode_and_cache: %s", e, exc_info=True)
             return None
 
+    def has_active_future(
+        self,
+        index: int,
+        expected_path: Optional[Path | str] = None,
+    ) -> bool:
+        """True if the exact requested image still has queued/running work."""
+        with self._futures_lock:
+            fut = self.futures.get(index)
+            if fut is None or fut.done():
+                return False
+            if expected_path is None:
+                return True
+            active_path = self.future_paths.get(index)
+            if active_path is None:
+                return False
+            return normalize_path_key(active_path) == normalize_path_key(expected_path)
+
+    def _report_queued_cancellation(
+        self,
+        index: int,
+        future: Future,
+        reason: str,
+    ) -> None:
+        if self.nav_trace is None:
+            return
+        meta = getattr(future, "_faststack_trace_meta", None)
+        if not isinstance(meta, dict):
+            meta = {}
+        try:
+            self.nav_trace(
+                {
+                    "canceled": True,
+                    "stage": f"queued:{reason}",
+                    "wasted_ms": 0.0,
+                    "index": index,
+                    "source_path": meta.get("source_path"),
+                    "quality": meta.get("quality") or self.future_quality.get(index),
+                    "seq": meta.get("seq"),
+                    "task_id": meta.get("task_id"),
+                    "role": meta.get("role"),
+                    "priority": meta.get("priority"),
+                }
+            )
+        except Exception:
+            log.debug("nav_trace cancellation sink raised", exc_info=True)
+
     def _cleanup_future(self, index: int, future: Future):
         """Removes the future from the tracking dictionary upon completion."""
+        failed = future.cancelled()
+        if not failed:
+            try:
+                failed = future.exception() is not None or future.result() is None
+            except Exception:
+                failed = True
+
         with self._futures_lock:
             # Only remove if it's the specific future we're tracking
             # (to avoid race if a new task for the same index was submitted)
@@ -1086,12 +1986,13 @@ class Prefetcher:
                 self.futures.pop(index, None)
                 self.future_paths.pop(index, None)
                 self.future_quality.pop(index, None)
+                self._demand_indices.discard(index)
                 # Self-heal: if this future was cancelled by ANY cancellation
                 # path, make sure the index isn't left permanently
                 # "scheduled" with nothing actually decoded/cached for it.
                 # Idempotent -- harmless if another cancel loop already
                 # discarded it.
-                if future.cancelled():
+                if failed:
                     for scheduled in self._scheduled.values():
                         scheduled.discard(index)
 
@@ -1113,6 +2014,7 @@ class Prefetcher:
                     self.futures.pop(idx, None)
                     self.future_paths.pop(idx, None)
                     self.future_quality.pop(idx, None)
+                    self._demand_indices.discard(idx)
             for i, image_file in enumerate(self.image_files):
                 if Path(image_file.path).as_posix() == path_str:
                     for scheduled in self._scheduled.values():
@@ -1153,9 +2055,15 @@ class Prefetcher:
                 if future is None:
                     continue
                 if future.cancel():
+                    self._report_queued_cancellation(
+                        index,
+                        future,
+                        "quality-superseded",
+                    )
                     self.futures.pop(index, None)
                     self.future_paths.pop(index, None)
                     self.future_quality.pop(index, None)
+                    self._demand_indices.discard(index)
                     for scheduled in self._scheduled.values():
                         scheduled.discard(index)
 
@@ -1171,6 +2079,8 @@ class Prefetcher:
         self.futures.clear()
         self.future_paths.clear()
         self.future_quality.clear()
+        self._demand_indices.clear()
+        self._active_window.clear()
         self._scheduled.clear()
 
     def cancel_all(self):
@@ -1184,3 +2094,4 @@ class Prefetcher:
         self._stop_event.set()
         self.cancel_all()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.demand_executor.shutdown(wait=False, cancel_futures=True)

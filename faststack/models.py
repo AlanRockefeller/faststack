@@ -101,6 +101,19 @@ class DecodedImage:
     bytes_per_line: int
     format: Any  # QImage.Format
     quality: str = "cover"  # "fast" navigation decode or settled "cover" decode
+    native_width: int = 0
+    native_height: int = 0
+    # Provenance is populated by the display decoder. It lets the provider
+    # verify that the buffer it is about to expose belongs to the requested
+    # file instead of reconstructing that answer from the current index.
+    source_path: Optional[str] = None
+    cache_key: Optional[str] = None
+    # Present only for debug-cache runs. The same dictionary is completed by
+    # the worker after cache insertion, so a later cache hit retains the exact
+    # task/queue/decode history of the pixels being served.
+    decode_trace: Optional[Dict[str, Any]] = None
+    is_placeholder: bool = False
+    placeholder_reason: Optional[str] = None
 
     def __sizeof__(self) -> int:
         """Returns the size of the image buffer in bytes."""

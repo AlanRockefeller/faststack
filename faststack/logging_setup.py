@@ -1,13 +1,32 @@
 """Configures application-wide logging."""
 
+import atexit
 import logging
 import logging.handlers
 import os
+import queue
 import sys
 import tempfile
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+_queue_listener: logging.handlers.QueueListener | None = None
+_destination_handler: logging.Handler | None = None
+_atexit_registered = False
+
+
+def _stop_queue_listener() -> None:
+    """Flush and stop the process-wide asynchronous logging listener."""
+    global _destination_handler, _queue_listener
+    listener = _queue_listener
+    handler = _destination_handler
+    _queue_listener = None
+    _destination_handler = None
+    if listener is not None:
+        listener.stop()
+    if handler is not None:
+        handler.close()
 
 
 def _is_writable_dir(path: Path) -> bool:
@@ -70,31 +89,40 @@ def get_app_data_dir() -> Path:
     return fallback
 
 
-def setup_logging(debug: bool = False) -> Path | None:
-    """Sets up logging to a rotating file in the app data directory.
+def setup_logging(debug: bool = False, *, diagnostic: bool = False) -> Path | None:
+    """Set up asynchronous console logging, or file logging when headless.
 
     Args:
-        debug: If True, sets log level to DEBUG. Otherwise, sets to WARNING to reduce noise.
+        debug: Emit verbose DEBUG records.
+        diagnostic: Emit concise INFO diagnostics without enabling general
+            DEBUG noise. Ignored when ``debug`` is true.
 
     Returns:
         The log file path, or None when file logging is unavailable.
     """
-    log_dir = get_app_data_dir() / "logs"
+    global _atexit_registered, _destination_handler, _queue_listener
+
+    _stop_queue_listener()
+
+    # Console and file logging are deliberately mutually exclusive. A console
+    # run already has a durable destination chosen by the caller (the terminal,
+    # or an explicit shell redirect); windowed builds have no stderr and need
+    # the rotating file instead.
+    console_available = sys.stderr is not None and not getattr(
+        sys.stderr, "closed", False
+    )
+
+    log_dir = None if console_available else get_app_data_dir() / "logs"
     log_file = None
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        log_dir = Path(tempfile.gettempdir()) / "faststack" / "logs"
+    if log_dir is not None:
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
-            log_dir = None
-
-    # Windowed PyInstaller builds run with sys.stderr set to None.
-    if log_dir is None and sys.stderr is not None:
-        sys.stderr.write(
-            "WARNING: Could not create log directory; logs will not be persisted.\n"
-        )
+            log_dir = Path(tempfile.gettempdir()) / "faststack" / "logs"
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                log_dir = None
 
     if log_dir is not None:
         log_file = log_dir / "app.log"
@@ -104,20 +132,27 @@ def setup_logging(debug: bool = False) -> Path | None:
     )
 
     root_logger = logging.getLogger()
-    # Set log level based on debug flag
+    # Base cache diagnostics should not turn every module's INFO stream back
+    # on. Keep the root at WARNING and selectively admit AppController's
+    # consolidated NAVTRACE/startup records; explicit trace/debug modes remain
+    # fully verbose.
     root_logger.setLevel(logging.DEBUG if debug else logging.WARNING)
     root_logger.handlers.clear()
 
-    # Console handler (for seeing logs in terminal). Windowed builds have no
-    # stderr stream; a handler attached to None would raise on every record.
-    if sys.stderr is not None:
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
-        root_logger.addHandler(console_handler)
+    app_logger = logging.getLogger("faststack.app")
+    if debug:
+        app_logger.setLevel(logging.DEBUG)
+    elif diagnostic:
+        app_logger.setLevel(logging.INFO)
+    else:
+        app_logger.setLevel(logging.NOTSET)
 
-    if log_file is not None:
+    destination_handler: logging.Handler | None = None
+    if console_available:
+        destination_handler = logging.StreamHandler(sys.stderr)
+    elif log_file is not None:
         try:
-            file_handler = logging.handlers.RotatingFileHandler(
+            destination_handler = logging.handlers.RotatingFileHandler(
                 log_file, maxBytes=10 * 1024 * 1024, backupCount=5
             )
         except OSError as exc:
@@ -126,17 +161,32 @@ def setup_logging(debug: bool = False) -> Path | None:
             # Return None so main() can tell the user no log file is available.
             log.warning("Could not open log file %s: %s", log_file, exc)
             log_file = None
-        else:
-            file_handler.setFormatter(formatter)
-            root_logger.addHandler(file_handler)
+
+    if destination_handler is not None:
+        destination_handler.setFormatter(formatter)
+        log_queue: queue.SimpleQueue = queue.SimpleQueue()
+        root_logger.addHandler(logging.handlers.QueueHandler(log_queue))
+        _queue_listener = logging.handlers.QueueListener(
+            log_queue,
+            destination_handler,
+            respect_handler_level=True,
+        )
+        _destination_handler = destination_handler
+        _queue_listener.start()
+        if not _atexit_registered:
+            atexit.register(_stop_queue_listener)
+            _atexit_registered = True
 
     # Configure logging for key modules
     if debug:
         logging.getLogger("faststack.imaging.cache").setLevel(logging.DEBUG)
         logging.getLogger("faststack.imaging.prefetch").setLevel(logging.DEBUG)
+    elif diagnostic:
+        logging.getLogger("faststack.imaging.cache").setLevel(logging.WARNING)
+        logging.getLogger("faststack.imaging.prefetch").setLevel(logging.WARNING)
     else:
         # In non-debug mode, only log errors from these noisy modules
         logging.getLogger("faststack.imaging.cache").setLevel(logging.ERROR)
         logging.getLogger("faststack.imaging.prefetch").setLevel(logging.ERROR)
-    logging.getLogger("PIL").setLevel(logging.INFO)
+    logging.getLogger("PIL").setLevel(logging.INFO if debug else logging.WARNING)
     return log_file
