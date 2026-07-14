@@ -1215,6 +1215,22 @@ ApplicationWindow {
             }
             MenuActionItem {
                 width: 220
+                visible: root.uiStateRef ? root.uiStateRef.stackDirectorySwitchVisible : false
+                text: (root.uiStateRef && root.uiStateRef.isInStackInputDirectory)
+                    ? "Switch to Main Photo Directory"
+                    : "Switch to Stack Input Directory"
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                onClicked: {
+                    sortSubMenu.close()
+                    actionsMenu.close()
+                    Qt.callLater(function() {
+                        if (root.uiStateRef) root.uiStateRef.switchStackInputDirectory()
+                    })
+                }
+            }
+            MenuActionItem {
+                width: 220
                 text: "Auto-Level Batch"
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
@@ -1448,12 +1464,6 @@ ApplicationWindow {
 
     property int footerHeight: 60
     property int effectiveFooterHeight: fullScreenLoupe ? 0 : footerHeight
-    readonly property bool loupeNavigationShortcutsEnabled: root.uiStateRef
-        ? root.uiStateRef.imageCount > 0
-          && !root.uiStateRef.isGridViewActive
-          && !root.uiStateRef.isDialogOpen
-          && !(root.uiStateRef.isEditorOpen && root.uiStateRef.isEditorExpanded)
-        : false
 
     Shortcut {
         sequence: "F11"
@@ -1525,34 +1535,6 @@ ApplicationWindow {
         onActivated: {
             if (root.uiStateRef) root.uiStateRef.toggleGridView()
         }
-    }
-
-    Shortcut {
-        sequence: "Left"
-        context: Qt.WindowShortcut
-        enabled: root.loupeNavigationShortcutsEnabled
-        onActivated: root.uiStateRef.prevImage()
-    }
-
-    Shortcut {
-        sequence: "Right"
-        context: Qt.WindowShortcut
-        enabled: root.loupeNavigationShortcutsEnabled
-        onActivated: root.uiStateRef.nextImage()
-    }
-
-    Shortcut {
-        sequence: "Shift+Left"
-        context: Qt.WindowShortcut
-        enabled: root.loupeNavigationShortcutsEnabled
-        onActivated: root.uiStateRef.prevImageBy10()
-    }
-
-    Shortcut {
-        sequence: "Shift+Right"
-        context: Qt.WindowShortcut
-        enabled: root.loupeNavigationShortcutsEnabled
-        onActivated: root.uiStateRef.nextImageBy10()
     }
 
     // Handle View Switching and Prefetch Gating

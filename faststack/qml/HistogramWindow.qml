@@ -12,6 +12,22 @@ Window {
     minimumHeight: 50
     property var uiStateRef: typeof uiState !== "undefined" ? uiState : null
     property var controllerRef: typeof controller !== "undefined" ? controller : null
+    readonly property bool plainArrowNavigationEnabled: visible
+                                                        && controllerRef
+                                                        && uiStateRef
+                                                        && !uiStateRef.isCropping
+    onPlainArrowNavigationEnabledChanged: {
+        if (!plainArrowNavigationEnabled && histogramWindow.controllerRef)
+            histogramWindow.controllerRef.release_auxiliary_navigation_hold(histogramWindow)
+    }
+    Component.onCompleted: {
+        if (histogramWindow.controllerRef)
+            histogramWindow.controllerRef.register_auxiliary_navigation_window(histogramWindow)
+    }
+    Component.onDestruction: {
+        if (histogramWindow.controllerRef)
+            histogramWindow.controllerRef.unregister_auxiliary_navigation_window(histogramWindow)
+    }
     Settings {
         id: histSettings
         category: "histogram"
@@ -26,11 +42,19 @@ Window {
         focus: histogramWindow.visible
 
         Keys.onPressed: function(event) {
-            if (event.key === Qt.Key_H && histogramWindow.controllerRef) {
+            var blockedArrowModifiers = event.modifiers
+                                      & (Qt.ControlModifier | Qt.AltModifier
+                                         | Qt.MetaModifier | Qt.ShiftModifier)
+            if ((event.key === Qt.Key_Left || event.key === Qt.Key_Right)
+                    && !blockedArrowModifiers) {
+                // The controller's window event filter owns the physical
+                // press/hold/release lifecycle for plain arrows.
+                event.accepted = true
+            } else if (event.key === Qt.Key_H && histogramWindow.controllerRef) {
                 histogramWindow.controllerRef.toggle_histogram()
                 event.accepted = true
             } else if (histogramWindow.controllerRef) {
-                // Forward unhandled keys (e.g. arrow keys) to controller
+                // Forward modifier arrows and unrelated keys to the controller.
                 histogramWindow.controllerRef.handle_key_from_histogram(event.key, event.modifiers, event.text)
                 event.accepted = true
             }
@@ -50,7 +74,13 @@ Window {
         if (visible && histogramWindow.controllerRef) {
             histogramKeyScope.forceActiveFocus()
             histogramWindow.controllerRef.update_histogram()
+        } else if (histogramWindow.controllerRef) {
+            histogramWindow.controllerRef.release_auxiliary_navigation_hold(histogramWindow)
         }
+    }
+    onActiveChanged: {
+        if (!active && histogramWindow.controllerRef)
+            histogramWindow.controllerRef.release_auxiliary_navigation_hold(histogramWindow)
     }
 
     // --- Injected Properties ---

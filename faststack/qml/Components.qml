@@ -36,7 +36,7 @@ Item {
     // starts. Zoom-triggered high-res swaps stay blocked until crop mode exits,
     // because any async source swap during cropping can rescale the image and
     // invalidate the crop box's visual alignment.
-    readonly property string requestedImageSource: loupeView.uiStateRef && loupeView.uiStateRef.imageCount > 0 ? loupeView.uiStateRef.currentImageSource : ""
+    readonly property string requestedImageSource: loupeView.uiStateRef && loupeView.uiStateRef.isFolderLoaded && loupeView.uiStateRef.imageCount > 0 ? loupeView.uiStateRef.currentImageSource : ""
     property string cropDragImageSource: ""
     readonly property bool isCropSourceFrozen: cropDragImageSource !== "" && ((mainMouseArea && mainMouseArea.isCropDragging) || (loupeView.uiStateRef && loupeView.uiStateRef.isCropping))
     readonly property string displayedImageSource: isCropSourceFrozen ? cropDragImageSource : requestedImageSource
@@ -165,10 +165,11 @@ Item {
         // Handle Enter for Crop Execution (formerly Keys.onEnterPressed)
         // We only accept the event if we actually act on it.
         if ((event.key === Qt.Key_Enter || event.key === Qt.Key_Return) && loupeView.uiStateRef && loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
-            // Force immediate rotation update before executing crop
-            if (mainMouseArea.cropRotation !== 0) {
-                loupeView.controllerRef.set_straighten_angle(mainMouseArea.cropRotation, -1)
-            }
+            // Stop any queued throttle and publish the visible angle even when
+            // it is zero. A conditional update can leave a previous backend
+            // straighten angle hidden behind a visually reset crop overlay.
+            mainMouseArea.clearPendingRotation(mainMouseArea.cropRotation)
+            loupeView.controllerRef.set_straighten_angle(mainMouseArea.cropRotation, -1)
 
             loupeView.uiStateRef.setZoomed(false) // Force unzoom
             loupeView.controllerRef.execute_crop()
@@ -436,18 +437,46 @@ Item {
                     imageRotator.recomputeFitScale(true)
                 }
 
-                onSourceSizeChanged: { handleSourceSizeChange() }
+                property bool _geometryUpdatePending: false
+
+                function scheduleSourceGeometryUpdate() {
+                    if (_geometryUpdatePending) return
+                    _geometryUpdatePending = true
+                    Qt.callLater(function() {
+                        _geometryUpdatePending = false
+                        mainImage.handleSourceSizeChange()
+                    })
+                }
+
+                onSourceSizeChanged: { scheduleSourceGeometryUpdate() }
+
+                // Navigation correlation id captured when the source binds, so
+                // the render acknowledgement below reports the frame that
+                // actually became Ready (see UIState.currentNavSeq).
+                property int _presentSeq: -1
+                property int _presentGeneration: -1
 
                 onStatusChanged: {
                    if (status === Image.Ready) {
-                       // Some backends update sourceSize right as status flips
-                       mainImage.handleSourceSizeChange()
-                       imageRotator.updateRotatorGeometry()
+                       // sourceSize and Ready commonly change in the same event
+                       // turn; coalesce their geometry/layout work.
+                       mainImage.scheduleSourceGeometryUpdate()
+                       if (loupeView.uiStateRef) {
+                           loupeView.uiStateRef.notifyImageReady(
+                               mainImage._presentSeq,
+                               mainImage._presentGeneration
+                           )
+                       }
                    }
                 }
 
                 // Force reset when source changes (existing logic)
                 onSourceChanged: {
+                    // Bind the current navigation seq to THIS source so the
+                    // Ready handler acknowledges the correct frame.
+                    mainImage._presentSeq = loupeView.uiStateRef ? loupeView.uiStateRef.currentNavSeq : -1
+                    mainImage._presentGeneration = loupeView.uiStateRef ? loupeView.uiStateRef.currentImageGeneration : -1
+
                     if (mainMouseArea.isCropDragging) {
                         // Source changed mid-drag (e.g. high-res edit buffer loading).
                         // Defer ALL visual/geometry resets so the coordinate system
@@ -474,7 +503,10 @@ Item {
                 }
                 fillMode: Image.PreserveAspectFit
                 cache: false // We do our own caching in Python
-                smooth: false // Crisp rendering for technical accuracy
+                // Fast navigation may intentionally use the nearest smaller
+                // JPEG DCT scale. Let the GPU smooth that small upscale; at
+                // 1:1 settled resolution this has no visible effect.
+                smooth: !isZooming
                 mipmap: false // Crisp rendering
                 
                 property bool _sourceSizeStale: false
@@ -1433,6 +1465,16 @@ Item {
             if (name === "16:9 (Wide)") return [16, 9]
             return null
         }
+
+        function normalizedAspectRatio(ratioPair) {
+            if (!ratioPair || !mainImage || mainImage.width <= 0 || mainImage.height <= 0) return -1
+
+            // Crop coordinates are normalized independently on each axis, so
+            // convert the requested output pixel ratio into normalized space.
+            var pixelAspect = ratioPair[0] / ratioPair[1]
+            if (cropOverlay._dimensionsAreSwapped()) pixelAspect = 1.0 / pixelAspect
+            return pixelAspect * (mainImage.height / mainImage.width)
+        }
         
         function applyAspectRatioConstraint(left, top, right, bottom, dragMode) {
             if (loupeView.uiStateRef.currentAspectRatioIndex <= 0 || !loupeView.uiStateRef.aspectRatioNames || loupeView.uiStateRef.aspectRatioNames.length <= loupeView.uiStateRef.currentAspectRatioIndex) {
@@ -1451,22 +1493,8 @@ Item {
                 return [left, top, right, bottom];
             }
 
-            // Calculate effective aspect ratio in 0-1000 normalized space
-            // targetAspect (pixels) = width_px / height_px
-            // width_px = width_norm * imgW / 1000
-            // height_px = height_norm * imgH / 1000
-            // targetAspect = (width_norm * imgW) / (height_norm * imgH)
-            // width_norm / height_norm = targetAspect * (imgH / imgW)
-            
-            var pixelAspect = ratioPair[0] / ratioPair[1];
-            // At an odd 90-degree straighten the committed output swaps width
-            // and height (editor.py _crop_box_canvas_rect), so a 16:9 lock must
-            // constrain the source box to 9:16 to land 16:9 after the swap.
-            // Mirror the swap cropViewRectForBox/cropBoxFromViewRect already do.
-            if (cropOverlay._dimensionsAreSwapped()) pixelAspect = 1.0 / pixelAspect;
-            // Use mainImage (fixed canvas) for aspect ratio calculation
-            var imageAspect = mainImage.width / mainImage.height;
-            var targetAspect = pixelAspect * (1.0 / imageAspect); // Normalized aspect ratio
+            var targetAspect = normalizedAspectRatio(ratioPair)
+            if (targetAspect <= 0) return [left, top, right, bottom]
 
             var currentWidth = right - left;
             var currentHeight = bottom - top;
@@ -1642,13 +1670,19 @@ Item {
             var ratioPair = getAspectRatio(ratioName);
 
             if (!ratioPair) { // Freeform selected
-                loupeView.uiStateRef.currentCropBox = [0, 0, 1000, 1000] // Reset to full image
-                mainMouseArea.cropRotation = 0 // Also reset visual rotation
+                // Remove the constraint without discarding the user's crop or
+                // straighten work. Flush a pending rotation so UI and backend
+                // remain synchronized when Enter is pressed immediately.
+                mainMouseArea.clearPendingRotation(mainMouseArea.cropRotation)
+                if (loupeView.controllerRef) {
+                    loupeView.controllerRef.set_straighten_angle(mainMouseArea.cropRotation, -1)
+                }
                 mainMouseArea.isRotating = false
                 mainMouseArea.cropDragMode = "none"
-                return;
+                return
             }
-            var targetAspect = ratioPair[0] / ratioPair[1];
+            var targetAspect = normalizedAspectRatio(ratioPair)
+            if (targetAspect <= 0) return
             
             // Maximize width/height within 0-1000 centered at cx, cy
             // Distance to edges

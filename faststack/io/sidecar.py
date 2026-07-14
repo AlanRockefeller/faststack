@@ -8,28 +8,13 @@ from pathlib import Path
 from typing import Literal, Optional, Union, overload
 
 from faststack.io.indexer import JPG_EXTENSIONS, RAW_EXTENSIONS
+from faststack.io.utils import atomic_write_json
 from faststack.models import EntryMetadata, Sidecar
 
 log = logging.getLogger(__name__)
 KNOWN_IMAGE_EXTENSIONS = frozenset(
     ext.lower() for ext in JPG_EXTENSIONS | RAW_EXTENSIONS
 )
-
-
-def _fsync_directory(path: Path) -> None:
-    """Best-effort fsync for a directory entry update."""
-    fd: Optional[int] = None
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        os.fsync(fd)
-    except OSError as e:
-        log.debug("Failed to fsync sidecar directory %s: %s", path, e)
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
 
 
 def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
@@ -128,43 +113,21 @@ class SidecarManager:
 
     def save(self):
         """Saves the sidecar data to disk atomically."""
-        temp_path = self.path.with_suffix(".tmp")
-        was_watcher_running = False
         try:
-            if (
-                self.watcher
-                and hasattr(self.watcher, "is_alive")
-                and self.watcher.is_alive()
-            ):
-                self.stop_watcher()
-                was_watcher_running = True
-            with temp_path.open("w") as f:
-                # Convert to a dict that json.dump can handle
-                serializable_data = {
-                    "version": self.data.version,
-                    "last_index": self.data.last_index,
-                    "entries": {
-                        key: _entrymetadata_to_json(meta)
-                        for key, meta in self.data.entries.items()
-                    },
-                    "stacks": self.data.stacks,
-                }
-                json.dump(serializable_data, f, indent=2)
-                # Force the bytes to disk before the rename so an unexpected
-                # reboot/power-loss can't leave the temp file's contents unflushed.
-                f.flush()
-                os.fsync(f.fileno())
-
-            # Atomic rename
-            temp_path.replace(self.path)
-            _fsync_directory(self.path.parent)
+            serializable_data = {
+                "version": self.data.version,
+                "last_index": self.data.last_index,
+                "entries": {
+                    key: _entrymetadata_to_json(meta)
+                    for key, meta in self.data.entries.items()
+                },
+                "stacks": self.data.stacks,
+            }
+            atomic_write_json(self.path, serializable_data)
             log.debug(f"Saved sidecar file to {self.path}")
 
         except (IOError, TypeError) as e:
             log.error(f"Failed to save sidecar file {self.path}: {e}")
-        finally:
-            if was_watcher_running:
-                self.start_watcher()
 
     @overload
     def get_metadata(

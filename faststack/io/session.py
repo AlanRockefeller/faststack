@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from faststack.io.utils import atomic_write_json
 from faststack.logging_setup import get_app_data_dir
 
 log = logging.getLogger(__name__)
@@ -87,33 +88,6 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _atomic_write_json(path: Path, payload: dict) -> None:
-    """Write ``payload`` as JSON atomically with fsync (temp file + replace)."""
-    tmp_path = path.with_suffix(f".{os.getpid()}.tmp")
-    with tmp_path.open("w") as f:
-        json.dump(payload, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp_path.replace(path)
-    _fsync_directory(path.parent)
-
-
-def _fsync_directory(path: Path) -> None:
-    """Best-effort fsync for a directory entry update."""
-    fd: Optional[int] = None
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        os.fsync(fd)
-    except OSError as e:
-        log.debug("Failed to fsync session directory %s: %s", path, e)
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
 def _validated_session_payload(data: object) -> Optional[dict]:
     """Return a normalized session dict, or None for malformed payloads."""
     if not isinstance(data, dict):
@@ -173,7 +147,7 @@ class SessionRegistry:
                 "boot_id": _current_boot_id(),
                 "updated": time.time(),
             }
-            _atomic_write_json(self.path, payload)
+            atomic_write_json(self.path, payload)
         except (OSError, RuntimeError) as e:
             log.warning("Failed to update session file %s: %s", self.path, e)
 

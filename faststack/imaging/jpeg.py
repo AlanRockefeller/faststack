@@ -9,6 +9,7 @@ from typing import Any, Literal, Optional, Tuple
 import numpy as np
 from PIL import Image
 
+from faststack.imaging.optional_deps import cv2
 from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
 
 log = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ def decode_jpeg_rgb(
     jpeg_bytes: bytes,
     fast_dct: bool = False,
     source_path: Optional[str] = None,
+    stats: Optional[dict] = None,
 ) -> Optional[np.ndarray]:
     """Decodes JPEG bytes into an RGB numpy array."""
     if TURBO_AVAILABLE and JPEG_DECODER:
@@ -67,18 +69,25 @@ def decode_jpeg_rgb(
             flags = 0
             if fast_dct:
                 flags |= 2048
-            return _decode_with_retry(
+            result = _decode_with_retry(
                 jpeg_bytes,
                 source_path=source_path,
                 pixel_format=TJPF_RGB,
                 flags=flags,
             )
+            if stats is not None and result is not None:
+                stats["decoder"] = "turbojpeg"
+                stats["dct"] = (1, 1)
+            return result
         except Exception as e:
             log.exception("PyTurboJPEG failed to decode image: %s. Trying Pillow.", e)
 
     # Fallback to Pillow
     try:
         img = Image.open(BytesIO(jpeg_bytes)).convert("RGB")
+        if stats is not None:
+            stats["decoder"] = "pillow"
+            stats["dct"] = (1, 1)
         return np.array(img)
     except Exception as e:
         log.exception("Pillow also failed to decode image: %s", e)
@@ -124,18 +133,24 @@ def decode_jpeg_thumb_rgb(
 
 
 def _get_turbojpeg_scaling_factor(
-    width: int, height: int, max_dim: int
+    width: int,
+    height: int,
+    max_width: int,
+    max_height: Optional[int] = None,
 ) -> Optional[Tuple[int, int]]:
-    """Finds the best libjpeg-turbo scaling factor to get a thumbnail <= max_dim.
+    """Find the largest TurboJPEG scale that fits the target rectangle.
 
     "Fit within" semantics: returns the LARGEST factor whose scaled
-    dimensions are both <= ``max_dim``, falling back to the smallest
-    available factor if nothing fits. For display decodes that must
-    never come out undersized, use
+    dimensions are within ``max_width`` and ``max_height``, falling back to
+    the smallest available factor if nothing fits. Omitting ``max_height``
+    retains the original square-thumbnail behavior. For display decodes that
+    must never come out undersized, use
     :func:`_get_turbojpeg_covering_factor` instead.
     """
     if not TURBO_AVAILABLE or not JPEG_DECODER:
         return None
+    if max_height is None:
+        max_height = max_width
 
     # PyTurboJPEG provides a set of supported scaling factors
     supported_factors = sorted(
@@ -145,7 +160,7 @@ def _get_turbojpeg_scaling_factor(
     )
 
     for num, den in supported_factors:
-        if (width * num / den) <= max_dim and (height * num / den) <= max_dim:
+        if (width * num / den) <= max_width and (height * num / den) <= max_height:
             return (num, den)
 
     # If no suitable factor is found, return the smallest one
@@ -189,6 +204,20 @@ def _get_turbojpeg_covering_factor(
     return (1, 1)
 
 
+def _fit_dimensions(
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+) -> tuple[int, int]:
+    """Return an aspect-preserving size bounded by the target rectangle."""
+    scale = min(target_width / source_width, target_height / source_height, 1.0)
+    return (
+        max(1, int(round(source_width * scale))),
+        max(1, int(round(source_height * scale))),
+    )
+
+
 def decode_jpeg_resized(
     jpeg_bytes: bytes,
     width: int,
@@ -196,17 +225,32 @@ def decode_jpeg_resized(
     fast_dct: bool = False,
     source_path: Optional[str] = None,
     mode: Literal["fast", "cover"] = "cover",
+    stats: Optional[dict] = None,
 ) -> Optional[np.ndarray]:
-    """Decodes and resizes a JPEG to fit within the given dimensions."""
+    """Decodes and resizes a JPEG to fit within the given dimensions.
+
+    When ``stats`` is provided it is populated in-place with diagnostic fields
+    (``source``, ``dct``, ``output``, ``jpeg_ms``, ``resize_ms``) for the
+    navigation trace. Purely optional; callers that omit it are unaffected.
+    """
     if mode not in ("fast", "cover"):
         raise ValueError(f"Unknown JPEG resize mode: {mode}")
 
     if width <= 0 or height <= 0:
-        return decode_jpeg_rgb(jpeg_bytes, fast_dct=fast_dct, source_path=source_path)
+        return decode_jpeg_rgb(
+            jpeg_bytes,
+            fast_dct=fast_dct,
+            source_path=source_path,
+            stats=stats,
+        )
 
     if TURBO_AVAILABLE and JPEG_DECODER:
         try:
+            if stats is not None:
+                stats["decoder"] = "turbojpeg"
             img_width, img_height, _, _ = JPEG_DECODER.decode_header(jpeg_bytes)
+            if stats is not None:
+                stats["source"] = (img_width, img_height)
 
             if mode == "cover":
                 # The constraining dimension is the one that bounds the
@@ -222,21 +266,21 @@ def decode_jpeg_resized(
 
                 scale_factor = _get_turbojpeg_covering_factor(constraining_dim, max_dim)
             else:
-                if img_width * height > img_height * width:
-                    max_dim = width
-                else:
-                    max_dim = height
                 scale_factor = _get_turbojpeg_scaling_factor(
                     img_width,
                     img_height,
-                    max_dim,
+                    width,
+                    height,
                 )
 
             if scale_factor:
+                if stats is not None:
+                    stats["dct"] = scale_factor
                 flags = 0
                 if fast_dct:
                     flags |= 2048
 
+                _t_decode = time.perf_counter() if stats is not None else None
                 decoded = _decode_with_retry(
                     jpeg_bytes,
                     source_path=source_path,
@@ -244,23 +288,67 @@ def decode_jpeg_resized(
                     pixel_format=TJPF_RGB,
                     flags=flags,
                 )
+                if stats is not None and _t_decode is not None:
+                    stats["jpeg_ms"] = (time.perf_counter() - _t_decode) * 1000.0
 
-                # Only use Pillow for final resize if needed
+                # Only do a final resize if the selected DCT scale is larger
+                # than the exact display target. OpenCV's area downsampler is
+                # substantially faster than Pillow LANCZOS for the multi-
+                # megapixel settled frame while retaining high downscale quality.
                 if decoded.shape[0] > height or decoded.shape[1] > width:
-                    img = Image.fromarray(decoded)
-                    # Use BILINEAR for speed
-                    img.thumbnail((width, height), Image.Resampling.BILINEAR)
-                    return np.array(img)
+                    _t_resize = time.perf_counter() if stats is not None else None
+                    output_width, output_height = _fit_dimensions(
+                        decoded.shape[1],
+                        decoded.shape[0],
+                        width,
+                        height,
+                    )
+                    if cv2 is not None:
+                        interpolation = (
+                            cv2.INTER_LINEAR if mode == "fast" else cv2.INTER_AREA
+                        )
+                        result = cv2.resize(
+                            decoded,
+                            (output_width, output_height),
+                            interpolation=interpolation,
+                        )
+                    else:
+                        img = Image.fromarray(decoded)
+                        resampling = (
+                            Image.Resampling.BILINEAR
+                            if mode == "fast"
+                            else Image.Resampling.LANCZOS
+                        )
+                        img.thumbnail((width, height), resampling)
+                        result = np.array(img)
+                    result = np.ascontiguousarray(result)
+                    if stats is not None and _t_resize is not None:
+                        stats["resize_ms"] = (time.perf_counter() - _t_resize) * 1000.0
+                        stats["output"] = (result.shape[1], result.shape[0])
+                    return result
+                if stats is not None:
+                    stats["resize_ms"] = 0.0
+                    stats["output"] = (decoded.shape[1], decoded.shape[0])
                 return decoded
         except Exception as e:
             log.exception("PyTurboJPEG failed: %s", e)
 
     # Fallback to Pillow (existing code)
     try:
+        if stats is not None:
+            stats["decoder"] = "pillow"
+            stats["dct"] = (1, 1)
+        _t_decode = time.perf_counter() if stats is not None else None
         img = Image.open(BytesIO(jpeg_bytes))
+        if stats is not None:
+            stats["source"] = (img.width, img.height)
 
         if width <= 0 or height <= 0:
-            return np.array(img.convert("RGB"))
+            result = np.array(img.convert("RGB"))
+            if stats is not None and _t_decode is not None:
+                stats["jpeg_ms"] = (time.perf_counter() - _t_decode) * 1000.0
+                stats["output"] = (result.shape[1], result.shape[0])
+            return result
 
         scale_factor_ratio = min(img.width / width, img.height / height)
 
@@ -273,7 +361,14 @@ def decode_jpeg_resized(
             )  # Higher quality for smaller downscales
 
         img.thumbnail((width, height), resampling)
-        return np.array(img.convert("RGB"))
+        result = np.array(img.convert("RGB"))
+        if stats is not None and _t_decode is not None:
+            # Pillow decodes and resizes together; attribute the whole cost to
+            # jpeg (there is no separable DCT-scale step in this path).
+            stats["jpeg_ms"] = (time.perf_counter() - _t_decode) * 1000.0
+            stats["resize_ms"] = 0.0
+            stats["output"] = (result.shape[1], result.shape[0])
+        return result
     except Exception as e:
         log.exception("Pillow failed to decode and resize image: %s", e)
         return None

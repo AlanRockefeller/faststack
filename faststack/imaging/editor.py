@@ -209,6 +209,7 @@ INSTAGRAM_RATIOS = {
     "1:1 (Square)": (1, 1),
     "4:5 (Portrait)": (4, 5),
     "1.91:1 (Landscape)": (191, 100),
+    "16:9 (Wide)": (16, 9),
     "9:16 (Story)": (9, 16),
 }
 
@@ -840,7 +841,9 @@ class ImageEditor:
 
         Args:
             filepath: Path to the image file
-            cached_preview: Optional byte-buffer for faster initial display
+            cached_preview: Optional viewer buffer retained for API compatibility.
+                            Viewer buffers are display-corrected, so they are not
+                            used as the editor's source-space preview master.
             source_exif: Optional EXIF bytes from original source (preserve camera metadata)
             preview_only: If True and image is 8-bit, skip cv2 and float32 conversion.
                           Loads only PIL image + float_preview for histogram analysis.
@@ -1094,36 +1097,47 @@ class ImageEditor:
             if _debug:
                 t_orient = time.perf_counter()
 
-            # --- Create Float Preview ---
-            # Use the cached, display-sized preview if available to speed up
-            if cached_preview:
-                # cached_preview.buffer is uint8
-                preview_arr = np.frombuffer(
-                    cached_preview.buffer, dtype=np.uint8
-                ).reshape((cached_preview.height, cached_preview.width, 3))
+            # --- Create Source-Space Float Preview ---
+            # Prefetch buffers have already received the display-only ICC or
+            # saturation transform. Applying edits to those cooked pixels would
+            # make quick renders disagree with full-resolution refinement and
+            # export. Always derive the editor master from the oriented source,
+            # then apply display correction only after edits are rendered.
+            if cached_preview is not None:
+                log.debug("Ignoring display-corrected cache buffer for editor master")
 
-                # IMPORTANT: The cached_preview coming from the Prefetcher already has
-                # EXIF orientation applied (in prefetch.py's "Unified EXIF Orientation Application").
-                # Do NOT apply orientation again here - that would cause double rotation!
-                # The cached_preview is also "cooked" (has Color Management / Saturation applied).
-                # We use it for the VERY FIRST frame for fast display, then immediately
-                # re-render from the master float_image in the background.
-                log.debug(
-                    "Using cached preview (assumed orientation-correct from prefetcher)"
-                )
-
-                loaded_float_preview = preview_arr.astype(np.float32) / 255.0
+            if (
+                loaded_bit_depth == 16
+                and loaded_float_image is not None
+                and cv2 is not None
+            ):
+                h, w = loaded_float_image.shape[:2]
+                scale = min(1920.0 / w, 1080.0 / h, 1.0)
+                if scale < 1.0:
+                    loaded_float_preview = np.ascontiguousarray(
+                        cv2.resize(
+                            loaded_float_image,
+                            (max(1, round(w * scale)), max(1, round(h * scale))),
+                            interpolation=cv2.INTER_AREA,
+                        ),
+                        dtype=np.float32,
+                    )
+                else:
+                    loaded_float_preview = np.array(
+                        loaded_float_image,
+                        dtype=np.float32,
+                        copy=True,
+                        order="C",
+                    )
             else:
-                # Downscale to preview size. The JPEG fast path already has the
-                # oriented pixels as a numpy array; cv2.resize is ~4x faster
-                # than the PIL thumbnail round-trip at 20MP.
+                # The JPEG fast path already has oriented source pixels as an
+                # array; cv2.resize avoids a second Pillow conversion.
                 if jpeg_arr is not None and cv2 is not None:
                     h, w = jpeg_arr.shape[:2]
                     scale = min(1920.0 / w, 1080.0 / h, 1.0)
                     if scale < 1.0:
                         # round(), not int(): truncation skews the preview
-                        # master's aspect ratio relative to the display-size
-                        # downscale in _apply_edits, which uses round().
+                        # master's aspect ratio relative to full-res refinement.
                         preview_u8 = cv2.resize(
                             jpeg_arr,
                             (max(1, round(w * scale)), max(1, round(h * scale))),
@@ -1136,21 +1150,11 @@ class ImageEditor:
                     thumb.thumbnail((1920, 1080))
                     preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
 
-                # float_preview is display-space by contract: cached previews
-                # from the prefetcher arrive already "cooked" (ICC/saturation
-                # applied), and preview-sized renders are shown WITHOUT any
-                # further color correction. A preview built from raw source
-                # pixels must get the same treatment, or ICC mode displays it
-                # badly oversaturated on wide-gamut monitors.
-                preview_u8 = apply_loupe_color_correction(
-                    preview_u8,
-                    icc_bytes=loaded_original.info.get("icc_profile"),
-                )
                 loaded_float_preview = preview_u8.astype(np.float32)
                 loaded_float_preview *= np.float32(1.0 / 255.0)
 
-                # Preview is derived from oriented pixels (exif_transpose /
-                # apply_orientation_to_np already ran), so orientation is correct.
+            # Preview pixels are derived after EXIF orientation was applied, so
+            # they match the full-resolution source geometry.
 
             if _debug:
                 t_preview = time.perf_counter()
@@ -1271,6 +1275,7 @@ class ImageEditor:
         edits: Optional[Dict[str, Any]] = None,
         *,
         for_export: bool = False,
+        levels_soft_knee_override: Optional[bool] = None,
         mask_assets_override: Optional[Dict[str, "MaskData"]] = None,
         cache_override: Optional["MaskRasterCache"] = None,
         cache_context: Optional[dict] = None,
@@ -1298,6 +1303,11 @@ class ImageEditor:
         """
         if edits is None:
             edits = self.current_edits
+        use_levels_soft_knee = (
+            self.levels_soft_knee
+            if levels_soft_knee_override is None
+            else bool(levels_soft_knee_override)
+        )
 
         debug_enabled = log.isEnabledFor(logging.DEBUG)
         debug_t0 = time.perf_counter() if debug_enabled else None
@@ -1951,7 +1961,7 @@ class ImageEditor:
             if abs(wp - bp) < 0.0001:
                 wp = bp + 0.0001
             arr = (arr - bp) / (wp - bp)
-            if self.levels_soft_knee:
+            if use_levels_soft_knee:
                 # The ramp above allocates, so in-place soft clip is safe.
                 arr = _apply_levels_soft_clip(arr)
 
@@ -2768,6 +2778,7 @@ class ImageEditor:
             base,
             edits=edits,
             for_export=False,
+            apply_loupe_color=True,
             icc_bytes=icc_bytes,
             protect_input=True,
         )
@@ -2950,27 +2961,30 @@ class ImageEditor:
         return crop_only
 
     def _float_preview_from_master(self) -> Optional[np.ndarray]:
-        """Build a display-sized float preview from the unedited source buffer.
-
-        The result is display-space ("cooked"), matching the float_preview
-        contract — preview-sized renders are shown without further color
-        correction.
-        """
+        """Build a display-sized source-space preview from the unedited master."""
         with self._lock:
             if self.float_preview is not None:
                 return self.float_preview.copy()
-            source = self.float_image.copy() if self.float_image is not None else None
+            source = self.float_image
             original = (
                 self.original_image.copy() if self.original_image is not None else None
             )
-            icc_bytes = (
-                self.original_image.info.get("icc_profile")
-                if self.original_image is not None
-                else None
-            )
 
         if source is not None:
-            arr_u8 = (np.clip(source, 0.0, 1.0) * 255).astype(np.uint8)
+            h, w = source.shape[:2]
+            scale = min(1920.0 / w, 1080.0 / h, 1.0)
+            if scale < 1.0 and cv2 is not None:
+                return np.ascontiguousarray(
+                    cv2.resize(
+                        source,
+                        (max(1, round(w * scale)), max(1, round(h * scale))),
+                        interpolation=cv2.INTER_AREA,
+                    ),
+                    dtype=np.float32,
+                )
+            if scale >= 1.0:
+                return np.array(source, dtype=np.float32, copy=True, order="C")
+            arr_u8 = _float01_to_u8(source)
             thumb = Image.fromarray(arr_u8, mode="RGB")
         elif original is not None:
             thumb = original.convert("RGB")
@@ -2978,10 +2992,7 @@ class ImageEditor:
             return None
 
         thumb.thumbnail((1920, 1080))
-        preview_u8 = apply_loupe_color_correction(
-            np.asarray(thumb.convert("RGB"), dtype=np.uint8),
-            icc_bytes=icc_bytes,
-        )
+        preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
         preview = preview_u8.astype(np.float32)
         preview *= np.float32(1.0 / 255.0)
         return preview
@@ -3034,7 +3045,7 @@ class ImageEditor:
             base,
             edits=edits,
             for_export=full_resolution,
-            apply_loupe_color=full_resolution,
+            apply_loupe_color=True,
             icc_bytes=icc_bytes,
             cache_context={},
             downscale_long_edge=max_long_edge if full_resolution else None,
@@ -3667,6 +3678,9 @@ class ImageEditor:
             # --- EXIF (may read original_image and _source_exif_bytes) ---
             main_exif = self._get_sanitized_exif_bytes()
             source_exif = self._source_exif_bytes
+            source_icc_bytes = self.original_image.info.get("icc_profile")
+            levels_soft_knee = bool(self.levels_soft_knee)
+            export_dither = bool(self.export_dither)
 
         # Build mask override dict.  When darken is present but disabled (or
         # has no mask), provide an empty dict so _apply_edits uses it instead
@@ -3694,14 +3708,20 @@ class ImageEditor:
             "bit_depth": self.bit_depth,
             "main_exif": main_exif,
             "source_exif": source_exif,
-            "source_icc_bytes": self.original_image.info.get("icc_profile"),
+            "source_icc_bytes": source_icc_bytes,
+            "levels_soft_knee": levels_soft_knee,
+            "export_dither": export_dither,
             "write_developed_jpg": write_developed_jpg,
             "developed_path": developed_path,
             "mask_assets": mask_assets_snapshot,
         }
 
     def _dither_for_export(
-        self, final_float: np.ndarray, edits: Dict[str, Any]
+        self,
+        final_float: np.ndarray,
+        edits: Dict[str, Any],
+        *,
+        enabled: Optional[bool] = None,
     ) -> np.ndarray:
         """Add ±1 LSB TPDF dither before 8-bit quantization when warranted.
 
@@ -3712,7 +3732,8 @@ class ImageEditor:
         speckle) and the RNG is seeded so identical edits export identical
         bytes. Returns a new array; the input snapshot buffer is not mutated.
         """
-        if not self.export_dither:
+        use_dither = self.export_dither if enabled is None else bool(enabled)
+        if not use_dither:
             return final_float
         try:
             blacks = float(edits.get("blacks", 0.0))
@@ -3736,9 +3757,7 @@ class ImageEditor:
         )
         return final_float + noise[..., None]
 
-    def save_from_snapshot(
-        self, snapshot: Dict[str, Any]
-    ) -> Optional[Tuple[Path, Path]]:
+    def save_from_snapshot(self, snapshot: Dict[str, Any]) -> Tuple[Path, Path]:
         """Run the full-resolution export from a pre-captured snapshot.
 
         This method is safe to call from a background thread — it does NOT
@@ -3747,7 +3766,7 @@ class ImageEditor:
         ``snapshot_for_export()``.
 
         Returns:
-            A tuple of (saved_path, backup_path) on success, otherwise None.
+            A tuple of (saved_path, backup_path) on success.
 
         Raises:
             RuntimeError: If saving fails.
@@ -3759,6 +3778,9 @@ class ImageEditor:
         original_path = snapshot["original_path"]
         main_exif = snapshot["main_exif"]
         source_exif = snapshot["source_exif"]
+        source_icc_bytes = snapshot.get("source_icc_bytes")
+        levels_soft_knee = bool(snapshot.get("levels_soft_knee", True))
+        export_dither = bool(snapshot.get("export_dither", True))
         write_developed_jpg = snapshot["write_developed_jpg"]
         developed_path = snapshot["developed_path"]
         source_shape = snapshot["source_shape"]
@@ -3774,9 +3796,11 @@ class ImageEditor:
             source_arr,
             edits=edits_snapshot,
             for_export=True,
+            levels_soft_knee_override=levels_soft_knee,
             mask_assets_override=mask_override,
             cache_override=export_cache,
             cache_context=export_cache_context,
+            update_highlight_state=False,
         )  # (H,W,3) float32
 
         if _debug:
@@ -3791,7 +3815,7 @@ class ImageEditor:
         # 2. Backup
         backup_path = create_backup_file(original_path)
         if backup_path is None:
-            return None
+            raise RuntimeError(f"Unable to create backup for {original_path}")
         if _debug:
             t_backup = time.perf_counter()
 
@@ -3802,7 +3826,11 @@ class ImageEditor:
             # 8-bit outputs (main JPEG and/or developed JPG) share one
             # dithered buffer; the 16-bit TIFF path stays undithered.
             if not is_tiff or write_developed_jpg:
-                dithered_float = self._dither_for_export(final_float, edits_snapshot)
+                dithered_float = self._dither_for_export(
+                    final_float,
+                    edits_snapshot,
+                    enabled=export_dither,
+                )
             else:
                 dithered_float = final_float
 
@@ -3823,6 +3851,8 @@ class ImageEditor:
                 save_kwargs = {"quality": 95}
                 if main_exif:
                     save_kwargs["exif"] = main_exif
+                if source_icc_bytes:
+                    save_kwargs["icc_profile"] = source_icc_bytes
 
                 tmp_path = original_path.with_name(
                     f".{original_path.stem}_{uuid.uuid4().hex[:8]}{original_path.suffix}"
@@ -3830,8 +3860,19 @@ class ImageEditor:
                 try:
                     try:
                         img_u8.save(tmp_path, **save_kwargs)
-                    except Exception:
-                        img_u8.save(tmp_path)
+                    except Exception as metadata_error:
+                        # Invalid legacy EXIF should not prevent saving, but the
+                        # source ICC profile must remain attached to source-space
+                        # pixels or other applications will misinterpret color.
+                        log.warning(
+                            "JPEG metadata save failed for %s (%s); retrying without EXIF",
+                            original_path,
+                            metadata_error,
+                        )
+                        fallback_kwargs = {"quality": 95}
+                        if source_icc_bytes:
+                            fallback_kwargs["icc_profile"] = source_icc_bytes
+                        img_u8.save(tmp_path, **fallback_kwargs)
                     _safe_replace(tmp_path, original_path)
                 except BaseException:
                     tmp_path.unlink(missing_ok=True)
@@ -3864,6 +3905,8 @@ class ImageEditor:
                 dev_kwargs = {"quality": 90}
                 if exif_bytes:
                     dev_kwargs["exif"] = exif_bytes
+                if source_icc_bytes:
+                    dev_kwargs["icc_profile"] = source_icc_bytes
 
                 tmp_dev = developed_path.with_name(
                     f".{developed_path.stem}_{uuid.uuid4().hex[:8]}{developed_path.suffix}"
@@ -3871,8 +3914,17 @@ class ImageEditor:
                 try:
                     try:
                         img_u8.save(tmp_dev, **dev_kwargs)
-                    except Exception:
-                        img_u8.save(tmp_dev)
+                    except Exception as metadata_error:
+                        log.warning(
+                            "Developed JPEG metadata save failed for %s (%s); "
+                            "retrying without EXIF",
+                            developed_path,
+                            metadata_error,
+                        )
+                        fallback_kwargs = {"quality": 90}
+                        if source_icc_bytes:
+                            fallback_kwargs["icc_profile"] = source_icc_bytes
+                        img_u8.save(tmp_dev, **fallback_kwargs)
                     _safe_replace(tmp_dev, developed_path)
                 except BaseException:
                     tmp_dev.unlink(missing_ok=True)
@@ -3902,7 +3954,7 @@ class ImageEditor:
         write_developed_jpg: bool = False,
         developed_path: Optional[Path] = None,
         save_target_path: Optional[Path] = None,
-    ) -> Optional[Tuple[Path, Path]]:
+    ) -> Tuple[Path, Path]:
         """Saves the edited image, backing up the original.
 
         Convenience wrapper that calls ``snapshot_for_export()`` then
@@ -3915,7 +3967,7 @@ class ImageEditor:
             save_target_path: Optional override for the output path.
 
         Returns:
-            A tuple of (saved_path, backup_path) on success, otherwise None.
+            A tuple of (saved_path, backup_path) on success.
 
         Raises:
             RuntimeError: If preconditions are not met or saving fails.
@@ -3929,7 +3981,7 @@ class ImageEditor:
 
     def _save_u8_pil_image(
         self, img_u8: Image.Image, original_path: Path, log_prefix: str
-    ) -> Optional[Tuple[Path, Path]]:
+    ) -> Tuple[Path, Path]:
         """Save a prepared uint8 RGB image with backup, EXIF, and best-effort atomic replace."""
         try:
             original_stat = original_path.stat()
@@ -3938,12 +3990,19 @@ class ImageEditor:
 
         backup_path = create_backup_file(original_path)
         if backup_path is None:
-            return None
+            raise RuntimeError(f"Unable to create backup for {original_path}")
 
         exif_bytes = self._get_sanitized_exif_bytes()
+        icc_bytes = (
+            self.original_image.info.get("icc_profile")
+            if self.original_image is not None
+            else None
+        )
         save_kwargs = {"quality": 95}
         if exif_bytes:
             save_kwargs["exif"] = exif_bytes
+        if icc_bytes:
+            save_kwargs["icc_profile"] = icc_bytes
 
         tmp_path = original_path.with_name(
             f"{original_path.stem}.__faststack_tmp__{uuid.uuid4().hex}{original_path.suffix}"
@@ -3951,8 +4010,17 @@ class ImageEditor:
         try:
             try:
                 img_u8.save(tmp_path, **save_kwargs)
-            except Exception:
-                img_u8.save(tmp_path, quality=95)
+            except Exception as metadata_error:
+                log.warning(
+                    "%s metadata save failed for %s (%s); retrying without EXIF",
+                    log_prefix,
+                    original_path,
+                    metadata_error,
+                )
+                fallback_kwargs = {"quality": 95}
+                if icc_bytes:
+                    fallback_kwargs["icc_profile"] = icc_bytes
+                img_u8.save(tmp_path, **fallback_kwargs)
             try:
                 os.replace(tmp_path, original_path)
             except OSError as e:
@@ -3961,8 +4029,18 @@ class ImageEditor:
                 )
                 try:
                     img_u8.save(original_path, **save_kwargs)
-                except Exception:
-                    img_u8.save(original_path, quality=95)
+                except Exception as metadata_error:
+                    log.warning(
+                        "%s direct metadata save failed for %s (%s); "
+                        "retrying without EXIF",
+                        log_prefix,
+                        original_path,
+                        metadata_error,
+                    )
+                    fallback_kwargs = {"quality": 95}
+                    if icc_bytes:
+                        fallback_kwargs["icc_profile"] = icc_bytes
+                    img_u8.save(original_path, **fallback_kwargs)
         finally:
             try:
                 if tmp_path.exists():
@@ -4075,8 +4153,6 @@ class ImageEditor:
         save_result = self._save_u8_pil_image(
             img_u8, original_path, log_prefix="[SAVE_IMAGE_U8_LEVELS]"
         )
-        if save_result is None:
-            return None
 
         if _debug:
             t_write = time.perf_counter()
@@ -4172,8 +4248,6 @@ class ImageEditor:
         save_result = self._save_u8_pil_image(
             img_u8, original_path, log_prefix="[SAVE_IMAGE_U8_WB]"
         )
-        if save_result is None:
-            return None
 
         if _debug:
             t_write = time.perf_counter()

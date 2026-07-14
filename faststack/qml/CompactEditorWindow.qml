@@ -39,6 +39,8 @@ Window {
 
     Component.onCompleted: {
         compactEditor.controllerRef = controller
+        if (compactEditor.controllerRef)
+            compactEditor.controllerRef.register_auxiliary_navigation_window(compactEditor)
         compactEditor.restoreWindowPlacement()
         compactEditor.windowGeometryReady = true
         compactEditor.uiStateRef = uiState
@@ -118,8 +120,18 @@ Window {
     onYChanged: saveGeometryTimer.restart()
     onWidthChanged: saveGeometryTimer.restart()
     onHeightChanged: saveGeometryTimer.restart()
-    onActiveChanged: if (active) compactEditor.focusKeyboardHandler()
-    Component.onDestruction: compactEditor.saveWindowPlacement(true)
+    onActiveChanged: {
+        if (active) {
+            compactEditor.focusKeyboardHandler()
+        } else if (compactEditor.controllerRef) {
+            compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
+        }
+    }
+    Component.onDestruction: {
+        if (compactEditor.controllerRef)
+            compactEditor.controllerRef.unregister_auxiliary_navigation_window(compactEditor)
+        compactEditor.saveWindowPlacement(true)
+    }
 
     // --- Color Palette (matches full editor) ---
     readonly property color backgroundColor: "#1e1e1e"
@@ -139,6 +151,15 @@ Window {
     // Whether the per-hue COLOR MIX section is expanded (collapsed by default).
     property bool colorMixExpanded: false
     readonly property bool cropActive: compactEditor.uiStateRef ? compactEditor.uiStateRef.isCropping : false
+    readonly property bool plainArrowNavigationEnabled: visible
+                                                        && controllerRef
+                                                        && uiStateRef
+                                                        && !cropActive
+                                                        && !discardDialog.opened
+    onPlainArrowNavigationEnabledChanged: {
+        if (!plainArrowNavigationEnabled && compactEditor.controllerRef)
+            compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
+    }
     property int lastLoadedIndex: -1
     property bool lastLoadWasFull: false
     property bool forceNextPreviewLoad: false
@@ -194,6 +215,10 @@ Window {
         if (modifiers === undefined) modifiers = Qt.NoModifier
         if (compactEditor.cropActive || discardDialog.opened) return false
         if (key === Qt.Key_Left || key === Qt.Key_Right) {
+            // Plain arrows are owned by the controller's physical
+            // press/hold/release event filter. Only modifier shortcuts are
+            // forwarded through the synthetic key path.
+            if (modifiers === Qt.NoModifier) return true
             if (compactEditor.controllerRef)
                 compactEditor.controllerRef.handle_key_from_compact_editor(key, modifiers, "")
             return true
@@ -279,6 +304,8 @@ Window {
             compactEditor.clampWindowToVisibleScreen(true)
             Qt.callLater(compactEditor.focusKeyboardHandler)
         } else {
+            if (compactEditor.controllerRef)
+                compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
             compactEditor.saveWindowPlacement(true)
             deferredLoadTimer.stop()
         }
@@ -290,8 +317,6 @@ Window {
         }
     }
 
-    property int slidersPressedCount: 0
-
     function getBackendValue(key) {
         var _dependency = updatePulse;
         if (compactEditor.uiStateRef && key in compactEditor.uiStateRef) return compactEditor.uiStateRef[key];
@@ -301,20 +326,6 @@ Window {
     function sliderEditScale(key) {
         if (key === "contrast") return 0.5
         return (key === "exposure" || key === "whites") ? 2.0 : 1.0
-    }
-
-    Shortcut {
-        sequence: "Left"
-        context: Qt.WindowShortcut
-        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
-        onActivated: compactEditor.handleArrowKey(Qt.Key_Left, Qt.NoModifier)
-    }
-
-    Shortcut {
-        sequence: "Right"
-        context: Qt.WindowShortcut
-        enabled: compactEditor.visible && !compactEditor.cropActive && !discardDialog.opened
-        onActivated: compactEditor.handleArrowKey(Qt.Key_Right, Qt.NoModifier)
     }
 
     Shortcut {
@@ -340,10 +351,9 @@ Window {
 
     // Keyboard handling for the compact editor window.
     //
-    // Arrow keys are handled by WindowShortcut entries above so they still work
-    // when a child control has focus:
-    //   - Left / Right     -> previous / next image
-    //   - Up / Down        -> raise / lower the highlighted slider
+    // Plain Left / Right are handled by the controller's QWindow event filter
+    // so physical release is observable even when a child control has focus.
+    // Modifier Left / Right and Up / Down retain their shortcuts/local handling.
     //
     // This focus scope handles the remaining compact-editor keys:
     //   - Esc / E / S / O  -> editor-local actions (close / save / crop)
@@ -411,6 +421,11 @@ Window {
         anchors.centerIn: parent
         width: 260
         standardButtons: Dialog.Yes | Dialog.No
+
+        onOpened: {
+            if (compactEditor.controllerRef)
+                compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
+        }
 
         Label {
             text: "You have unsaved edits.\nDiscard and close?"
@@ -1055,14 +1070,12 @@ Window {
                         compactEditor.ensureEditorLoaded("slider-change")
                         compactEditor.highlightedSliderKey = sliderRow.key
                         compactEditor.focusKeyboardHandler()
-                        compactEditor.slidersPressedCount++
                         if (!slider.isResetting) {
                             _pendingValue = value
                             slider._lastSentValue = value
                             if (!sendTimer.running) sendTimer.start()
                         }
                     } else {
-                        compactEditor.slidersPressedCount--
                         sendTimer.stop()
                         if (slider.isResetting) {
                             if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, 0.0)

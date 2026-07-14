@@ -62,8 +62,6 @@ Window {
         }
     }
 
-    property int slidersPressedCount: 0
-
     function getBackendValue(key) {
         var _dependency = updatePulse;
         if (imageEditorDialog.uiStateRef && key in imageEditorDialog.uiStateRef) return imageEditorDialog.uiStateRef[key];
@@ -780,8 +778,6 @@ Window {
 
                 onPressedChanged: {
                     if (pressed) {
-                        imageEditorDialog.slidersPressedCount++
-                        
                         // Initialize drag logic only if not resetting
                         if (!slider.isResetting) {
                             _pendingValue = value
@@ -789,7 +785,6 @@ Window {
                             if (!sendTimer.running) sendTimer.start()
                         }
                     } else {
-                        imageEditorDialog.slidersPressedCount--
                         sendTimer.stop()
                         
                         if (slider.isResetting) {

@@ -32,7 +32,9 @@ Window {
     property double autoLevelChannelBudget: 3.0
     property bool levelsSoftKnee: true
     property bool exportDither: true
-    property int prefetchRadius: 4
+    property int prefetchRadius: 20
+    property int navigationRateFps: 15
+    property string heldNavigationQuality: "balanced"
     property int theme: 0
     property string defaultDirectory: ""
     property string photoshopPath: ""
@@ -132,9 +134,11 @@ Window {
         settingsDialog.setLoaderProperty(defaultDirField, "text", settingsDialog.defaultDirectory)
         settingsDialog.setLoaderProperty(cacheSizeField, "text", settingsDialog.cacheSize.toFixed(1))
         settingsDialog.setLoaderProperty(prefetchRadiusLoader, "value", settingsDialog.prefetchRadius)
+        settingsDialog.setLoaderProperty(navigationRateFpsLoader, "value", settingsDialog.navigationRateFps)
     }
 
     onPrefetchRadiusChanged: settingsDialog.setLoaderProperty(prefetchRadiusLoader, "value", settingsDialog.prefetchRadius)
+    onNavigationRateFpsChanged: settingsDialog.setLoaderProperty(navigationRateFpsLoader, "value", settingsDialog.navigationRateFps)
 
     // Helper to open the dialog
     function open() {
@@ -147,6 +151,8 @@ Window {
             settingsDialog.secondaryRawSourceDir = settingsDialog.uiStateRef.get_secondary_raw_source_dir()
             settingsDialog.cacheSize = settingsDialog.uiStateRef.get_cache_size()
             settingsDialog.prefetchRadius = settingsDialog.uiStateRef.get_prefetch_radius()
+            settingsDialog.navigationRateFps = settingsDialog.uiStateRef.get_navigation_rate_fps()
+            settingsDialog.heldNavigationQuality = settingsDialog.uiStateRef.get_held_navigation_quality()
             settingsDialog.theme = settingsDialog.uiStateRef.theme
             settingsDialog.defaultDirectory = settingsDialog.uiStateRef.get_default_directory()
             settingsDialog.optimizeFor = settingsDialog.uiStateRef.get_optimize_for()
@@ -210,6 +216,8 @@ Window {
         state.set_secondary_raw_source_dir(settingsDialog.secondaryRawSourceDir)
         state.set_cache_size(settingsDialog.cacheSize)
         state.set_prefetch_radius(settingsDialog.prefetchRadius)
+        state.set_navigation_rate_fps(settingsDialog.navigationRateFps)
+        state.set_held_navigation_quality(settingsDialog.heldNavigationQuality)
         state.set_theme(settingsDialog.theme)
         state.set_default_directory(settingsDialog.defaultDirectory)
         state.set_optimize_for(settingsDialog.optimizeFor)
@@ -771,19 +779,78 @@ Window {
                                 }
                                 
                                 ToolTip.visible: prefetchHover.containsMouse
-                                ToolTip.text: "Number of images around the current image to pre-load in the background. Higher values make browsing smoother but use more CPU/RAM. Lower values reduce resource usage. Recommended: 4-8 for smooth navigation."
+                                ToolTip.text: "Number of fast navigation images to keep warm around the current image. Higher values absorb longer held-key bursts but use more CPU/RAM. Recommended: 16-24 for smooth loupe navigation."
                             }
                             Loader {
                                 id: prefetchRadiusLoader
                                 sourceComponent: styledSpinBox
                                 onLoaded: {
                                     settingsDialog.setLoaderProperty(prefetchRadiusLoader, "from", 1)
-                                    settingsDialog.setLoaderProperty(prefetchRadiusLoader, "to", 20)
+                                    settingsDialog.setLoaderProperty(prefetchRadiusLoader, "to", 40)
                                     settingsDialog.setLoaderProperty(prefetchRadiusLoader, "value", settingsDialog.prefetchRadius)
                                     settingsDialog.connectLoaderSignal(prefetchRadiusLoader, "valueChanged", function() {
                                         settingsDialog.prefetchRadius = settingsDialog.loaderProperty(prefetchRadiusLoader, "value", settingsDialog.prefetchRadius)
                                     })
                                 }
+                            }
+
+                            Label {
+                                text: "Held-key Speed (FPS)"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: navigationRateHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: navigationRateHover.containsMouse
+                                ToolTip.text: "How many photos per second are displayed after the initial keyboard repeat delay. Lower values are easier to follow; higher values browse faster. Recommended: 12-15 FPS."
+                            }
+                            Loader {
+                                id: navigationRateFpsLoader
+                                sourceComponent: styledSpinBox
+                                onLoaded: {
+                                    settingsDialog.setLoaderProperty(navigationRateFpsLoader, "from", 1)
+                                    settingsDialog.setLoaderProperty(navigationRateFpsLoader, "to", 30)
+                                    settingsDialog.setLoaderProperty(navigationRateFpsLoader, "value", settingsDialog.navigationRateFps)
+                                    settingsDialog.connectLoaderSignal(navigationRateFpsLoader, "valueChanged", function() {
+                                        settingsDialog.navigationRateFps = settingsDialog.loaderProperty(navigationRateFpsLoader, "value", settingsDialog.navigationRateFps)
+                                    })
+                                }
+                            }
+
+                            Label {
+                                text: "Held-key Image Quality"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: heldNavigationQualityHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: heldNavigationQualityHover.containsMouse
+                                ToolTip.text: "Resolution used while an arrow key is held. Performance: approximately 648×486 for these photos. Balanced: 1296×972 (current default). Detailed: 1944×1458. Highest: 2592×1944. Actual sizes follow the source aspect ratio and JPEG decode steps; higher quality uses more CPU and RAM and may lower the achieved FPS. Settled images always upgrade to full display quality."
+                            }
+                            ComboBox {
+                                id: heldNavigationQualityCombo
+                                model: ["Performance", "Balanced", "Detailed", "Highest"]
+                                currentIndex: Math.max(0, model.indexOf(
+                                    settingsDialog.heldNavigationQuality.charAt(0).toUpperCase()
+                                    + settingsDialog.heldNavigationQuality.slice(1)
+                                ))
+                                onActivated: settingsDialog.heldNavigationQuality = model[currentIndex].toLowerCase()
+                                Layout.preferredWidth: 150
+                                delegate: ItemDelegate {
+                                    id: heldNavigationQualityOption
+                                    required property string modelData
+                                    width: heldNavigationQualityCombo.width
+                                    contentItem: Text { text: heldNavigationQualityOption.modelData; color: settingsDialog.textColor; font: heldNavigationQualityOption.font; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
+                                    background: Rectangle { color: heldNavigationQualityOption.highlighted ? "#20ffffff" : "transparent" }
+                                }
+                                contentItem: Text { text: heldNavigationQualityCombo.displayText; color: settingsDialog.textColor; verticalAlignment: Text.AlignVCenter; leftPadding: 10 }
+                                background: Rectangle { color: "#10ffffff"; border.color: settingsDialog.controlBorder; radius: 4 }
                             }
 
                             // Optimize For

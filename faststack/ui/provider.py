@@ -14,6 +14,7 @@ from PySide6.QtQuick import QQuickImageProvider
 
 from faststack.config import config
 from faststack.imaging.cache import build_cache_key
+from faststack.io.utils import normalize_path_key
 
 # Try to import QColorSpace if available (Qt 6+)
 try:
@@ -50,46 +51,14 @@ class ImageProvider(QQuickImageProvider):
     def _fallback_image(self) -> QImage:
         return self.placeholder.copy()
 
-    def _last_image_fallback(self) -> QImage:
-        """Return the last successfully displayed image instead of gray.
-
-        Used for terminal failures on a CURRENT (non-stale) request, so a
-        transient decode error never paints a gray placeholder over a
-        perfectly good previous frame. Falls back to the gray placeholder
-        only if no previous frame is available or it can't be rebuilt.
-        """
-        try:
-            with self.app_controller._last_image_lock:
-                last = self.app_controller.last_displayed_image
-        except Exception:
-            last = None
-        if last is None:
-            return self._fallback_image()
-        try:
-            fmt = getattr(last, "format", None)
-            if fmt is None:
-                fmt = QImage.Format.Format_RGB888
-            qimg = QImage(
-                last.buffer,
-                last.width,
-                last.height,
-                last.bytes_per_line,
-                fmt,
-            )
-            if qimg.isNull():
-                return self._fallback_image()
-            # Copy so this rarely-hit fallback path never needs keepalive
-            # bookkeeping for a buffer we don't otherwise track here.
-            return qimg.copy()
-        except Exception:
-            return self._fallback_image()
-
     def _log_provider_fallback(
         self,
         request_id: str,
         reason: str,
         *,
         stale: bool,
+        index: object = None,
+        expected_path: object = None,
         exc_info: bool = False,
     ) -> None:
         if stale:
@@ -97,23 +66,101 @@ class ImageProvider(QQuickImageProvider):
                 "Ignoring stale image provider request %s: %s", request_id, reason
             )
             return
+        # Invariant: a placeholder is being returned for the CURRENT frame while
+        # a decode for it is still in flight -- the user sees gray unnecessarily.
+        future_note = ""
+        if isinstance(index, int):
+            prefetcher = getattr(self.app_controller, "prefetcher", None)
+            has_active = getattr(prefetcher, "has_active_future", None)
+            try:
+                if callable(has_active) and has_active(index, expected_path):
+                    future_note = " (WARNING: decode future still active)"
+            except Exception:
+                future_note = ""
         log.warning(
-            "Image provider could not satisfy current request %s: %s",
+            "Image provider could not satisfy current request %s: %s%s",
             request_id,
             reason,
+            future_note,
             exc_info=exc_info,
         )
+
+    def _record_provider(
+        self,
+        nav_seq: object,
+        index: int,
+        gen: object,
+        elapsed_ms: float,
+        image_data: object,
+        *,
+        outcome: str,
+        expected_path: object = None,
+        provenance_kind: str = "display",
+        placeholder_reason: str | None = None,
+        future_active: bool = False,
+    ) -> None:
+        """Report the provider round-trip + served-pixel provenance by seq."""
+        record_timing = getattr(self.app_controller, "_record_provider_timing", None)
+        if not callable(record_timing):
+            return
+        served_quality = None
+        served_path = None
+        worker = None
+        if image_data is not None:
+            served_quality = getattr(image_data, "quality", None)
+            served_path = getattr(image_data, "source_path", None)
+            worker = getattr(image_data, "decode_trace", None)
+        try:
+            record_timing(
+                nav_seq,
+                index,
+                gen,
+                elapsed_ms,
+                outcome=outcome,
+                expected_path=str(expected_path) if expected_path is not None else None,
+                provenance_kind=provenance_kind,
+                served_quality=served_quality,
+                served_path=served_path,
+                placeholder_reason=placeholder_reason,
+                future_active=future_active,
+                worker=worker if isinstance(worker, dict) else None,
+            )
+        except Exception:
+            log.debug("Navigation provider telemetry failed", exc_info=True)
+
+    def _has_active_future(
+        self,
+        index: object,
+        expected_path: object = None,
+    ) -> bool:
+        if not isinstance(index, int):
+            return False
+        prefetcher = getattr(self.app_controller, "prefetcher", None)
+        has_active = getattr(prefetcher, "has_active_future", None)
+        try:
+            return bool(callable(has_active) and has_active(index, expected_path))
+        except Exception:
+            return False
 
     def requestImage(self, id: str, size: object, requestedSize: object) -> QImage:
         """Handles image requests from QML."""
         _debug = getattr(self.app_controller, "debug_cache", False)
-        if _debug:
-            _t_start = time.perf_counter()
+        # Per-request [DBGCACHE] lines are trace-level; --debugcache keeps only
+        # summaries + the one consolidated [NAVTRACE] line.
+        _trace = _debug and getattr(self.app_controller, "debug_cache_trace", False)
+        _t_start = time.perf_counter() if _debug else 0.0
+        if _trace:
             log.info(f"[DBGCACHE] {_t_start*1000:.3f} requestImage: START id={id}")
 
         if not id:
             return self._fallback_image()
 
+        # Bound before the parse so the terminal fallbacks can attribute a
+        # returned placeholder to its navigation seq.
+        index = None
+        nav_seq = None
+        gen = None
+        expected_path = None
         request_is_stale = False
         try:
             # Handle mask overlay requests
@@ -125,11 +172,12 @@ class ImageProvider(QQuickImageProvider):
                     return overlay.copy()
                 return self._transparent
 
-            # Parse index and optional generation
+            # Parse index and optional generation + navigation seq
             parts = id.split("/")
             try:
                 index = int(parts[0])
                 gen = int(parts[1]) if len(parts) > 1 else None
+                nav_seq = int(parts[2]) if len(parts) > 2 else None
             except ValueError as e:
                 log.warning("Invalid image ID requested from QML: %s. Error: %s", id, e)
                 return self._fallback_image()
@@ -169,7 +217,35 @@ class ImageProvider(QQuickImageProvider):
                     f"index {index} outside image list of {image_count}",
                     stale=stale_bounds_request,
                 )
+                if _debug and not stale_bounds_request:
+                    active = self._has_active_future(index, expected_path)
+                    self._record_provider(
+                        nav_seq,
+                        index,
+                        gen,
+                        (time.perf_counter() - _t_start) * 1000.0,
+                        None,
+                        outcome="placeholder",
+                        placeholder_reason="index outside image list",
+                        future_active=active,
+                    )
                 return self._fallback_image()
+
+            if isinstance(image_files, list):
+                if (
+                    getattr(self.app_controller, "view_override_path", None)
+                    and index == current_index
+                ):
+                    expected_path = self.app_controller.view_override_path
+                else:
+                    expected_path = image_files[index].path
+            nav_expected = getattr(
+                self.app_controller,
+                "_nav_expected_path",
+                None,
+            )
+            if callable(nav_expected):
+                expected_path = nav_expected(nav_seq, expected_path)
 
             # For a stale request, a provider URL still fully identifies its
             # content by index, so serving the real pixels for the requested
@@ -181,9 +257,12 @@ class ImageProvider(QQuickImageProvider):
                 try:
                     path = image_files[index].path
                     _, _, display_gen = self.app_controller.get_display_info()
-                    stale_cached_image_data = self.app_controller.image_cache.get(
-                        build_cache_key(path, display_gen)
-                    )
+                    for quality in ("fast", "cover"):
+                        stale_cached_image_data = self.app_controller.image_cache.get(
+                            build_cache_key(path, display_gen, quality)
+                        )
+                        if stale_cached_image_data is not None:
+                            break
                 except Exception:
                     stale_cached_image_data = None
                 if stale_cached_image_data is None:
@@ -227,29 +306,31 @@ class ImageProvider(QQuickImageProvider):
             # This is independent of the meaningful-edits requirement, so a valid
             # editor-open preview displays without satisfying the stricter
             # _has_current_live_preview_for_index() check a second time.
-            current_preview_session_key = None
-            get_preview_key = getattr(
+            current_preview_provenance = None
+            get_preview_provenance = getattr(
                 self.app_controller,
-                "_get_current_live_preview_session_key",
+                "_get_current_preview_session_provenance",
                 None,
             )
-            if callable(get_preview_key):
+            if callable(get_preview_provenance):
                 try:
-                    current_preview_session_key = get_preview_key()
+                    current_preview_provenance = get_preview_provenance()
                 except Exception:
-                    current_preview_session_key = None
+                    current_preview_provenance = None
 
-            current_compare_session_key = None
-            get_compare_key = getattr(
-                self.app_controller,
-                "_get_current_original_compare_session_key",
-                None,
+            current_preview_session_key = (
+                (
+                    current_preview_provenance[0],
+                    current_preview_provenance[1],
+                )
+                if current_preview_provenance is not None
+                else None
             )
-            if callable(get_compare_key):
-                try:
-                    current_compare_session_key = get_compare_key()
-                except Exception:
-                    current_compare_session_key = None
+            current_compare_session_key = (
+                tuple(current_preview_provenance)
+                if current_preview_provenance is not None
+                else None
+            )
 
             has_valid_preview_buffer = (
                 current_preview_session_key is not None
@@ -305,27 +386,75 @@ class ImageProvider(QQuickImageProvider):
                 )
             )
 
-            if _debug:
+            if _trace:
                 _t_get = time.perf_counter()
 
             if use_original_compare_preview:
                 image_data = self.app_controller._original_compare_preview
+                buffer_expected_path = current_compare_session_key[0]
+                provenance_kind = "original-compare-preview"
             elif use_editor_preview:
                 image_data = self.app_controller._last_rendered_preview
+                buffer_expected_path = current_preview_session_key[0]
+                provenance_kind = "editor-preview"
             elif stale_cached_image_data is not None:
                 # Stale request with a cache hit found above: use it directly
                 # rather than triggering a (possibly blocking) decode.
                 image_data = stale_cached_image_data
+                buffer_expected_path = expected_path
+                provenance_kind = "display"
             else:
-                image_data = self.app_controller.get_decoded_image(index)
+                image_data = self.app_controller.get_decoded_image(
+                    index,
+                    nav_seq,
+                    gen,
+                    requested_path=expected_path,
+                )
+                buffer_expected_path = expected_path
+                provenance_kind = "display"
 
-            if _debug:
+            if _trace:
                 _t_got = time.perf_counter()
                 log.info(
                     f"[DBGCACHE] {_t_got*1000:.3f} requestImage: got image_data in {(_t_got - _t_get)*1000:.2f}ms"
                 )
 
             if image_data:
+                served_path = getattr(image_data, "source_path", None)
+                if served_path is not None and buffer_expected_path is not None:
+                    expected_key = normalize_path_key(buffer_expected_path)
+                    served_key = normalize_path_key(served_path)
+                    if expected_key != served_key:
+                        reason = (
+                            f"wrong decoded buffer: expected {buffer_expected_path}, "
+                            f"served {served_path}"
+                        )
+                        self._log_provider_fallback(
+                            id,
+                            reason,
+                            stale=request_is_stale,
+                            index=index,
+                            expected_path=buffer_expected_path,
+                        )
+                        if _debug and not request_is_stale:
+                            active = self._has_active_future(
+                                index,
+                                buffer_expected_path,
+                            )
+                            self._record_provider(
+                                nav_seq,
+                                index,
+                                gen,
+                                (time.perf_counter() - _t_start) * 1000.0,
+                                image_data,
+                                outcome="wrong-image-blocked",
+                                expected_path=buffer_expected_path,
+                                provenance_kind=provenance_kind,
+                                placeholder_reason=reason,
+                                future_active=active,
+                            )
+                        return self._fallback_image()
+
                 # Handle format being None (from prefetcher) or missing
                 fmt = getattr(image_data, "format", None)
                 if fmt is None:
@@ -339,16 +468,28 @@ class ImageProvider(QQuickImageProvider):
                     fmt,
                 )
                 if qimg.isNull():
+                    active = self._has_active_future(index, buffer_expected_path)
                     self._log_provider_fallback(
                         id,
                         "decoded buffer produced a null QImage",
                         stale=request_is_stale,
+                        index=index,
+                        expected_path=buffer_expected_path,
                     )
-                    return (
-                        self._fallback_image()
-                        if request_is_stale
-                        else self._last_image_fallback()
-                    )
+                    if _debug and not request_is_stale:
+                        self._record_provider(
+                            nav_seq,
+                            index,
+                            gen,
+                            (time.perf_counter() - _t_start) * 1000.0,
+                            image_data,
+                            outcome="placeholder",
+                            expected_path=buffer_expected_path,
+                            provenance_kind=provenance_kind,
+                            placeholder_reason="decoded buffer produced a null QImage",
+                            future_active=active,
+                        )
+                    return self._fallback_image()
 
                 # Detach from Python buffer to prevent ownership issues and force proper texture upload
                 # OPTIMIZATION: Only do this expensive copy when serving the live editor preview,
@@ -383,8 +524,32 @@ class ImageProvider(QQuickImageProvider):
 
                 if _debug:
                     _t_end = time.perf_counter()
-                    log.info(
-                        f"[DBGCACHE] {_t_end*1000:.3f} requestImage: DONE id={id} total={(_t_end - _t_start)*1000:.2f}ms"
+                    if _trace:
+                        log.info(
+                            f"[DBGCACHE] {_t_end*1000:.3f} requestImage: DONE id={id} total={(_t_end - _t_start)*1000:.2f}ms"
+                        )
+                    # Attribute this provider round-trip to its navigation seq,
+                    # recording the provenance of the pixels actually served so
+                    # the wrong-image invariant can compare requested vs served.
+                    decoded_placeholder = bool(
+                        getattr(image_data, "is_placeholder", False)
+                    )
+                    self._record_provider(
+                        nav_seq,
+                        index,
+                        gen,
+                        (_t_end - _t_start) * 1000.0,
+                        image_data,
+                        outcome=(
+                            "decoded-placeholder" if decoded_placeholder else "image"
+                        ),
+                        expected_path=buffer_expected_path,
+                        provenance_kind=provenance_kind,
+                        placeholder_reason=getattr(
+                            image_data,
+                            "placeholder_reason",
+                            None,
+                        ),
                     )
 
                 # When we took the copy() branch above, qimg owns its own
@@ -394,32 +559,54 @@ class ImageProvider(QQuickImageProvider):
 
         except (ValueError, IndexError) as e:
             log.warning("Invalid image ID requested from QML: %s. Error: %s", id, e)
-            return (
-                self._fallback_image()
-                if request_is_stale
-                else self._last_image_fallback()
-            )
+            return self._fallback_image()
         except Exception:
+            active = self._has_active_future(index, expected_path)
             self._log_provider_fallback(
                 id,
                 "unexpected provider error",
                 stale=request_is_stale,
+                index=index,
+                expected_path=expected_path,
                 exc_info=True,
             )
-            return (
-                self._fallback_image()
-                if request_is_stale
-                else self._last_image_fallback()
-            )
+            if _debug and not request_is_stale and isinstance(index, int):
+                self._record_provider(
+                    nav_seq,
+                    index,
+                    gen,
+                    (time.perf_counter() - _t_start) * 1000.0,
+                    None,
+                    outcome="placeholder",
+                    expected_path=expected_path,
+                    placeholder_reason="unexpected provider error",
+                    future_active=active,
+                )
+            return self._fallback_image()
 
         self._log_provider_fallback(
             id,
             "decode returned no image data",
             stale=request_is_stale,
+            index=index,
+            expected_path=expected_path,
         )
-        return (
-            self._fallback_image() if request_is_stale else self._last_image_fallback()
-        )
+        # A placeholder is being returned for this navigation; record it so the
+        # present ack marks it as a placeholder rather than a real first frame.
+        if _debug and not request_is_stale:
+            active = self._has_active_future(index, expected_path)
+            self._record_provider(
+                nav_seq,
+                index,
+                gen,
+                (time.perf_counter() - _t_start) * 1000.0,
+                None,
+                outcome="placeholder",
+                expected_path=expected_path,
+                placeholder_reason="decode returned no image data",
+                future_active=active,
+            )
+        return self._fallback_image()
 
 
 class UIState(QObject):
@@ -459,6 +646,7 @@ class UIState(QObject):
     awbRgbLowerBoundChanged = Signal()
     awbRgbUpperBoundChanged = Signal()
     currentDirectoryChanged = Signal()  # Signal when working directory changes
+    stackDirectorySwitchChanged = Signal()
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
@@ -647,18 +835,15 @@ class UIState(QObject):
             self.app_controller.editSourceModeChanged.connect(
                 lambda _: self.saveBehaviorMessageChanged.emit()
             )
-            self.app_controller.editSourceModeChanged.connect(
-                lambda _: self.metadataChanged.emit()
-            )  # Also update metadata binding if needed
         if hasattr(self.app_controller, "rawDevelopmentStateChanged"):
             self.app_controller.rawDevelopmentStateChanged.connect(
                 self.rawDevelopmentStateChanged
             )
             self.app_controller.rawDevelopmentStateChanged.connect(
-                self.saveBehaviorMessageChanged.emit
+                self.metadataChanged.emit
             )
             self.app_controller.rawDevelopmentStateChanged.connect(
-                self.metadataChanged.emit
+                self.saveBehaviorMessageChanged.emit
             )
 
         # Connect batch auto levels progress signals
@@ -675,6 +860,7 @@ class UIState(QObject):
         self.isGridViewActiveChanged.connect(
             lambda _: self.currentImageSourceChanged.emit()
         )
+        self.currentDirectoryChanged.connect(self.stackDirectorySwitchChanged)
 
     def _on_batch_al_progress(self, current: int, total: int):
         self._batch_al_current = current
@@ -756,7 +942,51 @@ class UIState(QObject):
         # Prevent QML from requesting full-res images when in grid view
         if self.isGridViewActive:
             return ""
-        return f"image://provider/{self.app_controller.current_index}/{self.app_controller.ui_refresh_generation}"
+        # Some list/filter/delete paths change current_index directly instead
+        # of going through _set_current_index. Mint the diagnostic seq lazily
+        # as this displayed source is evaluated, so every actual target change
+        # still receives an immutable path identity.
+        ensure_nav = getattr(
+            self.app_controller,
+            "_ensure_nav_record_for_current_target",
+            None,
+        )
+        if callable(ensure_nav):
+            ensure_nav()
+        # The nav seq is embedded so the provider/worker/present all share one
+        # correlation id, and so returning to the same index/generation still
+        # yields a distinct URL (guaranteeing a reload + a fresh present ack).
+        seq = getattr(self.app_controller, "_current_nav_seq", 0)
+        return (
+            f"image://provider/{self.app_controller.current_index}"
+            f"/{self.app_controller.ui_refresh_generation}/{seq}"
+        )
+
+    @Property(int, notify=currentImageSourceChanged)
+    def currentNavSeq(self):
+        """Navigation correlation id for the current image source.
+
+        QML captures this when the loupe Image source changes and hands it back
+        via notifyImageReady() once the frame reaches Image.Ready, so the
+        controller can log target-index-changed -> frame-actually-rendered.
+        """
+        return getattr(self.app_controller, "_current_nav_seq", 0)
+
+    @Property(int, notify=currentImageSourceChanged)
+    def currentImageGeneration(self):
+        """Generation embedded in the current provider URL."""
+        return self.app_controller.ui_refresh_generation
+
+    @Slot(int, int)
+    def notifyImageReady(self, seq: int, generation: int):
+        """The exact (seq, generation) provider source reached Image.Ready.
+
+        Ready means loaded, not on-screen; the on-screen timestamp is taken by
+        the controller from the window's frameSwapped signal.
+        """
+        handler = getattr(self.app_controller, "_on_frame_ready", None)
+        if callable(handler):
+            handler(seq, generation)
 
     @Property(int, notify=currentImageSourceChanged)
     def currentNativeImageWidth(self):
@@ -1065,6 +1295,14 @@ class UIState(QObject):
         """Returns the path of the current working directory."""
         return str(self.app_controller.image_dir)
 
+    @Property(bool, notify=stackDirectorySwitchChanged)
+    def isInStackInputDirectory(self):
+        return self.app_controller.is_in_stack_input_directory()
+
+    @Property(bool, notify=stackDirectorySwitchChanged)
+    def stackDirectorySwitchVisible(self):
+        return self.app_controller.stack_directory_switch_visible()
+
     @Property(bool, notify=metadataChanged)
     def isStackedJpg(self):
         """Returns True if the current image is a stacked JPG."""
@@ -1115,6 +1353,10 @@ class UIState(QObject):
     def jumpToLastUploaded(self):
         self.app_controller.jump_to_last_uploaded()
 
+    @Slot()
+    def switchStackInputDirectory(self):
+        self.app_controller.switch_stack_input_directory()
+
     @Slot(result=str)
     def get_helicon_path(self):
         return self.app_controller.get_helicon_path()
@@ -1146,6 +1388,7 @@ class UIState(QObject):
     @Slot(str)
     def set_raw_source_dir(self, path):
         self.app_controller.set_raw_source_dir(path)
+        self.stackDirectorySwitchChanged.emit()
 
     @Slot(result=str)
     def get_secondary_raw_source_dir(self):
@@ -1154,6 +1397,7 @@ class UIState(QObject):
     @Slot(str)
     def set_secondary_raw_source_dir(self, path):
         self.app_controller.set_secondary_raw_source_dir(path)
+        self.stackDirectorySwitchChanged.emit()
 
     @Slot(str, result=str)
     def open_file_dialog(self, current_path):
@@ -1182,6 +1426,22 @@ class UIState(QObject):
     @Slot(int)
     def set_prefetch_radius(self, radius):
         self.app_controller.set_prefetch_radius(radius)
+
+    @Slot(result=int)
+    def get_navigation_rate_fps(self):
+        return self.app_controller.get_navigation_rate_fps()
+
+    @Slot(int)
+    def set_navigation_rate_fps(self, fps):
+        self.app_controller.set_navigation_rate_fps(fps)
+
+    @Slot(result=str)
+    def get_held_navigation_quality(self):
+        return self.app_controller.get_held_navigation_quality()
+
+    @Slot(str)
+    def set_held_navigation_quality(self, quality):
+        self.app_controller.set_held_navigation_quality(quality)
 
     @Slot(result=int)
     def get_theme(self):

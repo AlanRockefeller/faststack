@@ -1,9 +1,44 @@
-"""Utilities for IO operations, specifically path normalization and hashing."""
+"""Utilities for filesystem operations, path normalization, and hashing."""
 
 import hashlib
+import json
+import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Union
+
+log = logging.getLogger(__name__)
+
+
+def fsync_directory(path: Path) -> None:
+    """Best-effort fsync for a directory entry update."""
+    if os.name == "nt":
+        return
+
+    fd: int | None = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        os.fsync(fd)
+    except OSError as e:
+        log.debug("Failed to fsync directory %s: %s", path, e)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def atomic_write_json(path: Path, payload: object) -> None:
+    """Write JSON atomically and flush the file and directory to disk."""
+    temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    with temp_path.open("w") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    temp_path.replace(path)
+    fsync_directory(path.parent)
 
 
 def normalize_path_key(path: Union[Path, str]) -> str:
