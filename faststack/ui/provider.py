@@ -957,9 +957,17 @@ class UIState(QObject):
         # correlation id, and so returning to the same index/generation still
         # yields a distinct URL (guaranteeing a reload + a fresh present ack).
         seq = getattr(self.app_controller, "_current_nav_seq", 0)
+        generation = self.app_controller.ui_refresh_generation
+        note_requested = getattr(
+            self.app_controller,
+            "_note_nav_source_requested",
+            None,
+        )
+        if callable(note_requested):
+            note_requested(seq, generation)
         return (
             f"image://provider/{self.app_controller.current_index}"
-            f"/{self.app_controller.ui_refresh_generation}/{seq}"
+            f"/{generation}/{seq}"
         )
 
     @Property(int, notify=currentImageSourceChanged)

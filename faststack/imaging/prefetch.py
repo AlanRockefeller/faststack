@@ -71,6 +71,9 @@ class _DecodeTaskFuture(Future):
         self._execution_lock = threading.RLock()
         self._execution_future: Optional[Future] = None
         self._execution_executor: object = None
+        self._execution_priority: Optional[int] = None
+        self._execution_queue_group: Optional[int] = None
+        self._execution_queue_order: Optional[int] = None
         self._completion_claimed = False
 
     def submit_execution(
@@ -95,6 +98,9 @@ class _DecodeTaskFuture(Future):
                 return
             self._execution_future = execution
             self._execution_executor = executor
+            self._execution_priority = priority
+            self._execution_queue_group = queue_group
+            self._execution_queue_order = queue_order
         # A completed Future invokes callbacks synchronously. Register outside
         # _execution_lock so logical completion callbacks are never run while
         # holding the migration lock.
@@ -106,8 +112,10 @@ class _DecodeTaskFuture(Future):
         target_executor,
         *,
         priority: int,
+        queue_group: int = _QUEUE_GROUP_INTERACTIVE,
+        queue_order: Optional[int] = None,
     ) -> str:
-        """Move queued work between executors without changing logical identity.
+        """Move or requeue work without changing its logical identity.
 
         Future.cancel() and Future.set_running_or_notify_cancel() serialize the
         queued-versus-running race. A failed cancellation means the source work
@@ -122,17 +130,26 @@ class _DecodeTaskFuture(Future):
             execution = self._execution_future
             if execution is None or self._execution_executor is not source_executor:
                 return "not-source"
+            source_priority = self._execution_priority
+            source_queue_group = self._execution_queue_group
+            source_queue_order = self._execution_queue_order
 
             # Detach before cancel(): cancellation invokes callbacks
             # synchronously. The obsolete execution callback must see that it no
             # longer owns this logical future and do nothing.
             self._execution_future = None
             self._execution_executor = None
+            self._execution_priority = None
+            self._execution_queue_group = None
+            self._execution_queue_order = None
             if not execution.cancel():
                 # The worker won the race. Restore ownership and, if it also
                 # completed while detached, transfer its result explicitly.
                 self._execution_future = execution
                 self._execution_executor = source_executor
+                self._execution_priority = source_priority
+                self._execution_queue_group = source_queue_group
+                self._execution_queue_order = source_queue_order
                 if execution.done():
                     completed_execution = execution
                     state = "complete"
@@ -144,7 +161,8 @@ class _DecodeTaskFuture(Future):
                         self._worker,
                         *self._worker_args,
                         priority=priority,
-                        queue_group=_QUEUE_GROUP_INTERACTIVE,
+                        queue_group=queue_group,
+                        queue_order=queue_order,
                     )
                 except BaseException as exc:
                     self._completion_claimed = True
@@ -153,6 +171,9 @@ class _DecodeTaskFuture(Future):
                 else:
                     self._execution_future = replacement
                     self._execution_executor = target_executor
+                    self._execution_priority = priority
+                    self._execution_queue_group = queue_group
+                    self._execution_queue_order = queue_order
                     state = "migrated"
 
         if completed_execution is not None:
@@ -169,6 +190,21 @@ class _DecodeTaskFuture(Future):
             if self._execution_executor is executor:
                 return self._execution_future
             return None
+
+    def execution_queue_group_for(self, executor) -> Optional[int]:
+        """Return the current physical queue group for ``executor``."""
+        with self._execution_lock:
+            if self._execution_executor is executor:
+                return self._execution_queue_group
+            return None
+
+    def note_priority_bump(self, executor, priority: int, queue_group: int) -> None:
+        """Mirror a successful in-place PriorityExecutor queue update."""
+        with self._execution_lock:
+            if self._execution_executor is executor:
+                self._execution_priority = priority
+                self._execution_queue_group = queue_group
+                self._execution_queue_order = None
 
     def running(self) -> bool:
         """Mirror the physical execution's running state."""
@@ -189,12 +225,21 @@ class _DecodeTaskFuture(Future):
                 return False
             execution = self._execution_future
             executor = self._execution_executor
+            execution_priority = self._execution_priority
+            execution_queue_group = self._execution_queue_group
+            execution_queue_order = self._execution_queue_order
             if execution is not None:
                 self._execution_future = None
                 self._execution_executor = None
+                self._execution_priority = None
+                self._execution_queue_group = None
+                self._execution_queue_order = None
                 if not execution.cancel():
                     self._execution_future = execution
                     self._execution_executor = executor
+                    self._execution_priority = execution_priority
+                    self._execution_queue_group = execution_queue_group
+                    self._execution_queue_order = execution_queue_order
                     if execution.done():
                         completed_execution = execution
                     else:
@@ -219,6 +264,9 @@ class _DecodeTaskFuture(Future):
             self._completion_claimed = True
             self._execution_future = None
             self._execution_executor = None
+            self._execution_priority = None
+            self._execution_queue_group = None
+            self._execution_queue_order = None
         if execution.cancelled():
             super().cancel()
             return
@@ -941,7 +989,17 @@ class Prefetcher:
         self.futures: Dict[int, Future] = {}
         self.future_paths: Dict[int, Path] = {}
         self.future_quality: Dict[int, DecodeQuality] = {}
+        # Persistent Preload All work can temporarily become a dependency of a
+        # cover wrapper, which replaces the one-future-per-index entry. Keep an
+        # independent registry until each logical preload reaches a terminal
+        # state so cancellation and queue demotion never lose ownership of it.
+        self._persistent_preloads: Dict[Future, tuple[int, Path]] = {}
+        self._persistent_preloads_by_index: Dict[int, set[Future]] = {}
         self._demand_indices: set[int] = set()
+        # Only ordinary window speculation, exact demand, and cover work need
+        # navigation-driven cancellation scans. Persistent Preload All tasks
+        # can number in the thousands and must not make each key step O(folder).
+        self._navigation_cancel_indices: set[int] = set()
         self.generation = 0
         self._scheduled: Dict[int, set] = {}  # generation -> set of scheduled indices
         self._active_window: set[int] = set()
@@ -980,15 +1038,82 @@ class Prefetcher:
                         fut = self.futures.get(i)
                         if fut is not None:
                             fut.cancel()
+                        self._cancel_persistent_preloads_for_index(i)
                         self.futures.pop(i, None)
                         self.future_paths.pop(i, None)
                         self.future_quality.pop(i, None)
                         self._demand_indices.discard(i)
+                        self._navigation_cancel_indices.discard(i)
                         for scheduled in self._scheduled.values():
                             scheduled.discard(i)
                     return
 
             self._cancel_all_locked()
+
+    def _register_persistent_preload(
+        self,
+        index: int,
+        path: Path,
+        future: Future,
+    ) -> None:
+        """Track persistent preload work independently of the index map."""
+        if future in self._persistent_preloads:
+            return
+        self._persistent_preloads[future] = (index, path)
+        self._persistent_preloads_by_index.setdefault(index, set()).add(future)
+        future.add_done_callback(self._cleanup_persistent_preload)
+
+    def _cleanup_persistent_preload(self, future: Future) -> None:
+        with self._futures_lock:
+            tracked = self._persistent_preloads.pop(future, None)
+            if tracked is None:
+                return
+            index, _path = tracked
+            indexed = self._persistent_preloads_by_index.get(index)
+            if indexed is None:
+                return
+            indexed.discard(future)
+            if not indexed:
+                self._persistent_preloads_by_index.pop(index, None)
+
+    def _active_persistent_preload(
+        self,
+        index: int,
+        path: Path,
+    ) -> Optional[Future]:
+        requested_key = normalize_path_key(path)
+        for future in tuple(self._persistent_preloads_by_index.get(index, ())):
+            tracked = self._persistent_preloads.get(future)
+            if (
+                tracked is not None
+                and not future.done()
+                and normalize_path_key(tracked[1]) == requested_key
+            ):
+                return future
+        return None
+
+    def _cancel_persistent_preloads_for_index(self, index: int) -> None:
+        for future in tuple(self._persistent_preloads_by_index.get(index, ())):
+            future.cancel()
+
+    @staticmethod
+    def _preload_dependency(future: Future) -> Optional[Future]:
+        dependency = getattr(future, "_faststack_preload_dependency", None)
+        return dependency if isinstance(dependency, Future) else None
+
+    def _demote_preload_dependency(self, future: Future) -> None:
+        dependency = self._preload_dependency(future)
+        if (
+            dependency is not None
+            and dependency in self._persistent_preloads
+            and not dependency.done()
+        ):
+            self._demote_queued_preload(dependency)
+
+    def _demote_persistent_preloads_for_index(self, index: int) -> None:
+        for future in tuple(self._persistent_preloads_by_index.get(index, ())):
+            if not future.done():
+                self._demote_queued_preload(future)
 
     @staticmethod
     def _bump_executor_priority(executor, future: Future, priority: int) -> bool:
@@ -1000,13 +1125,65 @@ class Prefetcher:
         )
         if execution is None:
             return False
-        return bool(
+        bumped = bool(
             executor.bump_priority(
                 execution,
                 priority,
                 queue_group=_QUEUE_GROUP_INTERACTIVE,
             )
         )
+        if bumped and isinstance(future, _DecodeTaskFuture):
+            future.note_priority_bump(
+                executor,
+                priority,
+                _QUEUE_GROUP_INTERACTIVE,
+            )
+        return bumped
+
+    @staticmethod
+    def _is_preload_future(future: Future) -> bool:
+        """Whether ``future`` originated as persistent Preload All work."""
+        meta = getattr(future, "_faststack_trace_meta", None)
+        return isinstance(meta, dict) and bool(meta.get("preload_task"))
+
+    def _demote_queued_preload(self, future: Future) -> None:
+        """Return an adopted preload to its low-priority queue when possible."""
+        if not isinstance(future, _DecodeTaskFuture):
+            return
+        if (
+            future.execution_queue_group_for(self.demand_executor)
+            == _QUEUE_GROUP_INTERACTIVE
+        ):
+            source_executor = self.demand_executor
+        elif (
+            future.execution_queue_group_for(self.executor) == _QUEUE_GROUP_INTERACTIVE
+        ):
+            source_executor = self.executor
+        else:
+            return
+        meta = getattr(future, "_faststack_trace_meta", None)
+        queue_order = meta.get("preload_order") if isinstance(meta, dict) else None
+        tracked = self._persistent_preloads.get(future)
+        if tracked is not None:
+            index, _path = tracked
+            current = self.futures.get(index)
+            if current is future or self._preload_dependency(current) is future:
+                self._demand_indices.discard(index)
+        if isinstance(meta, dict):
+            meta["role"] = "preload"
+            meta["priority"] = _PRIORITY_PREFETCH_BASE
+            meta["queue_group"] = _QUEUE_GROUP_PRELOAD
+            meta["queue_order"] = queue_order
+            meta["migrated_to_demand"] = False
+        demotion_state = future.migrate_queued_execution(
+            source_executor,
+            self.executor,
+            priority=_PRIORITY_PREFETCH_BASE,
+            queue_group=_QUEUE_GROUP_PRELOAD,
+            queue_order=queue_order,
+        )
+        if isinstance(meta, dict):
+            meta["demotion_state"] = demotion_state
 
     def update_prefetch(
         self,
@@ -1102,6 +1279,7 @@ class Prefetcher:
 
             start = max(0, safe_current - behind)
             end = min(n, safe_current + ahead + 1)
+            previous_window = self._active_window
             self._active_window = set(range(start, end))
 
             log.debug(
@@ -1133,8 +1311,22 @@ class Prefetcher:
             # Get scheduled set for current generation
             scheduled = self._scheduled.setdefault(self.generation, set())
 
-            for index, future in list(self.futures.items()):
+            for index in previous_window - self._active_window:
+                self._demote_persistent_preloads_for_index(index)
+                future = self.futures.get(index)
+                if future is not None and self._is_preload_future(future):
+                    self._demote_queued_preload(future)
+
+            for index in list(self._navigation_cancel_indices):
+                future = self.futures.get(index)
+                if future is None:
+                    self._navigation_cancel_indices.discard(index)
+                    continue
                 if index < start or index >= end:
+                    if self._is_preload_future(future):
+                        self._navigation_cancel_indices.discard(index)
+                        self._demote_queued_preload(future)
+                        continue
                     task_quality = self.future_quality.get(index)
                     if future.cancel():
                         if task_quality == "cover":
@@ -1143,10 +1335,12 @@ class Prefetcher:
                                 future,
                                 "outside-prefetch-window",
                             )
+                            self._demote_preload_dependency(future)
                         self.futures.pop(index, None)
                         self.future_paths.pop(index, None)
                         self.future_quality.pop(index, None)
                         self._demand_indices.discard(index)
+                        self._navigation_cancel_indices.discard(index)
                         scheduled.discard(index)
 
             for rank, i in enumerate(priority_order):
@@ -1232,6 +1426,16 @@ class Prefetcher:
                 queue_order = preload_order
 
             existing_future = self.futures.get(index)
+            if existing_future is None or existing_future.done():
+                persistent_preload = self._active_persistent_preload(
+                    index,
+                    requested_path,
+                )
+                if persistent_preload is not None:
+                    existing_future = persistent_preload
+                    self.futures[index] = persistent_preload
+                    self.future_paths[index] = requested_path
+                    self.future_quality[index] = "fast"
             existing_same_path_future = None
             decode_after_future = None
 
@@ -1245,6 +1449,7 @@ class Prefetcher:
                 if current_path != requested_path:
                     # Force cancel the old one to switch paths
                     canceled = existing_future.cancel()
+                    self._demote_preload_dependency(existing_future)
                     if canceled and current_quality == "cover":
                         self._report_queued_cancellation(
                             index,
@@ -1255,12 +1460,25 @@ class Prefetcher:
                     self.future_paths.pop(index, None)
                     self.future_quality.pop(index, None)
                     self._demand_indices.discard(index)
+                    self._navigation_cancel_indices.discard(index)
                 elif quality == "cover" and current_quality == "fast":
-                    if existing_future.cancel():
+                    if self._is_preload_future(existing_future):
+                        # Preserve the preload's logical future and fast-tier
+                        # cache contract. Promote it ahead of the chained cover
+                        # task so a one-worker speculative pool cannot block on
+                        # a lower-group dependency queued behind itself.
+                        self._bump_executor_priority(
+                            self.executor,
+                            existing_future,
+                            _PRIORITY_COVER - 1,
+                        )
+                        decode_after_future = existing_future
+                    elif existing_future.cancel():
                         self.futures.pop(index, None)
                         self.future_paths.pop(index, None)
                         self.future_quality.pop(index, None)
                         self._demand_indices.discard(index)
+                        self._navigation_cancel_indices.discard(index)
                     else:
                         # The fast decode is already running. Chain the
                         # settled cover decode after it so a running fast
@@ -1268,7 +1486,24 @@ class Prefetcher:
                         # skipped, while keeping one tracked future per index.
                         decode_after_future = existing_future
                 elif quality == "fast" and current_quality == "cover":
-                    if existing_future.cancel():
+                    preload_dependency = getattr(
+                        existing_future,
+                        "_faststack_preload_dependency",
+                        None,
+                    )
+                    if (
+                        isinstance(preload_dependency, Future)
+                        and not preload_dependency.done()
+                    ):
+                        # A cover task may be waiting on the original preload.
+                        # Exact demand must adopt that same stable logical
+                        # future rather than launch a duplicate fast decode.
+                        existing_same_path_future = preload_dependency
+                        self.futures[index] = preload_dependency
+                        self.future_paths[index] = requested_path
+                        self.future_quality[index] = "fast"
+                        self._navigation_cancel_indices.discard(index)
+                    elif existing_future.cancel():
                         self._report_queued_cancellation(
                             index,
                             existing_future,
@@ -1278,6 +1513,7 @@ class Prefetcher:
                         self.future_paths.pop(index, None)
                         self.future_quality.pop(index, None)
                         self._demand_indices.discard(index)
+                        self._navigation_cancel_indices.discard(index)
                     else:
                         # The cover decode is already running. Stop tracking it
                         # so this index can submit and wait on a fresh fast
@@ -1287,6 +1523,7 @@ class Prefetcher:
                         self.future_paths.pop(index, None)
                         self.future_quality.pop(index, None)
                         self._demand_indices.discard(index)
+                        self._navigation_cancel_indices.discard(index)
                 else:
                     existing_same_path_future = existing_future
 
@@ -1295,7 +1532,11 @@ class Prefetcher:
                 safe_radius = 2
                 direction = self._last_navigation_direction
 
-                for task_index, future in list(self.futures.items()):
+                for task_index in list(self._navigation_cancel_indices):
+                    future = self.futures.get(task_index)
+                    if future is None:
+                        self._navigation_cancel_indices.discard(task_index)
+                        continue
                     if task_index == index or abs(task_index - index) <= safe_radius:
                         continue
 
@@ -1306,6 +1547,9 @@ class Prefetcher:
                         continue
 
                     task_quality = self.future_quality.get(task_index)
+                    if self._is_preload_future(future):
+                        self._demote_queued_preload(future)
+                        continue
                     if not future.done() and future.cancel():
                         if task_quality == "cover":
                             self._report_queued_cancellation(
@@ -1313,11 +1557,13 @@ class Prefetcher:
                                 future,
                                 "demand-priority",
                             )
+                            self._demote_preload_dependency(future)
                         cancelled_count += 1
                         self.futures.pop(task_index, None)
                         self.future_paths.pop(task_index, None)
                         self.future_quality.pop(task_index, None)
                         self._demand_indices.discard(task_index)
+                        self._navigation_cancel_indices.discard(task_index)
                         # This index is no longer decoded/queued -- allow it
                         # to be resubmitted, mirroring update_prefetch()'s
                         # own out-of-window cancel loop.
@@ -1340,6 +1586,19 @@ class Prefetcher:
                     "_faststack_trace_meta",
                     None,
                 )
+                if preload_order is not None and isinstance(existing_meta, dict):
+                    # Preload All may attach to ordinary nearby speculation
+                    # that was queued first. Promote that same logical future
+                    # to persistent preload work so navigation cannot cancel
+                    # the callback it just adopted.
+                    existing_meta["preload_task"] = True
+                    existing_meta["preload_order"] = preload_order
+                    self._navigation_cancel_indices.discard(index)
+                    self._register_persistent_preload(
+                        index,
+                        requested_path,
+                        existing_same_path_future,
+                    )
                 prior_seq = (
                     existing_meta.get("seq")
                     if isinstance(existing_meta, dict)
@@ -1486,6 +1745,8 @@ class Prefetcher:
                     "queue_depth": target_executor.qsize(),
                     "inflight": len(self.futures),
                     "window_bound": window_bound,
+                    "preload_task": preload_order is not None,
+                    "preload_order": preload_order,
                 }
             else:
                 # Role is correctness metadata as well as telemetry: an
@@ -1497,6 +1758,8 @@ class Prefetcher:
                     "quality": quality,
                     "source_path": str(requested_path),
                     "window_bound": window_bound,
+                    "preload_task": preload_order is not None,
+                    "preload_order": preload_order,
                 }
 
             decode_args = (
@@ -1520,6 +1783,14 @@ class Prefetcher:
                 worker = self._decode_and_cache
                 worker_args = decode_args
             future = _DecodeTaskFuture(worker, worker_args)
+            if decode_after_future is not None and self._is_preload_future(
+                decode_after_future
+            ):
+                setattr(
+                    future,
+                    "_faststack_preload_dependency",
+                    decode_after_future,
+                )
             # Future safely carries mutable diagnostics shared with the worker.
             # This is also the stable identity returned to every caller.
             setattr(future, "_faststack_trace_meta", submit_meta)
@@ -1541,8 +1812,14 @@ class Prefetcher:
             self.futures[index] = future
             self.future_paths[index] = requested_path
             self.future_quality[index] = quality
+            if preload_order is not None:
+                self._navigation_cancel_indices.discard(index)
+            else:
+                self._navigation_cancel_indices.add(index)
             if priority and quality == "fast":
                 self._demand_indices.add(index)
+            if preload_order is not None:
+                self._register_persistent_preload(index, requested_path, future)
             future.add_done_callback(lambda f, idx=index: self._cleanup_future(idx, f))
             return future
 
@@ -1639,6 +1916,8 @@ class Prefetcher:
 
         def fast_work_is_relevant() -> bool:
             if quality != "fast" or not window_bound:
+                return True
+            if _meta.get("preload_task"):
                 return True
             # A queued/running look-ahead task can be adopted by an exact
             # demand request. Its mutable trace role changes at adoption, so it
@@ -1917,6 +2196,23 @@ class Prefetcher:
                 except Exception:
                     log.debug("nav_trace sink raised", exc_info=True)
 
+            if cache_result is False:
+                # A rejected stale/tombstoned insertion is not successful
+                # preload or navigation work. A racing decode may nevertheless
+                # have populated the same key, in which case the logical cache
+                # requirement is already satisfied.
+                if self.cache_get_quality is not None:
+                    cached_quality = self.cache_get_quality(cache_key)
+                    cache_satisfied = cached_quality == "cover" or (
+                        cached_quality == "fast" and cache_quality == "fast"
+                    )
+                elif self.cache_contains is not None:
+                    cache_satisfied = self.cache_contains(cache_key)
+                else:
+                    cache_satisfied = False
+                if not cache_satisfied:
+                    return None
+
             return (target_path, display_generation)
 
         except Exception as e:
@@ -1932,14 +2228,22 @@ class Prefetcher:
         """True if the exact requested image still has queued/running work."""
         with self._futures_lock:
             fut = self.futures.get(index)
-            if fut is None or fut.done():
-                return False
+            if fut is not None and not fut.done():
+                if expected_path is None:
+                    return True
+                active_path = self.future_paths.get(index)
+                if active_path is not None and normalize_path_key(
+                    active_path
+                ) == normalize_path_key(expected_path):
+                    return True
             if expected_path is None:
-                return True
-            active_path = self.future_paths.get(index)
-            if active_path is None:
-                return False
-            return normalize_path_key(active_path) == normalize_path_key(expected_path)
+                return any(
+                    not future.done()
+                    for future in self._persistent_preloads_by_index.get(index, ())
+                )
+            return (
+                self._active_persistent_preload(index, Path(expected_path)) is not None
+            )
 
     def _report_queued_cancellation(
         self,
@@ -1980,6 +2284,8 @@ class Prefetcher:
                 failed = True
 
         with self._futures_lock:
+            if future.cancelled():
+                self._demote_preload_dependency(future)
             # Only remove if it's the specific future we're tracking
             # (to avoid race if a new task for the same index was submitted)
             if self.futures.get(index) is future:
@@ -1987,6 +2293,7 @@ class Prefetcher:
                 self.future_paths.pop(index, None)
                 self.future_quality.pop(index, None)
                 self._demand_indices.discard(index)
+                self._navigation_cancel_indices.discard(index)
                 # Self-heal: if this future was cancelled by ANY cancellation
                 # path, make sure the index isn't left permanently
                 # "scheduled" with nothing actually decoded/cached for it.
@@ -2006,6 +2313,11 @@ class Prefetcher:
         """
         path_str = Path(path).as_posix()
         with self._futures_lock:
+            for future, (_index, preload_path) in list(
+                self._persistent_preloads.items()
+            ):
+                if Path(preload_path).as_posix() == path_str:
+                    future.cancel()
             for idx, p in list(self.future_paths.items()):
                 if Path(p).as_posix() == path_str:
                     fut = self.futures.get(idx)
@@ -2015,6 +2327,7 @@ class Prefetcher:
                     self.future_paths.pop(idx, None)
                     self.future_quality.pop(idx, None)
                     self._demand_indices.discard(idx)
+                    self._navigation_cancel_indices.discard(idx)
             for i, image_file in enumerate(self.image_files):
                 if Path(image_file.path).as_posix() == path_str:
                     for scheduled in self._scheduled.values():
@@ -2060,10 +2373,12 @@ class Prefetcher:
                         future,
                         "quality-superseded",
                     )
+                    self._demote_preload_dependency(future)
                     self.futures.pop(index, None)
                     self.future_paths.pop(index, None)
                     self.future_quality.pop(index, None)
                     self._demand_indices.discard(index)
+                    self._navigation_cancel_indices.discard(index)
                     for scheduled in self._scheduled.values():
                         scheduled.discard(index)
 
@@ -2073,13 +2388,17 @@ class Prefetcher:
         """
         self.generation += 1  # Invalidate in-flight tasks
         # Snapshot values before cancelling
-        all_futures = list(self.futures.values())
+        all_futures = set(self.futures.values())
+        all_futures.update(self._persistent_preloads)
         for future in all_futures:
             future.cancel()
         self.futures.clear()
         self.future_paths.clear()
         self.future_quality.clear()
+        self._persistent_preloads.clear()
+        self._persistent_preloads_by_index.clear()
         self._demand_indices.clear()
+        self._navigation_cancel_indices.clear()
         self._active_window.clear()
         self._scheduled.clear()
 

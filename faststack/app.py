@@ -275,10 +275,6 @@ class AppController(QObject):
             return None
         return normalize_path_key(p)
 
-    class ProgressReporter(QObject):
-        progress_updated = Signal(int)
-        finished = Signal()
-
     editSourceModeChanged = Signal(str)  # Notify when JPEG/RAW mode changes
     rawDevelopmentStateChanged = Signal()  # Notify when RAW development starts/stops
     _saveFinished = Signal(
@@ -292,6 +288,7 @@ class AppController(QObject):
     _qualityDecodeFinished = Signal(object)  # Settled cover-quality decode result
     _pacedNavigationReady = Signal(object)  # Exact fast-tier target is cache-ready
     _frameSwapObserved = Signal(float)  # render-thread timestamp -> GUI thread
+    _preloadProgressReady = Signal(object)  # Worker counters -> GUI thread
 
     def __init__(
         self,
@@ -361,6 +358,7 @@ class AppController(QObject):
         self._updateCheckFinished.connect(self._on_update_check_finished)
         self._qualityDecodeFinished.connect(self._on_quality_decode_finished)
         self._pacedNavigationReady.connect(self._on_paced_navigation_ready)
+        self._preloadProgressReady.connect(self._on_preload_progress_ready)
         self._update_check_token = 0
         self._update_check_inflight = False
         self._preview_inflight = False
@@ -421,7 +419,8 @@ class AppController(QObject):
         self._batch_indices_cache: set = set()
         self._batch_indices_cache_key: Optional[tuple] = None
         self.recycle_bin_dir: Optional[Path] = None
-        self.reporter: Optional[AppController.ProgressReporter] = None
+        self._preload_operation_token = 0
+        self._preload_operation: Optional[dict] = None
         self._last_rendered_preview_index: int = -1
         self._last_rendered_preview_gen: int = -1
         self._batch_al_indices: list = []
@@ -990,6 +989,7 @@ class AppController(QObject):
             self.clear_filter()
             return
 
+        self._begin_direct_image_transition("filter applied")
         self._filter_string = filter_string
         self._filter_flags = flags
         self._filter_enabled = True
@@ -1016,6 +1016,7 @@ class AppController(QObject):
         self.current_index = 0
         self._do_prefetch(self.current_index)
         self.sync_ui_state(image_count_changed=True)
+        self._restart_quality_decode_timer()
 
     @Slot(result=str)
     def get_filter_string(self):
@@ -1035,6 +1036,7 @@ class AppController(QObject):
             and not self._filter_flags
         ):
             return
+        self._begin_direct_image_transition("filter cleared")
         self._filter_enabled = False
         self._filter_string = ""
         self._filter_flags = []
@@ -1060,6 +1062,7 @@ class AppController(QObject):
         self.current_index = min(self.current_index, max(0, len(self.image_files) - 1))
         self._do_prefetch(self.current_index)
         self.sync_ui_state(image_count_changed=True)
+        self._restart_quality_decode_timer()
 
     @Slot(result=str)
     def get_sort_mode(self):
@@ -1087,6 +1090,7 @@ class AppController(QObject):
                 clear_stacks = True
 
         # --- Past this point we are committed to the sort ---
+        self._begin_direct_image_transition("sort order changed")
         self.sort_mode = mode
 
         preserved_path = None
@@ -1170,6 +1174,7 @@ class AppController(QObject):
 
         self._do_prefetch(self.current_index)
         self.sync_ui_state(image_count_changed=True)
+        self._restart_quality_decode_timer()
         self.dataChanged.emit()
         if hasattr(self, "ui_state") and self.ui_state:
             self.ui_state.sortModeChanged.emit()
@@ -1904,6 +1909,8 @@ class AppController(QObject):
                 key = event.key()
                 if key in (Qt.Key_Enter, Qt.Key_Return):
                     return False  # Let QML handle crop execution
+                if key in (Qt.Key_Left, Qt.Key_Right):
+                    return False  # Crop UI owns arrows; never start navigation.
 
             # When in grid view, let QML handle navigation and action keys
             if self._is_grid_view_active:
@@ -2182,6 +2189,8 @@ class AppController(QObject):
         updates the prefetcher, and syncs the UI so the display never
         references an out-of-bounds index.
         """
+        self._begin_direct_image_transition("watcher rebuilt the image list")
+
         # Remember which image we were viewing so we can stay on it
         preserved_path = None
         if self.image_files and 0 <= self.current_index < len(self.image_files):
@@ -2229,6 +2238,7 @@ class AppController(QObject):
 
         self._do_prefetch(self.current_index)
         self.sync_ui_state(image_count_changed=True)
+        self._restart_quality_decode_timer()
 
     def _apply_filter_to_cached_list(self, *, notify: bool = True):
         """Applies current filter to cached image list without disk I/O."""
@@ -2263,6 +2273,7 @@ class AppController(QObject):
         ):
             return False
 
+        self._begin_direct_image_transition("active flag filter rebuilt the list")
         old_index = self.current_index
         old_stack_paths = self._resolve_ranges_to_paths(self.stacks)
         old_stack_start_path = (
@@ -2316,6 +2327,7 @@ class AppController(QObject):
             self._grid_model_dirty = True
 
         self._do_prefetch(self.current_index)
+        self._restart_quality_decode_timer()
         return True
 
     def _rebuild_path_to_index(self):
@@ -5170,7 +5182,10 @@ class AppController(QObject):
                         current_directory_key,
                     )
 
-            # 2. Update variants and re-select index
+            # 2. Update variants and re-select index. A save can finish while
+            # navigation is decoding/presenting another target, so invalidate
+            # that paced meaning before rebuilding the visible list.
+            self._begin_direct_image_transition("save completion rebuilt the list")
             self.refresh_image_list()
 
             if still_on_same_session:
@@ -5187,6 +5202,8 @@ class AppController(QObject):
                     self._reindex_after_save(preserved_path)
                 if saved_path:
                     self._invalidate_decoded_path(saved_path, force=True)
+
+            self._restart_quality_decode_timer()
 
             # Auto-add to batch if enabled
             if saved_path:
@@ -5366,6 +5383,26 @@ class AppController(QObject):
         key = self._nav_request_key(generation)
         requests = record.setdefault("requests", {})
         return requests.setdefault(key, {"generation": generation})
+
+    def _note_nav_source_requested(self, seq: int, generation: int) -> None:
+        """Record a bound QML source before its asynchronous Ready callback."""
+        if not self.debug_cache:
+            return
+        with self._nav_trace_lock:
+            record = self._nav_records.get(seq)
+            if record is None and seq == 0:
+                expected_path = None
+                if self.image_files and 0 <= self.current_index < len(self.image_files):
+                    expected_path = str(self.image_files[self.current_index].path)
+                record = self._ensure_startup_nav_record(
+                    seq,
+                    self.current_index,
+                    expected_path,
+                )
+            if record is None:
+                return
+            request = self._nav_request_record(record, generation)
+            request.setdefault("requested_t", time.perf_counter())
 
     def _new_burst(self, now: float) -> dict:
         return {
@@ -5565,7 +5602,12 @@ class AppController(QObject):
                 requests = list(final_record.get("requests", {}).values())
                 latest = requests[-1] if requests else {}
                 if not final_record.get("first_source_presented"):
-                    if latest.get("ready_t") is not None:
+                    if final_record.get("abandoned"):
+                        reason = (
+                            "abandoned: "
+                            f"{final_record.get('abandoned_reason', 'target invalidated')}"
+                        )
+                    elif latest.get("ready_t") is not None:
                         reason = "no frame swap after Image.Ready"
                     elif latest.get("outcome"):
                         reason = "provider completed but QML did not become Ready"
@@ -5821,6 +5863,8 @@ class AppController(QObject):
             if record is None:
                 return
             request = self._nav_request_record(record, generation)
+            if record.get("abandoned") or request.get("abandoned"):
+                return
             request.pop("provenance_error", None)
             request.pop("provenance_unknown", None)
             request.update(
@@ -5912,6 +5956,17 @@ class AppController(QObject):
         # no longer eligible to release pacing or enter presentation tracing.
         if seq != self._current_nav_seq:
             return
+        if self.debug_cache:
+            with self._nav_trace_lock:
+                record = self._nav_records.get(seq)
+                if record is not None:
+                    request = record.get("requests", {}).get(
+                        self._nav_request_key(generation)
+                    )
+                    if record.get("abandoned") or (
+                        request is not None and request.get("abandoned")
+                    ):
+                        return
         now = time.perf_counter()
         fallback_due_t = None
         with self._nav_trace_lock:
@@ -6099,7 +6154,12 @@ class AppController(QObject):
             if record is None:
                 return
             request = self._nav_request_record(record, generation)
-            if request.get("presented") or request.get("coalesced"):
+            if (
+                record.get("abandoned")
+                or request.get("abandoned")
+                or request.get("presented")
+                or request.get("coalesced")
+            ):
                 return
             request["coalesced"] = True
             is_initial = not record.get("first_source_presented")
@@ -6144,7 +6204,12 @@ class AppController(QObject):
             if record is None:
                 return
             request = self._nav_request_record(record, generation)
-            if request.get("presented") or request.get("coalesced"):
+            if (
+                record.get("abandoned")
+                or request.get("abandoned")
+                or request.get("presented")
+                or request.get("coalesced")
+            ):
                 return
             request["presented"] = True
             request["rendered"] = rendered
@@ -6496,6 +6561,11 @@ class AppController(QObject):
         releasing or re-establishing pacing for a newer source.
         """
         gate_seq = None
+        pending_seq = (
+            self._paced_navigation_pending.get("nav_seq")
+            if self._paced_navigation_pending is not None
+            else None
+        )
         self._paced_navigation_epoch += 1
         self._paced_navigation_pending = None
         self._paced_navigation_queue.clear()
@@ -6504,17 +6574,117 @@ class AppController(QObject):
         self._navigation_repeat_started = False
         self._quality_decode_immediate_pending = False
         self._navigation_hold_timer.stop()
+        abandoned_logs = []
         with self._nav_trace_lock:
             if self._paced_present_gate is not None:
                 gate_seq = self._paced_present_gate.get("seq")
             self._paced_present_gate = None
             self._paced_present_ready = False
-        if gate_seq is not None and self.debug_cache:
-            log.debug(
-                "[NAVTRACE] abandoned stale presentation gate seq=%s reason=%s",
-                gate_seq,
-                reason,
+
+            # A Ready/synchronized source from the sequence being abandoned
+            # must not become eligible for a later swap from a replacement
+            # source. Sequence ids are monotonic; retain any genuinely newer
+            # entries rather than clearing presentation telemetry wholesale.
+            abandon_through = self._current_nav_seq
+            abandoned_seqs = {
+                seq
+                for seq in (gate_seq, pending_seq)
+                if isinstance(seq, int) and seq <= abandon_through
+            }
+            abandoned_seqs.update(
+                seq
+                for seq, _generation, _ready_t, _sync_t in self._nav_pending_present
+                if seq <= abandon_through
             )
+
+            # A bound QML source is outstanding before Image.Ready and therefore
+            # may not have a paced gate or pending-present marker yet. Include
+            # the active record when its initial source is still unpresented or
+            # it owns an outstanding refresh/upgrade request.
+            active_record = self._nav_records.get(self._current_nav_seq)
+            if active_record is not None:
+                active_requests = active_record.get("requests", {}).values()
+                has_outstanding_request = any(
+                    not request.get("presented")
+                    and not request.get("coalesced")
+                    and not request.get("abandoned")
+                    for request in active_requests
+                )
+                if (
+                    not active_record.get("first_source_presented")
+                    or has_outstanding_request
+                ):
+                    abandoned_seqs.add(self._current_nav_seq)
+
+            self._nav_pending_present = [
+                pending
+                for pending in self._nav_pending_present
+                if pending[0] not in abandoned_seqs
+            ]
+
+            abandoned_t = time.perf_counter()
+            for seq in abandoned_seqs:
+                record = self._nav_records.get(seq)
+                if record is None:
+                    continue
+                request_abandoned = False
+                for request in record.get("requests", {}).values():
+                    if (
+                        not request.get("presented")
+                        and not request.get("coalesced")
+                        and not request.get("abandoned")
+                    ):
+                        request["abandoned"] = True
+                        request["abandoned_t"] = abandoned_t
+                        request["abandoned_reason"] = reason
+                        request_abandoned = True
+                initial_abandoned = not record.get("first_source_presented")
+                if initial_abandoned:
+                    record["abandoned"] = True
+                    record["abandoned_t"] = abandoned_t
+                    record["abandoned_reason"] = reason
+                if not initial_abandoned and not request_abandoned:
+                    continue
+                record["terminal"] = True
+                record["summary_emitted_pending"] = False
+                abandoned_logs.append(
+                    (
+                        seq,
+                        record.get("index"),
+                        record.get("filename", "n/a"),
+                        "initial" if initial_abandoned else "request",
+                    )
+                )
+
+            # A list/generation transition may retain the same path and index.
+            # Force the next displayed source evaluation to mint a fresh trace
+            # sequence instead of reusing the explicitly terminated record.
+            self._nav_target_index = None
+            self._nav_target_path_key = None
+        if self.debug_cache:
+            for seq, index, filename, frame_kind in abandoned_logs:
+                log.info(
+                    "[NAVTRACE] seq=%s index=%s file=%r frame=%s_abandoned reason=%s",
+                    seq,
+                    index,
+                    filename,
+                    frame_kind,
+                    reason,
+                )
+
+    def _begin_direct_image_transition(self, reason: str) -> None:
+        """Invalidate paced/deferred work before a direct list/source mutation."""
+        self._abandon_paced_navigation_state(reason)
+        # Invalidate the active URL correlation immediately. The replacement
+        # source may not be evaluated until a later QML turn, and an old Ready
+        # acknowledgement must not remain eligible during that gap.
+        with self._nav_trace_lock:
+            self._nav_seq += 1
+            self._current_nav_seq = self._nav_seq
+        self._quality_decode_token += 1
+        self._quality_decode_immediate_pending = False
+        self._quality_decode_timer.stop()
+        self.prefetcher.cancel_pending_cover_tasks()
 
     def _cancel_paced_navigation(self) -> None:
         """Invalidate pending navigation during view or generation changes."""
@@ -7028,6 +7198,7 @@ class AppController(QObject):
         """Called when any dialog opens to disable global keybindings."""
         self._dialog_open_count += 1
         if self._dialog_open_count == 1:
+            self._begin_direct_image_transition("dialog opened")
             self._dialog_open = True
             self.dialogStateChanged.emit(True)
             log.debug("Dialog opened (count=1), disabling global keybindings")
@@ -7040,6 +7211,7 @@ class AppController(QObject):
         if prev > 0 and self._dialog_open_count == 0:
             self._dialog_open = False
             self.dialogStateChanged.emit(False)
+            self._restart_quality_decode_timer()
             log.debug("Dialog closed (count=0), re-enabling global keybindings")
 
     def toggle_grid_view(self):
@@ -7284,6 +7456,7 @@ class AppController(QObject):
             raw_pair=None,
             timestamp=stat.st_mtime,
         )
+        self._begin_direct_image_transition("image duplicated")
         insert_index = self.current_index + 1
         self.image_files.insert(insert_index, duplicate_image)
 
@@ -7336,6 +7509,7 @@ class AppController(QObject):
         if stacks_changed:
             self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
+        self._restart_quality_decode_timer()
         self.update_status_message(f"Duplicated image as {duplicate_path.name}")
         log.info("Duplicated image %s -> %s", source_path, duplicate_path)
 
@@ -9789,6 +9963,8 @@ class AppController(QObject):
                                    (for File -> Open Folder). If False, keeps existing base
                                    (for grid navigation within current base).
         """
+        self._begin_direct_image_transition("directory switched")
+
         # Stop the old watcher
         if self.watcher:
             self.watcher.stop()
@@ -9882,6 +10058,15 @@ class AppController(QObject):
         if path:
             self._switch_to_directory(Path(path), update_base_directory=True)
 
+    def _preload_dataset_identity(
+        self,
+    ) -> tuple[Optional[str], tuple[Optional[str], ...]]:
+        """Return the current folder and ordered visible-path identity."""
+        return (
+            self._key(self.image_dir),
+            tuple(self._key(image_file.path) for image_file in self.image_files),
+        )
+
     def preload_all_images(self):
         if self.ui_state.isPreloading:
             log.info("Preloading is already in progress.")
@@ -9891,21 +10076,23 @@ class AppController(QObject):
         self.ui_state.isPreloading = True
         self.ui_state.preloadProgress = 0
 
-        self.reporter = self.ProgressReporter()
-        self.reporter.progress_updated.connect(self._update_preload_progress)
-        self.reporter.finished.connect(self._finish_preloading)
-
-        total_images = len(self.image_files)
+        image_files = list(self.image_files)
+        total_images = len(image_files)
         if total_images == 0:
             log.info("No images to preload.")
             self.ui_state.isPreloading = False
             self.ui_state.preloadProgress = 0
             return
 
-        # --- Check for cached images ---
-        images_to_preload = []
+        # Snapshot the requested dataset, but deliberately do not snapshot the
+        # starting neighborhood. The final MRU pass recomputes that from the
+        # then-current list and index after verifying this identity still matches.
+        dataset_identity = self._preload_dataset_identity()
+        display_width, display_height, display_gen = self.get_display_info()
+        cache_quality = "fast" if display_width > 0 and display_height > 0 else "cover"
+
+        images_to_preload: list[tuple[int, Path]] = []
         already_cached_count = 0
-        _, _, display_gen = self.get_display_info()
 
         # We want to load images furthest from the current index FIRST,
         # and images closest to the current index LAST.
@@ -9922,93 +10109,119 @@ class AppController(QObject):
         # Sort by distance descending (furthest first)
         all_images_with_dist.sort(key=lambda x: x[1], reverse=True)
 
-        # Determine which images are "nearby" (e.g. within prefetch radius * 2)
-        # We will FORCE these to be re-cached even if they are already in cache,
-        # to ensure they are moved to the front of the LRU queue.
+        # Nearby cached entries still receive a logical task so they are touched
+        # after farther work. The deterministic final pass below establishes the
+        # exact ordering without relying on worker completion order.
         nearby_radius = self.prefetcher.prefetch_radius * 2
-        nearby_paths = [
-            self.image_files[i].path
-            for i, dist in all_images_with_dist
-            if i < len(self.image_files) and dist <= nearby_radius
-        ]
-
-        skipped_count = 0
         for i, dist in all_images_with_dist:
-            if i >= len(self.image_files):
-                # Out-of-range index (image list shrank underneath us); still
-                # needs to be accounted for so `completed` can reach `total_images`.
-                skipped_count += 1
-                continue
-            image_path = self.image_files[i].path
-            cache_key = build_cache_key(image_path, display_gen, "fast")
+            image_path = image_files[i].path
+            cache_key = build_cache_key(image_path, display_gen, cache_quality)
             is_cached = cache_key in self.image_cache
             is_nearby = dist <= nearby_radius
 
             if is_cached and not is_nearby:
                 already_cached_count += 1
             else:
-                # Add to preload list if it's not cached OR if it's nearby (to refresh LRU)
-                images_to_preload.append(i)
+                images_to_preload.append((i, image_path))
 
         log.info(
             f"Found {already_cached_count} cached images (skipping). Preloading {len(images_to_preload)} images (including nearby refreshes)."
         )
 
+        self._preload_operation_token += 1
+        operation = {
+            "token": self._preload_operation_token,
+            "lock": threading.Lock(),
+            "total": total_images,
+            "terminal": already_cached_count,
+            "succeeded": already_cached_count,
+            "canceled": 0,
+            "failed": 0,
+            "skipped": 0,
+            "applied_terminal": -1,
+            "applied_progress": -1,
+            "finalized": False,
+            "dataset_identity": dataset_identity,
+            "display_generation": display_gen,
+            "cache_quality": cache_quality,
+        }
+        self._preload_operation = operation
+
+        def _snapshot_locked() -> dict:
+            return {
+                "token": operation["token"],
+                "total": operation["total"],
+                "terminal": operation["terminal"],
+                "succeeded": operation["succeeded"],
+                "canceled": operation["canceled"],
+                "failed": operation["failed"],
+                "skipped": operation["skipped"],
+            }
+
+        def _on_done(future, *, expected_path: Path):
+            result = None
+            terminal_kind = "skipped"
+            if future is not None:
+                if future.cancelled():
+                    terminal_kind = "canceled"
+                else:
+                    try:
+                        result = future.result()
+                    except concurrent.futures.CancelledError:
+                        terminal_kind = "canceled"
+                    except Exception:
+                        terminal_kind = "failed"
+                        log.warning(
+                            "Preload decode failed for %s",
+                            expected_path,
+                            exc_info=True,
+                        )
+
+            result_matches = False
+            if isinstance(result, tuple) and len(result) == 2:
+                result_path, result_generation = result
+                result_matches = (
+                    self._key(Path(result_path)) == self._key(expected_path)
+                    and result_generation == display_gen
+                )
+
+            # A cancellation or stale result may race another logical decode
+            # that satisfies the same requested entry. Conversely, a matching
+            # non-None result is proof that insertion was accepted (or that the
+            # entry was already present) even if later cache pressure evicts it.
+            cache_key = build_cache_key(expected_path, display_gen, cache_quality)
+            cached = self.image_cache.get(cache_key)
+            cache_satisfied = cached is not None and (
+                cache_quality == "fast"
+                or getattr(cached, "quality", "cover") == "cover"
+            )
+            succeeded = result_matches or cache_satisfied
+
+            with operation["lock"]:
+                operation["terminal"] += 1
+                if succeeded:
+                    operation["succeeded"] += 1
+                else:
+                    operation[terminal_kind] += 1
+                payload = _snapshot_locked()
+            try:
+                self._preloadProgressReady.emit(payload)
+            except RuntimeError:
+                pass
+
         if not images_to_preload:
             log.info("All images are already cached.")
-            self._update_preload_progress(100)
-            self._finish_preloading()
+            self._preloadProgressReady.emit(_snapshot_locked())
             return
 
-        # --- Setup progress tracking ---
-        # `completed` starts at the number of images already cached (that we are skipping)
-        # plus any out-of-range indices we could not submit at all.
-        completed = already_cached_count + skipped_count
-        completed_lock = threading.Lock()
-        finished_emitted = False
-
-        # Update initial progress
-        initial_progress = int((completed / total_images) * 100)
-        self._update_preload_progress(initial_progress)
-
-        def _on_done(_future):
-            nonlocal completed, finished_emitted
-            with completed_lock:
-                completed += 1
-                progress = int((completed / total_images) * 100)
-                # Check if all images (including cached/skipped ones) are accounted for.
-                should_finish = completed >= total_images and not finished_emitted
-                if should_finish:
-                    finished_emitted = True
-            self.reporter.progress_updated.emit(progress)
-            if should_finish:
-                # Decode durations can finish out of order even though execution
-                # starts farthest-first. Once every logical task is terminal,
-                # touch surviving nearby entries farthest-to-nearest so the
-                # nearest buffers have deterministic MRU order without copying
-                # or decoding them again.
-                _, _, current_display_gen = self.get_display_info()
-                if current_display_gen == display_gen:
-                    for path in nearby_paths:
-                        for cache_quality in ("cover", "fast"):
-                            self.image_cache.get(
-                                build_cache_key(
-                                    path,
-                                    display_gen,
-                                    cache_quality,
-                                )
-                            )
-                self.reporter.finished.emit()
+        # Publish the cached/skipped baseline through the same serialized path
+        # used by worker completions. Cross-thread callback emission order is not
+        # meaningful; the GUI-thread slot below applies only newer snapshots.
+        self._preloadProgressReady.emit(_snapshot_locked())
 
         # --- Submit tasks ---
         # images_to_preload is already sorted furthest -> nearest
-        for preload_order, i in enumerate(images_to_preload):
-            # For nearby images that we are forcing to re-cache, we might need to remove them first
-            # to ensure the cache actually updates the LRU position (depending on cache implementation).
-            # ByteLRUCache (cachetools) updates LRU on access (get/set), so just overwriting is fine.
-            # But we need to make sure we don't skip the task in prefetcher if it thinks it's already done.
-            # The prefetcher checks self.futures, but we are submitting new ones.
-
+        for preload_order, (i, image_path) in enumerate(images_to_preload):
             future = self.prefetcher.submit_task(
                 i,
                 self.prefetcher.generation,
@@ -10016,20 +10229,100 @@ class AppController(QObject):
                 preload_order=preload_order,
             )
             if future:
-                future.add_done_callback(_on_done)
+                future.add_done_callback(
+                    lambda fut, path=image_path: _on_done(
+                        fut,
+                        expected_path=path,
+                    )
+                )
             else:
-                # submit_task can return None (executor stopping, index out of
-                # bounds); still account for the image so preloading can finish.
-                _on_done(None)
+                _on_done(None, expected_path=image_path)
 
-    def _update_preload_progress(self, progress: int):
-        log.debug("Updating preload progress in UI: %d%%", progress)
-        self.ui_state.preloadProgress = progress
+    @Slot(object)
+    def _on_preload_progress_ready(self, payload) -> None:
+        """Apply one preload counter snapshot on the controller's Qt thread."""
+        if not isinstance(payload, dict):
+            return
+        operation = self._preload_operation
+        if operation is None or payload.get("token") != operation.get("token"):
+            return
+        if operation["finalized"]:
+            return
 
-    def _finish_preloading(self):
+        terminal = int(payload.get("terminal", 0))
+        total = max(1, int(payload.get("total", operation["total"])))
+        if terminal < operation["applied_terminal"]:
+            return
+
+        operation["applied_terminal"] = terminal
+        progress = min(100, int((terminal / total) * 100))
+        if progress > operation["applied_progress"]:
+            operation["applied_progress"] = progress
+            log.debug("Updating preload progress in UI: %d%%", progress)
+            self.ui_state.preloadProgress = progress
+
+        if terminal < total:
+            return
+        operation["finalized"] = True
+        self._finish_preloading(operation, payload)
+
+    def _finish_preloading(self, operation: dict, counters: dict) -> None:
+        """Finalize one current preload operation exactly once on the GUI thread."""
+
+        # This slot runs on the controller's Qt thread. Recompute the protected
+        # neighborhood only if the exact folder, ordered visible list, and
+        # display generation still belong to this operation.
+        _, _, current_display_gen = self.get_display_info()
+        same_dataset = self._preload_dataset_identity() == operation["dataset_identity"]
+        operation_is_current = (
+            same_dataset and current_display_gen == operation["display_generation"]
+        )
+        if operation_is_current and self.image_files:
+            current_index = max(0, min(self.current_index, len(self.image_files) - 1))
+            nearby_radius = self.prefetcher.prefetch_radius * 2
+            nearby = [
+                (image_file.path, abs(index - current_index))
+                for index, image_file in enumerate(self.image_files)
+                if abs(index - current_index) <= nearby_radius
+            ]
+            nearby.sort(key=lambda item: item[1], reverse=True)
+            for path, _distance in nearby:
+                for quality in ("cover", "fast"):
+                    self.image_cache.get(
+                        build_cache_key(
+                            path,
+                            current_display_gen,
+                            quality,
+                        )
+                    )
+
+        succeeded = int(counters.get("succeeded", 0))
+        total = int(counters.get("total", operation["total"]))
+        canceled = int(counters.get("canceled", 0))
+        failed = int(counters.get("failed", 0))
+        skipped = int(counters.get("skipped", 0))
+
+        if self._preload_operation is operation:
+            self._preload_operation = None
         self.ui_state.isPreloading = False
         self.ui_state.preloadProgress = 0
-        log.info("Finished preloading all images.")
+        if not operation_is_current:
+            message = (
+                f"Preload finished for an earlier image view: "
+                f"{succeeded}/{total} images loaded; current view changed."
+            )
+            log.warning(message)
+        elif succeeded == total:
+            message = f"Preload complete: {succeeded} images loaded."
+            log.info(message)
+        else:
+            message = (
+                f"Preload finished: {succeeded}/{total} images loaded; "
+                f"{canceled} canceled, {failed} failed, {skipped} skipped."
+            )
+            log.warning(message)
+        if not self._shutting_down:
+            self.update_status_message(message, timeout=7000)
 
     @Slot(result=int)
     def get_batch_count_for_current_image(self) -> int:
@@ -10626,6 +10919,10 @@ class AppController(QObject):
 
     def _rollback_ui_items(self, items: List[Tuple[int, Any]], job: DeleteJob) -> None:
         """Restore items to the UI list in correct order."""
+        if not items:
+            return
+        self._begin_direct_image_transition("delete rollback restored the image list")
+
         # Each saved idx is an ORIGINAL list position. During a partial rollback
         # some earlier-deleted items stay removed, so a raw insert at idx would
         # overshoot a still-missing lower position. Shift each idx left by the
@@ -10661,8 +10958,10 @@ class AppController(QObject):
             # Restore model rows (simple refresh for correctness)
             self._thumbnail_model.refresh()
 
+        self.prefetcher.set_image_files(self.image_files)
         if self.image_files:
             self.prefetcher.update_prefetch(self.current_index)
+        self._restart_quality_decode_timer()
 
         # Restore saved batch state if present
         ui = job.ui_state
@@ -10787,6 +11086,7 @@ class AppController(QObject):
         if self._block_if_saving(*[img.path for img in images_to_delete]):
             return summary
 
+        self._begin_direct_image_transition("image deletion changed the list")
         summary["requested_count"] = len(images_to_delete)
 
         # --- PHASE 1: OPTIMISTIC UI UPDATE (instant, no I/O) ---
@@ -10968,6 +11268,7 @@ class AppController(QObject):
                     self._suppressed_paths[self._key(img.raw_pair)] = now + ttl
 
         self.sync_ui_state()
+        self._restart_quality_decode_timer()
 
         # snapshot for worker: just paths. Worker checks existence dynamically.
         worker_items = [(img.path, img.raw_pair) for img in images_to_delete]
@@ -11222,6 +11523,8 @@ class AppController(QObject):
         self, target: Path, *, update_hist: bool = False
     ) -> None:
         """Centralized logic for refreshing state after an undo action."""
+        self._begin_direct_image_transition("undo rebuilt the image list")
+
         # Clear stale editor/preview state so the provider doesn't serve a
         # pre-undo preview frame.  image_editor.clear() leaves current_edits
         # populated; reset_edits() zeroes them out.
@@ -11252,6 +11555,7 @@ class AppController(QObject):
         self.prefetcher.cancel_all()
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
+        self._restart_quality_decode_timer()
 
         if update_hist and self.ui_state.isHistogramVisible:
             self.update_histogram()
@@ -11313,6 +11617,7 @@ class AppController(QObject):
                 # Restore removed items to in-memory list immediately
                 removed_items = job.removed_items
                 previous_index = job.previous_index
+                self._begin_direct_image_transition("undo restored a pending deletion")
 
                 # Re-insert in ascending index order so each insertion shifts
                 # subsequent indices correctly, restoring original positions.
@@ -11349,6 +11654,7 @@ class AppController(QObject):
                     self.sidecar.data.stacks = self.stacks
                     self._metadata_cache_index = (-1, -1)
                 self.sync_ui_state()
+                self._restart_quality_decode_timer()
 
                 count = len(removed_items)
                 self.update_status_message(
@@ -14185,7 +14491,9 @@ class AppController(QObject):
             if self._block_if_saving(current_path):
                 return
 
+            self._begin_direct_image_transition("crop mode activated")
             if not self.load_image_for_editing():
+                self._restart_quality_decode_timer()
                 return
 
             self._snapshot_crop_mode_geometry()
