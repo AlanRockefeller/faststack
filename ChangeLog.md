@@ -2,8 +2,12 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
-## 1.6.7 (2026-07-13)
+## 1.6.7 (2026-07-26)
 
+- Implemented safe multi-process sidecar merging - now having multiple Faststack windows won't clobber sidecars with old data.
+- We now watch for changes in images and load the new image - very useful if you are editing photos in Gimp or Photoshop.
+- Pressing P to open an image in Photoshop now also copies the JPG path to the clipboard, even when Photoshop opens the paired RAW file.
+- Image position is now restored by filename, folders default to filename sorting, and each folder remembers its selected sort mode. Overwriting an image no longer moves it to the end.
 - Flipping through images by holding down the arrow key is now faster and smoother.
 - If a stack input directory is detected, the Action menu now has a menuitem to switch to the stack input directory. If you switch, that menu item becomes a switch back to main photo directory menu item.
 

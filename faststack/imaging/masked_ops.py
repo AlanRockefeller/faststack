@@ -11,13 +11,9 @@ import logging
 
 import numpy as np
 
-log = logging.getLogger(__name__)
+from faststack.imaging.optional_deps import get_cv2
 
-# Optional dependency -------------------------------------------------------
-try:
-    import cv2
-except ImportError:
-    cv2 = None  # type: ignore[assignment]
+log = logging.getLogger(__name__)
 
 
 def apply_masked_darken(
@@ -51,6 +47,7 @@ def apply_masked_darken(
     if darken_amount < 0.001:
         return arr
 
+    cv2 = get_cv2()
     mask3 = mask[..., np.newaxis]  # (H, W, 1) for broadcasting
 
     # 1. Pedestal subtraction — remove the grey floor

@@ -3,10 +3,10 @@
 Each running FastStack process owns exactly one JSON file under
 ``get_app_data_dir() / "sessions"``, named by a per-launch UUID so that
 concurrent instances never clobber each other. The file records the open
-directory, current image index, and view mode. A clean shutdown deletes the
-file; a file that survives is therefore evidence that the process was killed
-(crash or reboot) while a folder was open, and is offered for reopening on the
-next launch.
+directory, current image path, index fallback, and view mode. A clean shutdown
+deletes the file; a file that survives is therefore evidence that the process
+was killed (crash or reboot) while a folder was open, and is offered for
+reopening on the next launch.
 """
 
 import ctypes
@@ -101,6 +101,10 @@ def _validated_session_payload(data: object) -> Optional[dict]:
     if isinstance(index, bool) or not isinstance(index, int):
         return None
 
+    image_path = data.get("path")
+    if image_path is not None and not isinstance(image_path, str):
+        return None
+
     grid = data.get("grid")
     if grid is not None and not isinstance(grid, bool):
         return None
@@ -120,6 +124,7 @@ def _validated_session_payload(data: object) -> Optional[dict]:
     normalized = dict(data)
     normalized["dir"] = directory
     normalized["index"] = index
+    normalized["path"] = image_path
     normalized["grid"] = grid
     normalized["pid"] = pid
     normalized["boot_id"] = boot_id
@@ -134,7 +139,13 @@ class SessionRegistry:
         self.session_id = uuid.uuid4().hex
         self.path = _sessions_dir() / f"{self.session_id}.json"
 
-    def update(self, image_dir, index: int, grid: bool) -> None:
+    def update(
+        self,
+        image_dir,
+        index: int,
+        grid: bool,
+        image_path: Optional[Path] = None,
+    ) -> None:
         """Record/refresh this instance's session file. Best-effort."""
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,6 +153,7 @@ class SessionRegistry:
             payload = {
                 "dir": str(directory),
                 "index": int(index),
+                "path": str(image_path) if image_path is not None else None,
                 "grid": bool(grid),
                 "pid": os.getpid(),
                 "boot_id": _current_boot_id(),
@@ -241,19 +253,28 @@ class SessionRegistry:
                 log.warning("Failed to prune session file %s: %s", path, e)
 
 
-def respawn_for_directory(directory: str, grid: Optional[bool]) -> None:
+def respawn_for_directory(
+    directory: str,
+    grid: Optional[bool],
+    image_path: Optional[str] = None,
+    index: Optional[int] = None,
+) -> None:
     """Launch a new FastStack process for ``directory``.
 
     Used to reopen additional folders (one window each) selected at the
-    crash-recovery prompt. The CLI path restores the folder's last index from
-    its own sidecar; ``--loupe`` is passed when the folder was last in loupe
-    view so the view mode is preserved too.
+    crash-recovery prompt. The internal CLI options restore the exact image
+    path, with the index retained as a fallback; ``--loupe`` is passed when
+    the folder was last in loupe view so the view mode is preserved too.
     """
     import subprocess
 
     args = [sys.executable, "-m", "faststack.app"]
     if grid is False:
         args.append("--loupe")
+    if image_path:
+        args.extend(["--restore-path", image_path])
+    if index is not None:
+        args.extend(["--restore-index", str(index)])
     args.append(directory)
     try:
         subprocess.Popen(args, shell=False)

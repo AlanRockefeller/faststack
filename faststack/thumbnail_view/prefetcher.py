@@ -9,7 +9,7 @@ from concurrent.futures import Future
 from contextlib import nullcontext
 from pathlib import Path
 from threading import Lock
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -18,7 +18,7 @@ import faststack.util.thumb_debug as thumb_debug
 from faststack.imaging.jpeg import _decode_with_retry
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
-from faststack.io.utils import compute_path_hash
+from faststack.io.utils import compute_path_hash, normalize_path_key
 from faststack.util.executors import create_priority_executor
 
 log = logging.getLogger(__name__)
@@ -132,6 +132,7 @@ class ThumbnailPrefetcher:
 
         # Track futures for potential cancellation
         self._futures: Dict[Tuple[int, str, int], Future] = {}
+        self._job_paths: Dict[Tuple[int, str, int], Path] = {}
 
         # If Qt is available AND a QApplication exists, forward ready notifications
         # to Qt/main thread. This prevents Qt warnings/crashes from worker-thread callbacks.
@@ -245,6 +246,7 @@ class ThumbnailPrefetcher:
                 )
 
             self._inflight[job_key] = (timer.rid if timer else 0, timer)
+            self._job_paths[job_key] = path
             thumb_debug.gauge("inflight", len(self._inflight))
 
         # Submit decode job
@@ -262,7 +264,17 @@ class ThumbnailPrefetcher:
             )
 
             with self._inflight_lock:
-                self._futures[job_key] = future
+                # A path-specific or global cancellation may have arrived
+                # between logical registration and executor submission.
+                cancelled_during_submit = job_key not in self._inflight or bool(
+                    timer and timer.cancelled
+                )
+                if not cancelled_during_submit:
+                    self._futures[job_key] = future
+
+            if cancelled_during_submit:
+                future.cancel()
+                return False
 
             # Add callback *after* registering future. If already done, add_done_callback
             # may invoke immediately in this thread, so we want state initialized first.
@@ -275,6 +287,7 @@ class ThumbnailPrefetcher:
             # Executor shutdown
             with self._inflight_lock:
                 self._inflight.pop(job_key, None)
+                self._job_paths.pop(job_key, None)
                 thumb_debug.gauge("inflight", len(self._inflight))
             return False
 
@@ -446,6 +459,7 @@ class ThumbnailPrefetcher:
             thumb_debug.gauge("inflight", len(self._inflight))
             if self._futures.get(job_key) is future:
                 del self._futures[job_key]
+            self._job_paths.pop(job_key, None)
 
         if timer:
             timer.t_done = time.perf_counter()
@@ -499,6 +513,7 @@ class ThumbnailPrefetcher:
             futures = list(self._futures.values())
             inflight_timers = [t for _, t in self._inflight.values()]
             self._futures.clear()
+            self._job_paths.clear()
             self._inflight.clear()
             thumb_debug.gauge("qdepth", 0)
             thumb_debug.gauge("inflight", 0)
@@ -513,6 +528,34 @@ class ThumbnailPrefetcher:
                 f.cancel()
             except Exception:
                 pass
+
+    def cancel_paths(self, paths: Iterable[Path | str]) -> None:
+        """Cancel queued or running thumbnail work for specific source paths."""
+        path_keys = {normalize_path_key(path) for path in paths if path is not None}
+        if not path_keys:
+            return
+
+        with self._inflight_lock:
+            cancelled = []
+            for job_key, path in list(self._job_paths.items()):
+                if normalize_path_key(path) not in path_keys:
+                    continue
+                future = self._futures.pop(job_key, None)
+                _rid, timer = self._inflight.pop(job_key, (0, None))
+                self._job_paths.pop(job_key, None)
+                cancelled.append((future, timer))
+            thumb_debug.gauge("qdepth", len(self._inflight))
+            thumb_debug.gauge("inflight", len(self._inflight))
+
+        for future, timer in cancelled:
+            if timer is not None:
+                timer.cancelled = True
+                thumb_debug.log_trace("cancel_requested", rid=timer.rid)
+            if future is not None:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
 
     def shutdown(self):
         """Shutdown the executor."""

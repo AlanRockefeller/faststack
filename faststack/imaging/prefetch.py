@@ -53,6 +53,31 @@ HELD_NAVIGATION_QUALITY_DIMENSIONS = {
     "highest": 3200,
 }
 _MIN_DIRECTION_TAIL = 4
+_JPEG_FRESH_SNAPSHOT_RETRY_DELAY = 0.2
+# A JPEG last written within this many seconds is treated as possibly still
+# being imported; anything older that fails to decode is treated as broken.
+_JPEG_FRESH_SNAPSHOT_MAX_AGE = 2.0
+
+
+def _jpeg_write_may_be_in_progress(
+    target_path: Path,
+    snapshot_size: Optional[int],
+) -> bool:
+    """Return True when a failed JPEG decode is worth retrying after a delay.
+
+    ``snapshot_size`` is the size of the mmap snapshot the failed decode read,
+    or None when the mapping itself could not be created (an empty file).
+    """
+    try:
+        st = target_path.stat()
+    except OSError:
+        return False
+    if st.st_size == 0:
+        return False
+    if snapshot_size is not None and st.st_size != snapshot_size:
+        # The file changed under the snapshot, so a re-read sees more data.
+        return True
+    return (time.time() - st.st_mtime) < _JPEG_FRESH_SNAPSHOT_MAX_AGE
 
 
 class _DecodeTaskFuture(Future):
@@ -790,6 +815,7 @@ def _decode_buffer(
     native_height = 0
     placeholder_reason = None
     is_jpeg = target_path.suffix.lower() in {".jpg", ".jpeg", ".jpe"}
+    snapshot_size: Optional[int] = None
 
     if is_jpeg:
         icc_metadata_read = False
@@ -797,6 +823,7 @@ def _decode_buffer(
             _t_read = time.perf_counter() if stats is not None else None
             with open(target_path, "rb") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                    snapshot_size = len(mmapped)
                     if stats is not None and _t_read is not None:
                         # Diagnostic-only (nav trace active): fault every page
                         # in sequentially so file I/O and antivirus scan cost
@@ -813,6 +840,7 @@ def _decode_buffer(
                             source_path=str(target_path),
                             mode=decode_quality,
                             stats=stats,
+                            log_errors=False,
                         )
                     else:
                         _t_decode = time.perf_counter() if stats is not None else None
@@ -821,6 +849,7 @@ def _decode_buffer(
                             fast_dct=fast_dct,
                             source_path=str(target_path),
                             stats=stats,
+                            log_errors=False,
                         )
                         if stats is not None and _t_decode is not None:
                             stats["jpeg_ms"] = (
@@ -884,6 +913,15 @@ def _decode_buffer(
                 log.warning("Failed to read metadata from %s: %s", target_path, e)
 
     if buffer is None:
+        # A watcher refresh can expose a newly created JPEG while an importer is
+        # still writing it. The mmap above is a fixed-size snapshot, so retry
+        # from a freshly opened file after a short delay. This also keeps a
+        # recoverable partial write from producing two decoder tracebacks.
+        # Only wait when the file still looks like it is being written: a
+        # permanently corrupt or zero-byte JPEG would otherwise add this delay
+        # to every visible navigation step onto it, forever.
+        if is_jpeg and _jpeg_write_may_be_in_progress(target_path, snapshot_size):
+            time.sleep(_JPEG_FRESH_SNAPSHOT_RETRY_DELAY)
         try:
             with PILImage.open(target_path) as img:
                 native_width, native_height = img.size

@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import ExifTags, Image, ImageFilter, ImageOps
@@ -36,15 +36,31 @@ from faststack.imaging.math_utils import (
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
 from faststack.models import DecodedImage
+from faststack.util.executors import create_daemon_threadpool_executor
 
 try:
     from PySide6.QtGui import QImage
 except ImportError:
     QImage = None
 
-from faststack.imaging.optional_deps import cv2
+from faststack.imaging.optional_deps import get_cv2
 
 log = logging.getLogger(__name__)
+
+_CV2_UNLOADED = object()
+cv2: Any = _CV2_UNLOADED
+
+
+def _get_cv2():
+    """Resolve the lazy OpenCV import while preserving module-level overrides."""
+    global cv2
+    if cv2 is _CV2_UNLOADED:
+        cv2 = get_cv2()
+    return cv2
+
+
+class EditRenderCancelled(RuntimeError):
+    """Raised when a display-only render is superseded by a newer edit."""
 
 _REPLACE_RETRY_DELAY = 0.3
 _REPLACE_MAX_RETRIES = 3
@@ -121,9 +137,48 @@ def _rec601_gray(arr: np.ndarray) -> np.ndarray:
     (Python-list coefficients), which silently doubles the memory traffic of
     every downstream blend; cv2.transform is also multithreaded.
     """
+    cv2 = _get_cv2()
     if cv2 is not None and arr.flags["C_CONTIGUOUS"]:
         return cv2.transform(arr, _REC601_LUMA.reshape(1, 3)).reshape(arr.shape[:2])
     return arr @ _REC601_LUMA
+
+
+def _apply_basic_srgb_adjustments(
+    arr: np.ndarray,
+    brightness: float,
+    contrast: float,
+    saturation: float,
+    vibrance: float,
+) -> np.ndarray:
+    """Apply the common per-pixel sRGB chain to one independent row band."""
+    cv2 = _get_cv2()
+    if abs(brightness) > 0.001:
+        arr = arr * (1.0 + brightness)
+    if abs(contrast) > 0.001:
+        contrast_factor = 1.0 + contrast * 0.4
+        arr = (arr - 0.5) * contrast_factor + 0.5
+
+    if abs(saturation) > 0.001:
+        factor = 1.0 + saturation * 0.5
+        gray = _rec601_gray(arr)[..., None]
+        arr = gray + (arr - gray) * factor
+
+    if abs(vibrance) > 0.001:
+        if cv2 is not None:
+            cmax = cv2.max(cv2.max(arr[:, :, 0], arr[:, :, 1]), arr[:, :, 2])
+            cmin = cv2.min(cv2.min(arr[:, :, 0], arr[:, :, 1]), arr[:, :, 2])
+        else:
+            cmax = arr.max(axis=2)
+            cmin = arr.min(axis=2)
+        delta = cmax - cmin
+        sat = np.zeros_like(cmax)
+        np.divide(delta, cmax, out=sat, where=cmax > 0.0001)
+        sat_mask = np.clip(1.0 - sat, 0.0, 1.0)
+        factor = 1.0 + vibrance * sat_mask
+        gray = _rec601_gray(arr)[..., None]
+        arr = gray + (arr - gray) * factor[..., None]
+
+    return arr
 
 
 def _float01_to_u8(arr: np.ndarray) -> np.ndarray:
@@ -133,6 +188,7 @@ def _float01_to_u8(arr: np.ndarray) -> np.ndarray:
     pass (the numpy fallback truncates instead of rounding — a <=1 LSB
     difference well below JPEG encoding noise).
     """
+    cv2 = _get_cv2()
     clipped = np.clip(arr, 0.0, 1.0)
     if cv2 is not None:
         return cv2.convertScaleAbs(clipped, alpha=255.0)
@@ -310,6 +366,7 @@ def _gaussian_blur_float(arr: np.ndarray, radius: float) -> np.ndarray:
     if radius <= 0:
         return arr
 
+    cv2 = _get_cv2()
     if cv2 is None:
         # Fallback (only used when OpenCV is unavailable): Pillow's GaussianBlur
         # doesn't support float32 ('F' mode isn't supported by its filters), so we
@@ -867,6 +924,7 @@ class ImageEditor:
             log.error("Image file not found: %s", filepath)
             return False
 
+        cv2 = _get_cv2()
         load_filepath = Path(filepath)
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
@@ -1223,6 +1281,7 @@ class ImageEditor:
         if abs(angle_deg) < 0.01:
             return img_arr
 
+        cv2 = _get_cv2()
         h, w = img_arr.shape[:2]
         if expand:
             new_w, new_h = _expanded_canvas_size(w, h, angle_deg)
@@ -1282,6 +1341,7 @@ class ImageEditor:
         update_highlight_state: bool = True,
         downscale_long_edge: Optional[int] = None,
         protect_input: bool = False,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
         Returns float32 array (H, W, 3).
@@ -1300,7 +1360,12 @@ class ImageEditor:
         downscale, the working array is copied only if it still shares memory
         with ``img_arr``. Cropping then copies just the cropped region instead
         of the whole master, and a downscale already produced fresh memory.
+
+        ``cancel_check`` is reserved for discardable display renders. It is
+        sampled between expensive stages so idle refinement can yield when a
+        newer edit revision arrives. Export callers never pass it.
         """
+        cv2 = _get_cv2()
         if edits is None:
             edits = self.current_edits
         use_levels_soft_knee = (
@@ -1318,6 +1383,22 @@ class ImageEditor:
         def _mark(stage: str) -> None:
             if debug_stage_marks is not None:
                 debug_stage_marks.append((stage, time.perf_counter()))
+
+        def _check_cancelled() -> None:
+            if cancel_check is not None and cancel_check():
+                raise EditRenderCancelled
+
+        def _cancellable_rows(operation, source: np.ndarray) -> np.ndarray:
+            if cancel_check is None or source.shape[0] < 8:
+                return operation(source)
+            output = np.empty_like(source)
+            band_height = max(1, math.ceil(source.shape[0] / 8))
+            for top in range(0, source.shape[0], band_height):
+                _check_cancelled()
+                bottom = min(source.shape[0], top + band_height)
+                output[top:bottom] = operation(source[top:bottom])
+            _check_cancelled()
+            return output
 
         # Alias
         arr = img_arr
@@ -1443,6 +1524,7 @@ class ImageEditor:
             )
 
         _mark("geometry")
+        _check_cancelled()
 
         # 4. Display-size downscale (display-only renders)
         # Tonal edits below are per-pixel, so applying them to an INTER_AREA
@@ -1459,6 +1541,7 @@ class ImageEditor:
                 arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
         _mark("downscale")
+        _check_cancelled()
 
         # Detach from a shared input buffer before any tonal op can touch it.
         # Everything below either reassigns or mutates `arr` in place (vignette,
@@ -1535,6 +1618,7 @@ class ImageEditor:
                     self._last_highlight_state = analysis_state
 
             _mark("skip_linear")
+            _check_cancelled()
 
         if not _skip_linear:
             # Capture strided view for analysis ONLY if needed
@@ -1565,8 +1649,9 @@ class ImageEditor:
 
             # Base image data is always in [0, 1], so the clamped LUT version
             # is safe here; headroom (>1.0) only appears later, in linear space.
-            arr = _srgb_to_linear_fast(arr)
+            arr = _cancellable_rows(_srgb_to_linear_fast, arr)
             _mark("linear_convert")
+            _check_cancelled()
 
             # 6. White Balance (Multipliers in Linear Space)
             by = edits.get("white_balance_by", 0.0) * 0.5
@@ -1655,6 +1740,7 @@ class ImageEditor:
                 )
 
             _mark("linear_tone")
+            _check_cancelled()
 
             # 9-11. Clarity / Texture / Sharpness (Unified Pyramid Detail Bands)
             #
@@ -1840,65 +1926,81 @@ class ImageEditor:
                 arr *= gain[..., None]
 
             _mark("detail_bands")
+            _check_cancelled()
 
             # 12. Global Headroom Shoulder (safety net for values > 1.0)
             # This ONLY affects values above 1.0, compressing headroom smoothly.
             # It does NOT interfere with normal highlight slider work below 1.0.
             # Applied here in linear space before gamma conversion.
             # Use small max_overshoot (0.05) to keep values very close to 1.0
-            arr = _apply_headroom_shoulder(arr, max_overshoot=0.05)
+            arr = _cancellable_rows(
+                lambda band: _apply_headroom_shoulder(band, max_overshoot=0.05),
+                arr,
+            )
 
             # 13. Conversion back to sRGB
             # The headroom shoulder above caps values at 1.05, inside the LUT
             # domain, so the fast version is exact here (within quantization).
-            arr = _linear_to_srgb_fast(arr)
+            arr = _cancellable_rows(_linear_to_srgb_fast, arr)
             _mark("linear_exit")
+            _check_cancelled()
 
         # --- sRGB Space Operations ---
         # NOTE: All operations below must be non-mutating (use reassignment) when
         # _skip_linear=True and for_export=True to avoid corrupting self.float_image.
         # Vignette is excluded from the no-copy path because it uses in-place math.
 
-        # 14. Brightness (sRGB Space)
+        # 14-17. Common scalar sRGB adjustments. Export processes independent
+        # row bands on a small scoped daemon pool; the save worker waits for
+        # every future here, so no Qt handoff or staleness token is involved.
         b_val = edits.get("brightness", 0.0)
-        if abs(b_val) > 0.001:
-            factor = 1.0 + b_val
-            arr = arr * factor
-
-        # 15. Contrast (sRGB Space)
         c_val = edits.get("contrast", 0.0)
-        if abs(c_val) > 0.001:
-            # Scale effect to reduce sensitivity (0.4x)
-            factor = 1.0 + c_val * 0.4
-            arr = (arr - 0.5) * factor + 0.5
-
-        # 16. Saturation (sRGB Space)
         sat_val = edits.get("saturation", 0.0)
-        if abs(sat_val) > 0.001:
-            # Scale effect to reduce sensitivity (0.5x)
-            factor = 1.0 + sat_val * 0.5
-            gray = _rec601_gray(arr)[..., None]
-            arr = gray + (arr - gray) * factor
-
-        # 17. Vibrance (Smart Saturation)
         vibrance = edits.get("vibrance", 0.0)
-        if abs(vibrance) > 0.001:
-            if cv2 is not None:
-                # ~3x faster than numpy axis reductions at full resolution
-                cmax = cv2.max(cv2.max(arr[:, :, 0], arr[:, :, 1]), arr[:, :, 2])
-                cmin = cv2.min(cv2.min(arr[:, :, 0], arr[:, :, 1]), arr[:, :, 2])
-            else:
-                cmax = arr.max(axis=2)
-                cmin = arr.min(axis=2)
-            delta = cmax - cmin
-            sat = np.zeros_like(cmax)
-            np.divide(delta, cmax, out=sat, where=cmax > 0.0001)
+        basic_srgb_active = any(
+            abs(value) > 0.001 for value in (b_val, c_val, sat_val, vibrance)
+        )
+        if basic_srgb_active and cancel_check is not None:
+            output = np.empty_like(arr)
+            band_height = max(1, math.ceil(arr.shape[0] / 8))
+            for top in range(0, arr.shape[0], band_height):
+                _check_cancelled()
+                bottom = min(arr.shape[0], top + band_height)
+                output[top:bottom] = _apply_basic_srgb_adjustments(
+                    arr[top:bottom], b_val, c_val, sat_val, vibrance
+                )
+            arr = output
+        elif basic_srgb_active and for_export and arr.shape[0] * arr.shape[1] >= 4_000_000:
+            output = np.empty_like(arr)
+            band_height = math.ceil(arr.shape[0] / 2)
+            executor = create_daemon_threadpool_executor(
+                max_workers=2,
+                thread_name_prefix="ExportPixels",
+            )
+            try:
+                futures = []
+                for top in range(0, arr.shape[0], band_height):
+                    bottom = min(arr.shape[0], top + band_height)
+                    future = executor.submit(
+                        _apply_basic_srgb_adjustments,
+                        arr[top:bottom],
+                        b_val,
+                        c_val,
+                        sat_val,
+                        vibrance,
+                    )
+                    futures.append((top, bottom, future))
+                for top, bottom, future in futures:
+                    output[top:bottom] = future.result()
+                arr = output
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+        elif basic_srgb_active:
+            arr = _apply_basic_srgb_adjustments(
+                arr, b_val, c_val, sat_val, vibrance
+            )
 
-            sat_mask = np.clip(1.0 - sat, 0.0, 1.0)
-            factor = 1.0 + vibrance * sat_mask
-
-            gray = _rec601_gray(arr)[..., None]
-            arr = gray + (arr - gray) * np.expand_dims(factor, axis=2)
+        _check_cancelled()
 
         # 18. Per-hue saturation (color mix bank)
         # Eight hue bands each scale chroma toward Rec.601 gray, hue-targeted via
@@ -1952,6 +2054,8 @@ class ImageEditor:
             gray = _rec601_gray(arr)[..., None]
             arr = gray + (arr - gray) * (1.0 + factor)[..., None]
 
+        _check_cancelled()
+
         # 19. Levels (Blacks/Whites)
         blacks = edits.get("blacks", 0.0)
         whites = edits.get("whites", 0.0)
@@ -1964,6 +2068,8 @@ class ImageEditor:
             if use_levels_soft_knee:
                 # The ramp above allocates, so in-place soft clip is safe.
                 arr = _apply_levels_soft_clip(arr)
+
+        _check_cancelled()
 
         # 19.5. Background Darkening (masked, after levels, before vignette)
         darken = edits.get("darken_settings")
@@ -1999,6 +2105,8 @@ class ImageEditor:
                     edge_protection=darken.edge_protection,
                 )
 
+        _check_cancelled()
+
         _mark("srgb_ops")
 
         # 20. Vignette
@@ -2018,6 +2126,7 @@ class ImageEditor:
                 arr *= np.expand_dims(gain, axis=2)
 
         _mark("vignette")
+        _check_cancelled()
 
         # Export contract: return in [0,1] sRGB when skip_linear (no tone mapping
         # was applied, just sRGB-space ops). save_image also clips, but this
@@ -2730,6 +2839,7 @@ class ImageEditor:
         allow_compute: bool = True,
         edits_override: Optional[Dict[str, Any]] = None,
         output_size: Optional[Tuple[int, int]] = None,
+        downscale_long_edge: Optional[int] = None,
     ) -> Optional[DecodedImage]:
         """Return cached preview if available, otherwise compute and cache.
 
@@ -2739,6 +2849,8 @@ class ImageEditor:
                 to (aspect-guarded). Keeps live-preview dimensions stable across
                 the full-resolution refinement swap so it cannot nudge the
                 fitted image. The unresized render is what gets cached.
+            downscale_long_edge: Optional cap applied before tonal edits for a
+                discardable reduced-resolution drag render.
         """
         cached: Optional[DecodedImage] = None
         with self._lock:
@@ -2780,12 +2892,20 @@ class ImageEditor:
             for_export=False,
             apply_loupe_color=True,
             icc_bytes=icc_bytes,
+            downscale_long_edge=downscale_long_edge,
             protect_input=True,
         )
 
         with self._lock:
-            # Only cache if revision hasn't changed during computation
-            if edits_override is None and self._edits_rev == rev:
+            # Only canonical quick renders may populate the revision cache.
+            # Drag renders are intentionally degraded; caching one under only
+            # _edits_rev would let the final soft frame poison consumers when
+            # refinement is suppressed (for example while zoomed/cropping).
+            if (
+                edits_override is None
+                and downscale_long_edge is None
+                and self._edits_rev == rev
+            ):
                 self._cached_preview = decoded
                 self._cached_rev = rev
 
@@ -2802,6 +2922,7 @@ class ImageEditor:
         target recorded before a geometry edit must not distort the frame);
         the unresized frame is always correct, just at other dimensions.
         """
+        cv2 = _get_cv2()
         if decoded is None or output_size is None or cv2 is None:
             return decoded
         if QImage is None or decoded.format != QImage.Format.Format_RGB888:
@@ -2842,8 +2963,10 @@ class ImageEditor:
         cache_context: Optional[dict] = None,
         downscale_long_edge: Optional[int] = None,
         protect_input: bool = False,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> DecodedImage:
         """Render edits against a float RGB array and package it for Qt display."""
+        cv2 = _get_cv2()
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
@@ -2854,7 +2977,10 @@ class ImageEditor:
             cache_context=cache_context,
             downscale_long_edge=downscale_long_edge,
             protect_input=protect_input,
+            cancel_check=cancel_check,
         )
+        if cancel_check is not None and cancel_check():
+            raise EditRenderCancelled
         if _debug:
             t_apply = time.perf_counter()
         # _apply_edits returns either a fresh array or a view of `base`; every
@@ -2872,6 +2998,8 @@ class ImageEditor:
             t_u8 = time.perf_counter()
         if apply_loupe_color:
             arr_u8 = apply_loupe_color_correction(arr_u8, icc_bytes=icc_bytes)
+        if cancel_check is not None and cancel_check():
+            raise EditRenderCancelled
         if _debug:
             t_color = time.perf_counter()
             log.debug(
@@ -2909,6 +3037,7 @@ class ImageEditor:
         self,
         max_long_edge: Optional[int] = None,
         edits_override: Optional[Dict[str, Any]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Optional[DecodedImage]:
         """Apply current edits to the full-resolution master for live display.
 
@@ -2951,6 +3080,7 @@ class ImageEditor:
             cache_context={},
             downscale_long_edge=max_long_edge,
             protect_input=True,
+            cancel_check=cancel_check,
         )
 
     def _crop_only_edits(self, edits: Dict[str, Any]) -> Dict[str, Any]:
@@ -2962,6 +3092,7 @@ class ImageEditor:
 
     def _float_preview_from_master(self) -> Optional[np.ndarray]:
         """Build a display-sized source-space preview from the unedited master."""
+        cv2 = _get_cv2()
         with self._lock:
             if self.float_preview is not None:
                 return self.float_preview.copy()
@@ -3492,6 +3623,7 @@ class ImageEditor:
         Writes a float32 (0-1) numpy array as an uncompressed 16-bit RGB TIFF using OpenCV.
         arr_float shape: (H, W, 3)
         """
+        cv2 = _get_cv2()
         if cv2 is None:
             raise RuntimeError("Saving 16-bit TIFF requires OpenCV")
 
