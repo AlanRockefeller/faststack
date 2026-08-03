@@ -628,7 +628,9 @@ class UIState(QObject):
 
     isZoomedChanged = Signal()
     statusMessageChanged = Signal()  # New signal for status messages
-    statusMessageColorChanged = Signal()  # Optional override color for the status message
+    statusMessageColorChanged = (
+        Signal()
+    )  # Optional override color for the status message
     resetZoomPanRequested = Signal()  # Signal to tell QML to reset zoom/pan
     absoluteZoomRequested = Signal(
         float

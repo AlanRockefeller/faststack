@@ -12563,9 +12563,7 @@ class AppController(QObject):
         self.ui_state.resetZoomPan()
         self.update_status_message("Reset zoom and pan")
 
-    def update_status_message(
-        self, message: str, timeout: int = 3000, color: str = ""
-    ):
+    def update_status_message(self, message: str, timeout: int = 3000, color: str = ""):
         """
         Updates the UI status message and clears it after a timeout.
 
@@ -12596,7 +12594,9 @@ class AppController(QObject):
         if TURBO_AVAILABLE:
             return
         self._turbo_fallback_warning_shown = True
-        log.warning("TurboJPEG not available - falling back to Pillow (slower decoding)")
+        log.warning(
+            "TurboJPEG not available - falling back to Pillow (slower decoding)"
+        )
         self.update_status_message(
             "TurboJPEG not installed - using slower Pillow decoding. "
             "Install PyTurboJPEG for faster image loading.",
@@ -14280,8 +14280,7 @@ class AppController(QObject):
 
         now = time.monotonic()
         frequent_quick_kick = (
-            not render_full_resolution
-            and now - self._last_quick_preview_kick_at <= 0.3
+            not render_full_resolution and now - self._last_quick_preview_kick_at <= 0.3
         )
         if not render_full_resolution:
             self._last_quick_preview_kick_at = now

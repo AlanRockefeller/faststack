@@ -62,6 +62,7 @@ def _get_cv2():
 class EditRenderCancelled(RuntimeError):
     """Raised when a display-only render is superseded by a newer edit."""
 
+
 _REPLACE_RETRY_DELAY = 0.3
 _REPLACE_MAX_RETRIES = 3
 _AUTO_VIBRANCE_MAX = 0.18
@@ -1970,7 +1971,11 @@ class ImageEditor:
                     arr[top:bottom], b_val, c_val, sat_val, vibrance
                 )
             arr = output
-        elif basic_srgb_active and for_export and arr.shape[0] * arr.shape[1] >= 4_000_000:
+        elif (
+            basic_srgb_active
+            and for_export
+            and arr.shape[0] * arr.shape[1] >= 4_000_000
+        ):
             output = np.empty_like(arr)
             band_height = math.ceil(arr.shape[0] / 2)
             executor = create_daemon_threadpool_executor(
@@ -1996,9 +2001,7 @@ class ImageEditor:
             finally:
                 executor.shutdown(wait=True, cancel_futures=True)
         elif basic_srgb_active:
-            arr = _apply_basic_srgb_adjustments(
-                arr, b_val, c_val, sat_val, vibrance
-            )
+            arr = _apply_basic_srgb_adjustments(arr, b_val, c_val, sat_val, vibrance)
 
         _check_cancelled()
 
