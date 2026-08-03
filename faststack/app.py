@@ -296,6 +296,7 @@ class AppController(QObject):
     _pacedNavigationReady = Signal(object)  # Exact fast-tier target is cache-ready
     _frameSwapObserved = Signal(float)  # render-thread timestamp -> GUI thread
     _preloadProgressReady = Signal(object)  # Worker counters -> GUI thread
+    _indexScanReady = Signal(object)  # (images, variant_map) or None -> GUI thread
 
     def __init__(
         self,
@@ -369,6 +370,22 @@ class AppController(QObject):
         )
         self._updateCheckFinished.connect(self._on_update_check_finished)
         self._qualityDecodeFinished.connect(self._on_quality_decode_finished)
+
+        # Directory scan offloading for watcher-triggered rescans (single
+        # worker: only one directory walk is ever useful in flight at once).
+        # See _maybe_start_index_scan() for the throttle/coalescing that
+        # bounds how often this actually runs under sustained file churn.
+        self._index_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="IndexScan"
+        )
+        self._index_scan_inflight = False
+        self._index_rescan_needed = False
+        self._last_index_scan_time: float = 0.0
+        # Minimum wall-clock spacing between watcher-triggered full directory
+        # scans. Caps CPU spent rescanning when something external is
+        # touching many files in a row (e.g. a lingering save/export queue).
+        self._index_scan_min_interval_s = 1.0
+        self._indexScanReady.connect(self._on_index_scan_ready)
         self._pacedNavigationReady.connect(self._on_paced_navigation_ready)
         self._preloadProgressReady.connect(self._on_preload_progress_ready)
         self._update_check_token = 0
@@ -831,6 +848,15 @@ class AppController(QObject):
         self._watcher_debounce_timer.setSingleShot(True)
         self._watcher_debounce_timer.setInterval(200)  # 200ms debounce
         self._watcher_debounce_timer.timeout.connect(self._on_watcher_refresh)
+
+        # Throttle retry timer: when a watcher refresh arrives sooner than
+        # _index_scan_min_interval_s after the last scan started, the scan
+        # is deferred to fire here instead of immediately.
+        self._index_throttle_timer = QTimer(self)
+        self._index_throttle_timer.setSingleShot(True)
+        self._index_throttle_timer.timeout.connect(
+            lambda: self._maybe_start_index_scan()
+        )
 
         # Periodic summary for thumbnail debug logging
         if self.debug_thumb_timing or self.debug_thumb_trace:
@@ -2282,15 +2308,84 @@ class AppController(QObject):
 
     @Slot()
     def _on_watcher_refresh(self):
-        """Watcher debounce handler: rescan disk and keep UI consistent.
+        """Watcher debounce handler: kick off a (throttled, background) rescan.
+
+        The actual directory walk runs off the GUI thread via
+        _maybe_start_index_scan()/_start_index_scan() so that a burst of
+        filesystem churn (e.g. an external process rewriting many files)
+        cannot repeatedly block the UI thread. Completion is handled by
+        _on_index_scan_ready().
+        """
+        self._maybe_start_index_scan()
+
+    def _maybe_start_index_scan(self) -> None:
+        """Starts a background directory scan, subject to throttling.
+
+        At most one scan runs at a time (single-worker executor), and scans
+        are capped to _index_scan_min_interval_s apart no matter how often
+        the watcher fires — otherwise sustained external file churn (a
+        lingering save/export queue, a sync client, etc.) could keep the
+        directory walk running back-to-back indefinitely.
+        """
+        if self._index_scan_inflight:
+            # A scan is already running; make sure we scan again once it
+            # finishes so this change isn't lost.
+            self._index_rescan_needed = True
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._last_index_scan_time
+        if elapsed < self._index_scan_min_interval_s:
+            self._index_rescan_needed = True
+            remaining_ms = int((self._index_scan_min_interval_s - elapsed) * 1000) + 1
+            if not self._index_throttle_timer.isActive():
+                self._index_throttle_timer.start(remaining_ms)
+            return
+
+        self._start_index_scan()
+
+    def _start_index_scan(self) -> None:
+        """Submits the directory walk to the background index executor."""
+        clear_raw_count_cache()
+        self._index_scan_inflight = True
+        self._index_rescan_needed = False
+        self._last_index_scan_time = time.monotonic()
+        self._scan_count_variant += 1
+
+        fut = self._index_executor.submit(find_images_with_variants, self.image_dir)
+        fut.add_done_callback(self._on_index_scan_done)
+
+    def _on_index_scan_done(self, fut: concurrent.futures.Future) -> None:
+        """Runs on the index executor's worker thread — no QObject access here."""
+        try:
+            result = fut.result()
+        except Exception as e:
+            log.error("Background directory scan failed: %s", e)
+            result = None
+        self._indexScanReady.emit(result)
+
+    @Slot(object)
+    def _on_index_scan_ready(self, result) -> None:
+        """GUI-thread continuation of a watcher-triggered background scan.
 
         Unlike bare refresh_image_list(), this clamps current_index,
         updates the prefetcher, and syncs the UI so the display never
         references an out-of-bounds index.
         """
+        self._index_scan_inflight = False
+
+        if result is None:
+            if self._index_rescan_needed:
+                self._maybe_start_index_scan()
+            return
+
+        images, variant_map = result
+
         self._begin_direct_image_transition("watcher rebuilt the image list")
 
-        # Remember which image we were viewing so we can stay on it
+        # Remember which image we were viewing so we can stay on it. Read
+        # now (not at scan-submission time) since the user may have kept
+        # navigating while the scan ran in the background.
         preserved_path = None
         if self.image_files and 0 <= self.current_index < len(self.image_files):
             preserved_path = self.image_files[self.current_index].path
@@ -2299,7 +2394,12 @@ class AppController(QObject):
             changed_paths = self._watcher_changed_paths
             self._watcher_changed_paths = set()
 
-        self.refresh_image_list(notify=False)
+        self._all_images = images
+        self._variant_map = variant_map
+        self._apply_filter_to_cached_list(notify=False)
+        self._grid_model_dirty = True
+        if self._thumbnail_model and self._is_grid_view_active:
+            self._refresh_thumbnail_model_from_controller()
 
         # Bust decode caches so modified-on-disk files are re-decoded.
         # Invalidate only the files the watcher reported (a save produces a
@@ -2338,6 +2438,10 @@ class AppController(QObject):
         self._do_prefetch(self.current_index)
         self.sync_ui_state(image_count_changed=True)
         self._restart_quality_decode_timer()
+
+        # More changes arrived (or were throttled) during this scan — go again.
+        if self._index_rescan_needed:
+            self._maybe_start_index_scan()
 
     def _apply_filter_to_cached_list(self, *, notify: bool = True):
         """Applies current filter to cached image list without disk I/O."""
@@ -11226,6 +11330,8 @@ class AppController(QObject):
         # Coalesce with watcher: if we are doing a delete refresh, we don't
         # need a separate watcher refresh immediately after.
         self._watcher_debounce_timer.stop()
+        self._index_throttle_timer.stop()
+        self._index_rescan_needed = False
 
         clear_raw_count_cache()
         self._rebuild_path_to_index()
@@ -12058,6 +12164,7 @@ class AppController(QObject):
             self._metadata_debounce_timer.stop()
             self._exif_debounce_timer.stop()
             self._watcher_debounce_timer.stop()
+            self._index_throttle_timer.stop()
             self._auto_adjust_save_timer.stop()
             self._quality_decode_timer.stop()
             self._session_save_timer.stop()
@@ -12161,6 +12268,11 @@ class AppController(QObject):
         self._safe_shutdown_executor(
             getattr(self, "_update_executor", None),
             "update",
+            wait=False,
+        )
+        self._safe_shutdown_executor(
+            getattr(self, "_index_executor", None),
+            "index scan",
             wait=False,
         )
         # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
