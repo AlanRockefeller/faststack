@@ -2383,14 +2383,24 @@ class AppController(QObject):
 
     def _start_index_scan(self) -> None:
         """Submits the directory walk to the background index executor."""
+        if getattr(self, "_shutting_down", False):
+            return
+
         clear_raw_count_cache()
         self._index_scan_inflight = True
         self._index_rescan_needed = False
         self._last_index_scan_time = time.monotonic()
         self._scan_count_variant += 1
 
-        fut = self._index_executor.submit(find_images_with_variants, self.image_dir)
-        fut.add_done_callback(self._on_index_scan_done)
+        try:
+            fut = self._index_executor.submit(find_images_with_variants, self.image_dir)
+            fut.add_done_callback(self._on_index_scan_done)
+        except RuntimeError:
+            # Executor already shut down; leave no inflight flag behind or the
+            # next watcher tick would think a scan is still running.
+            log.warning("Index executor failed (shutting down?)")
+            self._index_scan_inflight = False
+            return
 
     def _on_index_scan_done(self, fut: concurrent.futures.Future) -> None:
         """Runs on the index executor's worker thread — no QObject access here."""
@@ -2409,6 +2419,10 @@ class AppController(QObject):
         updates the prefetcher, and syncs the UI so the display never
         references an out-of-bounds index.
         """
+        if getattr(self, "_shutting_down", False):
+            self._index_scan_inflight = False
+            return
+
         self._index_scan_inflight = False
 
         if result is None:
