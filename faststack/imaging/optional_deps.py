@@ -22,7 +22,11 @@ def get_cv2() -> Optional[ModuleType]:
             if _cv2 is _UNLOADED:
                 try:
                     _cv2 = importlib.import_module("cv2")
-                except ImportError:
+                except Exception:
+                    # Not just ImportError: a broken OpenCV build can raise at
+                    # import time (missing shared libs, bad numpy ABI). Cache
+                    # the failure so callers fall back to Pillow instead of
+                    # retrying the import or seeing it propagate.
                     _cv2 = None
                     log.debug("OpenCV is not available", exc_info=True)
     return cast(Optional[ModuleType], _cv2)

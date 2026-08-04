@@ -1181,6 +1181,14 @@ class UIState(QObject):
         if self._status_message != value:
             self._status_message = value
             self.statusMessageChanged.emit()
+            # A new status text always starts with the default color; callers
+            # that want a colored message (e.g. update_status_message) must
+            # set statusMessageColor *after* statusMessage. This keeps a
+            # stale override (e.g. a yellow warning) from leaking onto later
+            # messages that replace the text without touching the color.
+            if self._status_message_color != "":
+                self._status_message_color = ""
+                self.statusMessageColorChanged.emit()
 
     @Property(str, notify=statusMessageColorChanged)
     def statusMessageColor(self):

@@ -398,7 +398,6 @@ def resolve_mask(
     *image_arr* is the current sRGB float32 (H, W, 3) image used for
     edge-aware analysis.  *shape* must match ``image_arr.shape[:2]``.
     """
-    cv2 = get_cv2()
     geo_hash = _geometry_hash(edits)
     params_key = settings.params_tuple()
     img_key = _image_content_key(image_arr)
@@ -495,7 +494,8 @@ def resolve_mask(
 
     # --- Expand / contract ---
     ec = settings.expand_contract
-    if abs(ec) > 0.01 and cv2 is not None:
+    cv2 = get_cv2() if abs(ec) > 0.01 else None
+    if cv2 is not None:
         ksize = max(3, int(abs(ec) * min(shape) * 0.02)) | 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
         if ec > 0:

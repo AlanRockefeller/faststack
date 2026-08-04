@@ -1962,15 +1962,12 @@ class ImageEditor:
             abs(value) > 0.001 for value in (b_val, c_val, sat_val, vibrance)
         )
         if basic_srgb_active and cancel_check is not None:
-            output = np.empty_like(arr)
-            band_height = max(1, math.ceil(arr.shape[0] / 8))
-            for top in range(0, arr.shape[0], band_height):
-                _check_cancelled()
-                bottom = min(arr.shape[0], top + band_height)
-                output[top:bottom] = _apply_basic_srgb_adjustments(
-                    arr[top:bottom], b_val, c_val, sat_val, vibrance
-                )
-            arr = output
+            arr = _cancellable_rows(
+                lambda band: _apply_basic_srgb_adjustments(
+                    band, b_val, c_val, sat_val, vibrance
+                ),
+                arr,
+            )
         elif (
             basic_srgb_active
             and for_export

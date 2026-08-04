@@ -259,6 +259,9 @@ CACHE_THRASH_WINDOW_SECS = 2.0
 CACHE_THRASH_THRESHOLD = 5
 CACHE_WARNING_COOLDOWN_SECS = 300
 
+# Sort modes accepted from the sidecar and from set_sort_mode().
+SUPPORTED_SORT_MODES = ("default", "filename", "date", "date_reverse")
+
 
 from faststack.util.executors import create_daemon_threadpool_executor
 
@@ -719,19 +722,7 @@ class AppController(QObject):
             []
         )  # Active flag filters (e.g. ["uploaded", "stacked"])
         self._filter_enabled: bool = False
-        saved_sort_mode = self.sidecar.data.sort_mode
-        if saved_sort_mode in ("default", "filename", "date", "date_reverse"):
-            self.sort_mode = saved_sort_mode
-        elif self.sidecar.data.stacks:
-            # Legacy stack ranges were recorded against the historical
-            # timestamp-based default order. Preserve that order until the
-            # user explicitly chooses a different sort.
-            self.sort_mode = "default"
-        else:
-            # Stable camera filenames do not change when an external editor
-            # replaces a JPG, unlike filesystem modification timestamps.
-            self.sort_mode = "filename"
-        self.sidecar.data.sort_mode = self.sort_mode
+        self._adopt_saved_sort_mode()
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
@@ -1140,9 +1131,29 @@ class AppController(QObject):
     def get_sort_mode(self):
         return self.sort_mode
 
+    def _adopt_saved_sort_mode(self) -> None:
+        """Take the sort mode from the current sidecar, deriving one if absent.
+
+        Used both at startup and when switching directories, so the derived
+        fallback stays identical in both places.
+        """
+        saved_sort_mode = self.sidecar.data.sort_mode
+        if saved_sort_mode in SUPPORTED_SORT_MODES:
+            self.sort_mode = saved_sort_mode
+        elif self.sidecar.data.stacks:
+            # Legacy stack ranges were recorded against the historical
+            # timestamp-based default order. Preserve that order until the
+            # user explicitly chooses a different sort.
+            self.sort_mode = "default"
+        else:
+            # Stable camera filenames do not change when an external editor
+            # replaces a JPG, unlike filesystem modification timestamps.
+            self.sort_mode = "filename"
+        self.sidecar.data.sort_mode = self.sort_mode
+
     @Slot(str)
     def set_sort_mode(self, mode: str):
-        if mode not in ("default", "filename", "date", "date_reverse"):
+        if mode not in SUPPORTED_SORT_MODES:
             return
         if self.sort_mode == mode:
             return
@@ -2234,14 +2245,40 @@ class AppController(QObject):
                 expiry = self._suppressed_paths.get(key)
                 if expiry:
                     if now < expiry:
+                        # An external tool (Photoshop, GIMP, ...) can overwrite
+                        # this path during our own suppression window, right
+                        # after FastStack's save already completed. Compare
+                        # against the fingerprint recorded the last time we
+                        # invalidated the decode cache for this path: if the
+                        # file no longer matches, this is a genuine external
+                        # write and must not be silently dropped, or the
+                        # external content would stay absent from the
+                        # display/cache until some unrelated later event.
+                        current_fingerprint = self._file_state_fingerprint(p)
+                        with self._decode_invalidation_lock:
+                            epoch_entry = self._decode_invalidation_epochs.get(key)
+                        expected_fingerprint = epoch_entry[1] if epoch_entry else None
+                        if (
+                            current_fingerprint is None
+                            or expected_fingerprint is None
+                            or current_fingerprint == expected_fingerprint
+                        ):
+                            if _debug_mode:
+                                log.debug(
+                                    "Suppressing watcher refresh for recently deleted path: %s",
+                                    path,
+                                )
+                            return
                         if _debug_mode:
                             log.debug(
-                                "Suppressing watcher refresh for recently deleted path: %s",
+                                "Not suppressing watcher refresh for %s: "
+                                "on-disk state changed during suppression "
+                                "window (external write)",
                                 path,
                             )
-                        return
-                    # Cleanup expired entry
-                    del self._suppressed_paths[key]
+                    else:
+                        # Cleanup expired entry
+                        del self._suppressed_paths[key]
             with self._watcher_changed_lock:
                 self._watcher_changed_paths.add(p)
         else:
@@ -10242,14 +10279,7 @@ class AppController(QObject):
         # Reinitialize directory-bound components
         self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
-        saved_sort_mode = self.sidecar.data.sort_mode
-        if saved_sort_mode in ("default", "filename", "date", "date_reverse"):
-            self.sort_mode = saved_sort_mode
-        elif self.sidecar.data.stacks:
-            self.sort_mode = "default"
-        else:
-            self.sort_mode = "filename"
-        self.sidecar.data.sort_mode = self.sort_mode
+        self._adopt_saved_sort_mode()
         self.ui_state.sortModeChanged.emit()
 
         # Only update recycle bin when switching base directories (not subfolder navigation)
@@ -12693,8 +12723,10 @@ class AppController(QObject):
                 self.ui_state.statusMessage = ""
                 self.ui_state.statusMessageColor = ""
 
-        self.ui_state.statusMessageColor = color
+        # statusMessage's setter resets statusMessageColor to "" as soon as
+        # the text changes, so the color must be applied after the text.
         self.ui_state.statusMessage = message
+        self.ui_state.statusMessageColor = color
         QTimer.singleShot(timeout, clear_message)
 
     def _maybe_show_turbo_fallback_warning(self):
