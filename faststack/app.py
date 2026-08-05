@@ -1137,10 +1137,12 @@ class AppController(QObject):
         Used both at startup and when switching directories, so the derived
         fallback stays identical in both places.
         """
-        saved_sort_mode = self.sidecar.data.sort_mode
+        with self.sidecar._state_lock:
+            saved_sort_mode = self.sidecar.data.sort_mode
+            has_stacks = bool(self.sidecar.data.stacks)
         if saved_sort_mode in SUPPORTED_SORT_MODES:
             self.sort_mode = saved_sort_mode
-        elif self.sidecar.data.stacks:
+        elif has_stacks:
             # Legacy stack ranges were recorded against the historical
             # timestamp-based default order. Preserve that order until the
             # user explicitly chooses a different sort.
@@ -1149,7 +1151,8 @@ class AppController(QObject):
             # Stable camera filenames do not change when an external editor
             # replaces a JPG, unlike filesystem modification timestamps.
             self.sort_mode = "filename"
-        self.sidecar.data.sort_mode = self.sort_mode
+        with self.sidecar._state_lock:
+            self.sidecar.data.sort_mode = self.sort_mode
 
     @Slot(str)
     def set_sort_mode(self, mode: str):
@@ -1217,13 +1220,15 @@ class AppController(QObject):
             self.stacks = []
             self.stack_start_index = None
             self.stack_end_index = None
-            self.sidecar.data.stacks = []
+            with self.sidecar._state_lock:
+                self.sidecar.data.stacks = []
         elif have_stacks:
             self.stacks = self._rebuild_ranges_from_paths(old_stack_paths)
             # Only persist to sidecar when no filter is active — filtered
             # image_files may hide stack members, producing incomplete ranges.
             if not self._filter_enabled:
-                self.sidecar.data.stacks = self.stacks
+                with self.sidecar._state_lock:
+                    self.sidecar.data.stacks = self.stacks
 
         # Remap pending stack start marker (even when no completed stacks exist)
         if not clear_stacks and old_stack_start_path:
@@ -1245,7 +1250,8 @@ class AppController(QObject):
             self._clear_variant_override()
             self.current_index = 0
 
-        self.sidecar.data.sort_mode = mode
+        with self.sidecar._state_lock:
+            self.sidecar.data.sort_mode = mode
         self.sidecar.set_last_position(
             self.current_index,
             self._current_image_path(),
@@ -3340,7 +3346,8 @@ class AppController(QObject):
         """
         current_path = self._current_image_path()
         try:
-            self.sidecar.data.sort_mode = self.sort_mode
+            with self.sidecar._state_lock:
+                self.sidecar.data.sort_mode = self.sort_mode
             self.sidecar.set_last_position(self.current_index, current_path)
             self.sidecar.save()
         except Exception as e:
@@ -7811,7 +7818,8 @@ class AppController(QObject):
         if self.stack_end_index is not None and self.stack_end_index >= insert_index:
             self.stack_end_index += 1
         if stacks_changed:
-            self.sidecar.data.stacks = self.stacks
+            with self.sidecar._state_lock:
+                self.sidecar.data.stacks = self.stacks
             self.sidecar.save()
             self._metadata_cache_index = (-1, -1)
 
@@ -8370,7 +8378,8 @@ class AppController(QObject):
         end = max(self.stack_start_index, self.stack_end_index)
         self.stacks.append([start, end])
         self.stacks = self._merge_stack_ranges(self.stacks)
-        self.sidecar.data.stacks = self.stacks
+        with self.sidecar._state_lock:
+            self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
         log.info("Defined new stack: [%d, %d]", start, end)
         self.stack_start_index = None
@@ -8727,7 +8736,8 @@ class AppController(QObject):
 
             if stack_modified:
                 self.stacks = new_stacks
-                self.sidecar.data.stacks = self.stacks
+                with self.sidecar._state_lock:
+                    self.sidecar.data.stacks = self.stacks
                 self.sidecar.save()
         if removed:
             self._metadata_cache_index = (-1, -1)
@@ -8889,7 +8899,8 @@ class AppController(QObject):
                         new_stack_idx + 1,
                     )
 
-        self.sidecar.data.stacks = self.stacks
+        with self.sidecar._state_lock:
+            self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
         self._metadata_cache_index = (-1, -1)
         self.dataChanged.emit()
@@ -9149,7 +9160,8 @@ class AppController(QObject):
         self.stack_end_index = None
         # Do NOT clear batches here
 
-        self.sidecar.data.stacks = self.stacks
+        with self.sidecar._state_lock:
+            self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
 
         self._metadata_cache_index = (-1, -1)
@@ -11347,7 +11359,8 @@ class AppController(QObject):
                 self.stack_end_index = self._shift_start_index(
                     ui.saved_stack_end_index, still_deleted
                 )
-            self.sidecar.data.stacks = self.stacks
+            with self.sidecar._state_lock:
+                self.sidecar.data.stacks = self.stacks
             self._metadata_cache_index = (-1, -1)
 
     def _schedule_delete_refresh(self) -> None:
@@ -11541,7 +11554,8 @@ class AppController(QObject):
                     new_stacks.append([ns, ne])
             if new_stacks != self.stacks:
                 self.stacks = new_stacks
-                self.sidecar.data.stacks = self.stacks
+                with self.sidecar._state_lock:
+                    self.sidecar.data.stacks = self.stacks
                 self._metadata_cache_index = (-1, -1)
 
         # Adjust stack_start_index for removed entries
@@ -12004,7 +12018,8 @@ class AppController(QObject):
                     self.stacks = ui.saved_stacks
                     self.stack_start_index = ui.saved_stack_start_index
                     self.stack_end_index = ui.saved_stack_end_index
-                    self.sidecar.data.stacks = self.stacks
+                    with self.sidecar._state_lock:
+                        self.sidecar.data.stacks = self.stacks
                     self._metadata_cache_index = (-1, -1)
                 self.sync_ui_state()
                 self._restart_quality_decode_timer()
@@ -12382,7 +12397,8 @@ class AppController(QObject):
         # NOTE: This runs on the main thread during shutdown (via main() -> shutdown_nonqt()).
         # It needs to be robust against file I/O errors to avoid hanging the exit.
         try:
-            self.sidecar.data.sort_mode = self.sort_mode
+            with self.sidecar._state_lock:
+                self.sidecar.data.sort_mode = self.sort_mode
             self.sidecar.set_last_position(
                 self.current_index,
                 self._current_image_path(),
@@ -12850,33 +12866,34 @@ class AppController(QObject):
     ) -> None:
         """Restore only the metadata fields owned by edit-save actions."""
         stable_key = sidecar.metadata_key_for_path(image_path)
-        current_meta = sidecar.data.entries.get(stable_key)
         restored_edited = bool(snapshot.get("edited", False)) if snapshot else False
         restored_edited_date = snapshot.get("edited_date") if snapshot else None
         restored_edit_state = snapshot.get("edit_state") if snapshot else None
         changed = False
 
-        if current_meta is None:
-            if not restored_edited and restored_edited_date is None:
-                return
-            current_meta = sidecar.get_metadata(image_path, create=True)
-            changed = True
-
-        if current_meta.edited != restored_edited:
-            current_meta.edited = restored_edited
-            changed = True
-        if current_meta.edited_date != restored_edited_date:
-            current_meta.edited_date = restored_edited_date
-            changed = True
-        if current_meta.edit_state != restored_edit_state:
-            current_meta.edit_state = restored_edit_state
-            changed = True
-
-        if snapshot is None:
-            default_meta = EntryMetadata()
-            if current_meta.__dict__ == default_meta.__dict__:
-                del sidecar.data.entries[stable_key]
+        with sidecar._state_lock:
+            current_meta = sidecar.data.entries.get(stable_key)
+            if current_meta is None:
+                if not restored_edited and restored_edited_date is None:
+                    return
+                current_meta = sidecar.get_metadata(image_path, create=True)
                 changed = True
+
+            if current_meta.edited != restored_edited:
+                current_meta.edited = restored_edited
+                changed = True
+            if current_meta.edited_date != restored_edited_date:
+                current_meta.edited_date = restored_edited_date
+                changed = True
+            if current_meta.edit_state != restored_edit_state:
+                current_meta.edit_state = restored_edit_state
+                changed = True
+
+            if snapshot is None:
+                default_meta = EntryMetadata()
+                if current_meta.__dict__ == default_meta.__dict__:
+                    del sidecar.data.entries[stable_key]
+                    changed = True
 
         if changed:
             sidecar.save()
