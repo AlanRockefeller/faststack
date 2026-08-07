@@ -2247,7 +2247,8 @@ class AppController(QObject):
             )
         self._startup_restore_path = None
         self._startup_restore_index = None
-        self.stacks = self.sidecar.data.stacks  # Load stacks from sidecar
+        with self.sidecar._state_lock:
+            self.stacks = self.sidecar.data.stacks  # Load stacks from sidecar
         self.dataChanged.emit()  # Emit after stacks are loaded
         # Register this instance for crash recovery as soon as a folder is open.
         self._session_registry.update(

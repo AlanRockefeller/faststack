@@ -238,6 +238,15 @@ class SidecarManager:
         # migrating entries. Never held across file I/O, and never held while
         # calling save() — save() takes _save_lock first, so acquiring the
         # locks in the other order would risk a deadlock.
+        #
+        # Thread contract: all mutation of ``self.data`` (and of EntryMetadata
+        # objects returned by get_metadata()) happens on the main/Qt thread —
+        # background executors (save, delete) do file I/O only and hand results
+        # back via queued Qt signals, which AppController's slots then apply to
+        # the sidecar on the main thread. This lock therefore only needs to
+        # protect against save()'s own background merge-back, not against
+        # concurrent callers mutating entries; it is not a substitute for
+        # copy-on-read if that contract ever changes.
         self._state_lock = threading.RLock()
         self._write_lock_path = directory / "faststack.json.lock"
         # Identity of the disk file the baseline payload was taken from. Set by
