@@ -204,11 +204,11 @@ class PriorityExecutor:
                 if self._admitted < self._concurrency_limit:
                     self._admitted += 1
                     return True
+                if not blocking:
+                    return False
                 # Bounded wait: notifications drive the fast path, the timeout
                 # only guarantees a missed wake-up can never wedge a worker.
                 self._admission.wait(0.25)
-                if not blocking:
-                    return False
 
     def _release_admission(self, *, was_running: bool) -> None:
         with self._admission:
