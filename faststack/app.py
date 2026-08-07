@@ -97,7 +97,12 @@ from faststack.imaging.prefetch import (
     normalize_held_navigation_quality,
 )
 from faststack.ui.keystrokes import Keybinder
-from faststack.imaging.editor import ImageEditor, ASPECT_RATIOS, _safe_replace
+from faststack.imaging.editor import (
+    ASPECT_RATIOS,
+    EditRenderCancelled,
+    ImageEditor,
+    _safe_replace,
+)
 from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
 from faststack.imaging.mask_engine import inverse_transform
 from faststack.imaging.metadata import get_exif_data
@@ -143,6 +148,8 @@ _AWB_NOOP_EPS = 0.005
 _AWB_LABEL_EPS = 0.002
 _AUTO_ADJUST_HIGHLIGHT_STEP = 0.14
 _AUTO_ADJUST_BLACK_STEP = 0.07
+_WINDOWS_SHARING_VIOLATION_ERRORS = frozenset({32, 33})
+_RECYCLE_SHARING_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.4, 0.4)
 _AUTO_VIBRANCE_EPS = 0.001
 _AUTO_BRIGHTNESS_EPS = 0.001
 # Midtone correction dead band and recovery. Images whose projected
@@ -252,6 +259,9 @@ CACHE_THRASH_WINDOW_SECS = 2.0
 CACHE_THRASH_THRESHOLD = 5
 CACHE_WARNING_COOLDOWN_SECS = 300
 
+# Sort modes accepted from the sidecar and from set_sort_mode().
+SUPPORTED_SORT_MODES = ("default", "filename", "date", "date_reverse")
+
 
 from faststack.util.executors import create_daemon_threadpool_executor
 
@@ -289,6 +299,7 @@ class AppController(QObject):
     _pacedNavigationReady = Signal(object)  # Exact fast-tier target is cache-ready
     _frameSwapObserved = Signal(float)  # render-thread timestamp -> GUI thread
     _preloadProgressReady = Signal(object)  # Worker counters -> GUI thread
+    _indexScanReady = Signal(object)  # {"epoch", "result"} payload -> GUI thread
 
     def __init__(
         self,
@@ -300,6 +311,8 @@ class AppController(QObject):
         debug_thumb_trace: bool = False,
         start_in_loupe: bool = False,
         app_start_t: Optional[float] = None,
+        restore_path: Optional[str] = None,
+        restore_index: Optional[int] = None,
     ):
         super().__init__()
         self.debug_thumb_timing = debug_thumb_timing
@@ -345,6 +358,9 @@ class AppController(QObject):
         self._preview_executor = create_daemon_threadpool_executor(
             max_workers=1, thread_name_prefix="Preview"
         )
+        self._preview_refine_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="PreviewRefine"
+        )
         # EXIF Brief Offloading Setup (dedicated executor to avoid blocking histograms)
         self._exif_executor = create_daemon_threadpool_executor(
             max_workers=2, thread_name_prefix="EXIF"
@@ -357,6 +373,25 @@ class AppController(QObject):
         )
         self._updateCheckFinished.connect(self._on_update_check_finished)
         self._qualityDecodeFinished.connect(self._on_quality_decode_finished)
+
+        # Directory scan offloading for watcher-triggered rescans (single
+        # worker: only one directory walk is ever useful in flight at once).
+        # See _maybe_start_index_scan() for the throttle/coalescing that
+        # bounds how often this actually runs under sustained file churn.
+        self._index_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="IndexScan"
+        )
+        self._index_scan_inflight = False
+        self._index_rescan_needed = False
+        # Bumped whenever the scanned directory changes, so a walk that was
+        # submitted for the old directory can be discarded on arrival.
+        self._index_scan_epoch = 0
+        self._last_index_scan_time: float = 0.0
+        # Minimum wall-clock spacing between watcher-triggered full directory
+        # scans. Caps CPU spent rescanning when something external is
+        # touching many files in a row (e.g. a lingering save/export queue).
+        self._index_scan_min_interval_s = 1.0
+        self._indexScanReady.connect(self._on_index_scan_ready)
         self._pacedNavigationReady.connect(self._on_paced_navigation_ready)
         self._preloadProgressReady.connect(self._on_preload_progress_ready)
         self._update_check_token = 0
@@ -364,6 +399,10 @@ class AppController(QObject):
         self._preview_inflight = False
         self._preview_pending = False
         self._preview_token = 0
+        self._preview_refinement_inflight = False
+        self._preview_refinement_cancel: Optional[threading.Event] = None
+        self._editor_slider_drag_active = False
+        self._last_quick_preview_kick_at = 0.0
         # Token of the last display-capped full-resolution kick; its accepted
         # final frame defines _live_preview_target_dims for quick renders.
         self._preview_full_res_token = -1
@@ -390,6 +429,8 @@ class AppController(QObject):
         self._shutting_down = False  # Flag to gate async callbacks during shutdown
         self._refresh_scheduled = False  # Coalesce guard for deferred disk refresh
         self._opencv_warning_shown = False  # Only show OpenCV warning once per session
+        # Only warn once per session that we fell back to Pillow decoding
+        self._turbo_fallback_warning_shown = False
         self._last_auto_levels_msg: str = (
             ""  # Detail message from last auto_levels() call
         )
@@ -435,6 +476,8 @@ class AppController(QObject):
         self.view_override_kind: Optional[str] = None  # "main"|"developed"|"backup"
 
         self.image_dir = Path(image_dir).expanduser().resolve()
+        self._startup_restore_path = restore_path
+        self._startup_restore_index = restore_index
         self.image_files: List[ImageFile] = []  # Filtered list for display
         self._all_images: List[ImageFile] = []  # Cached full list from disk
         self._path_to_index: Dict[str, int] = (
@@ -523,6 +566,10 @@ class AppController(QObject):
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
         self._suppressed_paths: Dict[str, float] = {}  # key -> monotonic expiry time
+        # Normalized key -> in-flight save count. A timed suppression window
+        # cannot bound a save of unknown duration, so writes we are performing
+        # ourselves are suppressed for exactly as long as they are running.
+        self._saving_path_keys: Dict[str, int] = {}
         self._suppressed_paths_lock = threading.Lock()  # guards cross-thread access
         # Paths reported by the watcher since the last debounced refresh, so
         # _on_watcher_refresh can invalidate decodes per-path instead of
@@ -582,6 +629,21 @@ class AppController(QObject):
                 fallback=0,
             ),
         )
+        # Foreground constraint tokens (see _enter_prefetch_constraint). Save
+        # and preview refinement carry their own per-operation token on the
+        # work item itself; only startup needs controller-held state.
+        self._startup_prefetch_constraint_token: Optional[int] = None
+        if start_in_loupe:
+            # Only --loupe startup decodes a foreground frame before the user
+            # does anything; grid startup would never see the Ready callback
+            # that releases this, so it must not be constrained at all.
+            self._startup_prefetch_constraint_token = self._enter_prefetch_constraint(
+                "startup"
+            )
+            QTimer.singleShot(
+                self._STARTUP_CONSTRAINT_FAILSAFE_MS,
+                lambda: self._release_startup_prefetch_constraint("failsafe-timeout"),
+            )
         self.last_displayed_image: Optional[DecodedImage] = (
             None  # Cache last image to avoid grey squares
         )
@@ -678,7 +740,7 @@ class AppController(QObject):
             []
         )  # Active flag filters (e.g. ["uploaded", "stacked"])
         self._filter_enabled: bool = False
-        self.sort_mode: str = "default"
+        self._adopt_saved_sort_mode()
 
         self._metadata_cache = {}
         self._metadata_cache_index = (-1, -1)
@@ -770,6 +832,16 @@ class AppController(QObject):
         self._navigation_hold_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._navigation_hold_timer.setInterval(self._navigation_interval_ms)
         self._navigation_hold_timer.timeout.connect(self._paced_navigation_tick)
+        # A missed QML Ready/synchronize/swap acknowledgement must not leave a
+        # physical arrow hold permanently stuck after its first image.
+        self._navigation_gate_watchdog_timer = QTimer(self)
+        self._navigation_gate_watchdog_timer.setSingleShot(True)
+        self._navigation_gate_watchdog_timer.setInterval(
+            max(750, self._navigation_repeat_delay_ms + 250)
+        )
+        self._navigation_gate_watchdog_timer.timeout.connect(
+            self._on_paced_present_timeout
+        )
 
         # Preview refresh uses a gate pattern instead of a timer:
         # - _kick_preview_worker() runs immediately if not inflight
@@ -785,6 +857,15 @@ class AppController(QObject):
         self._watcher_debounce_timer.setSingleShot(True)
         self._watcher_debounce_timer.setInterval(200)  # 200ms debounce
         self._watcher_debounce_timer.timeout.connect(self._on_watcher_refresh)
+
+        # Throttle retry timer: when a watcher refresh arrives sooner than
+        # _index_scan_min_interval_s after the last scan started, the scan
+        # is deferred to fire here instead of immediately.
+        self._index_throttle_timer = QTimer(self)
+        self._index_throttle_timer.setSingleShot(True)
+        self._index_throttle_timer.timeout.connect(
+            lambda: self._maybe_start_index_scan()
+        )
 
         # Periodic summary for thumbnail debug logging
         if self.debug_thumb_timing or self.debug_thumb_trace:
@@ -817,9 +898,9 @@ class AppController(QObject):
         )
 
         # Debounce timer for crash-recovery session persistence. Flushes the
-        # current image index to the folder sidecar and refreshes this
-        # instance's session record ~1s after the user settles, so an
-        # unexpected reboot can resume close to where they left off.
+        # current image path plus an index fallback to the folder sidecar and
+        # refreshes this instance's session record ~1s after the user settles,
+        # so an unexpected reboot can resume close to where they left off.
         self._session_registry = SessionRegistry()
         # Tracks the directory last written to config.last_directory so we only
         # rewrite the INI when the open folder actually changes.
@@ -874,9 +955,9 @@ class AppController(QObject):
         if is_open:
             # Warn once if OpenCV is not available (detail sliders will be slower)
             if not self._opencv_warning_shown:
-                from faststack.imaging.optional_deps import HAS_OPENCV
+                from faststack.imaging.optional_deps import has_opencv
 
-                if not HAS_OPENCV:
+                if not has_opencv():
                     self._opencv_warning_shown = True
                     log.warning(
                         "OpenCV not available - detail sliders (clarity/texture/sharpness) will be slower"
@@ -1068,9 +1149,32 @@ class AppController(QObject):
     def get_sort_mode(self):
         return self.sort_mode
 
+    def _adopt_saved_sort_mode(self) -> None:
+        """Take the sort mode from the current sidecar, deriving one if absent.
+
+        Used both at startup and when switching directories, so the derived
+        fallback stays identical in both places.
+        """
+        with self.sidecar._state_lock:
+            saved_sort_mode = self.sidecar.data.sort_mode
+            has_stacks = bool(self.sidecar.data.stacks)
+        if saved_sort_mode in SUPPORTED_SORT_MODES:
+            self.sort_mode = saved_sort_mode
+        elif has_stacks:
+            # Legacy stack ranges were recorded against the historical
+            # timestamp-based default order. Preserve that order until the
+            # user explicitly chooses a different sort.
+            self.sort_mode = "default"
+        else:
+            # Stable camera filenames do not change when an external editor
+            # replaces a JPG, unlike filesystem modification timestamps.
+            self.sort_mode = "filename"
+        with self.sidecar._state_lock:
+            self.sidecar.data.sort_mode = self.sort_mode
+
     @Slot(str)
     def set_sort_mode(self, mode: str):
-        if mode not in ("default", "filename", "date", "date_reverse"):
+        if mode not in SUPPORTED_SORT_MODES:
             return
         if self.sort_mode == mode:
             return
@@ -1134,15 +1238,15 @@ class AppController(QObject):
             self.stacks = []
             self.stack_start_index = None
             self.stack_end_index = None
-            self.sidecar.data.stacks = []
-            self.sidecar.save()
+            with self.sidecar._state_lock:
+                self.sidecar.data.stacks = []
         elif have_stacks:
             self.stacks = self._rebuild_ranges_from_paths(old_stack_paths)
             # Only persist to sidecar when no filter is active — filtered
             # image_files may hide stack members, producing incomplete ranges.
             if not self._filter_enabled:
-                self.sidecar.data.stacks = self.stacks
-                self.sidecar.save()
+                with self.sidecar._state_lock:
+                    self.sidecar.data.stacks = self.stacks
 
         # Remap pending stack start marker (even when no completed stacks exist)
         if not clear_stacks and old_stack_start_path:
@@ -1163,6 +1267,14 @@ class AppController(QObject):
         else:
             self._clear_variant_override()
             self.current_index = 0
+
+        with self.sidecar._state_lock:
+            self.sidecar.data.sort_mode = mode
+        self.sidecar.set_last_position(
+            self.current_index,
+            self._current_image_path(),
+        )
+        self.sidecar.save()
 
         if self._is_grid_view_active:
             self._thumbnail_prefetcher.cancel_all()
@@ -1799,7 +1911,6 @@ class AppController(QObject):
 
         if is_navigation_window and event.type() in {
             QEvent.Type.WindowDeactivate,
-            QEvent.Type.FocusOut,
             QEvent.Type.Close,
             QEvent.Type.Hide,
             QEvent.Type.Destroy,
@@ -1840,13 +1951,16 @@ class AppController(QObject):
                     self._dialog_open or getattr(self.ui_state, "isCropping", False)
                 )
                 if navigation_enabled:
-                    if not event.isAutoRepeat():
-                        direction = 1 if event.key() == Qt.Key_Right else -1
-                        self._begin_navigation_hold(direction, source=watched)
+                    direction = 1 if event.key() == Qt.Key_Right else -1
+                    # Repeated OS presses are liveness signals. The controller
+                    # timer still owns the cadence, but calling begin again
+                    # lets a physical hold recover if a resize, refresh, or
+                    # focus transition cleared its internal state.
+                    self._begin_navigation_hold(direction, source=watched)
                 else:
                     self._end_navigation_hold(0, source=watched)
-                # Physical auto-repeat is intentionally consumed. The precise
-                # controller timer owns repeat cadence after the initial press.
+                # Physical auto-repeat is consumed after re-arming. The precise
+                # controller timer owns repeat cadence while state is healthy.
                 return True
 
         # Don't handle key events when a dialog is open
@@ -1939,15 +2053,79 @@ class AppController(QObject):
                     | Qt.ShiftModifier
                 )
                 if not blocked_modifiers:
-                    if not event.isAutoRepeat():
-                        direction = 1 if event.key() == Qt.Key_Right else -1
-                        self._begin_navigation_hold(direction, source=watched)
+                    direction = 1 if event.key() == Qt.Key_Right else -1
+                    # Do this for both the initial and auto-repeat presses. A
+                    # healthy hold is a no-op in _begin_navigation_hold(); a
+                    # hold whose state was cleared while the key remained down
+                    # is re-established on the next native repeat event.
+                    self._begin_navigation_hold(direction, source=watched)
                     return True
 
             handled = self.keybinder.handle_key_press(event)
             if handled:
                 return True
         return super().eventFilter(watched, event)
+
+    def _enter_prefetch_constraint(self, reason: str) -> Optional[int]:
+        """Throttle speculative decoding while foreground work runs.
+
+        Returns a token for _leave_prefetch_constraint(), or None when the
+        prefetcher is gone/shutting down. Never raises: a governor problem must
+        not be able to break a save or a preview render.
+        """
+        prefetcher = getattr(self, "prefetcher", None)
+        if prefetcher is None:
+            return None
+        try:
+            return prefetcher.enter_constrained_mode(reason)
+        except Exception:
+            log.debug("Prefetch governor enter failed (%s)", reason, exc_info=True)
+            return None
+
+    def _leave_prefetch_constraint(self, token: Optional[int]) -> None:
+        """Release one constraint token; duplicate/stale tokens are ignored."""
+        if token is None:
+            return
+        prefetcher = getattr(self, "prefetcher", None)
+        if prefetcher is None:
+            return
+        try:
+            prefetcher.leave_constrained_mode(token)
+        except Exception:
+            log.debug("Prefetch governor release failed", exc_info=True)
+
+    def _clear_prefetch_constraint_reason(self, reason: str) -> None:
+        """Fail-safe: drop every constraint token held for one reason."""
+        prefetcher = getattr(self, "prefetcher", None)
+        if prefetcher is None:
+            return
+        try:
+            prefetcher.clear_constrained_reason(reason)
+        except Exception:
+            log.debug("Prefetch governor clear failed (%s)", reason, exc_info=True)
+
+    def _release_startup_prefetch_constraint(self, reason: str) -> None:
+        """Restore normal speculative capacity after the first loupe frame.
+
+        Release policy is "first decoded frame reached Image.Ready", not "first
+        frame swapped": Ready means the current image is decoded and handed to
+        the scene graph, which is the point where the foreground decode this
+        constraint protects is finished. The swap-based presentation tracking
+        is navigation- and diagnostic-scoped and would not fire reliably for a
+        cold startup frame.
+
+        Idempotent: the token is dropped before it is released, so a repeated
+        Ready callback, an empty folder, a grid switch, and shutdown can all
+        call this in any order.
+        """
+        token = getattr(self, "_startup_prefetch_constraint_token", None)
+        if token is None:
+            return
+        self._startup_prefetch_constraint_token = None
+        log.debug("Releasing startup prefetch constraint (%s)", reason)
+        self._leave_prefetch_constraint(token)
+        # Defensive: a token that was somehow duplicated cannot outlive startup.
+        self._clear_prefetch_constraint_reason("startup")
 
     def _do_prefetch(
         self,
@@ -2018,6 +2196,25 @@ class AppController(QObject):
 
         self._grid_model_dirty = False
 
+    def _current_image_path(self) -> Optional[Path]:
+        """Return the current visible image path, if one is selected."""
+        if self.image_files and 0 <= self.current_index < len(self.image_files):
+            return self.image_files[self.current_index].path
+        return None
+
+    def _index_for_saved_path(self, saved_path: Optional[str]) -> Optional[int]:
+        """Resolve a persisted absolute or folder-relative image path."""
+        if not saved_path:
+            return None
+        path = Path(saved_path)
+        if not path.is_absolute():
+            path = self.image_dir / path
+        try:
+            key = self._key(path)
+        except (OSError, TypeError, ValueError):
+            return None
+        return self._path_to_index.get(key)
+
     def load(self, skip_thumbnail_refresh: bool = False):
         """Loads images, sidecar data, and starts services."""
         self._cancel_paced_navigation()
@@ -2032,15 +2229,33 @@ class AppController(QObject):
         self.refresh_image_list(notify=False)  # Initial scan from disk
         if not self.image_files:
             self.current_index = 0
+            # Nothing will ever be decoded or presented here, so the startup
+            # constraint has no release event of its own.
+            self._release_startup_prefetch_constraint("empty-folder")
         else:
-            self.current_index = max(
-                0, min(self.sidecar.data.last_index, len(self.image_files) - 1)
+            saved_path = self._startup_restore_path or self.sidecar.data.last_path
+            saved_index = (
+                self._startup_restore_index
+                if self._startup_restore_index is not None
+                else self.sidecar.data.last_index
             )
-        self.stacks = self.sidecar.data.stacks  # Load stacks from sidecar
+            path_index = self._index_for_saved_path(saved_path)
+            self.current_index = (
+                path_index
+                if path_index is not None
+                else max(0, min(saved_index, len(self.image_files) - 1))
+            )
+        self._startup_restore_path = None
+        self._startup_restore_index = None
+        with self.sidecar._state_lock:
+            self.stacks = self.sidecar.data.stacks  # Load stacks from sidecar
         self.dataChanged.emit()  # Emit after stacks are loaded
         # Register this instance for crash recovery as soon as a folder is open.
         self._session_registry.update(
-            self.image_dir, self.current_index, self._is_grid_view_active
+            self.image_dir,
+            self.current_index,
+            self._is_grid_view_active,
+            self._current_image_path(),
         )
         self._remember_last_directory()
         self.watcher.start()
@@ -2081,10 +2296,13 @@ class AppController(QObject):
 
         if self._is_grid_view_active:
             self._set_folder_loaded(True)
+            # A loupe startup that ends up in the grid has no first frame.
+            self._release_startup_prefetch_constraint("grid-startup")
 
         if not self._is_grid_view_active:
             self._maybe_decode_current_image("startup-loupe")
             self._restart_quality_decode_timer()
+            self._maybe_show_turbo_fallback_warning()
 
         log.info(
             "Load summary: scans=variant:%d grid_refreshes:%d",
@@ -2106,17 +2324,52 @@ class AppController(QObject):
             key = self._key(p)
             now = time.monotonic()
             with self._suppressed_paths_lock:
+                if key in self._saving_path_keys:
+                    # Our own atomic save is replacing this file right now. The
+                    # save's own completion handler refreshes what is needed.
+                    if _debug_mode:
+                        log.debug(
+                            "Suppressing watcher refresh for in-flight save: %s",
+                            path,
+                        )
+                    return
                 expiry = self._suppressed_paths.get(key)
                 if expiry:
                     if now < expiry:
+                        # An external tool (Photoshop, GIMP, ...) can overwrite
+                        # this path during our own suppression window, right
+                        # after FastStack's save already completed. Compare
+                        # against the fingerprint recorded the last time we
+                        # invalidated the decode cache for this path: if the
+                        # file no longer matches, this is a genuine external
+                        # write and must not be silently dropped, or the
+                        # external content would stay absent from the
+                        # display/cache until some unrelated later event.
+                        current_fingerprint = self._file_state_fingerprint(p)
+                        with self._decode_invalidation_lock:
+                            epoch_entry = self._decode_invalidation_epochs.get(key)
+                        expected_fingerprint = epoch_entry[1] if epoch_entry else None
+                        if (
+                            current_fingerprint is None
+                            or expected_fingerprint is None
+                            or current_fingerprint == expected_fingerprint
+                        ):
+                            if _debug_mode:
+                                log.debug(
+                                    "Suppressing watcher refresh for recently deleted path: %s",
+                                    path,
+                                )
+                            return
                         if _debug_mode:
                             log.debug(
-                                "Suppressing watcher refresh for recently deleted path: %s",
+                                "Not suppressing watcher refresh for %s: "
+                                "on-disk state changed during suppression "
+                                "window (external write)",
                                 path,
                             )
-                        return
-                    # Cleanup expired entry
-                    del self._suppressed_paths[key]
+                    else:
+                        # Cleanup expired entry
+                        del self._suppressed_paths[key]
             with self._watcher_changed_lock:
                 self._watcher_changed_paths.add(p)
         else:
@@ -2183,15 +2436,103 @@ class AppController(QObject):
 
     @Slot()
     def _on_watcher_refresh(self):
-        """Watcher debounce handler: rescan disk and keep UI consistent.
+        """Watcher debounce handler: kick off a (throttled, background) rescan.
+
+        The actual directory walk runs off the GUI thread via
+        _maybe_start_index_scan()/_start_index_scan() so that a burst of
+        filesystem churn (e.g. an external process rewriting many files)
+        cannot repeatedly block the UI thread. Completion is handled by
+        _on_index_scan_ready().
+        """
+        self._maybe_start_index_scan()
+
+    def _maybe_start_index_scan(self) -> None:
+        """Starts a background directory scan, subject to throttling.
+
+        At most one scan runs at a time (single-worker executor), and scans
+        are capped to _index_scan_min_interval_s apart no matter how often
+        the watcher fires — otherwise sustained external file churn (a
+        lingering save/export queue, a sync client, etc.) could keep the
+        directory walk running back-to-back indefinitely.
+        """
+        if self._index_scan_inflight:
+            # A scan is already running; make sure we scan again once it
+            # finishes so this change isn't lost.
+            self._index_rescan_needed = True
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._last_index_scan_time
+        if elapsed < self._index_scan_min_interval_s:
+            self._index_rescan_needed = True
+            remaining_ms = int((self._index_scan_min_interval_s - elapsed) * 1000) + 1
+            if not self._index_throttle_timer.isActive():
+                self._index_throttle_timer.start(remaining_ms)
+            return
+
+        self._start_index_scan()
+
+    def _start_index_scan(self) -> None:
+        """Submits the directory walk to the background index executor."""
+        if getattr(self, "_shutting_down", False):
+            return
+
+        clear_raw_count_cache()
+        self._index_scan_inflight = True
+        self._index_rescan_needed = False
+        self._last_index_scan_time = time.monotonic()
+        self._scan_count_variant += 1
+
+        epoch = self._index_scan_epoch
+        try:
+            fut = self._index_executor.submit(find_images_with_variants, self.image_dir)
+            fut.add_done_callback(functools.partial(self._on_index_scan_done, epoch))
+        except RuntimeError:
+            # Executor already shut down; leave no inflight flag behind or the
+            # next watcher tick would think a scan is still running.
+            log.warning("Index executor failed (shutting down?)")
+            self._index_scan_inflight = False
+            return
+
+    def _on_index_scan_done(self, epoch: int, fut: concurrent.futures.Future) -> None:
+        """Runs on the index executor's worker thread — no QObject access here."""
+        try:
+            result = fut.result()
+        except Exception as e:
+            log.error("Background directory scan failed: %s", e)
+            result = None
+        self._indexScanReady.emit({"epoch": epoch, "result": result})
+
+    @Slot(object)
+    def _on_index_scan_ready(self, payload) -> None:
+        """GUI-thread continuation of a watcher-triggered background scan.
 
         Unlike bare refresh_image_list(), this clamps current_index,
         updates the prefetcher, and syncs the UI so the display never
         references an out-of-bounds index.
         """
+        if getattr(self, "_shutting_down", False):
+            self._index_scan_inflight = False
+            return
+
+        self._index_scan_inflight = False
+
+        result = payload.get("result")
+        # A scan submitted for a directory we have since left describes files
+        # that are not in self.image_dir any more — applying it would repopulate
+        # the list with the old directory's images.
+        if result is None or payload.get("epoch") != self._index_scan_epoch:
+            if self._index_rescan_needed:
+                self._maybe_start_index_scan()
+            return
+
+        images, variant_map = result
+
         self._begin_direct_image_transition("watcher rebuilt the image list")
 
-        # Remember which image we were viewing so we can stay on it
+        # Remember which image we were viewing so we can stay on it. Read
+        # now (not at scan-submission time) since the user may have kept
+        # navigating while the scan ran in the background.
         preserved_path = None
         if self.image_files and 0 <= self.current_index < len(self.image_files):
             preserved_path = self.image_files[self.current_index].path
@@ -2200,7 +2541,12 @@ class AppController(QObject):
             changed_paths = self._watcher_changed_paths
             self._watcher_changed_paths = set()
 
-        self.refresh_image_list(notify=False)
+        self._all_images = images
+        self._variant_map = variant_map
+        self._apply_filter_to_cached_list(notify=False)
+        self._grid_model_dirty = True
+        if self._thumbnail_model and self._is_grid_view_active:
+            self._refresh_thumbnail_model_from_controller()
 
         # Bust decode caches so modified-on-disk files are re-decoded.
         # Invalidate only the files the watcher reported (a save produces a
@@ -2239,6 +2585,10 @@ class AppController(QObject):
         self._do_prefetch(self.current_index)
         self.sync_ui_state(image_count_changed=True)
         self._restart_quality_decode_timer()
+
+        # More changes arrived (or were throttled) during this scan — go again.
+        if self._index_rescan_needed:
+            self._maybe_start_index_scan()
 
     def _apply_filter_to_cached_list(self, *, notify: bool = True):
         """Applies current filter to cached image list without disk I/O."""
@@ -3079,19 +3429,25 @@ class AppController(QObject):
     def _persist_session_state(self):
         """Flush the current position for crash/reboot recovery.
 
-        Writes the current index to the folder sidecar (so it survives an
-        unexpected reboot, not just a clean shutdown) and refreshes this
-        instance's session record. Best-effort: a transient I/O error must
-        never disrupt navigation.
+        Writes the current path and index fallback to the folder sidecar (so
+        they survive an unexpected reboot, not just a clean shutdown) and
+        refreshes this instance's session record. Best-effort: a transient I/O
+        error must never disrupt navigation.
         """
+        current_path = self._current_image_path()
         try:
-            self.sidecar.set_last_index(self.current_index)
+            with self.sidecar._state_lock:
+                self.sidecar.data.sort_mode = self.sort_mode
+            self.sidecar.set_last_position(self.current_index, current_path)
             self.sidecar.save()
         except Exception as e:
             log.warning("Error persisting sidecar position: %s", e)
         try:
             self._session_registry.update(
-                self.image_dir, self.current_index, self._is_grid_view_active
+                self.image_dir,
+                self.current_index,
+                self._is_grid_view_active,
+                current_path,
             )
         except Exception as e:
             log.warning("Error updating session record: %s", e)
@@ -4112,6 +4468,10 @@ class AppController(QObject):
         """Increment in-flight save counters for the target path and image key."""
         if target:
             self._saves_in_flight[target] = self._saves_in_flight.get(target, 0) + 1
+            key = self._key(Path(target))
+            if key:
+                with self._suppressed_paths_lock:
+                    self._saving_path_keys[key] = self._saving_path_keys.get(key, 0) + 1
         if save_image_key:
             self._saving_keys[save_image_key] = (
                 self._saving_keys.get(save_image_key, 0) + 1
@@ -4130,6 +4490,17 @@ class AppController(QObject):
                 self._saves_in_flight[target] = remaining
             else:
                 self._saves_in_flight.pop(target, None)
+            key = self._key(Path(target))
+            if key:
+                with self._suppressed_paths_lock:
+                    key_remaining = self._saving_path_keys.get(key, 0) - 1
+                    if key_remaining > 0:
+                        self._saving_path_keys[key] = key_remaining
+                    else:
+                        self._saving_path_keys.pop(key, None)
+                        # Hand off to a timed window with no gap: watcher events
+                        # for the write are still in flight from the OS.
+                        self._suppressed_paths[key] = time.monotonic() + 3.0
         if save_image_key:
             remaining = self._saving_keys.get(save_image_key, 0) - 1
             if remaining > 0:
@@ -4735,6 +5106,14 @@ class AppController(QObject):
 
         self._suppress_watcher_paths(target)
         self._increment_save_tracking(target=target, save_image_key=save_image_key)
+        # One governor token per accepted save execution, carried on the
+        # context so it travels into the result dict. Encoding and file I/O
+        # compete with speculative decoding for the same cores, and overlapping
+        # saves each hold their own token, so capacity returns only when the
+        # last one completes -- navigating away from the image does not
+        # release it, and a duplicate completion callback releases a token the
+        # governor has already forgotten.
+        context["prefetch_constraint_token"] = self._enter_prefetch_constraint("save")
         self._mark_current_live_edit_session_submitted(context["save_revision"])
         self.ui_state.isSaving = True
         if saving_status:
@@ -4767,6 +5146,11 @@ class AppController(QObject):
 
         def on_done(future):
             if self._shutting_down:
+                # _on_save_finished will never run, so release this save's
+                # token here instead of relying on the prefetcher teardown.
+                self._leave_prefetch_constraint(
+                    context.get("prefetch_constraint_token")
+                )
                 return
             try:
                 result = future.result()
@@ -4782,6 +5166,9 @@ class AppController(QObject):
         try:
             future = self._save_executor.submit(do_save)
         except Exception as e:
+            self._leave_prefetch_constraint(
+                context.pop("prefetch_constraint_token", None)
+            )
             self._decrement_save_tracking(target=target, save_image_key=save_image_key)
             if not self._saves_in_flight:
                 self.ui_state.isSaving = False
@@ -4843,6 +5230,9 @@ class AppController(QObject):
 
         self._suppress_watcher_paths(target)
         self._increment_save_tracking(target=target, save_image_key=save_image_key)
+        # Same per-execution token as the async path; _on_save_finished below
+        # releases it from the result dict regardless of outcome.
+        context["prefetch_constraint_token"] = self._enter_prefetch_constraint("save")
         self._mark_current_live_edit_session_submitted(context["save_revision"])
         self.ui_state.isSaving = True
         if saving_status:
@@ -4979,6 +5369,10 @@ class AppController(QObject):
     @Slot(object)
     def _on_save_finished(self, save_result: dict):
         """Handle save completion on main thread (called via signal from background)."""
+        # Released first and unconditionally, before the shutdown guard: this
+        # token belongs to THIS save execution only, so a duplicate or stale
+        # completion cannot restore capacity another in-flight save still needs.
+        self._leave_prefetch_constraint(save_result.get("prefetch_constraint_token"))
         # Guard against callbacks during/after shutdown
         if self._shutting_down:
             return
@@ -5243,6 +5637,11 @@ class AppController(QObject):
     _NAV_RECORDS_MAX = 96
     _NAV_SETTLE_MS = 400
     _NAV_SUMMARY_DEADLINE_MS = 1800
+    # Upper bound on how long --loupe startup may throttle speculative decodes.
+    # The real release is the first Ready frame; this only guarantees that a
+    # missed Ready callback (QML error, decode failure, unusual view state)
+    # cannot leave FastStack permanently constrained.
+    _STARTUP_CONSTRAINT_FAILSAFE_MS = 10000
 
     def _fast_buffer_depth(self, index: int, direction: int) -> int:
         """Count consecutive cache-ready fast frames ahead of ``index``."""
@@ -5951,6 +6350,12 @@ class AppController(QObject):
 
     @Slot(int, int)
     def _on_frame_ready(self, seq: int, generation: int) -> None:
+        # The first decoded frame to reach Image.Ready is the usable current
+        # image the startup constraint was protecting, so capacity is restored
+        # here rather than at the later frame swap -- even if a newer
+        # navigation already superseded this seq below.
+        if self._startup_prefetch_constraint_token is not None:
+            self._release_startup_prefetch_constraint("first-frame-ready")
         # QML may finish an asynchronous source after a direct jump has minted
         # a newer navigation sequence. Such a Ready belongs to pixels that are
         # no longer eligible to release pacing or enter presentation tracing.
@@ -5980,6 +6385,7 @@ class AppController(QObject):
                     self._paced_present_gate = None
                     self._paced_present_ready = False
         if fallback_due_t is not None:
+            self._navigation_gate_watchdog_timer.stop()
             if self._paced_navigation_queue or self._held_navigation_direction:
                 if (
                     self._held_navigation_direction
@@ -6091,6 +6497,7 @@ class AppController(QObject):
                 self._paced_present_gate = None
                 self._paced_present_ready = False
         if pace_due_t is not None:
+            self._navigation_gate_watchdog_timer.stop()
             if self._paced_navigation_queue or self._held_navigation_direction:
                 if (
                     self._held_navigation_direction
@@ -6537,6 +6944,20 @@ class AppController(QObject):
             self._held_navigation_direction == direction
             and self._navigation_hold_source is source
         ):
+            # Native auto-repeat reaches here while the physical key remains
+            # down. Normally the controller timer, a decode, or a presentation
+            # gate is already active. If none is active, restart the cadence;
+            # if a gate lost its watchdog, restore that safety net too.
+            with self._nav_trace_lock:
+                has_present_gate = self._paced_present_gate is not None
+            if has_present_gate:
+                if not self._navigation_gate_watchdog_timer.isActive():
+                    self._navigation_gate_watchdog_timer.start()
+            elif (
+                self._paced_navigation_pending is None
+                and not self._navigation_hold_timer.isActive()
+            ):
+                self._resume_paced_navigation()
             return
         if self._held_navigation_direction:
             self._abandon_paced_navigation_state("navigation hold direction changed")
@@ -6574,6 +6995,7 @@ class AppController(QObject):
         self._navigation_repeat_started = False
         self._quality_decode_immediate_pending = False
         self._navigation_hold_timer.stop()
+        self._navigation_gate_watchdog_timer.stop()
         abandoned_logs = []
         with self._nav_trace_lock:
             if self._paced_present_gate is not None:
@@ -6675,6 +7097,10 @@ class AppController(QObject):
     def _begin_direct_image_transition(self, reason: str) -> None:
         """Invalidate paced/deferred work before a direct list/source mutation."""
         self._abandon_paced_navigation_state(reason)
+        with self._preview_lock:
+            cancel_event = self._preview_refinement_cancel
+        if cancel_event is not None:
+            cancel_event.set()
         # Invalidate the active URL correlation immediately. The replacement
         # source may not be evaluated until a later QML turn, and an old Ready
         # acknowledgement must not remain eligible during that gap.
@@ -6792,6 +7218,26 @@ class AppController(QObject):
             self._navigation_hold_timer.start()
         else:
             self._restart_quality_decode_timer()
+
+    @Slot()
+    def _on_paced_present_timeout(self) -> None:
+        """Recover a held key when a QML presentation acknowledgement is missed."""
+        with self._nav_trace_lock:
+            gate = self._paced_present_gate
+            if gate is None:
+                return
+            self._paced_present_gate = None
+            self._paced_present_ready = False
+        log.warning(
+            "Navigation presentation acknowledgement timed out for seq=%s; "
+            "continuing held navigation",
+            gate.get("seq"),
+        )
+        if self._held_navigation_direction:
+            # The watchdog interval already includes the initial keyboard repeat
+            # delay, so resume at the normal paced cadence.
+            self._navigation_repeat_started = True
+        self._resume_paced_navigation()
 
     def _request_paced_navigation_step(self, direction: int) -> bool:
         """Request one adjacent image without exposing an unready source to QML."""
@@ -6963,6 +7409,7 @@ class AppController(QObject):
                 "sync_t": None,
             }
             self._paced_present_ready = False
+        self._navigation_gate_watchdog_timer.start()
         self._set_current_index(
             target_index,
             direction=direction,
@@ -6973,6 +7420,7 @@ class AppController(QObject):
             with self._nav_trace_lock:
                 self._paced_present_gate = None
                 self._paced_present_ready = False
+            self._navigation_gate_watchdog_timer.stop()
             self._resume_paced_navigation()
 
     def _set_current_index(
@@ -7244,6 +7692,9 @@ class AppController(QObject):
 
         if active:
             # Entering grid view
+            # No loupe frame will be presented, so a still-held startup
+            # constraint has to be released here instead.
+            self._release_startup_prefetch_constraint("left-loupe")
             self._cancel_paced_navigation()
             self.pending_prefetch_index = None
             self._quality_decode_token += 1
@@ -7279,6 +7730,7 @@ class AppController(QObject):
             # Trigger exactly one decode for the current index
             self._maybe_decode_current_image("enter-loupe")
             self._restart_quality_decode_timer()
+            self._maybe_show_turbo_fallback_warning()
 
         # Notify UI state via signal
         self.ui_state.isGridViewActiveChanged.emit(active)
@@ -7493,7 +7945,8 @@ class AppController(QObject):
         if self.stack_end_index is not None and self.stack_end_index >= insert_index:
             self.stack_end_index += 1
         if stacks_changed:
-            self.sidecar.data.stacks = self.stacks
+            with self.sidecar._state_lock:
+                self.sidecar.data.stacks = self.stacks
             self.sidecar.save()
             self._metadata_cache_index = (-1, -1)
 
@@ -8052,7 +8505,8 @@ class AppController(QObject):
         end = max(self.stack_start_index, self.stack_end_index)
         self.stacks.append([start, end])
         self.stacks = self._merge_stack_ranges(self.stacks)
-        self.sidecar.data.stacks = self.stacks
+        with self.sidecar._state_lock:
+            self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
         log.info("Defined new stack: [%d, %d]", start, end)
         self.stack_start_index = None
@@ -8409,7 +8863,8 @@ class AppController(QObject):
 
             if stack_modified:
                 self.stacks = new_stacks
-                self.sidecar.data.stacks = self.stacks
+                with self.sidecar._state_lock:
+                    self.sidecar.data.stacks = self.stacks
                 self.sidecar.save()
         if removed:
             self._metadata_cache_index = (-1, -1)
@@ -8571,7 +9026,8 @@ class AppController(QObject):
                         new_stack_idx + 1,
                     )
 
-        self.sidecar.data.stacks = self.stacks
+        with self.sidecar._state_lock:
+            self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
         self._metadata_cache_index = (-1, -1)
         self.dataChanged.emit()
@@ -8831,7 +9287,8 @@ class AppController(QObject):
         self.stack_end_index = None
         # Do NOT clear batches here
 
-        self.sidecar.data.stacks = self.stacks
+        with self.sidecar._state_lock:
+            self.sidecar.data.stacks = self.stacks
         self.sidecar.save()
 
         self._metadata_cache_index = (-1, -1)
@@ -9975,6 +10432,8 @@ class AppController(QObject):
         # Reinitialize directory-bound components
         self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
+        self._adopt_saved_sort_mode()
+        self.ui_state.sortModeChanged.emit()
 
         # Only update recycle bin when switching base directories (not subfolder navigation)
         # This ensures all deleted files go to the same recycle bin
@@ -9987,7 +10446,12 @@ class AppController(QObject):
             self._grid_nav_history.clear()
             self.ui_state.gridCanGoBackChanged.emit()
 
-        # Clear directory-specific state
+        # Clear directory-specific state. Bumping the index-scan epoch makes any
+        # walk still running against the old directory discard its result; the
+        # in-flight flag stays owned by that scan so a second walk cannot queue
+        # behind it and then have its flag cleared by the stale arrival.
+        self._index_scan_epoch += 1
+        self._index_rescan_needed = False
         self.stacks = []
         self.batches = []
         self.batch_start_index = None
@@ -10225,6 +10689,12 @@ class AppController(QObject):
             future = self.prefetcher.submit_task(
                 i,
                 self.prefetcher.generation,
+                # Pin the path captured in the snapshot. Without this the worker
+                # decodes whatever occupies index i at execution time, which no
+                # longer matches the expected_path _on_done accounts against if
+                # the image list is rebuilt mid-preload — every remaining image
+                # then reports as "skipped".
+                override_path=image_path,
                 quality="fast",
                 preload_order=preload_order,
             )
@@ -10397,13 +10867,32 @@ class AppController(QObject):
             unique_tag = uuid.uuid4().hex[:8]
         dest = recycle_bin / f"{src.stem}._fs_{unique_tag}{src.suffix}"
 
-        try:
-            # Fast path: rename within same filesystem (no data copy)
-            os.replace(str(src), str(dest))
-            log.info("Moved %s to recycle bin: %s (rename)", src.name, dest.name)
-            return dest
-        except OSError:
-            pass  # Cross-device or permission issue, fall back to shutil
+        # Fast path: rename within the same filesystem. On Windows, a decode
+        # that won the cancellation race can retain a file mapping briefly.
+        # This worker is already off the UI thread, so allow that handle time
+        # to close before treating the recycle operation as failed.
+        for attempt in range(len(_RECYCLE_SHARING_RETRY_DELAYS) + 1):
+            try:
+                os.replace(str(src), str(dest))
+                log.info("Moved %s to recycle bin: %s (rename)", src.name, dest.name)
+                return dest
+            except OSError as e:
+                sharing_violation = (
+                    os.name == "nt"
+                    and getattr(e, "winerror", None)
+                    in _WINDOWS_SHARING_VIOLATION_ERRORS
+                )
+                if not sharing_violation or attempt >= len(
+                    _RECYCLE_SHARING_RETRY_DELAYS
+                ):
+                    break
+                delay = _RECYCLE_SHARING_RETRY_DELAYS[attempt]
+                log.debug(
+                    "Recycle waiting %.2fs for an open handle on %s",
+                    delay,
+                    src.name,
+                )
+                time.sleep(delay)
 
         try:
             shutil.move(str(src), str(dest))
@@ -11002,7 +11491,8 @@ class AppController(QObject):
                 self.stack_end_index = self._shift_start_index(
                     ui.saved_stack_end_index, still_deleted
                 )
-            self.sidecar.data.stacks = self.stacks
+            with self.sidecar._state_lock:
+                self.sidecar.data.stacks = self.stacks
             self._metadata_cache_index = (-1, -1)
 
     def _schedule_delete_refresh(self) -> None:
@@ -11029,6 +11519,8 @@ class AppController(QObject):
         # Coalesce with watcher: if we are doing a delete refresh, we don't
         # need a separate watcher refresh immediately after.
         self._watcher_debounce_timer.stop()
+        self._index_throttle_timer.stop()
+        self._index_rescan_needed = False
 
         clear_raw_count_cache()
         self._rebuild_path_to_index()
@@ -11194,7 +11686,8 @@ class AppController(QObject):
                     new_stacks.append([ns, ne])
             if new_stacks != self.stacks:
                 self.stacks = new_stacks
-                self.sidecar.data.stacks = self.stacks
+                with self.sidecar._state_lock:
+                    self.sidecar.data.stacks = self.stacks
                 self._metadata_cache_index = (-1, -1)
 
         # Adjust stack_start_index for removed entries
@@ -11211,17 +11704,23 @@ class AppController(QObject):
 
         # Update UI immediately - this is fast since it just reads from memory
         # Check for existence, not truthiness (empty cache is falsy)
+        paths_to_evict = [
+            path
+            for img in images_to_delete
+            for path in (img.path, img.raw_pair)
+            if path is not None
+        ]
         if self.image_cache is not None:
             # Targeted eviction: remove only deleted images and their raw pairs
             # This preserves the cache for remaining images (huge perf win)
-            paths_to_evict = []
-            for img in images_to_delete:
-                paths_to_evict.append(img.path)
-                if img.raw_pair:
-                    paths_to_evict.append(img.raw_pair)
-
             # Use new targeted eviction with tombstones
             self.image_cache.evict_paths(paths_to_evict)
+
+        # Prevent queued grid work from opening a file after the recycle worker
+        # starts. Running jobs receive a cancellation marker; the sharing-
+        # violation retry in _move_to_recycle covers the brief unwind window.
+        if self._thumbnail_prefetcher:
+            self._thumbnail_prefetcher.cancel_paths(paths_to_evict)
 
         # Sync prefetcher's image list and cancel pending tasks
         if self.prefetcher:
@@ -11651,7 +12150,8 @@ class AppController(QObject):
                     self.stacks = ui.saved_stacks
                     self.stack_start_index = ui.saved_stack_start_index
                     self.stack_end_index = ui.saved_stack_end_index
-                    self.sidecar.data.stacks = self.stacks
+                    with self.sidecar._state_lock:
+                        self.sidecar.data.stacks = self.stacks
                     self._metadata_cache_index = (-1, -1)
                 self.sync_ui_state()
                 self._restart_quality_decode_timer()
@@ -11850,11 +12350,18 @@ class AppController(QObject):
         self._exif_pending_path = None
         log.info("Application shutting down (Qt cleanup).")
 
+        # Drop the startup constraint: its release callbacks are now no-ops.
+        # Save/refinement reasons stay until their own completion paths run or
+        # Prefetcher.shutdown() clears them (executor shutdown ignores the
+        # governor either way, so no worker can be parked on it).
+        self._release_startup_prefetch_constraint("shutdown")
+
         # Stop Qt timers
         try:
             self._metadata_debounce_timer.stop()
             self._exif_debounce_timer.stop()
             self._watcher_debounce_timer.stop()
+            self._index_throttle_timer.stop()
             self._auto_adjust_save_timer.stop()
             self._quality_decode_timer.stop()
             self._session_save_timer.stop()
@@ -11941,6 +12448,11 @@ class AppController(QObject):
         self._safe_shutdown_executor(self._hist_executor, "histogram", wait=False)
         self._safe_shutdown_executor(self._preview_executor, "preview", wait=False)
         self._safe_shutdown_executor(
+            getattr(self, "_preview_refine_executor", None),
+            "preview refinement",
+            wait=False,
+        )
+        self._safe_shutdown_executor(
             getattr(self, "_exif_executor", None),
             "exif",
             wait=False,
@@ -11953,6 +12465,11 @@ class AppController(QObject):
         self._safe_shutdown_executor(
             getattr(self, "_update_executor", None),
             "update",
+            wait=False,
+        )
+        self._safe_shutdown_executor(
+            getattr(self, "_index_executor", None),
+            "index scan",
             wait=False,
         )
         # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
@@ -12018,7 +12535,12 @@ class AppController(QObject):
         # NOTE: This runs on the main thread during shutdown (via main() -> shutdown_nonqt()).
         # It needs to be robust against file I/O errors to avoid hanging the exit.
         try:
-            self.sidecar.set_last_index(self.current_index)
+            with self.sidecar._state_lock:
+                self.sidecar.data.sort_mode = self.sort_mode
+            self.sidecar.set_last_position(
+                self.current_index,
+                self._current_image_path(),
+            )
             self.sidecar.save()
         except Exception as e:
             log.warning("Error saving sidecar during shutdown: %s", e)
@@ -12351,9 +12873,12 @@ class AppController(QObject):
         self.ui_state.resetZoomPan()
         self.update_status_message("Reset zoom and pan")
 
-    def update_status_message(self, message: str, timeout: int = 3000):
+    def update_status_message(self, message: str, timeout: int = 3000, color: str = ""):
         """
         Updates the UI status message and clears it after a timeout.
+
+        ``color`` optionally overrides the status text color (e.g. a yellow
+        warning). Pass "" (the default) to use the standard text color.
         """
         self._status_message_token += 1
         token = self._status_message_token
@@ -12364,9 +12889,32 @@ class AppController(QObject):
                 and self.ui_state.statusMessage == message
             ):
                 self.ui_state.statusMessage = ""
+                self.ui_state.statusMessageColor = ""
 
+        # statusMessage's setter resets statusMessageColor to "" as soon as
+        # the text changes, so the color must be applied after the text.
         self.ui_state.statusMessage = message
+        self.ui_state.statusMessageColor = color
         QTimer.singleShot(timeout, clear_message)
+
+    def _maybe_show_turbo_fallback_warning(self):
+        """Warn once in loupe view if TurboJPEG is unavailable (slower Pillow path)."""
+        if self._turbo_fallback_warning_shown:
+            return
+        from faststack.imaging.jpeg import TURBO_AVAILABLE
+
+        if TURBO_AVAILABLE:
+            return
+        self._turbo_fallback_warning_shown = True
+        log.warning(
+            "TurboJPEG not available - falling back to Pillow (slower decoding)"
+        )
+        self.update_status_message(
+            "TurboJPEG not installed - using slower Pillow decoding. "
+            "Install PyTurboJPEG for faster image loading.",
+            timeout=10000,
+            color="#FFD54F",
+        )
 
     def _capture_metadata_snapshot(
         self, sidecar: SidecarManager, image_path: Path
@@ -12456,33 +13004,34 @@ class AppController(QObject):
     ) -> None:
         """Restore only the metadata fields owned by edit-save actions."""
         stable_key = sidecar.metadata_key_for_path(image_path)
-        current_meta = sidecar.data.entries.get(stable_key)
         restored_edited = bool(snapshot.get("edited", False)) if snapshot else False
         restored_edited_date = snapshot.get("edited_date") if snapshot else None
         restored_edit_state = snapshot.get("edit_state") if snapshot else None
         changed = False
 
-        if current_meta is None:
-            if not restored_edited and restored_edited_date is None:
-                return
-            current_meta = sidecar.get_metadata(image_path, create=True)
-            changed = True
-
-        if current_meta.edited != restored_edited:
-            current_meta.edited = restored_edited
-            changed = True
-        if current_meta.edited_date != restored_edited_date:
-            current_meta.edited_date = restored_edited_date
-            changed = True
-        if current_meta.edit_state != restored_edit_state:
-            current_meta.edit_state = restored_edit_state
-            changed = True
-
-        if snapshot is None:
-            default_meta = EntryMetadata()
-            if current_meta.__dict__ == default_meta.__dict__:
-                del sidecar.data.entries[stable_key]
+        with sidecar._state_lock:
+            current_meta = sidecar.data.entries.get(stable_key)
+            if current_meta is None:
+                if not restored_edited and restored_edited_date is None:
+                    return
+                current_meta = sidecar.get_metadata(image_path, create=True)
                 changed = True
+
+            if current_meta.edited != restored_edited:
+                current_meta.edited = restored_edited
+                changed = True
+            if current_meta.edited_date != restored_edited_date:
+                current_meta.edited_date = restored_edited_date
+                changed = True
+            if current_meta.edit_state != restored_edit_state:
+                current_meta.edit_state = restored_edit_state
+                changed = True
+
+            if snapshot is None:
+                default_meta = EntryMetadata()
+                if current_meta.__dict__ == default_meta.__dict__:
+                    del sidecar.data.entries[stable_key]
+                    changed = True
 
         if changed:
             sidecar.save()
@@ -13115,6 +13664,20 @@ class AppController(QObject):
     def get_preview_data(self) -> Optional[DecodedImage]:
         """Gets the preview data of the currently edited image as a DecodedImage."""
         return self.image_editor.get_preview_data()
+
+    @Slot(bool)
+    def set_editor_slider_drag_active(self, active: bool):
+        """Tell the preview scheduler when a compact-editor slider is pressed."""
+        self._editor_slider_drag_active = bool(active)
+        if not active:
+            return
+        # A press can precede the first valueChanged signal. Cancel obsolete
+        # refinement immediately so it is not competing with the first drag
+        # frame when that signal arrives.
+        with self._preview_lock:
+            cancel_event = self._preview_refinement_cancel
+        if cancel_event is not None:
+            cancel_event.set()
 
     @Slot(str, "QVariant")
     def set_edit_parameter(self, key: str, value: Any):
@@ -14006,6 +14569,17 @@ class AppController(QObject):
         preview_edits["crop_box"] = composed_crop_box
         return preview_edits
 
+    def _preview_refinement_available(self) -> bool:
+        """True when the idle pass can re-render a degraded frame at display size.
+
+        Crop overlays and zoom both re-frame the preview per event, so
+        refinement is suppressed in those states — which also means a frame
+        rendered below the quick tier there would never be sharpened.
+        """
+        return not (
+            self.ui_state is None or self.ui_state.isCropping or self.ui_state.isZoomed
+        )
+
     def _kick_preview_worker(self, *, full_resolution: Optional[bool] = None):
         """Kicks off a background preview render task."""
         if getattr(self, "_shutting_down", False):
@@ -14017,7 +14591,30 @@ class AppController(QObject):
             else full_resolution
         )
 
+        now = time.monotonic()
+        frequent_quick_kick = (
+            not render_full_resolution and now - self._last_quick_preview_kick_at <= 0.3
+        )
+        if not render_full_resolution:
+            self._last_quick_preview_kick_at = now
+        # Only degrade below the quick tier when the idle refinement pass can
+        # sharpen the result afterwards. While cropping or zoomed it cannot, so
+        # a drag-tier frame would stay soft on screen until the user navigates
+        # away — and crop dragging produces back-to-back kicks, which would
+        # otherwise put the whole crop interaction on the degraded path.
+        drag_render = (
+            not render_full_resolution
+            and (self._editor_slider_drag_active or frequent_quick_kick)
+            and self._preview_refinement_available()
+        )
+
         with self._preview_lock:
+            # Refinement owns a separate worker and never owns the quick gate.
+            # Signal it before gate inspection so even a coalesced drag event
+            # promptly stops obsolete display-resolution work.
+            cancel_event = self._preview_refinement_cancel
+            if cancel_event is not None:
+                cancel_event.set()
             if self._preview_inflight:
                 self._preview_pending = True
                 return
@@ -14043,6 +14640,19 @@ class AppController(QObject):
             if preview_edits_override is None
             else None
         )
+        quick_downscale_long_edge = None
+        if drag_render:
+            with self.image_editor._lock:
+                preview_master = self.image_editor.float_preview
+                if preview_master is not None:
+                    # Keep drag renders somewhat below the quick master for
+                    # responsiveness without making the displayed frame look
+                    # conspicuously soft. A 4:3 1440x1080 master renders at
+                    # 1080px long-edge; a 1920x1080 master is capped at 1280px.
+                    quick_downscale_long_edge = min(
+                        1280,
+                        max(1, round(max(preview_master.shape[:2]) * 0.75)),
+                    )
         if render_full_resolution and display_long_edge:
             # This kick's accepted final frame defines the quick-render target
             # size. Uncapped (zoomed) full-res renders must not: quick frames
@@ -14061,6 +14671,7 @@ class AppController(QObject):
                 preview_edits_override,
                 self.previewReady.emit,
                 quick_output_size,
+                quick_downscale_long_edge,
             )
             fut.add_done_callback(self._on_preview_done)
         except RuntimeError:
@@ -14080,13 +14691,12 @@ class AppController(QObject):
         """Re-render the last preview-resolution frame at display resolution.
 
         Armed by every preview-resolution kick; fires once slider/keyboard
-        input has been idle for the debounce interval. The full-resolution
-        path emits a cheap preview-size frame first, so a refinement that a
-        new drag interrupts never blocks live feedback.
+        input has been idle for the debounce interval. Refinement runs on its
+        own cancellable worker so it can never occupy the quick-preview queue.
         """
         if getattr(self, "_shutting_down", False):
             return
-        if self.ui_state is None or self.ui_state.isCropping or self.ui_state.isZoomed:
+        if not self._preview_refinement_available():
             return
         if not self.image_editor or self.image_editor.current_filepath is None:
             return
@@ -14094,6 +14704,11 @@ class AppController(QObject):
         with self._preview_lock:
             if self._preview_inflight:
                 # A render is still running; check again once it settles.
+                self._hq_preview_timer.start()
+                return
+            if self._preview_refinement_inflight:
+                # A cancelled refinement may still be unwinding between
+                # stages. Check again after it releases the dedicated worker.
                 self._hq_preview_timer.start()
                 return
             # Only refine a frame that is still being displayed: same index
@@ -14109,7 +14724,89 @@ class AppController(QObject):
         if not has_current_buffer:
             return
 
-        self._kick_preview_worker(full_resolution=True)
+        self._start_preview_refinement()
+
+    def _start_preview_refinement(self):
+        """Submit an idle display-resolution render outside the quick gate."""
+        display_long_edge = self._display_preview_long_edge()
+        session_key = self._get_current_live_preview_session_key()
+        if session_key is None:
+            return
+
+        cancel_event = threading.Event()
+        image_editor = self.image_editor
+        with image_editor._lock:
+            edits_revision = image_editor._edits_rev
+        with self._preview_lock:
+            if self._preview_inflight or self._preview_refinement_inflight:
+                self._hq_preview_timer.start()
+                return
+            self._preview_refinement_inflight = True
+            self._preview_refinement_cancel = cancel_event
+            self._preview_token += 1
+            token = self._preview_token
+            if display_long_edge:
+                self._preview_full_res_token = token
+
+        def cancelled() -> bool:
+            return cancel_event.is_set() or image_editor._edits_rev != edits_revision
+
+        # Only the expensive settled/display-resolution refinement throttles
+        # speculation; lightweight quick-preview renders never do. Acquired
+        # before submit so a job that finishes immediately still releases via
+        # its own callback token, and released again if submission fails.
+        governor_token = self._enter_prefetch_constraint("preview_refinement")
+
+        try:
+            future = self._preview_refine_executor.submit(
+                self._render_preview_worker,
+                token,
+                session_key,
+                image_editor,
+                True,
+                display_long_edge,
+                None,
+                None,
+                None,
+                None,
+                cancelled,
+            )
+            future.add_done_callback(
+                lambda done, tok=governor_token: self._on_preview_refinement_done(
+                    done, tok
+                )
+            )
+        except RuntimeError:
+            log.warning("Preview refinement failed to start")
+            self._leave_prefetch_constraint(governor_token)
+            with self._preview_lock:
+                if self._preview_refinement_cancel is cancel_event:
+                    self._preview_refinement_cancel = None
+                self._preview_refinement_inflight = False
+
+    def _on_preview_refinement_done(self, future, governor_token=None):
+        # Released first and unconditionally: success, stale result,
+        # cooperative cancellation, worker exception, and shutdown all land
+        # here, and the token identifies THIS refinement, so a rapidly
+        # replaced job cannot restore capacity a newer one still needs.
+        self._leave_prefetch_constraint(governor_token)
+        if getattr(self, "_shutting_down", False):
+            return
+        try:
+            token, session_key, decoded = future.result()
+        except Exception:
+            token, session_key, decoded = None, None, None
+
+        with self._preview_lock:
+            self._preview_refinement_inflight = False
+            self._preview_refinement_cancel = None
+
+        try:
+            # Refinement never owns/releases _preview_inflight. The fifth
+            # payload field preserves the quick gate's final-frame contract.
+            self.previewReady.emit((token, session_key, decoded, True, False))
+        except RuntimeError:
+            pass
 
     @staticmethod
     def _render_preview_worker(
@@ -14121,6 +14818,8 @@ class AppController(QObject):
         preview_edits_override=None,
         emit_intermediate=None,
         quick_output_size=None,
+        quick_downscale_long_edge=None,
+        cancel_check=None,
     ):
         # Heavy work (PIL apply_edits) happens here off-thread
         try:
@@ -14141,6 +14840,7 @@ class AppController(QObject):
                 decoded = image_editor.get_full_resolution_preview_data(
                     max_long_edge=display_long_edge,
                     edits_override=preview_edits_override,
+                    cancel_check=cancel_check,
                 )
             if decoded is None:
                 # allow_compute=True ensures we actually do the work
@@ -14148,8 +14848,12 @@ class AppController(QObject):
                     allow_compute=True,
                     edits_override=preview_edits_override,
                     output_size=quick_output_size,
+                    downscale_long_edge=quick_downscale_long_edge,
                 )
             return token, session_key, decoded
+        except EditRenderCancelled:
+            log.debug("Preview refinement cancelled (token=%s)", token)
+            return token, session_key, None
         except Exception:
             log.exception("Preview render failed")
             return token, session_key, None
@@ -14186,9 +14890,19 @@ class AppController(QObject):
             return
 
         try:
-            token, session_key, decoded, is_final = payload
+            token, session_key, decoded, is_final, owns_gate = payload
         except (TypeError, ValueError):
-            token, session_key, decoded, is_final = None, None, None, True
+            try:
+                token, session_key, decoded, is_final = payload
+                owns_gate = True
+            except (TypeError, ValueError):
+                token, session_key, decoded, is_final, owns_gate = (
+                    None,
+                    None,
+                    None,
+                    True,
+                    True,
+                )
         should_kick = False
         should_accept = False
 
@@ -14197,12 +14911,14 @@ class AppController(QObject):
             # final frame is delivered synchronously and can be processed
             # before the queued intermediate; that late intermediate (gate
             # already released) must not overwrite the full-quality result.
-            stale_intermediate = not is_final and not self._preview_inflight
+            stale_intermediate = (
+                owns_gate and not is_final and not self._preview_inflight
+            )
 
             # Intermediate frames (fast preview-size pass of a full-resolution
             # render) must not release the gate: the worker is still busy
             # producing the final frame.
-            if is_final:
+            if owns_gate and is_final:
                 self._preview_inflight = False
 
             # Accept result only if:
@@ -14237,7 +14953,7 @@ class AppController(QObject):
                 should_accept = True
 
             # Consume pending flag atomically before scheduling
-            if is_final and self._preview_pending:
+            if owns_gate and is_final and self._preview_pending:
                 self._preview_pending = False
                 should_kick = True
 
@@ -14467,6 +15183,11 @@ class AppController(QObject):
                 self.ui_refresh_generation += 1
                 self._kick_preview_worker()
             self.update_status_message("Crop cancelled")
+            # Entering crop mode stopped the settled cover decode via
+            # _begin_direct_image_transition; re-arm it now that the crop
+            # transaction is over, so the current image still upgrades to
+            # cover quality without waiting for the next navigation.
+            self._restart_quality_decode_timer()
 
     @Slot()
     def toggle_crop_mode(self):
@@ -14984,6 +15705,9 @@ class AppController(QObject):
         else:
             self._kick_preview_worker()
         self.update_status_message("Crop applied", timeout=5000)
+        # Pairs with the _begin_direct_image_transition performed when crop mode
+        # was entered, which stopped the settled cover decode.
+        self._restart_quality_decode_timer()
         log.info("Crop applied to live session for %s", filepath)
 
     @Slot()
@@ -15663,9 +16387,33 @@ class AppController(QObject):
             # Speculative + the reserved demand decoder, matching the
             # decode_workers=N(1 demand) notation in the NAVTRACE header.
             speculative = self.prefetcher.total_decode_workers - 1
+            # Governor state confirms at a glance that demand work bypasses the
+            # limit, that no more than the effective limit is running while
+            # constrained, and that queued work is only delayed. All counters
+            # are O(1) -- Preload All may hold thousands of queued tasks.
+            governor = ""
+            try:
+                state = self.prefetcher.constrained_mode_snapshot()
+                if state["constrained"]:
+                    governor = (
+                        f", governed {state['running']}/{state['effective_limit']}"
+                        f" [{','.join(sorted(state['reasons']))}]"
+                        f" q{state['queued_interactive']}+{state['queued_preload']}"
+                        f" demand {state['running_demand']}/1"
+                        f" q{state['queued_demand']}"
+                    )
+                elif state["queued_total"] or state["running"]:
+                    governor = (
+                        f", spec {state['running']}/{state['effective_limit']}"
+                        f" q{state['queued_interactive']}+{state['queued_preload']}"
+                        f" demand {state['running_demand']}/1"
+                        f" q{state['queued_demand']}"
+                    )
+            except Exception:
+                log.debug("Prefetch governor snapshot failed", exc_info=True)
             self.ui_state.cacheStats = (
                 f"Cache: {hits} hits, {misses} misses ({hit_rate:.1f}%), "
-                f"{size_mb:.1f} MB, workers {speculative}+1"
+                f"{size_mb:.1f} MB, workers {speculative}+1{governor}"
             )
 
     def get_recycle_bin_stats(self) -> List[Dict[str, Any]]:
@@ -15967,8 +16715,8 @@ def _prompt_reopen_sessions(records):
     """Ask the user which crash-survivor folders to reopen.
 
     ``records`` are stale session dicts (see ``SessionRegistry.scan_stale``).
-    Returns the list of selected ``(directory, grid)`` tuples, or an empty list
-    if the user opts to skip (cancel / "Open default instead").
+    Returns the selected session records, or an empty list if the user opts to
+    skip (cancel / "Open default instead").
     """
     dialog = QDialog()
     dialog.setWindowTitle("Resume FastStack sessions")
@@ -16006,11 +16754,7 @@ def _prompt_reopen_sessions(records):
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return []
 
-    return [
-        (rec.get("dir", ""), rec.get("grid"))
-        for checkbox, rec in checkboxes
-        if checkbox.isChecked()
-    ]
+    return [rec for checkbox, rec in checkboxes if checkbox.isChecked()]
 
 
 def main(
@@ -16021,6 +16765,8 @@ def main(
     debug_thumb_timing: bool = False,
     debug_thumb_trace: bool = False,
     start_in_loupe: bool = False,
+    restore_path: Optional[str] = None,
+    restore_index: Optional[int] = None,
 ):
     """FastStack Application Entry Point"""
     global _debug_mode, _debug_thumb_timing, _debug_thumb_trace
@@ -16132,10 +16878,19 @@ def main(
         if stale_records:
             chosen = _prompt_reopen_sessions(stale_records)
             if chosen:
-                first_dir, first_grid = chosen[0]
+                first_record = chosen[0]
+                first_dir = first_record.get("dir", "")
+                first_grid = first_record.get("grid")
+                restore_path = first_record.get("path")
+                restore_index = first_record.get("index")
                 # Reopen the rest as separate windows (one process each).
-                for other_dir, other_grid in chosen[1:]:
-                    respawn_for_directory(other_dir, other_grid)
+                for other_record in chosen[1:]:
+                    respawn_for_directory(
+                        other_record.get("dir", ""),
+                        other_record.get("grid"),
+                        other_record.get("path"),
+                        other_record.get("index"),
+                    )
                 image_dir_str = first_dir
                 # Restore the first folder's view mode in this process.
                 if first_grid is False:
@@ -16208,6 +16963,8 @@ def main(
         debug_thumb_trace=debug_thumb_trace,
         start_in_loupe=start_in_loupe,
         app_start_t=t0,
+        restore_path=restore_path,
+        restore_index=restore_index,
     )
     if debug_requested:
         log.info("Startup: after AppController: %.3fs", time.perf_counter() - t0)
@@ -16287,8 +17044,8 @@ def main(
             "[NAVTRACE] enabled schema=2 mode=%s correlation=seq+generation "
             "presentation=%s navigation_fps=%.1f repeat_delay=%dms "
             "pacing=%s held_quality=%s fast_decode_max=%dpx "
-            "decode_workers=%d(1 demand) input_settle=%dms "
-            "summary_deadline=%dms",
+            "decode_workers=%d(1 demand) constrained_speculative=%d "
+            "input_settle=%dms summary_deadline=%dms",
             "trace" if debug_cache_trace else "summary",
             present_mode,
             controller._navigation_rate_fps,
@@ -16297,6 +17054,7 @@ def main(
             controller._held_navigation_quality,
             controller.prefetcher.fast_decode_max_dimension,
             controller.prefetcher.total_decode_workers,
+            controller.prefetcher.governor.constrained_limit,
             controller._NAV_SETTLE_MS,
             controller._NAV_SUMMARY_DEADLINE_MS,
         )
@@ -16414,6 +17172,13 @@ def cli():
         action="store_true",
         help="Enable thumbnail pipeline trace logs (implies --debug)",
     )
+    parser.add_argument("--restore-path", default="", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--restore-index",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     if args.debug_thumbtiming or args.debug_thumbtrace:
         args.debug = True
@@ -16427,6 +17192,8 @@ def cli():
         debug_thumb_timing=args.debug_thumbtiming,
         debug_thumb_trace=args.debug_thumbtrace,
         start_in_loupe=args.loupe,
+        restore_path=args.restore_path or None,
+        restore_index=args.restore_index,
     )
 
 

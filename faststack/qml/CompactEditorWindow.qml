@@ -304,8 +304,10 @@ Window {
             compactEditor.clampWindowToVisibleScreen(true)
             Qt.callLater(compactEditor.focusKeyboardHandler)
         } else {
-            if (compactEditor.controllerRef)
+            if (compactEditor.controllerRef) {
                 compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
+                compactEditor.controllerRef.set_editor_slider_drag_active(false)
+            }
             compactEditor.saveWindowPlacement(true)
             deferredLoadTimer.stop()
         }
@@ -1067,6 +1069,7 @@ Window {
 
                 onPressedChanged: {
                     if (pressed) {
+                        if (compactEditor.controllerRef) compactEditor.controllerRef.set_editor_slider_drag_active(true)
                         compactEditor.ensureEditorLoaded("slider-change")
                         compactEditor.highlightedSliderKey = sliderRow.key
                         compactEditor.focusKeyboardHandler()
@@ -1083,6 +1086,7 @@ Window {
                             if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
                         }
                         if (compactEditor.controllerRef) compactEditor.controllerRef.update_histogram()
+                        if (compactEditor.controllerRef) compactEditor.controllerRef.set_editor_slider_drag_active(false)
                     }
                 }
 

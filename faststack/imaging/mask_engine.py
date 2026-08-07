@@ -15,14 +15,9 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from faststack.imaging.mask import DarkenSettings, MaskData
+from faststack.imaging.optional_deps import get_cv2
 
 log = logging.getLogger(__name__)
-
-# Optional dependency -------------------------------------------------------
-try:
-    import cv2
-except ImportError:
-    cv2 = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +215,9 @@ def _draw_stroke_cv2(
     radius_px: float,
 ) -> None:
     """Draw a stroke onto *canvas* using cv2.circle (faster)."""
+    cv2 = get_cv2()
+    if cv2 is None:
+        return
     r = max(1, int(round(radius_px)))
 
     # Interpolate to prevent gaps from fast mouse movement
@@ -242,6 +240,7 @@ def rasterize_strokes(
     Strokes are in oriented-base-image normalised coords and are
     forward-transformed to *shape* accounting for current geometry edits.
     """
+    cv2 = get_cv2()
     h, w = shape
     add_map = np.zeros((h, w), dtype=np.float32)
     protect_map = np.zeros((h, w), dtype=np.float32)
@@ -277,6 +276,7 @@ def _gaussian_blur(arr: np.ndarray, sigma: float) -> np.ndarray:
     """Gaussian blur a 2-D float32 array."""
     if sigma < 0.5:
         return arr
+    cv2 = get_cv2()
     if cv2 is not None:
         ksize = int(math.ceil(sigma * 6)) | 1  # odd kernel
         return cv2.GaussianBlur(arr, (ksize, ksize), sigma)
@@ -338,6 +338,7 @@ def _border_prior(
 
 def _edge_magnitude(image_arr: np.ndarray) -> np.ndarray:
     """Gradient magnitude for edge stopping."""
+    cv2 = get_cv2()
     luma = image_arr @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
     if cv2 is not None:
         gx = cv2.Sobel(luma, cv2.CV_32F, 1, 0, ksize=3)
@@ -493,7 +494,8 @@ def resolve_mask(
 
     # --- Expand / contract ---
     ec = settings.expand_contract
-    if abs(ec) > 0.01 and cv2 is not None:
+    cv2 = get_cv2() if abs(ec) > 0.01 else None
+    if cv2 is not None:
         ksize = max(3, int(abs(ec) * min(shape) * 0.02)) | 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
         if ec > 0:

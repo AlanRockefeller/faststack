@@ -10,6 +10,8 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
+from faststack.io.indexer import JPG_EXTENSIONS, RAW_EXTENSIONS
+
 log = logging.getLogger(__name__)
 
 # Matches FastStack backup filenames: name-backup.jpg, name-backup2.jpg, etc.
@@ -18,6 +20,7 @@ _TEMP_IMAGE_RE = re.compile(
     r"/\.[^/]+\.(?:jpe?g|jpe|tiff?|cr2|cr3|nef|arw|orf|rw2|raf|dng)$",
     re.IGNORECASE,
 )
+_WATCHED_IMAGE_EXTENSIONS = frozenset(JPG_EXTENSIONS | RAW_EXTENSIONS)
 
 
 def _is_ignored_path(path: str) -> bool:
@@ -27,11 +30,17 @@ def _is_ignored_path(path: str) -> bool:
     return (
         p.endswith(".tmp")
         or p.endswith("faststack.json")
+        or p.endswith("faststack.json.lock")
         or ".__faststack_tmp__" in p
         or _TEMP_IMAGE_RE.search(p) is not None
         or _BACKUP_RE.search(p) is not None
         or "image recycle bin" in p.split("/")
     )
+
+
+def _is_watched_image_path(path: str) -> bool:
+    """Return True when a file can contribute pixels to FastStack's image list."""
+    return Path(path).suffix.lower() in _WATCHED_IMAGE_EXTENSIONS
 
 
 class ImageDirectoryEventHandler(FileSystemEventHandler):
@@ -58,20 +67,28 @@ class ImageDirectoryEventHandler(FileSystemEventHandler):
         self.callback(event.src_path)
 
     def on_moved(self, event):
-        if _is_ignored_path(event.src_path) or _is_ignored_path(event.dest_path):
-            return
         log.info(
             "Detected file move: %s -> %s. Requesting refresh.",
             event.src_path,
             event.dest_path,
         )
-        self.callback(event.src_path)
-        self.callback(event.dest_path)
+        # Treat the endpoints independently. Applications commonly save by moving
+        # an ignored temporary file over the real image; the destination still
+        # needs to invalidate its cached pixels.
+        if not _is_ignored_path(event.src_path):
+            self.callback(event.src_path)
+        if not _is_ignored_path(event.dest_path):
+            self.callback(event.dest_path)
 
     def on_modified(self, event):
-        # This is a no-op to prevent spurious refreshes from file modifications
-        # that don't change the content (e.g., antivirus scans).
-        pass
+        if (
+            event.is_directory
+            or _is_ignored_path(event.src_path)
+            or not _is_watched_image_path(event.src_path)
+        ):
+            return
+        log.info("Detected image modification: %s. Requesting refresh.", event.src_path)
+        self.callback(event.src_path)
 
 
 class Watcher:

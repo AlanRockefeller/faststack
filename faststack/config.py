@@ -435,6 +435,12 @@ DEFAULT_CONFIG = {
         # 0 = auto: ~3/4 of logical cores, clamped to [2, 16]. Override for
         # throughput tuning; decode and color transforms release the GIL.
         "prefetch_workers": "0",
+        # Speculative decodes allowed to RUN while latency-sensitive foreground
+        # work is active (startup first frame, background save, settled preview
+        # refinement). The reserved demand worker is never throttled. 0 pauses
+        # new speculative decodes until the foreground work finishes; a value at
+        # or above the speculative pool size keeps the old full concurrency.
+        "prefetch_constrained_workers": "2",
         "held_navigation_quality": "balanced",
         "navigation_repeat_delay_ms": "500",
         "theme": "dark",

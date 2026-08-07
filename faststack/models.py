@@ -87,6 +87,8 @@ class Sidecar:
 
     version: int = 2
     last_index: int = 0
+    last_path: Optional[str] = None
+    sort_mode: Optional[str] = None
     entries: Dict[str, EntryMetadata] = dataclasses.field(default_factory=dict)
     stacks: List[List[int]] = dataclasses.field(default_factory=list)
 

@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
-from faststack.imaging.optional_deps import cv2
+from faststack.imaging.optional_deps import get_cv2
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ def apply_orientation_to_np(buffer: np.ndarray, orientation: int) -> np.ndarray:
     # cv2.rotate/flip produce bit-identical contiguous output ~5x faster.
     # Orientations 5/7 (mirror + rotate) stay on numpy — cameras essentially
     # never emit them.
+    cv2 = get_cv2()
     if cv2 is not None and buffer.flags["C_CONTIGUOUS"]:
         if orientation == 2:
             return cv2.flip(buffer, 1)

@@ -9,7 +9,7 @@ from typing import Any, Literal, Optional, Tuple
 import numpy as np
 from PIL import Image
 
-from faststack.imaging.optional_deps import cv2
+from faststack.imaging.optional_deps import get_cv2
 from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
 
 log = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ def decode_jpeg_rgb(
     fast_dct: bool = False,
     source_path: Optional[str] = None,
     stats: Optional[dict] = None,
+    log_errors: bool = True,
 ) -> Optional[np.ndarray]:
     """Decodes JPEG bytes into an RGB numpy array."""
     if TURBO_AVAILABLE and JPEG_DECODER:
@@ -80,7 +81,13 @@ def decode_jpeg_rgb(
                 stats["dct"] = (1, 1)
             return result
         except Exception as e:
-            log.exception("PyTurboJPEG failed to decode image: %s. Trying Pillow.", e)
+            log.log(
+                logging.ERROR if log_errors else logging.DEBUG,
+                "PyTurboJPEG failed to decode %s: %s. Trying Pillow.",
+                source_path or "<unknown>",
+                e,
+                exc_info=log_errors,
+            )
 
     # Fallback to Pillow
     try:
@@ -90,7 +97,13 @@ def decode_jpeg_rgb(
             stats["dct"] = (1, 1)
         return np.array(img)
     except Exception as e:
-        log.exception("Pillow also failed to decode image: %s", e)
+        log.log(
+            logging.ERROR if log_errors else logging.DEBUG,
+            "Pillow also failed to decode %s: %s",
+            source_path or "<unknown>",
+            e,
+            exc_info=log_errors,
+        )
         return None
 
 
@@ -226,6 +239,7 @@ def decode_jpeg_resized(
     source_path: Optional[str] = None,
     mode: Literal["fast", "cover"] = "cover",
     stats: Optional[dict] = None,
+    log_errors: bool = True,
 ) -> Optional[np.ndarray]:
     """Decodes and resizes a JPEG to fit within the given dimensions.
 
@@ -242,6 +256,7 @@ def decode_jpeg_resized(
             fast_dct=fast_dct,
             source_path=source_path,
             stats=stats,
+            log_errors=log_errors,
         )
 
     if TURBO_AVAILABLE and JPEG_DECODER:
@@ -297,6 +312,7 @@ def decode_jpeg_resized(
                 # megapixel settled frame while retaining high downscale quality.
                 if decoded.shape[0] > height or decoded.shape[1] > width:
                     _t_resize = time.perf_counter() if stats is not None else None
+                    cv2 = get_cv2()
                     output_width, output_height = _fit_dimensions(
                         decoded.shape[1],
                         decoded.shape[0],
@@ -331,7 +347,13 @@ def decode_jpeg_resized(
                     stats["output"] = (decoded.shape[1], decoded.shape[0])
                 return decoded
         except Exception as e:
-            log.exception("PyTurboJPEG failed: %s", e)
+            log.log(
+                logging.ERROR if log_errors else logging.DEBUG,
+                "PyTurboJPEG failed for %s: %s",
+                source_path or "<unknown>",
+                e,
+                exc_info=log_errors,
+            )
 
     # Fallback to Pillow (existing code)
     try:
@@ -370,5 +392,11 @@ def decode_jpeg_resized(
             stats["output"] = (result.shape[1], result.shape[0])
         return result
     except Exception as e:
-        log.exception("Pillow failed to decode and resize image: %s", e)
+        log.log(
+            logging.ERROR if log_errors else logging.DEBUG,
+            "Pillow failed to decode and resize %s: %s",
+            source_path or "<unknown>",
+            e,
+            exc_info=log_errors,
+        )
         return None

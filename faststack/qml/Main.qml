@@ -164,6 +164,15 @@ ApplicationWindow {
         dialog.open()
     }
 
+    function openSettingsDialog() {
+        settingsDialogLoader.openWhenLoaded = true
+        settingsDialogLoader.loadedOnce = true
+        if (settingsDialogLoader.item && settingsDialogLoader.openWhenLoaded) {
+            root.openDialogSafely(settingsDialogLoader.item)
+            settingsDialogLoader.openWhenLoaded = false
+        }
+    }
+
     // Debounce continuous geometry changes (drags/resizes) and let the window
     // settle after maximize/un-maximize transitions before persisting, so we
     // never store a transient size/visibility. Authoritative saves on close go
@@ -814,7 +823,7 @@ ApplicationWindow {
                 text: "Settings..."
                 hoverFillColor: root.menuHoverColor
                 onClicked: {
-                    root.openDialogSafely(settingsDialog)
+                    root.openSettingsDialog()
                     fileMenu.close()
                 }
                 defaultTextColor: root.currentTextColor
@@ -1926,7 +1935,11 @@ ApplicationWindow {
             Label {
                 id: statusMessageLabel
                 text: root.uiStateRef ? root.uiStateRef.statusMessage : ""
-                color: (root.uiStateRef && root.uiStateRef.isSaving) ? "#4CAF50" : root.currentTextColor
+                color: (root.uiStateRef && root.uiStateRef.isSaving)
+                    ? "#4CAF50"
+                    : ((root.uiStateRef && root.uiStateRef.statusMessageColor !== "")
+                        ? root.uiStateRef.statusMessageColor
+                        : root.currentTextColor)
                 font.bold: (root.uiStateRef && root.uiStateRef.isSaving) ? true : false
                 font.pixelSize: (root.uiStateRef && root.uiStateRef.isSaving) ? 14 : 12
                 visible: root.uiStateRef ? (root.uiStateRef.statusMessage !== "") : false
@@ -2233,8 +2246,18 @@ ApplicationWindow {
         }
     }
 
-    SettingsDialog {
-        id: settingsDialog
+    Loader {
+        id: settingsDialogLoader
+        property bool loadedOnce: false
+        property bool openWhenLoaded: false
+        active: loadedOnce
+        source: "SettingsDialog.qml"
+        onLoaded: {
+            if (openWhenLoaded) {
+                root.openDialogSafely(item)
+                openWhenLoaded = false
+            }
+        }
     }
 
     FilterDialog {
@@ -2267,28 +2290,54 @@ ApplicationWindow {
         gridLineColor: root.isDarkTheme ? "#454545" : "#dcdcdc"
     }
 
-    CompactEditorWindow {
-        id: compactEditorWindow
-        onVisibleChanged: {
-            if (!visible) {
+    Loader {
+        id: compactEditorLoader
+        property bool loadedOnce: false
+        active: loadedOnce || (root.uiStateRef
+                               && root.uiStateRef.isEditorOpen
+                               && !root.uiStateRef.isEditorExpanded)
+        source: "CompactEditorWindow.qml"
+        onLoaded: Qt.callLater(function() { compactEditorLoader.loadedOnce = true })
+    }
+
+    Connections {
+        target: compactEditorLoader.item
+        function onVisibleChanged() {
+            if (!compactEditorLoader.item["visible"]) {
                 mainViewLoader.forceActiveFocus()
             }
         }
     }
 
-    ImageEditorDialog {
-        id: imageEditorDialog
-        backgroundColor: root.currentBackgroundColor
-        textColor: root.currentTextColor
-        onVisibleChanged: {
-            if (!visible) {
+    Loader {
+        id: imageEditorLoader
+        property bool loadedOnce: false
+        active: loadedOnce || (root.uiStateRef
+                               && root.uiStateRef.isEditorOpen
+                               && root.uiStateRef.isEditorExpanded)
+        source: "ImageEditorDialog.qml"
+        onLoaded: {
+            item.backgroundColor = Qt.binding(function() { return root.currentBackgroundColor })
+            item.textColor = Qt.binding(function() { return root.currentTextColor })
+            Qt.callLater(function() { imageEditorLoader.loadedOnce = true })
+        }
+    }
+
+    Connections {
+        target: imageEditorLoader.item
+        function onVisibleChanged() {
+            if (!imageEditorLoader.item["visible"]) {
                 mainViewLoader.forceActiveFocus()
             }
         }
     }
 
-    DarkenToolPanel {
-        id: darkenToolPanel
+    Loader {
+        id: darkenToolLoader
+        property bool loadedOnce: false
+        active: loadedOnce || (root.uiStateRef && root.uiStateRef.isDarkening)
+        source: "DarkenToolPanel.qml"
+        onLoaded: Qt.callLater(function() { darkenToolLoader.loadedOnce = true })
     }
 
     function show_jump_to_image_dialog() {

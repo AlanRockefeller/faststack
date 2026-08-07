@@ -2,10 +2,19 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
-## 1.6.7 (2026-07-13)
+## 1.6.7 (2026-08-03)
 
+- Implemented safe multi-process sidecar merging - now having multiple Faststack windows won't clobber sidecars with old data.
+- We now watch for changes in images and load the new image - very useful if you are editing photos in Gimp or Photoshop.
+- Pressing P to open an image in Photoshop now also copies the JPG path to the clipboard, even when Photoshop opens the paired RAW file.
+- Image position is now restored by filename, folders default to filename sorting, and each folder remembers its selected sort mode. Overwriting an image no longer moves it to the end.
 - Flipping through images by holding down the arrow key is now faster and smoother.
 - If a stack input directory is detected, the Action menu now has a menuitem to switch to the stack input directory. If you switch, that menu item becomes a switch back to main photo directory menu item.
+- Faster startup. OpenCV is now only loaded the first time it's actually needed instead of at launch, so FastStack should open noticeably quicker.
+- The Settings, Image Editor, and Darken panels now load in the background only when you first open them, instead of all being built at startup — another startup speed win.
+- Fixed a rare crash/glitch when a new photo is still being written to disk (e.g. copied in from Photoshop/Gimp) right as FastStack tries to load it — it now waits briefly and retries instead of showing a broken image.
+- Fixed an occasional failure to move files to the Recycle Bin on Windows when another program briefly had the file open — FastStack now retries a few times before giving up.
+- Status messages can now show in different colors (e.g. warnings)
 
 ## 1.6.6 (2026-07-08)
 

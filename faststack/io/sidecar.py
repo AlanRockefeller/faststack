@@ -1,11 +1,15 @@
 """Manages reading and writing the faststack.json sidecar file."""
 
+import copy
+import dataclasses
 import json
 import logging
 import os
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal, Optional, Union, overload
+from typing import BinaryIO, Iterator, Literal, Optional, Union, overload
 
 from faststack.io.indexer import JPG_EXTENSIONS, RAW_EXTENSIONS
 from faststack.io.utils import atomic_write_json
@@ -15,6 +19,7 @@ log = logging.getLogger(__name__)
 KNOWN_IMAGE_EXTENSIONS = frozenset(
     ext.lower() for ext in JPG_EXTENSIONS | RAW_EXTENSIONS
 )
+_MISSING = object()
 
 
 def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
@@ -30,8 +35,6 @@ def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
         # stack_id IS in the current model, so we keep it (don't delete it).
 
         # Filter out unknown keys
-        import dataclasses
-
         valid_keys = {f.name for f in dataclasses.fields(EntryMetadata)}
         filtered_meta = {k: v for k, v in meta.items() if k in valid_keys}
 
@@ -42,11 +45,173 @@ def _entrymetadata_from_json(meta: dict) -> EntryMetadata:
 
 
 def _entrymetadata_to_json(meta: EntryMetadata) -> dict:
-    """Convert EntryMetadata to a JSON-ready dict without noisy empty edit state."""
+    """Convert EntryMetadata to a detached JSON-ready dict.
+
+    ``edit_state`` is the only nested mutable field, so copying it explicitly
+    detaches the entry without a full deepcopy — this runs once per entry on
+    every save, which is a UI-thread cost on large folders.
+    """
     data = meta.__dict__.copy()
-    if data.get("edit_state") is None:
+    edit_state = data.get("edit_state")
+    if edit_state is None:
         data.pop("edit_state", None)
+    else:
+        data["edit_state"] = copy.deepcopy(edit_state)
     return data
+
+
+def _sidecar_to_json(sidecar: Sidecar) -> dict:
+    """Return a detached JSON payload for a sidecar."""
+    return {
+        "version": sidecar.version,
+        "last_index": sidecar.last_index,
+        "last_path": sidecar.last_path,
+        "sort_mode": sidecar.sort_mode,
+        "entries": {
+            key: _entrymetadata_to_json(meta) for key, meta in sidecar.entries.items()
+        },
+        "stacks": copy.deepcopy(sidecar.stacks),
+    }
+
+
+def _sidecar_from_json(data: dict) -> Sidecar:
+    """Reconstruct a sidecar from a validated version-2 JSON payload."""
+    entries_data = data.get("entries", {})
+    if not isinstance(entries_data, dict):
+        raise TypeError("sidecar entries must be an object")
+    return Sidecar(
+        version=data.get("version", 2),
+        last_index=data.get("last_index", 0),
+        last_path=(
+            data.get("last_path") if isinstance(data.get("last_path"), str) else None
+        ),
+        sort_mode=(
+            data.get("sort_mode") if isinstance(data.get("sort_mode"), str) else None
+        ),
+        entries={
+            key: _entrymetadata_from_json(meta)
+            for key, meta in entries_data.items()
+            if isinstance(meta, dict)
+        },
+        stacks=copy.deepcopy(data.get("stacks", [])),
+    )
+
+
+def _select_three_way(base, ours, theirs):
+    """Choose a value without letting an unchanged stale value win."""
+    if ours == base:
+        return _MISSING if theirs is _MISSING else copy.deepcopy(theirs)
+    if theirs == base or ours == theirs:
+        return _MISSING if ours is _MISSING else copy.deepcopy(ours)
+    # Both writers changed the same value. The process holding the write lock
+    # is the most recent writer, so its explicit change wins.
+    return _MISSING if ours is _MISSING else copy.deepcopy(ours)
+
+
+def _copy_merge_value(value):
+    """Copy a merge value without cloning the identity-based missing sentinel."""
+    return _MISSING if value is _MISSING else copy.deepcopy(value)
+
+
+def _merge_entry(base, ours, theirs):
+    """Three-way merge one metadata entry at field granularity."""
+    if ours == base:
+        return _copy_merge_value(theirs)
+    if theirs == base or ours == theirs:
+        return _copy_merge_value(ours)
+    if not isinstance(ours, dict) or not isinstance(theirs, dict):
+        return _copy_merge_value(ours)
+
+    default_entry = _entrymetadata_to_json(EntryMetadata())
+    base_fields = base if isinstance(base, dict) else default_entry
+    merged = {}
+    for field_name in base_fields.keys() | ours.keys() | theirs.keys():
+        base_value = base_fields.get(field_name, _MISSING)
+        our_value = ours.get(field_name, _MISSING)
+        their_value = theirs.get(field_name, _MISSING)
+        value = _select_three_way(base_value, our_value, their_value)
+        if value is not _MISSING:
+            merged[field_name] = value
+    return merged
+
+
+def _merge_entries(base, ours, theirs) -> dict:
+    """Three-way merge the sidecar entry mapping."""
+    base = base if isinstance(base, dict) else {}
+    ours = ours if isinstance(ours, dict) else {}
+    theirs = theirs if isinstance(theirs, dict) else {}
+    merged = {}
+    for key in base.keys() | ours.keys() | theirs.keys():
+        value = _merge_entry(
+            base.get(key, _MISSING),
+            ours.get(key, _MISSING),
+            theirs.get(key, _MISSING),
+        )
+        if value is not _MISSING:
+            merged[key] = value
+    return merged
+
+
+def _merge_sidecar_payloads(base: dict, ours: dict, theirs: dict) -> dict:
+    """Merge changes made since ``base`` into the latest disk payload."""
+    merged = {}
+    for key in base.keys() | ours.keys() | theirs.keys():
+        if key == "entries":
+            value = _merge_entries(
+                base.get(key, {}),
+                ours.get(key, {}),
+                theirs.get(key, {}),
+            )
+        else:
+            value = _select_three_way(
+                base.get(key, _MISSING),
+                ours.get(key, _MISSING),
+                theirs.get(key, _MISSING),
+            )
+        if value is not _MISSING:
+            merged[key] = value
+    return merged
+
+
+def _lock_sidecar_file(lock_file: BinaryIO) -> None:
+    """Acquire an exclusive process lock on the first byte of ``lock_file``."""
+    lock_file.seek(0, os.SEEK_END)
+    if lock_file.tell() == 0:
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_sidecar_file(lock_file: BinaryIO) -> None:
+    """Release the process lock acquired by ``_lock_sidecar_file``."""
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _sidecar_write_lock(lock_path: Path) -> Iterator[None]:
+    """Serialize read/merge/write transactions across FastStack processes."""
+    with lock_path.open("a+b") as lock_file:
+        _lock_sidecar_file(lock_file)
+        try:
+            yield
+        finally:
+            _unlock_sidecar_file(lock_file)
 
 
 class SidecarManager:
@@ -66,7 +231,30 @@ class SidecarManager:
         self._stable_key_cache: dict[str, str] = {}
         self._filename_key_cache: dict[str, str] = {}
         self._key_cache_max = 8192
+        self._save_lock = threading.RLock()
+        # Guards the structure of ``self.data`` (entry dict, stacks list, the
+        # scalar position fields) so a background save cannot serialize or
+        # merge-back a half-updated state while another thread is adding or
+        # migrating entries. Never held across file I/O, and never held while
+        # calling save() — save() takes _save_lock first, so acquiring the
+        # locks in the other order would risk a deadlock.
+        #
+        # Thread contract: all mutation of ``self.data`` (and of EntryMetadata
+        # objects returned by get_metadata()) happens on the main/Qt thread —
+        # background executors (save, delete) do file I/O only and hand results
+        # back via queued Qt signals, which AppController's slots then apply to
+        # the sidecar on the main thread. This lock therefore only needs to
+        # protect against save()'s own background merge-back, not against
+        # concurrent callers mutating entries; it is not a substitute for
+        # copy-on-read if that contract ever changes.
+        self._state_lock = threading.RLock()
+        self._write_lock_path = directory / "faststack.json.lock"
+        # Identity of the disk file the baseline payload was taken from. Set by
+        # load() and by every successful save; see _disk_matches_baseline.
+        self._baseline_stamp: Optional[tuple[int, int, int]] = None
         self.data = self.load()
+        # Three-way merge base: the disk state this process last incorporated.
+        self._baseline_payload = _sidecar_to_json(self.data)
 
     def stop_watcher(self):
         if self.watcher:
@@ -76,16 +264,77 @@ class SidecarManager:
         if self.watcher:
             self.watcher.start()
 
+    def _disk_stamp(self) -> Optional[tuple[int, int, int]]:
+        """Return a cheap identity for the on-disk sidecar, or None if absent.
+
+        ``atomic_write_json`` replaces the file, so a write by any process
+        changes mtime/size and, where the platform supports it, the inode.
+
+        ``st_ino`` is only a bonus signal here: Windows network shares and some
+        FAT/exFAT volumes report 0 or an unstable value. Both failure modes are
+        safe — an inode that changes spuriously makes the stamp mismatch, which
+        only costs us a full three-way merge, and an inode that is always 0
+        simply leaves mtime+size doing the work. The stamp is never used to
+        conclude that a foreign write *did* happen, only that none did.
+        """
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        ino = getattr(st, "st_ino", 0) or 0
+        return (st.st_mtime_ns, st.st_size, ino)
+
+    def _disk_matches_baseline(self) -> bool:
+        """True when no other process has written the file since our baseline."""
+        if self._baseline_stamp is None:
+            return False
+        stamp = self._disk_stamp()
+        return stamp is not None and stamp == self._baseline_stamp
+
+    def _read_disk_payload(self) -> Optional[dict]:
+        """Return the current version-2 disk payload, or None if unusable.
+
+        Mirrors ``load()``'s tolerance: a missing, malformed or pre-v2 file is
+        reported as "nothing to merge against" rather than raising. Raising here
+        would abort the save and, because the caller swallows the error, leave
+        the bad file in place to break every subsequent save too.
+        """
+        try:
+            with self.path.open("r") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning(f"Ignoring unreadable sidecar file {self.path}: {e}")
+            return None
+        if not isinstance(payload, dict):
+            log.warning(f"Ignoring sidecar file {self.path}: root is not an object")
+            return None
+        if payload.get("version") != 2:
+            log.warning(
+                f"Ignoring sidecar file {self.path}: "
+                f"unsupported version {payload.get('version')!r}"
+            )
+            return None
+        return payload
+
     def load(self) -> Sidecar:
         """Loads sidecar data from disk if it exists, otherwise returns a new object."""
         if not self.path.exists():
             log.info(f"No sidecar file found at {self.path}. Creating new one.")
+            self._baseline_stamp = None
             return Sidecar()
         try:
             t_start = time.perf_counter()
+            # Stamp before reading: if a foreign write lands in between we keep
+            # the older stamp and the next save falls back to a full merge,
+            # which is the safe direction to be wrong in.
+            self._baseline_stamp = self._disk_stamp()
             with self.path.open("r") as f:
                 data = json.load(f)
             json_load_time = time.perf_counter() - t_start
+            if not isinstance(data, dict):
+                raise TypeError("sidecar root must be an object")
 
             if self.debug:
                 log.info(
@@ -95,39 +344,76 @@ class SidecarManager:
                 log.warning("Old sidecar format detected. Starting fresh.")
                 return Sidecar()
 
-            # Reconstruct nested objects
-            entries = {
-                key: _entrymetadata_from_json(meta)
-                for key, meta in data.get("entries", {}).items()
-            }
-            return Sidecar(
-                version=data.get("version", 2),
-                last_index=data.get("last_index", 0),
-                entries=entries,
-                stacks=data.get("stacks", []),
-            )
+            return _sidecar_from_json(data)
         except (json.JSONDecodeError, TypeError) as e:
             log.error(f"Failed to load or parse sidecar file {self.path}: {e}")
             # Consider backing up the corrupted file here
             return Sidecar()
 
     def save(self):
-        """Saves the sidecar data to disk atomically."""
-        try:
-            serializable_data = {
-                "version": self.data.version,
-                "last_index": self.data.last_index,
-                "entries": {
-                    key: _entrymetadata_to_json(meta)
-                    for key, meta in self.data.entries.items()
-                },
-                "stacks": self.data.stacks,
-            }
-            atomic_write_json(self.path, serializable_data)
-            log.debug(f"Saved sidecar file to {self.path}")
+        """Merge this process's changes with disk, then save atomically."""
+        with self._save_lock:
+            try:
+                with self._state_lock:
+                    ours = _sidecar_to_json(self.data)
+                with _sidecar_write_lock(self._write_lock_path):
+                    theirs = (
+                        None
+                        if self._disk_matches_baseline()
+                        else self._read_disk_payload()
+                    )
+                    if theirs is None:
+                        # Either nobody has touched the file since our baseline,
+                        # or what is there is unreadable/pre-v2 and load() has
+                        # already discarded it. Both mean there is nothing to
+                        # merge, so write our state straight out. This keeps a
+                        # legacy or corrupt file from making every save a no-op.
+                        atomic_write_json(self.path, ours)
+                        self._baseline_payload = ours
+                        self._baseline_stamp = self._disk_stamp()
+                        log.debug(f"Saved sidecar file to {self.path}")
+                        return
 
-        except (IOError, TypeError) as e:
-            log.error(f"Failed to save sidecar file {self.path}: {e}")
+                    merged = _merge_sidecar_payloads(
+                        self._baseline_payload,
+                        ours,
+                        theirs,
+                    )
+                    atomic_write_json(self.path, merged)
+                    self._baseline_stamp = self._disk_stamp()
+
+                # Incorporate changes from other processes into this manager so
+                # a later save cannot mistake them for local deletions.
+                merged_data = _sidecar_from_json(merged)
+                with self._state_lock:
+                    self.data.version = merged_data.version
+                    self.data.last_index = merged_data.last_index
+                    self.data.last_path = merged_data.last_path
+                    self.data.sort_mode = merged_data.sort_mode
+                    # Mutate in place: AppController aliases this list as
+                    # ``self.stacks``, so rebinding it would hide merged-in
+                    # stacks from the UI and let the next save overwrite them.
+                    self.data.stacks[:] = merged_data.stacks
+                    for key in list(self.data.entries):
+                        if key not in merged_data.entries:
+                            del self.data.entries[key]
+                    for key, merged_meta in merged_data.entries.items():
+                        current_meta = self.data.entries.get(key)
+                        if current_meta is None:
+                            self.data.entries[key] = merged_meta
+                            continue
+                        for field in dataclasses.fields(EntryMetadata):
+                            setattr(
+                                current_meta,
+                                field.name,
+                                copy.deepcopy(getattr(merged_meta, field.name)),
+                            )
+
+                    self._baseline_payload = _sidecar_to_json(self.data)
+                log.debug(f"Merged and saved sidecar file to {self.path}")
+
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as e:
+                log.error(f"Failed to merge or save sidecar file {self.path}: {e}")
 
     @overload
     def get_metadata(
@@ -179,34 +465,41 @@ class SidecarManager:
                 raise ValueError(f"image_ref must not be empty: {image_ref!r}")
             return None
 
-        meta = self.data.entries.get(stable_key)
-        if meta is None:
-            for candidate_key in candidate_keys:
-                if candidate_key == stable_key:
-                    continue
-                candidate_meta = self.data.entries.get(candidate_key)
-                if candidate_meta is None:
-                    continue
-                meta = candidate_meta
-                if stable_key not in self.data.entries:
-                    self.data.entries[stable_key] = candidate_meta
-                if candidate_key in self.data.entries and candidate_key != stable_key:
-                    del self.data.entries[candidate_key]
-                break
-        if meta is None and migrate:
-            for existing_key, existing_meta in list(self.data.entries.items()):
-                if existing_key == stable_key:
-                    continue
-                if self._stable_key_from_key(existing_key, check_fs=True) != stable_key:
-                    continue
-                meta = existing_meta
-                self.data.entries[stable_key] = existing_meta
-                del self.data.entries[existing_key]
-                break
+        with self._state_lock:
+            meta = self.data.entries.get(stable_key)
+            if meta is None:
+                for candidate_key in candidate_keys:
+                    if candidate_key == stable_key:
+                        continue
+                    candidate_meta = self.data.entries.get(candidate_key)
+                    if candidate_meta is None:
+                        continue
+                    meta = candidate_meta
+                    if stable_key not in self.data.entries:
+                        self.data.entries[stable_key] = candidate_meta
+                    if (
+                        candidate_key in self.data.entries
+                        and candidate_key != stable_key
+                    ):
+                        del self.data.entries[candidate_key]
+                    break
+            if meta is None and migrate:
+                for existing_key, existing_meta in list(self.data.entries.items()):
+                    if existing_key == stable_key:
+                        continue
+                    if (
+                        self._stable_key_from_key(existing_key, check_fs=True)
+                        != stable_key
+                    ):
+                        continue
+                    meta = existing_meta
+                    self.data.entries[stable_key] = existing_meta
+                    del self.data.entries[existing_key]
+                    break
 
-        if meta is None and create:
-            meta = EntryMetadata()
-            self.data.entries[stable_key] = meta
+            if meta is None and create:
+                meta = EntryMetadata()
+                self.data.entries[stable_key] = meta
         return meta
 
     def metadata_key_for_path(self, image_path: Union[str, Path]) -> str:
@@ -311,7 +604,24 @@ class SidecarManager:
         return key
 
     def set_last_index(self, index: int):
-        self.data.last_index = index
+        with self._state_lock:
+            self.data.last_index = index
+
+    def set_last_position(self, index: int, image_path: Optional[Path]) -> None:
+        """Store an index fallback plus a relocatable path within this folder."""
+        if image_path is None:
+            with self._state_lock:
+                self.data.last_index = index
+                self.data.last_path = None
+            return
+        path = Path(image_path)
+        try:
+            last_path = path.relative_to(self.directory).as_posix()
+        except ValueError:
+            last_path = str(path)
+        with self._state_lock:
+            self.data.last_index = index
+            self.data.last_path = last_path
 
     def update_metadata(self, image_ref: Union[str, Path], updates: dict):
         """Update multiple metadata fields for an image and save if changed."""
