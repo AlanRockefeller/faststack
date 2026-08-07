@@ -53,6 +53,14 @@ HELD_NAVIGATION_QUALITY_DIMENSIONS = {
     "highest": 3200,
 }
 _MIN_DIRECTION_TAIL = 4
+
+# Speculative decodes allowed while latency-sensitive foreground work runs.
+# Profiling showed 11 concurrent native TurboJPEG/ICC decodes saturating CPU
+# and memory bandwidth on a 16-thread machine, which is what made the UI
+# unresponsive -- not the GIL. Two leaves the look-ahead buffer refilling
+# without competing with the frame the user is actually waiting on.
+DEFAULT_CONSTRAINED_SPECULATIVE_WORKERS = 2
+_GOVERNOR_LOG_PREFIX = "[PREFETCH_GOVERNOR]"
 _JPEG_FRESH_SNAPSHOT_RETRY_DELAY = 0.2
 # A JPEG last written within this many seconds is treated as possibly still
 # being imported; anything older that fails to decode is treated as broken.
@@ -100,6 +108,13 @@ class _DecodeTaskFuture(Future):
         self._execution_queue_group: Optional[int] = None
         self._execution_queue_order: Optional[int] = None
         self._completion_claimed = False
+        # Deferred execution: a decode that must not start until another task
+        # has settled is held here instead of being queued as a wrapper that
+        # blocks a worker thread on its dependency.
+        self._deferred_executor: object = None
+        self._deferred_priority: Optional[int] = None
+        self._deferred_queue_group: Optional[int] = None
+        self._deferred_queue_order: Optional[int] = None
 
     def submit_execution(
         self,
@@ -130,6 +145,76 @@ class _DecodeTaskFuture(Future):
         # _execution_lock so logical completion callbacks are never run while
         # holding the migration lock.
         execution.add_done_callback(self._execution_done)
+
+    def defer_execution(
+        self,
+        executor,
+        *,
+        priority: int,
+        queue_group: int = _QUEUE_GROUP_INTERACTIVE,
+        queue_order: Optional[int] = None,
+    ) -> None:
+        """Record where this decode will be submitted once a dependency settles.
+
+        Nothing is queued yet, so the logical future stays plainly cancellable
+        and occupies neither an admission slot nor a physical worker.
+        """
+        with self._execution_lock:
+            self._deferred_executor = executor
+            self._deferred_priority = priority
+            self._deferred_queue_group = queue_group
+            self._deferred_queue_order = queue_order
+
+    def submit_deferred_execution(
+        self, worker_args: Optional[tuple[Any, ...]] = None
+    ) -> bool:
+        """Queue the deferred execution; False when it is no longer wanted."""
+        with self._execution_lock:
+            if (
+                self.done()
+                or self._completion_claimed
+                or self._deferred_executor is None
+            ):
+                return False
+            executor = self._deferred_executor
+            priority = self._deferred_priority
+            queue_group = self._deferred_queue_group
+            queue_order = self._deferred_queue_order
+            self._deferred_executor = None
+            self._deferred_priority = None
+            self._deferred_queue_group = None
+            self._deferred_queue_order = None
+            if worker_args is not None:
+                self._worker_args = worker_args
+        # submit_execution takes the lock again and re-checks completion, so a
+        # cancellation racing this call still cancels the physical work.
+        self.submit_execution(
+            executor,
+            priority=priority if priority is not None else _PRIORITY_COVER,
+            queue_group=(
+                queue_group if queue_group is not None else _QUEUE_GROUP_INTERACTIVE
+            ),
+            queue_order=queue_order,
+        )
+        return True
+
+    def bump_deferred_priority(self, executor, priority: int, queue_group: int) -> bool:
+        """Apply a priority bump to work that has not been queued yet."""
+        with self._execution_lock:
+            if self._deferred_executor is not executor:
+                return False
+            current_group = self._deferred_queue_group
+            current_priority = self._deferred_priority
+            if current_group is None:
+                current_group = _QUEUE_GROUP_INTERACTIVE
+            if current_priority is None:
+                current_priority = _PRIORITY_COVER
+            if (queue_group, priority) >= (current_group, current_priority):
+                return False
+            self._deferred_priority = priority
+            self._deferred_queue_group = queue_group
+            self._deferred_queue_order = None
+            return True
 
     def migrate_queued_execution(
         self,
@@ -958,6 +1043,211 @@ def _decode_buffer(
     )
 
 
+def resolve_constrained_speculative_workers(speculative_workers: int) -> int:
+    """Resolve ``core.prefetch_constrained_workers`` against real capacity.
+
+    0 is valid and means "pause new speculative decodes entirely while a
+    foreground activity is running". Anything at or above the speculative pool
+    size preserves the old (unthrottled) behavior. Unparseable values fall back
+    to the conservative default rather than disabling the governor silently.
+    """
+    raw = config.get(
+        "core",
+        "prefetch_constrained_workers",
+        fallback=str(DEFAULT_CONSTRAINED_SPECULATIVE_WORKERS),
+    )
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning(
+            "%s invalid core.prefetch_constrained_workers=%r; using default %d",
+            _GOVERNOR_LOG_PREFIX,
+            raw,
+            DEFAULT_CONSTRAINED_SPECULATIVE_WORKERS,
+        )
+        value = DEFAULT_CONSTRAINED_SPECULATIVE_WORKERS
+    clamped = max(0, min(value, max(0, speculative_workers)))
+    if clamped != value:
+        log.warning(
+            "%s clamped core.prefetch_constrained_workers=%d to %d "
+            "(speculative capacity=%d)",
+            _GOVERNOR_LOG_PREFIX,
+            value,
+            clamped,
+            speculative_workers,
+        )
+    return clamped
+
+
+class SpeculativeWorkloadGovernor:
+    """Reference-counted throttle over one speculative decode executor.
+
+    Foreground activities (startup first frame, background save, settled
+    preview refinement) overlap freely: each ``acquire`` returns a unique
+    token, and normal capacity is restored only when the last token is
+    released. Tokens make duplicate or stale completion callbacks harmless --
+    a token can be released exactly once, so counts cannot underflow and an
+    obsolete refinement cannot lift a newer one's constraint.
+
+    The dedicated demand executor is deliberately not wired to a governor:
+    exact current-image decodes must never queue behind speculation.
+    """
+
+    def __init__(
+        self,
+        executor,
+        *,
+        normal_limit: int,
+        constrained_limit: int,
+        debug: bool = False,
+    ) -> None:
+        self._executor = executor
+        self._normal_limit = max(1, int(normal_limit))
+        self._constrained_limit = max(0, min(int(constrained_limit), normal_limit))
+        self._debug = debug
+        self._lock = threading.Lock()
+        self._tokens: Dict[int, str] = {}
+        self._counts: Dict[str, int] = {}
+        self._next_token = 0
+
+    @property
+    def constrained_limit(self) -> int:
+        return self._constrained_limit
+
+    @property
+    def normal_limit(self) -> int:
+        return self._normal_limit
+
+    def is_constrained(self) -> bool:
+        with self._lock:
+            return bool(self._tokens)
+
+    def acquire(self, reason: str) -> Optional[int]:
+        """Enter constrained mode for ``reason``; returns a release token."""
+        reason = str(reason or "unknown")
+        with self._lock:
+            self._next_token += 1
+            token = self._next_token
+            self._tokens[token] = reason
+            self._counts[reason] = self._counts.get(reason, 0) + 1
+            entering = len(self._tokens) == 1
+            if entering:
+                self._executor.set_concurrency_limit(self._constrained_limit)
+            summary = self._summary_locked()
+        self._log_transition("enter" if entering else "join", reason, summary)
+        return token
+
+    def release(self, token: Optional[int]) -> bool:
+        """Release one token. Unknown/duplicate tokens are a safe no-op."""
+        if token is None:
+            return False
+        with self._lock:
+            reason = self._tokens.pop(token, None)
+            if reason is None:
+                return False
+            self._drop_reason_locked(reason)
+            leaving = not self._tokens
+            if leaving:
+                self._executor.set_concurrency_limit(self._normal_limit)
+            summary = self._summary_locked()
+        self._log_transition("leave" if leaving else "release", reason, summary)
+        return True
+
+    def clear_reason(self, reason: str) -> int:
+        """Release every token held for ``reason`` (fail-safe / shutdown)."""
+        with self._lock:
+            tokens = [tok for tok, held in self._tokens.items() if held == reason]
+            if not tokens:
+                return 0
+            for tok in tokens:
+                self._tokens.pop(tok, None)
+                self._drop_reason_locked(reason)
+            leaving = not self._tokens
+            if leaving:
+                self._executor.set_concurrency_limit(self._normal_limit)
+            summary = self._summary_locked()
+        self._log_transition(
+            "clear" if not leaving else "leave-clear",
+            reason,
+            summary,
+        )
+        return len(tokens)
+
+    def clear_all(self, reason: str = "shutdown") -> int:
+        with self._lock:
+            released = len(self._tokens)
+            if not released:
+                return 0
+            self._tokens.clear()
+            self._counts.clear()
+            self._executor.set_concurrency_limit(self._normal_limit)
+            summary = self._summary_locked()
+        self._log_transition("leave-all", reason, summary)
+        return released
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._summary_locked()
+
+    # ---- internals ---------------------------------------------------------
+
+    def _drop_reason_locked(self, reason: str) -> None:
+        remaining = self._counts.get(reason, 0) - 1
+        if remaining > 0:
+            self._counts[reason] = remaining
+        else:
+            self._counts.pop(reason, None)
+
+    def _summary_locked(self) -> Dict[str, Any]:
+        executor_state = self._executor.concurrency_snapshot()
+        queued = executor_state.get("queued_by_group", {})
+        constrained = bool(self._tokens)
+        return {
+            "constrained": constrained,
+            "reasons": dict(self._counts),
+            "held_tokens": len(self._tokens),
+            "normal_limit": self._normal_limit,
+            "constrained_limit": self._constrained_limit,
+            "effective_limit": executor_state.get("limit"),
+            "running": executor_state.get("running"),
+            "admitted": executor_state.get("admitted"),
+            "queued_interactive": queued.get(_QUEUE_GROUP_INTERACTIVE, 0),
+            "queued_preload": queued.get(_QUEUE_GROUP_PRELOAD, 0),
+            "queued_total": executor_state.get("queued_total", 0),
+            "normal_capacity_restored": not constrained,
+        }
+
+    def _log_transition(
+        self,
+        action: str,
+        reason: str,
+        summary: Dict[str, Any],
+    ) -> None:
+        message = (
+            "%s %s reason=%s reasons=%s tokens=%d normal=%d constrained=%d "
+            "effective=%d running=%d queued_interactive=%d queued_preload=%d "
+            "restored=%s"
+        )
+        args = (
+            _GOVERNOR_LOG_PREFIX,
+            action,
+            reason,
+            summary["reasons"],
+            summary["held_tokens"],
+            summary["normal_limit"],
+            summary["constrained_limit"],
+            summary["effective_limit"],
+            summary["running"],
+            summary["queued_interactive"],
+            summary["queued_preload"],
+            summary["normal_capacity_restored"],
+        )
+        if self._debug:
+            log.info(message, *args)
+        else:
+            log.debug(message, *args)
+
+
 class Prefetcher:
     def __init__(
         self,
@@ -1008,6 +1298,7 @@ class Prefetcher:
         self.total_decode_workers = optimal_workers
         speculative_workers = max(1, optimal_workers - 1)
 
+        self.speculative_decode_workers = speculative_workers
         self.executor = create_priority_executor(
             max_workers=speculative_workers,
             thread_name_prefix="Prefetcher",
@@ -1015,6 +1306,23 @@ class Prefetcher:
         self.demand_executor = create_priority_executor(
             max_workers=1,
             thread_name_prefix="DemandDecoder",
+        )
+        # Foreground activities temporarily cap how many speculative decodes
+        # may RUN; the demand executor above is never governed, so an exact
+        # current-image miss always has a free native decoder.
+        self.governor = SpeculativeWorkloadGovernor(
+            self.executor,
+            normal_limit=speculative_workers,
+            constrained_limit=resolve_constrained_speculative_workers(
+                speculative_workers
+            ),
+            debug=debug,
+        )
+        log.info(
+            "%s ready: speculative=%d demand=1 constrained_limit=%d",
+            _GOVERNOR_LOG_PREFIX,
+            speculative_workers,
+            self.governor.constrained_limit,
         )
         # The configured monitor profile is known before QML finishes loading.
         # Build its overwhelmingly common sRGB transform during that otherwise
@@ -1055,6 +1363,36 @@ class Prefetcher:
 
         # Directional prefetching
         self._last_navigation_direction: int = 1  # 1 = forward, -1 = backward
+
+    def enter_constrained_mode(self, reason: str) -> Optional[int]:
+        """Throttle speculative decodes while a foreground activity runs.
+
+        Returns a token that must be handed back to leave_constrained_mode().
+        Safe (and a no-op) after shutdown.
+        """
+        if self._stop_event.is_set():
+            return None
+        return self.governor.acquire(reason)
+
+    def leave_constrained_mode(self, token: Optional[int]) -> bool:
+        """Release one constraint token. Duplicate/stale tokens are ignored."""
+        return self.governor.release(token)
+
+    def clear_constrained_reason(self, reason: str) -> int:
+        """Fail-safe release of every token held for one reason."""
+        return self.governor.clear_reason(reason)
+
+    def constrained_mode_snapshot(self) -> Dict[str, Any]:
+        """Governor + speculative queue state for debug summaries."""
+        snapshot = self.governor.snapshot()
+        # The demand lane is reported alongside the governed one so a debug
+        # readout can show that exact-image decoding still starts while
+        # speculation is throttled.
+        demand_state = self.demand_executor.concurrency_snapshot()
+        snapshot["queued_demand"] = demand_state["queued_total"]
+        snapshot["running_demand"] = demand_state["running"]
+        snapshot["speculative_workers"] = self.speculative_decode_workers
+        return snapshot
 
     def set_image_files(self, image_files: List[ImageFile]):
         with self._futures_lock:
@@ -1162,7 +1500,16 @@ class Prefetcher:
             else future
         )
         if execution is None:
-            return False
+            # Nothing queued yet: a decode chained behind a dependency is only
+            # submitted when that dependency settles, so record the bump for
+            # the eventual submission instead of dropping it.
+            if not isinstance(future, _DecodeTaskFuture):
+                return False
+            return future.bump_deferred_priority(
+                executor,
+                priority,
+                _QUEUE_GROUP_INTERACTIVE,
+            )
         bumped = bool(
             executor.bump_priority(
                 execution,
@@ -1814,13 +2161,7 @@ class Prefetcher:
                 window_bound,
                 submit_meta,
             )
-            if decode_after_future is not None:
-                worker = self._decode_after_future
-                worker_args = (decode_after_future, *decode_args)
-            else:
-                worker = self._decode_and_cache
-                worker_args = decode_args
-            future = _DecodeTaskFuture(worker, worker_args)
+            future = _DecodeTaskFuture(self._decode_and_cache, decode_args)
             if decode_after_future is not None and self._is_preload_future(
                 decode_after_future
             ):
@@ -1832,21 +2173,36 @@ class Prefetcher:
             # Future safely carries mutable diagnostics shared with the worker.
             # This is also the stable identity returned to every caller.
             setattr(future, "_faststack_trace_meta", submit_meta)
-            try:
-                future.submit_execution(
+            execution_queue_group = (
+                queue_group
+                if target_executor is self.executor
+                else _QUEUE_GROUP_INTERACTIVE
+            )
+            execution_queue_order = (
+                queue_order if target_executor is self.executor else None
+            )
+            if decode_after_future is not None:
+                # Chained decode: hold the submission until the dependency
+                # settles instead of queueing a task that waits on it. Waiting
+                # from a worker would pin a physical thread, and with the
+                # dependency behind this task in the queue no worker could be
+                # left to run it.
+                future.defer_execution(
                     target_executor,
                     priority=queue_priority,
-                    queue_group=(
-                        queue_group
-                        if target_executor is self.executor
-                        else _QUEUE_GROUP_INTERACTIVE
-                    ),
-                    queue_order=(
-                        queue_order if target_executor is self.executor else None
-                    ),
+                    queue_group=execution_queue_group,
+                    queue_order=execution_queue_order,
                 )
-            except RuntimeError:
-                return None
+            else:
+                try:
+                    future.submit_execution(
+                        target_executor,
+                        priority=queue_priority,
+                        queue_group=execution_queue_group,
+                        queue_order=execution_queue_order,
+                    )
+                except RuntimeError:
+                    return None
             self.futures[index] = future
             self.future_paths[index] = requested_path
             self.future_quality[index] = quality
@@ -1859,53 +2215,51 @@ class Prefetcher:
             if preload_order is not None:
                 self._register_persistent_preload(index, requested_path, future)
             future.add_done_callback(lambda f, idx=index: self._cleanup_future(idx, f))
+            if decode_after_future is not None:
+                self._submit_after_future(future, decode_after_future, decode_args)
             return future
 
-    def _decode_after_future(
+    def _submit_after_future(
         self,
+        future: _DecodeTaskFuture,
         previous_future: Future,
-        image_file: ImageFile,
-        index: int,
-        generation: int,
-        display_width: int,
-        display_height: int,
-        display_generation: int,
-        override_path: Optional[Path],
-        quality: DecodeQuality,
-        quality_token: Optional[int],
-        quality_index: int,
-        window_bound: bool,
-        submit_meta: Optional[dict] = None,
-    ) -> Optional[tuple[Path, int]]:
-        """Run a decode after a same-index lower-quality decode has finished."""
+        decode_args: tuple[Any, ...],
+    ) -> None:
+        """Queue ``future``'s decode once ``previous_future`` reaches a terminal state.
+
+        Never wait for a same-executor future from inside a worker: the waiter
+        would hold a physical thread, and because a cover task can sit in the
+        interactive group while its dependency was demoted to the preload
+        group, enough waiters can consume every worker and leave nothing to
+        run the dependencies they need. Chaining off the completion callback
+        keeps both the admission slot and the thread free.
+        """
+        submit_meta = decode_args[-1] if decode_args else None
         dependency_started = time.perf_counter() if submit_meta else None
-        try:
-            previous_future.result()
-        except Exception:
-            pass
-        chained_meta = dict(submit_meta or {})
-        if dependency_started is not None:
-            chained_meta["dependency_ms"] = (
-                time.perf_counter() - dependency_started
-            ) * 1000.0
-        # The cover decode itself starts now. Preserve dependency_ms separately
-        # rather than pretending that dependency time was executor queue time.
-        if chained_meta:
-            chained_meta["enqueue_t"] = time.perf_counter()
-        return self._decode_and_cache(
-            image_file,
-            index,
-            generation,
-            display_width,
-            display_height,
-            display_generation,
-            override_path,
-            quality,
-            quality_token,
-            quality_index,
-            window_bound,
-            submit_meta=chained_meta,
-        )
+
+        def _chain(_dependency: Future) -> None:
+            # Dependency failure or cancellation is not fatal: the chained
+            # decode reads from disk itself, so it still runs.
+            if self._stop_event.is_set() or future.done():
+                return
+            chained_meta = dict(submit_meta or {})
+            if dependency_started is not None:
+                chained_meta["dependency_ms"] = (
+                    time.perf_counter() - dependency_started
+                ) * 1000.0
+            # The decode starts now. Preserve dependency_ms separately rather
+            # than pretending that dependency time was executor queue time.
+            if chained_meta:
+                chained_meta["enqueue_t"] = time.perf_counter()
+            try:
+                future.submit_deferred_execution((*decode_args[:-1], chained_meta))
+            except RuntimeError:
+                # Executor shut down between deferral and dependency completion.
+                future.cancel()
+
+        # Runs inline when the dependency is already settled; submitting is a
+        # queue put, so it is safe from a worker thread or under _futures_lock.
+        previous_future.add_done_callback(_chain)
 
     def _decode_and_cache(
         self,
@@ -2449,6 +2803,10 @@ class Prefetcher:
         """Initiates a clean shutdown of the prefetcher."""
         log.info("Shutting down Prefetcher...")
         self._stop_event.set()
+        # Drop any foreground constraint first: executor shutdown already
+        # bypasses admission, but this keeps the governor state honest and
+        # logs the final transition.
+        self.governor.clear_all("shutdown")
         self.cancel_all()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.demand_executor.shutdown(wait=False, cancel_futures=True)

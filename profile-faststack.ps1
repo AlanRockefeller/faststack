@@ -1,9 +1,17 @@
 <#
+
 Guided py-spy profiler for FastStack on Windows.
-Harness version: 2026-08-05-v3.1-safe
+
+Harness version: 2026-08-05-v4-cache-trace
+
+
 
 Outputs one interactive SVG flame graph plus an LLM-friendly text/TSV report
-from the same SVG for every startup or interactive scenario.
+
+from the same SVG for every py-spy scenario. It also includes a separate,
+
+matched --debugcache-trace workflow for cold/warm cache and decode analysis.
+
 #>
 
 [CmdletBinding()]
@@ -24,7 +32,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $ProfileNumber = 0
-$HarnessVersion = "2026-08-05-v3-safe"
+$HarnessVersion = "2026-08-05-v4-cache-trace"
 
 function Write-Utf8File {
     param([string]$Path, [string]$Text)
@@ -50,8 +58,11 @@ function Invoke-NativeCommandLogged {
     }
 
     # Windows PowerShell 5.1 converts native stderr into ErrorRecord objects.
+
     # With the script-wide ErrorActionPreference=Stop, a normal py-spy error
+
     # would otherwise abort this harness before it can write a useful log.
+
     $oldPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -79,8 +90,11 @@ function ConvertTo-WindowsArgumentString {
         }
         else {
             # None of the harness-generated arguments end in a directory
+
             # separator. Escaping embedded quotes is therefore sufficient for
+
             # the paths and switches passed to py-spy here.
+
             '"' + ($argument -replace '"', '\"') + '"'
         }
     }
@@ -147,6 +161,7 @@ function Invoke-PySpyRecordWithWatchdog {
     }
     catch {
         # The process may already have been reaped after watchdog termination.
+
     }
 
     $stdout = $stdoutTask.GetAwaiter().GetResult()
@@ -211,8 +226,11 @@ function Wait-FastStackPythonTarget {
 
         if ($candidates.Count -gt 0) {
             # A Windows venv python.exe is a redirector. The real CPython
+
             # interpreter is normally its child whose ExecutablePath points to
+
             # the base Python installation rather than venv\Scripts\python.exe.
+
             $venvExecutable = [System.IO.Path]::GetFullPath($VenvPythonPath).TrimEnd('\')
             $realInterpreterCandidates = @(
                 $candidates |
@@ -227,8 +245,11 @@ function Wait-FastStackPythonTarget {
             )
 
             # Do not select the redirector during the brief interval before its
+
             # real interpreter child appears. This is the exact process that
+
             # makes py-spy report "Failed to find python version" on Windows.
+
             if ($realInterpreterCandidates.Count -eq 0) {
                 Start-Sleep -Milliseconds 20
                 continue
@@ -260,7 +281,9 @@ function Wait-FastStackPythonTarget {
             }
             catch {
                 # The redirector may have exited between CIM enumeration and
+
                 # Get-Process. Continue polling for the stable interpreter.
+
             }
         }
 
@@ -471,6 +494,7 @@ function Add-IndexProfile {
 
 ## $Title
 
+
 - Mode: $Mode
 - Duration: $Duration seconds
 - Sampling rate: $Rate Hz
@@ -481,6 +505,7 @@ function Add-IndexProfile {
 - Frame table: [$BaseName.frames.tsv]($BaseName.frames.tsv)
 - py-spy log: [$BaseName.py-spy.log]($BaseName.py-spy.log)
 "@
+
     Add-Utf8File -Path $IndexPath -Text $entry
 }
 
@@ -549,6 +574,7 @@ py-spy invocation delay from launch: $attachDelay ms
 Note: the very earliest Windows venv redirector handoff is not sampled; normal FastStack imports and UI startup after attachment are sampled.
 
 "@
+
         Write-Utf8File -Path $logPath -Text $metadata
         Write-Host ('Venv launcher PID: {0}; real CPython PID: {1}; attaching after ~{2} ms' -f $launcher.Id, $target.Id, $attachDelay) -ForegroundColor Green
 
@@ -742,13 +768,560 @@ function Invoke-HangDump {
 
 ## Hang or freeze dump
 
+
 - Target PID: $($FastStackProcess.Id)
 - Thread dump: [$baseName.txt]($baseName.txt)
 "@
+
     Add-Utf8File -Path $IndexPath -Text $entry
 }
 
+
+function Get-SharedFileLength {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [int64]0
+    }
+
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        return [int64]$stream.Length
+    }
+    finally {
+        if ($stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Read-SharedFileRange {
+    param(
+        [string]$Path,
+        [int64]$StartOffset,
+        [int64]$EndOffset
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ''
+    }
+
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        $safeStart = [Math]::Max([int64]0, [Math]::Min($StartOffset, $stream.Length))
+        $safeEnd = [Math]::Max($safeStart, [Math]::Min($EndOffset, $stream.Length))
+        $count = $safeEnd - $safeStart
+        if ($count -le 0) {
+            return ''
+        }
+        if ($count -gt [int]::MaxValue) {
+            throw ('Trace segment is unexpectedly large: {0} bytes' -f $count)
+        }
+
+        [void]$stream.Seek($safeStart, [System.IO.SeekOrigin]::Begin)
+        $buffer = New-Object byte[] ([int]$count)
+        $readTotal = 0
+        while ($readTotal -lt $buffer.Length) {
+            $read = $stream.Read($buffer, $readTotal, $buffer.Length - $readTotal)
+            if ($read -le 0) {
+                break
+            }
+            $readTotal += $read
+        }
+        if ($readTotal -eq 0) {
+            return ''
+        }
+        if ($readTotal -lt $buffer.Length) {
+            $trimmed = New-Object byte[] $readTotal
+            [Array]::Copy($buffer, $trimmed, $readTotal)
+            $buffer = $trimmed
+        }
+        return [System.Text.Encoding]::UTF8.GetString($buffer)
+    }
+    finally {
+        if ($stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Get-TraceBoundary {
+    param(
+        [string]$StdoutPath,
+        [string]$StderrPath
+    )
+
+    return [pscustomobject]@{
+        Timestamp = Get-Date
+        StdoutOffset = Get-SharedFileLength -Path $StdoutPath
+        StderrOffset = Get-SharedFileLength -Path $StderrPath
+    }
+}
+
+function Write-TraceSegment {
+    param(
+        [pscustomobject]$StartBoundary,
+        [pscustomobject]$EndBoundary,
+        [string]$StdoutPath,
+        [string]$StderrPath,
+        [string]$OutputPath,
+        [string]$Label
+    )
+
+    $stdoutText = Read-SharedFileRange -Path $StdoutPath -StartOffset $StartBoundary.StdoutOffset -EndOffset $EndBoundary.StdoutOffset
+    $stderrText = Read-SharedFileRange -Path $StderrPath -StartOffset $StartBoundary.StderrOffset -EndOffset $EndBoundary.StderrOffset
+    $text = @"
+# FastStack --debugcache-trace segment: $Label
+
+# Started: $($StartBoundary.Timestamp.ToString('o'))
+
+# Ended: $($EndBoundary.Timestamp.ToString('o'))
+
+
+===== STDOUT (unbuffered print/[DBGCACHE] records) =====
+$stdoutText
+
+===== STDERR (logging records, including [NAVTRACE]) =====
+$stderrText
+"@
+
+    Write-Utf8File -Path $OutputPath -Text $text
+}
+
+function Get-RegexCount {
+    param(
+        [string]$Text,
+        [string]$Pattern
+    )
+    return [regex]::Matches(
+        $Text,
+        $Pattern,
+        [System.Text.RegularExpressions.RegexOptions]::Multiline
+    ).Count
+}
+
+function Get-TraceWorkerRows {
+    param([string]$Text)
+
+    $rows = @()
+    $matches = [regex]::Matches(
+        $Text,
+        '(?m)^.*\[NAVTRACE\]\s+worker\s+(?<fields>.*)$'
+    )
+    foreach ($match in $matches) {
+        $fields = $match.Groups['fields'].Value
+
+        $taskMatch = [regex]::Match($fields, '(?:^|\s)task=(?<value>\d+)')
+        $seqMatch = [regex]::Match($fields, '(?:^|\s)seq=(?<value>\S+)')
+        $roleMatch = [regex]::Match($fields, '(?:^|\s)role=(?<value>\S+)')
+        $qualityMatch = [regex]::Match($fields, '(?:^|\s)quality=(?<value>\S+)')
+        $generationMatch = [regex]::Match($fields, '(?:^|\s)display_gen=(?<value>-?\d+)')
+        $pathMatch = [regex]::Match($fields, '(?:^|\s)path=(?:''(?<single>[^'']*)''|"(?<double>[^"]*)"|(?<bare>\S+))')
+        $totalMatch = [regex]::Match($fields, '(?:^|\s)total=(?<value>[\d.]+)ms')
+        $decodeMatch = [regex]::Match($fields, '(?:^|\s)decode=(?<value>[\d.]+)ms')
+        $queueMatch = [regex]::Match($fields, '(?:^|\s)queue=(?<value>[\d.]+)ms')
+
+        $path = ''
+        if ($pathMatch.Success) {
+            foreach ($name in @('single', 'double', 'bare')) {
+                if ($pathMatch.Groups[$name].Success) {
+                    $path = $pathMatch.Groups[$name].Value
+                    break
+                }
+            }
+        }
+
+        $rows += [pscustomobject]@{
+            Task = if ($taskMatch.Success) { [int]$taskMatch.Groups['value'].Value } else { $null }
+            Seq = if ($seqMatch.Success) { $seqMatch.Groups['value'].Value } else { '' }
+            Role = if ($roleMatch.Success) { $roleMatch.Groups['value'].Value } else { '' }
+            Quality = if ($qualityMatch.Success) { $qualityMatch.Groups['value'].Value } else { '' }
+            DisplayGeneration = if ($generationMatch.Success) { [int]$generationMatch.Groups['value'].Value } else { $null }
+            Path = $path
+            QueueMs = if ($queueMatch.Success) { [double]$queueMatch.Groups['value'].Value } else { $null }
+            DecodeMs = if ($decodeMatch.Success) { [double]$decodeMatch.Groups['value'].Value } else { $null }
+            TotalMs = if ($totalMatch.Success) { [double]$totalMatch.Groups['value'].Value } else { $null }
+            Raw = $match.Value.Trim()
+        }
+    }
+    return @($rows)
+}
+
+function Get-ObservedTraceTaskIds {
+    param([string]$Text)
+
+    $ids = @()
+    foreach ($match in [regex]::Matches($Text, '(?m)\[NAVTRACE\].*?\btask=(?<task>\d+)')) {
+        $ids += [int]$match.Groups['task'].Value
+    }
+    return @($ids | Sort-Object -Unique)
+}
+
+function Get-TraceStats {
+    param(
+        [string]$Label,
+        [string]$Text
+    )
+
+    $workers = @(Get-TraceWorkerRows -Text $Text)
+    $taskIds = @(Get-ObservedTraceTaskIds -Text $Text)
+    $comboRows = @(
+        $workers |
+            Where-Object { $_.Path -and $_.Quality -and $null -ne $_.DisplayGeneration } |
+            ForEach-Object {
+                [pscustomobject]@{
+                    Combination = '{0}|gen={1}|quality={2}' -f $_.Path, $_.DisplayGeneration, $_.Quality
+                }
+            }
+    )
+    $combos = @($comboRows | Group-Object -Property Combination | Sort-Object Count -Descending)
+    $repeated = @($combos | Where-Object { $_.Count -gt 1 })
+
+    $rejectReasons = @()
+    foreach ($match in [regex]::Matches($Text, '(?m)\[NAVTRACE\]\s+cache_reject\b.*?\breason=(?<reason>.*?)\s+key=')) {
+        $rejectReasons += $match.Groups['reason'].Value.Trim()
+    }
+
+    return [pscustomobject]@{
+        Label = $Label
+        Lines = @($Text -split '\r?\n').Count
+        DbgCacheLines = Get-RegexCount -Text $Text -Pattern '\[DBGCACHE\]'
+        NavTraceLines = Get-RegexCount -Text $Text -Pattern '\[NAVTRACE\]'
+        CacheHits = Get-RegexCount -Text $Text -Pattern 'get_decoded_image:\s+CACHE HIT\b'
+        CacheMisses = Get-RegexCount -Text $Text -Pattern 'get_decoded_image:\s+CACHE MISS\b'
+        QualitySubmits = Get-RegexCount -Text $Text -Pattern 'quality_decode:\s+SUBMIT\b'
+        QualityRefreshes = Get-RegexCount -Text $Text -Pattern 'quality_decode:\s+REFRESH\b'
+        WorkerCompletions = $workers.Count
+        ObservedTaskIds = $taskIds.Count
+        TaskCanceled = Get-RegexCount -Text $Text -Pattern '\[NAVTRACE\]\s+task_canceled\b'
+        TaskAdopted = Get-RegexCount -Text $Text -Pattern '\[NAVTRACE\]\s+task_adopted\b'
+        TaskMigrated = Get-RegexCount -Text $Text -Pattern '\[NAVTRACE\]\s+task_migrated\b'
+        CacheRejects = Get-RegexCount -Text $Text -Pattern '\[NAVTRACE\]\s+cache_reject\b'
+        BurstSummaries = Get-RegexCount -Text $Text -Pattern '\[NAVTRACE\]\s+burst\b'
+        Placeholders = Get-RegexCount -Text $Text -Pattern 'frame=placeholder\b'
+        NotPresented = Get-RegexCount -Text $Text -Pattern '(?:frame=not_presented\b|\bNOT_PRESENTED\b)'
+        WrongImageBlocked = Get-RegexCount -Text $Text -Pattern '\bWRONG_IMAGE_BLOCKED\b'
+        UnderflowEvents = Get-RegexCount -Text $Text -Pattern '\[NAVTRACE\]\s+underflow\b'
+        RepeatedDecodeCombos = $repeated.Count
+        WorkerRows = $workers
+        RepeatedCombos = $repeated
+        RejectReasons = @($rejectReasons | Group-Object | Sort-Object Count -Descending)
+    }
+}
+
+function Write-TraceReports {
+    param(
+        [string]$ColdPath,
+        [string]$WarmPath,
+        [string]$SummaryPath,
+        [string]$EventsTsvPath
+    )
+
+    $coldText = [System.IO.File]::ReadAllText($ColdPath)
+    $warmText = [System.IO.File]::ReadAllText($WarmPath)
+    $cold = Get-TraceStats -Label 'Cold' -Text $coldText
+    $warm = Get-TraceStats -Label 'Warm' -Text $warmText
+
+    $metrics = @(
+        'Lines',
+        'DbgCacheLines',
+        'NavTraceLines',
+        'CacheHits',
+        'CacheMisses',
+        'QualitySubmits',
+        'QualityRefreshes',
+        'WorkerCompletions',
+        'ObservedTaskIds',
+        'TaskCanceled',
+        'TaskAdopted',
+        'TaskMigrated',
+        'CacheRejects',
+        'BurstSummaries',
+        'Placeholders',
+        'NotPresented',
+        'WrongImageBlocked',
+        'UnderflowEvents',
+        'RepeatedDecodeCombos'
+    )
+
+    $report = New-Object System.Text.StringBuilder
+    [void]$report.AppendLine('# FastStack matched cache/navigation trace')
+    [void]$report.AppendLine('')
+    [void]$report.AppendLine('FastStack was launched separately with `-u -m faststack --loupe --debugcache-trace`.')
+    [void]$report.AppendLine('No py-spy profiler was attached during these runs. Trace logging itself adds overhead,')
+    [void]$report.AppendLine('so use event counts and relationships as primary evidence; exact latency is secondary.')
+    [void]$report.AppendLine('')
+    [void]$report.AppendLine('`ObservedTaskIds` counts unique numeric task IDs appearing anywhere in NAVTRACE lines.')
+    [void]$report.AppendLine('It is a strong task-identity signal, but it is not claimed to be a perfect count of every')
+    [void]$report.AppendLine('submission because a process can end before all queued tasks produce a terminal trace.')
+    [void]$report.AppendLine('')
+    [void]$report.AppendLine('## Cold versus warm')
+    [void]$report.AppendLine("Metric`tCold`tWarm")
+    foreach ($metric in $metrics) {
+        [void]$report.AppendLine(('{0}`t{1}`t{2}' -f $metric, $cold.$metric, $warm.$metric))
+    }
+
+    foreach ($stats in @($cold, $warm)) {
+        [void]$report.AppendLine('')
+        [void]$report.AppendLine(('## {0}: repeated path/generation/quality worker combinations' -f $stats.Label))
+        if ($stats.RepeatedCombos.Count -eq 0) {
+            [void]$report.AppendLine('None found among completed worker records.')
+        }
+        else {
+            [void]$report.AppendLine("Count`tCombination")
+            foreach ($group in ($stats.RepeatedCombos | Select-Object -First 100)) {
+                [void]$report.AppendLine(('{0}`t{1}' -f $group.Count, $group.Name))
+            }
+        }
+
+        [void]$report.AppendLine('')
+        [void]$report.AppendLine(('## {0}: cache rejection reasons' -f $stats.Label))
+        if ($stats.RejectReasons.Count -eq 0) {
+            [void]$report.AppendLine('None.')
+        }
+        else {
+            [void]$report.AppendLine("Count`tReason")
+            foreach ($group in $stats.RejectReasons) {
+                [void]$report.AppendLine(('{0}`t{1}' -f $group.Count, $group.Name))
+            }
+        }
+
+        [void]$report.AppendLine('')
+        [void]$report.AppendLine(('## {0}: burst summary lines' -f $stats.Label))
+        $segmentText = if ($stats.Label -eq 'Cold') { $coldText } else { $warmText }
+        $burstLines = @(
+            $segmentText -split '\r?\n' |
+                Where-Object { $_ -match '\[NAVTRACE\]\s+burst\b' }
+        )
+        if ($burstLines.Count -eq 0) {
+            [void]$report.AppendLine('None found.')
+        }
+        else {
+            foreach ($line in $burstLines) {
+                [void]$report.AppendLine($line.Trim())
+            }
+        }
+    }
+
+    Write-Utf8File -Path $SummaryPath -Text $report.ToString()
+
+    $tsv = New-Object System.Text.StringBuilder
+    [void]$tsv.AppendLine("Run`tTask`tSeq`tRole`tQuality`tDisplayGeneration`tPath`tQueueMs`tDecodeMs`tTotalMs`tRaw")
+    foreach ($stats in @($cold, $warm)) {
+        $label = $stats.Label
+        foreach ($row in $stats.WorkerRows) {
+            $safePath = ([string]$row.Path) -replace "`t", ' '
+            $safeRaw = ([string]$row.Raw) -replace "`t", ' '
+            [void]$tsv.AppendLine(('{0}`t{1}`t{2}`t{3}`t{4}`t{5}`t{6}`t{7}`t{8}`t{9}`t{10}' -f
+                $label,
+                $row.Task,
+                $row.Seq,
+                $row.Role,
+                $row.Quality,
+                $row.DisplayGeneration,
+                $safePath,
+                $row.QueueMs,
+                $row.DecodeMs,
+                $row.TotalMs,
+                $safeRaw
+            ))
+        }
+    }
+    Write-Utf8File -Path $EventsTsvPath -Text $tsv.ToString()
+}
+
+function Start-FastStackTraceProcess {
+    param(
+        [string]$PythonPath,
+        [string]$ResolvedRepoRoot,
+        [string]$ResolvedImageDirectory,
+        [string]$StdoutPath,
+        [string]$StderrPath
+    )
+
+    Write-Utf8File -Path $StdoutPath -Text ''
+    Write-Utf8File -Path $StderrPath -Text ''
+    $beforeIds = @((Get-FastStackProcesses | ForEach-Object { [int]$_.ProcessId }))
+    $argumentLine = ('-u -m faststack "{0}" --loupe --debugcache-trace' -f $ResolvedImageDirectory)
+    $launcher = Start-Process `
+        -FilePath $PythonPath `
+        -ArgumentList $argumentLine `
+        -WorkingDirectory $ResolvedRepoRoot `
+        -RedirectStandardOutput $StdoutPath `
+        -RedirectStandardError $StderrPath `
+        -PassThru
+    $targetInfo = Wait-FastStackPythonTarget -LauncherProcessId $launcher.Id -ExistingIds $beforeIds -VenvPythonPath $PythonPath
+    return [pscustomobject]@{
+        Launcher = $launcher
+        Process = $targetInfo.Process
+        DetectionMilliseconds = $targetInfo.DetectionMilliseconds
+        ExistingIds = $beforeIds
+    }
+}
+
+function Wait-ForFastStackClose {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$Prompt
+    )
+
+    $Process.Refresh()
+    if ($Process.HasExited) {
+        return
+    }
+
+    [void](Read-Host $Prompt)
+    for ($i = 0; $i -lt 50; $i++) {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    try {
+        [void]$Process.CloseMainWindow()
+    }
+    catch {
+        # Continue to the explicit failure below.
+
+    }
+    for ($i = 0; $i -lt 50; $i++) {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw ('FastStack PID {0} is still running. Close it normally, then rerun the cache trace.' -f $Process.Id)
+}
+
+function Invoke-CacheTraceWorkflow {
+    param(
+        [System.Diagnostics.Process]$FastStackProcess,
+        [string]$PythonPath,
+        [string]$ResolvedRepoRoot,
+        [string]$ResolvedImageDirectory,
+        [string]$SessionDirectory,
+        [string]$IndexPath
+    )
+
+    Write-Section 'Scenario 9: Matched cache/navigation trace'
+    Write-Host 'This is intentionally separate from py-spy.' -ForegroundColor Yellow
+    Write-Host 'The normal profiling instance must close, then FastStack is relaunched with --debugcache-trace.'
+    Write-Host 'Use the same navigation range and pattern for the cold and warm segments.'
+    Write-Host 'The script records byte boundaries in unbuffered stdout/stderr, so the two logs are matched cleanly.' -ForegroundColor DarkGray
+
+    Wait-ForFastStackClose -Process $FastStackProcess -Prompt 'Close the current FastStack window normally, then press Enter'
+
+    $baseName = Get-NextBaseName -Slug 'cache-trace'
+    $stdoutPath = Join-Path $SessionDirectory ($baseName + '.stdout.log')
+    $stderrPath = Join-Path $SessionDirectory ($baseName + '.stderr.log')
+    $fullPath = Join-Path $SessionDirectory ($baseName + '-full.log')
+    $coldPath = Join-Path $SessionDirectory ($baseName + '-cold.log')
+    $warmPath = Join-Path $SessionDirectory ($baseName + '-warm.log')
+    $summaryPath = Join-Path $SessionDirectory ($baseName + '-summary.txt')
+    $eventsPath = Join-Path $SessionDirectory ($baseName + '-workers.tsv')
+
+    $trace = Start-FastStackTraceProcess `
+        -PythonPath $PythonPath `
+        -ResolvedRepoRoot $ResolvedRepoRoot `
+        -ResolvedImageDirectory $ResolvedImageDirectory `
+        -StdoutPath $stdoutPath `
+        -StderrPath $stderrPath
+    $traceProcess = $trace.Process
+
+    Write-Host ('Trace FastStack CPython PID: {0}' -f $traceProcess.Id) -ForegroundColor Green
+    Write-Host ('Detected after ~{0} ms; output is unbuffered.' -f $trace.DetectionMilliseconds) -ForegroundColor DarkGray
+    [void](Read-Host 'Wait until FastStack is fully ready in loupe view, then press Enter')
+    Start-Sleep -Milliseconds 1000
+
+    Write-Section 'Cache trace: cold navigation segment'
+    Write-Host '- Start near images this trace process has not visited.'
+    Write-Host '- Hold Right Arrow about 10 seconds, release briefly, then hold Left Arrow back.'
+    Write-Host '- End on the original image and wait for settled cover quality.'
+    [void](Read-Host 'Prepare the starting image, then press Enter to mark the cold segment start')
+    Start-Sleep -Milliseconds 300
+    $coldStart = Get-TraceBoundary -StdoutPath $stdoutPath -StderrPath $stderrPath
+    Write-Host 'Perform the cold navigation now. Return here only after the final image has settled.' -ForegroundColor Yellow
+    [void](Read-Host 'Press Enter to mark the cold segment end')
+    Start-Sleep -Milliseconds 1200
+    $coldEnd = Get-TraceBoundary -StdoutPath $stdoutPath -StderrPath $stderrPath
+    Write-TraceSegment -StartBoundary $coldStart -EndBoundary $coldEnd -StdoutPath $stdoutPath -StderrPath $stderrPath -OutputPath $coldPath -Label 'cold navigation'
+    Write-Host ('Created {0}' -f $coldPath) -ForegroundColor Green
+
+    Write-Section 'Cache trace: warm navigation segment'
+    Write-Host '- Repeat exactly the same image range and arrow-key pattern.'
+    Write-Host '- End on the same original image and wait for settled cover quality.'
+    [void](Read-Host 'Press Enter to mark the warm segment start')
+    Start-Sleep -Milliseconds 300
+    $warmStart = Get-TraceBoundary -StdoutPath $stdoutPath -StderrPath $stderrPath
+    Write-Host 'Perform the warm navigation now. Return here only after the final image has settled.' -ForegroundColor Yellow
+    [void](Read-Host 'Press Enter to mark the warm segment end')
+    Start-Sleep -Milliseconds 1200
+    $warmEnd = Get-TraceBoundary -StdoutPath $stdoutPath -StderrPath $stderrPath
+    Write-TraceSegment -StartBoundary $warmStart -EndBoundary $warmEnd -StdoutPath $stdoutPath -StderrPath $stderrPath -OutputPath $warmPath -Label 'warm navigation'
+    Write-Host ('Created {0}' -f $warmPath) -ForegroundColor Green
+
+    Wait-ForFastStackClose -Process $traceProcess -Prompt 'Close the trace FastStack window normally, then press Enter'
+    Start-Sleep -Milliseconds 500
+
+    $stdoutText = if (Test-Path -LiteralPath $stdoutPath) { [System.IO.File]::ReadAllText($stdoutPath) } else { '' }
+    $stderrText = if (Test-Path -LiteralPath $stderrPath) { [System.IO.File]::ReadAllText($stderrPath) } else { '' }
+    $fullText = @"
+# FastStack complete --debugcache-trace capture
+
+# Command: $PythonPath -u -m faststack "$ResolvedImageDirectory" --loupe --debugcache-trace
+
+
+===== STDOUT =====
+$stdoutText
+
+===== STDERR =====
+$stderrText
+"@
+
+    Write-Utf8File -Path $fullPath -Text $fullText
+    Write-TraceReports -ColdPath $coldPath -WarmPath $warmPath -SummaryPath $summaryPath -EventsTsvPath $eventsPath
+
+    $entry = @"
+
+## Matched cache/navigation trace
+
+
+- Mode: separate unbuffered FastStack process with `--debugcache-trace`; no py-spy attached
+- Full combined log: [$baseName-full.log]($baseName-full.log)
+- Cold segment: [$baseName-cold.log]($baseName-cold.log)
+- Warm segment: [$baseName-warm.log]($baseName-warm.log)
+- LLM summary: [$baseName-summary.txt]($baseName-summary.txt)
+- Parsed worker table: [$baseName-workers.tsv]($baseName-workers.tsv)
+- Raw stdout: [$baseName.stdout.log]($baseName.stdout.log)
+- Raw stderr: [$baseName.stderr.log]($baseName.stderr.log)
+"@
+
+    Add-Utf8File -Path $IndexPath -Text $entry
+
+    Write-Host ('Created {0}' -f $summaryPath) -ForegroundColor Green
+    Write-Host ('Created {0}' -f $eventsPath) -ForegroundColor Green
+    Write-Host 'Relaunching ordinary FastStack for any further py-spy scenarios.' -ForegroundColor DarkGray
+    return Start-FastStackDirect -PythonPath $PythonPath -ResolvedRepoRoot $ResolvedRepoRoot -ResolvedImageDirectory $ResolvedImageDirectory
+}
+
 # Resolve the repository and use the current FastStack command as the default photo folder.
+
 $ResolvedRepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
 $PythonPath = Join-Path $ResolvedRepoRoot '.venv-win\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
@@ -787,6 +1360,7 @@ $IndexPath = Join-Path $SessionDirectory 'INDEX.md'
 $indexHeader = @"
 # FastStack py-spy profiling session
 
+
 - Started: $(Get-Date -Format o)
 - Repository: $ResolvedRepoRoot
 - Python: $PythonPath
@@ -794,8 +1368,10 @@ $indexHeader = @"
 - Image directory: $ResolvedImageDirectory
 
 Each `.llm.txt` and `.frames.tsv` is extracted from the matching SVG, so the
-text and visual represent exactly the same sample set. Interactive and startup recordings use py-spy's --nonblocking mode and a hard watchdog to protect FastStack responsiveness.
+text and visual represent exactly the same sample set. Interactive and startup recordings use py-spy's --nonblocking mode and a hard watchdog to protect FastStack responsiveness. The optional cache trace is collected in a separate FastStack process without py-spy.
+
 "@
+
 Write-Utf8File -Path $IndexPath -Text $indexHeader
 
 $environmentPath = Join-Path $SessionDirectory 'environment.txt'
@@ -818,6 +1394,7 @@ Python path: $PythonPath
 Repository: $ResolvedRepoRoot
 Image directory: $ResolvedImageDirectory
 "@
+
 Write-Utf8File -Path $environmentPath -Text $environment
 
 Write-Section 'FastStack py-spy profiling harness'
@@ -886,7 +1463,8 @@ while (-not $finished) {
     foreach ($scenario in $scenarios) {
         Write-Host ('{0}. {1}' -f $scenario.Key, $scenario.Title)
     }
-    Write-Host 'A. Run all scenarios in order'
+    Write-Host '9. Matched cache/navigation trace (separate relaunch, no py-spy)'
+    Write-Host 'A. Run all py-spy scenarios in order'
     Write-Host 'H. Capture a hang/freeze thread dump'
     Write-Host 'O. Open the output folder'
     Write-Host 'Q. Finish and zip the results'
@@ -907,6 +1485,11 @@ while (-not $finished) {
     }
     if ($choice -match '^(?i:h|hang)$') {
         Invoke-HangDump -FastStackProcess $FastStackProcess -SessionDirectory $SessionDirectory -IndexPath $IndexPath -PySpyPath $PySpyPath
+        continue
+    }
+
+    if ($choice -match '^(?i:9|cache|trace|cache-trace)$') {
+        $FastStackProcess = Invoke-CacheTraceWorkflow -FastStackProcess $FastStackProcess -PythonPath $PythonPath -ResolvedRepoRoot $ResolvedRepoRoot -ResolvedImageDirectory $ResolvedImageDirectory -SessionDirectory $SessionDirectory -IndexPath $IndexPath
         continue
     }
 
@@ -950,3 +1533,4 @@ if (-not $FastStackProcess.HasExited) {
         Stop-Process -Id $FastStackProcess.Id -Force
     }
 }
+

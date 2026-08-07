@@ -7,7 +7,7 @@ import logging
 import queue
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +102,16 @@ class PriorityExecutor:
       3) explicit queue order, or -seq by default (LIFO within ties)
 
     Workers are daemon threads.
+
+    Concurrency admission: a worker waits for work to EXIST, then reserves a
+    slot, then dequeues. Reserving before dequeuing means a temporarily reduced
+    limit (see ``set_concurrency_limit``) throttles what starts without letting
+    already-dequeued low-priority work occupy every worker while it blocks --
+    queued items keep their full priority ordering and the next admission takes
+    the queue head. Waiting for work first means an idle worker holds no
+    reservation, so a limit lowered while the queue is empty applies to the very
+    next submission instead of being pre-empted by stale reservations.
+    ``_admitted`` therefore counts work admitted to execute, never idle polling.
     """
 
     def __init__(
@@ -131,14 +141,138 @@ class PriorityExecutor:
         self._count = 0
         self._count_lock = threading.Lock()
 
+        # Admission state. Guarded by its own condition so no caller ever holds
+        # it together with _count_lock or the queue mutex.
+        self._admission = threading.Condition(threading.Lock())
+        self._concurrency_limit = max_workers
+        self._admitted = 0
+        self._running = 0
+
+        # O(1) queued counters per queue group. Preload All can enqueue
+        # thousands of items, so diagnostics must never scan the heap.
+        # _stats_lock is a leaf: nothing else is acquired while it is held.
+        self._stats_lock = threading.Lock()
+        self._queued_by_group: dict[int, int] = {}
+
         for i in range(max_workers):
             t = threading.Thread(
                 target=self._worker_loop,
                 name=f"{thread_name_prefix}_{i}",
                 daemon=True,
             )
-            t.start()
             self._workers.append(t)
+        for t in self._workers:
+            t.start()
+
+    # ---- Admission control -------------------------------------------------
+
+    def set_concurrency_limit(self, limit: Optional[int]) -> int:
+        """Cap how many queued tasks may run at once; None restores the pool size.
+
+        Returns the effective (clamped) limit. Raising the limit wakes every
+        waiting worker so queued work resumes immediately.
+        """
+        effective = (
+            self._max_workers
+            if limit is None
+            else max(0, min(int(limit), self._max_workers))
+        )
+        with self._admission:
+            previous = self._concurrency_limit
+            self._concurrency_limit = effective
+            if effective > previous:
+                self._admission.notify_all()
+        return effective
+
+    @property
+    def concurrency_limit(self) -> int:
+        with self._admission:
+            return self._concurrency_limit
+
+    @property
+    def max_workers(self) -> int:
+        return self._max_workers
+
+    def _acquire_admission(self, *, blocking: bool) -> bool:
+        """Reserve one running slot. Shutdown is never gated by the limit."""
+        with self._admission:
+            while True:
+                if self._stop_event.is_set():
+                    # Draining/exiting must not depend on the governor.
+                    self._admitted += 1
+                    return True
+                if self._admitted < self._concurrency_limit:
+                    self._admitted += 1
+                    return True
+                # Bounded wait: notifications drive the fast path, the timeout
+                # only guarantees a missed wake-up can never wedge a worker.
+                self._admission.wait(0.25)
+                if not blocking:
+                    return False
+
+    def _release_admission(self, *, was_running: bool) -> None:
+        with self._admission:
+            self._admitted = max(0, self._admitted - 1)
+            if was_running:
+                self._running = max(0, self._running - 1)
+            self._admission.notify()
+
+    def _note_running(self) -> None:
+        with self._admission:
+            self._running += 1
+
+    # No suspend/resume admission API on purpose: a task must never block a
+    # worker on another task of this executor. Releasing the admission slot
+    # would not release the physical thread, so enough waiters can occupy every
+    # worker while the dependencies they wait on stay queued. Chain dependent
+    # work off the dependency's completion callback instead (see
+    # Prefetcher._submit_after_future).
+
+    def concurrency_snapshot(self) -> dict[str, Any]:
+        """Cheap diagnostic view of admission and queue state."""
+        with self._admission:
+            limit = self._concurrency_limit
+            admitted = self._admitted
+            running = self._running
+        with self._stats_lock:
+            queued = {group: count for group, count in self._queued_by_group.items()}
+        return {
+            "max_workers": self._max_workers,
+            "limit": limit,
+            "admitted": admitted,
+            "running": running,
+            "queued_by_group": queued,
+            "queued_total": sum(queued.values()),
+        }
+
+    def queued_in_group(self, queue_group: int) -> int:
+        """Number of queued (not-yet-started) tasks in one scheduling class."""
+        with self._stats_lock:
+            return self._queued_by_group.get(int(queue_group), 0)
+
+    def _note_queued(self, queue_group: int, delta: int) -> None:
+        with self._stats_lock:
+            remaining = self._queued_by_group.get(queue_group, 0) + delta
+            if remaining > 0:
+                self._queued_by_group[queue_group] = remaining
+            else:
+                self._queued_by_group.pop(queue_group, None)
+
+    def _wait_for_work(self, timeout: float) -> bool:
+        """Block until the queue looks non-empty. Never removes an item.
+
+        Idle workers must not hold admission slots: a slot reserved while the
+        queue was empty would survive a later limit reduction and let every
+        idle worker start new work at once. So availability is observed first,
+        and only then is a slot reserved.
+
+        Relies on the same CPython queue internals as bump_priority().
+        """
+        with self._queue.not_empty:
+            if self._queue.queue:
+                return True
+            self._queue.not_empty.wait(timeout)
+            return bool(self._queue.queue)
 
     def _worker_loop(self) -> None:
         # Drain behavior:
@@ -148,12 +282,28 @@ class PriorityExecutor:
             if self._stop_event.is_set() and self._queue.empty():
                 break
 
-            try:
-                item = self._queue.get(timeout=0.1)
-            except queue.Empty:
+            if not self._wait_for_work(0.1):
+                # Nothing to run: stay unadmitted so a constraint entered while
+                # idle takes effect immediately for the next submission.
                 continue
 
-            _queue_group, _priority, _order, _neg_seq, fn, args, kwargs, fut = item
+            if not self._acquire_admission(blocking=False):
+                # Constrained: re-check the stop/drain condition and wait again.
+                continue
+
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                # Another admitted worker took the item first.
+                self._release_admission(was_running=False)
+                continue
+            except BaseException:
+                self._release_admission(was_running=False)
+                raise
+
+            self._note_running()
+            queue_group, _priority, _order, _neg_seq, fn, args, kwargs, fut = item
+            self._note_queued(queue_group, -1)
             try:
                 if fut.set_running_or_notify_cancel():
                     try:
@@ -168,6 +318,7 @@ class PriorityExecutor:
                     pass
                 log.error("Error in PriorityExecutor worker: %s", e)
             finally:
+                self._release_admission(was_running=True)
                 # Always mark item done so join/drain semantics work.
                 try:
                     self._queue.task_done()
@@ -207,10 +358,14 @@ class PriorityExecutor:
             seq = self._count
 
         order = -seq if queue_order is None else int(queue_order)
+        group = int(queue_group)
+        # Counted before the put: a worker may dequeue the item before this
+        # call returns, and its decrement must never run against a zero count.
+        self._note_queued(group, 1)
         try:
             self._queue.put(
                 (
-                    int(queue_group),
+                    group,
                     priority,
                     order,
                     -seq,
@@ -222,6 +377,7 @@ class PriorityExecutor:
                 block=False,
             )
         except queue.Full:
+            self._note_queued(group, -1)
             fut.set_exception(RuntimeError("PriorityQueue full"))
         return fut
 
@@ -248,6 +404,7 @@ class PriorityExecutor:
 
         # Relies on CPython queue.Queue internals (.mutex and .queue heap);
         # recheck this on major Python upgrades.
+        moved_from: Optional[int] = None
         with self._queue.mutex:
             for idx, item in enumerate(self._queue.queue):
                 (
@@ -277,8 +434,14 @@ class PriorityExecutor:
                     fut,
                 )
                 heapq.heapify(self._queue.queue)
-                return True
-        return False
+                moved_from = current_group
+                if moved_from != queue_group:
+                    # Adjusted under the queue mutex so the item cannot be
+                    # dequeued (and decremented) between the two updates.
+                    self._note_queued(moved_from, -1)
+                    self._note_queued(queue_group, 1)
+                break
+        return moved_from is not None
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
         """Shutdown the executor.
@@ -287,13 +450,19 @@ class PriorityExecutor:
         If cancel_futures is False, workers will drain the queue before exiting.
         """
         self._stop_event.set()
+        # Workers parked on the admission governor -- or waiting for work to
+        # appear -- must exit, not wait either condition out.
+        with self._admission:
+            self._admission.notify_all()
+        with self._queue.not_empty:
+            self._queue.not_empty.notify_all()
 
         if cancel_futures:
             # Cancel queued work so workers can exit once queue empties.
             while True:
                 try:
                     (
-                        _queue_group,
+                        queue_group,
                         _priority,
                         _order,
                         _neg_seq,
@@ -304,6 +473,7 @@ class PriorityExecutor:
                     ) = self._queue.get_nowait()
                 except queue.Empty:
                     break
+                self._note_queued(queue_group, -1)
                 try:
                     fut.cancel()
                 finally:

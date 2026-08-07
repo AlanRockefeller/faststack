@@ -299,7 +299,7 @@ class AppController(QObject):
     _pacedNavigationReady = Signal(object)  # Exact fast-tier target is cache-ready
     _frameSwapObserved = Signal(float)  # render-thread timestamp -> GUI thread
     _preloadProgressReady = Signal(object)  # Worker counters -> GUI thread
-    _indexScanReady = Signal(object)  # (images, variant_map) or None -> GUI thread
+    _indexScanReady = Signal(object)  # {"epoch", "result"} payload -> GUI thread
 
     def __init__(
         self,
@@ -383,6 +383,9 @@ class AppController(QObject):
         )
         self._index_scan_inflight = False
         self._index_rescan_needed = False
+        # Bumped whenever the scanned directory changes, so a walk that was
+        # submitted for the old directory can be discarded on arrival.
+        self._index_scan_epoch = 0
         self._last_index_scan_time: float = 0.0
         # Minimum wall-clock spacing between watcher-triggered full directory
         # scans. Caps CPU spent rescanning when something external is
@@ -626,6 +629,21 @@ class AppController(QObject):
                 fallback=0,
             ),
         )
+        # Foreground constraint tokens (see _enter_prefetch_constraint). Save
+        # and preview refinement carry their own per-operation token on the
+        # work item itself; only startup needs controller-held state.
+        self._startup_prefetch_constraint_token: Optional[int] = None
+        if start_in_loupe:
+            # Only --loupe startup decodes a foreground frame before the user
+            # does anything; grid startup would never see the Ready callback
+            # that releases this, so it must not be constrained at all.
+            self._startup_prefetch_constraint_token = self._enter_prefetch_constraint(
+                "startup"
+            )
+            QTimer.singleShot(
+                self._STARTUP_CONSTRAINT_FAILSAFE_MS,
+                lambda: self._release_startup_prefetch_constraint("failsafe-timeout"),
+            )
         self.last_displayed_image: Optional[DecodedImage] = (
             None  # Cache last image to avoid grey squares
         )
@@ -2048,6 +2066,67 @@ class AppController(QObject):
                 return True
         return super().eventFilter(watched, event)
 
+    def _enter_prefetch_constraint(self, reason: str) -> Optional[int]:
+        """Throttle speculative decoding while foreground work runs.
+
+        Returns a token for _leave_prefetch_constraint(), or None when the
+        prefetcher is gone/shutting down. Never raises: a governor problem must
+        not be able to break a save or a preview render.
+        """
+        prefetcher = getattr(self, "prefetcher", None)
+        if prefetcher is None:
+            return None
+        try:
+            return prefetcher.enter_constrained_mode(reason)
+        except Exception:
+            log.debug("Prefetch governor enter failed (%s)", reason, exc_info=True)
+            return None
+
+    def _leave_prefetch_constraint(self, token: Optional[int]) -> None:
+        """Release one constraint token; duplicate/stale tokens are ignored."""
+        if token is None:
+            return
+        prefetcher = getattr(self, "prefetcher", None)
+        if prefetcher is None:
+            return
+        try:
+            prefetcher.leave_constrained_mode(token)
+        except Exception:
+            log.debug("Prefetch governor release failed", exc_info=True)
+
+    def _clear_prefetch_constraint_reason(self, reason: str) -> None:
+        """Fail-safe: drop every constraint token held for one reason."""
+        prefetcher = getattr(self, "prefetcher", None)
+        if prefetcher is None:
+            return
+        try:
+            prefetcher.clear_constrained_reason(reason)
+        except Exception:
+            log.debug("Prefetch governor clear failed (%s)", reason, exc_info=True)
+
+    def _release_startup_prefetch_constraint(self, reason: str) -> None:
+        """Restore normal speculative capacity after the first loupe frame.
+
+        Release policy is "first decoded frame reached Image.Ready", not "first
+        frame swapped": Ready means the current image is decoded and handed to
+        the scene graph, which is the point where the foreground decode this
+        constraint protects is finished. The swap-based presentation tracking
+        is navigation- and diagnostic-scoped and would not fire reliably for a
+        cold startup frame.
+
+        Idempotent: the token is dropped before it is released, so a repeated
+        Ready callback, an empty folder, a grid switch, and shutdown can all
+        call this in any order.
+        """
+        token = getattr(self, "_startup_prefetch_constraint_token", None)
+        if token is None:
+            return
+        self._startup_prefetch_constraint_token = None
+        log.debug("Releasing startup prefetch constraint (%s)", reason)
+        self._leave_prefetch_constraint(token)
+        # Defensive: a token that was somehow duplicated cannot outlive startup.
+        self._clear_prefetch_constraint_reason("startup")
+
     def _do_prefetch(
         self,
         index: int,
@@ -2150,6 +2229,9 @@ class AppController(QObject):
         self.refresh_image_list(notify=False)  # Initial scan from disk
         if not self.image_files:
             self.current_index = 0
+            # Nothing will ever be decoded or presented here, so the startup
+            # constraint has no release event of its own.
+            self._release_startup_prefetch_constraint("empty-folder")
         else:
             saved_path = self._startup_restore_path or self.sidecar.data.last_path
             saved_index = (
@@ -2213,6 +2295,8 @@ class AppController(QObject):
 
         if self._is_grid_view_active:
             self._set_folder_loaded(True)
+            # A loupe startup that ends up in the grid has no first frame.
+            self._release_startup_prefetch_constraint("grid-startup")
 
         if not self._is_grid_view_active:
             self._maybe_decode_current_image("startup-loupe")
@@ -2398,9 +2482,10 @@ class AppController(QObject):
         self._last_index_scan_time = time.monotonic()
         self._scan_count_variant += 1
 
+        epoch = self._index_scan_epoch
         try:
             fut = self._index_executor.submit(find_images_with_variants, self.image_dir)
-            fut.add_done_callback(self._on_index_scan_done)
+            fut.add_done_callback(functools.partial(self._on_index_scan_done, epoch))
         except RuntimeError:
             # Executor already shut down; leave no inflight flag behind or the
             # next watcher tick would think a scan is still running.
@@ -2408,17 +2493,17 @@ class AppController(QObject):
             self._index_scan_inflight = False
             return
 
-    def _on_index_scan_done(self, fut: concurrent.futures.Future) -> None:
+    def _on_index_scan_done(self, epoch: int, fut: concurrent.futures.Future) -> None:
         """Runs on the index executor's worker thread — no QObject access here."""
         try:
             result = fut.result()
         except Exception as e:
             log.error("Background directory scan failed: %s", e)
             result = None
-        self._indexScanReady.emit(result)
+        self._indexScanReady.emit({"epoch": epoch, "result": result})
 
     @Slot(object)
-    def _on_index_scan_ready(self, result) -> None:
+    def _on_index_scan_ready(self, payload) -> None:
         """GUI-thread continuation of a watcher-triggered background scan.
 
         Unlike bare refresh_image_list(), this clamps current_index,
@@ -2431,7 +2516,11 @@ class AppController(QObject):
 
         self._index_scan_inflight = False
 
-        if result is None:
+        result = payload.get("result")
+        # A scan submitted for a directory we have since left describes files
+        # that are not in self.image_dir any more — applying it would repopulate
+        # the list with the old directory's images.
+        if result is None or payload.get("epoch") != self._index_scan_epoch:
             if self._index_rescan_needed:
                 self._maybe_start_index_scan()
             return
@@ -5016,6 +5105,14 @@ class AppController(QObject):
 
         self._suppress_watcher_paths(target)
         self._increment_save_tracking(target=target, save_image_key=save_image_key)
+        # One governor token per accepted save execution, carried on the
+        # context so it travels into the result dict. Encoding and file I/O
+        # compete with speculative decoding for the same cores, and overlapping
+        # saves each hold their own token, so capacity returns only when the
+        # last one completes -- navigating away from the image does not
+        # release it, and a duplicate completion callback releases a token the
+        # governor has already forgotten.
+        context["prefetch_constraint_token"] = self._enter_prefetch_constraint("save")
         self._mark_current_live_edit_session_submitted(context["save_revision"])
         self.ui_state.isSaving = True
         if saving_status:
@@ -5048,6 +5145,11 @@ class AppController(QObject):
 
         def on_done(future):
             if self._shutting_down:
+                # _on_save_finished will never run, so release this save's
+                # token here instead of relying on the prefetcher teardown.
+                self._leave_prefetch_constraint(
+                    context.get("prefetch_constraint_token")
+                )
                 return
             try:
                 result = future.result()
@@ -5063,6 +5165,9 @@ class AppController(QObject):
         try:
             future = self._save_executor.submit(do_save)
         except Exception as e:
+            self._leave_prefetch_constraint(
+                context.pop("prefetch_constraint_token", None)
+            )
             self._decrement_save_tracking(target=target, save_image_key=save_image_key)
             if not self._saves_in_flight:
                 self.ui_state.isSaving = False
@@ -5124,6 +5229,9 @@ class AppController(QObject):
 
         self._suppress_watcher_paths(target)
         self._increment_save_tracking(target=target, save_image_key=save_image_key)
+        # Same per-execution token as the async path; _on_save_finished below
+        # releases it from the result dict regardless of outcome.
+        context["prefetch_constraint_token"] = self._enter_prefetch_constraint("save")
         self._mark_current_live_edit_session_submitted(context["save_revision"])
         self.ui_state.isSaving = True
         if saving_status:
@@ -5260,6 +5368,10 @@ class AppController(QObject):
     @Slot(object)
     def _on_save_finished(self, save_result: dict):
         """Handle save completion on main thread (called via signal from background)."""
+        # Released first and unconditionally, before the shutdown guard: this
+        # token belongs to THIS save execution only, so a duplicate or stale
+        # completion cannot restore capacity another in-flight save still needs.
+        self._leave_prefetch_constraint(save_result.get("prefetch_constraint_token"))
         # Guard against callbacks during/after shutdown
         if self._shutting_down:
             return
@@ -5524,6 +5636,11 @@ class AppController(QObject):
     _NAV_RECORDS_MAX = 96
     _NAV_SETTLE_MS = 400
     _NAV_SUMMARY_DEADLINE_MS = 1800
+    # Upper bound on how long --loupe startup may throttle speculative decodes.
+    # The real release is the first Ready frame; this only guarantees that a
+    # missed Ready callback (QML error, decode failure, unusual view state)
+    # cannot leave FastStack permanently constrained.
+    _STARTUP_CONSTRAINT_FAILSAFE_MS = 10000
 
     def _fast_buffer_depth(self, index: int, direction: int) -> int:
         """Count consecutive cache-ready fast frames ahead of ``index``."""
@@ -6232,6 +6349,12 @@ class AppController(QObject):
 
     @Slot(int, int)
     def _on_frame_ready(self, seq: int, generation: int) -> None:
+        # The first decoded frame to reach Image.Ready is the usable current
+        # image the startup constraint was protecting, so capacity is restored
+        # here rather than at the later frame swap -- even if a newer
+        # navigation already superseded this seq below.
+        if self._startup_prefetch_constraint_token is not None:
+            self._release_startup_prefetch_constraint("first-frame-ready")
         # QML may finish an asynchronous source after a direct jump has minted
         # a newer navigation sequence. Such a Ready belongs to pixels that are
         # no longer eligible to release pacing or enter presentation tracing.
@@ -7568,6 +7691,9 @@ class AppController(QObject):
 
         if active:
             # Entering grid view
+            # No loupe frame will be presented, so a still-held startup
+            # constraint has to be released here instead.
+            self._release_startup_prefetch_constraint("left-loupe")
             self._cancel_paced_navigation()
             self.pending_prefetch_index = None
             self._quality_decode_token += 1
@@ -10319,7 +10445,12 @@ class AppController(QObject):
             self._grid_nav_history.clear()
             self.ui_state.gridCanGoBackChanged.emit()
 
-        # Clear directory-specific state
+        # Clear directory-specific state. Bumping the index-scan epoch makes any
+        # walk still running against the old directory discard its result; the
+        # in-flight flag stays owned by that scan so a second walk cannot queue
+        # behind it and then have its flag cleared by the stale arrival.
+        self._index_scan_epoch += 1
+        self._index_rescan_needed = False
         self.stacks = []
         self.batches = []
         self.batch_start_index = None
@@ -12217,6 +12348,12 @@ class AppController(QObject):
         self._shutting_down = True  # set EARLY to make all slots no-op
         self._exif_pending_path = None
         log.info("Application shutting down (Qt cleanup).")
+
+        # Drop the startup constraint: its release callbacks are now no-ops.
+        # Save/refinement reasons stay until their own completion paths run or
+        # Prefetcher.shutdown() clears them (executor shutdown ignores the
+        # governor either way, so no worker can be parked on it).
+        self._release_startup_prefetch_constraint("shutdown")
 
         # Stop Qt timers
         try:
@@ -14613,6 +14750,12 @@ class AppController(QObject):
         def cancelled() -> bool:
             return cancel_event.is_set() or image_editor._edits_rev != edits_revision
 
+        # Only the expensive settled/display-resolution refinement throttles
+        # speculation; lightweight quick-preview renders never do. Acquired
+        # before submit so a job that finishes immediately still releases via
+        # its own callback token, and released again if submission fails.
+        governor_token = self._enter_prefetch_constraint("preview_refinement")
+
         try:
             future = self._preview_refine_executor.submit(
                 self._render_preview_worker,
@@ -14627,15 +14770,25 @@ class AppController(QObject):
                 None,
                 cancelled,
             )
-            future.add_done_callback(self._on_preview_refinement_done)
+            future.add_done_callback(
+                lambda done, tok=governor_token: self._on_preview_refinement_done(
+                    done, tok
+                )
+            )
         except RuntimeError:
             log.warning("Preview refinement failed to start")
+            self._leave_prefetch_constraint(governor_token)
             with self._preview_lock:
                 if self._preview_refinement_cancel is cancel_event:
                     self._preview_refinement_cancel = None
                 self._preview_refinement_inflight = False
 
-    def _on_preview_refinement_done(self, future):
+    def _on_preview_refinement_done(self, future, governor_token=None):
+        # Released first and unconditionally: success, stale result,
+        # cooperative cancellation, worker exception, and shutdown all land
+        # here, and the token identifies THIS refinement, so a rapidly
+        # replaced job cannot restore capacity a newer one still needs.
+        self._leave_prefetch_constraint(governor_token)
         if getattr(self, "_shutting_down", False):
             return
         try:
@@ -16233,9 +16386,33 @@ class AppController(QObject):
             # Speculative + the reserved demand decoder, matching the
             # decode_workers=N(1 demand) notation in the NAVTRACE header.
             speculative = self.prefetcher.total_decode_workers - 1
+            # Governor state confirms at a glance that demand work bypasses the
+            # limit, that no more than the effective limit is running while
+            # constrained, and that queued work is only delayed. All counters
+            # are O(1) -- Preload All may hold thousands of queued tasks.
+            governor = ""
+            try:
+                state = self.prefetcher.constrained_mode_snapshot()
+                if state["constrained"]:
+                    governor = (
+                        f", governed {state['running']}/{state['effective_limit']}"
+                        f" [{','.join(sorted(state['reasons']))}]"
+                        f" q{state['queued_interactive']}+{state['queued_preload']}"
+                        f" demand {state['running_demand']}/1"
+                        f" q{state['queued_demand']}"
+                    )
+                elif state["queued_total"] or state["running"]:
+                    governor = (
+                        f", spec {state['running']}/{state['effective_limit']}"
+                        f" q{state['queued_interactive']}+{state['queued_preload']}"
+                        f" demand {state['running_demand']}/1"
+                        f" q{state['queued_demand']}"
+                    )
+            except Exception:
+                log.debug("Prefetch governor snapshot failed", exc_info=True)
             self.ui_state.cacheStats = (
                 f"Cache: {hits} hits, {misses} misses ({hit_rate:.1f}%), "
-                f"{size_mb:.1f} MB, workers {speculative}+1"
+                f"{size_mb:.1f} MB, workers {speculative}+1{governor}"
             )
 
     def get_recycle_bin_stats(self) -> List[Dict[str, Any]]:
@@ -16866,8 +17043,8 @@ def main(
             "[NAVTRACE] enabled schema=2 mode=%s correlation=seq+generation "
             "presentation=%s navigation_fps=%.1f repeat_delay=%dms "
             "pacing=%s held_quality=%s fast_decode_max=%dpx "
-            "decode_workers=%d(1 demand) input_settle=%dms "
-            "summary_deadline=%dms",
+            "decode_workers=%d(1 demand) constrained_speculative=%d "
+            "input_settle=%dms summary_deadline=%dms",
             "trace" if debug_cache_trace else "summary",
             present_mode,
             controller._navigation_rate_fps,
@@ -16876,6 +17053,7 @@ def main(
             controller._held_navigation_quality,
             controller.prefetcher.fast_decode_max_dimension,
             controller.prefetcher.total_decode_workers,
+            controller.prefetcher.governor.constrained_limit,
             controller._NAV_SETTLE_MS,
             controller._NAV_SUMMARY_DEADLINE_MS,
         )
