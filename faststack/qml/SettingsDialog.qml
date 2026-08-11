@@ -24,6 +24,7 @@ Window {
     property string heliconPath: ""
     property double cacheSize: 1.5
     property double autoLevelClippingThreshold: 0.1
+    property double autoLevelBlackThreshold: 0.0
     property double autoLevelStrength: 1.0
     property bool autoLevelStrengthAuto: false
     property bool autoVibranceEnabled: true
@@ -159,6 +160,7 @@ Window {
             settingsDialog.updateCheckEnabled = settingsDialog.uiStateRef.get_update_check_enabled()
             settingsDialog.autoUpdateEnabled = settingsDialog.uiStateRef.get_auto_update_enabled()
             settingsDialog.autoLevelClippingThreshold = settingsDialog.uiStateRef.autoLevelClippingThreshold
+            settingsDialog.autoLevelBlackThreshold = settingsDialog.uiStateRef.autoLevelBlackThreshold
             settingsDialog.autoLevelStrength = settingsDialog.uiStateRef.autoLevelStrength
             settingsDialog.autoLevelStrengthAuto = settingsDialog.uiStateRef.autoLevelStrengthAuto
             settingsDialog.autoVibranceEnabled = settingsDialog.uiStateRef.autoVibranceEnabled
@@ -224,6 +226,7 @@ Window {
         state.set_update_check_enabled(settingsDialog.updateCheckEnabled)
         state.set_auto_update_enabled(settingsDialog.autoUpdateEnabled)
         state.autoLevelClippingThreshold = settingsDialog.autoLevelClippingThreshold
+        state.autoLevelBlackThreshold = settingsDialog.autoLevelBlackThreshold
         state.autoLevelStrength = settingsDialog.autoLevelStrength
         state.autoLevelStrengthAuto = settingsDialog.autoLevelStrengthAuto
         state.autoVibranceEnabled = settingsDialog.autoVibranceEnabled
@@ -1042,6 +1045,41 @@ Window {
                                     property: "text"
                                     value: settingsDialog.autoLevelClippingThreshold.toFixed(4)
                                     when: clipThresholdLoader.item && !settingsDialog.loaderProperty(clipThresholdLoader, "activeFocus", false)
+                                }
+                            }
+
+                            Label {
+                                text: "Blacks Clip %"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: blackThresholdHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: blackThresholdHover.containsMouse
+                                ToolTip.text: "Clips the dark end only, separately from Clip Threshold. 0 means follow Clip Threshold. Raise it (try 1-3%) when backgrounds that should read as black come out grey - it forces that share of the darkest pixels to black, so shadow detail goes with them. This is the only setting that deepens blacks."
+                            }
+                            Loader {
+                                id: blackThresholdLoader
+                                sourceComponent: styledTextField
+                                Layout.preferredWidth: 80
+                                onLoaded: {
+                                     settingsDialog.setLoaderProperty(blackThresholdLoader, "text", settingsDialog.autoLevelBlackThreshold.toFixed(4))
+                                     settingsDialog.connectLoaderSignal(blackThresholdLoader, "editingFinished", function() {
+                                         var value = parseFloat(settingsDialog.loaderProperty(blackThresholdLoader, "text", settingsDialog.autoLevelBlackThreshold.toFixed(4)))
+                                         if (!isNaN(value) && value >= 0.0 && value <= 50.0) {
+                                             settingsDialog.autoLevelBlackThreshold = value
+                                         }
+                                         settingsDialog.setLoaderProperty(blackThresholdLoader, "text", settingsDialog.autoLevelBlackThreshold.toFixed(4))
+                                     })
+                                }
+                                Binding {
+                                    target: blackThresholdLoader.item
+                                    property: "text"
+                                    value: settingsDialog.autoLevelBlackThreshold.toFixed(4)
+                                    when: blackThresholdLoader.item && !settingsDialog.loaderProperty(blackThresholdLoader, "activeFocus", false)
                                 }
                             }
 

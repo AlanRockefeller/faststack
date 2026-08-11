@@ -111,8 +111,8 @@ fi
 
 git remote get-url origin >/dev/null 2>&1 || die "remote 'origin' is not configured"
 
-note "Fetching origin/main and tags"
-git fetch origin +main:refs/remotes/origin/main --tags
+note "Fetching origin branches and tags"
+git fetch origin '+refs/heads/*:refs/remotes/origin/*' --tags
 
 git rev-parse --verify "$target_ref^{commit}" >/dev/null 2>&1 \
   || die "target ref does not resolve to a commit: $target_ref"

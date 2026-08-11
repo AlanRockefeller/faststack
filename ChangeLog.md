@@ -2,6 +2,13 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## 1.6.8 (2026-08-10)
+
+- Auto levels (L) no longer washes out photos. It used to judge brightness from the whole picture, so a mushroom on a black background looked "too dark" and got brightened way too much. It now looks at the subject instead of the background, and turns the brightness up much more gently.
+- New "Blacks Clip %" setting under Auto Levels. Leave it at 0 for the old behavior. Turn it up (try 1 to 3) if backgrounds that should be black keep coming out grey - it forces that share of the darkest pixels all the way to black. Some photos will go too dark, so it's off by default.
+- Pressing P now opens Photoshop immediately and discards any pending FastStack edits; when Photoshop creates or overwrites the expected JPG (including for RAW-only entries), FastStack reloads it and automatically adds it to the batch when that option is enabled.
+- The aspect ratio box in crop mode now has an X to close it when it's in the way.
+
 ## 1.6.7 (2026-08-03)
 
 - Implemented safe multi-process sidecar merging - now having multiple Faststack windows won't clobber sidecars with old data.

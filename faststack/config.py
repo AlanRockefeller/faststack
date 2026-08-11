@@ -474,7 +474,15 @@ DEFAULT_CONFIG = {
         #     Lower values (e.g. 0.001 = 0.1%) are gentler and preserve more dynamic range.
         #   - auto_level_strength: 1.0 applies the full mathematical correction. Lower values
         #     blend the result for a subtler effect.
+        #   - auto_level_black_threshold: same units, shadow end only. 0 means
+        #     "follow auto_level_threshold". The black point can never sit above
+        #     this percentile of luma, so this is the ONLY setting that deepens
+        #     blacks — auto_level_channel_budget loosens the per-channel cap but
+        #     cannot raise that ceiling. Raise it (1-3) if backgrounds that
+        #     should read as black come out grey; it clips that share of the
+        #     darkest pixels, so shadow detail goes with them.
         "auto_level_threshold": "0.1",
+        "auto_level_black_threshold": "0",
         "auto_level_strength": "1.0",
         "auto_level_strength_auto": "False",
         "auto_vibrance_enabled": "True",

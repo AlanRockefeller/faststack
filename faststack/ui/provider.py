@@ -651,6 +651,7 @@ class UIState(QObject):
     currentDirectoryChanged = Signal()  # Signal when working directory changes
     stackDirectorySwitchChanged = Signal()
     autoLevelClippingThresholdChanged = Signal(float)
+    autoLevelBlackThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
     autoVibranceEnabledChanged = Signal(bool)
@@ -1541,6 +1542,17 @@ class UIState(QObject):
             return
         self.app_controller.set_auto_level_clipping_threshold(value)
         self.autoLevelClippingThresholdChanged.emit(value)
+
+    @Property(float, notify=autoLevelBlackThresholdChanged)
+    def autoLevelBlackThreshold(self):
+        return self.app_controller.get_auto_level_black_threshold()
+
+    @autoLevelBlackThreshold.setter
+    def autoLevelBlackThreshold(self, value):
+        if self.app_controller.get_auto_level_black_threshold() == value:
+            return
+        self.app_controller.set_auto_level_black_threshold(value)
+        self.autoLevelBlackThresholdChanged.emit(value)
 
     @Property(float, notify=autoLevelStrengthChanged)
     def autoLevelStrength(self):

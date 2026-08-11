@@ -115,6 +115,7 @@ Item {
                 // Capture the session's visual source when crop mode turns on,
                 // then keep it stable until crop mode exits.
                 loupeView.freezeCropImageSource()
+                aspectRatioWindow.dismissed = false
             } else {
                 if (mainMouseArea) {
                     mainMouseArea.clearPendingRotation(0)
@@ -1726,7 +1727,9 @@ Item {
     // Aspect ratio selector window (upper left corner)
     Rectangle {
         id: aspectRatioWindow
-        visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping
+        // Dismissed by the X button; reset each time crop mode is entered.
+        property bool dismissed: false
+        visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping && !dismissed
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.margins: 10
@@ -1750,13 +1753,45 @@ Item {
             anchors.margins: 10
             spacing: 5
             
-            Text {
-                text: "Aspect Ratio"
-                font.bold: true
-                color: aspectRatioWindow.isDark ? "white" : "black"
-                font.pixelSize: 12
+            Item {
+                width: parent.width
+                height: closeButton.height
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Aspect Ratio"
+                    font.bold: true
+                    color: aspectRatioWindow.isDark ? "white" : "black"
+                    font.pixelSize: 12
+                }
+
+                Rectangle {
+                    id: closeButton
+                    anchors.right: parent.right
+                    width: 18
+                    height: 18
+                    radius: 3
+                    color: closeMouseArea.containsMouse
+                           ? (aspectRatioWindow.isDark ? "#555555" : "#d8d8d8")
+                           : "transparent"
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "✕"
+                        color: aspectRatioWindow.isDark ? "white" : "black"
+                        font.pixelSize: 11
+                    }
+
+                    MouseArea {
+                        id: closeMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onClicked: aspectRatioWindow.dismissed = true
+                    }
+                }
             }
-            
+
             Repeater {
                 model: loupeView.uiStateRef && loupeView.uiStateRef.aspectRatioNames ? loupeView.uiStateRef.aspectRatioNames.length : 0
                 

@@ -153,14 +153,24 @@ _RECYCLE_SHARING_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.4, 0.4)
 _AUTO_VIBRANCE_EPS = 0.001
 _AUTO_BRIGHTNESS_EPS = 0.001
 # Midtone correction dead band and recovery. Images whose projected
-# post-stretch median luma already sits within +/- deadband of the target are
+# post-stretch subject luma already sits within +/- deadband of the target are
 # left alone — a reasonable exposure should not be normalized toward one
 # canonical brightness (that made "most images too bright"). Images outside
 # the band are pulled only partway back to the nearest band *edge* (never to
 # the center), which keeps the correction continuous at the band boundary and
 # preserves intentional low-key / high-key character.
 _AUTO_MIDTONE_DEADBAND = 0.10
-_AUTO_MIDTONE_RECOVERY = 0.7
+_AUTO_MIDTONE_RECOVERY = 0.5
+# Hard bounds on the midtone brightness factor. The endpoint stretch is the
+# primary exposure tool (measured on ~90 finished photos it recovers a 2x
+# under-exposure on its own); this correction is only a nudge on top, so the
+# lift stays small. It used to allow 1.30x, which washed out dark-background
+# macro shots — see the subject-luma note in editor.analyze_auto_levels.
+_AUTO_MIDTONE_MAX_LIFT = 1.12
+_AUTO_MIDTONE_MAX_DROP = 0.85
+# Absolute ceiling on the blacks/whites endpoint stretch, applied whether or
+# not auto_level_strength_auto is on.
+_AUTO_LEVELS_MAX_STRETCH = 4.0
 
 
 def _awb_direction(value: float, pos_label: str, neg_label: str) -> str:
@@ -192,6 +202,12 @@ class LiveEditSessionState:
     session_id: Optional[str]
     persisted_revision: int
     submitted_revision: int
+
+
+@dataclass
+class PhotoshopHandoffState:
+    jpg_path: Path
+    baseline_fingerprint: Optional[tuple[float, int]]
 
 
 class PreviewSessionProvenance(NamedTuple):
@@ -576,6 +592,10 @@ class AppController(QObject):
         # busting the entire cache via a display-generation bump.
         self._watcher_changed_paths: set = set()
         self._watcher_changed_lock = threading.Lock()
+        # JPGs launched through Photoshop remain here until the watcher sees a
+        # write that differs from the launch-time baseline. The state is
+        # GUI-thread-owned; the watchdog thread only fills _watcher_changed_paths.
+        self._photoshop_handoffs: Dict[str, PhotoshopHandoffState] = {}
         # Per-path decode invalidation epochs (path key -> monotonic time).
         # _prefetch_cache_put rejects decode results that STARTED before the
         # path's epoch: their pixels were read from a file that has since
@@ -921,6 +941,10 @@ class AppController(QObject):
         self._dialog_open = False
 
         self.auto_level_threshold = config.getfloat("core", "auto_level_threshold", 0.1)
+        # 0 == follow auto_level_threshold. See _black_threshold_percent().
+        self.auto_level_black_threshold = config.getfloat(
+            "core", "auto_level_black_threshold", 0.0
+        )
         self.auto_level_strength = config.getfloat("core", "auto_level_strength", 1.0)
         self.auto_level_strength_auto = config.getboolean(
             "core", "auto_level_strength_auto", False
@@ -1655,6 +1679,54 @@ class AppController(QObject):
             return (st.st_mtime, st.st_size)
         except OSError:
             return None
+
+    def _track_photoshop_handoff(
+        self,
+        jpg_path: Path,
+    ) -> None:
+        """Remember the JPG that Photoshop is expected to overwrite."""
+        key = self._key(jpg_path)
+        if not key:
+            return
+        self._photoshop_handoffs[key] = PhotoshopHandoffState(
+            jpg_path=jpg_path,
+            baseline_fingerprint=self._file_state_fingerprint(jpg_path),
+        )
+
+    def _consume_photoshop_overwrites(self, changed_paths: set) -> list[Path]:
+        """Return Photoshop handoffs whose JPG now differs from their baseline."""
+        if not changed_paths:
+            return []
+
+        overwritten: list[Path] = []
+        for changed_path in changed_paths:
+            if changed_path is None:
+                continue
+            key = self._key(changed_path)
+            state = self._photoshop_handoffs.get(key)
+            if state is None:
+                continue
+            current = self._file_state_fingerprint(state.jpg_path)
+            if current is None or current == state.baseline_fingerprint:
+                continue
+            overwritten.append(state.jpg_path)
+            self._photoshop_handoffs.pop(key, None)
+        return overwritten
+
+    def _persist_photoshop_overwrite_batches(self, paths: list[Path]) -> int:
+        """Persist auto-batch flags before the watcher rebuilds runtime ranges."""
+        if not paths or not self.ui_state.autoAddEditedToBatch:
+            return 0
+
+        added = 0
+        for path in paths:
+            meta = self.sidecar.get_metadata(path)
+            if not meta.batch:
+                meta.batch = True
+                added += 1
+        if added:
+            self.sidecar.save()
+        return added
 
     def _invalidate_decoded_path(self, path, *, force: bool = False) -> None:
         """Targeted decode-cache invalidation for one changed file.
@@ -2541,6 +2613,13 @@ class AppController(QObject):
             changed_paths = self._watcher_changed_paths
             self._watcher_changed_paths = set()
 
+        photoshop_overwrites = self._consume_photoshop_overwrites(changed_paths)
+        photoshop_batch_additions = self._persist_photoshop_overwrite_batches(
+            photoshop_overwrites
+        )
+        for path in photoshop_overwrites:
+            log.info("Detected completed Photoshop overwrite: %s", path)
+
         self._all_images = images
         self._variant_map = variant_map
         self._apply_filter_to_cached_list(notify=False)
@@ -2585,6 +2664,12 @@ class AppController(QObject):
         self._do_prefetch(self.current_index)
         self.sync_ui_state(image_count_changed=True)
         self._restart_quality_decode_timer()
+        if photoshop_batch_additions:
+            self.dataChanged.emit()
+            self.update_status_message(
+                "Photoshop edit reloaded and added to batch",
+                timeout=5000,
+            )
 
         # More changes arrived (or were throttled) during this scan — go again.
         if self._index_rescan_needed:
@@ -4411,6 +4496,51 @@ class AppController(QObject):
             state.persisted_revision = revision
             state.submitted_revision = revision
 
+    def _discard_current_live_edits_for_photoshop(self) -> bool:
+        """Discard dirty FastStack state after handing the image to Photoshop."""
+        if not self._is_current_live_edit_session_dirty():
+            return False
+
+        if self.ui_state.isCropping:
+            self.ui_state.isCropRotating = False
+            self.ui_state.isCropping = False
+            self._clear_crop_mode_snapshot()
+
+        self._clear_active_auto_adjust_state(
+            "Photoshop handoff discarded unsaved FastStack edits",
+            clear_editor=False,
+        )
+        if self.image_editor:
+            self.image_editor.reset_edits()
+        if hasattr(self.ui_state, "reset_editor_state"):
+            self.ui_state.reset_editor_state()
+
+        self._clear_live_edit_session_state()
+        self._hq_preview_timer.stop()
+        with self._preview_lock:
+            self._preview_token += 1
+            self._preview_pending = False
+            cancel_event = self._preview_refinement_cancel
+            if cancel_event is not None:
+                cancel_event.set()
+            self._clear_last_rendered_preview_locked()
+
+        if self.ui_state.isEditorOpen:
+            self.ui_state.isEditorOpen = False
+        elif self.image_editor:
+            self.image_editor.clear()
+
+        if 0 <= self.current_index < len(self.image_files):
+            current_path = self.image_files[self.current_index].path
+            self._invalidate_decoded_path(current_path, force=True)
+        self.prefetcher.update_prefetch(self.current_index)
+        self.sync_ui_state()
+        if self.ui_state.isHistogramVisible:
+            self.update_histogram()
+
+        log.info("Discarded unsaved FastStack edits for Photoshop handoff")
+        return True
+
     def _mark_current_live_edit_session_save_failed(self, revision: int) -> None:
         """Rollback the submitted revision watermark when the latest save fails."""
         state = self._live_edit_session_state
@@ -4682,37 +4812,53 @@ class AppController(QObject):
             self._editor_prewarm_future = future
             future.add_done_callback(_clear_future)
 
+    def _black_threshold_percent(self) -> Optional[float]:
+        """Shadow-end clip percentile, or None to follow the shared threshold."""
+        value = self.auto_level_black_threshold
+        return value if value > 0.0 else None
+
     def _compute_auto_levels_recommendation(self) -> dict[str, Any]:
         """Compute the current baseline auto-level recommendation."""
         blacks, whites, p_low, p_high = self.image_editor.analyze_auto_levels(
             self.auto_level_threshold,
             reset_levels=True,
             channel_budget=self.auto_level_channel_budget,
+            black_threshold_percent=self._black_threshold_percent(),
         )
 
         dynamic_range = p_high - p_low
-        if self.auto_level_strength_auto:
-            if dynamic_range < 1.0:
-                strength = 0.0
-            else:
-                stretch_full = 255.0 / dynamic_range
-                stretch_cap = 4.0
-                if stretch_full <= stretch_cap:
-                    strength = 1.0
-                else:
-                    strength = (stretch_cap - 1.0) / (stretch_full - 1.0)
-                    strength = max(0.0, min(1.0, strength))
-
-                log.debug(
-                    "Auto levels: p_low=%0.1f, p_high=%0.1f, range=%0.1f, stretch_full=%0.2f, strength=%0.3f",
-                    p_low,
-                    p_high,
-                    dynamic_range,
-                    stretch_full,
-                    strength,
-                )
+        if dynamic_range < 1.0:
+            strength = (
+                0.0 if self.auto_level_strength_auto else self.auto_level_strength
+            )
         else:
-            strength = self.auto_level_strength
+            strength = (
+                1.0 if self.auto_level_strength_auto else self.auto_level_strength
+            )
+            # Ceiling on the endpoint stretch. This used to apply only when
+            # auto_level_strength_auto was on — which is off by default, so the
+            # default path had no bound at all and a very flat image could be
+            # stretched arbitrarily far. Measured on ~90 finished photos the
+            # honest stretch never exceeds ~2.7x even for a 2x under-exposure,
+            # so the ceiling is a guard rail, not a tuning knob.
+            stretch_full = 255.0 / dynamic_range
+            if stretch_full > _AUTO_LEVELS_MAX_STRETCH:
+                strength = min(
+                    strength,
+                    max(
+                        0.0,
+                        (_AUTO_LEVELS_MAX_STRETCH - 1.0) / (stretch_full - 1.0),
+                    ),
+                )
+
+            log.debug(
+                "Auto levels: p_low=%0.1f, p_high=%0.1f, range=%0.1f, stretch_full=%0.2f, strength=%0.3f",
+                p_low,
+                p_high,
+                dynamic_range,
+                stretch_full,
+                strength,
+            )
 
         base_blacks = blacks * strength
         base_whites = whites * strength
@@ -4724,24 +4870,31 @@ class AppController(QObject):
 
         # Midtone correction: an endpoint stretch leaves a full-range but
         # underexposed (or overexposed) image untouched. When the projected
-        # post-stretch median luma falls outside the dead band around the
+        # post-stretch subject luma falls outside the dead band around the
         # target, nudge brightness partway back toward the nearest band edge.
         # A well-exposed image inside the band is left alone (normalizing every
         # photo to one brightness made "most images too bright"); images that
         # are corrected only recover partway, preserving intentional low-key /
         # high-key character. The factor is capped so the auto result stays
         # conservative; the levels soft knee protects highlights from the lift.
+        #
+        # The metric is subject luma, not whole-frame median: on a black-
+        # background macro shot the median is the backdrop, so driving the
+        # correction from it lifted an already well-exposed subject by up to
+        # 1.3x and hazed the background. See editor.analyze_auto_levels.
         base_brightness = 0.0
         if self.auto_level_midtone and dynamic_range >= 1.0:
             stats = getattr(self.image_editor, "last_auto_levels_stats", {})
-            median_luma = float(stats.get("median_luma", 0.0))
-            if median_luma > 0.02:
+            subject_luma = float(
+                stats.get("subject_luma", stats.get("median_luma", 0.0))
+            )
+            if subject_luma > 0.02:
                 bp = -base_blacks * 0.15
                 wp = 1.0 - base_whites * 0.15
                 span = max(wp - bp, 1e-4)
                 target = max(0.2, min(0.6, self.auto_level_midtone_target))
-                # Median luma projected through the levels stretch.
-                projected = (median_luma - bp) / span
+                # Subject luma projected through the levels stretch.
+                projected = (subject_luma - bp) / span
                 band_low = target - _AUTO_MIDTONE_DEADBAND
                 band_high = target + _AUTO_MIDTONE_DEADBAND
                 desired = None
@@ -4755,9 +4908,11 @@ class AppController(QObject):
                     )
                 if desired is not None:
                     # Brightness multiplies before the levels ramp, so solve
-                    # (median * factor - bp) / span = desired for factor.
-                    factor = (desired * span + bp) / median_luma
-                    factor = max(0.85, min(1.3, factor))
+                    # (subject * factor - bp) / span = desired for factor.
+                    factor = (desired * span + bp) / subject_luma
+                    factor = max(
+                        _AUTO_MIDTONE_MAX_DROP, min(_AUTO_MIDTONE_MAX_LIFT, factor)
+                    )
                     if abs(factor - 1.0) >= 0.02:
                         base_brightness = factor - 1.0
 
@@ -10295,6 +10450,20 @@ class AppController(QObject):
         config.save()
 
     @Slot(result=float)
+    def get_auto_level_black_threshold(self):
+        return self.auto_level_black_threshold
+
+    @Slot(float)
+    def set_auto_level_black_threshold(self, value):
+        # 0 means "follow the shared clip threshold". The upper bound is far
+        # looser than the shared threshold's because deepening blacks past a
+        # few percent is a legitimate look for dark-background macro work.
+        value = max(0.0, min(50.0, value))
+        self.auto_level_black_threshold = value
+        config.set("core", "auto_level_black_threshold", f"{value:.6g}")
+        config.save()
+
+    @Slot(result=float)
     def get_auto_level_strength(self):
         return self.auto_level_strength
 
@@ -10452,6 +10621,7 @@ class AppController(QObject):
         # behind it and then have its flag cleared by the stale arrival.
         self._index_scan_epoch += 1
         self._index_rescan_needed = False
+        self._photoshop_handoffs.clear()
         self.stacks = []
         self.batches = []
         self.batch_start_index = None
@@ -12744,6 +12914,11 @@ class AppController(QObject):
         # Prefer RAW file if it exists, otherwise use JPG
         image_file = self.image_files[self.current_index]
         jpg_path = image_file.path
+        if jpg_path.suffix.lower() in RAW_EXTENSIONS:
+            # RAW-only entries have no JPEG path in the index yet. Photoshop's
+            # handoff target (also copied to the clipboard) is the same-stem
+            # JPEG that will replace the RAW-only entry after the watcher scan.
+            jpg_path = jpg_path.with_suffix(".jpg")
 
         # Handle backup images: strip -backup, -backup2, -backup-1, etc. to find original RAW
         original_stem = jpg_path.stem
@@ -12823,6 +12998,14 @@ class AppController(QObject):
                 close_fds=True,  # Close unused file descriptors
             )
 
+            # Photoshop owns the image after handoff. Do not queue a competing
+            # FastStack save; retire dirty in-memory edits so navigation or app
+            # shutdown cannot write them over Photoshop's later JPEG output.
+            self._track_photoshop_handoff(jpg_path)
+            discarded_faststack_edits = (
+                self._discard_current_live_edits_for_photoshop()
+            )
+
             jpg_clipboard_path = str(jpg_path)
             QApplication.clipboard().setText(jpg_clipboard_path)
             log.info(
@@ -12840,9 +13023,16 @@ class AppController(QObject):
             self.dataChanged.emit()
             self.sync_ui_state()
 
-            self.update_status_message(
-                f"Opened {current_image_path.name} in Photoshop. Copied JPG path."
-            )
+            if discarded_faststack_edits:
+                status = (
+                    f"Opened {current_image_path.name} in Photoshop. "
+                    "Discarded unsaved FastStack edits. Copied JPG path."
+                )
+            else:
+                status = (
+                    f"Opened {current_image_path.name} in Photoshop. Copied JPG path."
+                )
+            self.update_status_message(status)
             log.info("Launched Photoshop with: %s", command)
         except FileNotFoundError as e:
             self.update_status_message(f"Photoshop executable not found: {e}")

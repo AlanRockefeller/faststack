@@ -72,6 +72,12 @@ _AUTO_VIBRANCE_SAT_CEILING = 0.18
 _AUTO_VIBRANCE_MIN_COLOR_DELTA = 0.015
 _AUTO_VIBRANCE_CLIP_TOLERANCE = 0.0001
 _AUTO_LEVELS_ANALYSIS_MAX_EDGE = 1920
+# Subject-midtone estimation (see analyze_auto_levels). Pixels below the floor
+# are treated as backdrop and excluded from the midtone median; if fewer than
+# MIN_SUBJECT_FRAC of the frame clears the floor the sample is too small to
+# trust and the whole-frame median is used instead.
+_AUTO_MIDTONE_BG_FLOOR = 0.08
+_AUTO_MIDTONE_MIN_SUBJECT_FRAC = 0.15
 # Colorful-subject guard: median saturation can be low while a small subject
 # is already vivid. Scale the boost down as the 90th-percentile saturation
 # approaches full saturation so that subject is not pushed garish.
@@ -2163,7 +2169,10 @@ class ImageEditor:
         )
 
     def auto_levels(
-        self, threshold_percent: float = 0.1, channel_budget: float = 3.0
+        self,
+        threshold_percent: float = 0.1,
+        channel_budget: float = 3.0,
+        black_threshold_percent: Optional[float] = None,
     ) -> Tuple[float, float, float, float]:
         """
         Returns (blacks, whites, p_low, p_high).
@@ -2174,6 +2183,7 @@ class ImageEditor:
             threshold_percent,
             reset_levels=True,
             channel_budget=channel_budget,
+            black_threshold_percent=black_threshold_percent,
         )
 
         with self._lock:
@@ -2189,13 +2199,26 @@ class ImageEditor:
         edits: Optional[Dict[str, Any]] = None,
         reset_levels: bool = True,
         channel_budget: float = 3.0,
+        black_threshold_percent: Optional[float] = None,
     ) -> Tuple[float, float, float, float]:
-        """Analyze auto-levels on the current edited baseline without mutating edits."""
+        """Analyze auto-levels on the current edited baseline without mutating edits.
+
+        ``black_threshold_percent`` clips the shadow end independently of
+        ``threshold_percent``. The black point can never sit above this
+        percentile of luma, so it is the only control that deepens blacks —
+        ``channel_budget`` can loosen the per-channel cap but never raise that
+        ceiling. Pass None to keep the shadow end tied to ``threshold_percent``.
+        """
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
 
         threshold_percent = max(0.0, min(10.0, threshold_percent))
+        black_threshold_explicit = black_threshold_percent is not None
+        if black_threshold_percent is None:
+            black_threshold_percent = threshold_percent
+        else:
+            black_threshold_percent = max(0.0, min(50.0, black_threshold_percent))
 
         with self._lock:
             # Auto-levels is an aggregate percentile estimate. If the full
@@ -2297,7 +2320,7 @@ class ImageEditor:
         luma_q = (_rec601_gray(scaled) * (nbins - 1)).astype(np.uint16)
         luma_hist = np.bincount(luma_q.reshape(-1), minlength=nbins)
         luma_low = self._percentile_from_hist(
-            luma_hist, threshold_percent, method="lower"
+            luma_hist, black_threshold_percent, method="lower"
         )
         luma_high = self._percentile_from_hist(
             luma_hist, 100.0 - threshold_percent, method="higher"
@@ -2306,8 +2329,39 @@ class ImageEditor:
             nbins - 1
         )
 
+        # Subject midtone: the median over non-background pixels. Whole-frame
+        # median is a bad exposure signal for the dark-background macro shots
+        # this app is used for — with 60% of the frame black, the median tracks
+        # the backdrop, not the subject, and any midtone correction driven by it
+        # lifts the backdrop into grey haze while the subject was already fine.
+        # Fall back to the plain median when too little of the frame clears the
+        # floor to be a reliable sample (a genuinely dark photo, where the
+        # endpoint stretch is the right tool anyway).
+        floor_bin = int(_AUTO_MIDTONE_BG_FLOOR * (nbins - 1))
+        subject_hist = luma_hist.copy()
+        subject_hist[:floor_bin] = 0
+        total_px = int(luma_hist.sum())
+        if int(subject_hist.sum()) >= max(
+            64, int(_AUTO_MIDTONE_MIN_SUBJECT_FRAC * total_px)
+        ):
+            subject_luma = self._percentile_from_hist(
+                subject_hist, 50.0, method="lower"
+            ) / (nbins - 1)
+        else:
+            subject_luma = median_luma
+
         # Black point: luma-driven target, capped by the per-channel budgets.
-        p_low = min(luma_low, min(chan_lows)) * bin_to_255
+        # An explicitly configured black threshold drops that per-channel cap.
+        # It exists to stop one clipped channel from shifting hue, which is a
+        # real risk in bright saturated areas but not in deep shadow — down
+        # there a clipped channel just reads blacker. Leaving the cap in place
+        # made the setting inert on exactly the dark-background shots it is
+        # for: one dark channel spread over the backdrop pinned p_low near 0
+        # no matter how high the threshold went.
+        if black_threshold_explicit:
+            p_low = luma_low * bin_to_255
+        else:
+            p_low = min(luma_low, min(chan_lows)) * bin_to_255
         # White point: luma-driven target, floored by the per-channel budgets.
         p_high = max(luma_high, max(chan_highs)) * bin_to_255
 
@@ -2326,6 +2380,7 @@ class ImageEditor:
         with self._lock:
             self.last_auto_levels_stats = {
                 "median_luma": float(median_luma),
+                "subject_luma": float(subject_luma),
                 "p_low": float(p_low),
                 "p_high": float(p_high),
             }
@@ -2335,7 +2390,7 @@ class ImageEditor:
             h, w = scaled.shape[:2]
             log.debug(
                 "[AUTO_LEVEL] get_array=%dms render=%dms hist+clip=%dms total=%dms  "
-                "(%dx%d, %s, median_luma=%.3f)",
+                "(%dx%d, %s, median_luma=%.3f, subject_luma=%.3f)",
                 int((t_arr - t0) * 1000),
                 int((t_u8 - t_arr) * 1000),
                 int((t_end - t_u8) * 1000),
@@ -2344,6 +2399,7 @@ class ImageEditor:
                 h,
                 source_label,
                 median_luma,
+                subject_luma,
             )
 
         return blacks, whites, float(p_low), float(p_high)
