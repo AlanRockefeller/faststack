@@ -99,9 +99,11 @@ from faststack.imaging.prefetch import (
 from faststack.ui.keystrokes import Keybinder
 from faststack.imaging.editor import (
     ASPECT_RATIOS,
+    DEFAULT_PREVIEW_MASTER_BOX,
     EditRenderCancelled,
     ImageEditor,
     _safe_replace,
+    fit_scale_in_box,
 )
 from faststack.imaging.mask import DarkenSettings, MaskData, MaskStroke
 from faststack.imaging.mask_engine import inverse_transform
@@ -171,6 +173,48 @@ _AUTO_MIDTONE_MAX_DROP = 0.85
 # Absolute ceiling on the blacks/whites endpoint stretch, applied whether or
 # not auto_level_strength_auto is on.
 _AUTO_LEVELS_MAX_STRETCH = 4.0
+# Wall clock origin for the [STARTUP] breadcrumbs. Captured at import so the
+# milestones AppController logs share one timeline with main()'s "Startup:
+# after ..." lines (main() stamps its own t0 a few ms later, during argument
+# parsing). Only meaningful for diagnosing multi-second gaps, which is all
+# these lines are for.
+_STARTUP_T0 = time.perf_counter()
+
+
+def _startup_elapsed() -> float:
+    """Seconds since process start, for the [STARTUP] trace."""
+    return time.perf_counter() - _STARTUP_T0
+
+
+def _worker_unaccounted_ms(stats: dict) -> Optional[float]:
+    """Worker wall time not claimed by any measured decode phase.
+
+    total_ms spans the whole worker call. Only the top-level phases are summed:
+    decode_ms already contains read/jpeg/resize/metadata, so adding those again
+    would overstate the accounted time and hide a real gap behind the clamp.
+    Anything left over is time the thread was not doing decode work. Returns
+    None when the trace is too sparse to subtract.
+    """
+    total = stats.get("total_ms")
+    if not isinstance(total, (int, float)):
+        return None
+    accounted = 0.0
+    for key in ("setup_ms", "decode_ms", "icc_ms", "finalize_ms", "cache_ms"):
+        value = stats.get(key)
+        if isinstance(value, (int, float)):
+            accounted += value
+    return max(0.0, total - accounted)
+# Bounds on core.editor_preview_long_edge (0 = auto). The ceiling caps the
+# float32 preview master's footprint: 4096x2304 is ~113MB, and pixels beyond
+# the window are never displayed anyway. The floor keeps a hand-edited config
+# from making the editing view unusably coarse.
+EDITOR_PREVIEW_MIN_LONG_EDGE = 640
+EDITOR_PREVIEW_MAX_LONG_EDGE = 4096
+# Idle delay before a soft preview frame is re-rendered at display resolution.
+# Long while a slider is held (a drag would otherwise start a display-resolution
+# render between every two frames), short once input is discrete.
+_HQ_PREVIEW_DEBOUNCE_DRAG_MS = 350
+_HQ_PREVIEW_DEBOUNCE_SETTLED_MS = 110
 
 
 def _awb_direction(value: float, pos_label: str, neg_label: str) -> str:
@@ -439,7 +483,14 @@ class AppController(QObject):
         self._original_compare_gen: int = -1
         self._original_compare_active: bool = False
         self._original_compare_inflight: bool = False
-        self._original_compare_token: int = 0
+        self._original_compare_refine_inflight: bool = False
+        # Tier and view identity of the buffer above: held-space compare
+        # renders a quick (preview-master) frame first and sharpens it with a
+        # display-resolution pass, so a cached frame is only reusable when it
+        # was rendered for the same view. The identity is the display long-edge
+        # cap (None while zoomed), which changes only on resize or zoom.
+        self._original_compare_full_resolution: bool = False
+        self._original_compare_render_target: Optional[int] = None
         self._editor_prewarm_future: Optional[concurrent.futures.Future] = None
         self._editor_prewarm_lock = threading.Lock()
         self._shutting_down = False  # Flag to gate async callbacks during shutdown
@@ -604,6 +655,9 @@ class AppController(QObject):
         self._decode_invalidation_lock = threading.Lock()
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
         self.image_editor = ImageEditor()  # Initialize the editor
+        # Nothing is loaded yet, so this only records the size; the first
+        # display-size report re-applies it against the real window.
+        self.image_editor.preview_master_box = self._editor_preview_master_box()
         # In-progress background-darkening brush stroke; must exist before
         # the first navigation because _reset_darken_on_navigation reads it.
         self._current_darken_stroke: Optional[dict] = None
@@ -810,7 +864,7 @@ class AppController(QObject):
         # resolution, so drags stay cheap and the settled image is sharp.
         self._hq_preview_timer = QTimer(self)
         self._hq_preview_timer.setSingleShot(True)
-        self._hq_preview_timer.setInterval(350)
+        self._hq_preview_timer.setInterval(_HQ_PREVIEW_DEBOUNCE_DRAG_MS)
         self._hq_preview_timer.timeout.connect(self._refine_preview_resolution)
 
         # Settled navigation quality upgrade: arrow-key browsing uses cheap
@@ -1195,6 +1249,18 @@ class AppController(QObject):
             self.sort_mode = "filename"
         with self.sidecar._state_lock:
             self.sidecar.data.sort_mode = self.sort_mode
+
+    @Slot(str)
+    def markStartup(self, label: str) -> None:
+        """QML-callable startup breadcrumb.
+
+        engine.load() is a single synchronous call that instantiates the whole
+        Main.qml tree, so Python can only see its total. Component.onCompleted
+        fires per subtree in declaration order, which turns that one number
+        into a per-item breakdown. INFO on faststack.app, so it is visible
+        under --debugcache and silent otherwise.
+        """
+        log.info("[STARTUP] %.3fs qml: %s", _startup_elapsed(), label)
 
     @Slot(str)
     def set_sort_mode(self, mode: str):
@@ -1841,6 +1907,10 @@ class AppController(QObject):
         if is_first_resize:
             log.info("Display size now stable, enabling prefetch")
 
+        # The editing preview master is sized from the image area, so a resize
+        # invalidates it the same way it invalidates decoded buffers.
+        self._apply_editor_preview_master_box()
+
         self.prefetcher.cancel_all()  # Cancel stale tasks to avoid wasted work
         # Cache keys include the monotonically increasing display generation;
         # older sizes can never be reused and otherwise consume the byte budget.
@@ -1990,11 +2060,15 @@ class AppController(QObject):
             self._end_navigation_hold(0, source=watched)
 
         if is_navigation_window and event.type() == QEvent.Type.KeyRelease:
-            if (
-                is_main_window
-                and event.key() == Qt.Key_Space
-                and not event.isAutoRepeat()
-            ):
+            if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+                # Deliberately not limited to the main window. The compact
+                # editor and histogram forward unhandled presses through
+                # handle_key_from_* as synthetic main-window events, so Space
+                # pressed while one of them has focus starts compare — but the
+                # physical release lands on THAT window. Ignoring it here left
+                # compare active with no release able to end it: the loupe kept
+                # showing the original, and every later press was a silent
+                # no-op until the user navigated away.
                 was_active = self._original_compare_active
                 self.stop_original_compare_preview()
                 return was_active
@@ -2194,7 +2268,15 @@ class AppController(QObject):
         if token is None:
             return
         self._startup_prefetch_constraint_token = None
-        log.debug("Releasing startup prefetch constraint (%s)", reason)
+        # INFO, not debug: reason='failsafe-timeout' means the normal
+        # first-frame-ready release never fired and startup was held to
+        # _STARTUP_CONSTRAINT_FAILSAFE_MS. That is the single most useful
+        # startup signal there is, and it was invisible in --debugcache runs.
+        log.info(
+            "[STARTUP] %.3fs prefetch constraint released (%s)",
+            _startup_elapsed(),
+            reason,
+        )
         self._leave_prefetch_constraint(token)
         # Defensive: a token that was somehow duplicated cannot outlive startup.
         self._clear_prefetch_constraint_reason("startup")
@@ -2289,6 +2371,7 @@ class AppController(QObject):
 
     def load(self, skip_thumbnail_refresh: bool = False):
         """Loads images, sidecar data, and starts services."""
+        log.info("[STARTUP] %.3fs load() begin", _startup_elapsed())
         self._cancel_paced_navigation()
         # Reset instrumentation for this load operation
         self._scan_count_variant = 0
@@ -2317,6 +2400,12 @@ class AppController(QObject):
                 if path_index is not None
                 else max(0, min(saved_index, len(self.image_files) - 1))
             )
+        log.info(
+            "[STARTUP] %.3fs index restored: index=%d of %d",
+            _startup_elapsed(),
+            self.current_index,
+            len(self.image_files),
+        )
         self._startup_restore_path = None
         self._startup_restore_index = None
         with self.sidecar._state_lock:
@@ -2341,6 +2430,8 @@ class AppController(QObject):
             log.info("Display size now stable, enabling prefetch")
         if display_changed:
             self.prefetcher.cancel_all()
+        if display_changed or first_display_report:
+            self._apply_editor_preview_master_box()
 
         # Make decoding internally legal before prefetch, but defer the folder
         # readiness notification until the complete list/index state is emitted.
@@ -2348,11 +2439,16 @@ class AppController(QObject):
         if not self._is_grid_view_active:
             folder_loaded_changed = self._set_folder_loaded(True, notify=False)
         self._do_prefetch(self.current_index)
+        log.info("[STARTUP] %.3fs first decode submitted", _startup_elapsed())
 
         # Publish count, index, and source from one generation. imageCountChanged
         # may synchronously evaluate the source binding, so generation/index must
         # already be final before this call.
         self.sync_ui_state(image_count_changed=True)
+        # sync_ui_state can evaluate the QML source binding inline, so this line
+        # lands AFTER a blocking requestImage(). A long gap between it and the
+        # previous line is the provider waiting on the first decode.
+        log.info("[STARTUP] %.3fs UI state published", _startup_elapsed())
         if folder_loaded_changed:
             self.ui_state.isFolderLoadedChanged.emit()
 
@@ -2600,6 +2696,25 @@ class AppController(QObject):
 
         images, variant_map = result
 
+        with self._watcher_changed_lock:
+            changed_paths = self._watcher_changed_paths
+            self._watcher_changed_paths = set()
+
+        # A rescan that found nothing must not disturb navigation. The debounce
+        # fires for events we filtered out, and coalesced duplicates arrive with
+        # an already-drained change set — but _begin_direct_image_transition()
+        # below zeroes the held arrow direction, so a no-op rescan mid-burst
+        # costs a ~200 ms cold demand decode and drains the prefetch buffer.
+        if (
+            not changed_paths
+            and images == self._all_images
+            and variant_map == self._variant_map
+        ):
+            log.debug("Index rescan found no changes; leaving navigation untouched")
+            if self._index_rescan_needed:
+                self._maybe_start_index_scan()
+            return
+
         self._begin_direct_image_transition("watcher rebuilt the image list")
 
         # Remember which image we were viewing so we can stay on it. Read
@@ -2608,10 +2723,6 @@ class AppController(QObject):
         preserved_path = None
         if self.image_files and 0 <= self.current_index < len(self.image_files):
             preserved_path = self.image_files[self.current_index].path
-
-        with self._watcher_changed_lock:
-            changed_paths = self._watcher_changed_paths
-            self._watcher_changed_paths = set()
 
         photoshop_overwrites = self._consume_photoshop_overwrites(changed_paths)
         photoshop_batch_additions = self._persist_photoshop_overwrite_batches(
@@ -4296,7 +4407,7 @@ class AppController(QObject):
             restored_original.info["icc_profile"] = source_icc_bytes
 
         thumb = restored_original.copy()
-        thumb.thumbnail((1920, 1080))
+        thumb.thumbnail(self.image_editor.preview_master_box)
         # Editor preview masters stay in source space. The display-only ICC or
         # saturation transform is applied after edits during preview rendering.
         preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
@@ -4495,6 +4606,69 @@ class AppController(QObject):
         if state is not None:
             state.persisted_revision = revision
             state.submitted_revision = revision
+
+    def _retire_pending_saves_for_photoshop(
+        self,
+        image_path: Path,
+        handoff_path: Path,
+    ) -> bool:
+        """Drop deferred FastStack saves when Photoshop takes ownership."""
+        image_key = self._key(image_path)
+        handoff_key = self._key(handoff_path)
+        handoff_keys = {key for key in (image_key, handoff_key) if key is not None}
+
+        def request_matches(request: Any, fallback_target: Any = None) -> bool:
+            if not isinstance(request, dict):
+                return False
+            context = request.get("context", {})
+            if image_key is not None and context.get("save_image_key") == image_key:
+                return True
+            target = context.get("target") or fallback_target
+            try:
+                return bool(target and self._key(Path(target)) in handoff_keys)
+            except (OSError, TypeError, ValueError):
+                return False
+
+        retired_requests = 0
+        for save_image_key, request in list(
+            self._pending_edit_save_requests.items()
+        ):
+            if save_image_key in handoff_keys or request_matches(request):
+                self._pending_edit_save_requests.pop(save_image_key, None)
+                retired_requests += 1
+
+        for target, request in list(self._pending_save_recovery.items()):
+            if request_matches(request, target):
+                self._pending_save_recovery.pop(target, None)
+                retired_requests += 1
+
+        cleared_persisted_state = False
+        metadata_paths: dict[str, Path] = {}
+        for path in (image_path, handoff_path):
+            metadata_key = self.sidecar.metadata_key_for_path(path)
+            if metadata_key:
+                metadata_paths.setdefault(metadata_key, path)
+        for path in metadata_paths.values():
+            meta = self.sidecar.get_metadata(path, create=False)
+            edit_state = getattr(meta, "edit_state", None) if meta is not None else None
+            if (
+                isinstance(edit_state, dict)
+                and edit_state.get("status") == "pending_save"
+            ):
+                meta.edit_state = None
+                cleared_persisted_state = True
+        if cleared_persisted_state:
+            self.sidecar.save()
+
+        if retired_requests or cleared_persisted_state:
+            log.info(
+                "Photoshop handoff retired %d deferred save request(s)%s",
+                retired_requests,
+                " and persisted pending edit state"
+                if cleared_persisted_state
+                else "",
+            )
+        return bool(retired_requests or cleared_persisted_state)
 
     def _discard_current_live_edits_for_photoshop(self) -> bool:
         """Discard dirty FastStack state after handing the image to Photoshop."""
@@ -7039,6 +7213,9 @@ class AppController(QObject):
             if stats.get("source_path"):
                 parts.append(f"path={stats['source_path']!r}")
         parts.append(f"queue={ms('queue_ms')}")
+        if stats.get("setup_ms") is not None:
+            # Pre-read worker time: config + get_monitor_profile()'s ICC lock.
+            parts.append(f"setup={ms('setup_ms')}")
         if stats.get("read_ms") is not None:
             # Diagnostic page-fault pass: file I/O + antivirus cost, split out
             # of jpeg_ms (decode_ms still contains both).
@@ -7050,10 +7227,18 @@ class AppController(QObject):
                 f"resize={ms('resize_ms')}",
                 f"meta={ms('metadata_ms')}",
                 f"icc={ms('icc_ms')}",
+                f"finalize={ms('finalize_ms')}",
                 f"cache={ms('cache_ms')}",
                 f"total={ms('total_ms')}",
             ]
         )
+        # Wall time inside the worker that no phase claims. Normally a few ms of
+        # buffer copies; a large value means the thread was stalled on something
+        # unmeasured (constraint gate, contended lock, page-fault storm) and is
+        # the difference between "the decode was slow" and "the decode waited".
+        unaccounted = _worker_unaccounted_ms(stats)
+        if unaccounted is not None:
+            parts.append(f"other={unaccounted:.1f}ms")
         if stats.get("running_before_demand_ms", 0.0) > 0:
             parts.append(f"running_before_demand={ms('running_before_demand_ms')}")
         if stats.get("dependency_ms") is not None:
@@ -9704,6 +9889,48 @@ class AppController(QObject):
         self._paced_interval_max_ms = float(self._navigation_interval_ms) * 4.0
         self._navigation_hold_timer.setInterval(self._navigation_interval_ms)
 
+    def get_editor_preview_long_edge(self) -> int:
+        """Return the configured editing-preview long edge (0 = match window)."""
+        configured = config.getint("core", "editor_preview_long_edge", fallback=0)
+        if configured <= 0:
+            return 0
+        return max(
+            EDITOR_PREVIEW_MIN_LONG_EDGE, min(configured, EDITOR_PREVIEW_MAX_LONG_EDGE)
+        )
+
+    def set_editor_preview_long_edge(self, long_edge: int) -> None:
+        """Persist and immediately apply the editing-preview resolution."""
+        try:
+            requested = int(long_edge)
+        except (TypeError, ValueError):
+            log.warning("Ignoring invalid editor preview long edge: %r", long_edge)
+            return
+        if requested > 0:
+            requested = max(
+                EDITOR_PREVIEW_MIN_LONG_EDGE,
+                min(requested, EDITOR_PREVIEW_MAX_LONG_EDGE),
+            )
+        else:
+            requested = 0
+
+        if requested == self.get_editor_preview_long_edge():
+            return
+        config.set("core", "editor_preview_long_edge", requested)
+        config.save()
+        self._apply_editor_preview_master_box()
+        box_w, box_h = self.image_editor.preview_master_box
+        log.info(
+            "Editing preview resolution set to %s (master %dx%d)",
+            "auto" if requested == 0 else f"{requested}px",
+            box_w,
+            box_h,
+        )
+        self.update_status_message(
+            "Editing preview: match window"
+            if requested == 0
+            else f"Editing preview: {requested}px"
+        )
+
     def get_held_navigation_quality(self) -> str:
         """Return the configured held-key browsing quality tier."""
         return self._held_navigation_quality
@@ -11771,11 +11998,12 @@ class AppController(QObject):
         deleted_set = set(validated_sorted)
         if not self.image_files:
             self.current_index = 0
-        elif previous_index in deleted_set:
-            # Current image was deleted → stay at same position (shows next image) or clamp
-            self.current_index = min(previous_index, len(self.image_files) - 1)
         else:
-            # Current image survived → shift index down for each deletion before it
+            # Preserve the current image's position in the compressed list. If
+            # the current image was deleted, this selects the first survivor
+            # after it. This must include other deleted images before the
+            # cursor; otherwise deleting a batch ending at the cursor jumps
+            # forward by the size of the batch.
             shift = sum(1 for d in validated_sorted if d < previous_index)
             self.current_index = max(
                 0, min(previous_index - shift, len(self.image_files) - 1)
@@ -13002,8 +13230,13 @@ class AppController(QObject):
             # FastStack save; retire dirty in-memory edits so navigation or app
             # shutdown cannot write them over Photoshop's later JPEG output.
             self._track_photoshop_handoff(jpg_path)
+            retired_pending_saves = self._retire_pending_saves_for_photoshop(
+                image_file.path,
+                jpg_path,
+            )
+            discarded_live_edits = self._discard_current_live_edits_for_photoshop()
             discarded_faststack_edits = (
-                self._discard_current_live_edits_for_photoshop()
+                retired_pending_saves or discarded_live_edits
             )
 
             jpg_clipboard_path = str(jpg_path)
@@ -13670,6 +13903,17 @@ class AppController(QObject):
         if self.ui_state.isCropping:
             self.update_status_message("Apply or cancel the crop before editing")
             return False
+        if not 0 <= self.current_index < len(self.image_files):
+            log.debug(
+                "Skipping editor load without a valid image: index=%d, count=%d",
+                self.current_index,
+                len(self.image_files),
+            )
+            if not preview_only:
+                self.update_status_message("No image to edit")
+            if self.ui_state:
+                self.ui_state.isEditorOpen = False
+            return False
         try:
             if self.view_override_path:
                 active_path = Path(self.view_override_path)
@@ -13860,6 +14104,11 @@ class AppController(QObject):
         """Tell the preview scheduler when a compact-editor slider is pressed."""
         self._editor_slider_drag_active = bool(active)
         if not active:
+            # The release leaves a deliberately degraded drag frame on screen
+            # and no further kick is coming, so pull the armed refinement in to
+            # the discrete-edit delay instead of the drag one.
+            if self._hq_preview_timer.isActive():
+                self._hq_preview_timer.start(_HQ_PREVIEW_DEBOUNCE_SETTLED_MS)
             return
         # A press can precede the first valueChanged signal. Cancel obsolete
         # refinement immediately so it is not competing with the first drag
@@ -14660,6 +14909,97 @@ class AppController(QObject):
         if pending:
             self.histogram_timer.start()
 
+    def _editor_preview_master_box(self) -> Tuple[int, int]:
+        """Box the editor's source-space preview master should be fitted into.
+
+        Quick live previews (sliders, quick-adjust keys) render from that
+        master, so sizing it to the image area's physical pixels makes those
+        frames display-sharp on arrival instead of soft until the settled
+        full-resolution pass lands. ``core.editor_preview_long_edge`` caps the
+        long edge; 0 means auto (follow the window).
+
+        Reads the raw display size rather than ``get_display_info()``, which
+        reports 0x0 while zoomed — zooming must not resize the master.
+        """
+        configured = config.getint("core", "editor_preview_long_edge", fallback=0)
+        with self._display_lock:
+            box_w = int(self.display_width)
+            box_h = int(self.display_height)
+        if box_w <= 0 or box_h <= 0:
+            # Size unknown yet (startup): keep the historical master size, so
+            # an image edited before the first resize report still gets one.
+            box_w, box_h = DEFAULT_PREVIEW_MASTER_BOX
+
+        long_edge = max(box_w, box_h)
+        cap = long_edge if configured <= 0 else configured
+        cap = max(
+            EDITOR_PREVIEW_MIN_LONG_EDGE, min(cap, EDITOR_PREVIEW_MAX_LONG_EDGE)
+        )
+        scale = fit_scale_in_box(box_w, box_h, (cap, cap))
+        if scale >= 1.0:
+            return (box_w, box_h)
+        return (max(1, round(box_w * scale)), max(1, round(box_h * scale)))
+
+    def _apply_editor_preview_master_box(self) -> None:
+        """Push the configured preview-master size into the editor.
+
+        Rebuilds the loaded image's master when the size changed (window
+        resize, settings change) and re-renders so the loupe picks up the new
+        resolution without waiting for the next navigation.
+        """
+        if self.image_editor is None:
+            return
+        if not self.image_editor.set_preview_master_box(
+            self._editor_preview_master_box()
+        ):
+            return
+        self._live_preview_target_dims = None
+        self._live_preview_target_session_key = None
+        if self._has_current_live_preview_for_index(self.current_index):
+            self._kick_preview_worker()
+
+    def _quick_preview_master_dims_if_covering(self) -> Optional[Tuple[int, int]]:
+        """Master dimensions when quick renders already cover the screen.
+
+        When the preview master is at least as large as the image area the
+        loupe can show, a quick render carries every pixel the settled
+        display-resolution pass would — so that pass is a no-op the user only
+        experiences as a soft-then-sharp flicker, and it can be skipped.
+
+        Returns None (refinement still needed) when the master is smaller than
+        the fitted display size, when the size is unknown, while zoomed, or
+        whenever geometry edits are present: crop and straighten round at
+        master resolution, so their frames are not interchangeable.
+        """
+        display_w, display_h, _ = self.get_display_info()
+        if not display_w or not display_h:
+            return None
+
+        with self.image_editor._lock:
+            master = self.image_editor.float_preview
+            edits = dict(self.image_editor.current_edits)
+        if master is None:
+            return None
+        if (
+            edits.get("crop_box")
+            or float(edits.get("straighten_angle") or 0.0)
+            or int(edits.get("rotation") or 0)
+        ):
+            return None
+
+        native_w, native_h = self.get_current_display_native_size()
+        if native_w <= 0 or native_h <= 0:
+            return None
+        scale = fit_scale_in_box(native_w, native_h, (display_w, display_h))
+        fitted_w = max(1, round(native_w * scale))
+        fitted_h = max(1, round(native_h * scale))
+        master_h, master_w = master.shape[:2]
+        # 1px of slack: the master and the fitted size are independent
+        # roundings of the same aspect ratio.
+        if master_w + 1 < fitted_w or master_h + 1 < fitted_h:
+            return None
+        return (int(master_w), int(master_h))
+
     def _display_preview_long_edge(self) -> Optional[int]:
         """Long-edge cap for display-only full-resolution renders.
 
@@ -14684,6 +15024,15 @@ class AppController(QObject):
         cap = self._display_preview_long_edge()
         if not cap:
             return None
+
+        # When the preview master already covers the screen there is no
+        # refinement to match: the master's own size is the session's stable
+        # target, and settled quick frames land on it without any resampling.
+        # Drag frames are still stretched up to it, so the loupe's sourceSize
+        # stays put for the whole interaction.
+        covering_dims = self._quick_preview_master_dims_if_covering()
+        if covering_dims is not None:
+            return covering_dims
 
         # Prefer the recorded size of the last display-capped full-resolution
         # frame for this session: ground truth, exact for tonal-only edits.
@@ -14830,6 +15179,15 @@ class AppController(QObject):
             if preview_edits_override is None
             else None
         )
+        # Whether this quick frame is display-complete, i.e. the target size
+        # came from a master that already covers the screen. Read from the same
+        # helper the target size uses so the two can never disagree.
+        covering_dims_used = (
+            not render_full_resolution
+            and preview_edits_override is None
+            and quick_output_size is not None
+            and quick_output_size == self._quick_preview_master_dims_if_covering()
+        )
         quick_downscale_long_edge = None
         if drag_render:
             with self.image_editor._lock:
@@ -14874,8 +15232,22 @@ class AppController(QObject):
         # Always called from the main thread (slots and queued signals).
         if render_full_resolution:
             self._hq_preview_timer.stop()
+        elif covering_dims_used and not drag_render:
+            # The frame just submitted already carries every pixel the screen
+            # can show, so there is nothing to sharpen: no soft-then-sharp
+            # swap, and no full-resolution render behind it. Also cancels a
+            # pass armed by an earlier drag, which this frame supersedes.
+            self._hq_preview_timer.stop()
         else:
-            self._hq_preview_timer.start()
+            # Sharpen sooner after a discrete edit (a keypress, a slider click,
+            # Auto Levels). The long debounce exists to coalesce continuous
+            # drags; spending it on a one-shot edit is the soft half-second the
+            # user notices.
+            self._hq_preview_timer.start(
+                _HQ_PREVIEW_DEBOUNCE_DRAG_MS
+                if self._editor_slider_drag_active
+                else _HQ_PREVIEW_DEBOUNCE_SETTLED_MS
+            )
 
     def _refine_preview_resolution(self):
         """Re-render the last preview-resolution frame at display resolution.
@@ -15179,24 +15551,59 @@ class AppController(QObject):
         if getattr(self, "_shutting_down", False):
             return
         if not self.image_files or self._is_grid_view_active:
+            log.debug("[COMPARE] start skipped: no images or grid view")
             return
         if getattr(self.ui_state, "isCropping", False):
+            log.debug("[COMPARE] start skipped: cropping")
             return
 
         active_path = self._ensure_active_image_loaded_for_auto_adjust()
         if active_path is None:
+            log.debug("[COMPARE] start skipped: no active edit path")
             return
 
         session_key = self._get_current_original_compare_session_key()
         if session_key is None:
+            # Silent here means space does nothing at all and the matching
+            # release is a no-op too, because the active flag never got set.
+            log.debug(
+                "[COMPARE] start skipped: no preview session "
+                "(active=%s editor=%s)",
+                active_path,
+                getattr(self.image_editor, "current_filepath", None),
+            )
             return
 
-        render_full_resolution = (
+        # Skip the quick tier when the display-resolution render is the only
+        # sensible frame: while zoomed a preview-master frame would be visibly
+        # soft with no fit-sized frame to stand in for it, and after geometry
+        # edits the quick and full paths round the crop differently.
+        skip_quick_tier = (
             bool(getattr(self.ui_state, "isZoomed", False))
             or self._should_render_live_preview_full_resolution()
         )
 
+        # Match the compare frame's dimensions to the live preview it swaps
+        # with, so toggling space cannot nudge the fitted image. Both are
+        # None while zoomed (display size reports 0x0), preserving the
+        # uncapped native render zoom needs.
+        compare_long_edge = self._display_preview_long_edge()
+        compare_output_size = self._live_preview_quick_target_size()
+        # The cap alone identifies which view a compare frame belongs to (it
+        # is None only while zoomed), and it changes just on resize or zoom.
+        # The output size deliberately stays out of the identity: it tracks
+        # whatever the live preview last rendered and can change while a
+        # compare render is in flight, so counting it would reject the very
+        # frame the user is holding space waiting for. It is a sizing hint.
+        render_target = compare_long_edge
+
+        emit_source_changed = False
+        submit_quick = False
+        submit_refine = False
+        index = self.current_index
+
         with self._preview_lock:
+            was_active = self._original_compare_active
             self._original_compare_active = True
             if hasattr(self.ui_state, "originalCompareActive"):
                 self.ui_state.originalCompareActive = True
@@ -15205,54 +15612,108 @@ class AppController(QObject):
                 self._original_compare_preview is not None
                 and self._original_compare_index == self.current_index
                 and self._original_compare_session_key == session_key
+                and self._original_compare_render_target == render_target
             )
-            if buffer_ready:
+            if buffer_ready and (
+                not was_active
+                or self._original_compare_gen != self.ui_refresh_generation
+            ):
+                # Show the cached frame immediately, then fall through: a
+                # quick-tier buffer still needs its sharpening pass, or a
+                # soft frame would stay soft for the rest of the session.
+                # A fresh generation is required on every activation because
+                # sync_ui_state() may have advanced the cached frame's marker
+                # while compare was inactive and the edited frame stayed on
+                # screen. While already active, avoid duplicate refreshes for
+                # pixels the loupe is currently showing.
                 self.ui_refresh_generation += 1
                 self._original_compare_gen = self.ui_refresh_generation
-                self.ui_state.currentImageSourceChanged.emit()
-                return
+                emit_source_changed = True
 
-            if self._original_compare_inflight:
-                return
-
-            self._original_compare_inflight = True
-            self._original_compare_token += 1
-            token = self._original_compare_token
-            index = self.current_index
-
-        # Match the compare frame's dimensions to the live preview it swaps
-        # with, so toggling space cannot nudge the fitted image. Both are
-        # None while zoomed (display size reports 0x0), preserving the
-        # uncapped native render zoom needs.
-        compare_long_edge = self._display_preview_long_edge()
-        compare_output_size = self._live_preview_quick_target_size()
-
-        try:
-            future = self._preview_executor.submit(
-                self._render_original_compare_worker,
-                token,
-                session_key,
-                index,
-                self.image_editor,
-                render_full_resolution,
-                compare_long_edge,
-                compare_output_size,
+            # At most one render per tier is ever outstanding; the flags are
+            # cleared only by that tier's completion, so tapping space while a
+            # render is running reuses it instead of queueing a duplicate.
+            submit_quick = (
+                not buffer_ready
+                and not skip_quick_tier
+                and not self._original_compare_inflight
             )
-            future.add_done_callback(self._on_original_compare_done)
-        except RuntimeError:
-            log.warning("Original compare render failed to start")
-            with self._preview_lock:
-                self._original_compare_inflight = False
+            submit_refine = (
+                not (buffer_ready and self._original_compare_full_resolution)
+                and not self._original_compare_refine_inflight
+            )
+            if submit_quick:
+                self._original_compare_inflight = True
+            if submit_refine:
+                self._original_compare_refine_inflight = True
+
+        log.debug(
+            "[COMPARE] start idx=%d was_active=%s buffer=%s full=%s "
+            "emit=%s quick=%s refine=%s target=%s",
+            index,
+            was_active,
+            buffer_ready,
+            self._original_compare_full_resolution,
+            emit_source_changed,
+            submit_quick,
+            submit_refine,
+            render_target,
+        )
+
+        if emit_source_changed:
+            self.ui_state.currentImageSourceChanged.emit()
+
+        if submit_quick:
+            try:
+                future = self._preview_executor.submit(
+                    self._render_original_compare_worker,
+                    session_key,
+                    index,
+                    self.image_editor,
+                    False,
+                    compare_long_edge,
+                    compare_output_size,
+                    render_target,
+                )
+                future.add_done_callback(self._on_original_compare_done)
+            except RuntimeError:
+                log.warning("Original compare render failed to start")
+                with self._preview_lock:
+                    self._original_compare_inflight = False
+
+        if submit_refine:
+            # The display-resolution pass runs on the refinement worker, not
+            # the quick-preview queue, so a long master render can never delay
+            # the next interactive preview.
+            try:
+                future = self._preview_refine_executor.submit(
+                    self._render_original_compare_worker,
+                    session_key,
+                    index,
+                    self.image_editor,
+                    True,
+                    compare_long_edge,
+                    compare_output_size,
+                    render_target,
+                )
+                future.add_done_callback(self._on_original_compare_done)
+            except RuntimeError:
+                log.warning("Original compare refinement failed to start")
+                with self._preview_lock:
+                    self._original_compare_refine_inflight = False
 
     @Slot()
     def stop_original_compare_preview(self):
         """Return the loupe to the normal edited preview after space is released."""
         with self._preview_lock:
             if not self._original_compare_active:
+                log.debug("[COMPARE] stop: was not active")
                 return
+            # In-flight renders are deliberately left running: their results
+            # are identity-checked, so they still populate the compare buffer
+            # and make the next press instant instead of being thrown away.
             self._original_compare_active = False
-            self._original_compare_inflight = False
-            self._original_compare_token += 1
+        log.debug("[COMPARE] stop: restoring edited preview")
 
         if hasattr(self.ui_state, "originalCompareActive"):
             self.ui_state.originalCompareActive = False
@@ -15273,13 +15734,13 @@ class AppController(QObject):
 
     @staticmethod
     def _render_original_compare_worker(
-        token,
         session_key,
         index: int,
         image_editor,
         full_resolution: bool,
         max_long_edge=None,
         output_size=None,
+        render_target=None,
     ):
         try:
             decoded = image_editor.get_original_compare_preview_data(
@@ -15287,10 +15748,10 @@ class AppController(QObject):
                 max_long_edge=max_long_edge,
                 output_size=output_size,
             )
-            return token, session_key, index, decoded
+            return session_key, index, decoded, full_resolution, render_target
         except Exception:
             log.exception("Original compare render failed")
-            return token, session_key, index, None
+            return session_key, index, None, full_resolution, render_target
 
     def _on_original_compare_done(self, future):
         if getattr(self, "_shutting_down", False):
@@ -15305,33 +15766,103 @@ class AppController(QObject):
 
     @Slot(object)
     def _apply_original_compare_result(self, payload):
+        stage_known = True
         try:
-            token, session_key, index, decoded = payload
+            session_key, index, decoded, full_resolution, render_target = payload
         except (TypeError, ValueError):
-            token, session_key, index, decoded = None, None, -1, None
+            # Which tier produced this is unrecoverable; release both so a
+            # malformed payload cannot wedge compare for the rest of the run.
+            stage_known = False
+            session_key, index, decoded = None, -1, None
+            full_resolution, render_target = False, None
+
+        # Read outside _preview_lock: _display_preview_long_edge() takes
+        # _display_lock, and this slot runs on the UI thread, so there is no
+        # reason to nest the two.
+        current_target = self._display_preview_long_edge()
 
         should_emit = False
+        needs_rekick = False
         with self._preview_lock:
-            if token == self._original_compare_token:
+            if not stage_known:
                 self._original_compare_inflight = False
-            if (
-                decoded is not None
-                and self._original_compare_active
-                and token == self._original_compare_token
-                and index == self.current_index
+                self._original_compare_refine_inflight = False
+            elif full_resolution:
+                self._original_compare_refine_inflight = False
+            else:
+                self._original_compare_inflight = False
+
+            current_session_key = self._get_current_original_compare_session_key()
+            matches_current = (
+                index == self.current_index
                 and session_key is not None
-                and session_key == self._get_current_original_compare_session_key()
-            ):
+                and session_key == current_session_key
+            )
+            # The tiers run on separate workers, so the quick frame can land
+            # after the refinement it was standing in for. Never downgrade.
+            stale_tier = (
+                not full_resolution
+                and self._original_compare_full_resolution
+                and self._original_compare_preview is not None
+                and self._original_compare_index == index
+                and self._original_compare_session_key == session_key
+                and self._original_compare_render_target == render_target
+            )
+            if decoded is not None and matches_current and not stale_tier:
                 decoded.source_path = session_key[0]
                 self._original_compare_preview = decoded
                 self._original_compare_session_key = session_key
                 self._original_compare_index = index
-                self.ui_refresh_generation += 1
-                self._original_compare_gen = self.ui_refresh_generation
-                should_emit = True
+                self._original_compare_full_resolution = bool(full_resolution)
+                self._original_compare_render_target = render_target
+                # Frames that land after space was released still populate the
+                # buffer above (the next press is then instant) but must not
+                # repaint the loupe, which is showing the edited image again.
+                # A frame for another view (the user zoomed or resized while it
+                # was in flight) is kept but never shown at the wrong scale.
+                if self._original_compare_active and render_target == current_target:
+                    self.ui_refresh_generation += 1
+                    self._original_compare_gen = self.ui_refresh_generation
+                    should_emit = True
+
+            # This render was for a view the user has already left (they
+            # navigated or zoomed while it was in flight), so nothing on
+            # screen improved and the tier flag it was holding blocked the
+            # request for the current view. Re-kick now that the flag is
+            # free. Strictly limited to superseded requests: re-kicking
+            # merely because a render came back unusable would spin, since
+            # the retry would fail exactly the same way.
+            superseded = stage_known and (
+                not matches_current or render_target != current_target
+            )
+            needs_rekick = (
+                self._original_compare_active
+                and superseded
+                and not self._original_compare_refine_inflight
+            )
+
+        log.debug(
+            "[COMPARE] result full=%s idx=%s ok=%s matches=%s stale_tier=%s "
+            "emit=%s rekick=%s target=%s/%s",
+            full_resolution,
+            index,
+            decoded is not None,
+            matches_current,
+            stale_tier,
+            should_emit,
+            needs_rekick,
+            render_target,
+            current_target,
+        )
 
         if should_emit:
             self.ui_state.currentImageSourceChanged.emit()
+        # Re-read the flag: the emit above runs QML bindings synchronously, so
+        # the space release can land inside it. Restarting compare afterwards
+        # would re-show the original with no release left to dismiss it.
+        if needs_rekick and self._original_compare_active:
+            # Outside the lock: start_original_compare_preview takes it too.
+            self.start_original_compare_preview()
 
     @Slot()
     def cancel_crop_mode(self):
@@ -17168,6 +17699,9 @@ def main(
     context.setContextProperty("uiState", controller.ui_state)
     context.setContextProperty("controller", controller)
     context.setContextProperty("thumbnailModel", controller._thumbnail_model)
+
+    if debug_requested:
+        log.info("Startup: after QML providers+context: %.3fs", time.perf_counter() - t0)
 
     qml_file = app_qml_dir / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_file)))

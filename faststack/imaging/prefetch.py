@@ -38,7 +38,6 @@ DecodeQuality = Literal["fast", "cover"]
 _PRIORITY_DEMAND = 0
 _PRIORITY_COVER = 5
 _PRIORITY_PREFETCH_BASE = 10
-_PRIORITY_PREWARM = 100
 _QUEUE_GROUP_INTERACTIVE = 0
 _QUEUE_GROUP_PRELOAD = 1
 
@@ -592,18 +591,28 @@ def get_monitor_profile() -> Optional[ImageCms.ImageCmsProfile]:
             _monitor_profile_cache[monitor_icc_path] = None
             return None
 
-        # Load and cache the profile
-        try:
-            profile = ImageCms.ImageCmsProfile(monitor_icc_path)
-            log.debug("Loaded monitor ICC profile: %s", monitor_icc_path)
-            _monitor_profile_cache[monitor_icc_path] = profile
-        except (OSError, ImageCms.PyCMSError) as e:
-            log.warning(
-                "Failed to load monitor ICC profile from %s: %s", monitor_icc_path, e
-            )
-            _monitor_profile_cache[monitor_icc_path] = None
+    # Load OUTSIDE the lock. This reads the profile off disk, and holding the
+    # shared ICC lock across that I/O stalls every decode worker that only
+    # wants a cache hit -- get_monitor_profile() is called from each worker's
+    # pre-read setup phase, so a cold load here blocks decoding wholesale.
+    # Same build-then-insert shape get_icc_transform already uses.
+    profile: Optional[ImageCms.ImageCmsProfile]
+    try:
+        profile = ImageCms.ImageCmsProfile(monitor_icc_path)
+        log.debug("Loaded monitor ICC profile: %s", monitor_icc_path)
+    except (OSError, ImageCms.PyCMSError) as e:
+        log.warning(
+            "Failed to load monitor ICC profile from %s: %s", monitor_icc_path, e
+        )
+        profile = None
 
-        return _monitor_profile_cache[monitor_icc_path]
+    with _icc_cache_lock:
+        # A racing caller may have inserted while we loaded; prefer its object
+        # so every consumer shares one profile instance.
+        if monitor_icc_path in _monitor_profile_cache:
+            return _monitor_profile_cache[monitor_icc_path]
+        _monitor_profile_cache[monitor_icc_path] = profile
+        return profile
 
 
 def _prewarm_common_icc_transform() -> None:
@@ -623,6 +632,35 @@ def _prewarm_common_icc_transform() -> None:
         )
     except Exception:
         log.debug("Could not prewarm the display ICC transform", exc_info=True)
+
+
+def prewarm_decode_stack() -> None:
+    """Pay one-time PIL plugin-import cost before the first visible decode.
+
+    The first PILImage.open() in a process imports PIL's plugin registry, and
+    getexif() pulls in the TIFF plugin on top of that. Landing that on the
+    demand decode is worse than it looks: every decode worker that starts
+    concurrently blocks on the same import lock, so the whole startup window
+    converges on one cold import.
+
+    Deliberately import-only. An earlier version also opened the folder's
+    first photo to warm the transform for the ICC profile the files embed,
+    which is a real ~250 ms saving — but it read a cold file and took the
+    shared ICC cache lock (via get_monitor_profile) milliseconds before the
+    startup decode wanted both, and startup regressed by seconds. Warming
+    must not contend with the frame it is trying to accelerate.
+
+    preinit() rather than init(): init() imports every plugin PIL ships
+    (~1 s measured) to warm the handful this decode path uses.
+    """
+    try:
+        PILImage.preinit()
+        # preinit() covers JPEG but not TIFF, and Exif.load() needs TIFF.
+        from PIL import TiffImagePlugin  # noqa: F401
+    except Exception:
+        log.debug("Could not prewarm the PIL plugin registry", exc_info=True)
+
+    _prewarm_common_icc_transform()
 
 
 # Strip-parallel ICC apply. An lcms transform is immutable once built, so the
@@ -1325,12 +1363,13 @@ class Prefetcher:
             self.governor.constrained_limit,
         )
         # The configured monitor profile is known before QML finishes loading.
-        # Build its overwhelmingly common sRGB transform during that otherwise
-        # idle time instead of adding ~200 ms to the first visible image.
-        self.executor.submit(
-            _prewarm_common_icc_transform,
-            priority=_PRIORITY_PREWARM,
-        )
+        # Warm the decode stack during that otherwise idle time instead of
+        # adding seconds to the first visible image. This runs on its own
+        # thread rather than the priority executor so it can neither be
+        # starved behind speculative work nor occupy a decode slot. It must
+        # finish long before load() submits the first decode (~0.8s in), so
+        # keep it import-only — see prewarm_decode_stack.
+        self._start_decode_stack_prewarm()
         self._futures_lock = threading.RLock()
         self.futures: Dict[int, Future] = {}
         self.future_paths: Dict[int, Path] = {}
@@ -1393,6 +1432,14 @@ class Prefetcher:
         snapshot["running_demand"] = demand_state["running"]
         snapshot["speculative_workers"] = self.speculative_decode_workers
         return snapshot
+
+    def _start_decode_stack_prewarm(self) -> None:
+        """Run the one-time PIL/ICC warmup clear of the decode executors."""
+        threading.Thread(
+            target=prewarm_decode_stack,
+            name="DecodePrewarm",
+            daemon=True,
+        ).start()
 
     def set_image_files(self, image_files: List[ImageFile]):
         with self._futures_lock:
@@ -1615,6 +1662,10 @@ class Prefetcher:
             if not self._radius_expanded
             else self.prefetch_radius
         )
+        display_width, display_height, display_generation = self.get_display_info()
+        cache_quality: DecodeQuality = (
+            "fast" if display_width > 0 and display_height > 0 else "cover"
+        )
 
         if self.debug:
             log.info(
@@ -1752,7 +1803,29 @@ class Prefetcher:
                     if isinstance(trace_meta, dict):
                         trace_meta["priority"] = desired_priority
                         trace_meta["queue_group"] = _QUEUE_GROUP_INTERACTIVE
-                elif i not in scheduled and future is None:
+                elif future is None:
+                    if i in scheduled and self.cache_contains is not None:
+                        cache_key = build_cache_key(
+                            image_files[i].path,
+                            display_generation,
+                            cache_quality,
+                        )
+                        if not self.cache_contains(cache_key):
+                            # `_scheduled` records completed submissions, not
+                            # cache residency. Eviction normally clears it via
+                            # unschedule_path(), but the cache is authoritative:
+                            # self-heal if any eviction/invalidation path missed
+                            # that notification or raced this window update.
+                            scheduled.discard(i)
+                            if self.debug:
+                                log.info(
+                                    "[DBGCACHE] Recovering stale scheduled "
+                                    "prefetch index=%d path=%s",
+                                    i,
+                                    image_files[i].path,
+                                )
+                    if i in scheduled:
+                        continue
                     self.submit_task(
                         i,
                         self.generation,
@@ -2425,6 +2498,12 @@ class Prefetcher:
             _t_decode_buffer = (
                 time.perf_counter() if self.nav_trace is not None else None
             )
+            if _t_decode_buffer is not None and _t_worker_start is not None:
+                # Everything before the first byte is read: config lookups and
+                # get_monitor_profile(), which loads the profile while holding
+                # the shared ICC cache lock. A large value here means the
+                # worker was blocked waiting, not decoding.
+                _stats["setup_ms"] = (_t_decode_buffer - _t_worker_start) * 1000.0
             (
                 buffer,
                 orientation,
@@ -2469,8 +2548,10 @@ class Prefetcher:
                     buffer = apply_icc_transform_to_buffer(buffer, transform)
                 except Exception as e:
                     log.warning("ICC conversion failed: %s", e)
+            _t_post_icc = None
             if _t_icc is not None:
-                _stats["icc_ms"] = (time.perf_counter() - _t_icc) * 1000.0
+                _t_post_icc = time.perf_counter()
+                _stats["icc_ms"] = (_t_post_icc - _t_icc) * 1000.0
 
             if not quality_work_is_current():
                 return bail_stale("post-icc")
@@ -2565,6 +2646,9 @@ class Prefetcher:
                 return None
 
             _t_cache = time.perf_counter() if self.nav_trace is not None else None
+            if _t_cache is not None and _t_post_icc is not None:
+                # Orientation apply, contiguity copy, DecodedImage construction.
+                _stats["finalize_ms"] = (_t_cache - _t_post_icc) * 1000.0
             cache_result = self.cache_put(
                 cache_key,
                 decoded,

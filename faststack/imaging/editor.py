@@ -63,6 +63,14 @@ class EditRenderCancelled(RuntimeError):
     """Raised when a display-only render is superseded by a newer edit."""
 
 
+def fit_scale_in_box(width: int, height: int, box: Tuple[int, int]) -> float:
+    """Downscale factor that fits ``width x height`` inside ``box`` (never up)."""
+    box_w, box_h = box
+    if width <= 0 or height <= 0 or box_w <= 0 or box_h <= 0:
+        return 1.0
+    return min(box_w / float(width), box_h / float(height), 1.0)
+
+
 _REPLACE_RETRY_DELAY = 0.3
 _REPLACE_MAX_RETRIES = 3
 _AUTO_VIBRANCE_MAX = 0.18
@@ -72,6 +80,13 @@ _AUTO_VIBRANCE_SAT_CEILING = 0.18
 _AUTO_VIBRANCE_MIN_COLOR_DELTA = 0.015
 _AUTO_VIBRANCE_CLIP_TOLERANCE = 0.0001
 _AUTO_LEVELS_ANALYSIS_MAX_EDGE = 1920
+# Box the source-space preview master (``float_preview``) is fitted into.
+# Quick live-preview renders apply edits to that buffer, so this is the
+# resolution the user sees while editing until the display-resolution
+# refinement pass lands. AppController overrides it from the window size and
+# core.editor_preview_long_edge; this default keeps standalone ImageEditor
+# users (tests, scripts) on the historical size.
+DEFAULT_PREVIEW_MASTER_BOX = (1920, 1080)
 # Subject-midtone estimation (see analyze_auto_levels). Pixels below the floor
 # are treated as backdrop and excluded from the midtone median; if fewer than
 # MIN_SUBJECT_FRAC of the frame clears the floor the sample is too small to
@@ -636,6 +651,9 @@ class ImageEditor:
         self.float_image: Optional[np.ndarray] = None
         # Float32 normalized preview image
         self.float_preview: Optional[np.ndarray] = None
+        # Box float_preview is fitted into. Set by AppController from the
+        # window size so quick previews can match what the screen shows.
+        self.preview_master_box: Tuple[int, int] = DEFAULT_PREVIEW_MASTER_BOX
 
         # Stores the currently applied edits (used for preview)
         self.current_edits: Dict[str, Any] = self._initial_edits()
@@ -1171,13 +1189,14 @@ class ImageEditor:
             if cached_preview is not None:
                 log.debug("Ignoring display-corrected cache buffer for editor master")
 
+            preview_box = self.preview_master_box
             if (
                 loaded_bit_depth == 16
                 and loaded_float_image is not None
                 and cv2 is not None
             ):
                 h, w = loaded_float_image.shape[:2]
-                scale = min(1920.0 / w, 1080.0 / h, 1.0)
+                scale = fit_scale_in_box(w, h, preview_box)
                 if scale < 1.0:
                     loaded_float_preview = np.ascontiguousarray(
                         cv2.resize(
@@ -1199,7 +1218,7 @@ class ImageEditor:
                 # array; cv2.resize avoids a second Pillow conversion.
                 if jpeg_arr is not None and cv2 is not None:
                     h, w = jpeg_arr.shape[:2]
-                    scale = min(1920.0 / w, 1080.0 / h, 1.0)
+                    scale = fit_scale_in_box(w, h, preview_box)
                     if scale < 1.0:
                         # round(), not int(): truncation skews the preview
                         # master's aspect ratio relative to full-res refinement.
@@ -1212,7 +1231,7 @@ class ImageEditor:
                         preview_u8 = jpeg_arr
                 else:
                     thumb = loaded_original.copy()
-                    thumb.thumbnail((1920, 1080))
+                    thumb.thumbnail(preview_box)
                     preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
 
                 loaded_float_preview = preview_u8.astype(np.float32)
@@ -3148,10 +3167,21 @@ class ImageEditor:
 
     def _float_preview_from_master(self) -> Optional[np.ndarray]:
         """Build a display-sized source-space preview from the unedited master."""
-        cv2 = _get_cv2()
         with self._lock:
             if self.float_preview is not None:
                 return self.float_preview.copy()
+        return self._build_preview_master_from_source()
+
+    def _build_preview_master_from_source(self) -> Optional[np.ndarray]:
+        """Fit the loaded source into ``preview_master_box``, ignoring float_preview.
+
+        The rebuild path for a preview master that is the wrong size (window
+        resized, resolution setting changed); ``_float_preview_from_master``
+        wraps it with the "reuse the existing master" shortcut.
+        """
+        cv2 = _get_cv2()
+        with self._lock:
+            box = self.preview_master_box
             source = self.float_image
             original = (
                 self.original_image.copy() if self.original_image is not None else None
@@ -3159,7 +3189,7 @@ class ImageEditor:
 
         if source is not None:
             h, w = source.shape[:2]
-            scale = min(1920.0 / w, 1080.0 / h, 1.0)
+            scale = fit_scale_in_box(w, h, box)
             if scale < 1.0 and cv2 is not None:
                 return np.ascontiguousarray(
                     cv2.resize(
@@ -3178,11 +3208,45 @@ class ImageEditor:
         else:
             return None
 
-        thumb.thumbnail((1920, 1080))
+        thumb.thumbnail(box)
         preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
         preview = preview_u8.astype(np.float32)
         preview *= np.float32(1.0 / 255.0)
         return preview
+
+    def set_preview_master_box(self, box: Tuple[int, int]) -> bool:
+        """Resize the preview master, rebuilding a loaded one to the new box.
+
+        Returns True when the master of the currently loaded image was
+        rebuilt, so the caller can re-render the live preview. The rebuild is
+        built before the swap and guarded on ``session_id`` so a concurrent
+        load always wins and preview workers never observe a missing master.
+        """
+        new_box = (max(1, int(box[0])), max(1, int(box[1])))
+        with self._lock:
+            if new_box == self.preview_master_box:
+                return False
+            self.preview_master_box = new_box
+            if self.float_preview is None:
+                # Nothing loaded (or preview-less session): the next load
+                # picks up the new box on its own.
+                return False
+            session = self.session_id
+
+        rebuilt = self._build_preview_master_from_source()
+        if rebuilt is None:
+            return False
+
+        with self._lock:
+            if self.session_id != session or self.preview_master_box != new_box:
+                return False
+            self.float_preview = rebuilt
+            # Drop the cached quick frame; it was rendered at the old size.
+            # _edits_rev is deliberately left alone: it feeds the live edit
+            # session's dirty check, and resizing a buffer is not an edit.
+            self._cached_preview = None
+            self._cached_rev = -1
+        return True
 
     def get_original_compare_preview_data(
         self,

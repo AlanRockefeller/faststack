@@ -442,6 +442,15 @@ DEFAULT_CONFIG = {
         # or above the speculative pool size keeps the old full concurrency.
         "prefetch_constrained_workers": "2",
         "held_navigation_quality": "balanced",
+        # Resolution of the in-editor preview master, as a long-edge pixel
+        # count. Sliders and quick-adjust keys render from that buffer, so
+        # anything smaller than the image area on screen looks soft until the
+        # settled full-resolution pass replaces it. 0 = auto: match the image
+        # area in physical pixels (clamped to 4096), which removes the
+        # soft-then-sharp swap entirely and costs more CPU and RAM per render.
+        # Set a fixed value (1920, 2560, ...) to trade sharpness back for
+        # responsiveness on a slow machine with a high-resolution screen.
+        "editor_preview_long_edge": "0",
         "navigation_repeat_delay_ms": "500",
         "theme": "dark",
         "default_directory": "",

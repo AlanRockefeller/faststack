@@ -29,6 +29,12 @@ ApplicationWindow {
     Settings {
         id: mainWindowSettings
         category: "mainWindow"
+        // Startup marker. NOTE: measured 2026-08-13 -- this fires at the same
+        // instant as the last-declared child, because QML creates every object
+        // first and then runs componentComplete() across the tree in a batch.
+        // These marks bracket "tree finished"; they CANNOT attribute cost to
+        // individual subtrees. Use elimination for that.
+        Component.onCompleted: controller.markStartup("mainWindowSettings (first child)")
         property real savedX: 0
         property real savedY: 0
         property real savedWidth: -1
@@ -209,9 +215,11 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        controller.markStartup("root complete (all children built)")
         root.uiStateRef = uiState
         root.controllerRef = controller
         root.restoreWindowPlacement()
+        controller.markStartup("after restoreWindowPlacement")
         root.windowGeometryReady = true
         // No forced save here: restoreWindowPlacement already persisted the
         // first-run placement, and saving now would read a transient
@@ -1583,6 +1591,9 @@ ApplicationWindow {
     // StackLayout to switch between loupe and grid view
     StackLayout {
         id: contentArea
+        // Startup marker -- see the note on mainWindowSettings: completion
+        // callbacks batch, so gaps between these marks are not per-item cost.
+        Component.onCompleted: controller.markStartup("contentArea (StackLayout)")
         anchors.top: customTitleBar.visible ? customTitleBar.bottom : parent.top
         anchors.left: parent.left
         anchors.right: parent.right
@@ -1668,6 +1679,7 @@ ApplicationWindow {
         z: 100
         anchors.bottom: parent.bottom
         id: footerRect
+        Component.onCompleted: controller.markStartup("footerRect")
         // Keep footer height fixed so the main image area doesn't change size when
         // stack/batch labels appear or disappear (prevents cache invalidations).
         height: root.effectiveFooterHeight
@@ -2072,6 +2084,7 @@ ApplicationWindow {
     // Old, more robust About dialog
     Dialog {
         id: aboutDialog
+        Component.onCompleted: controller.markStartup("aboutDialog")
         title: "Key Bindings"
         standardButtons: Dialog.Ok
         modal: true
@@ -2185,6 +2198,7 @@ ApplicationWindow {
 
     Dialog {
         id: readmeDialog
+        Component.onCompleted: controller.markStartup("readmeDialog")
         title: "FastStack Readme"
         standardButtons: Dialog.Ok
         modal: true
@@ -2226,6 +2240,7 @@ ApplicationWindow {
 
     Dialog {
         id: showStacksDialog
+        Component.onCompleted: controller.markStartup("showStacksDialog")
         title: "Stack Information"
         standardButtons: Dialog.Ok
         modal: true

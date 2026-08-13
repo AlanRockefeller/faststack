@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from faststack.io.variants import (
     VariantGroup,
@@ -70,8 +70,11 @@ def _scan_directory(
 def _build_image_list(
     visible_jpgs: List[Tuple[Path, os.stat_result]],
     raws: Dict[str, List[Tuple[Path, os.stat_result]]],
+    *,
+    phase_timings: Optional[Dict[str, float]] = None,
 ) -> List[ImageFile]:
     """Build sorted image list from visible JPGs and RAWs."""
+    t_pair_build = time.perf_counter()
     base_map: Dict[str, Tuple[float, str]] = {}
     developed_candidates: List[Tuple[Path, os.stat_result, str]] = []
     image_entries: List[Tuple[Tuple[float, str, int, str], ImageFile]] = []
@@ -116,7 +119,15 @@ def _build_image_list(
                 )
                 image_entries.append((image_sort_key(img), img))
 
+    if phase_timings is not None:
+        phase_timings["pair_build_ms"] = (
+            time.perf_counter() - t_pair_build
+        ) * 1000.0
+
+    t_sort = time.perf_counter()
     image_entries.sort(key=lambda x: x[0])
+    if phase_timings is not None:
+        phase_timings["sort_ms"] = (time.perf_counter() - t_sort) * 1000.0
     return [x[1] for x in image_entries]
 
 
@@ -154,7 +165,15 @@ def _is_hidden_variant_path(path: Path, group: VariantGroup) -> bool:
     return path == group.developed_path or path in group.backup_paths.values()
 
 
-def _log_scan_result(image_files: List[ImageFile], elapsed: float) -> None:
+def _log_scan_result(
+    image_files: List[ImageFile],
+    *,
+    directory: Path,
+    mode: str,
+    jpg_count: int,
+    raw_count: int,
+    phase_timings: Dict[str, float],
+) -> None:
     paired_count = sum(
         1
         for im in image_files
@@ -163,12 +182,30 @@ def _log_scan_result(image_files: List[ImageFile], elapsed: float) -> None:
     raw_only_count = sum(
         1 for im in image_files if im.path.suffix.lower() not in JPG_EXTENSIONS
     )
+
+    def phase(name: str) -> str:
+        value = phase_timings.get(name)
+        return f"{value:.1f}ms" if value is not None else "n/a"
+
     log.info(
-        "Found %d images (%d paired, %d raw-only) in %.2fs.",
+        "[SCANTRACE] Found %d images (%d paired, %d raw-only) "
+        "mode=%s candidates=%d jpg/%d raw total=%s "
+        "phases(scandir=%s variants=%s filter=%s pair_build=%s sort=%s "
+        "annotate=%s) directory=%r",
         len(image_files),
         paired_count,
         raw_only_count,
-        elapsed,
+        mode,
+        jpg_count,
+        raw_count,
+        phase("total_ms"),
+        phase("scandir_ms"),
+        phase("variants_ms"),
+        phase("filter_ms"),
+        phase("pair_build_ms"),
+        phase("sort_ms"),
+        phase("annotate_ms"),
+        str(directory),
     )
 
 
@@ -179,18 +216,32 @@ def find_images(directory: Path) -> List[ImageFile]:
     For variant-aware loading, use find_images_with_variants() instead.
     """
     t_start = time.perf_counter()
+    phase_timings: Dict[str, float] = {}
     log.info("Scanning directory for images: %s", directory)
 
+    t_phase = time.perf_counter()
     try:
         visible_jpgs, _, raws = _scan_directory(directory)
     except OSError:
         log.exception("Error scanning directory %s", directory)
         return []
+    phase_timings["scandir_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
-    image_files = _build_image_list(visible_jpgs, raws)
+    image_files = _build_image_list(
+        visible_jpgs,
+        raws,
+        phase_timings=phase_timings,
+    )
 
-    elapsed = time.perf_counter() - t_start
-    _log_scan_result(image_files, elapsed)
+    phase_timings["total_ms"] = (time.perf_counter() - t_start) * 1000.0
+    _log_scan_result(
+        image_files,
+        directory=directory,
+        mode="basic",
+        jpg_count=len(visible_jpgs),
+        raw_count=sum(len(raw_list) for raw_list in raws.values()),
+        phase_timings=phase_timings,
+    )
     return image_files
 
 
@@ -204,21 +255,27 @@ def find_images_with_variants(
         group_key.casefold().
     """
     t_start = time.perf_counter()
+    phase_timings: Dict[str, float] = {}
     log.info("Scanning directory for images: %s", directory)
 
+    t_phase = time.perf_counter()
     try:
         _, all_jpgs, raws = _scan_directory(directory, include_visible_jpgs=False)
     except OSError:
         log.exception("Error scanning directory %s", directory)
         return [], {}
+    phase_timings["scandir_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
     # Build variant map from ALL jpgs (including backups)
+    t_phase = time.perf_counter()
     all_jpg_paths = [p for p, _ in all_jpgs]
     variant_map = build_variant_map(all_jpg_paths)
     groups_by_path = _variant_groups_by_path(variant_map)
+    phase_timings["variants_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
     # Hide only files that are actually exposed by a group's variant badges.
     # Same-stem JPGs that are not selected as developed/backups stay visible.
+    t_phase = time.perf_counter()
     visible_variant_jpgs = []
     for p, stat in all_jpgs:
         p_norm = Path(norm_path(p))
@@ -231,9 +288,15 @@ def find_images_with_variants(
             )
             continue
         visible_variant_jpgs.append((p, stat))
+    phase_timings["filter_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
-    image_files = _build_image_list(visible_variant_jpgs, raws)
+    image_files = _build_image_list(
+        visible_variant_jpgs,
+        raws,
+        phase_timings=phase_timings,
+    )
 
+    t_phase = time.perf_counter()
     for img in image_files:
         ext = img.path.suffix.lower()
         if ext not in JPG_EXTENSIONS:
@@ -245,9 +308,17 @@ def find_images_with_variants(
                 group.developed_path is not None
                 and group.developed_path != group.main_path
             )
+    phase_timings["annotate_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
-    elapsed = time.perf_counter() - t_start
-    _log_scan_result(image_files, elapsed)
+    phase_timings["total_ms"] = (time.perf_counter() - t_start) * 1000.0
+    _log_scan_result(
+        image_files,
+        directory=directory,
+        mode="variants",
+        jpg_count=len(all_jpgs),
+        raw_count=sum(len(raw_list) for raw_list in raws.values()),
+        phase_timings=phase_timings,
+    )
     return image_files, variant_map
 
 

@@ -1466,6 +1466,14 @@ class UIState(QObject):
     def set_navigation_rate_fps(self, fps):
         self.app_controller.set_navigation_rate_fps(fps)
 
+    @Slot(result=int)
+    def get_editor_preview_long_edge(self):
+        return self.app_controller.get_editor_preview_long_edge()
+
+    @Slot(int)
+    def set_editor_preview_long_edge(self, long_edge):
+        self.app_controller.set_editor_preview_long_edge(long_edge)
+
     @Slot(result=str)
     def get_held_navigation_quality(self):
         return self.app_controller.get_held_navigation_quality()

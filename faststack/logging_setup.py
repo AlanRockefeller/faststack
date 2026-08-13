@@ -147,6 +147,15 @@ def setup_logging(debug: bool = False, *, diagnostic: bool = False) -> Path | No
     else:
         app_logger.setLevel(logging.NOTSET)
 
+    # A base --debugcache run keeps the root logger at WARNING, but scan timing
+    # is a concise startup diagnostic rather than general INFO noise. Admit the
+    # indexer's start/result records explicitly; trace/debug modes inherit the
+    # root DEBUG level, and ordinary runs continue to inherit root WARNING.
+    indexer_logger = logging.getLogger("faststack.io.indexer")
+    indexer_logger.setLevel(
+        logging.INFO if diagnostic and not debug else logging.NOTSET
+    )
+
     destination_handler: logging.Handler | None = None
     if console_available:
         destination_handler = logging.StreamHandler(sys.stderr)
