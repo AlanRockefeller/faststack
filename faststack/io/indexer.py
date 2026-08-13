@@ -120,9 +120,7 @@ def _build_image_list(
                 image_entries.append((image_sort_key(img), img))
 
     if phase_timings is not None:
-        phase_timings["pair_build_ms"] = (
-            time.perf_counter() - t_pair_build
-        ) * 1000.0
+        phase_timings["pair_build_ms"] = (time.perf_counter() - t_pair_build) * 1000.0
 
     t_sort = time.perf_counter()
     image_entries.sort(key=lambda x: x[0])

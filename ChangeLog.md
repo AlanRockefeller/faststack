@@ -8,7 +8,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 - New "Blacks Clip %" setting under Auto Levels. Leave it at 0 for the old behavior. Turn it up (try 1 to 3) if backgrounds that should be black keep coming out grey - it forces that share of the darkest pixels all the way to black. Some photos will go too dark, so it's off by default.
 - Pressing P now opens Photoshop immediately and discards any pending FastStack edits; when Photoshop creates or overwrites the expected JPG (including for RAW-only entries), FastStack reloads it and automatically adds it to the batch when that option is enabled.
 - The aspect ratio box in crop mode now has an X to close it when it's in the way.
-- Holding Space to see the original photo now shows it sharp instead of blurry.
+- Holding Space to see the original photo now works a lot better.
 - Fixed sluggish held-arrow navigation after cached images were evicted. FastStack now detects stale prefetch bookkeeping and resumes decoding ahead before the navigation buffer runs dry.
 - Edits now look sharp the moment they appear, instead of showing blurry for half a second and then snapping into focus. There is a new "Editing Preview Resolution" setting for this - leave it on Match Window, or pick a smaller size if editing feels slow on a big screen.
 - Fixed an occasional stutter while holding an arrow key. FastStack rechecks the folder for new photos in the background, and even when nothing had changed it was interrupting the flip and making the next photo load slowly.

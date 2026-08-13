@@ -204,6 +204,8 @@ def _worker_unaccounted_ms(stats: dict) -> Optional[float]:
         if isinstance(value, (int, float)):
             accounted += value
     return max(0.0, total - accounted)
+
+
 # Bounds on core.editor_preview_long_edge (0 = auto). The ceiling caps the
 # float32 preview master's footprint: 4096x2304 is ~113MB, and pixels beyond
 # the window are never displayed anyway. The floor keeps a hand-edited config
@@ -4630,9 +4632,7 @@ class AppController(QObject):
                 return False
 
         retired_requests = 0
-        for save_image_key, request in list(
-            self._pending_edit_save_requests.items()
-        ):
+        for save_image_key, request in list(self._pending_edit_save_requests.items()):
             if save_image_key in handoff_keys or request_matches(request):
                 self._pending_edit_save_requests.pop(save_image_key, None)
                 retired_requests += 1
@@ -4664,9 +4664,7 @@ class AppController(QObject):
             log.info(
                 "Photoshop handoff retired %d deferred save request(s)%s",
                 retired_requests,
-                " and persisted pending edit state"
-                if cleared_persisted_state
-                else "",
+                " and persisted pending edit state" if cleared_persisted_state else "",
             )
         return bool(retired_requests or cleared_persisted_state)
 
@@ -13235,9 +13233,7 @@ class AppController(QObject):
                 jpg_path,
             )
             discarded_live_edits = self._discard_current_live_edits_for_photoshop()
-            discarded_faststack_edits = (
-                retired_pending_saves or discarded_live_edits
-            )
+            discarded_faststack_edits = retired_pending_saves or discarded_live_edits
 
             jpg_clipboard_path = str(jpg_path)
             QApplication.clipboard().setText(jpg_clipboard_path)
@@ -14932,9 +14928,7 @@ class AppController(QObject):
 
         long_edge = max(box_w, box_h)
         cap = long_edge if configured <= 0 else configured
-        cap = max(
-            EDITOR_PREVIEW_MIN_LONG_EDGE, min(cap, EDITOR_PREVIEW_MAX_LONG_EDGE)
-        )
+        cap = max(EDITOR_PREVIEW_MIN_LONG_EDGE, min(cap, EDITOR_PREVIEW_MAX_LONG_EDGE))
         scale = fit_scale_in_box(box_w, box_h, (cap, cap))
         if scale >= 1.0:
             return (box_w, box_h)
@@ -15567,8 +15561,7 @@ class AppController(QObject):
             # Silent here means space does nothing at all and the matching
             # release is a no-op too, because the active flag never got set.
             log.debug(
-                "[COMPARE] start skipped: no preview session "
-                "(active=%s editor=%s)",
+                "[COMPARE] start skipped: no preview session " "(active=%s editor=%s)",
                 active_path,
                 getattr(self.image_editor, "current_filepath", None),
             )
@@ -17701,7 +17694,9 @@ def main(
     context.setContextProperty("thumbnailModel", controller._thumbnail_model)
 
     if debug_requested:
-        log.info("Startup: after QML providers+context: %.3fs", time.perf_counter() - t0)
+        log.info(
+            "Startup: after QML providers+context: %.3fs", time.perf_counter() - t0
+        )
 
     qml_file = app_qml_dir / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_file)))
