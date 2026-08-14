@@ -532,6 +532,14 @@ Item {
                     function onWidthChanged() { mainImage.reportDisplaySize() }
                     function onHeightChanged() { mainImage.reportDisplaySize() }
                 }
+
+                // The viewport keeps its logical size when the device pixel
+                // ratio changes -- moving to a monitor with different scaling,
+                // or Qt recovering a DPI it initially failed to read (see
+                // util/win_dpi.py) -- so the handlers above never fire and
+                // Python would keep decoding at the old resolution.
+                property real screenDpr: Screen.devicePixelRatio
+                onScreenDprChanged: reportDisplaySize()
         
                 // Removed direct onWidth/HeightChanged handlers for resizeDebounceTimer 
                 // because we now drive size reporting via viewport changes.

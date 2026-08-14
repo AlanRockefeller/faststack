@@ -128,6 +128,7 @@ from faststack.thumbnail_view.folder_stats import (
     clear_raw_count_cache,
     get_file_counts_by_extension,
 )
+from faststack.util.win_dpi import start_dpi_watchdog
 import numpy as np
 from faststack.io.indexer import RAW_EXTENSIONS, JPG_EXTENSIONS
 from faststack.io.deletion import (
@@ -17471,6 +17472,33 @@ def _prompt_reopen_sessions(records):
     return [rec for checkbox, rec in checkboxes if checkbox.isChecked()]
 
 
+_dpi_notice: Optional[QMessageBox] = None
+
+
+def _warn_dpi_stuck() -> None:
+    """Tell the user a restart is needed when the DPI repair did not take.
+
+    Shown at most once per run, and non-modally: the interface is drawn too
+    small at this point but still usable, so this must not block work. The
+    reference is kept because a QMessageBox that is only shown (not exec'd)
+    is collected as soon as it goes out of scope.
+    """
+    global _dpi_notice
+    if _dpi_notice is not None:
+        return
+    log.error("DPI repair did not take effect; advising restart")
+    _dpi_notice = QMessageBox(
+        QMessageBox.Icon.Warning,
+        "FastStack Display Scaling",
+        "Windows did not report this monitor's scaling to FastStack, so the "
+        "interface is being drawn too small.\n\nThis usually happens after "
+        "waking the computer from sleep. Restarting FastStack fixes it.",
+    )
+    _dpi_notice.setStandardButtons(QMessageBox.StandardButton.Ok)
+    _dpi_notice.setModal(False)
+    _dpi_notice.show()
+
+
 def main(
     image_dir: Optional[str] = None,
     debug: bool = False,
@@ -17711,6 +17739,13 @@ def main(
     main_window = engine.rootObjects()[0]
     controller.main_window = main_window
     main_window.installEventFilter(controller)
+
+    # Qt's Windows plugin can cache a 96 DPI fallback for a monitor it could
+    # not read (seen after resuming from suspend), which leaves the whole UI
+    # drawn at 1:1 on a scaled display. See faststack/util/win_dpi.py.
+    dpi_watchdog = start_dpi_watchdog(app)
+    if dpi_watchdog is not None:
+        dpi_watchdog.repairFailed.connect(_warn_dpi_stuck)
 
     # Frame swaps also release the held-navigation presentation gate, so this
     # lightweight connection is required in normal (non-diagnostic) runs.
