@@ -218,6 +218,7 @@ EDITOR_PREVIEW_MAX_LONG_EDGE = 4096
 # render between every two frames), short once input is discrete.
 _HQ_PREVIEW_DEBOUNCE_DRAG_MS = 350
 _HQ_PREVIEW_DEBOUNCE_SETTLED_MS = 110
+_PHOTOSHOP_HANDOFF_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 def _awb_direction(value: float, pos_label: str, neg_label: str) -> str:
@@ -255,6 +256,7 @@ class LiveEditSessionState:
 class PhotoshopHandoffState:
     jpg_path: Path
     baseline_fingerprint: Optional[tuple[float, int]]
+    launched_at: float
 
 
 class PreviewSessionProvenance(NamedTuple):
@@ -647,7 +649,7 @@ class AppController(QObject):
         self._watcher_changed_paths: set = set()
         self._watcher_changed_lock = threading.Lock()
         # JPGs launched through Photoshop remain here until the watcher sees a
-        # write that differs from the launch-time baseline. The state is
+        # timely write that differs from the launch-time baseline. The state is
         # GUI-thread-owned; the watchdog thread only fills _watcher_changed_paths.
         self._photoshop_handoffs: Dict[str, PhotoshopHandoffState] = {}
         # Per-path decode invalidation epochs (path key -> monotonic time).
@@ -1760,12 +1762,20 @@ class AppController(QObject):
         self._photoshop_handoffs[key] = PhotoshopHandoffState(
             jpg_path=jpg_path,
             baseline_fingerprint=self._file_state_fingerprint(jpg_path),
+            launched_at=time.monotonic(),
         )
 
     def _consume_photoshop_overwrites(self, changed_paths: set) -> list[Path]:
         """Return Photoshop handoffs whose JPG now differs from their baseline."""
         if not changed_paths:
             return []
+
+        cutoff = time.monotonic() - _PHOTOSHOP_HANDOFF_MAX_AGE_SECONDS
+        self._photoshop_handoffs = {
+            key: state
+            for key, state in self._photoshop_handoffs.items()
+            if state.launched_at >= cutoff
+        }
 
         overwritten: list[Path] = []
         for changed_path in changed_paths:
@@ -7213,7 +7223,7 @@ class AppController(QObject):
                 parts.append(f"path={stats['source_path']!r}")
         parts.append(f"queue={ms('queue_ms')}")
         if stats.get("setup_ms") is not None:
-            # Pre-read worker time: config + get_monitor_profile()'s ICC lock.
+            # Pre-read worker time: config + get_monitor_profile() work.
             parts.append(f"setup={ms('setup_ms')}")
         if stats.get("read_ms") is not None:
             # Diagnostic page-fault pass: file I/O + antivirus cost, split out
@@ -9919,7 +9929,7 @@ class AppController(QObject):
         self._apply_editor_preview_master_box()
         box_w, box_h = self.image_editor.preview_master_box
         log.info(
-            "Editing preview resolution set to %s (master %dx%d)",
+            "Editing preview resolution set to %s (master box %dx%d)",
             "auto" if requested == 0 else f"{requested}px",
             box_w,
             box_h,
@@ -14913,7 +14923,8 @@ class AppController(QObject):
         master, so sizing it to the image area's physical pixels makes those
         frames display-sharp on arrival instead of soft until the settled
         full-resolution pass lands. ``core.editor_preview_long_edge`` caps the
-        long edge; 0 means auto (follow the window).
+        image's long edge whichever way it is oriented; 0 means auto (follow
+        the window).
 
         Reads the raw display size rather than ``get_display_info()``, which
         reports 0x0 while zoomed — zooming must not resize the master.
@@ -14930,10 +14941,14 @@ class AppController(QObject):
         long_edge = max(box_w, box_h)
         cap = long_edge if configured <= 0 else configured
         cap = max(EDITOR_PREVIEW_MIN_LONG_EDGE, min(cap, EDITOR_PREVIEW_MAX_LONG_EDGE))
-        scale = fit_scale_in_box(box_w, box_h, (cap, cap))
-        if scale >= 1.0:
-            return (box_w, box_h)
-        return (max(1, round(box_w * scale)), max(1, round(box_h * scale)))
+        # Square cap box, clipped to the display. Scaling the display's own
+        # shape down to the cap would let the display's *short* edge limit a
+        # portrait photo — 1920px on a 3840x2160 screen yields a 1920x1080 box,
+        # and a portrait image fitted into it gets only 1080px on its long
+        # edge. Clipping a square box keeps the configured resolution
+        # available in whichever direction the image is tall, while the
+        # display bound stops either side from exceeding what can be shown.
+        return (min(cap, box_w), min(cap, box_h))
 
     def _apply_editor_preview_master_box(self) -> None:
         """Push the configured preview-master size into the editor.

@@ -2499,10 +2499,9 @@ class Prefetcher:
                 time.perf_counter() if self.nav_trace is not None else None
             )
             if _t_decode_buffer is not None and _t_worker_start is not None:
-                # Everything before the first byte is read: config lookups and
-                # get_monitor_profile(), which loads the profile while holding
-                # the shared ICC cache lock. A large value here means the
-                # worker was blocked waiting, not decoding.
+                # Everything before the first byte is read: configuration
+                # lookups and get_monitor_profile() work, including possible
+                # cold-profile disk I/O.
                 _stats["setup_ms"] = (_t_decode_buffer - _t_worker_start) * 1000.0
             (
                 buffer,

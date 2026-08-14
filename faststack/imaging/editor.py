@@ -654,6 +654,7 @@ class ImageEditor:
         # Box float_preview is fitted into. Set by AppController from the
         # window size so quick previews can match what the screen shows.
         self.preview_master_box: Tuple[int, int] = DEFAULT_PREVIEW_MASTER_BOX
+        self._preview_master_generation = 0
 
         # Stores the currently applied edits (used for preview)
         self.current_edits: Dict[str, Any] = self._initial_edits()
@@ -1189,31 +1190,32 @@ class ImageEditor:
             if cached_preview is not None:
                 log.debug("Ignoring display-corrected cache buffer for editor master")
 
-            preview_box = self.preview_master_box
-            if (
-                loaded_bit_depth == 16
-                and loaded_float_image is not None
-                and cv2 is not None
-            ):
-                h, w = loaded_float_image.shape[:2]
-                scale = fit_scale_in_box(w, h, preview_box)
-                if scale < 1.0:
-                    loaded_float_preview = np.ascontiguousarray(
-                        cv2.resize(
-                            loaded_float_image,
-                            (max(1, round(w * scale)), max(1, round(h * scale))),
-                            interpolation=cv2.INTER_AREA,
-                        ),
-                        dtype=np.float32,
-                    )
-                else:
-                    loaded_float_preview = np.array(
+            def build_loaded_float_preview(
+                preview_box: Tuple[int, int],
+            ) -> np.ndarray:
+                if (
+                    loaded_bit_depth == 16
+                    and loaded_float_image is not None
+                    and cv2 is not None
+                ):
+                    h, w = loaded_float_image.shape[:2]
+                    scale = fit_scale_in_box(w, h, preview_box)
+                    if scale < 1.0:
+                        return np.ascontiguousarray(
+                            cv2.resize(
+                                loaded_float_image,
+                                (max(1, round(w * scale)), max(1, round(h * scale))),
+                                interpolation=cv2.INTER_AREA,
+                            ),
+                            dtype=np.float32,
+                        )
+                    return np.array(
                         loaded_float_image,
                         dtype=np.float32,
                         copy=True,
                         order="C",
                     )
-            else:
+
                 # The JPEG fast path already has oriented source pixels as an
                 # array; cv2.resize avoids a second Pillow conversion.
                 if jpeg_arr is not None and cv2 is not None:
@@ -1234,29 +1236,41 @@ class ImageEditor:
                     thumb.thumbnail(preview_box)
                     preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
 
-                loaded_float_preview = preview_u8.astype(np.float32)
-                loaded_float_preview *= np.float32(1.0 / 255.0)
+                preview = preview_u8.astype(np.float32)
+                preview *= np.float32(1.0 / 255.0)
+                return preview
+
+            while True:
+                with self._lock:
+                    preview_box = self.preview_master_box
+                    preview_generation = self._preview_master_generation
+                loaded_float_preview = build_loaded_float_preview(preview_box)
+
+                # Assign all state atomically under lock to prevent a race with
+                # preview-box changes and preview workers. If the box changed
+                # while the preview was built, retry against the latest box.
+                with self._lock:
+                    if preview_generation != self._preview_master_generation:
+                        continue
+                    self.current_filepath = load_filepath
+                    self.source_filepath = load_filepath
+                    self.session_id = uuid.uuid4().hex
+                    self.original_image = loaded_original
+                    self.float_image = loaded_float_image
+                    self.float_preview = loaded_float_preview
+                    self.bit_depth = loaded_bit_depth
+                    # Reset edits
+                    self.current_edits = self._initial_edits()
+                    self._edits_rev += 1
+                    self._cached_preview = None
+                    self._cached_rev = -1
+                    break
 
             # Preview pixels are derived after EXIF orientation was applied, so
             # they match the full-resolution source geometry.
 
             if _debug:
                 t_preview = time.perf_counter()
-
-            # Assign all state atomically under lock to prevent race with preview worker
-            with self._lock:
-                self.current_filepath = load_filepath
-                self.source_filepath = load_filepath
-                self.session_id = uuid.uuid4().hex
-                self.original_image = loaded_original
-                self.float_image = loaded_float_image
-                self.float_preview = loaded_float_preview
-                self.bit_depth = loaded_bit_depth
-                # Reset edits
-                self.current_edits = self._initial_edits()
-                self._edits_rev += 1
-                self._cached_preview = None
-                self._cached_rev = -1
 
             if _debug:
                 t_end = time.perf_counter()
@@ -3227,6 +3241,7 @@ class ImageEditor:
             if new_box == self.preview_master_box:
                 return False
             self.preview_master_box = new_box
+            self._preview_master_generation += 1
             if self.float_preview is None:
                 # Nothing loaded (or preview-less session): the next load
                 # picks up the new box on its own.

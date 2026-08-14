@@ -469,8 +469,8 @@ DEFAULT_CONFIG = {
         #   image editor or uses the "Quick Auto Levels" hotkey.
         #
         # Algorithm:
-        #   1. Compute black/white points by clipping `auto_level_threshold` fraction of pixels
-        #      (0.0-1.0) at the dark and light ends of the histogram.
+        #   1. Compute black/white points by clipping `auto_level_threshold` percent of pixels
+        #      at the dark and light ends of the histogram.
         #   2. Construct a levels transform to map these points to 0 and 255.
         #   3. Blend the transformed image with the original using `auto_level_strength`.
         #   4. If `auto_level_strength_auto` is True, `auto_level_strength` acts as a maximum;
@@ -478,9 +478,9 @@ DEFAULT_CONFIG = {
         #      transform would cause excessive clipping or color instability.
         #
         # Practical Tuning:
-        #   - auto_level_threshold: A fraction (not percent).
-        #     Higher values (e.g. 0.05 = 5%) increase contrast but risk hard clipping.
-        #     Lower values (e.g. 0.001 = 0.1%) are gentler and preserve more dynamic range.
+        #   - auto_level_threshold: A percentage.
+        #     Higher values (e.g. 5 = 5%) increase contrast but risk hard clipping.
+        #     Lower values (e.g. 0.1 = 0.1%) are gentler and preserve more dynamic range.
         #   - auto_level_strength: 1.0 applies the full mathematical correction. Lower values
         #     blend the result for a subtler effect.
         #   - auto_level_black_threshold: same units, shadow end only. 0 means

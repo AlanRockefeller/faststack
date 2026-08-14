@@ -1780,9 +1780,27 @@ Item {
                     width: 18
                     height: 18
                     radius: 3
-                    color: closeMouseArea.containsMouse
+                    activeFocusOnTab: true
+                    color: closeMouseArea.containsMouse || activeFocus
                            ? (aspectRatioWindow.isDark ? "#555555" : "#d8d8d8")
                            : "transparent"
+                    border.color: activeFocus
+                                  ? (aspectRatioWindow.isDark ? "white" : "black")
+                                  : "transparent"
+                    border.width: activeFocus ? 1 : 0
+
+                    Accessible.name: "Close aspect ratio menu"
+                    Accessible.role: Accessible.Button
+                    Accessible.onPressAction: aspectRatioWindow.dismissed = true
+
+                    Keys.onPressed: (event) => {
+                        if (event.key === Qt.Key_Enter
+                                || event.key === Qt.Key_Return
+                                || event.key === Qt.Key_Space) {
+                            aspectRatioWindow.dismissed = true
+                            event.accepted = true
+                        }
+                    }
 
                     Text {
                         anchors.centerIn: parent
