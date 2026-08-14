@@ -84,6 +84,7 @@ class DpiWatchdog(QObject):
             app.screenAdded.connect(self._on_screens_changed)
             app.screenRemoved.connect(self._on_screens_changed)
             app.primaryScreenChanged.connect(self._on_screens_changed)
+        QTimer.singleShot(0, self._check)
 
     def _on_screens_changed(self, _screen: object = None) -> None:
         # Windows hands out monitor handles a moment after announcing the

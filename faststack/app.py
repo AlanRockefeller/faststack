@@ -17511,6 +17511,7 @@ def _warn_dpi_stuck() -> None:
     )
     _dpi_notice.setStandardButtons(QMessageBox.StandardButton.Ok)
     _dpi_notice.setModal(False)
+    _dpi_notice.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
     _dpi_notice.show()
 
 
