@@ -442,6 +442,15 @@ DEFAULT_CONFIG = {
         # or above the speculative pool size keeps the old full concurrency.
         "prefetch_constrained_workers": "2",
         "held_navigation_quality": "balanced",
+        # Resolution of the in-editor preview master, as a long-edge pixel
+        # count. Sliders and quick-adjust keys render from that buffer, so
+        # anything smaller than the image area on screen looks soft until the
+        # settled full-resolution pass replaces it. 0 = auto: match the image
+        # area in physical pixels (clamped to 4096), which removes the
+        # soft-then-sharp swap entirely and costs more CPU and RAM per render.
+        # Set a fixed value (1920, 2560, ...) to trade sharpness back for
+        # responsiveness on a slow machine with a high-resolution screen.
+        "editor_preview_long_edge": "0",
         "navigation_repeat_delay_ms": "500",
         "theme": "dark",
         "default_directory": "",
@@ -460,8 +469,8 @@ DEFAULT_CONFIG = {
         #   image editor or uses the "Quick Auto Levels" hotkey.
         #
         # Algorithm:
-        #   1. Compute black/white points by clipping `auto_level_threshold` fraction of pixels
-        #      (0.0-1.0) at the dark and light ends of the histogram.
+        #   1. Compute black/white points by clipping `auto_level_threshold` percent of pixels
+        #      at the dark and light ends of the histogram.
         #   2. Construct a levels transform to map these points to 0 and 255.
         #   3. Blend the transformed image with the original using `auto_level_strength`.
         #   4. If `auto_level_strength_auto` is True, `auto_level_strength` acts as a maximum;
@@ -469,12 +478,20 @@ DEFAULT_CONFIG = {
         #      transform would cause excessive clipping or color instability.
         #
         # Practical Tuning:
-        #   - auto_level_threshold: A fraction (not percent).
-        #     Higher values (e.g. 0.05 = 5%) increase contrast but risk hard clipping.
-        #     Lower values (e.g. 0.001 = 0.1%) are gentler and preserve more dynamic range.
+        #   - auto_level_threshold: A percentage.
+        #     Higher values (e.g. 5 = 5%) increase contrast but risk hard clipping.
+        #     Lower values (e.g. 0.1 = 0.1%) are gentler and preserve more dynamic range.
         #   - auto_level_strength: 1.0 applies the full mathematical correction. Lower values
         #     blend the result for a subtler effect.
+        #   - auto_level_black_threshold: same units, shadow end only. 0 means
+        #     "follow auto_level_threshold". The black point can never sit above
+        #     this percentile of luma, so this is the ONLY setting that deepens
+        #     blacks — auto_level_channel_budget loosens the per-channel cap but
+        #     cannot raise that ceiling. Raise it (1-3) if backgrounds that
+        #     should read as black come out grey; it clips that share of the
+        #     darkest pixels, so shadow detail goes with them.
         "auto_level_threshold": "0.1",
+        "auto_level_black_threshold": "0",
         "auto_level_strength": "1.0",
         "auto_level_strength_auto": "False",
         "auto_vibrance_enabled": "True",

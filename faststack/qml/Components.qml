@@ -115,6 +115,7 @@ Item {
                 // Capture the session's visual source when crop mode turns on,
                 // then keep it stable until crop mode exits.
                 loupeView.freezeCropImageSource()
+                aspectRatioWindow.dismissed = false
             } else {
                 if (mainMouseArea) {
                     mainMouseArea.clearPendingRotation(0)
@@ -531,6 +532,14 @@ Item {
                     function onWidthChanged() { mainImage.reportDisplaySize() }
                     function onHeightChanged() { mainImage.reportDisplaySize() }
                 }
+
+                // The viewport keeps its logical size when the device pixel
+                // ratio changes -- moving to a monitor with different scaling,
+                // or Qt recovering a DPI it initially failed to read (see
+                // util/win_dpi.py) -- so the handlers above never fire and
+                // Python would keep decoding at the old resolution.
+                property real screenDpr: Screen.devicePixelRatio
+                onScreenDprChanged: reportDisplaySize()
         
                 // Removed direct onWidth/HeightChanged handlers for resizeDebounceTimer 
                 // because we now drive size reporting via viewport changes.
@@ -1726,7 +1735,9 @@ Item {
     // Aspect ratio selector window (upper left corner)
     Rectangle {
         id: aspectRatioWindow
-        visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping
+        // Dismissed by the X button; reset each time crop mode is entered.
+        property bool dismissed: false
+        visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping && !dismissed
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.margins: 10
@@ -1750,13 +1761,63 @@ Item {
             anchors.margins: 10
             spacing: 5
             
-            Text {
-                text: "Aspect Ratio"
-                font.bold: true
-                color: aspectRatioWindow.isDark ? "white" : "black"
-                font.pixelSize: 12
+            Item {
+                width: parent.width
+                height: closeButton.height
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Aspect Ratio"
+                    font.bold: true
+                    color: aspectRatioWindow.isDark ? "white" : "black"
+                    font.pixelSize: 12
+                }
+
+                Rectangle {
+                    id: closeButton
+                    anchors.right: parent.right
+                    width: 18
+                    height: 18
+                    radius: 3
+                    activeFocusOnTab: true
+                    color: closeMouseArea.containsMouse || activeFocus
+                           ? (aspectRatioWindow.isDark ? "#555555" : "#d8d8d8")
+                           : "transparent"
+                    border.color: activeFocus
+                                  ? (aspectRatioWindow.isDark ? "white" : "black")
+                                  : "transparent"
+                    border.width: activeFocus ? 1 : 0
+
+                    Accessible.name: "Close aspect ratio menu"
+                    Accessible.role: Accessible.Button
+                    Accessible.onPressAction: aspectRatioWindow.dismissed = true
+
+                    Keys.onPressed: (event) => {
+                        if (event.key === Qt.Key_Enter
+                                || event.key === Qt.Key_Return
+                                || event.key === Qt.Key_Space) {
+                            aspectRatioWindow.dismissed = true
+                            event.accepted = true
+                        }
+                    }
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "✕"
+                        color: aspectRatioWindow.isDark ? "white" : "black"
+                        font.pixelSize: 11
+                    }
+
+                    MouseArea {
+                        id: closeMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onClicked: aspectRatioWindow.dismissed = true
+                    }
+                }
             }
-            
+
             Repeater {
                 model: loupeView.uiStateRef && loupeView.uiStateRef.aspectRatioNames ? loupeView.uiStateRef.aspectRatioNames.length : 0
                 

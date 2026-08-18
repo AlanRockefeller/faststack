@@ -24,6 +24,7 @@ Window {
     property string heliconPath: ""
     property double cacheSize: 1.5
     property double autoLevelClippingThreshold: 0.1
+    property double autoLevelBlackThreshold: 0.0
     property double autoLevelStrength: 1.0
     property bool autoLevelStrengthAuto: false
     property bool autoVibranceEnabled: true
@@ -35,6 +36,9 @@ Window {
     property int prefetchRadius: 20
     property int navigationRateFps: 15
     property string heldNavigationQuality: "balanced"
+    // 0 = match the window; otherwise a long-edge pixel count.
+    property int editorPreviewLongEdge: 0
+    readonly property var editorPreviewValues: [0, 1920, 2560, 3840]
     property int theme: 0
     property string defaultDirectory: ""
     property string photoshopPath: ""
@@ -83,6 +87,26 @@ Window {
 
     function loaderItem(loader) {
         return loader ? loader.item : null
+    }
+
+    // Combo index for a stored long edge. A hand-edited config value that is
+    // not one of the offered sizes shows as the nearest one rather than
+    // silently reading as "Match Window".
+    function editorPreviewIndexFor(value) {
+        var values = settingsDialog.editorPreviewValues
+        var exact = values.indexOf(value)
+        if (exact >= 0)
+            return exact
+        var best = 0
+        var bestDelta = -1
+        for (var i = 1; i < values.length; ++i) {
+            var delta = Math.abs(values[i] - value)
+            if (bestDelta < 0 || delta < bestDelta) {
+                best = i
+                bestDelta = delta
+            }
+        }
+        return best
     }
 
     function loaderProperty(loader, propertyName, fallbackValue) {
@@ -153,12 +177,14 @@ Window {
             settingsDialog.prefetchRadius = settingsDialog.uiStateRef.get_prefetch_radius()
             settingsDialog.navigationRateFps = settingsDialog.uiStateRef.get_navigation_rate_fps()
             settingsDialog.heldNavigationQuality = settingsDialog.uiStateRef.get_held_navigation_quality()
+            settingsDialog.editorPreviewLongEdge = settingsDialog.uiStateRef.get_editor_preview_long_edge()
             settingsDialog.theme = settingsDialog.uiStateRef.theme
             settingsDialog.defaultDirectory = settingsDialog.uiStateRef.get_default_directory()
             settingsDialog.optimizeFor = settingsDialog.uiStateRef.get_optimize_for()
             settingsDialog.updateCheckEnabled = settingsDialog.uiStateRef.get_update_check_enabled()
             settingsDialog.autoUpdateEnabled = settingsDialog.uiStateRef.get_auto_update_enabled()
             settingsDialog.autoLevelClippingThreshold = settingsDialog.uiStateRef.autoLevelClippingThreshold
+            settingsDialog.autoLevelBlackThreshold = settingsDialog.uiStateRef.autoLevelBlackThreshold
             settingsDialog.autoLevelStrength = settingsDialog.uiStateRef.autoLevelStrength
             settingsDialog.autoLevelStrengthAuto = settingsDialog.uiStateRef.autoLevelStrengthAuto
             settingsDialog.autoVibranceEnabled = settingsDialog.uiStateRef.autoVibranceEnabled
@@ -218,12 +244,14 @@ Window {
         state.set_prefetch_radius(settingsDialog.prefetchRadius)
         state.set_navigation_rate_fps(settingsDialog.navigationRateFps)
         state.set_held_navigation_quality(settingsDialog.heldNavigationQuality)
+        state.set_editor_preview_long_edge(settingsDialog.editorPreviewLongEdge)
         state.set_theme(settingsDialog.theme)
         state.set_default_directory(settingsDialog.defaultDirectory)
         state.set_optimize_for(settingsDialog.optimizeFor)
         state.set_update_check_enabled(settingsDialog.updateCheckEnabled)
         state.set_auto_update_enabled(settingsDialog.autoUpdateEnabled)
         state.autoLevelClippingThreshold = settingsDialog.autoLevelClippingThreshold
+        state.autoLevelBlackThreshold = settingsDialog.autoLevelBlackThreshold
         state.autoLevelStrength = settingsDialog.autoLevelStrength
         state.autoLevelStrengthAuto = settingsDialog.autoLevelStrengthAuto
         state.autoVibranceEnabled = settingsDialog.autoVibranceEnabled
@@ -853,6 +881,36 @@ Window {
                                 background: Rectangle { color: "#10ffffff"; border.color: settingsDialog.controlBorder; radius: 4 }
                             }
 
+                            Label {
+                                text: "Editing Preview Resolution"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: editorPreviewHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: editorPreviewHover.containsMouse
+                                ToolTip.text: "Resolution edits are rendered at while you work. Match Window renders at the size the photo is actually displayed, so an edit looks sharp the moment it appears. A fixed size below your window makes each edit land faster but soft for a moment, until the sharp version replaces it — pick one if editing feels sluggish on a high-resolution screen. Saved files are always full resolution."
+                            }
+                            ComboBox {
+                                id: editorPreviewCombo
+                                model: ["Match Window", "1920 px", "2560 px", "3840 px"]
+                                currentIndex: settingsDialog.editorPreviewIndexFor(settingsDialog.editorPreviewLongEdge)
+                                onActivated: settingsDialog.editorPreviewLongEdge = settingsDialog.editorPreviewValues[currentIndex]
+                                Layout.preferredWidth: 150
+                                delegate: ItemDelegate {
+                                    id: editorPreviewOption
+                                    required property string modelData
+                                    width: editorPreviewCombo.width
+                                    contentItem: Text { text: editorPreviewOption.modelData; color: settingsDialog.textColor; font: editorPreviewOption.font; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
+                                    background: Rectangle { color: editorPreviewOption.highlighted ? "#20ffffff" : "transparent" }
+                                }
+                                contentItem: Text { text: editorPreviewCombo.displayText; color: settingsDialog.textColor; verticalAlignment: Text.AlignVCenter; leftPadding: 10 }
+                                background: Rectangle { color: "#10ffffff"; border.color: settingsDialog.controlBorder; radius: 4 }
+                            }
+
                             // Optimize For
                             Label { 
                                 text: "Optimize For"
@@ -1042,6 +1100,41 @@ Window {
                                     property: "text"
                                     value: settingsDialog.autoLevelClippingThreshold.toFixed(4)
                                     when: clipThresholdLoader.item && !settingsDialog.loaderProperty(clipThresholdLoader, "activeFocus", false)
+                                }
+                            }
+
+                            Label {
+                                text: "Blacks Clip %"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: blackThresholdHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: blackThresholdHover.containsMouse
+                                ToolTip.text: "Clips the dark end only, separately from Clip Threshold. 0 means follow Clip Threshold. Raise it (try 1-3%) when backgrounds that should read as black come out grey - it forces that share of the darkest pixels to black, so shadow detail goes with them. This is the only setting that deepens blacks."
+                            }
+                            Loader {
+                                id: blackThresholdLoader
+                                sourceComponent: styledTextField
+                                Layout.preferredWidth: 80
+                                onLoaded: {
+                                     settingsDialog.setLoaderProperty(blackThresholdLoader, "text", settingsDialog.autoLevelBlackThreshold.toFixed(4))
+                                     settingsDialog.connectLoaderSignal(blackThresholdLoader, "editingFinished", function() {
+                                         var value = parseFloat(settingsDialog.loaderProperty(blackThresholdLoader, "text", settingsDialog.autoLevelBlackThreshold.toFixed(4)))
+                                         if (!isNaN(value) && value >= 0.0 && value <= 50.0) {
+                                             settingsDialog.autoLevelBlackThreshold = value
+                                         }
+                                         settingsDialog.setLoaderProperty(blackThresholdLoader, "text", settingsDialog.autoLevelBlackThreshold.toFixed(4))
+                                     })
+                                }
+                                Binding {
+                                    target: blackThresholdLoader.item
+                                    property: "text"
+                                    value: settingsDialog.autoLevelBlackThreshold.toFixed(4)
+                                    when: blackThresholdLoader.item && !settingsDialog.loaderProperty(blackThresholdLoader, "activeFocus", false)
                                 }
                             }
 

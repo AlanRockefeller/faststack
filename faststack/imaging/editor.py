@@ -63,6 +63,14 @@ class EditRenderCancelled(RuntimeError):
     """Raised when a display-only render is superseded by a newer edit."""
 
 
+def fit_scale_in_box(width: int, height: int, box: Tuple[int, int]) -> float:
+    """Downscale factor that fits ``width x height`` inside ``box`` (never up)."""
+    box_w, box_h = box
+    if width <= 0 or height <= 0 or box_w <= 0 or box_h <= 0:
+        return 1.0
+    return min(box_w / float(width), box_h / float(height), 1.0)
+
+
 _REPLACE_RETRY_DELAY = 0.3
 _REPLACE_MAX_RETRIES = 3
 _AUTO_VIBRANCE_MAX = 0.18
@@ -72,6 +80,19 @@ _AUTO_VIBRANCE_SAT_CEILING = 0.18
 _AUTO_VIBRANCE_MIN_COLOR_DELTA = 0.015
 _AUTO_VIBRANCE_CLIP_TOLERANCE = 0.0001
 _AUTO_LEVELS_ANALYSIS_MAX_EDGE = 1920
+# Box the source-space preview master (``float_preview``) is fitted into.
+# Quick live-preview renders apply edits to that buffer, so this is the
+# resolution the user sees while editing until the display-resolution
+# refinement pass lands. AppController overrides it from the window size and
+# core.editor_preview_long_edge; this default keeps standalone ImageEditor
+# users (tests, scripts) on the historical size.
+DEFAULT_PREVIEW_MASTER_BOX = (1920, 1080)
+# Subject-midtone estimation (see analyze_auto_levels). Pixels below the floor
+# are treated as backdrop and excluded from the midtone median; if fewer than
+# MIN_SUBJECT_FRAC of the frame clears the floor the sample is too small to
+# trust and the whole-frame median is used instead.
+_AUTO_MIDTONE_BG_FLOOR = 0.08
+_AUTO_MIDTONE_MIN_SUBJECT_FRAC = 0.15
 # Colorful-subject guard: median saturation can be low while a small subject
 # is already vivid. Scale the boost down as the 90th-percentile saturation
 # approaches full saturation so that subject is not pushed garish.
@@ -630,6 +651,10 @@ class ImageEditor:
         self.float_image: Optional[np.ndarray] = None
         # Float32 normalized preview image
         self.float_preview: Optional[np.ndarray] = None
+        # Box float_preview is fitted into. Set by AppController from the
+        # window size so quick previews can match what the screen shows.
+        self.preview_master_box: Tuple[int, int] = DEFAULT_PREVIEW_MASTER_BOX
+        self._preview_master_generation = 0
 
         # Stores the currently applied edits (used for preview)
         self.current_edits: Dict[str, Any] = self._initial_edits()
@@ -1165,35 +1190,37 @@ class ImageEditor:
             if cached_preview is not None:
                 log.debug("Ignoring display-corrected cache buffer for editor master")
 
-            if (
-                loaded_bit_depth == 16
-                and loaded_float_image is not None
-                and cv2 is not None
-            ):
-                h, w = loaded_float_image.shape[:2]
-                scale = min(1920.0 / w, 1080.0 / h, 1.0)
-                if scale < 1.0:
-                    loaded_float_preview = np.ascontiguousarray(
-                        cv2.resize(
-                            loaded_float_image,
-                            (max(1, round(w * scale)), max(1, round(h * scale))),
-                            interpolation=cv2.INTER_AREA,
-                        ),
-                        dtype=np.float32,
-                    )
-                else:
-                    loaded_float_preview = np.array(
+            def build_loaded_float_preview(
+                preview_box: Tuple[int, int],
+            ) -> np.ndarray:
+                if (
+                    loaded_bit_depth == 16
+                    and loaded_float_image is not None
+                    and cv2 is not None
+                ):
+                    h, w = loaded_float_image.shape[:2]
+                    scale = fit_scale_in_box(w, h, preview_box)
+                    if scale < 1.0:
+                        return np.ascontiguousarray(
+                            cv2.resize(
+                                loaded_float_image,
+                                (max(1, round(w * scale)), max(1, round(h * scale))),
+                                interpolation=cv2.INTER_AREA,
+                            ),
+                            dtype=np.float32,
+                        )
+                    return np.array(
                         loaded_float_image,
                         dtype=np.float32,
                         copy=True,
                         order="C",
                     )
-            else:
+
                 # The JPEG fast path already has oriented source pixels as an
                 # array; cv2.resize avoids a second Pillow conversion.
                 if jpeg_arr is not None and cv2 is not None:
                     h, w = jpeg_arr.shape[:2]
-                    scale = min(1920.0 / w, 1080.0 / h, 1.0)
+                    scale = fit_scale_in_box(w, h, preview_box)
                     if scale < 1.0:
                         # round(), not int(): truncation skews the preview
                         # master's aspect ratio relative to full-res refinement.
@@ -1206,32 +1233,44 @@ class ImageEditor:
                         preview_u8 = jpeg_arr
                 else:
                     thumb = loaded_original.copy()
-                    thumb.thumbnail((1920, 1080))
+                    thumb.thumbnail(preview_box)
                     preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
 
-                loaded_float_preview = preview_u8.astype(np.float32)
-                loaded_float_preview *= np.float32(1.0 / 255.0)
+                preview = preview_u8.astype(np.float32)
+                preview *= np.float32(1.0 / 255.0)
+                return preview
+
+            while True:
+                with self._lock:
+                    preview_box = self.preview_master_box
+                    preview_generation = self._preview_master_generation
+                loaded_float_preview = build_loaded_float_preview(preview_box)
+
+                # Assign all state atomically under lock to prevent a race with
+                # preview-box changes and preview workers. If the box changed
+                # while the preview was built, retry against the latest box.
+                with self._lock:
+                    if preview_generation != self._preview_master_generation:
+                        continue
+                    self.current_filepath = load_filepath
+                    self.source_filepath = load_filepath
+                    self.session_id = uuid.uuid4().hex
+                    self.original_image = loaded_original
+                    self.float_image = loaded_float_image
+                    self.float_preview = loaded_float_preview
+                    self.bit_depth = loaded_bit_depth
+                    # Reset edits
+                    self.current_edits = self._initial_edits()
+                    self._edits_rev += 1
+                    self._cached_preview = None
+                    self._cached_rev = -1
+                    break
 
             # Preview pixels are derived after EXIF orientation was applied, so
             # they match the full-resolution source geometry.
 
             if _debug:
                 t_preview = time.perf_counter()
-
-            # Assign all state atomically under lock to prevent race with preview worker
-            with self._lock:
-                self.current_filepath = load_filepath
-                self.source_filepath = load_filepath
-                self.session_id = uuid.uuid4().hex
-                self.original_image = loaded_original
-                self.float_image = loaded_float_image
-                self.float_preview = loaded_float_preview
-                self.bit_depth = loaded_bit_depth
-                # Reset edits
-                self.current_edits = self._initial_edits()
-                self._edits_rev += 1
-                self._cached_preview = None
-                self._cached_rev = -1
 
             if _debug:
                 t_end = time.perf_counter()
@@ -2163,7 +2202,10 @@ class ImageEditor:
         )
 
     def auto_levels(
-        self, threshold_percent: float = 0.1, channel_budget: float = 3.0
+        self,
+        threshold_percent: float = 0.1,
+        channel_budget: float = 3.0,
+        black_threshold_percent: Optional[float] = None,
     ) -> Tuple[float, float, float, float]:
         """
         Returns (blacks, whites, p_low, p_high).
@@ -2174,6 +2216,7 @@ class ImageEditor:
             threshold_percent,
             reset_levels=True,
             channel_budget=channel_budget,
+            black_threshold_percent=black_threshold_percent,
         )
 
         with self._lock:
@@ -2189,13 +2232,26 @@ class ImageEditor:
         edits: Optional[Dict[str, Any]] = None,
         reset_levels: bool = True,
         channel_budget: float = 3.0,
+        black_threshold_percent: Optional[float] = None,
     ) -> Tuple[float, float, float, float]:
-        """Analyze auto-levels on the current edited baseline without mutating edits."""
+        """Analyze auto-levels on the current edited baseline without mutating edits.
+
+        ``black_threshold_percent`` clips the shadow end independently of
+        ``threshold_percent``. The black point can never sit above this
+        percentile of luma, so it is the only control that deepens blacks —
+        ``channel_budget`` can loosen the per-channel cap but never raise that
+        ceiling. Pass None to keep the shadow end tied to ``threshold_percent``.
+        """
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
 
         threshold_percent = max(0.0, min(10.0, threshold_percent))
+        black_threshold_explicit = black_threshold_percent is not None
+        if black_threshold_percent is None:
+            black_threshold_percent = threshold_percent
+        else:
+            black_threshold_percent = max(0.0, min(50.0, black_threshold_percent))
 
         with self._lock:
             # Auto-levels is an aggregate percentile estimate. If the full
@@ -2297,7 +2353,7 @@ class ImageEditor:
         luma_q = (_rec601_gray(scaled) * (nbins - 1)).astype(np.uint16)
         luma_hist = np.bincount(luma_q.reshape(-1), minlength=nbins)
         luma_low = self._percentile_from_hist(
-            luma_hist, threshold_percent, method="lower"
+            luma_hist, black_threshold_percent, method="lower"
         )
         luma_high = self._percentile_from_hist(
             luma_hist, 100.0 - threshold_percent, method="higher"
@@ -2306,8 +2362,39 @@ class ImageEditor:
             nbins - 1
         )
 
+        # Subject midtone: the median over non-background pixels. Whole-frame
+        # median is a bad exposure signal for the dark-background macro shots
+        # this app is used for — with 60% of the frame black, the median tracks
+        # the backdrop, not the subject, and any midtone correction driven by it
+        # lifts the backdrop into grey haze while the subject was already fine.
+        # Fall back to the plain median when too little of the frame clears the
+        # floor to be a reliable sample (a genuinely dark photo, where the
+        # endpoint stretch is the right tool anyway).
+        floor_bin = int(_AUTO_MIDTONE_BG_FLOOR * (nbins - 1))
+        subject_hist = luma_hist.copy()
+        subject_hist[:floor_bin] = 0
+        total_px = int(luma_hist.sum())
+        if int(subject_hist.sum()) >= max(
+            64, int(_AUTO_MIDTONE_MIN_SUBJECT_FRAC * total_px)
+        ):
+            subject_luma = self._percentile_from_hist(
+                subject_hist, 50.0, method="lower"
+            ) / (nbins - 1)
+        else:
+            subject_luma = median_luma
+
         # Black point: luma-driven target, capped by the per-channel budgets.
-        p_low = min(luma_low, min(chan_lows)) * bin_to_255
+        # An explicitly configured black threshold drops that per-channel cap.
+        # It exists to stop one clipped channel from shifting hue, which is a
+        # real risk in bright saturated areas but not in deep shadow — down
+        # there a clipped channel just reads blacker. Leaving the cap in place
+        # made the setting inert on exactly the dark-background shots it is
+        # for: one dark channel spread over the backdrop pinned p_low near 0
+        # no matter how high the threshold went.
+        if black_threshold_explicit:
+            p_low = luma_low * bin_to_255
+        else:
+            p_low = min(luma_low, min(chan_lows)) * bin_to_255
         # White point: luma-driven target, floored by the per-channel budgets.
         p_high = max(luma_high, max(chan_highs)) * bin_to_255
 
@@ -2326,6 +2413,7 @@ class ImageEditor:
         with self._lock:
             self.last_auto_levels_stats = {
                 "median_luma": float(median_luma),
+                "subject_luma": float(subject_luma),
                 "p_low": float(p_low),
                 "p_high": float(p_high),
             }
@@ -2335,7 +2423,7 @@ class ImageEditor:
             h, w = scaled.shape[:2]
             log.debug(
                 "[AUTO_LEVEL] get_array=%dms render=%dms hist+clip=%dms total=%dms  "
-                "(%dx%d, %s, median_luma=%.3f)",
+                "(%dx%d, %s, median_luma=%.3f, subject_luma=%.3f)",
                 int((t_arr - t0) * 1000),
                 int((t_u8 - t_arr) * 1000),
                 int((t_end - t_u8) * 1000),
@@ -2344,6 +2432,7 @@ class ImageEditor:
                 h,
                 source_label,
                 median_luma,
+                subject_luma,
             )
 
         return blacks, whites, float(p_low), float(p_high)
@@ -3092,10 +3181,21 @@ class ImageEditor:
 
     def _float_preview_from_master(self) -> Optional[np.ndarray]:
         """Build a display-sized source-space preview from the unedited master."""
-        cv2 = _get_cv2()
         with self._lock:
             if self.float_preview is not None:
                 return self.float_preview.copy()
+        return self._build_preview_master_from_source()
+
+    def _build_preview_master_from_source(self) -> Optional[np.ndarray]:
+        """Fit the loaded source into ``preview_master_box``, ignoring float_preview.
+
+        The rebuild path for a preview master that is the wrong size (window
+        resized, resolution setting changed); ``_float_preview_from_master``
+        wraps it with the "reuse the existing master" shortcut.
+        """
+        cv2 = _get_cv2()
+        with self._lock:
+            box = self.preview_master_box
             source = self.float_image
             original = (
                 self.original_image.copy() if self.original_image is not None else None
@@ -3103,7 +3203,7 @@ class ImageEditor:
 
         if source is not None:
             h, w = source.shape[:2]
-            scale = min(1920.0 / w, 1080.0 / h, 1.0)
+            scale = fit_scale_in_box(w, h, box)
             if scale < 1.0 and cv2 is not None:
                 return np.ascontiguousarray(
                     cv2.resize(
@@ -3122,11 +3222,46 @@ class ImageEditor:
         else:
             return None
 
-        thumb.thumbnail((1920, 1080))
+        thumb.thumbnail(box)
         preview_u8 = np.asarray(thumb.convert("RGB"), dtype=np.uint8)
         preview = preview_u8.astype(np.float32)
         preview *= np.float32(1.0 / 255.0)
         return preview
+
+    def set_preview_master_box(self, box: Tuple[int, int]) -> bool:
+        """Resize the preview master, rebuilding a loaded one to the new box.
+
+        Returns True when the master of the currently loaded image was
+        rebuilt, so the caller can re-render the live preview. The rebuild is
+        built before the swap and guarded on ``session_id`` so a concurrent
+        load always wins and preview workers never observe a missing master.
+        """
+        new_box = (max(1, int(box[0])), max(1, int(box[1])))
+        with self._lock:
+            if new_box == self.preview_master_box:
+                return False
+            self.preview_master_box = new_box
+            self._preview_master_generation += 1
+            if self.float_preview is None:
+                # Nothing loaded (or preview-less session): the next load
+                # picks up the new box on its own.
+                return False
+            session = self.session_id
+
+        rebuilt = self._build_preview_master_from_source()
+        if rebuilt is None:
+            return False
+
+        with self._lock:
+            if self.session_id != session or self.preview_master_box != new_box:
+                return False
+            self.float_preview = rebuilt
+            # Drop the cached quick frame; it was rendered at the old size.
+            # _edits_rev is deliberately left alone: it feeds the live edit
+            # session's dirty check, and resizing a buffer is not an edit.
+            self._cached_preview = None
+            self._cached_rev = -1
+        return True
 
     def get_original_compare_preview_data(
         self,
