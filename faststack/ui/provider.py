@@ -737,6 +737,8 @@ class UIState(QObject):
     batchAutoLevelsActiveChanged = Signal()
     autoAddEditedToBatchChanged = Signal()
 
+    updateNoticeChanged = Signal()  # Unobtrusive update banner state
+
     # Variant badges
     variantBadgesChanged = Signal()
     variantSaveHintChanged = Signal()
@@ -1200,6 +1202,18 @@ class UIState(QObject):
         if self._status_message_color != value:
             self._status_message_color = value
             self.statusMessageColorChanged.emit()
+
+    @Property(str, notify=updateNoticeChanged)
+    def updateNoticeVersion(self):
+        """Version for the update banner, or "" when nothing is pending.
+
+        Only automatic checks populate this; a manual check opens the dialog
+        directly instead of raising the banner.
+        """
+        getter = getattr(self.app_controller, "get_pending_update_version", None)
+        if callable(getter):
+            return getter()
+        return ""
 
     @Property(str, notify=variantSaveHintChanged)
     def variantSaveHint(self):

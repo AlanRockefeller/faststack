@@ -170,6 +170,10 @@ if show_target_file faststack/updater.py | grep -Eq 'FALLBACK_VERSION = "[0-9]';
 fi
 target_file_contains .github/workflows/build-executables.yml 'gh release create' \
   || die "target build workflow is not configured to publish GitHub Release assets"
+target_file_contains .github/workflows/build-executables.yml 'tools/release_notes.py' \
+  || die "target build workflow must build release notes from ChangeLog.md"
+target_file_contains tools/release_notes.py 'def render_release_notes' \
+  || die "target tools/release_notes.py is missing the release-notes builder"
 
 if [ "$skip_ruff" = false ]; then
   python_bin="$(find_venv_python)" \

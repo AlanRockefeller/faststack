@@ -531,8 +531,10 @@ DEFAULT_CONFIG = {
     },
     "updates": {
         "check_for_updates": "true",
-        "auto_update": "false",
-        "last_check_at": "",
+        # Automatic checks are paced separately for reached-GitHub and
+        # failed-to-reach-GitHub attempts; see faststack/updater.py.
+        "last_successful_update_check": "",
+        "last_failed_update_check": "",
         "last_ignored_version": "",
     },
 }
@@ -568,6 +570,9 @@ class AppConfig:
                         self.config.set(section, key, value)
                         config_changed = True
 
+        if self._migrate_update_settings():
+            config_changed = True
+
         # Auto-detect external tool paths only once: on first run, or a one-time
         # migration for configs created before detection existed. Doing this on
         # every launch would re-scan the filesystem (slow on WSL/network mounts)
@@ -583,6 +588,39 @@ class AppConfig:
 
         if config_changed:
             self.save()
+
+    def _migrate_update_settings(self) -> bool:
+        """Move legacy [updates] keys onto the current schema.
+
+        FastStack used to store a single ``last_check_at`` that was written
+        before the network call, so one failed check silenced the updater for
+        24 hours. That timestamp now becomes ``last_successful_update_check``
+        (the closest honest reading of it) and the legacy key is dropped.
+
+        ``auto_update`` is also removed: FastStack never installed updates by
+        itself, and the setting only existed to back a permanently disabled
+        checkbox. Returns True when the config was modified.
+        """
+        if not self.config.has_section("updates"):
+            return False
+
+        changed = False
+        legacy_check = self.config.get(
+            "updates", "last_check_at", fallback=""
+        ).strip()
+        current = self.config.get(
+            "updates", "last_successful_update_check", fallback=""
+        ).strip()
+        if legacy_check and not current:
+            self.config.set("updates", "last_successful_update_check", legacy_check)
+            changed = True
+
+        for dead_key in ("last_check_at", "auto_update"):
+            if self.config.has_option("updates", dead_key):
+                self.config.remove_option("updates", dead_key)
+                changed = True
+
+        return changed
 
     def _detect_external_tool_paths(self) -> bool:
         """Fill in external tool paths that are not configured yet.

@@ -1258,7 +1258,7 @@ ApplicationWindow {
             }
             MenuActionItem {
                 width: 220
-                text: "Stack Source RAWs"
+                text: "Restack Source RAWs"
                 enabled: root.uiStateRef ? root.uiStateRef.isStackedJpg : false
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
@@ -1669,6 +1669,87 @@ ApplicationWindow {
                     property: "isDarkTheme"
                     value: root.isDarkTheme
                     when: gridViewLoader.item
+                }
+            }
+        }
+    }
+
+    // -------- UPDATE NOTICE (unobtrusive, sits above the status bar) --------
+    // Automatic update checks land here instead of throwing a modal dialog at
+    // the user seconds after launch. Manual checks still open the dialog.
+    Rectangle {
+        id: updateNoticeBanner
+        z: 101
+        readonly property string pendingVersion: root.uiStateRef ? root.uiStateRef.updateNoticeVersion : ""
+
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: footerRect.top
+        height: visible ? 36 : 0
+        visible: !root.fullScreenLoupe && updateNoticeBanner.pendingVersion !== ""
+        color: root.isDarkTheme ? "#1f2c1f" : "#eaf5ea"
+        border.color: root.isDarkTheme ? "#3a5a3a" : "#bcd9bc"
+        border.width: 1
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 12
+            anchors.rightMargin: 8
+            spacing: 10
+
+            Label {
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                color: root.currentTextColor
+                font.pixelSize: 13
+                text: "FastStack " + updateNoticeBanner.pendingVersion + " is available"
+            }
+
+            Button {
+                id: updateNoticeDetailsButton
+                text: "What's New"
+                flat: true
+                implicitHeight: 26
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.show_pending_update()
+                }
+                background: Rectangle {
+                    color: updateNoticeDetailsButton.pressed ? "#30000000" : "transparent"
+                    border.color: root.isDarkTheme ? "#4c7a4c" : "#9cc49c"
+                    border.width: 1
+                    radius: 4
+                }
+                contentItem: Text {
+                    text: updateNoticeDetailsButton.text
+                    color: root.currentTextColor
+                    font.pixelSize: 12
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+
+            Button {
+                id: updateNoticeDismissButton
+                text: "\u2715"
+                flat: true
+                implicitWidth: 26
+                implicitHeight: 26
+                ToolTip.visible: updateNoticeDismissButton.hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Dismiss until the next check"
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.dismiss_pending_update()
+                }
+                background: Rectangle {
+                    color: updateNoticeDismissButton.pressed ? "#30000000" : "transparent"
+                    radius: 4
+                }
+                contentItem: Text {
+                    text: updateNoticeDismissButton.text
+                    color: root.currentTextColor
+                    font.pixelSize: 12
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
                 }
             }
         }
@@ -2498,6 +2579,9 @@ ApplicationWindow {
                 Button {
                     text: "Open Release"
                     highlighted: true
+                    // The release URL is dropped when it fails the GitHub
+                    // release allowlist, so there may be nothing to open.
+                    enabled: updateDialog.releaseUrl !== ""
                     Layout.preferredWidth: 120
                     onClicked: {
                         if (root.controllerRef) root.controllerRef.open_update_release(updateDialog.releaseUrl)

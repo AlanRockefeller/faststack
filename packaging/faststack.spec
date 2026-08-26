@@ -7,7 +7,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 
 ROOT = Path(SPECPATH).parent
@@ -36,6 +36,15 @@ datas = [
     # the frozen macOS/Windows builds (see resources.faststack_readme_path).
     (str(ROOT / "README.md"), "faststack"),
 ]
+# Ship faststack's own dist-info so importlib.metadata.version("faststack")
+# resolves inside the frozen build. Without it the updater cannot tell which
+# version is running and stops offering updates entirely (see
+# faststack/updater.get_current_version).
+try:
+    datas += copy_metadata("faststack")
+except Exception as exc:  # pragma: no cover - build-time diagnostics only
+    print(f"WARNING: could not bundle faststack metadata: {exc}")
+
 datas += collect_data_files(
     "PySide6",
     includes=[

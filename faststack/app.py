@@ -115,7 +115,15 @@ from faststack.resources import (
     pyside_qml_dir,
     readme_from_metadata,
 )
-from faststack.updater import GITHUB_REPOSITORY, check_for_update, get_current_version
+from faststack.updater import (
+    GITHUB_REPOSITORY,
+    check_for_update,
+    get_current_version,
+    is_release_url_allowed,
+    normalize_version,
+    same_base_version,
+    should_check_for_updates,
+)
 from faststack.thumbnail_view import (
     DEFAULT_THUMBNAIL_CACHE_BYTES,
     ThumbnailModel,
@@ -461,6 +469,10 @@ class AppController(QObject):
         self._preloadProgressReady.connect(self._on_preload_progress_ready)
         self._update_check_token = 0
         self._update_check_inflight = False
+        # Payload of the most recent automatic check that found an update the
+        # user has not skipped. Automatic checks only raise the footer banner;
+        # this is what the banner's "What's New" action opens.
+        self._pending_update_payload: Optional[dict] = None
         self._preview_inflight = False
         self._preview_pending = False
         self._preview_token = 0
@@ -10042,28 +10054,34 @@ class AppController(QObject):
         config.set("updates", "check_for_updates", "true" if enabled else "false")
         config.save()
 
-    @Slot(result=bool)
-    def get_auto_update_enabled(self):
-        return config.getboolean("updates", "auto_update", False)
-
-    @Slot(bool)
-    def set_auto_update_enabled(self, enabled):
-        # Source/venv installs cannot be safely self-updated yet. Persist false
-        # so the setting exists without promising unavailable behavior.
-        config.set("updates", "auto_update", "false")
-        config.save()
-
-    def _last_update_check_time(self) -> Optional[datetime]:
-        raw_value = config.get("updates", "last_check_at", fallback="").strip()
+    def _update_timestamp(self, key: str) -> Optional[datetime]:
+        """Read an ISO timestamp from the [updates] config section."""
+        raw_value = config.get("updates", key, fallback="").strip()
         if not raw_value:
             return None
         try:
             parsed = datetime.fromisoformat(raw_value)
         except ValueError:
+            log.debug("Ignoring unparseable updates.%s value %r", key, raw_value)
             return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
+
+    def _record_update_check_outcome(self, *, succeeded: bool) -> None:
+        """Persist when the last check reached GitHub, or failed to.
+
+        The timestamps are written *after* the attempt finishes so a request
+        that never got an answer cannot masquerade as a completed check.
+        """
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if succeeded:
+            config.set("updates", "last_successful_update_check", now)
+            # A success clears the backoff so the next failure starts fresh.
+            config.set("updates", "last_failed_update_check", "")
+        else:
+            config.set("updates", "last_failed_update_check", now)
+        config.save()
 
     @Slot()
     def maybe_check_for_updates(self):
@@ -10071,17 +10089,24 @@ class AppController(QObject):
         if not self.get_update_check_enabled():
             return
 
-        last_check = self._last_update_check_time()
-        if last_check is not None:
-            elapsed = datetime.now(timezone.utc) - last_check
-            if elapsed.total_seconds() < 24 * 60 * 60:
-                return
+        if not should_check_for_updates(
+            now=datetime.now(timezone.utc),
+            last_success=self._update_timestamp("last_successful_update_check"),
+            last_failure=self._update_timestamp("last_failed_update_check"),
+        ):
+            return
 
         self.check_for_updates(False)
 
     @Slot(bool)
     def check_for_updates(self, manual=False):
-        """Check GitHub Releases for a newer FastStack version."""
+        """Check GitHub Releases for a newer FastStack version.
+
+        The HTTP request always runs on the single-worker update executor; the
+        GUI thread never blocks on the network. A manual check ignores the
+        cooldown entirely (the caller decides), an automatic one has already
+        been gated by maybe_check_for_updates().
+        """
         manual = bool(manual)
         if self._shutting_down:
             return
@@ -10095,12 +10120,6 @@ class AppController(QObject):
         self._update_check_inflight = True
         self._update_check_token += 1
         token = self._update_check_token
-        config.set(
-            "updates",
-            "last_check_at",
-            datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        )
-        config.save()
 
         if manual:
             self.update_status_message("Checking for updates...")
@@ -10151,47 +10170,122 @@ class AppController(QObject):
         manual = bool(payload.get("manual", False))
         error = str(payload.get("error") or "")
         if error:
+            self._record_update_check_outcome(succeeded=False)
             if manual:
                 self.update_status_message(
                     f"Could not check for updates: {error}", 6000
                 )
+            else:
+                # An automatic check must never interrupt the user; the retry
+                # window in updater.should_check_for_updates handles it.
+                log.info("Automatic update check failed: %s", error)
             return
+
+        self._record_update_check_outcome(succeeded=True)
 
         current_version = str(payload.get("currentVersion") or get_current_version())
         latest_version = str(payload.get("latestVersion") or "")
         if payload.get("isNewer"):
-            ignored_version = config.get(
-                "updates", "last_ignored_version", fallback=""
-            ).strip()
-            if not manual and latest_version == ignored_version:
+            if not manual and self._is_update_version_skipped(latest_version):
                 log.info("Update %s is available but skipped by user.", latest_version)
                 return
 
-            if self.main_window and hasattr(self.main_window, "openUpdateDialog"):
-                self.main_window.openUpdateDialog(payload)
+            if manual:
+                # The user asked, so answer immediately with the full dialog.
+                self._show_update_dialog(payload)
             else:
-                self.update_status_message(
-                    f"FastStack {latest_version} is available", 8000
-                )
+                # Automatic checks stay out of the way: raise the footer
+                # banner and let the user open the dialog when they want to.
+                self._set_pending_update(payload)
             return
 
+        self._clear_pending_update()
         if manual:
             self.update_status_message(f"FastStack {current_version} is up to date")
 
+    def _is_update_version_skipped(self, version: str) -> bool:
+        """True when the user skipped this version (any build of it)."""
+        ignored_version = config.get(
+            "updates", "last_ignored_version", fallback=""
+        ).strip()
+        if not ignored_version:
+            return False
+        return same_base_version(ignored_version, version)
+
+    def _show_update_dialog(self, payload) -> bool:
+        """Open the modal update dialog, falling back to a status message."""
+        if self.main_window and hasattr(self.main_window, "openUpdateDialog"):
+            self.main_window.openUpdateDialog(payload)
+            return True
+
+        latest_version = str(payload.get("latestVersion") or "")
+        self.update_status_message(f"FastStack {latest_version} is available", 8000)
+        return False
+
+    def _set_pending_update(self, payload) -> None:
+        """Remember an available update and raise the unobtrusive banner."""
+        self._pending_update_payload = dict(payload)
+        self._notify_update_notice_changed()
+
+    def _clear_pending_update(self) -> None:
+        if self._pending_update_payload is None:
+            return
+        self._pending_update_payload = None
+        self._notify_update_notice_changed()
+
+    def _notify_update_notice_changed(self) -> None:
+        ui_state = getattr(self, "ui_state", None)
+        signal = getattr(ui_state, "updateNoticeChanged", None)
+        if signal is not None:
+            signal.emit()
+
+    def get_pending_update_version(self) -> str:
+        """Version string for the banner, or "" when there is nothing to show."""
+        if not self._pending_update_payload:
+            return ""
+        return str(self._pending_update_payload.get("latestVersion") or "")
+
+    @Slot()
+    def show_pending_update(self):
+        """Banner action: open the existing update dialog for the pending update."""
+        payload = self._pending_update_payload
+        if not payload:
+            return
+        self._show_update_dialog(payload)
+
+    @Slot()
+    def dismiss_pending_update(self):
+        """Banner action: hide the notice for now without skipping the version."""
+        self._clear_pending_update()
+
     @Slot(str)
     def skip_update_version(self, version):
-        version = str(version or "").strip()
-        if not version:
+        """Never notify about this application version again.
+
+        The base version is stored, so skipping 1.6.8 also covers every
+        v1.6.8-buildN rebuild of it. A later 1.6.9 still notifies normally.
+        """
+        normalized = normalize_version(str(version or ""))
+        if not normalized:
             return
-        config.set("updates", "last_ignored_version", version)
+        config.set("updates", "last_ignored_version", normalized)
         config.save()
-        self.update_status_message(f"Skipped FastStack {version}")
+        self._clear_pending_update()
+        self.update_status_message(f"Skipped FastStack {normalized}")
 
     @Slot(str)
     def open_update_release(self, url):
+        """Open a release page, but only if it really is one of ours."""
         url = str(url or "").strip()
         if not url:
             self.update_status_message("No update release URL available")
+            return
+        if not is_release_url_allowed(url):
+            log.warning("Refusing to open non-release update URL: %r", url)
+            self.update_status_message(
+                f"Update link was not a {GITHUB_REPOSITORY} release page; not opening",
+                6000,
+            )
             return
         if not QDesktopServices.openUrl(QUrl(url)):
             self.update_status_message("Could not open update release page", 5000)
