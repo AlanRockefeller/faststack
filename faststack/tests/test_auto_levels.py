@@ -1,7 +1,23 @@
 import numpy as np
+import pytest
 from PIL import Image
 
 from faststack.imaging.editor import ImageEditor
+
+# analyze_auto_levels quantizes to 1024 bins before taking percentiles, so an
+# endpoint recovered in 0-255 space lands within one bin (255/1023 ~= 0.25) of
+# the original 8-bit value rather than exactly on it.
+_BIN = 255.0 / 1023.0
+
+
+def _approx_255(value):
+    return pytest.approx(value, abs=_BIN)
+
+
+def _approx_slider(value):
+    """Same tolerance, expressed in slider units (endpoints are divided by 40)."""
+    return pytest.approx(value, abs=_BIN / 40.0)
+
 
 
 def test_auto_levels_pins_highlights_if_clipped():
@@ -26,11 +42,11 @@ def test_auto_levels_pins_highlights_if_clipped():
     # Actually logic is eps = min(threshold, 0.01). If threshold 0.0, eps=0.0.
     # 1% > 0.0% -> Pins.
 
-    assert p_high == 255.0
+    assert p_high == _approx_255(255.0)
     assert whites == 0.0
 
     # p_low should be the strict minimum (100)
-    assert p_low == 100.0
+    assert p_low == _approx_255(100.0)
 
 
 def test_auto_levels_pins_shadows_if_clipped():
@@ -49,12 +65,12 @@ def test_auto_levels_pins_shadows_if_clipped():
     # Threshold 0.0 -> eps=0.0. 1% detected > 0.0 -> Pins.
     blacks, whites, p_low, p_high = editor.auto_levels(threshold_percent=0.0)
 
-    assert p_low == 0.0
+    assert p_low == _approx_255(0.0)
     assert blacks == 0.0
 
     # Whites should be normal (max is 100)
-    assert p_high == 100.0
-    assert whites == (255.0 - 100.0) / 40.0
+    assert p_high == _approx_255(100.0)
+    assert whites == _approx_slider((255.0 - 100.0) / 40.0)
 
 
 def test_auto_levels_tiny_hot_pixel_ignored():
@@ -92,7 +108,7 @@ def test_auto_levels_tiny_hot_pixel_ignored():
     blacks, whites, p_low, p_high = editor.auto_levels(threshold_percent=0.1)
 
     # p_high should be 200 (from the 200-level plateau), ignoring the 255.
-    assert p_high == 200.0
+    assert p_high == _approx_255(200.0)
     assert p_high != 255.0  # Check explicitly not pinned
     assert whites > 0.0
 
@@ -109,8 +125,8 @@ def test_auto_levels_degenerate_image():
 
     blacks, whites, p_low, p_high = editor.auto_levels(threshold_percent=0.1)
 
-    assert p_high == 128.0
-    assert p_low == 128.0
+    assert p_high == _approx_255(128.0)
+    assert p_low == _approx_255(128.0)
     assert blacks == 0.0
     assert whites == 0.0
 
@@ -129,11 +145,11 @@ def test_auto_levels_normal_range():
 
     blacks, whites, p_low, p_high = editor.auto_levels(threshold_percent=0.0)
 
-    assert p_high == 200.0
-    assert p_low == 50.0
+    assert p_high == _approx_255(200.0)
+    assert p_low == _approx_255(50.0)
 
     assert p_high != 255.0  # Not pinned
     assert p_low != 0.0  # Not pinned
 
-    assert whites == (255.0 - 200.0) / 40.0
-    assert blacks == -50.0 / 40.0
+    assert whites == _approx_slider((255.0 - 200.0) / 40.0)
+    assert blacks == _approx_slider(-50.0 / 40.0)

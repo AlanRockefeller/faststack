@@ -50,6 +50,16 @@ class DummyImageFile:
         return self.path.with_name(f"{self.path.stem}-developed.jpg")
 
 
+
+def _stub_develop_guards(app):
+    """Neutralize the in-flight develop guards on a MagicMock controller.
+
+    ``_develop_raw_backend`` bails out early unless the guards report that no
+    development is running; on a bare MagicMock they return truthy mocks.
+    """
+    app._is_raw_development_in_flight.return_value = False
+    app._mark_raw_development_started.return_value = "develop-key"
+
 class TestRawPipeline(unittest.TestCase):
     @patch("faststack.app.os.path.exists")
     @patch("faststack.app.subprocess.run")
@@ -58,7 +68,14 @@ class TestRawPipeline(unittest.TestCase):
     def test_develop_raw_empty_output_cleanup(
         self, mock_thread, mock_config_get, mock_run, mock_exists
     ):
-        """Test garbage collection if RT exits 0 but produces 0-byte file."""
+        """RT exiting 0 with an empty output must not yield a usable working TIFF.
+
+        Development writes to a hidden temp file and only atomically replaces
+        the working TIFF once the output is non-empty, so an empty result
+        leaves no temp file behind and never promotes itself to the working
+        path. A pre-existing 0-byte file at that path stays where it is, but
+        never counts as valid (``has_working_tif`` requires a non-zero size).
+        """
         mock_config_get.return_value = "c:\\path\\to\\rawtherapee-cli.exe"
         mock_exists.return_value = True  # exe exists
 
@@ -79,6 +96,7 @@ class TestRawPipeline(unittest.TestCase):
         app = MagicMock()
         app.image_files = [self.image_file]
         app.current_index = 0
+        _stub_develop_guards(app)
         app.update_status_message = MagicMock()
 
         # Bind the real _develop_raw_backend method to our mock
@@ -94,8 +112,21 @@ class TestRawPipeline(unittest.TestCase):
 
         app._develop_raw_backend()
 
-        # Expect file to be DELETED because it was 0 bytes
-        self.assertFalse(tif_path.exists(), "Zombie 0-byte file should be cleaned up")
+        # The empty output was never promoted, so the working TIFF is still
+        # 0 bytes and still not usable.
+        self.assertEqual(tif_path.stat().st_size, 0)
+        self.assertFalse(
+            AppController.is_valid_working_tif(app, tif_path),
+            "A 0-byte working TIFF must not count as a valid one",
+        )
+
+        # No hidden temp file may leak from the failed run.
+        leftovers = [
+            q.name
+            for q in tif_path.parent.iterdir()
+            if q.name.startswith(f".{tif_path.stem}_")
+        ]
+        self.assertEqual(leftovers, [], f"Temp files left behind: {leftovers}")
 
     @patch("faststack.app.QTimer.singleShot")
     @patch("faststack.app.os.path.exists")
@@ -123,6 +154,7 @@ class TestRawPipeline(unittest.TestCase):
         app = MagicMock()
         app.image_files = [self.image_file]
         app.current_index = 0
+        _stub_develop_guards(app)
         app._develop_raw_backend = AppController._develop_raw_backend.__get__(
             app, AppController
         )
@@ -177,6 +209,7 @@ class TestRawPipeline(unittest.TestCase):
         app = MagicMock()
         app.image_files = [self.image_file]
         app.current_index = 0
+        _stub_develop_guards(app)
         app._develop_raw_backend = AppController._develop_raw_backend.__get__(
             app, AppController
         )

@@ -1,4 +1,5 @@
 import hashlib
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -69,6 +70,11 @@ def test_apply_edits_no_copy_does_not_mutate_input():
     ), "float_image was mutated by _apply_edits on the no-copy path"
 
 
+def _stub_pil_save(fp, *args, **kwargs):
+    """Stand in for ``PIL.Image.Image.save`` while still creating the file."""
+    Path(fp).write_bytes(b"stub-jpeg")
+
+
 def test_save_image_passes_float_image_without_copy_when_safe(tmp_path):
     """
     Wiring test: prove save_image uses the same float_image object when _edits_can_share_input is True.
@@ -133,7 +139,9 @@ def test_save_image_passes_float_image_without_copy_when_safe(tmp_path):
             "faststack.imaging.editor.create_backup_file",
             return_value=tmp_path / "backup.jpg",
         ),
-        patch("PIL.Image.Image.save"),
+        # The export writes to a hidden temp file and then atomically replaces
+        # the target, so a save stub must still produce a file on disk.
+        patch("PIL.Image.Image.save", side_effect=_stub_pil_save),
         patch.object(ed, "_restore_file_times"),
         patch.object(ed, "_get_sanitized_exif_bytes", return_value=None),
     ):

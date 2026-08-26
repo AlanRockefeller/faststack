@@ -2444,7 +2444,18 @@ class AppController(QObject):
             self._current_image_path(),
         )
         self._remember_last_directory()
-        self.watcher.start()
+        # Best-effort: Watcher.start() reports failure instead of raising, but
+        # load() runs after the window is visible so even an unexpected error
+        # must not leave a half-initialised app (FS-P1-005).
+        try:
+            watching = self.watcher.start()
+        except Exception:
+            log.exception("Watcher failed to start for %s", self.image_dir)
+            watching = False
+        if watching is False:
+            log.warning(
+                "Continuing without live file monitoring for %s", self.image_dir
+            )
 
         # A pending resize timer cannot fire while requestImage() is blocking.
         # Commit its latest dimensions now so the first decode is display-sized.
@@ -5005,7 +5016,12 @@ class AppController(QObject):
                 return  # shutting down
 
             self._editor_prewarm_future = future
-            future.add_done_callback(_clear_future)
+
+        # Registered outside the lock on purpose: a future that already finished
+        # runs its callback inline on this thread, and _clear_future takes the
+        # same non-reentrant lock. _job no-ops whenever the float master is
+        # already warm, so it really can complete before we get here.
+        future.add_done_callback(_clear_future)
 
     def _black_threshold_percent(self) -> Optional[float]:
         """Shadow-end clip percentile, or None to follow the shared threshold."""
@@ -5571,6 +5587,17 @@ class AppController(QObject):
         ):
             if saving_status is None and target:
                 self._pending_save_recovery[target] = request
+                # This deferred request IS the newest revision for the target,
+                # so it must be published with the same ordering guarantees as
+                # a normally accepted async save. Without this, the persisted
+                # pending edit state still names the older in-flight request,
+                # and shutdown recovery's _mark_image_edited_in_sidecar() then
+                # mistakes that stale marker for a *newer* pending request and
+                # preserves it over the state it just saved -- leaving pixels
+                # from this request beside recovery metadata from the previous
+                # one. See FS-P1-002.
+                self._remember_pending_edit_save_request(request)
+                self._write_pending_edit_state_for_request(request)
                 log.info(
                     "Deferring latest save for %s until shutdown recovery; "
                     "an older save is still in flight",
@@ -13452,6 +13479,44 @@ class AppController(QObject):
             for field_name in EntryMetadata.__dataclass_fields__
         }
 
+    @staticmethod
+    def _pending_edit_state_is_superseded(
+        pending_state: dict[str, Any], saved_state: dict[str, Any]
+    ) -> bool:
+        """Is a stored pending_save marker provably OLDER than a saved state?
+
+        A differing ``request_id`` alone does not prove the stored marker is
+        newer. Every published request carries the live session's monotonic
+        ``save_revision`` plus a ``session_token`` of
+        ``[image_key, view_override_kind, session_id, revision]``. When both
+        markers come from the same session lineage (the first three token
+        components match) their revisions are directly comparable, so a stored
+        revision that is not greater than the one just saved is stale and must
+        be overwritten rather than "preserved as newer" (FS-P1-002).
+
+        When the lineage cannot be compared the answer is False: keeping an
+        unorderable pending marker risks a redundant replay, dropping it risks
+        losing edits, and only the latter is data loss.
+        """
+        pending_lineage = pending_state.get("session_token")
+        saved_lineage = saved_state.get("session_token")
+        if not isinstance(pending_lineage, (list, tuple)) or not isinstance(
+            saved_lineage, (list, tuple)
+        ):
+            return False
+        if len(pending_lineage) < 3 or len(saved_lineage) < 3:
+            return False
+        if list(pending_lineage[:3]) != list(saved_lineage[:3]):
+            return False
+
+        pending_revision = pending_state.get("revision")
+        saved_revision = saved_state.get("revision")
+        if isinstance(pending_revision, bool) or isinstance(saved_revision, bool):
+            return False
+        if not isinstance(pending_revision, int) or not isinstance(saved_revision, int):
+            return False
+        return pending_revision <= saved_revision
+
     def _mark_image_edited_in_sidecar(
         self,
         sidecar: SidecarManager,
@@ -13473,6 +13538,9 @@ class AppController(QObject):
                 and completed_edit_state_request_id is not None
                 and current_edit_state.get("request_id")
                 != completed_edit_state_request_id
+                and not self._pending_edit_state_is_superseded(
+                    current_edit_state, saved_edit_state
+                )
             ):
                 log.debug(
                     "Preserving newer pending edit state for %s after save %s finished",
@@ -17609,6 +17677,35 @@ def _warn_dpi_stuck() -> None:
     _dpi_notice.show()
 
 
+def _make_sigint_close_handler(app, window_holder):
+    """Build a SIGINT handler that honours the vetoable window-close path.
+
+    Ctrl-C used to call ``app.quit()`` directly, which skips
+    ``ApplicationWindow.onClosing`` and therefore skips
+    ``prepare_for_app_close()``. ``aboutToQuit`` can retry a failed save but
+    cannot cancel the quit, so unsaved edits could be lost (FS-P1-001).
+
+    ``window_holder`` is a list that main() appends the main window to once
+    QML has loaded. Until then there is nothing to veto and nothing to save,
+    so an early Ctrl-C still terminates immediately instead of being
+    swallowed.
+    """
+
+    def _handle_sigint(*_args):
+        window = window_holder[0] if window_holder else None
+        if window is not None:
+            try:
+                # Runs onClosing -> prepare_for_app_close(); a rejected close
+                # leaves the app running, exactly like clicking the X.
+                window.close()
+                return
+            except Exception:
+                log.exception("SIGINT: window close failed; quitting directly")
+        app.quit()
+
+    return _handle_sigint
+
+
 def main(
     image_dir: Optional[str] = None,
     debug: bool = False,
@@ -17693,10 +17790,13 @@ def main(
         debug_message_box.addButton(QMessageBox.StandardButton.Ok)
         debug_message_box.exec()
 
-    # Enable Ctrl-C to terminate the application
+    # Enable Ctrl-C to terminate the application. Route it through the main
+    # window's close path once that window exists so a dirty editor session
+    # can still veto the exit (FS-P1-001).
     import signal
 
-    signal.signal(signal.SIGINT, lambda *args: app.quit())
+    sigint_window_holder: list = []
+    signal.signal(signal.SIGINT, _make_sigint_close_handler(app, sigint_window_holder))
     # Ensure Python's signal handler runs (Qt blocks main thread)
     timer = QTimer()
     timer.start(500)  # Check for signals every 500ms
@@ -17727,6 +17827,11 @@ def main(
             log.warning("Failed to scan for previous sessions: %s", e)
             stale_records, stale_paths = [], []
 
+        # Session files whose folder the user asked for but which we failed to
+        # actually reopen. These must survive pruning so the next launch can
+        # offer them again (FS-P1-006).
+        unconsumed_paths: set = set()
+
         if stale_records:
             chosen = _prompt_reopen_sessions(stale_records)
             if chosen:
@@ -17737,12 +17842,21 @@ def main(
                 restore_index = first_record.get("index")
                 # Reopen the rest as separate windows (one process each).
                 for other_record in chosen[1:]:
-                    respawn_for_directory(
+                    spawned = respawn_for_directory(
                         other_record.get("dir", ""),
                         other_record.get("grid"),
                         other_record.get("path"),
                         other_record.get("index"),
                     )
+                    if not spawned:
+                        record_path = other_record.get("_path")
+                        if record_path:
+                            unconsumed_paths.add(str(record_path))
+                            log.warning(
+                                "Keeping session file %s: respawn for %s failed",
+                                record_path,
+                                other_record.get("dir", ""),
+                            )
                 image_dir_str = first_dir
                 # Restore the first folder's view mode in this process.
                 if first_grid is False:
@@ -17750,10 +17864,12 @@ def main(
             else:
                 recovery_prompt_rejected = True
 
-        # Consume stale records and orphan files regardless of whether any were
-        # reopenable; reopened instances create fresh session files of their own.
-        if stale_paths:
-            SessionRegistry.prune(stale_paths)
+        # Consume stale records and orphan files: everything the user declined,
+        # duplicate records for an already-handled folder, and corrupt/dead
+        # orphans are all prunable. Only records whose respawn failed are kept.
+        prunable = [p for p in stale_paths if str(p) not in unconsumed_paths]
+        if prunable:
+            SessionRegistry.prune(prunable)
 
         # Resume the last folder only when no recovery prompt was declined,
         # then fall back to the static default.
@@ -17849,6 +17965,8 @@ def main(
     main_window = engine.rootObjects()[0]
     controller.main_window = main_window
     main_window.installEventFilter(controller)
+    # From here on Ctrl-C goes through the vetoable close path.
+    sigint_window_holder.append(main_window)
 
     # Qt's Windows plugin can cache a 96 DPI fallback for a monitor it could
     # not read (seen after resuming from suspend), which leaves the whole UI

@@ -845,7 +845,10 @@ ApplicationWindow {
                 width: 200
                 text: "Exit"
                 hoverFillColor: root.menuHoverColor
-                onClicked: Qt.quit()
+                // root.close() (not Qt.quit()) so onClosing runs: the recycle
+                // bin prompt and controller.prepare_for_app_close() must be
+                // able to veto the exit. See FS-P1-001.
+                onClicked: root.close()
                 defaultTextColor: root.currentTextColor
             }
         }
@@ -2955,7 +2958,10 @@ ApplicationWindow {
                         onClicked: {
                             root.allowCloseWithRecycleBins = true
                             recycleBinCleanupDialog.close()
-                            Qt.quit()
+                            // Re-enter onClosing: allowCloseWithRecycleBins
+                            // skips the bin prompt but prepare_for_app_close()
+                            // still gets to veto on a failed save (FS-P1-001).
+                            root.close()
                         }
                         cursorShape: Qt.PointingHandCursor
                         onEntered: parent.color = root.isDarkTheme ? "#444444" : "#d0d0d0"
@@ -2985,7 +2991,8 @@ ApplicationWindow {
                             if (root.uiStateRef) root.uiStateRef.cleanupRecycleBins()
                             root.allowCloseWithRecycleBins = true
                             recycleBinCleanupDialog.close()
-                            Qt.quit()
+                            // See "Keep and Quit" above (FS-P1-001).
+                            root.close()
                         }
                         cursorShape: Qt.PointingHandCursor
                         onEntered: parent.color = "#f44336"

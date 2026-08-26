@@ -22,7 +22,7 @@ def test_per_image_error_does_not_invalidate_other_entries(app_controller, tmp_p
     c = _make_image(tmp_path, "c.jpg")
     app_controller.image_files = [a, bad, c]
 
-    def fake_get_metadata(path, *, create):
+    def fake_get_metadata(path, *, create, migrate=True):
         if path == bad.path:
             raise OSError("simulated sidecar failure for one image")
         return EntryMetadata(favorite=True, uploaded=True)
@@ -63,7 +63,7 @@ def test_first_image_raises_subsequent_succeed(app_controller, tmp_path):
     good = _make_image(tmp_path, "b.jpg")
     app_controller.image_files = [bad, good]
 
-    def fake_get_metadata(path, *, create):
+    def fake_get_metadata(path, *, create, migrate=True):
         if path == bad.path:
             raise RuntimeError("first one fails")
         return EntryMetadata(stacked=True)
