@@ -1,11 +1,48 @@
 """Deletion logic for FastStack."""
 
 import logging
+import os
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtWidgets import QMessageBox
 
+from faststack.deletion_types import FileIdentity
+
 log = logging.getLogger(__name__)
+
+
+class SourceChangedError(OSError):
+    """The path no longer names the file authorized for deletion."""
+
+
+def capture_file_identity(path: Path) -> FileIdentity:
+    """Capture portable metadata for a path, including expected absence."""
+    try:
+        stat = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return FileIdentity(exists=False)
+    return FileIdentity(
+        exists=True,
+        device=stat.st_dev,
+        file_id=stat.st_ino,
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+        ctime_ns=stat.st_ctime_ns,
+    )
+
+
+def validate_file_identity(path: Path, expected: FileIdentity) -> None:
+    """Raise when *path* differs from its acceptance-time identity."""
+    actual = capture_file_identity(path)
+    if actual != expected:
+        if not expected.exists and actual.exists:
+            detail = "appeared after deletion was requested"
+        elif expected.exists and not actual.exists:
+            detail = "disappeared after deletion was requested"
+        else:
+            detail = "was replaced or modified after deletion was requested"
+        raise SourceChangedError(f"Deletion cancelled because {path.name} {detail}.")
 
 
 def _mkdir(path: Path) -> None:
@@ -144,7 +181,10 @@ def confirm_batch_permanent_delete(images: list, reason: str = "") -> bool:
     return msg_box.clickedButton() == delete_btn
 
 
-def permanently_delete_image_files(image_file) -> bool:
+def permanently_delete_image_files(
+    image_file,
+    expected_identities: Optional[tuple[FileIdentity, Optional[FileIdentity]]] = None,
+) -> bool:
     """Permanently delete an image and its RAW pair from disk.
 
     This does NOT add to undo history since deletion is permanent.
@@ -159,21 +199,36 @@ def permanently_delete_image_files(image_file) -> bool:
     jpg_path = image_file.path
     raw_path = image_file.raw_pair
 
+    if expected_identities is not None:
+        jpg_identity, raw_identity = expected_identities
+        if jpg_path:
+            validate_file_identity(jpg_path, jpg_identity)
+        if raw_path and raw_identity is not None:
+            validate_file_identity(raw_path, raw_identity)
+
     # Delete JPG
     if jpg_path and jpg_path.exists():
         try:
+            if expected_identities is not None:
+                validate_file_identity(jpg_path, expected_identities[0])
             _unlink(jpg_path)
             log.info("Permanently deleted: %s", jpg_path.name)
             deleted_any = True
+        except SourceChangedError:
+            raise
         except OSError as e:
             log.exception("Failed to permanently delete %s: %s", jpg_path.name, e)
 
     # Delete RAW if exists
     if raw_path and raw_path.exists():
         try:
+            if expected_identities is not None and expected_identities[1] is not None:
+                validate_file_identity(raw_path, expected_identities[1])
             _unlink(raw_path)
             log.info("Permanently deleted: %s", raw_path.name)
             deleted_any = True
+        except SourceChangedError:
+            raise
         except OSError as e:
             log.exception("Failed to permanently delete %s: %s", raw_path.name, e)
 

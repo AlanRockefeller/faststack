@@ -100,14 +100,16 @@ def test_daemon_pool_is_not_registered_with_concurrent_futures():
         max_workers=2, thread_name_prefix="RegistryProbe"
     )
     try:
-        futures = [executor.submit(lambda: threading.current_thread()) for _ in range(4)]
+        futures = [
+            executor.submit(lambda: threading.current_thread()) for _ in range(4)
+        ]
         workers = {f.result(timeout=10) for f in futures}
         assert workers, "no worker threads ran"
         assert all(t.daemon for t in workers), "workers must be daemon threads"
         registered = workers & set(_threads_queues)
-        assert not registered, (
-            f"workers registered for interpreter-exit join: {registered}"
-        )
+        assert (
+            not registered
+        ), f"workers registered for interpreter-exit join: {registered}"
     finally:
         executor.shutdown(wait=True)
 

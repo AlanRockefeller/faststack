@@ -605,9 +605,7 @@ class AppConfig:
             return False
 
         changed = False
-        legacy_check = self.config.get(
-            "updates", "last_check_at", fallback=""
-        ).strip()
+        legacy_check = self.config.get("updates", "last_check_at", fallback="").strip()
         current = self.config.get(
             "updates", "last_successful_update_check", fallback=""
         ).strip()

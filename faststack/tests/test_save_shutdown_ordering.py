@@ -279,6 +279,4 @@ def test_supersession_revision_comparison(save_env, pending_rev, saved_rev, expe
     lineage = ["key", None, "session-1"]
     pending = {"session_token": lineage + [pending_rev], "revision": pending_rev}
     saved = {"session_token": lineage + [saved_rev], "revision": saved_rev}
-    assert (
-        controller._pending_edit_state_is_superseded(pending, saved) is expected
-    )
+    assert controller._pending_edit_state_is_superseded(pending, saved) is expected

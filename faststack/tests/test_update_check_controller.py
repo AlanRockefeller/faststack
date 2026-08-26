@@ -259,8 +259,13 @@ class UpdateCheckControllerTest(unittest.TestCase):
     def test_stale_token_results_are_discarded(self):
         self.controller._update_check_token = 7
         self.controller._on_update_check_finished(
-            {"token": 3, "manual": True, "error": "", "isNewer": True,
-             "latestVersion": "1.6.9"}
+            {
+                "token": 3,
+                "manual": True,
+                "error": "",
+                "isNewer": True,
+                "latestVersion": "1.6.9",
+            }
         )
         self.controller.main_window.openUpdateDialog.assert_not_called()
 

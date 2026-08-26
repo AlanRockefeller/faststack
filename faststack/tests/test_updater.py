@@ -242,7 +242,9 @@ class TestSummarizeReleaseBody(unittest.TestCase):
 
 class _FakeResponse:
     def __init__(self, payload, status=200):
-        self._data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        self._data = (
+            payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        )
         self.status = status
 
     def read(self):

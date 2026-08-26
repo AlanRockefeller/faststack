@@ -27,9 +27,7 @@ def _real_config_module(config_dir: Path):
     (config_dir / "faststack.ini").write_text(_SEED_INI, encoding="utf-8")
     sys.modules.pop("faststack.config", None)
     try:
-        with patch(
-            "faststack.logging_setup.get_app_data_dir", return_value=config_dir
-        ):
+        with patch("faststack.logging_setup.get_app_data_dir", return_value=config_dir):
             module = importlib.import_module("faststack.config")
     finally:
         pass
@@ -48,9 +46,7 @@ class UpdateConfigMigrationTest(unittest.TestCase):
             # Put the mock back so unrelated tests see what they expect.
             self.addCleanup(sys.modules.__setitem__, "faststack.config", replaced)
 
-        patcher = patch.object(
-            module, "get_app_data_dir", return_value=self.config_dir
-        )
+        patcher = patch.object(module, "get_app_data_dir", return_value=self.config_dir)
         patcher.start()
         self.addCleanup(patcher.stop)
 

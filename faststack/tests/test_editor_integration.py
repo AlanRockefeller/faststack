@@ -17,7 +17,9 @@ class TestEditorIntegration(unittest.TestCase):
         self.mock_config = MagicMock()
 
         # Patch config to avoid file I/O or errors
-        self.config_patcher = patch("faststack.app.config", new_callable=make_config_mock)
+        self.config_patcher = patch(
+            "faststack.app.config", new_callable=make_config_mock
+        )
         self.mock_config_module = self.config_patcher.start()
 
         # Instantiate AppController with a dummy path

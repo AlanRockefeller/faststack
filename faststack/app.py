@@ -140,17 +140,34 @@ from faststack.util.win_dpi import start_dpi_watchdog
 import numpy as np
 from faststack.io.indexer import RAW_EXTENSIONS, JPG_EXTENSIONS
 from faststack.io.deletion import (
+    SourceChangedError,
+    capture_file_identity,
     confirm_permanent_delete,
     confirm_batch_permanent_delete,
     permanently_delete_image_files,
+    validate_file_identity,
 )
 from faststack.deletion_types import (
     DeleteJob,
     DeleteResult,
     DeleteRecord,
+    DeleteWorkItem,
     DeletionErrorCodes,
     UIStateRestoration,
 )
+
+
+@dataclass(frozen=True)
+class RawDevelopmentResult:
+    """Immutable result emitted by a RAW worker across the Qt boundary."""
+
+    operation_id: str
+    source_path: Path
+    tif_path: Path
+    develop_key: str
+    success: bool
+    error: Optional[str] = None
+
 
 # AWB thresholds on the -1..+1 normalized slider range.
 # NOOP: skip corrections that are effectively imperceptible in the current gain model.
@@ -360,6 +377,7 @@ class AppController(QObject):
 
     editSourceModeChanged = Signal(str)  # Notify when JPEG/RAW mode changes
     rawDevelopmentStateChanged = Signal()  # Notify when RAW development starts/stops
+    _rawDevelopmentFinished = Signal(object)
     _saveFinished = Signal(
         object
     )  # Signal for save completion (result or error from background)
@@ -426,6 +444,10 @@ class AppController(QObject):
         self._deleteFinished.connect(self._on_delete_finished)
         self._pending_delete_jobs: Dict[int, DeleteJob] = {}  # job_id -> DeleteJob
         self._next_delete_job_id = 0
+        self._rawDevelopmentFinished.connect(
+            self._on_develop_finished,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
         # Preview Offloading Setup
         self._preview_executor = create_daemon_threadpool_executor(
@@ -11356,6 +11378,7 @@ class AppController(QObject):
         src: Path,
         _created_bins: set | None = None,
         unique_tag: str | None = None,
+        expected_identity=None,
     ) -> Optional[Path]:
         """Moves a file to the recycle bin safely. Thread-safe, no Qt access.
 
@@ -11372,6 +11395,8 @@ class AppController(QObject):
         Returns:
             Destination path in recycle bin, or None on failure.
         """
+        if expected_identity is not None:
+            validate_file_identity(src, expected_identity)
         if not src.exists() or not src.is_file():
             return None
 
@@ -11400,6 +11425,8 @@ class AppController(QObject):
         # to close before treating the recycle operation as failed.
         for attempt in range(len(_RECYCLE_SHARING_RETRY_DELAYS) + 1):
             try:
+                if expected_identity is not None:
+                    validate_file_identity(src, expected_identity)
                 os.replace(str(src), str(dest))
                 log.info("Moved %s to recycle bin: %s (rename)", src.name, dest.name)
                 return dest
@@ -11422,9 +11449,13 @@ class AppController(QObject):
                 time.sleep(delay)
 
         try:
+            if expected_identity is not None:
+                validate_file_identity(src, expected_identity)
             shutil.move(str(src), str(dest))
             log.info("Moved %s to recycle bin: %s (copy)", src.name, dest.name)
             return dest
+        except SourceChangedError:
+            raise
         except OSError as e:
             log.error("Failed to recycle %s: %s", src.name, e)
             return None
@@ -11432,19 +11463,32 @@ class AppController(QObject):
     @staticmethod
     def _perm_delete_worker(
         job_id: int,
-        items: list,  # List of (original_index, ImageFile)
+        items: list,
     ) -> dict:
         """Background worker: performs permanent deletion. No Qt access."""
         perm_success = []
         perm_fail = []
 
-        for idx, img in items:
+        perm_changed = []
+
+        for item in items:
+            idx, img = item[:2]
+            work_item = item[2] if len(item) > 2 else None
             try:
-                # permanently_delete_image_files is imported from faststack.io.deletion
-                if permanently_delete_image_files(img):
+                identities = None
+                if work_item is not None:
+                    identities = (
+                        work_item.jpg_identity,
+                        work_item.raw_identity,
+                    )
+                if permanently_delete_image_files(img, identities):
                     perm_success.append((idx, img))
                 else:
                     perm_fail.append((idx, img))
+            except SourceChangedError as e:
+                log.warning("Permanent deletion cancelled for %s: %s", img.path, e)
+                perm_fail.append((idx, img))
+                perm_changed.append((idx, img, str(e)))
             except Exception as e:
                 log.error("Perm delete failed for %s: %s", img.path, e)
                 perm_fail.append((idx, img))
@@ -11454,6 +11498,7 @@ class AppController(QObject):
             "_perm_result": True,
             "perm_success": perm_success,
             "perm_fail": perm_fail,
+            "perm_changed": perm_changed,
         }
 
     @staticmethod
@@ -11466,7 +11511,8 @@ class AppController(QObject):
 
         Args:
             job_id: Unique job identifier.
-            images_to_delete: List of (jpg_path, raw_path) tuples.
+            images_to_delete: List of DeleteWorkItem objects. Legacy two-tuples
+                are accepted for direct callers and snapshotted immediately.
             cancel_event: threading.Event; if set, abort early.
 
         Returns:
@@ -11493,10 +11539,27 @@ class AppController(QObject):
                 cancel_index = i
                 break
 
-            # Sanity Check for Problem A (AttributeError):
-            # images_to_delete MUST be List[Tuple[Path, Optional[Path]]]
-            # If item is (0, (path, raw)), it's a nested structure from incorrect calling code.
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
+            if isinstance(item, DeleteWorkItem):
+                work_item = item
+                jpg_path = item.jpg_path
+                raw_path = item.raw_path
+            elif isinstance(item, (tuple, list)) and len(item) == 2:
+                jpg_path, raw_path = item
+                if isinstance(raw_path, (tuple, list)):
+                    work_item = None
+                else:
+                    work_item = DeleteWorkItem(
+                        jpg_path=jpg_path,
+                        raw_path=raw_path,
+                        jpg_identity=capture_file_identity(jpg_path),
+                        raw_identity=(
+                            capture_file_identity(raw_path) if raw_path else None
+                        ),
+                    )
+            else:
+                work_item = None
+
+            if work_item is None:
                 log.error(
                     "CRITICAL: _delete_worker received invalid item format: %r", item
                 )
@@ -11509,33 +11572,23 @@ class AppController(QObject):
                 )
                 continue
 
-            jpg_path, raw_path = item
-
-            # Robustness: if raw_path is a tuple/list, we have a nested structure error.
-            # This is a hard error — record failure and skip rather than silently recovering,
-            # which would mask upstream bugs.
-            if isinstance(raw_path, (tuple, list)):
-                log.error(
-                    "CRITICAL: _delete_worker received nested tuple item: %r", item
-                )
-                failures.append(
-                    {
-                        "jpg": str(jpg_path) if jpg_path else None,
-                        "raw": None,
-                        "code": DeletionErrorCodes.INVALID_WORK_ITEM.value,
-                    }
-                )
-                continue
-
             processed_count += 1
-            actual_raw_exists = bool(raw_path and raw_path.exists())
 
             try:
+                # Pair preflight: neither member may have changed before the
+                # first destructive operation begins.
+                validate_file_identity(jpg_path, work_item.jpg_identity)
+                if raw_path and work_item.raw_identity is not None:
+                    validate_file_identity(raw_path, work_item.raw_identity)
+
                 # Share the same UUID tag for JPG + RAW so their stems
                 # still match in the recycle bin (enables re-pairing).
                 shared_tag = uuid.uuid4().hex[:8]
                 recycled_jpg = AppController._move_to_recycle(
-                    jpg_path, created_bins, unique_tag=shared_tag
+                    jpg_path,
+                    created_bins,
+                    unique_tag=shared_tag,
+                    expected_identity=work_item.jpg_identity,
                 )
                 if not recycled_jpg:
                     failures.append(
@@ -11548,13 +11601,32 @@ class AppController(QObject):
                     continue
 
                 recycled_raw = None
-                if actual_raw_exists:
+                if (
+                    raw_path
+                    and work_item.raw_identity
+                    and work_item.raw_identity.exists
+                ):
                     try:
                         recycled_raw = AppController._move_to_recycle(
-                            raw_path, created_bins, unique_tag=shared_tag
+                            raw_path,
+                            created_bins,
+                            unique_tag=shared_tag,
+                            expected_identity=work_item.raw_identity,
                         )
                         if not recycled_raw:
                             raise OSError("RAW move failed")
+                    except SourceChangedError:
+                        # The JPG was already moved. Restore it only if its
+                        # original pathname is still empty; never overwrite a
+                        # replacement that appeared during the operation.
+                        if recycled_jpg and not jpg_path.exists():
+                            try:
+                                os.replace(str(recycled_jpg), str(jpg_path))
+                            except OSError:
+                                log.exception(
+                                    "Could not restore JPG after RAW identity changed"
+                                )
+                        raise
                     except OSError as e:
                         log.warning("RAW recycle failed for %s: %s", raw_path.name, e)
                         warnings.append(
@@ -11570,6 +11642,16 @@ class AppController(QObject):
                     }
                 )
 
+            except SourceChangedError as e:
+                log.warning("Deletion cancelled for %s: %s", jpg_path.name, e)
+                failures.append(
+                    {
+                        "jpg": jpg_path,
+                        "raw": raw_path,
+                        "code": DeletionErrorCodes.SOURCE_CHANGED.value,
+                        "message": str(e),
+                    }
+                )
             except PermissionError:
                 log.warning("Permission denied deleting %s", jpg_path.name)
                 failures.append(
@@ -11608,11 +11690,12 @@ class AppController(QObject):
         if did_cancel and cancel_index >= 0:
             remaining = images_to_delete[cancel_index:]
             for item in remaining:
-                # Re-validate shape to prevent crashes on invalid items
-                if not isinstance(item, (tuple, list)) or len(item) != 2:
+                if isinstance(item, DeleteWorkItem):
+                    jpg_path, raw_path = item.jpg_path, item.raw_path
+                elif isinstance(item, (tuple, list)) and len(item) == 2:
+                    jpg_path, raw_path = item
+                else:
                     continue
-
-                jpg_path, raw_path = item
                 failures.append(
                     {
                         "jpg": jpg_path,
@@ -11689,6 +11772,10 @@ class AppController(QObject):
                 # Rollback failures (they have original indices)
                 # Note: job context is required for rollback (restores index/batches/focus)
                 self._rollback_ui_items(result.perm_fail, job)
+                if result.perm_changed:
+                    self.update_status_message(
+                        "Deletion cancelled because the file changed."
+                    )
 
             self._rebuild_path_to_index()
             self.sync_ui_state()
@@ -11768,9 +11855,18 @@ class AppController(QObject):
                 msg = "Image moved to recycle bin"
             self.update_status_message(msg)
         elif result.failures:
-            self.update_status_message(
-                "Deletion cancelled" if result.cancelled else "Delete failed"
+            source_changed = any(
+                failure.code == DeletionErrorCodes.SOURCE_CHANGED.value
+                for failure in result.failures
             )
+            if source_changed:
+                self.update_status_message(
+                    "Deletion cancelled because the file changed."
+                )
+            else:
+                self.update_status_message(
+                    "Deletion cancelled" if result.cancelled else "Delete failed"
+                )
 
         self._schedule_delete_refresh()
 
@@ -11867,8 +11963,15 @@ class AppController(QObject):
                     except Exception as e:
                         log.error("Perm delete worker exception: %s", e)
 
+                work_by_key = {
+                    self._key(item.jpg_path): item for item in job.work_items
+                }
+                permanent_items = [
+                    (idx, img, work_by_key.get(self._key(img.path)))
+                    for idx, img in perm_candidates
+                ]
                 fut = self._delete_executor.submit(
-                    self._perm_delete_worker, job.job_id, perm_candidates
+                    self._perm_delete_worker, job.job_id, permanent_items
                 )
                 fut.add_done_callback(_on_perm_done)
 
@@ -12105,6 +12208,31 @@ class AppController(QObject):
         if self._block_if_saving(*[img.path for img in images_to_delete]):
             return summary
 
+        # Capture authorization before any optimistic UI mutation. Absence is
+        # also part of the snapshot, so a paired path that appears later is
+        # never treated as part of this request.
+        worker_items = []
+        try:
+            for img in images_to_delete:
+                jpg_identity = capture_file_identity(img.path)
+                raw_identity = (
+                    capture_file_identity(img.raw_pair) if img.raw_pair else None
+                )
+                worker_items.append(
+                    DeleteWorkItem(
+                        jpg_path=img.path,
+                        raw_path=img.raw_pair,
+                        jpg_identity=jpg_identity,
+                        raw_identity=raw_identity,
+                    )
+                )
+        except OSError as e:
+            log.warning("Could not capture deletion identity: %s", e)
+            self.update_status_message(
+                "Deletion cancelled because a file could not be verified."
+            )
+            return summary
+
         self._begin_direct_image_transition("image deletion changed the list")
         summary["requested_count"] = len(images_to_delete)
 
@@ -12282,23 +12410,8 @@ class AppController(QObject):
                     model_rows,
                 )
 
-        # Pre-suppress watcher events for these soon-to-be-moved/deleted paths.
-        # Must happen BEFORE the worker starts I/O, because watchdog events can arrive immediately.
-        ttl = (
-            2.0  # seconds; plenty to cover os.replace/shutil.move and watchdog delivery
-        )
-        now = time.monotonic()
-        with self._suppressed_paths_lock:
-            for img in images_to_delete:
-                self._suppressed_paths[self._key(img.path)] = now + ttl
-                if img.raw_pair:
-                    self._suppressed_paths[self._key(img.raw_pair)] = now + ttl
-
         self.sync_ui_state()
         self._restart_quality_decode_timer()
-
-        # snapshot for worker: just paths. Worker checks existence dynamically.
-        worker_items = [(img.path, img.raw_pair) for img in images_to_delete]
 
         # Create job record for tracking/undo
         job_id = self._next_delete_job_id
@@ -12314,6 +12427,7 @@ class AppController(QObject):
             cancel_event=cancel_event,
             previous_index=previous_index,
             images_to_delete=images_to_delete,
+            work_items=worker_items,
             ui_state=UIStateRestoration(
                 saved_batches=pre_batch_snapshot,
                 saved_batch_start_index=pre_batch_start_snapshot,
@@ -12351,7 +12465,9 @@ class AppController(QObject):
                                 "raw": str(r) if r else None,
                                 "code": str(e),
                             }
-                            for p, r in worker_items
+                            for p, r in (
+                                (item.jpg_path, item.raw_path) for item in worker_items
+                            )
                         ],
                         "cancelled": False,
                     }
@@ -13866,43 +13982,37 @@ class AppController(QObject):
             return False
         self.update_status_message("Developing RAW... please wait.")
         log.info("Starting RAW development: %s -> %s", raw_path, tif_path)
+        operation_id = uuid.uuid4().hex
+        source_path = image_file.path
 
         def worker():
-            # Check for optional args in config
-            rt_args = config.get("rawtherapee", "args")
-
-            # Build command: rawtherapee-cli -t -Y -o <out.tif> -c <in.raw>
-            # -t: TIFF output
-            # -b16: 16-bit depth (Critical! Default is often 8-bit)
-            # -Y: Overwrite existing
-            # -o: Output file
-            # -c: Input file (must be last)
-            cmd = [rt_exe, "-t", "-b16", "-Y", "-o", str(tmp_tif_path)]
-
-            if rt_args:
-                try:
-                    # Use shlex to properly parse arguments with quotes/escapes
-                    # On Windows, use posix=False to handle Windows-style paths
-                    parsed_args = shlex.split(rt_args, posix=(os.name != "nt"))
-                    cmd.extend(parsed_args)
-                except ValueError as e:
-                    log.error("Invalid rawtherapee args format: %s", e)
-
-            cmd.extend(["-c", str(raw_path)])
-            cmd_str = " ".join(cmd)  # For logging
-
-            # Run process
-            run_kwargs = {
-                "capture_output": True,
-                "text": True,
-                "timeout": 60,  # 60 second timeout
-            }
-            if sys.platform == "win32":
-                run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
+            completion = RawDevelopmentResult(
+                operation_id=operation_id,
+                source_path=source_path,
+                tif_path=tif_path,
+                develop_key=develop_key,
+                success=False,
+                error="RAW development did not complete.",
+            )
             try:
-                result = subprocess.run(cmd, check=False, **run_kwargs)
+                rt_args = config.get("rawtherapee", "args")
+                cmd = [rt_exe, "-t", "-b16", "-Y", "-o", str(tmp_tif_path)]
+                if rt_args:
+                    try:
+                        cmd.extend(shlex.split(rt_args, posix=(os.name != "nt")))
+                    except ValueError as e:
+                        log.error("Invalid rawtherapee args format: %s", e)
+                cmd.extend(["-c", str(raw_path)])
+                cmd_str = " ".join(cmd)
+                run_kwargs = {
+                    "capture_output": True,
+                    "text": True,
+                    "timeout": 60,
+                }
+                if sys.platform == "win32":
+                    run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
+                result = subprocess.run(cmd, check=False, **run_kwargs)
                 if result.returncode == 0:
                     if tmp_tif_path.exists() and tmp_tif_path.stat().st_size > 0:
                         try:
@@ -13910,83 +14020,75 @@ class AppController(QObject):
                         except OSError as e:
                             msg = f"RawTherapee output was valid but could not replace working TIFF: {e}"
                             log.error(msg)
-                            QTimer.singleShot(
-                                0,
-                                functools.partial(
-                                    self._on_develop_finished,
-                                    False,
-                                    msg,
-                                    develop_key,
-                                ),
-                            )
-                            return
-                        log.info("RAW development successful.")
-                        # Use partial to bind variable deeply
-                        QTimer.singleShot(
-                            0,
-                            functools.partial(
-                                self._on_develop_finished,
-                                True,
-                                None,
+                            completion = RawDevelopmentResult(
+                                operation_id,
+                                source_path,
+                                tif_path,
                                 develop_key,
-                            ),
-                        )
-                        return  # Success path
-                    msg = f"RawTherapee exited successfully but output file is missing or empty.\nCommand: {cmd_str}"
-                    log.error(msg)
-                    QTimer.singleShot(
-                        0,
-                        functools.partial(
-                            self._on_develop_finished,
+                                False,
+                                msg,
+                            )
+                        else:
+                            log.info("RAW development successful.")
+                            completion = RawDevelopmentResult(
+                                operation_id,
+                                source_path,
+                                tif_path,
+                                develop_key,
+                                True,
+                            )
+                    else:
+                        msg = f"RawTherapee exited successfully but output file is missing or empty.\nCommand: {cmd_str}"
+                        log.error(msg)
+                        completion = RawDevelopmentResult(
+                            operation_id,
+                            source_path,
+                            tif_path,
+                            develop_key,
                             False,
                             msg,
-                            develop_key,
-                        ),
-                    )
+                        )
                 else:
                     stderr = result.stderr.strip() if result.stderr else "(no stderr)"
                     stdout = result.stdout.strip() if result.stdout else "(no stdout)"
                     err_msg = f"RawTherapee failed (exit code {result.returncode}):\nCommand: {cmd_str}\nstderr: {stderr}\nstdout: {stdout}"
                     log.error(err_msg)
-                    QTimer.singleShot(
-                        0,
-                        functools.partial(
-                            self._on_develop_finished,
-                            False,
-                            err_msg,
-                            develop_key,
-                        ),
+                    completion = RawDevelopmentResult(
+                        operation_id,
+                        source_path,
+                        tif_path,
+                        develop_key,
+                        False,
+                        err_msg,
                     )
-
             except subprocess.TimeoutExpired:
                 err_msg = f"RawTherapee timed out after 60 seconds.\nCommand: {cmd_str}"
                 log.error(err_msg)
-                QTimer.singleShot(
-                    0,
-                    functools.partial(
-                        self._on_develop_finished,
-                        False,
-                        err_msg,
-                        develop_key,
-                    ),
+                completion = RawDevelopmentResult(
+                    operation_id,
+                    source_path,
+                    tif_path,
+                    develop_key,
+                    False,
+                    err_msg,
                 )
             except Exception as e:
                 err_msg = f"Unexpected error running RawTherapee: {str(e)}"
                 log.exception(err_msg)
-                QTimer.singleShot(
-                    0,
-                    functools.partial(
-                        self._on_develop_finished,
-                        False,
-                        err_msg,
-                        develop_key,
-                    ),
+                completion = RawDevelopmentResult(
+                    operation_id,
+                    source_path,
+                    tif_path,
+                    develop_key,
+                    False,
+                    err_msg,
                 )
             finally:
                 try:
                     tmp_tif_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+                self._rawDevelopmentFinished.emit(completion)
 
         threading.Thread(target=worker, daemon=True).start()
         return True
@@ -14238,30 +14340,30 @@ class AppController(QObject):
         # Notify UI
         self.ui_state.editorImageChanged.emit()
 
-    def _on_develop_finished(
-        self,
-        success: bool,
-        error_msg: Optional[str],
-        develop_key: Optional[str] = None,
-    ):
-        """Callback on main thread after RAW development."""
-        self._mark_raw_development_finished(develop_key)
-        if success:
+    @Slot(object)
+    def _on_develop_finished(self, result: RawDevelopmentResult) -> None:
+        """Apply a RAW completion on the controller's Qt thread."""
+        if self._shutting_down:
+            with self._raw_develop_lock:
+                self._raw_developing_keys.discard(result.develop_key)
+            return
+
+        self._mark_raw_development_finished(result.develop_key)
+        if result.success:
             self.update_status_message("RAW Development complete.")
-            if develop_key is None or (
+            if (
                 self.image_files
                 and 0 <= self.current_index < len(self.image_files)
-                and develop_key
+                and self._key(result.source_path)
+                == self._key(self.image_files[self.current_index].path)
+                and result.develop_key
                 == self._raw_development_key_for_image(
                     self.image_files[self.current_index]
                 )
             ):
-                # Load active path (which should now be the developed TIFF)
                 self.load_image_for_editing()
         else:
-            self.update_status_message(f"Development failed: {error_msg}")
-            # Ensure UI reflects failure (maybe revert mode? or just show error)
-            # Staying in RAW mode but failing to load allows user to try again or see error.
+            self.update_status_message(f"Development failed: {result.error}")
 
     @Slot(result=DecodedImage)
     def get_preview_data(self) -> Optional[DecodedImage]:

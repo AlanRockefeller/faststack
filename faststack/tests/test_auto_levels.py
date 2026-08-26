@@ -19,7 +19,6 @@ def _approx_slider(value):
     return pytest.approx(value, abs=_BIN / 40.0)
 
 
-
 def test_auto_levels_pins_highlights_if_clipped():
     editor = ImageEditor()
     # 10x10 image

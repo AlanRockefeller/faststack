@@ -20,7 +20,9 @@ class TestEditorLifecycleAndSafety(unittest.TestCase):
         self.sidecar_patcher = patch("faststack.app.SidecarManager")
         self.prefetcher_patcher = patch("faststack.app.Prefetcher")
         self.cache_patcher = patch("faststack.app.ByteLRUCache")
-        self.config_patcher = patch("faststack.app.config", new_callable=make_config_mock)
+        self.config_patcher = patch(
+            "faststack.app.config", new_callable=make_config_mock
+        )
 
         self.mock_watcher = self.watcher_patcher.start()
         self.mock_sidecar = self.sidecar_patcher.start()

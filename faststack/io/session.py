@@ -172,9 +172,7 @@ def _pid_alive(pid: int) -> bool:
                 return ctypes.get_last_error() != 87
             try:
                 exit_code = wintypes.DWORD()
-                if not kernel32.GetExitCodeProcess(
-                    handle, ctypes.byref(exit_code)
-                ):
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                     return True
                 # STILL_ACTIVE = 259
                 return exit_code.value == 259

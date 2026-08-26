@@ -223,9 +223,9 @@ def test_windows_boot_id_no_longer_mixes_the_wall_clock(monkeypatch):
     monkeypatch.setattr(session_mod.time, "time", lambda: 1_800_000_000.0)
     after = session_mod._current_boot_id()
 
-    assert before == "" and after == "", (
-        "Windows must not derive a boot id from the wall clock"
-    )
+    assert (
+        before == "" and after == ""
+    ), "Windows must not derive a boot id from the wall clock"
     assert before == after
 
 

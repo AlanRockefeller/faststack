@@ -22,7 +22,30 @@ class DeletionErrorCodes(str, Enum):
     ROLLBACK_DEST_EXISTS = "rollback_dest_exists"
     INVALID_WORK_ITEM = "invalid_work_item"
     CANCELLED = "cancelled"  # Added standardized code
+    SOURCE_CHANGED = "source_changed"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class FileIdentity:
+    """Immutable identity captured when deletion is accepted."""
+
+    exists: bool
+    device: Optional[int] = None
+    file_id: Optional[int] = None
+    size: Optional[int] = None
+    mtime_ns: Optional[int] = None
+    ctime_ns: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class DeleteWorkItem:
+    """Paths and their original deletion authorization."""
+
+    jpg_path: Path
+    raw_path: Optional[Path]
+    jpg_identity: FileIdentity
+    raw_identity: Optional[FileIdentity]
 
 
 @dataclass
@@ -53,6 +76,7 @@ class DeleteJob:
     user_undone: bool = False
     undo_requested: bool = False  # Policy 1: auto-restore files on completion
     ui_state: Optional[UIStateRestoration] = None
+    work_items: List[DeleteWorkItem] = field(default_factory=list)
 
 
 @dataclass
@@ -102,6 +126,7 @@ class DeleteResult:  # pylint: disable=too-many-instance-attributes
     is_perm_result: bool = False
     perm_success: list = field(default_factory=list)  # List[(idx, ImageFile)]
     perm_fail: list = field(default_factory=list)  # List[(idx, ImageFile)]
+    perm_changed: list = field(default_factory=list)
 
     @classmethod
     def from_worker_dict(cls, raw: dict) -> "DeleteResult":
@@ -116,6 +141,7 @@ class DeleteResult:  # pylint: disable=too-many-instance-attributes
                 is_perm_result=True,
                 perm_success=raw.get("perm_success", []),
                 perm_fail=raw.get("perm_fail", []),
+                perm_changed=raw.get("perm_changed", []),
             )
 
         def _to_path(v):

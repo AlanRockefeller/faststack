@@ -50,7 +50,6 @@ class DummyImageFile:
         return self.path.with_name(f"{self.path.stem}-developed.jpg")
 
 
-
 def _stub_develop_guards(app):
     """Neutralize the in-flight develop guards on a MagicMock controller.
 
@@ -59,6 +58,7 @@ def _stub_develop_guards(app):
     """
     app._is_raw_development_in_flight.return_value = False
     app._mark_raw_development_started.return_value = "develop-key"
+
 
 class TestRawPipeline(unittest.TestCase):
     @patch("faststack.app.os.path.exists")
@@ -161,16 +161,10 @@ class TestRawPipeline(unittest.TestCase):
 
         app._develop_raw_backend()
 
-        # Check QTimer call
-        mock_single_shot.assert_called()
-        # call_args[0] is (0, partial_obj)
-        _, callback = mock_single_shot.call_args[0]
-        # callback is functools.partial(self._on_develop_finished, False, err_msg)
-        # For a bound method, callback.func is the method
-        self.assertTrue(hasattr(callback, "func"))
-        self.assertTrue("_on_develop_finished" in str(callback.func))
-        self.assertEqual(callback.args[0], False)  # Success = False
-        self.assertIn("timed out", callback.args[1])  # Msg
+        mock_single_shot.assert_not_called()
+        completion = app._rawDevelopmentFinished.emit.call_args.args[0]
+        self.assertFalse(completion.success)
+        self.assertIn("timed out", completion.error)
 
     @patch("faststack.app.os.path.exists")
     @patch("faststack.app.subprocess.run")
