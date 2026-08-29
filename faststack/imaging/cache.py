@@ -429,6 +429,26 @@ class ByteLRUCache(LRUCache):
                 len(paths),
             )
 
+    def release_tombstones(self, paths: list[Union[Path, str]]) -> None:
+        """Allow restored files to be cached again immediately.
+
+        ``evict_paths`` temporarily blocks late decode results from resurrecting
+        deleted files. Once an undo has put those files back on disk, waiting
+        for that timeout would make the image provider return a gray fallback.
+        """
+        prefixes = set()
+        for path in paths:
+            normalized = (
+                path.as_posix()
+                if isinstance(path, Path)
+                else str(path).replace("\\", "/")
+            )
+            prefixes.add(f"{normalized}::")
+        with self._lock:
+            for prefix in prefixes:
+                self._tombstones.discard(prefix)
+                self._tombstone_expiry.pop(prefix, None)
+
 
 def build_cache_key(
     image_path: Union[Path, str],

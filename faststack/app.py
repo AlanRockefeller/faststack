@@ -672,6 +672,14 @@ class AppController(QObject):
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
         self._suppressed_paths: Dict[str, float] = {}  # key -> monotonic expiry time
+        # Normalized key -> [expected FileIdentity, refcount, monotonic deadline]
+        # for files a delete worker is about to move. A timed window cannot
+        # bound a batch whose per-file Windows retries run for seconds, so the
+        # entry lives for as long as the job does; the deadline is only a
+        # safety net for a job whose completion handler never runs. Suppression
+        # is identity-aware: a file that no longer matches what was authorized
+        # for deletion is an external replacement and must still refresh.
+        self._pending_delete_identities: Dict[str, list] = {}
         # Normalized key -> in-flight save count. A timed suppression window
         # cannot bound a save of unknown duration, so writes we are performing
         # ourselves are suppressed for exactly as long as they are running.
@@ -2559,6 +2567,13 @@ class AppController(QObject):
                             path,
                         )
                     return
+                if self._is_pending_delete_path(key, p, now):
+                    if _debug_mode:
+                        log.debug(
+                            "Suppressing watcher refresh for in-flight delete: %s",
+                            path,
+                        )
+                    return
                 expiry = self._suppressed_paths.get(key)
                 if expiry:
                     if now < expiry:
@@ -2624,6 +2639,79 @@ class AppController(QObject):
                     continue
                 if key:
                     self._suppressed_paths[key] = now + ttl
+
+    def _register_pending_delete_paths(self, work_items) -> None:
+        """Suppress watcher refreshes for files an in-flight delete job owns.
+
+        Must run before the worker starts I/O: watchdog events for the first
+        move can arrive while later files in the same batch are still on disk,
+        and a rescan would reinsert rows the worker is about to remove.
+        """
+        # Windows sharing-violation retries can add over a second per file.
+        deadline = time.monotonic() + 60.0 + 5.0 * len(work_items)
+        with self._suppressed_paths_lock:
+            for item in work_items:
+                for path, identity in (
+                    (item.jpg_path, item.jpg_identity),
+                    (item.raw_path, item.raw_identity),
+                ):
+                    if path is None:
+                        continue
+                    try:
+                        key = self._key(path)
+                    except (OSError, TypeError, ValueError):
+                        continue
+                    if not key:
+                        continue
+                    entry = self._pending_delete_identities.get(key)
+                    if entry is None:
+                        self._pending_delete_identities[key] = [identity, 1, deadline]
+                    else:
+                        entry[0] = identity
+                        entry[1] += 1
+                        entry[2] = max(entry[2], deadline)
+
+    def _release_pending_delete_paths(self, work_items) -> None:
+        """Drop the pending-delete suppression registered for *work_items*."""
+        with self._suppressed_paths_lock:
+            for item in work_items:
+                for path in (item.jpg_path, item.raw_path):
+                    if path is None:
+                        continue
+                    try:
+                        key = self._key(path)
+                    except (OSError, TypeError, ValueError):
+                        continue
+                    entry = self._pending_delete_identities.get(key)
+                    if entry is None:
+                        continue
+                    entry[1] -= 1
+                    if entry[1] <= 0:
+                        del self._pending_delete_identities[key]
+
+    def _is_pending_delete_path(self, key: str, path: Path, now: float) -> bool:
+        """Return True when *path* is a file our own delete worker is moving.
+
+        Caller must hold ``_suppressed_paths_lock``. A path still registered but
+        whose on-disk file no longer matches the identity deletion was
+        authorized against is treated as an external replacement, so the
+        watcher event is delivered normally.
+        """
+        entry = self._pending_delete_identities.get(key)
+        if entry is None:
+            return False
+        if now >= entry[2]:
+            # Safety net: a completion handler that never ran must not
+            # suppress this path forever.
+            del self._pending_delete_identities[key]
+            return False
+        try:
+            current = capture_file_identity(path)
+        except OSError:
+            return True
+        # Gone means our move already happened; unchanged means it is still
+        # waiting its turn in the same job.
+        return not current.exists or current == entry[0]
 
     @Slot()
     def _start_watcher_debounce_timer(self) -> None:
@@ -11574,6 +11662,16 @@ class AppController(QObject):
 
             processed_count += 1
 
+            # An orphan RAW is indexed with path == raw_pair (see
+            # find_images()); both members name one physical file. Collapse the
+            # pair so the file is validated and moved exactly once, instead of
+            # the second move seeing it already gone and reporting
+            # SOURCE_CHANGED.
+            if raw_path is not None and AppController._key(
+                raw_path
+            ) == AppController._key(jpg_path):
+                raw_path = None
+
             try:
                 # Pair preflight: neither member may have changed before the
                 # first destructive operation begins.
@@ -11737,6 +11835,7 @@ class AppController(QObject):
         job = self._pending_delete_jobs.pop(result.job_id, None)
 
         if job:
+            self._release_pending_delete_paths(job.work_items)
             # Remove pending_delete placeholders from undo history
             self.undo_history = [
                 entry
@@ -11814,6 +11913,25 @@ class AppController(QObject):
             # Do NOT record history.
             # Failures/Cancelled items are already handled by the undo_delete logic (restored to UI)
             # or simply ignored because they never moved.
+
+            # The optimistic undo may have happened after the worker moved the
+            # selected file. Now that all worker I/O and auto-restores are
+            # complete, remove the deletion cache tombstone, jump to the
+            # restored image, and issue a fresh provider request.
+            if job.removed_items:
+                restored_paths = [
+                    path
+                    for _, image in job.removed_items
+                    for path in (image.path, image.raw_pair)
+                    if path is not None and path.exists()
+                ]
+                self.image_cache.release_tombstones(restored_paths)
+                _, target_image = min(
+                    job.removed_items,
+                    key=lambda item: abs(item[0] - job.previous_index),
+                )
+                if target_image.path.exists():
+                    self._post_undo_refresh_and_select(target_image.path)
 
             # Update status
             self.update_status_message("Deletion cancelled (files restored)")
@@ -11953,6 +12071,7 @@ class AppController(QObject):
                 # ASYNC permanent delete
                 # Put job back in pending map so _on_delete_finished can find it again
                 self._pending_delete_jobs[job.job_id] = job
+                self._register_pending_delete_paths(job.work_items)
 
                 # Define callback to bridge back to main thread
                 def _on_perm_done(future):
@@ -12440,6 +12559,11 @@ class AppController(QObject):
         # Add single placeholder undo entry per job
         self.undo_history.append(("pending_delete", job_id, timestamp))
 
+        # Suppress watcher refreshes for these paths for as long as the job
+        # runs, so a scan triggered by the first move cannot reinsert files
+        # later in the same batch that are still on disk.
+        self._register_pending_delete_paths(worker_items)
+
         log.info(
             "Delete enqueued: job_id=%d, type='%s', count=%d",
             job_id,
@@ -12695,6 +12819,7 @@ class AppController(QObject):
 
         self._bump_display_generation()
         self.image_cache.clear()
+        self.image_cache.release_tombstones([target])
         self.prefetcher.cancel_all()
         self.prefetcher.update_prefetch(self.current_index)
         self.sync_ui_state()
@@ -12760,6 +12885,7 @@ class AppController(QObject):
                 # Restore removed items to in-memory list immediately
                 removed_items = job.removed_items
                 previous_index = job.previous_index
+                preserved_path = self._current_image_path()
                 self._begin_direct_image_transition("undo restored a pending deletion")
 
                 # Re-insert in ascending index order so each insertion shifts
@@ -12768,7 +12894,19 @@ class AppController(QObject):
                     insert_idx = min(idx, len(self.image_files))
                     self.image_files.insert(insert_idx, img)
 
-                self.current_index = min(previous_index, len(self.image_files) - 1)
+                self._rebuild_path_to_index()
+                # Keep showing the user's current image until the worker has
+                # definitely stopped moving files. Its completion path jumps
+                # to the restored image and starts the fresh decode.
+                selected_index = (
+                    self._path_to_index.get(self._key(preserved_path))
+                    if preserved_path is not None
+                    else None
+                )
+                if selected_index is not None:
+                    self.current_index = selected_index
+                else:
+                    self.current_index = min(previous_index, len(self.image_files) - 1)
                 self._bump_display_generation()
                 # Targeted eviction instead of full clear
                 if self.image_cache is not None:
@@ -12782,7 +12920,6 @@ class AppController(QObject):
                 self.prefetcher.cancel_all()
                 if self.image_files:
                     self.prefetcher.update_prefetch(self.current_index)
-                self._rebuild_path_to_index()
                 # Restore batch state that was shifted during _delete_indices
                 ui = job.ui_state
                 if ui is not None and ui.saved_batches is not None and removed_items:
