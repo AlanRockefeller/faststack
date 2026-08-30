@@ -2880,6 +2880,8 @@ class UIState(QObject):
 
         restored = result["restored_count"]
         skipped = result["skipped_count"]
+        superseded = result["superseded_count"]
+        ambiguous = result["ambiguous_count"]
         legacy = result["legacy_remaining_count"]
         dest = result["dest_dir"]
 
@@ -2890,8 +2892,14 @@ class UIState(QObject):
                 f"Restored {restored} file{'s' if restored != 1 else ''} to {dest}"
             )
         if skipped > 0:
+            parts.append(f"{skipped} skipped (destination exists or restore failed)")
+        if superseded > 0:
             parts.append(
-                f"{skipped} skipped (already exist{'s' if skipped == 1 else ''})"
+                f"{superseded} older version{'s' if superseded != 1 else ''} kept"
+            )
+        if ambiguous > 0:
+            parts.append(
+                f"{ambiguous} ambiguous version{'s' if ambiguous != 1 else ''} kept"
             )
 
         msg = ", ".join(parts) if parts else "Nothing to restore"

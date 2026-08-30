@@ -813,7 +813,10 @@ class ImageEditor:
         self._cached_highlight_analysis: Optional[Dict[str, Any]] = None
 
         # Cache for luma detail bands (pyramid blur decomposition)
-        # Stores: {'hash': int, 'Y20': ndarray, 'Y3': ndarray, 'Y1': ndarray}
+        # Stores hash/frozen upstream edits, effective detail scale, exposure
+        # gain, and the Y20/Y3/Y1 arrays. Scale is part of cache validity so a
+        # same-shaped buffer rendered against different source geometry cannot
+        # reuse spatial-frequency bands from another preview tier.
         self._cached_detail_bands: Optional[Dict[str, Any]] = None
 
         # Cached 768-entry LUT list for save_image_uint8_levels (R+G+B tables),
@@ -1502,6 +1505,7 @@ class ImageEditor:
         cache_context: Optional[dict] = None,
         update_highlight_state: bool = True,
         downscale_long_edge: Optional[int] = None,
+        detail_source_scale: float = 1.0,
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> np.ndarray:
@@ -1516,6 +1520,12 @@ class ImageEditor:
         AFTER geometry (rotation/crop) but BEFORE tonal edits. Display-only
         renders use it so a full-resolution master is not processed at 20MP
         when the screen can only show a fraction of that.
+
+        ``detail_source_scale`` is the input buffer's pixel scale relative to
+        the full-resolution source. Geometry is scale-equivariant, so combining
+        this with the actual post-geometry downscale keeps detail blur radii in
+        the same physical image space for crop and rotation as well as full-frame
+        previews.
 
         ``protect_input`` lets callers pass a shared buffer (e.g.
         ``self.float_image``) without copying it first: after geometry and
@@ -1692,6 +1702,7 @@ class ImageEditor:
         # downscale of the cropped master is visually equivalent to rendering
         # at full resolution and letting the GPU scale it down — and several
         # times cheaper.
+        detail_render_scale = max(0.0, min(float(detail_source_scale), 1.0))
         if downscale_long_edge and cv2 is not None:
             h, w = arr.shape[:2]
             long_edge = max(h, w)
@@ -1700,6 +1711,9 @@ class ImageEditor:
                 new_w = max(1, round(w * scale))
                 new_h = max(1, round(h * scale))
                 arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                # Use the realized pixel ratio after rounding, not merely the
+                # requested long-edge ratio.
+                detail_render_scale *= min(new_w / w, new_h / h)
 
         _mark("downscale")
         _check_cancelled()
@@ -1936,6 +1950,7 @@ class ImageEditor:
 
                 # Check cache for detail bands (hash + frozen tuple verification)
                 detail_hash, detail_frozen = self._get_detail_upstream_hash(edits)
+                detail_scale_key = round(detail_render_scale, 8)
                 Y20_cached = Y3_cached = Y1_cached = None
                 cache_hit = False
                 cached_exp_gain = 1.0
@@ -1951,6 +1966,7 @@ class ImageEditor:
                         cached
                         and cached.get("hash") == detail_hash
                         and cached.get("frozen") == detail_frozen
+                        and cached.get("detail_scale") == detail_scale_key
                     ):
                         Y20_cached = cached.get("Y20")
                         Y3_cached = cached.get("Y3")
@@ -1988,26 +2004,33 @@ class ImageEditor:
                 Y_3d = Y[..., None]  # (H, W, 1) for blur function
                 Y20 = Y3 = Y1 = None
                 newly_computed = {"Y20": None, "Y3": None, "Y1": None}
+                radius_scale = max(detail_render_scale, 0.001)
 
                 if need_Y20:
                     if Y20_cached is not None:
                         Y20 = Y20_cached * exp_scale
                     else:
-                        Y20 = _extract_2d(_gaussian_blur_float(Y_3d, radius=20.0))
+                        Y20 = _extract_2d(
+                            _gaussian_blur_float(Y_3d, radius=20.0 * radius_scale)
+                        )
                         newly_computed["Y20"] = Y20
 
                 if need_Y3:
                     if Y3_cached is not None:
                         Y3 = Y3_cached * exp_scale
                     else:
-                        Y3 = _extract_2d(_gaussian_blur_float(Y_3d, radius=3.0))
+                        Y3 = _extract_2d(
+                            _gaussian_blur_float(Y_3d, radius=3.0 * radius_scale)
+                        )
                         newly_computed["Y3"] = Y3
 
                 if need_Y1:
                     if Y1_cached is not None:
                         Y1 = Y1_cached * exp_scale
                     else:
-                        Y1 = _extract_2d(_gaussian_blur_float(Y_3d, radius=1.0))
+                        Y1 = _extract_2d(
+                            _gaussian_blur_float(Y_3d, radius=1.0 * radius_scale)
+                        )
                         newly_computed["Y1"] = Y1
 
                 # Update cache if we computed any new blurs
@@ -2019,6 +2042,7 @@ class ImageEditor:
                             new_cache = {
                                 "hash": detail_hash,
                                 "frozen": detail_frozen,
+                                "detail_scale": detail_scale_key,
                                 "exp_gain": cached_exp_gain,  # Keep original exp_gain for existing blurs
                                 "Y20": Y20_cached,
                                 "Y3": Y3_cached,
@@ -2038,6 +2062,7 @@ class ImageEditor:
                             new_cache = {
                                 "hash": detail_hash,
                                 "frozen": detail_frozen,
+                                "detail_scale": detail_scale_key,
                                 "exp_gain": current_exp_gain,
                                 "Y20": newly_computed["Y20"],
                                 "Y3": newly_computed["Y3"],
@@ -3063,6 +3088,7 @@ class ImageEditor:
                 discardable reduced-resolution drag render.
         """
         cached: Optional[DecodedImage] = None
+        detail_source_scale = 1.0
         with self._lock:
             # Check cache validity
             if (
@@ -3078,6 +3104,20 @@ class ImageEditor:
                 # is only ever reassigned, never mutated in place, so the render
                 # can share it; protect_input copies only the post-crop region.
                 base = self.float_preview
+                if base is not None:
+                    if self.float_image is not None:
+                        full_h, full_w = self.float_image.shape[:2]
+                    elif self.original_image is not None:
+                        full_w, full_h = self.original_image.size
+                    else:
+                        full_w = full_h = 0
+                    if full_w > 0 and full_h > 0:
+                        base_h, base_w = base.shape[:2]
+                        detail_source_scale = min(
+                            base_w / full_w,
+                            base_h / full_h,
+                            1.0,
+                        )
                 edits = (
                     dict(self.current_edits)
                     if edits_override is None
@@ -3103,6 +3143,7 @@ class ImageEditor:
             apply_loupe_color=True,
             icc_bytes=icc_bytes,
             downscale_long_edge=downscale_long_edge,
+            detail_source_scale=detail_source_scale,
             protect_input=True,
         )
 
@@ -3172,6 +3213,7 @@ class ImageEditor:
         icc_bytes: Optional[bytes] = None,
         cache_context: Optional[dict] = None,
         downscale_long_edge: Optional[int] = None,
+        detail_source_scale: float = 1.0,
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> DecodedImage:
@@ -3186,6 +3228,7 @@ class ImageEditor:
             for_export=for_export,
             cache_context=cache_context,
             downscale_long_edge=downscale_long_edge,
+            detail_source_scale=detail_source_scale,
             protect_input=protect_input,
             cancel_check=cancel_check,
         )

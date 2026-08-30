@@ -478,6 +478,31 @@ class ThumbnailModel(QAbstractListModel):
             [self.IsInBatchRole],
         )
 
+    def notify_current_paths_changed(
+        self,
+        old_path: Optional[Path],
+        new_path: Optional[Path],
+        *,
+        force: bool = False,
+    ) -> None:
+        """Invalidate only rows whose dynamic current-image role changed."""
+        old_key = normalize_path_key(old_path) if old_path is not None else None
+        new_key = normalize_path_key(new_path) if new_path is not None else None
+        if old_key == new_key and not force:
+            return
+
+        rows = set()
+        for path_key in (old_key, new_key):
+            if path_key is None:
+                continue
+            row = self._path_to_row.get(path_key)
+            if row is not None:
+                rows.add(row)
+
+        for row in sorted(rows):
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index, [self.IsCurrentRole])
+
     def remove_rows_by_path(self, paths: List[Path]) -> None:
         """Targeted removal of rows by path without full model reset."""
         if not paths or not self._entries:

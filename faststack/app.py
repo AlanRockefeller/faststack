@@ -2677,6 +2677,15 @@ class AppController(QObject):
             return self.image_files[self.current_index].path
         return None
 
+    def _notify_thumbnail_current_path_changed(
+        self, old_path: Optional[Path], *, force: bool = False
+    ) -> None:
+        """Invalidate current-image badges without rebuilding the grid model."""
+        if self._thumbnail_model:
+            self._thumbnail_model.notify_current_paths_changed(
+                old_path, self._current_image_path(), force=force
+            )
+
     def _index_for_saved_path(self, saved_path: Optional[str]) -> Optional[int]:
         """Resolve a persisted absolute or folder-relative image path."""
         if not saved_path:
@@ -2699,10 +2708,28 @@ class AppController(QObject):
         self._grid_refreshes = 0
         self._grid_model_dirty = True
 
+        # Establish observation before the authoritative scan. Watchdog callbacks
+        # only queue the controller's debounce timer, so changes reported while
+        # load() is building the initial state cannot run against a half-loaded
+        # controller; they reconcile after this call returns to the event loop.
+        # If watching is unavailable the scan still provides a usable snapshot.
+        try:
+            watching = self.watcher.start()
+        except Exception:
+            log.exception("Watcher failed to start for %s", self.image_dir)
+            watching = False
+        if watching is False:
+            log.warning(
+                "Continuing without live file monitoring for %s", self.image_dir
+            )
+
         # Publish the new list only after its restored current index and decode
         # state are ready. An early imageCountChanged used to make QML request
         # index 0 while the real saved index was still being restored.
+        # Because watching is already active, this is also the authoritative
+        # post-watch snapshot that closes the startup/switch observation gap.
         self.refresh_image_list(notify=False)  # Initial scan from disk
+        provisional_current_path = self._current_image_path()
         if not self.image_files:
             self.current_index = 0
             # Nothing will ever be decoded or presented here, so the startup
@@ -2721,6 +2748,11 @@ class AppController(QObject):
                 if path_index is not None
                 else max(0, min(saved_index, len(self.image_files) - 1))
             )
+        # The model may have reset before the restored index was known (startup)
+        # or before the new directory's loupe map existed (directory switch).
+        self._notify_thumbnail_current_path_changed(
+            provisional_current_path, force=True
+        )
         log.info(
             "[STARTUP] %.3fs index restored: index=%d of %d",
             _startup_elapsed(),
@@ -2749,18 +2781,6 @@ class AppController(QObject):
             self._current_image_path(),
         )
         self._remember_last_directory()
-        # Best-effort: Watcher.start() reports failure instead of raising, but
-        # load() runs after the window is visible so even an unexpected error
-        # must not leave a half-initialised app (FS-P1-005).
-        try:
-            watching = self.watcher.start()
-        except Exception:
-            log.exception("Watcher failed to start for %s", self.image_dir)
-            watching = False
-        if watching is False:
-            log.warning(
-                "Continuing without live file monitoring for %s", self.image_dir
-            )
 
         # A pending resize timer cannot fire while requestImage() is blocking.
         # Commit its latest dimensions now so the first decode is display-sized.
@@ -3170,6 +3190,7 @@ class AppController(QObject):
         self._grid_model_dirty = True
         if self._thumbnail_model and self._is_grid_view_active:
             self._refresh_thumbnail_model_from_controller()
+        provisional_current_path = self._current_image_path()
 
         # Bust decode caches so modified-on-disk files are re-decoded.
         # Invalidate only the files the watcher reported (a save produces a
@@ -3204,6 +3225,9 @@ class AppController(QObject):
                 if self.image_files
                 else 0
             )
+        self._notify_thumbnail_current_path_changed(
+            provisional_current_path, force=True
+        )
 
         self._do_prefetch(self.current_index)
         self.sync_ui_state(image_count_changed=True)
@@ -3539,12 +3563,14 @@ class AppController(QObject):
         Returns True if saved_path was found.
         """
         cp = Path(saved_path)
+        old_current_path = self._current_image_path()
 
         # Fast path: normalized key lookup (must match _rebuild_path_to_index format)
         path_key = self._key(cp)
         new_idx = self._path_to_index.get(path_key)
         if new_idx is not None:
             self.current_index = new_idx
+            self._notify_thumbnail_current_path_changed(old_current_path)
             return True
 
         # Name-based fallback (drive letter / symlink mismatches)
@@ -3552,6 +3578,7 @@ class AppController(QObject):
         for i, img_file in enumerate(self.image_files):
             if img_file.path.name == target_name:
                 self.current_index = i
+                self._notify_thumbnail_current_path_changed(old_current_path)
                 return True
 
         log.warning("_reindex_after_save: could not find %s in list", saved_path)
@@ -8286,7 +8313,9 @@ class AppController(QObject):
         self._reset_crop_settings()
         self._reset_darken_on_navigation()
 
+        old_current_path = self._current_image_path()
         self.current_index = index  # Set index first so signals pick up correct image
+        self._notify_thumbnail_current_path_changed(old_current_path)
         if direction in (-1, 1):
             self._last_navigation_direction = direction
 
@@ -13086,6 +13115,7 @@ class AppController(QObject):
         if self._thumbnail_model:
             del_paths = [img.path for img in images_to_delete]
             self._thumbnail_model.remove_rows_by_path(del_paths)
+            self._notify_thumbnail_current_path_changed(previous_path)
 
             # Diagnostic: check synchronization between controller and model
             if _debug_mode:
@@ -13200,17 +13230,21 @@ class AppController(QObject):
         self, preserved_path: Optional[Path], previous_index: int
     ):
         """Reposition current_index after the image list refreshed post-deletion."""
+        old_current_path = self._current_image_path()
         if not self.image_files:
             self.current_index = 0
+            self._notify_thumbnail_current_path_changed(old_current_path)
             return
 
         if preserved_path:
             for i, img_file in enumerate(self.image_files):
                 if img_file.path == preserved_path:
                     self.current_index = i
+                    self._notify_thumbnail_current_path_changed(old_current_path)
                     return
 
         self.current_index = min(previous_index, len(self.image_files) - 1)
+        self._notify_thumbnail_current_path_changed(old_current_path)
 
     @Slot()
     def delete_current_image_only(self):
@@ -13388,6 +13422,7 @@ class AppController(QObject):
             self._clear_last_rendered_preview_locked()
 
         self.refresh_image_list()
+        provisional_current_path = self._current_image_path()
 
         # Use _key-based lookup (consistent with _reindex_after_save) for
         # robust cross-platform path matching on WSL/Windows.
@@ -13402,6 +13437,9 @@ class AppController(QObject):
                 if img_file.path.name == target_name:
                     self.current_index = i
                     break
+        self._notify_thumbnail_current_path_changed(
+            provisional_current_path, force=True
+        )
 
         self._bump_display_generation()
         self.image_cache.clear()
@@ -13493,6 +13531,7 @@ class AppController(QObject):
                     self.current_index = selected_index
                 else:
                     self.current_index = min(previous_index, len(self.image_files) - 1)
+                self._notify_thumbnail_current_path_changed(preserved_path)
                 self._bump_display_generation()
                 # Targeted eviction instead of full clear
                 if self.image_cache is not None:
@@ -18413,7 +18452,15 @@ class AppController(QObject):
 
     # ---- regex for reversing UUID-suffixed recycle bin names ----
     # Current format uses ``._fs_`` marker: ``{stem}._fs_{8hex}{suffix}``
-    _RECYCLE_FS_RE = re.compile(r"^(.+)\._fs_[0-9a-f]{8}$", re.IGNORECASE)
+    _RECYCLE_FS_RE = re.compile(r"^(.+)\._fs_([0-9a-f]{8})$", re.IGNORECASE)
+
+    @staticmethod
+    def _recycled_name_parts(recycled_path: Path) -> Optional[tuple[str, str]]:
+        """Return ``(original_name, operation_tag)`` for a current-format file."""
+        match = AppController._RECYCLE_FS_RE.match(recycled_path.stem)
+        if match is None:
+            return None
+        return match.group(1) + recycled_path.suffix, match.group(2).casefold()
 
     @staticmethod
     def _original_name_from_recycled(recycled_path: Path) -> Optional[str]:
@@ -18429,10 +18476,24 @@ class AppController(QObject):
         Returns:
             The original filename, or None if the name doesn't match the pattern.
         """
-        m = AppController._RECYCLE_FS_RE.match(recycled_path.stem)
-        if m:
-            return m.group(1) + recycled_path.suffix
-        return None
+        parts = AppController._recycled_name_parts(recycled_path)
+        return parts[0] if parts is not None else None
+
+    def _recycle_history_timestamps(self) -> dict[str, int]:
+        """Map known recycled paths to their actual in-session delete time."""
+        timestamps: dict[str, int] = {}
+        for action_type, action_data, timestamp in self.undo_history:
+            if action_type != "delete":
+                continue
+            try:
+                (_, jpg_bin), (_, raw_bin) = action_data
+            except (TypeError, ValueError):
+                continue
+            timestamp_ns = int(float(timestamp) * 1_000_000_000)
+            for recycled_path in (jpg_bin, raw_bin):
+                if recycled_path is not None:
+                    timestamps[self._key(recycled_path)] = timestamp_ns
+        return timestamps
 
     def _collect_active_bins(self) -> set:
         """Return the set of existing recycle bin directories (tracked + local).
@@ -18533,8 +18594,8 @@ class AppController(QObject):
             bin_path_str: Absolute path string of the recycle bin directory.
 
         Returns:
-            Dict with restored_count, skipped_count, legacy_remaining_count,
-            dest_dir, bin_path.
+            Dict with restored/skipped/superseded/ambiguous/legacy counts,
+            dest_dir, and bin_path.
         """
         bin_path = Path(bin_path_str).resolve()
         dest_dir = bin_path.parent
@@ -18542,6 +18603,8 @@ class AppController(QObject):
         result = {
             "restored_count": 0,
             "skipped_count": 0,
+            "superseded_count": 0,
+            "ambiguous_count": 0,
             "legacy_remaining_count": 0,
             "dest_dir": dest_dir_str,
             "bin_path": bin_path_str,
@@ -18569,13 +18632,164 @@ class AppController(QObject):
             log.exception("Failed to iterate recycle bin %s", bin_path)
             entries = []
 
+        history_timestamps = self._recycle_history_timestamps()
+        operations: dict[tuple[str, str], list[tuple[Path, str, int, bool]]] = {}
         for p in entries:
             if not p.is_file():
                 continue
-            original_name = self._original_name_from_recycled(p)
-            if original_name is None:
+            parts = self._recycled_name_parts(p)
+            if parts is None:
                 result["legacy_remaining_count"] += 1
                 continue
+            original_name, operation_tag = parts
+            known_timestamp = self._key(p) in history_timestamps
+            timestamp_ns = history_timestamps.get(self._key(p), 0)
+            if not known_timestamp and os.name != "nt":
+                # POSIX ctime normally records the same-filesystem rename that
+                # recycled the entry. It remains only an approximation because
+                # later metadata changes can advance it. Native Windows ctime
+                # is creation time on supported Python versions, not recycle
+                # time, so it must not be used to order historical versions.
+                try:
+                    timestamp_ns = p.stat().st_ctime_ns
+                except OSError:
+                    timestamp_ns = 0
+            operation_key = (operation_tag, Path(original_name).stem.casefold())
+            operations.setdefault(operation_key, []).append(
+                (p, original_name, timestamp_ns, known_timestamp)
+            )
+
+        versions: dict[
+            tuple[str, str],
+            list[tuple[str, list[tuple[Path, str, int, bool]], int, bool]],
+        ] = {}
+        raw_primary_names: dict[str, set[str]] = {}
+        for operation_entries in operations.values():
+            jpeg_names = {
+                entry[1].casefold()
+                for entry in operation_entries
+                if Path(entry[1]).suffix.casefold() in JPG_EXTENSIONS
+            }
+            if len(jpeg_names) != 1:
+                continue
+            primary_name = next(iter(jpeg_names))
+            for entry in operation_entries:
+                if Path(entry[1]).suffix.casefold() in RAW_EXTENSIONS:
+                    raw_primary_names.setdefault(entry[1].casefold(), set()).add(
+                        primary_name
+                    )
+
+        for (operation_tag, _stem), operation_entries in operations.items():
+            image_entries = [
+                entry
+                for entry in operation_entries
+                if Path(entry[1]).suffix.casefold() in (JPG_EXTENSIONS | RAW_EXTENSIONS)
+            ]
+            other_entries = [
+                entry for entry in operation_entries if entry not in image_entries
+            ]
+
+            if image_entries:
+                jpeg_names = {
+                    entry[1].casefold()
+                    for entry in image_entries
+                    if Path(entry[1]).suffix.casefold() in JPG_EXTENSIONS
+                }
+                primary_names = jpeg_names
+                if not primary_names:
+                    associated_primary_names = {
+                        primary_name
+                        for entry in image_entries
+                        for primary_name in raw_primary_names.get(
+                            entry[1].casefold(), set()
+                        )
+                    }
+                    primary_names = associated_primary_names or {
+                        entry[1].casefold() for entry in image_entries
+                    }
+                if len(primary_names) != 1:
+                    result["ambiguous_count"] += len(image_entries)
+                    log.warning(
+                        "Leaving recycle operation %s ambiguous: multiple primary names",
+                        operation_tag,
+                    )
+                else:
+                    family = ("image", next(iter(primary_names)))
+                    rank = max(entry[2] for entry in image_entries)
+                    all_known = all(entry[3] for entry in image_entries)
+                    versions.setdefault(family, []).append(
+                        (operation_tag, image_entries, rank, all_known)
+                    )
+
+            for entry in other_entries:
+                family = ("file", entry[1].casefold())
+                versions.setdefault(family, []).append(
+                    (operation_tag, [entry], entry[2], entry[3])
+                )
+
+        selected_operations: list[
+            tuple[str, list[tuple[Path, str, int, bool]], int, bool]
+        ] = []
+        for family_versions in versions.values():
+            if (
+                os.name == "nt"
+                and len(family_versions) > 1
+                and not all(version[3] for version in family_versions)
+            ):
+                ambiguous_entries = sum(len(version[1]) for version in family_versions)
+                result["ambiguous_count"] += ambiguous_entries
+                log.warning(
+                    "Leaving %d cross-session recycled files ambiguous on Windows",
+                    ambiguous_entries,
+                )
+                continue
+
+            newest = max(
+                family_versions,
+                key=lambda version: (version[2], version[0]),
+            )
+            selected_operations.append(newest)
+            for version in family_versions:
+                if version is newest:
+                    continue
+                result["superseded_count"] += len(version[1])
+                for older_path, _name, _timestamp, _known in version[1]:
+                    log.info(
+                        "Leaving older recycled version in place: %s",
+                        older_path.name,
+                    )
+
+        # Distinct primary names (foo.jpg and foo.jpeg) remain separate
+        # families. If their selected operations both contain the same RAW
+        # destination, restoring either RAW would silently pair it with the
+        # other operation. Leave only that conflicting member in the bin.
+        destination_operations: dict[str, set[str]] = {}
+        for operation_tag, operation_entries, _rank, _known in selected_operations:
+            for _path, original_name, _timestamp, _entry_known in operation_entries:
+                destination_operations.setdefault(original_name.casefold(), set()).add(
+                    operation_tag
+                )
+        conflicting_destinations = {
+            destination
+            for destination, tags in destination_operations.items()
+            if len(tags) > 1
+        }
+
+        selected_entries: list[tuple[Path, str, int, bool]] = []
+        for _tag, operation_entries, _rank, _known in selected_operations:
+            for entry in operation_entries:
+                if entry[1].casefold() in conflicting_destinations:
+                    result["ambiguous_count"] += 1
+                    log.warning(
+                        "Leaving conflicting paired destination in recycle bin: %s",
+                        entry[1],
+                    )
+                    continue
+                selected_entries.append(entry)
+
+        # Stable destination order keeps error/report ordering deterministic too.
+        selected_entries.sort(key=lambda item: (item[1].casefold(), item[0].name))
+        for p, original_name, _timestamp_ns, _known_timestamp in selected_entries:
             dest = dest_dir / original_name
             if dest.exists():
                 log.warning(
