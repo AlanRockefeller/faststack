@@ -248,8 +248,8 @@ ApplicationWindow {
     background: Rectangle { color: root.currentBackgroundColor }
 
     function toggleTheme() {
-        if (root.uiStateRef) {
-            root.uiStateRef.theme = (root.uiStateRef.theme === 0 ? 1 : 0)
+        if (root.uiStateRef && root.controllerRef) {
+            root.controllerRef.set_theme(root.uiStateRef.theme === 0 ? 1 : 0)
         }
     }
 

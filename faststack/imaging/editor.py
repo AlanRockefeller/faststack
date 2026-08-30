@@ -1608,12 +1608,11 @@ class ImageEditor:
             if crop_box_vals == (0.0, 0.0, 1000.0, 1000.0):
                 crop_box_vals = None
 
-        # Straighten is baked into the buffer only for export, or when a crop
-        # box must be sliced in straightened space; plain previews leave
-        # free-rotation display to the QML layer.
-        apply_rotation = abs(straighten_angle) > 0.001 and (
-            for_export or crop_box_vals is not None
-        )
+        # Straighten is authoritative pixel geometry for both preview and
+        # export. During an active crop drag QML rotates the deliberately
+        # frozen pre-drag source for responsiveness; once that source is
+        # released, QML resets to zero and this baked geometry is displayed.
+        apply_rotation = abs(straighten_angle) > 0.001
 
         # Capture dimensions after 90-degree rotation and before free rotation.
         orig_h, orig_w = arr.shape[:2]
@@ -3999,9 +3998,7 @@ class ImageEditor:
                     value = values.get(tag_id)
                     if value is not None:
                         byte_value = bytes(value)
-                        tags.append(
-                            (tag_id, "B", len(byte_value), byte_value, False)
-                        )
+                        tags.append((tag_id, "B", len(byte_value), byte_value, False))
             except Exception as exc:
                 raise RuntimeError("Could not prepare TIFF EXIF metadata") from exc
 
@@ -4024,7 +4021,9 @@ class ImageEditor:
         try:
             import tifffile
         except ImportError as exc:
-            raise RuntimeError("Saving metadata-preserving TIFF requires tifffile") from exc
+            raise RuntimeError(
+                "Saving metadata-preserving TIFF requires tifffile"
+            ) from exc
 
         arr = np.rint(np.clip(arr_float, 0.0, 1.0) * 65535).astype(np.uint16)
         tifffile.imwrite(

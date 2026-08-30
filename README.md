@@ -41,7 +41,7 @@ setup required. Download the latest release for your platform from the
 
 - **Windows:** Download the Windows build, unzip it, and run
   `FastStack.exe`.
-- **macOS:** Download the macOS build, open the `.dmg`, and drag FastStack to
+- **macOS:** Download the macOS ZIP archive, extract it, and move FastStack to
   your Applications folder. On first launch you need to right-click the app
   and choose **Open** to bypass Gatekeeper.
 

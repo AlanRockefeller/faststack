@@ -5,6 +5,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -14,17 +15,23 @@ from faststack.io.executable_validator import validate_executable_path
 log = logging.getLogger(__name__)
 
 
-def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
+@dataclass(frozen=True)
+class HeliconLaunch:
+    """A Helicon child and the manifest owned by that exact launch."""
+
+    process: subprocess.Popen
+    manifest_path: Path
+
+
+def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[HeliconLaunch]]:
     """Launches Helicon Focus with the provided list of RAW files.
 
     Args:
         raw_files: A list of absolute paths to RAW files.
 
     Returns:
-        Tuple of (success: bool, tmp_path: Optional[Path]).
-        Returns (True, tmp_path) if launched successfully, (False, None) otherwise.
-        On success, the caller is responsible for deleting the returned temporary file
-        after Helicon Focus completes processing.
+        Tuple of (success, launch). On success the caller owns the launch record
+        and must retain its manifest until that child exits.
     """
     helicon_exe = config.get("helicon", "exe")
     if not helicon_exe or not isinstance(helicon_exe, str):
@@ -90,7 +97,7 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
         log.info(f"Command: {' '.join(args)}")
 
         # SECURITY: Explicitly disable shell execution
-        subprocess.Popen(
+        process = subprocess.Popen(
             args,
             shell=False,  # CRITICAL: Never use shell=True with user input
             stdin=subprocess.DEVNULL,
@@ -98,7 +105,7 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[Path]]:
             stderr=subprocess.DEVNULL,
             close_fds=True,  # Close unused file descriptors
         )
-        return True, tmp_path
+        return True, HeliconLaunch(process=process, manifest_path=tmp_path)
     except (OSError, subprocess.SubprocessError) as e:
         log.exception(f"Failed to launch Helicon Focus: {e}")
         if tmp_path is not None:

@@ -78,7 +78,7 @@ from faststack.io.variants import (
 from faststack.io.sidecar import SidecarManager
 from faststack.io.session import SessionRegistry, respawn_for_directory
 from faststack.io.watcher import Watcher
-from faststack.io.helicon import launch_helicon_focus
+from faststack.io.helicon import HeliconLaunch, launch_helicon_focus
 from faststack.io.executable_validator import validate_executable_path
 from faststack.io.utils import normalize_path_key
 from faststack.imaging.cache import (
@@ -168,6 +168,21 @@ class RawDevelopmentResult:
     develop_key: str
     success: bool
     error: Optional[str] = None
+
+
+@dataclass
+class RawDevelopmentOperation:
+    """Lifecycle-owned RawTherapee process and its temporary output."""
+
+    operation_id: str
+    develop_key: str
+    source_path: Path
+    raw_path: Path
+    tif_path: Path
+    tmp_tif_path: Path
+    process: Optional[subprocess.Popen] = None
+    worker: Optional[threading.Thread] = None
+    cancel_requested: bool = False
 
 
 # AWB thresholds on the -1..+1 normalized slider range.
@@ -678,6 +693,7 @@ class AppController(QObject):
         self.current_edit_source_mode: str = "jpeg"
         self._raw_developing_keys: Set[str] = set()
         self._raw_develop_lock = threading.Lock()
+        self._raw_development_operations: Dict[str, RawDevelopmentOperation] = {}
 
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
@@ -719,9 +735,8 @@ class AppController(QObject):
         # the first navigation because _reset_darken_on_navigation reads it.
         self._current_darken_stroke: Optional[dict] = None
         self._dialog_open_count = 0  # Track nested dialogs
-        self._temp_files_to_clean: List[Path] = (
-            []
-        )  # Track temp files for cleanup on shutdown
+        self._helicon_launches: Dict[int, HeliconLaunch] = {}
+        self._helicon_launches_lock = threading.Lock()
 
         # -- Caching & Prefetching --
         cache_size_gb = config.getfloat("core", "cache_size_gb", 1.5)
@@ -851,6 +866,7 @@ class AppController(QObject):
         self.stack_start_index: Optional[int] = None
         self.stack_end_index: Optional[int] = None
         self.stacks: List[List[int]] = []
+        self._stack_identity_projection_blocked = False
 
         # -- Batch Selection State (for drag-and-drop) --
         self.batch_start_index: Optional[int] = None
@@ -1268,9 +1284,7 @@ class AppController(QObject):
 
         visible_keys = {self._key(image.path) for image in self.image_files}
         previous_member_keys = {
-            self._key(path)
-            for group in snapshot[groups_key]
-            for path in group
+            self._key(path) for group in snapshot[groups_key] for path in group
         }
         visible_member_keys = {
             self._key(path)
@@ -1303,6 +1317,18 @@ class AppController(QObject):
 
     def _persist_stack_state(self, *, clear_all: bool = False) -> bool:
         """Persist stack identity correctly even when the view is filtered."""
+        if self._stack_identity_projection_blocked and not clear_all:
+            # Runtime ranges are deliberately empty when even one persisted
+            # logical group cannot be represented by the current image list.
+            # Do not turn that fail-safe projection into an identity deletion.
+            log.warning(
+                "Stack persistence deferred: persisted identities are not fully "
+                "representable in the current image list"
+            )
+            self.stacks = []
+            return self._persist_sidecar()
+        if clear_all:
+            self._stack_identity_projection_blocked = False
         if self._filter_enabled and self._filter_identity_snapshot is not None:
             if clear_all:
                 self._filter_identity_snapshot["stack_groups"] = []
@@ -1312,18 +1338,89 @@ class AppController(QObject):
                 self._update_filter_identity_snapshot("stack")
             all_images = self._sorted_all_images_for_identity()
             all_path_to_index = {
-                self._key(image.path): index
-                for index, image in enumerate(all_images)
+                self._key(image.path): index for index, image in enumerate(all_images)
             }
             persisted_stacks = self._rebuild_ranges_from_paths_map(
                 self._filter_identity_snapshot["stack_groups"],
                 all_path_to_index,
             )
+            persisted_groups = self._filter_identity_snapshot["stack_groups"]
         else:
             persisted_stacks = [stack[:] for stack in self.stacks]
+            all_images = list(self.image_files)
+            persisted_groups = self._resolve_ranges_to_paths(self.stacks)
+        stack_order = [
+            self.sidecar.metadata_key_for_path(image.path) for image in all_images
+        ]
+        stack_paths = [
+            [self.sidecar.metadata_key_for_path(path) for path in group]
+            for group in persisted_groups
+        ]
         with self.sidecar._state_lock:
             self.sidecar.data.stacks = persisted_stacks
+            self.sidecar.data.stack_paths = stack_paths
+            self.sidecar.data.stack_order = stack_order
         return self._persist_sidecar()
+
+    def _restore_stacks_from_sidecar_identity(self) -> list[list[int]]:
+        """Resolve distinct persisted groups without splitting or merging them."""
+        groups = self.sidecar.data.stack_paths
+        if not groups:
+            self._stack_identity_projection_blocked = False
+            return self.sidecar.data.stacks
+        key_to_index = {
+            self.sidecar.metadata_key_for_path(image.path): index
+            for index, image in enumerate(self.image_files)
+        }
+        ranges = []
+        seen_members = set()
+        for group in groups:
+            if not group:
+                log.warning(
+                    "Stack identity restoration skipped: persisted group is empty"
+                )
+                self._stack_identity_projection_blocked = True
+                return []
+            group_members = set(group)
+            if seen_members & group_members:
+                log.warning(
+                    "Stack identity restoration skipped: persisted groups overlap"
+                )
+                self._stack_identity_projection_blocked = True
+                return []
+            seen_members.update(group_members)
+            missing_members = group_members - key_to_index.keys()
+            if missing_members:
+                log.warning(
+                    "Stack identity restoration skipped: persisted group has %d "
+                    "member(s) absent from the current image list",
+                    len(missing_members),
+                )
+                self._stack_identity_projection_blocked = True
+                return []
+            indices = sorted(key_to_index[key] for key in group_members)
+            if indices != list(range(indices[0], indices[-1] + 1)):
+                log.warning(
+                    "Stack identity restoration skipped: group is not contiguous "
+                    "in the current image order"
+                )
+                self._stack_identity_projection_blocked = True
+                return []
+            ranges.append([indices[0], indices[-1]])
+
+        ranges.sort()
+        if any(
+            current[0] <= previous[1] + 1
+            for previous, current in zip(ranges, ranges[1:])
+        ):
+            log.warning(
+                "Stack identity restoration skipped: distinct groups are adjacent "
+                "in the current image order"
+            )
+            self._stack_identity_projection_blocked = True
+            return []
+        self._stack_identity_projection_blocked = False
+        return ranges
 
     def _restore_filter_current_image(
         self, current_path: Optional[Path], previous_index: int
@@ -1406,7 +1503,9 @@ class AppController(QObject):
         self._begin_direct_image_transition("filter cleared")
         previous_index = self.current_index
         current_path = self._current_image_path()
-        identity_snapshot = self._filter_identity_snapshot or self._capture_filter_identity()
+        identity_snapshot = (
+            self._filter_identity_snapshot or self._capture_filter_identity()
+        )
         self._filter_enabled = False
         self._filter_string = ""
         self._filter_flags = []
@@ -2631,7 +2730,16 @@ class AppController(QObject):
         self._startup_restore_path = None
         self._startup_restore_index = None
         with self.sidecar._state_lock:
-            self.stacks = self.sidecar.data.stacks  # Load stacks from sidecar
+            restored_stacks = self._restore_stacks_from_sidecar_identity()
+            self.sidecar.data.stacks = restored_stacks
+            # SidecarManager intentionally mutates its list in place after a
+            # concurrent merge.  Keep an unsafe empty runtime projection
+            # detached so such a save cannot re-expose historical indexes.
+            self.stacks = (
+                []
+                if self._stack_identity_projection_blocked
+                else self.sidecar.data.stacks
+            )
         self.dataChanged.emit()  # Emit after stacks are loaded
         # Register this instance for crash recovery as soon as a folder is open.
         self._session_registry.update(
@@ -3047,6 +3155,18 @@ class AppController(QObject):
         self._all_images = images
         self._variant_map = variant_map
         self._apply_filter_to_cached_list(notify=False)
+        stack_ranges_changed = False
+        if not self._filter_enabled and self.sidecar.data.stack_paths:
+            previous_stacks = self.stacks
+            with self.sidecar._state_lock:
+                restored_stacks = self._restore_stacks_from_sidecar_identity()
+                self.sidecar.data.stacks = restored_stacks
+                self.stacks = (
+                    []
+                    if self._stack_identity_projection_blocked
+                    else self.sidecar.data.stacks
+                )
+            stack_ranges_changed = self.stacks != previous_stacks
         self._grid_model_dirty = True
         if self._thumbnail_model and self._is_grid_view_active:
             self._refresh_thumbnail_model_from_controller()
@@ -3088,8 +3208,11 @@ class AppController(QObject):
         self._do_prefetch(self.current_index)
         self.sync_ui_state(image_count_changed=True)
         self._restart_quality_decode_timer()
-        if photoshop_batch_additions:
+        if photoshop_batch_additions or stack_ranges_changed:
             self.dataChanged.emit()
+        if stack_ranges_changed:
+            self.ui_state.stackSummaryChanged.emit()
+        if photoshop_batch_additions:
             self.update_status_message(
                 "Photoshop edit reloaded and added to batch",
                 timeout=5000,
@@ -9945,18 +10068,14 @@ class AppController(QObject):
                 if any(self._key(path) not in visible_keys for path in group)
             ]
             hidden_group_keys = {
-                self._key(path)
-                for group in hidden_semantic_groups
-                for path in group
+                self._key(path) for group in hidden_semantic_groups for path in group
             }
             requested_stacks = [stack[:] for stack in self.stacks]
             for start, end in requested_stacks:
                 files_to_process = []
                 expected_count = end - start + 1
                 range_is_valid = (
-                    start >= 0
-                    and end >= start
-                    and end < len(self.image_files)
+                    start >= 0 and end >= start and end < len(self.image_files)
                 )
                 if range_is_valid:
                     for idx in range(start, end + 1):
@@ -10072,10 +10191,9 @@ class AppController(QObject):
         """
         log.info("Launching Helicon Focus with %d files.", len(files))
         unique_files = list(dict.fromkeys(files))
-        success, tmp_path = launch_helicon_focus(unique_files)
-        if success and tmp_path:
-            # Defer deletion until shutdown to avoid race condition with Helicon Focus
-            self._temp_files_to_clean.append(tmp_path)
+        success, launch = launch_helicon_focus(unique_files)
+        if success and launch:
+            self._track_helicon_launch(launch)
 
             # Record stacking metadata
             today = date.today().isoformat()
@@ -10092,6 +10210,36 @@ class AppController(QObject):
             self._metadata_cache_index = (-1, -1)  # Invalidate cache
 
         return success
+
+    def _track_helicon_launch(self, launch: HeliconLaunch) -> None:
+        """Retain one manifest until its owning Helicon child exits."""
+        launch_key = id(launch.process)
+        with self._helicon_launches_lock:
+            self._helicon_launches[launch_key] = launch
+
+        def cleanup_after_exit() -> None:
+            try:
+                launch.process.wait()
+            except (OSError, subprocess.SubprocessError):
+                log.warning("Error waiting for Helicon Focus process", exc_info=True)
+                return
+            try:
+                launch.manifest_path.unlink(missing_ok=True)
+            except OSError:
+                log.warning(
+                    "Helicon manifest cleanup failed; artifact remains at %s",
+                    launch.manifest_path,
+                    exc_info=True,
+                )
+            finally:
+                with self._helicon_launches_lock:
+                    self._helicon_launches.pop(launch_key, None)
+
+        threading.Thread(
+            target=cleanup_after_exit,
+            daemon=True,
+            name="HeliconManifestCleanup",
+        ).start()
 
     def clear_all_stacks(self):
         log.info("Clearing all defined stacks.")
@@ -11411,6 +11559,7 @@ class AppController(QObject):
         self._index_rescan_needed = False
         self._photoshop_handoffs.clear()
         self.stacks = []
+        self._stack_identity_projection_blocked = False
         self.batches = []
         self.batch_start_index = None
         self.stack_start_index = None
@@ -12546,7 +12695,8 @@ class AppController(QObject):
         current_path = self._current_image_path()
         images_by_key = {self._key(img.path): img for img in self.image_files}
         filtered_order = [
-            self._key(image.path) for image in self._filtered_sorted_copy(self.sort_mode)
+            self._key(image.path)
+            for image in self._filtered_sorted_copy(self.sort_mode)
         ]
         allowed_keys = set(filtered_order)
         for _old_index, image in items:
@@ -12554,9 +12704,11 @@ class AppController(QObject):
             if not filtered_order or image_key in allowed_keys:
                 images_by_key.setdefault(image_key, image)
 
-        order = filtered_order or self._delete_identity_order or [
-            self._key(path) for path in job.visible_order_paths
-        ]
+        order = (
+            filtered_order
+            or self._delete_identity_order
+            or [self._key(path) for path in job.visible_order_paths]
+        )
         rank = {key: index for index, key in enumerate(order)}
         current_rank = {
             self._key(image.path): index for index, image in enumerate(self.image_files)
@@ -12780,7 +12932,9 @@ class AppController(QObject):
             else None
         )
         if not self._pending_delete_jobs:
-            self._delete_identity_order = [self._key(path) for path in visible_order_paths]
+            self._delete_identity_order = [
+                self._key(path) for path in visible_order_paths
+            ]
             self._delete_batch_path_groups = pre_batch_path_groups
             self._delete_stack_path_groups = pre_stack_path_groups
             self._delete_batch_start_path = pre_batch_start_path
@@ -13672,6 +13826,7 @@ class AppController(QObject):
 
         self._shutting_down = True  # gate async callbacks during shutdown_nonqt too
         self._exif_pending_path = None  # optional but consistent with shutdown_qt
+        self._cancel_raw_development_operations()
 
         if self._pending_delete_jobs:
             log.info(
@@ -13794,19 +13949,6 @@ class AppController(QObject):
             self._session_registry.close()
         except Exception as e:
             log.warning("Error removing session record during shutdown: %s", e)
-
-        # Clean up temporary files (e.g. Helicon Focus lists)
-        if self._temp_files_to_clean:
-            log.debug(
-                "Cleaning up %d temporary files...", len(self._temp_files_to_clean)
-            )
-            for tmp_path in self._temp_files_to_clean:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                    log.debug("Deleted temporary file: %s", tmp_path)
-                except OSError as e:
-                    log.warning("Error deleting temporary file %s: %s", tmp_path, e)
-            self._temp_files_to_clean.clear()
 
         log.info("Background shutdown complete.")
 
@@ -14583,14 +14725,74 @@ class AppController(QObject):
         self.rawDevelopmentStateChanged.emit()
         return key
 
-    def _mark_raw_development_finished(self, key: Optional[str]) -> None:
+    def _mark_raw_development_finished(
+        self, key: Optional[str], operation_id: Optional[str] = None
+    ) -> None:
         if not key:
             return
         with self._raw_develop_lock:
+            operations = getattr(self, "_raw_development_operations", {})
+            current = operations.get(key)
+            if (
+                operation_id is not None
+                and current is not None
+                and current.operation_id != operation_id
+            ):
+                return
+            if current is not None:
+                operations.pop(key, None)
             if key not in self._raw_developing_keys:
                 return
             self._raw_developing_keys.remove(key)
         self.rawDevelopmentStateChanged.emit()
+
+    @staticmethod
+    def _stop_raw_process(process: subprocess.Popen, *, grace_seconds: float = 1.0):
+        """Terminate exactly one owned RawTherapee child, escalating if needed."""
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=grace_seconds)
+            return
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+            log.warning("RawTherapee did not terminate gracefully; killing it")
+        try:
+            process.kill()
+            process.wait(timeout=grace_seconds)
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+            log.error("RawTherapee could not be confirmed stopped", exc_info=True)
+
+    def _cancel_raw_development_operations(self) -> None:
+        """Cancel active RAW operations and briefly reconcile owned workers."""
+        with self._raw_develop_lock:
+            operations = list(getattr(self, "_raw_development_operations", {}).values())
+            for operation in operations:
+                operation.cancel_requested = True
+        for operation in operations:
+            process = operation.process
+            if process is not None:
+                self._stop_raw_process(process)
+        current_thread = threading.current_thread()
+        for operation in operations:
+            worker = operation.worker
+            if worker is None or worker is current_thread:
+                continue
+            worker.join(timeout=0.5)
+            if worker.is_alive():
+                log.warning(
+                    "RAW development worker did not stop within shutdown timeout: %s",
+                    operation.source_path,
+                )
+        for operation in operations:
+            try:
+                operation.tmp_tif_path.unlink(missing_ok=True)
+            except OSError:
+                log.warning(
+                    "Could not remove cancelled RAW temporary output %s",
+                    operation.tmp_tif_path,
+                    exc_info=True,
+                )
 
     def _develop_raw_backend(self):
         """Internal: Triggers the actual RawTherapee process."""
@@ -14633,6 +14835,20 @@ class AppController(QObject):
         log.info("Starting RAW development: %s -> %s", raw_path, tif_path)
         operation_id = uuid.uuid4().hex
         source_path = image_file.path
+        operation = RawDevelopmentOperation(
+            operation_id=operation_id,
+            develop_key=develop_key,
+            source_path=source_path,
+            raw_path=raw_path,
+            tif_path=tif_path,
+            tmp_tif_path=tmp_tif_path,
+        )
+        with self._raw_develop_lock:
+            operations = getattr(self, "_raw_development_operations", None)
+            if operations is None:
+                operations = {}
+                self._raw_development_operations = operations
+            operations[develop_key] = operation
 
         def worker():
             completion = RawDevelopmentResult(
@@ -14653,20 +14869,54 @@ class AppController(QObject):
                         log.error("Invalid rawtherapee args format: %s", e)
                 cmd.extend(["-c", str(raw_path)])
                 cmd_str = " ".join(cmd)
-                run_kwargs = {
-                    "capture_output": True,
+                popen_kwargs = {
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.PIPE,
                     "text": True,
-                    "timeout": 60,
                 }
                 if sys.platform == "win32":
-                    run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-                result = subprocess.run(cmd, check=False, **run_kwargs)
-                if result.returncode == 0:
-                    if tmp_tif_path.exists() and tmp_tif_path.stat().st_size > 0:
-                        try:
-                            _safe_replace(tmp_tif_path, tif_path)
-                        except OSError as e:
+                process = subprocess.Popen(cmd, shell=False, **popen_kwargs)
+                with self._raw_develop_lock:
+                    current = self._raw_development_operations.get(develop_key)
+                    if current is operation:
+                        operation.process = process
+                    cancelled = operation.cancel_requested or current is not operation
+                if cancelled:
+                    self._stop_raw_process(process)
+                    raise RuntimeError("RAW development cancelled during shutdown")
+
+                try:
+                    stdout, stderr = process.communicate(timeout=60)
+                except subprocess.TimeoutExpired:
+                    operation.cancel_requested = True
+                    self._stop_raw_process(process)
+                    raise
+
+                if process.returncode == 0:
+                    with self._raw_develop_lock:
+                        current = self._raw_development_operations.get(develop_key)
+                        cancelled = (
+                            operation.cancel_requested or current is not operation
+                        )
+                        output_is_valid = (
+                            not cancelled
+                            and tmp_tif_path.exists()
+                            and tmp_tif_path.stat().st_size > 0
+                        )
+                        if output_is_valid:
+                            try:
+                                _safe_replace(tmp_tif_path, tif_path)
+                            except OSError as e:
+                                replace_error = e
+                            else:
+                                replace_error = None
+                        else:
+                            replace_error = None
+                    if output_is_valid:
+                        if replace_error is not None:
+                            e = replace_error
                             msg = f"RawTherapee output was valid but could not replace working TIFF: {e}"
                             log.error(msg)
                             completion = RawDevelopmentResult(
@@ -14686,7 +14936,7 @@ class AppController(QObject):
                                 develop_key,
                                 True,
                             )
-                    else:
+                    elif not cancelled:
                         msg = f"RawTherapee exited successfully but output file is missing or empty.\nCommand: {cmd_str}"
                         log.error(msg)
                         completion = RawDevelopmentResult(
@@ -14697,10 +14947,29 @@ class AppController(QObject):
                             False,
                             msg,
                         )
+                    else:
+                        err_msg = "RAW development was cancelled."
+                        log.error(err_msg)
+                        completion = RawDevelopmentResult(
+                            operation_id,
+                            source_path,
+                            tif_path,
+                            develop_key,
+                            False,
+                            err_msg,
+                        )
                 else:
-                    stderr = result.stderr.strip() if result.stderr else "(no stderr)"
-                    stdout = result.stdout.strip() if result.stdout else "(no stdout)"
-                    err_msg = f"RawTherapee failed (exit code {result.returncode}):\nCommand: {cmd_str}\nstderr: {stderr}\nstdout: {stdout}"
+                    with self._raw_develop_lock:
+                        current = self._raw_development_operations.get(develop_key)
+                        cancelled = (
+                            operation.cancel_requested or current is not operation
+                        )
+                    stderr = stderr.strip() if stderr else "(no stderr)"
+                    stdout = stdout.strip() if stdout else "(no stdout)"
+                    if cancelled:
+                        err_msg = "RAW development was cancelled."
+                    else:
+                        err_msg = f"RawTherapee failed (exit code {process.returncode}):\nCommand: {cmd_str}\nstderr: {stderr}\nstdout: {stdout}"
                     log.error(err_msg)
                     completion = RawDevelopmentResult(
                         operation_id,
@@ -14739,7 +15008,9 @@ class AppController(QObject):
                     pass
                 self._rawDevelopmentFinished.emit(completion)
 
-        threading.Thread(target=worker, daemon=True).start()
+        thread = threading.Thread(target=worker, daemon=True, name="RawDevelopment")
+        operation.worker = thread
+        thread.start()
         return True
 
     # Preserving legacy slot name for compatibility if QML calls it directly,
@@ -14993,11 +15264,21 @@ class AppController(QObject):
     def _on_develop_finished(self, result: RawDevelopmentResult) -> None:
         """Apply a RAW completion on the controller's Qt thread."""
         if self._shutting_down:
-            with self._raw_develop_lock:
-                self._raw_developing_keys.discard(result.develop_key)
+            self._mark_raw_development_finished(result.develop_key, result.operation_id)
             return
 
-        self._mark_raw_development_finished(result.develop_key)
+        with self._raw_develop_lock:
+            operation = getattr(self, "_raw_development_operations", {}).get(
+                result.develop_key
+            )
+            result_is_current = (
+                operation is not None and operation.operation_id == result.operation_id
+            )
+        if not result_is_current:
+            log.info("Ignoring stale RAW development result %s", result.operation_id)
+            return
+
+        self._mark_raw_development_finished(result.develop_key, result.operation_id)
         if result.success:
             self.update_status_message("RAW Development complete.")
             if (

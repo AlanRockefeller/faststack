@@ -72,6 +72,8 @@ def _sidecar_to_json(sidecar: Sidecar) -> dict:
             key: _entrymetadata_to_json(meta) for key, meta in sidecar.entries.items()
         },
         "stacks": copy.deepcopy(sidecar.stacks),
+        "stack_paths": copy.deepcopy(sidecar.stack_paths),
+        "stack_order": copy.deepcopy(sidecar.stack_order),
     }
 
 
@@ -95,6 +97,8 @@ def _sidecar_from_json(data: dict) -> Sidecar:
             if isinstance(meta, dict)
         },
         stacks=copy.deepcopy(data.get("stacks", [])),
+        stack_paths=copy.deepcopy(data.get("stack_paths", [])),
+        stack_order=copy.deepcopy(data.get("stack_order", [])),
     )
 
 
@@ -153,9 +157,140 @@ def _merge_entries(base, ours, theirs) -> dict:
     return merged
 
 
+def _valid_stack_identity(payload: dict) -> Optional[tuple[list[list[str]], list[str]]]:
+    """Return validated semantic stack groups and their image order."""
+    groups = payload.get("stack_paths")
+    order = payload.get("stack_order")
+    if not isinstance(groups, list) or not isinstance(order, list):
+        return None
+    # A serializer round-trip of a legacy, index-only sidecar adds empty
+    # identity fields.  Those fields are not semantic evidence that its
+    # still-present numeric stacks were intentionally cleared.
+    if payload.get("stacks") and not groups:
+        return None
+    if any(not isinstance(key, str) or not key for key in order):
+        return None
+    if len(order) != len(set(order)):
+        return None
+    known = set(order)
+    normalized = []
+    for group in groups:
+        if not isinstance(group, list) or not group:
+            return None
+        if any(not isinstance(key, str) or key not in known for key in group):
+            return None
+        normalized.append(list(dict.fromkeys(group)))
+    return normalized, list(order)
+
+
+def _project_stack_groups(
+    groups: list[list[str]], order: list[str]
+) -> Optional[tuple[list[list[int]], list[list[str]]]]:
+    """Project distinct groups to ranges, or reject an unsafe representation."""
+    order_index = {key: index for index, key in enumerate(order)}
+    projected = []
+    seen_members = set()
+    for group in groups:
+        group_members = set(group)
+        if seen_members & group_members:
+            return None
+        seen_members.update(group_members)
+        indices = sorted(order_index[key] for key in group_members)
+        if indices != list(range(indices[0], indices[-1] + 1)):
+            return None
+        projected.append((indices[0], indices[-1], group_members))
+
+    projected.sort(key=lambda item: item[0])
+    for previous, current in zip(projected, projected[1:]):
+        if current[0] <= previous[1] + 1:
+            # Runtime ranges normalize adjacency, which would erase the
+            # persisted boundary between these two logical groups.
+            return None
+    ranges = [[start, end] for start, end, _members in projected]
+    ordered_groups = [
+        [key for key in order[start : end + 1] if key in group_members]
+        for start, end, group_members in projected
+    ]
+    return ranges, ordered_groups
+
+
+def _stack_merge_fail_safe(
+    identity: tuple[list[list[str]], list[str]], reason: str
+) -> tuple[list[list[int]], list[list[str]], list[str]]:
+    """Preserve lock-holder identities without inventing runtime ranges."""
+    groups, order = identity
+    projected = _project_stack_groups(groups, order)
+    log.warning(
+        "Concurrent stack merge could not preserve group boundaries (%s); "
+        "preserving the lock holder's stack identities",
+        reason,
+    )
+    ranges = projected[0] if projected is not None else []
+    return ranges, copy.deepcopy(groups), copy.deepcopy(order)
+
+
+def _merge_stack_payloads(
+    base: dict, ours: dict, theirs: dict
+) -> Optional[tuple[list[list[int]], list[list[str]], list[str]]]:
+    """Three-way merge distinct stack groups by stable image identity."""
+    base_identity = _valid_stack_identity(base)
+    our_identity = _valid_stack_identity(ours)
+    their_identity = _valid_stack_identity(theirs)
+    if base_identity is None or our_identity is None or their_identity is None:
+        return None
+
+    base_groups, base_order = base_identity
+    our_groups, our_order = our_identity
+    their_groups, their_order = their_identity
+    if our_order == base_order:
+        merged_order = their_order
+    elif their_order == base_order or our_order == their_order:
+        merged_order = our_order
+    elif set(our_order) == set(their_order):
+        # Both processes sorted the same images differently. Identity still
+        # makes membership safe; the lock holder's order is deterministic.
+        merged_order = our_order
+    else:
+        return _stack_merge_fail_safe(
+            our_identity,
+            "image orders contain incompatible identities",
+        )
+
+    base_group_set = {frozenset(group) for group in base_groups}
+    our_group_set = {frozenset(group) for group in our_groups}
+    their_group_set = {frozenset(group) for group in their_groups}
+    merged_group_set = set()
+    for group in base_group_set | our_group_set | their_group_set:
+        base_value = group in base_group_set
+        our_value = group in our_group_set
+        their_value = group in their_group_set
+        if our_value == base_value:
+            keep = their_value
+        elif their_value == base_value or our_value == their_value:
+            keep = our_value
+        else:  # Boolean group presence cannot reach a genuine conflict.
+            keep = our_value
+        if keep:
+            merged_group_set.add(group)
+
+    merged_groups = [list(group) for group in merged_group_set]
+    projected = _project_stack_groups(merged_groups, merged_order)
+    if projected is None:
+        # Overlapping concurrent edits to the same base group, a reordered
+        # non-contiguous group, or newly adjacent distinct groups cannot be
+        # expressed by FastStack's normalized runtime ranges. Lock-holder wins.
+        return _stack_merge_fail_safe(
+            our_identity,
+            "merged groups overlap, are non-contiguous, or became adjacent",
+        )
+    ranges, ordered_groups = projected
+    return ranges, ordered_groups, merged_order
+
+
 def _merge_sidecar_payloads(base: dict, ours: dict, theirs: dict) -> dict:
     """Merge changes made since ``base`` into the latest disk payload."""
     merged = {}
+    stack_merge = _merge_stack_payloads(base, ours, theirs)
     for key in base.keys() | ours.keys() | theirs.keys():
         if key == "entries":
             value = _merge_entries(
@@ -163,7 +298,26 @@ def _merge_sidecar_payloads(base: dict, ours: dict, theirs: dict) -> dict:
                 ours.get(key, {}),
                 theirs.get(key, {}),
             )
+        elif key in {"stacks", "stack_paths", "stack_order"} and stack_merge:
+            value = {
+                "stacks": stack_merge[0],
+                "stack_paths": stack_merge[1],
+                "stack_order": stack_merge[2],
+            }[key]
         else:
+            if key == "stacks" and stack_merge is None:
+                base_stacks = base.get(key, _MISSING)
+                our_stacks = ours.get(key, _MISSING)
+                their_stacks = theirs.get(key, _MISSING)
+                if (
+                    our_stacks != base_stacks
+                    and their_stacks != base_stacks
+                    and our_stacks != their_stacks
+                ):
+                    log.warning(
+                        "Concurrent legacy index-only stack edits cannot be merged "
+                        "safely; preserving the lock holder's ranges"
+                    )
             value = _select_three_way(
                 base.get(key, _MISSING),
                 ours.get(key, _MISSING),
@@ -453,6 +607,8 @@ class SidecarManager:
                     # ``self.stacks``, so rebinding it would hide merged-in
                     # stacks from the UI and let the next save overwrite them.
                     self.data.stacks[:] = merged_data.stacks
+                    self.data.stack_paths[:] = merged_data.stack_paths
+                    self.data.stack_order[:] = merged_data.stack_order
                     for key in list(self.data.entries):
                         if key not in merged_data.entries:
                             del self.data.entries[key]

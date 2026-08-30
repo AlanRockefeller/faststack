@@ -2,6 +2,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,11 +59,13 @@ def _stub_develop_guards(app):
     """
     app._is_raw_development_in_flight.return_value = False
     app._mark_raw_development_started.return_value = "develop-key"
+    app._raw_develop_lock = threading.Lock()
+    app._raw_development_operations = {}
 
 
 class TestRawPipeline(unittest.TestCase):
     @patch("faststack.app.os.path.exists")
-    @patch("faststack.app.subprocess.run")
+    @patch("faststack.app.subprocess.Popen")
     @patch("faststack.config.config.get")
     @patch("faststack.app.threading.Thread")
     def test_develop_raw_empty_output_cleanup(
@@ -88,10 +91,8 @@ class TestRawPipeline(unittest.TestCase):
 
         mock_thread.return_value.start.side_effect = side_effect_start
 
-        # Mock subprocess.run to return success (returncode=0)
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.communicate.return_value = ("", "")
 
         app = MagicMock()
         app.image_files = [self.image_file]
@@ -130,7 +131,7 @@ class TestRawPipeline(unittest.TestCase):
 
     @patch("faststack.app.QTimer.singleShot")
     @patch("faststack.app.os.path.exists")
-    @patch("faststack.app.subprocess.run")
+    @patch("faststack.app.subprocess.Popen")
     @patch("faststack.config.config.get")
     @patch("faststack.app.threading.Thread")
     def test_develop_raw_timeout(
@@ -147,7 +148,7 @@ class TestRawPipeline(unittest.TestCase):
 
         mock_thread.return_value.start.side_effect = side_effect_start
 
-        mock_run.side_effect = subprocess.TimeoutExpired(
+        mock_run.return_value.communicate.side_effect = subprocess.TimeoutExpired(
             cmd="rawtherapee-cli", timeout=60
         )
 
@@ -167,7 +168,7 @@ class TestRawPipeline(unittest.TestCase):
         self.assertIn("timed out", completion.error)
 
     @patch("faststack.app.os.path.exists")
-    @patch("faststack.app.subprocess.run")
+    @patch("faststack.app.subprocess.Popen")
     @patch("faststack.config.config.get")
     @patch("faststack.app.threading.Thread")
     def test_develop_raw_with_custom_args(
@@ -195,10 +196,8 @@ class TestRawPipeline(unittest.TestCase):
 
         mock_thread.return_value.start.side_effect = side_effect_start
 
-        # Mock subprocess.run
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.communicate.return_value = ("", "")
 
         app = MagicMock()
         app.image_files = [self.image_file]
@@ -266,7 +265,7 @@ class TestRawPipeline(unittest.TestCase):
         self.assertFalse(img2.has_raw)
 
     @patch("faststack.app.os.path.exists")
-    @patch("faststack.app.subprocess.run")
+    @patch("faststack.app.subprocess.Popen")
     @patch("faststack.config.config.get")
     def test_develop_raw_slot(self, mock_config_get, mock_run, mock_exists):
         """Test the develop_raw_for_current_image slot."""
@@ -302,14 +301,16 @@ class TestRawPipeline(unittest.TestCase):
         editor = ImageEditor()
 
         tif_path = self.tmp_path / "working-working.tif"
-        tif_path.touch()  # Ensure it exists for backup logic
+        # The atomic save transaction validates its rollback source, so use a
+        # minimal non-empty TIFF stand-in rather than a zero-byte zombie.
+        tif_path.write_bytes(b"II\x2a\x00")
 
         editor.load_image(str(self.jpg_path))
         editor.current_filepath = tif_path  # Trick it into "saving a TIFF"
 
         editor.current_edits["exposure"] = 1.0  # +1 EV -> 2x gain
 
-        def fake_write_tiff_16bit(path: Path, arr_float: np.ndarray):
+        def fake_write_tiff_16bit(path: Path, arr_float: np.ndarray, **_metadata):
             # Write a minimal TIFF header so downstream checks are meaningful.
             # Little-endian TIFF: "II*\x00"
             with open(path, "wb") as f:

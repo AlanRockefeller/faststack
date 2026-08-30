@@ -274,7 +274,9 @@ def permanently_delete_image_files(
         # attempted until every member has a complete recovery copy.
         try:
             for number, (staged_path, original_path) in enumerate(staged):
-                recovery_path = transaction_dir / f"rollback-{number}-{original_path.name}"
+                recovery_path = (
+                    transaction_dir / f"rollback-{number}-{original_path.name}"
+                )
                 shutil.copy2(staged_path, recovery_path)
                 compensation.append((recovery_path, original_path))
         except BaseException:
