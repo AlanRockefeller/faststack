@@ -57,6 +57,11 @@ class UIStateRestoration:
     saved_stacks: Optional[list] = None
     saved_stack_start_index: Optional[int] = None
     saved_stack_end_index: Optional[int] = None
+    saved_batch_paths: List[List[Path]] = field(default_factory=list)
+    saved_stack_paths: List[List[Path]] = field(default_factory=list)
+    saved_batch_start_path: Optional[Path] = None
+    saved_stack_start_path: Optional[Path] = None
+    saved_stack_end_path: Optional[Path] = None
 
 
 @dataclass
@@ -77,6 +82,9 @@ class DeleteJob:
     undo_requested: bool = False  # Policy 1: auto-restore files on completion
     ui_state: Optional[UIStateRestoration] = None
     work_items: List[DeleteWorkItem] = field(default_factory=list)
+    previous_path: Optional[Path] = None
+    visible_order_paths: List[Path] = field(default_factory=list)
+    future: Any = None
 
 
 @dataclass

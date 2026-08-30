@@ -10,6 +10,7 @@ import shutil
 import threading
 import time
 import uuid
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -279,6 +280,127 @@ def _safe_replace(tmp_path: Path, target_path: Path) -> None:
                 time.sleep(_REPLACE_RETRY_DELAY)
             else:
                 raise
+
+
+def _validate_temp_output(path: Path) -> None:
+    """Reject a missing or empty encoded output before a live file is touched."""
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise OSError(f"encoder did not produce a usable output: {path}")
+    except OSError as exc:
+        raise RuntimeError(f"Temporary output validation failed: {path}") from exc
+
+
+def _commit_temp_outputs(
+    outputs: List[Tuple[Path, Path]],
+    *,
+    rollback_sources: Optional[dict[Path, Path]] = None,
+) -> None:
+    """Commit encoded outputs as one rollback-capable filesystem transaction.
+
+    Every temporary file is validated before the first destination changes.
+    Existing destinations use either a supplied durable backup or a private
+    rollback file. If a later replacement fails, destinations already
+    committed by this call are restored in reverse order.
+    """
+    if not outputs:
+        raise ValueError("output transaction must contain at least one file")
+
+    for tmp_path, _destination in outputs:
+        _validate_temp_output(tmp_path)
+
+    supplied_sources = rollback_sources or {}
+    rollback_paths: dict[Path, Optional[Path]] = {}
+    owned_rollback_paths: set[Path] = set()
+    retained_rollback_paths: set[Path] = set()
+    committed: list[Path] = []
+    committed_identities: dict[Path, tuple[int, int, int, int, int]] = {}
+    try:
+        for _tmp_path, destination in outputs:
+            if destination.exists():
+                rollback_path = supplied_sources.get(destination)
+                if rollback_path is None:
+                    rollback_path = destination.with_name(
+                        f".{destination.name}.__faststack_rollback__{uuid.uuid4().hex}"
+                    )
+                    shutil.copy2(destination, rollback_path)
+                    owned_rollback_paths.add(rollback_path)
+                _validate_temp_output(rollback_path)
+                rollback_paths[destination] = rollback_path
+            else:
+                rollback_paths[destination] = None
+
+        for tmp_path, destination in outputs:
+            _safe_replace(tmp_path, destination)
+            committed.append(destination)
+            stat = destination.stat()
+            committed_identities[destination] = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+    except BaseException as commit_error:
+        rollback_errors = []
+        for destination in reversed(committed):
+            rollback_path = rollback_paths.get(destination)
+            try:
+                stat = destination.stat()
+                current_identity = (
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+                if current_identity != committed_identities[destination]:
+                    raise OSError(
+                        "destination changed after FastStack committed it; "
+                        "refusing to overwrite the replacement during rollback"
+                    )
+                if rollback_path is None:
+                    destination.unlink(missing_ok=True)
+                elif rollback_path in owned_rollback_paths:
+                    _safe_replace(rollback_path, destination)
+                    rollback_paths[destination] = None
+                else:
+                    # The normal user backup is an external rollback source:
+                    # copy it only on the failure path so successful saves do
+                    # not duplicate a large working TIFF twice, and never
+                    # consume the user's undo backup with os.replace.
+                    restore_tmp = destination.with_name(
+                        f".{destination.name}.__faststack_restore__{uuid.uuid4().hex}"
+                    )
+                    try:
+                        shutil.copy2(rollback_path, restore_tmp)
+                        _validate_temp_output(restore_tmp)
+                        _safe_replace(restore_tmp, destination)
+                    finally:
+                        restore_tmp.unlink(missing_ok=True)
+            except (OSError, RuntimeError) as rollback_error:
+                rollback_errors.append(f"{destination}: {rollback_error}")
+                if rollback_path is not None:
+                    retained_rollback_paths.add(rollback_path)
+                log.critical(
+                    "Could not roll back partially committed save destination %s; "
+                    "recovery artifact retained at %s",
+                    destination,
+                    rollback_path,
+                    exc_info=True,
+                )
+        if rollback_errors:
+            detail = "; ".join(rollback_errors)
+            raise RuntimeError(
+                f"Save commit failed and rollback was incomplete: {detail}"
+            ) from commit_error
+        raise
+    finally:
+        for tmp_path, _destination in outputs:
+            tmp_path.unlink(missing_ok=True)
+        for rollback_path in owned_rollback_paths:
+            if rollback_path not in retained_rollback_paths:
+                rollback_path.unlink(missing_ok=True)
 
 
 # Aspect Ratios for cropping
@@ -3753,27 +3875,166 @@ class ImageEditor:
             )
         )
 
-    def _write_tiff_16bit(self, path: Path, arr_float: np.ndarray):
-        """
-        Writes a float32 (0-1) numpy array as an uncompressed 16-bit RGB TIFF using OpenCV.
-        arr_float shape: (H, W, 3)
-        """
-        cv2 = _get_cv2()
-        if cv2 is None:
-            raise RuntimeError("Saving 16-bit TIFF requires OpenCV")
+    @staticmethod
+    def _tiff_metadata_tags(
+        exif_bytes: Optional[bytes], icc_bytes: Optional[bytes]
+    ) -> list[tuple]:
+        """Build safe TIFF tags, excluding pixel-layout and geometry metadata."""
+        tags: list[tuple] = []
+        if icc_bytes:
+            tags.append((34675, "B", len(icc_bytes), icc_bytes, False))
 
-        # Convert to 16-bit
-        # Clip to safe range before scaling
-        arr = (np.clip(arr_float, 0.0, 1.0) * 65535).astype(np.uint16)
+        # These descriptive/capture tags remain meaningful after crop/rotation.
+        # Geometry, thumbnail, strip, dimension, and resolution tags are
+        # deliberately regenerated by tifffile instead of copied from source.
+        safe_ascii_tags = {
+            270,  # ImageDescription
+            271,  # Make
+            272,  # Model
+            305,  # Software
+            306,  # DateTime
+            315,  # Artist
+            33432,  # Copyright
+            36867,  # DateTimeOriginal
+            36868,  # DateTimeDigitized
+            42036,  # LensModel
+        }
+        safe_unsigned_rational_tags = {
+            33434,  # ExposureTime
+            33437,  # FNumber
+            37378,  # ApertureValue
+            37381,  # MaxApertureValue
+            37382,  # SubjectDistance
+            37386,  # FocalLength
+            41988,  # DigitalZoomRatio
+        }
+        safe_signed_rational_tags = {
+            37377,  # ShutterSpeedValue
+            37379,  # BrightnessValue
+            37380,  # ExposureBiasValue
+        }
+        safe_integer_tags = {
+            34850,  # ExposureProgram
+            34855,  # PhotographicSensitivity / ISO
+            34864,  # SensitivityType
+            37383,  # MeteringMode
+            37384,  # LightSource
+            37385,  # Flash
+            41495,  # SensingMethod
+            41986,  # ExposureMode
+            41987,  # WhiteBalance
+            41989,  # FocalLengthIn35mmFilm
+            41990,  # SceneCaptureType
+            41991,  # GainControl
+            41992,  # Contrast
+            41993,  # Saturation
+            41994,  # Sharpness
+        }
+        safe_byte_tags = {
+            36864,  # ExifVersion
+            40960,  # FlashpixVersion
+        }
 
-        # OpenCv expects BGR for imwrite
-        if len(arr.shape) == 3 and arr.shape[2] == 3:
-            arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            success = cv2.imwrite(str(path), arr_bgr)
-            if not success:
-                raise IOError(f"Failed to write TIFF -> {path}")
-        else:
+        def _rational_pair(value: Any, *, signed: bool) -> tuple[int, int]:
+            numerator = getattr(value, "numerator", None)
+            denominator = getattr(value, "denominator", None)
+            if numerator is None or denominator is None:
+                if isinstance(value, (tuple, list)) and len(value) == 2:
+                    numerator, denominator = value
+                else:
+                    fraction = Fraction(float(value)).limit_denominator(1_000_000)
+                    numerator, denominator = fraction.numerator, fraction.denominator
+            numerator = int(numerator)
+            denominator = int(denominator)
+            if denominator == 0:
+                raise ValueError("EXIF rational denominator is zero")
+            if not signed and numerator < 0:
+                raise ValueError("unsigned EXIF rational is negative")
+            return numerator, denominator
+
+        if exif_bytes:
+            try:
+                exif = Image.Exif()
+                exif.load(exif_bytes)
+                values = dict(exif.items())
+                exif_ifd = exif.get_ifd(0x8769)
+                if exif_ifd:
+                    values.update(exif_ifd)
+                for tag_id in safe_ascii_tags:
+                    value = values.get(tag_id)
+                    if value is not None:
+                        ascii_value = str(value).encode("ascii", "replace").decode()
+                        tags.append((tag_id, "s", 0, ascii_value, False))
+                for tag_id in safe_unsigned_rational_tags:
+                    value = values.get(tag_id)
+                    if value is not None:
+                        tags.append(
+                            (
+                                tag_id,
+                                "2I",
+                                1,
+                                _rational_pair(value, signed=False),
+                                False,
+                            )
+                        )
+                for tag_id in safe_signed_rational_tags:
+                    value = values.get(tag_id)
+                    if value is not None:
+                        tags.append(
+                            (
+                                tag_id,
+                                "2i",
+                                1,
+                                _rational_pair(value, signed=True),
+                                False,
+                            )
+                        )
+                for tag_id in safe_integer_tags:
+                    value = values.get(tag_id)
+                    if value is not None:
+                        integer = int(value)
+                        dtype = "H" if 0 <= integer <= 0xFFFF else "I"
+                        tags.append((tag_id, dtype, 1, integer, False))
+                for tag_id in safe_byte_tags:
+                    value = values.get(tag_id)
+                    if value is not None:
+                        byte_value = bytes(value)
+                        tags.append(
+                            (tag_id, "B", len(byte_value), byte_value, False)
+                        )
+            except Exception as exc:
+                raise RuntimeError("Could not prepare TIFF EXIF metadata") from exc
+
+        # Orientation is always normalized because export bakes geometry into pixels.
+        tags.append((274, "H", 1, 1, False))
+        return tags
+
+    def _write_tiff_16bit(
+        self,
+        path: Path,
+        arr_float: np.ndarray,
+        *,
+        exif_bytes: Optional[bytes] = None,
+        icc_bytes: Optional[bytes] = None,
+    ) -> None:
+        """Write 16-bit RGB TIFF pixels plus sanitized ICC/EXIF metadata."""
+        if arr_float.ndim != 3 or arr_float.shape[2] != 3:
             raise ValueError("Only RGB supported for TIFF writer")
+
+        try:
+            import tifffile
+        except ImportError as exc:
+            raise RuntimeError("Saving metadata-preserving TIFF requires tifffile") from exc
+
+        arr = np.rint(np.clip(arr_float, 0.0, 1.0) * 65535).astype(np.uint16)
+        tifffile.imwrite(
+            path,
+            arr,
+            photometric="rgb",
+            compression=None,
+            metadata=None,
+            extratags=self._tiff_metadata_tags(exif_bytes, icc_bytes),
+        )
 
     def _get_sanitized_exif_bytes(self) -> Optional[bytes]:
         """
@@ -4079,15 +4340,10 @@ class ImageEditor:
             log.warning("Unable to read timestamps for %s: %s", original_path, e)
             original_stat = None
 
-        # 2. Backup
-        backup_path = create_backup_file(original_path)
-        if backup_path is None:
-            raise RuntimeError(f"Unable to create backup for {original_path}")
-        if _debug:
-            t_backup = time.perf_counter()
-
+        temp_outputs: list[tuple[Path, Path]] = []
         try:
-            # 3. Save Main File
+            # Encode every required output before creating the user backup or
+            # replacing any live destination.
             is_tiff = original_path.suffix.lower() in [".tif", ".tiff"]
 
             # 8-bit outputs (main JPEG and/or developed JPG) share one
@@ -4105,12 +4361,13 @@ class ImageEditor:
                 tmp_path = original_path.with_name(
                     f".{original_path.stem}_{uuid.uuid4().hex[:8]}{original_path.suffix}"
                 )
-                try:
-                    self._write_tiff_16bit(tmp_path, final_float)
-                    _safe_replace(tmp_path, original_path)
-                except BaseException:
-                    tmp_path.unlink(missing_ok=True)
-                    raise
+                temp_outputs.append((tmp_path, original_path))
+                self._write_tiff_16bit(
+                    tmp_path,
+                    final_float,
+                    exif_bytes=main_exif,
+                    icc_bytes=source_icc_bytes,
+                )
             else:
                 arr_u8 = _float01_to_u8(dithered_float)
                 img_u8 = Image.fromarray(arr_u8, mode="RGB")
@@ -4124,29 +4381,22 @@ class ImageEditor:
                 tmp_path = original_path.with_name(
                     f".{original_path.stem}_{uuid.uuid4().hex[:8]}{original_path.suffix}"
                 )
+                temp_outputs.append((tmp_path, original_path))
                 try:
-                    try:
-                        img_u8.save(tmp_path, **save_kwargs)
-                    except Exception as metadata_error:
-                        # Invalid legacy EXIF should not prevent saving, but the
-                        # source ICC profile must remain attached to source-space
-                        # pixels or other applications will misinterpret color.
-                        log.warning(
-                            "JPEG metadata save failed for %s (%s); retrying without EXIF",
-                            original_path,
-                            metadata_error,
-                        )
-                        fallback_kwargs = {"quality": 95}
-                        if source_icc_bytes:
-                            fallback_kwargs["icc_profile"] = source_icc_bytes
-                        img_u8.save(tmp_path, **fallback_kwargs)
-                    _safe_replace(tmp_path, original_path)
-                except BaseException:
-                    tmp_path.unlink(missing_ok=True)
-                    raise
-
-            if original_stat is not None:
-                self._restore_file_times(original_path, original_stat)
+                    img_u8.save(tmp_path, **save_kwargs)
+                except Exception as metadata_error:
+                    # Invalid legacy EXIF should not prevent saving, but the
+                    # source ICC profile must remain attached to source-space
+                    # pixels or other applications will misinterpret color.
+                    log.warning(
+                        "JPEG metadata save failed for %s (%s); retrying without EXIF",
+                        original_path,
+                        metadata_error,
+                    )
+                    fallback_kwargs = {"quality": 95}
+                    if source_icc_bytes:
+                        fallback_kwargs["icc_profile"] = source_icc_bytes
+                    img_u8.save(tmp_path, **fallback_kwargs)
 
             # 4. Save Sidecar JPG (-developed.jpg) — only when explicitly requested
             if write_developed_jpg:
@@ -4178,24 +4428,39 @@ class ImageEditor:
                 tmp_dev = developed_path.with_name(
                     f".{developed_path.stem}_{uuid.uuid4().hex[:8]}{developed_path.suffix}"
                 )
+                temp_outputs.append((tmp_dev, developed_path))
                 try:
-                    try:
-                        img_u8.save(tmp_dev, **dev_kwargs)
-                    except Exception as metadata_error:
-                        log.warning(
-                            "Developed JPEG metadata save failed for %s (%s); "
-                            "retrying without EXIF",
-                            developed_path,
-                            metadata_error,
-                        )
-                        fallback_kwargs = {"quality": 90}
-                        if source_icc_bytes:
-                            fallback_kwargs["icc_profile"] = source_icc_bytes
-                        img_u8.save(tmp_dev, **fallback_kwargs)
-                    _safe_replace(tmp_dev, developed_path)
-                except BaseException:
-                    tmp_dev.unlink(missing_ok=True)
-                    raise
+                    img_u8.save(tmp_dev, **dev_kwargs)
+                except Exception as metadata_error:
+                    log.warning(
+                        "Developed JPEG metadata save failed for %s (%s); "
+                        "retrying without EXIF",
+                        developed_path,
+                        metadata_error,
+                    )
+                    fallback_kwargs = {"quality": 90}
+                    if source_icc_bytes:
+                        fallback_kwargs["icc_profile"] = source_icc_bytes
+                    img_u8.save(tmp_dev, **fallback_kwargs)
+
+            for tmp_output, _destination in temp_outputs:
+                _validate_temp_output(tmp_output)
+
+            # Preserve the existing user-visible undo backup semantics, but
+            # create it only after all encoders have succeeded.
+            backup_path = create_backup_file(original_path)
+            if backup_path is None:
+                raise RuntimeError(f"Unable to create backup for {original_path}")
+            if _debug:
+                t_backup = time.perf_counter()
+
+            _commit_temp_outputs(
+                temp_outputs,
+                rollback_sources={original_path: backup_path},
+            )
+
+            if original_stat is not None:
+                self._restore_file_times(original_path, original_stat)
 
             if _debug:
                 t_write = time.perf_counter()
@@ -4215,6 +4480,9 @@ class ImageEditor:
         except Exception as e:
             log.exception("Failed to save %s: %s", original_path, e)
             raise RuntimeError(f"Save failed: {e}") from e
+        finally:
+            for tmp_output, _destination in temp_outputs:
+                tmp_output.unlink(missing_ok=True)
 
     def save_image(
         self,
@@ -4249,7 +4517,7 @@ class ImageEditor:
     def _save_u8_pil_image(
         self, img_u8: Image.Image, original_path: Path, log_prefix: str
     ) -> Tuple[Path, Path]:
-        """Save a prepared uint8 RGB image with backup, EXIF, and best-effort atomic replace."""
+        """Save a prepared uint8 RGB image with backup and atomic replacement."""
         try:
             original_stat = original_path.stat()
         except OSError:
@@ -4288,26 +4556,8 @@ class ImageEditor:
                 if icc_bytes:
                     fallback_kwargs["icc_profile"] = icc_bytes
                 img_u8.save(tmp_path, **fallback_kwargs)
-            try:
-                os.replace(tmp_path, original_path)
-            except OSError as e:
-                log.warning(
-                    "Atomic replace failed (%s); falling back to direct save", e
-                )
-                try:
-                    img_u8.save(original_path, **save_kwargs)
-                except Exception as metadata_error:
-                    log.warning(
-                        "%s direct metadata save failed for %s (%s); "
-                        "retrying without EXIF",
-                        log_prefix,
-                        original_path,
-                        metadata_error,
-                    )
-                    fallback_kwargs = {"quality": 95}
-                    if icc_bytes:
-                        fallback_kwargs["icc_profile"] = icc_bytes
-                    img_u8.save(original_path, **fallback_kwargs)
+            _validate_temp_output(tmp_path)
+            _safe_replace(tmp_path, original_path)
         finally:
             try:
                 if tmp_path.exists():

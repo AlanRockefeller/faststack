@@ -5,6 +5,7 @@ import dataclasses
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from contextlib import contextmanager
@@ -252,6 +253,10 @@ class SidecarManager:
         # Identity of the disk file the baseline payload was taken from. Set by
         # load() and by every successful save; see _disk_matches_baseline.
         self._baseline_stamp: Optional[tuple[int, int, int]] = None
+        self._load_failed = False
+        self._dirty = False
+        self._last_save_error: Optional[str] = None
+        self._recovery_backup_notice: Optional[Path] = None
         self.data = self.load()
         # Three-way merge base: the disk state this process last incorporated.
         self._baseline_payload = _sidecar_to_json(self.data)
@@ -320,10 +325,6 @@ class SidecarManager:
 
     def load(self) -> Sidecar:
         """Loads sidecar data from disk if it exists, otherwise returns a new object."""
-        if not self.path.exists():
-            log.info(f"No sidecar file found at {self.path}. Creating new one.")
-            self._baseline_stamp = None
-            return Sidecar()
         try:
             t_start = time.perf_counter()
             # Stamp before reading: if a foreign write lands in between we keep
@@ -342,25 +343,81 @@ class SidecarManager:
                 )
             if data.get("version") != 2:
                 log.warning("Old sidecar format detected. Starting fresh.")
+                self._load_failed = True
                 return Sidecar()
 
             return _sidecar_from_json(data)
-        except (json.JSONDecodeError, TypeError) as e:
-            log.error(f"Failed to load or parse sidecar file {self.path}: {e}")
-            # Consider backing up the corrupted file here
+        except FileNotFoundError:
+            log.info(f"No sidecar file found at {self.path}. Creating new one.")
+            self._baseline_stamp = None
+            return Sidecar()
+        except (OSError, json.JSONDecodeError, TypeError) as e:
+            self._load_failed = True
+            log.warning(
+                "Could not read sidecar %s; using safe in-memory state and "
+                "preserving the unreadable file: %s",
+                self.path,
+                e,
+            )
             return Sidecar()
 
-    def save(self):
-        """Merge this process's changes with disk, then save atomically."""
+    @property
+    def dirty(self) -> bool:
+        """Whether state still needs a successful durable write."""
+        return self._dirty
+
+    @property
+    def last_save_error(self) -> Optional[str]:
+        return self._last_save_error
+
+    def take_recovery_backup_notice(self) -> Optional[Path]:
+        """Return and clear the unreadable-sidecar backup notification."""
+        backup = self._recovery_backup_notice
+        self._recovery_backup_notice = None
+        return backup
+
+    def save(self, *, replace_unreadable: bool = False) -> bool:
+        """Merge and atomically persist state, returning durable success.
+
+        A sidecar that could not be read is never overwritten without recovery.
+        If a later read succeeds, normal merge/save resumes. Otherwise the
+        first requested write preserves the unknown original under a unique
+        backup name before atomically creating the new sidecar. The keyword is
+        retained for API compatibility; recovery is automatic either way.
+        """
         with self._save_lock:
+            self._dirty = True
             try:
                 with self._state_lock:
                     ours = _sidecar_to_json(self.data)
+                recovered_payload = None
                 with _sidecar_write_lock(self._write_lock_path):
+                    if self._load_failed:
+                        recovered_payload = self._read_disk_payload()
+                        if recovered_payload is not None:
+                            self._load_failed = False
+                        elif self.path.exists():
+                            recovery_backup = self.path.with_name(
+                                f"{self.path.name}.unreadable-{time.time_ns()}.bak"
+                            )
+                            shutil.copy2(self.path, recovery_backup)
+                            log.warning(
+                                "Preserved unreadable sidecar as %s before recovery",
+                                recovery_backup,
+                            )
+                            self._recovery_backup_notice = recovery_backup
+                            self._load_failed = False
+                        else:
+                            self._load_failed = False
+
                     theirs = (
-                        None
-                        if self._disk_matches_baseline()
-                        else self._read_disk_payload()
+                        recovered_payload
+                        if recovered_payload is not None
+                        else (
+                            None
+                            if self._disk_matches_baseline()
+                            else self._read_disk_payload()
+                        )
                     )
                     if theirs is None:
                         # Either nobody has touched the file since our baseline,
@@ -371,8 +428,10 @@ class SidecarManager:
                         atomic_write_json(self.path, ours)
                         self._baseline_payload = ours
                         self._baseline_stamp = self._disk_stamp()
+                        self._dirty = False
+                        self._last_save_error = None
                         log.debug(f"Saved sidecar file to {self.path}")
-                        return
+                        return True
 
                     merged = _merge_sidecar_payloads(
                         self._baseline_payload,
@@ -411,9 +470,14 @@ class SidecarManager:
 
                     self._baseline_payload = _sidecar_to_json(self.data)
                 log.debug(f"Merged and saved sidecar file to {self.path}")
+                self._dirty = False
+                self._last_save_error = None
+                return True
 
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as e:
+                self._last_save_error = str(e)
                 log.error(f"Failed to merge or save sidecar file {self.path}: {e}")
+                return False
 
     @overload
     def get_metadata(
@@ -623,7 +687,7 @@ class SidecarManager:
             self.data.last_index = index
             self.data.last_path = last_path
 
-    def update_metadata(self, image_ref: Union[str, Path], updates: dict):
+    def update_metadata(self, image_ref: Union[str, Path], updates: dict) -> bool:
         """Update multiple metadata fields for an image and save if changed."""
         meta = self.get_metadata(image_ref, create=True)
         changed = False
@@ -636,4 +700,5 @@ class SidecarManager:
                 log.warning(f"Unknown metadata key: {key}")
 
         if changed:
-            self.save()
+            return self.save()
+        return True

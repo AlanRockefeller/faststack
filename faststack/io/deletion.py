@@ -2,6 +2,8 @@
 
 import logging
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -185,7 +187,7 @@ def permanently_delete_image_files(
     image_file,
     expected_identities: Optional[tuple[FileIdentity, Optional[FileIdentity]]] = None,
 ) -> bool:
-    """Permanently delete an image and its RAW pair from disk.
+    """Permanently delete a complete logical image using staged compensation.
 
     This does NOT add to undo history since deletion is permanent.
 
@@ -193,43 +195,131 @@ def permanently_delete_image_files(
         image_file: The ImageFile to delete.
 
     Returns:
-        True if at least one file was deleted, False otherwise.
+        True only if every authorized physical member was deleted.
     """
-    deleted_any = False
     jpg_path = image_file.path
     raw_path = image_file.raw_pair
-
+    candidates: list[tuple[Path, FileIdentity]] = []
     if expected_identities is not None:
         jpg_identity, raw_identity = expected_identities
-        if jpg_path:
-            validate_file_identity(jpg_path, jpg_identity)
-        if raw_path and raw_identity is not None:
-            validate_file_identity(raw_path, raw_identity)
+        if jpg_path and jpg_identity.exists:
+            candidates.append((jpg_path, jpg_identity))
+        if raw_path and raw_identity is not None and raw_identity.exists:
+            candidates.append((raw_path, raw_identity))
+    else:
+        for path in (jpg_path, raw_path):
+            if path is not None:
+                identity = capture_file_identity(path)
+                if identity.exists:
+                    candidates.append((path, identity))
 
-    # Delete JPG
-    if jpg_path and jpg_path.exists():
+    if not candidates:
+        return False
+
+    # Preflight the complete logical image before moving its first member.
+    for path, identity in candidates:
+        validate_file_identity(path, identity)
+
+    transaction_dir = Path(
+        tempfile.mkdtemp(prefix=".faststack-delete-", dir=candidates[0][0].parent)
+    )
+    staged: list[tuple[Path, Path]] = []
+    compensation: list[tuple[Path, Path]] = []
+
+    def _restore(staged_path: Path, original_path: Path) -> None:
         try:
-            if expected_identities is not None:
-                validate_file_identity(jpg_path, expected_identities[0])
-            _unlink(jpg_path)
-            log.info("Permanently deleted: %s", jpg_path.name)
-            deleted_any = True
-        except SourceChangedError:
-            raise
-        except OSError as e:
-            log.exception("Failed to permanently delete %s: %s", jpg_path.name, e)
+            # A hard link is an atomic no-replace restore: unlike os.replace,
+            # it fails if another file appeared at the authorized pathname.
+            os.link(staged_path, original_path, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise SourceChangedError(
+                f"Cannot restore {original_path.name}: a replacement appeared. "
+                f"Authorized file remains at {staged_path}."
+            ) from exc
+        staged_path.unlink()
 
-    # Delete RAW if exists
-    if raw_path and raw_path.exists():
+    def _restore_all(files: list[tuple[Path, Path]]) -> None:
+        """Attempt every safe restore before reporting aggregate failure."""
+        failures: list[tuple[Path, BaseException]] = []
+        for staged_path, original_path in files:
+            try:
+                _restore(staged_path, original_path)
+            except BaseException as exc:
+                failures.append((staged_path, exc))
+                log.error(
+                    "Could not restore %s to %s; recovery artifact retained",
+                    staged_path,
+                    original_path,
+                    exc_info=True,
+                )
+        if not failures:
+            return
+        detail = "; ".join(f"{path}: {exc}" for path, exc in failures)
+        if any(isinstance(exc, SourceChangedError) for _path, exc in failures):
+            raise SourceChangedError(detail)
+        raise OSError(detail)
+
+    try:
         try:
-            if expected_identities is not None and expected_identities[1] is not None:
-                validate_file_identity(raw_path, expected_identities[1])
-            _unlink(raw_path)
-            log.info("Permanently deleted: %s", raw_path.name)
-            deleted_any = True
-        except SourceChangedError:
+            for number, (original_path, identity) in enumerate(candidates):
+                validate_file_identity(original_path, identity)
+                staged_path = transaction_dir / f"{number}-{original_path.name}"
+                os.replace(original_path, staged_path)
+                staged.append((staged_path, original_path))
+        except BaseException:
+            _restore_all(list(reversed(staged)))
             raise
-        except OSError as e:
-            log.exception("Failed to permanently delete %s: %s", raw_path.name, e)
 
-    return deleted_any
+        # Copies make unlink failure compensatable: no irreversible unlink is
+        # attempted until every member has a complete recovery copy.
+        try:
+            for number, (staged_path, original_path) in enumerate(staged):
+                recovery_path = transaction_dir / f"rollback-{number}-{original_path.name}"
+                shutil.copy2(staged_path, recovery_path)
+                compensation.append((recovery_path, original_path))
+        except BaseException:
+            _restore_all(list(reversed(staged)))
+            raise
+
+        try:
+            for staged_path, _original_path in staged:
+                _unlink(staged_path)
+        except BaseException:
+            _restore_all(compensation)
+            raise
+
+        cleanup_failures = []
+        for recovery_path, _original_path in compensation:
+            try:
+                recovery_path.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_failures.append(recovery_path)
+                log.warning(
+                    "Logical deletion succeeded but recovery debris could not be "
+                    "removed; retained at %s: %s",
+                    recovery_path,
+                    exc,
+                )
+        log.info(
+            "Permanently deleted logical image: %s",
+            ", ".join(path.name for path, _identity in candidates),
+        )
+        if cleanup_failures:
+            log.warning(
+                "Permanent deletion completed with %d retained cleanup artifacts",
+                len(cleanup_failures),
+            )
+        return True
+    except SourceChangedError:
+        raise
+    except OSError as exc:
+        log.exception("Permanent logical-image deletion failed: %s", exc)
+        return False
+    finally:
+        try:
+            transaction_dir.rmdir()
+        except OSError:
+            log.error(
+                "Permanent-delete transaction state retained for recovery: %s",
+                transaction_dir,
+            )
