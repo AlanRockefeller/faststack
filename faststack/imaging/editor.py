@@ -36,7 +36,7 @@ from faststack.imaging.math_utils import (
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
-from faststack.models import DecodedImage
+from faststack.models import DecodedImage, ResolvedDarkenMask
 from faststack.util.executors import create_daemon_threadpool_executor
 
 try:
@@ -926,6 +926,87 @@ class ImageEditor:
         }
 
     @staticmethod
+    def _freeze_mask_identity_value(value: Any) -> Any:
+        """Freeze small edit-state values without scanning rendered pixels."""
+        if isinstance(value, dict):
+            return tuple(
+                sorted(
+                    (
+                        ImageEditor._freeze_mask_identity_value(key),
+                        ImageEditor._freeze_mask_identity_value(item),
+                    )
+                    for key, item in value.items()
+                )
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(
+                ImageEditor._freeze_mask_identity_value(item) for item in value
+            )
+        if isinstance(value, np.ndarray):
+            # Edit state should not contain pixel buffers. If a future tool adds
+            # one, its immutable object identity is still safer on the hot path
+            # than silently reintroducing an O(image-size) scan.
+            return ("array", id(value), value.shape, value.dtype.str)
+        if isinstance(value, float):
+            return round(value, 9)
+        return value
+
+    def _mask_render_identity(
+        self,
+        source: Any,
+        edits: Dict[str, Any],
+        *,
+        for_export: bool,
+        levels_soft_knee: bool,
+        downscale_long_edge: Optional[int],
+        detail_source_scale: float,
+        stage_stamps: tuple,
+    ) -> tuple:
+        """Identity of the immutable source and all pre-mask render inputs.
+
+        The resolved-mask cache must invalidate whenever the pre-darken image
+        could differ, and stay stable otherwise. Everything that can move those
+        pixels is enumerated here:
+
+        * the decoded source — ``session_id`` changes on every load and
+          ``_preview_master_generation`` on every preview-master rebuild, so a
+          recycled ``id()`` cannot alias a different buffer; ``current_mtime``
+          covers reload-in-place.
+        * every edit except ``darken_settings`` and ``vignette``, which are the
+          only pipeline stages at or after the darken step (19.5 and 20).
+          Rotation, straighten and crop are ordinary edit keys, so geometry —
+          the one group of content-*moving* rather than content-scaling
+          operations before the mask — is covered here too.
+        * the render parameters that change pixels without changing edits:
+          ``for_export`` (selects the export clipping/skip-linear branch),
+          ``levels_soft_knee``, ``downscale_long_edge`` and
+          ``detail_source_scale``.
+        * ``stage_stamps`` — see ``_render_cache_stamps``. Two renders with
+          identical edits can still differ where an upstream cache handed back
+          an approximate stage, so the stamps of any *reused* stage are part of
+          the identity.
+
+        Shape is not included because ``resolve_mask`` already keys on it.
+        """
+        upstream_edits = tuple(
+            (key, self._freeze_mask_identity_value(value))
+            for key, value in sorted(edits.items())
+            if key not in {"darken_settings", "vignette"}
+        )
+        return (
+            self.session_id,
+            id(source),
+            self._preview_master_generation,
+            self.current_mtime,
+            bool(for_export),
+            bool(levels_soft_knee),
+            downscale_long_edge,
+            round(float(detail_source_scale), 9),
+            stage_stamps,
+            upstream_edits,
+        )
+
+    @staticmethod
     def _rotate_point_90_normalized(
         x: float, y: float, steps_ccw: int
     ) -> Tuple[float, float]:
@@ -1509,6 +1590,7 @@ class ImageEditor:
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
         stop_before_darken: bool = False,
+        render_state_out: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
         Returns float32 array (H, W, 3).
@@ -1541,6 +1623,11 @@ class ImageEditor:
         ``stop_before_darken`` returns the authoritative content-analysis stage
         used by the background-darkening mask. Overlay generation uses this
         exact boundary so it cannot derive priors from a different edit stage.
+
+        ``render_state_out`` receives this render's ``mask_render_identity``.
+        Callers that stop before the darken step and resolve the mask
+        themselves need it, because the identity depends on which upstream
+        stages this particular render reused rather than recomputed.
         """
         cv2 = _get_cv2()
         if edits is None:
@@ -1550,7 +1637,6 @@ class ImageEditor:
             if levels_soft_knee_override is None
             else bool(levels_soft_knee_override)
         )
-
         debug_enabled = log.isEnabledFor(logging.DEBUG)
         debug_t0 = time.perf_counter() if debug_enabled else None
         debug_stage_marks: list[tuple[str, float]] | None = (
@@ -1747,6 +1833,12 @@ class ImageEditor:
         # computes from a 4x-strided view below.
         _skip_linear = self._edits_skip_linear(edits)
 
+        # Stamps of any *reused* (and therefore possibly approximate) upstream
+        # stage, for _mask_render_identity(). None means "computed exactly from
+        # source + edits", which needs no identity of its own.
+        highlight_stage_stamp: Optional[tuple] = None
+        detail_stage_stamp: Optional[tuple] = None
+
         if for_export:
             log.debug("_apply_edits for_export: skip_linear=%s", _skip_linear)
 
@@ -1787,6 +1879,7 @@ class ImageEditor:
                         "hash": upstream_hash,
                         "frozen": upstream_frozen,
                         "state": analysis_state,
+                        "measured_shape": arr.shape[:2],
                     }
                     if cache_context is not None:
                         cache_context["highlight_analysis"] = entry
@@ -1865,6 +1958,7 @@ class ImageEditor:
                 upstream_hash, upstream_frozen = self._get_upstream_edits_hash(edits)
 
                 cached_analysis = None
+                cached_analysis_shape = None
                 with self._lock:
                     cached_dict = (
                         cache_context.get("highlight_analysis")
@@ -1877,6 +1971,7 @@ class ImageEditor:
                         and cached_dict["frozen"] == upstream_frozen
                     ):
                         cached_analysis = cached_dict["state"]
+                        cached_analysis_shape = cached_dict.get("measured_shape")
 
                 if cached_analysis:
                     analysis_state = cached_analysis
@@ -1892,16 +1987,25 @@ class ImageEditor:
                         pre_exposure_linear=pre_exposure_linear_stride,
                     )
 
+                    cached_analysis_shape = arr.shape[:2]
                     with self._lock:
                         entry = {
                             "hash": upstream_hash,
                             "frozen": upstream_frozen,
                             "state": analysis_state,
+                            "measured_shape": cached_analysis_shape,
                         }
                         if cache_context is not None:
                             cache_context["highlight_analysis"] = entry
                         else:
                             self._cached_highlight_analysis = entry
+
+                # The state is measured from a 4x-strided view, and its cache
+                # key does not include resolution — so a hit across two render
+                # tiers hands back numbers this buffer would not have produced.
+                # It reaches pixels only through the highlights branch below.
+                if abs(highlights) > 0.001:
+                    highlight_stage_stamp = cached_analysis_shape
 
             if not for_export and update_highlight_state:
                 with self._lock:
@@ -1959,6 +2063,17 @@ class ImageEditor:
                 Y20_cached = Y3_cached = Y1_cached = None
                 cache_hit = False
                 cached_exp_gain = 1.0
+                # Identity of each cached band: the conditions it was blurred
+                # under. The cache key (detail_frozen) deliberately excludes
+                # exposure, highlights and shadows so blurs survive a drag, so
+                # those are what a band's identity has to carry.
+                cached_band_ids: Dict[str, Any] = {}
+                blur_id = (
+                    detail_scale_key,
+                    round(float(current_exp_gain), 9),
+                    round(float(edits.get("highlights", 0.0)), 6),
+                    round(float(edits.get("shadows", 0.0)), 6),
+                )
 
                 with self._lock:
                     cached = (
@@ -1977,6 +2092,7 @@ class ImageEditor:
                         Y3_cached = cached.get("Y3")
                         Y1_cached = cached.get("Y1")
                         cached_exp_gain = cached.get("exp_gain", 1.0)
+                        cached_band_ids = dict(cached.get("band_ids") or {})
                         cache_hit = True
 
                         # Validate cached array shapes match current Y dimensions
@@ -1986,6 +2102,7 @@ class ImageEditor:
                             if cached_arr is not None and cached_arr.shape != y_shape:
                                 # Shape mismatch - invalidate cache
                                 Y20_cached = Y3_cached = Y1_cached = None
+                                cached_band_ids = {}
                                 cache_hit = False
                                 break
 
@@ -2049,6 +2166,7 @@ class ImageEditor:
                                 "frozen": detail_frozen,
                                 "detail_scale": detail_scale_key,
                                 "exp_gain": cached_exp_gain,  # Keep original exp_gain for existing blurs
+                                "band_ids": dict(cached_band_ids),
                                 "Y20": Y20_cached,
                                 "Y3": Y3_cached,
                                 "Y1": Y1_cached,
@@ -2062,6 +2180,7 @@ class ImageEditor:
                             for key, val in newly_computed.items():
                                 if val is not None:
                                     new_cache[key] = val * rescale_to_cached
+                                    new_cache["band_ids"][key] = blur_id
                         else:
                             # Fresh cache at current exposure
                             new_cache = {
@@ -2069,6 +2188,11 @@ class ImageEditor:
                                 "frozen": detail_frozen,
                                 "detail_scale": detail_scale_key,
                                 "exp_gain": current_exp_gain,
+                                "band_ids": {
+                                    key: blur_id
+                                    for key, val in newly_computed.items()
+                                    if val is not None
+                                },
                                 "Y20": newly_computed["Y20"],
                                 "Y3": newly_computed["Y3"],
                                 "Y1": newly_computed["Y1"],
@@ -2077,6 +2201,24 @@ class ImageEditor:
                             cache_context["detail_bands"] = new_cache
                         else:
                             self._cached_detail_bands = new_cache
+                        cached_band_ids = new_cache["band_ids"]
+
+                # A band this render used is its stored array rescaled from the
+                # gain it was blurred at to the current one, so its identity
+                # plus the current exposure (already in the key) pins its value
+                # exactly. A freshly blurred band and a reused band that was
+                # blurred under the same conditions therefore agree, while a
+                # band carried across an exposure or highlights/shadows change
+                # — where the rescale is only an approximation — does not.
+                detail_stage_stamp = tuple(
+                    (name, cached_band_ids.get(name))
+                    for name, needed in (
+                        ("Y20", need_Y20),
+                        ("Y3", need_Y3),
+                        ("Y1", need_Y1),
+                    )
+                    if needed
+                )
 
                 # Build hierarchical pyramid bands (non-overlapping frequency ranges)
                 detail = np.zeros_like(Y)
@@ -2262,6 +2404,18 @@ class ImageEditor:
         _check_cancelled()
 
         # 19.5. Background Darkening (masked, after levels, before vignette)
+        mask_render_identity = self._mask_render_identity(
+            img_arr,
+            edits,
+            for_export=for_export,
+            levels_soft_knee=use_levels_soft_knee,
+            downscale_long_edge=downscale_long_edge,
+            detail_source_scale=detail_source_scale,
+            stage_stamps=(highlight_stage_stamp, detail_stage_stamp),
+        )
+        if render_state_out is not None:
+            render_state_out["mask_render_identity"] = mask_render_identity
+
         if stop_before_darken:
             return arr
 
@@ -2290,7 +2444,25 @@ class ImageEditor:
                     arr.shape[:2],
                     edits,
                     cache=_cache,
+                    image_key=mask_render_identity,
                 )
+                if render_state_out is not None:
+                    # Hand the overlay the mask this render actually applied,
+                    # rather than making it re-render the pre-darken stage to
+                    # resolve an equivalent one. Published read-only: the array
+                    # is shared with MaskRasterCache and, once emitted, with the
+                    # GUI thread. See models.ResolvedDarkenMask.
+                    try:
+                        resolved.flags.writeable = False
+                    except ValueError:  # pragma: no cover - non-owning array
+                        pass
+                    render_state_out["resolved_darken_mask"] = ResolvedDarkenMask(
+                        mask=resolved,
+                        width=resolved.shape[1],
+                        height=resolved.shape[0],
+                        mask_id=darken.mask_id,
+                        mask_revision=mask_data.revision,
+                    )
                 arr = apply_masked_darken(
                     arr,
                     resolved,
@@ -2353,57 +2525,6 @@ class ImageEditor:
 
         return (
             arr  # May exceed 1.0 in preview/non-export; clipped for skip_linear export.
-        )
-
-    def resolve_darken_preview_mask(self) -> Optional[np.ndarray]:
-        """Resolve the live overlay from the renderer's pre-darken stage."""
-        with self._lock:
-            base = self.float_preview
-            edits = dict(self.current_edits)
-            settings = edits.get("darken_settings")
-            mask_data = (
-                self._mask_assets.get(settings.mask_id)
-                if settings is not None
-                else None
-            )
-            if base is None or mask_data is None or not mask_data.has_strokes():
-                return None
-
-            detail_source_scale = 1.0
-            if self.float_image is not None:
-                full_h, full_w = self.float_image.shape[:2]
-            elif self.original_image is not None:
-                full_w, full_h = self.original_image.size
-            else:
-                full_w = full_h = 0
-            if full_w > 0 and full_h > 0:
-                base_h, base_w = base.shape[:2]
-                detail_source_scale = min(
-                    base_w / full_w,
-                    base_h / full_h,
-                    1.0,
-                )
-
-        pre_darken = self._apply_edits(
-            base,
-            edits=edits,
-            for_export=False,
-            cache_context={},
-            update_highlight_state=False,
-            detail_source_scale=detail_source_scale,
-            protect_input=True,
-            stop_before_darken=True,
-        )
-
-        from faststack.imaging.mask_engine import resolve_mask
-
-        return resolve_mask(
-            mask_data,
-            settings,
-            pre_darken,
-            pre_darken.shape[:2],
-            edits,
-            cache=self._mask_raster_cache,
         )
 
     def auto_levels(
@@ -3260,6 +3381,9 @@ class ImageEditor:
             height=target_h,
             bytes_per_line=resized.strides[0],
             format=decoded.format,
+            # Display resizing does not re-resolve the mask; it stays at the
+            # tier that produced it and QML scales the overlay to fit.
+            darken_mask=decoded.darken_mask,
         )
 
     def _render_decoded_from_float(
@@ -3281,6 +3405,7 @@ class ImageEditor:
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
+        render_state: Dict[str, Any] = {}
         arr = self._apply_edits(
             base,
             edits=edits,
@@ -3290,6 +3415,7 @@ class ImageEditor:
             detail_source_scale=detail_source_scale,
             protect_input=protect_input,
             cancel_check=cancel_check,
+            render_state_out=render_state,
         )
         if cancel_check is not None and cancel_check():
             raise EditRenderCancelled
@@ -3343,6 +3469,8 @@ class ImageEditor:
             height=arr_u8.shape[0],
             bytes_per_line=arr_u8.strides[0],
             format=QImage.Format.Format_RGB888,
+            # Pixels and the mask applied to them travel together from here on.
+            darken_mask=render_state.get("resolved_darken_mask"),
         )
 
     def get_full_resolution_preview_data(

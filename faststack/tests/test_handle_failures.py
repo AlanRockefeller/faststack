@@ -58,6 +58,8 @@ def test_handle_delete_failures_recycle_codes():
     controller.sync_ui_state = MagicMock()
     controller._register_pending_delete_paths = MagicMock()
     controller._run_critical_user_data_operation = MagicMock()
+    # confirm_permanent_delete is handed the controller's modal-dialog runner.
+    controller._exec_modal_dialog = MagicMock(return_value=0)
 
     # Signals / executor used by the method
     controller._deleteFinished = MagicMock()

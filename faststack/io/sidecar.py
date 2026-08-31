@@ -74,6 +74,7 @@ def _sidecar_to_json(sidecar: Sidecar) -> dict:
         "stacks": copy.deepcopy(sidecar.stacks),
         "stack_paths": copy.deepcopy(sidecar.stack_paths),
         "stack_order": copy.deepcopy(sidecar.stack_order),
+        "ambiguous_legacy_keys": list(sidecar.ambiguous_legacy_keys),
     }
 
 
@@ -82,6 +83,9 @@ def _sidecar_from_json(data: dict) -> Sidecar:
     entries_data = data.get("entries", {})
     if not isinstance(entries_data, dict):
         raise TypeError("sidecar entries must be an object")
+    ambiguous_legacy_keys = data.get("ambiguous_legacy_keys", [])
+    if not isinstance(ambiguous_legacy_keys, list):
+        ambiguous_legacy_keys = []
     return Sidecar(
         version=data.get("version", 2),
         last_index=data.get("last_index", 0),
@@ -99,6 +103,9 @@ def _sidecar_from_json(data: dict) -> Sidecar:
         stacks=copy.deepcopy(data.get("stacks", [])),
         stack_paths=copy.deepcopy(data.get("stack_paths", [])),
         stack_order=copy.deepcopy(data.get("stack_order", [])),
+        ambiguous_legacy_keys=[
+            key for key in ambiguous_legacy_keys if isinstance(key, str) and key
+        ],
     )
 
 
@@ -298,6 +305,18 @@ def _merge_sidecar_payloads(base: dict, ours: dict, theirs: dict) -> dict:
                 ours.get(key, {}),
                 theirs.get(key, {}),
             )
+        elif key == "ambiguous_legacy_keys":
+            # Ambiguity provenance is monotonic: once a legacy key was seen
+            # with multiple possible owners, no later process may make it safe
+            # merely by omitting that observation from its stale snapshot.
+            provenance = set()
+            for source in (base, ours, theirs):
+                source_items = source.get(key, [])
+                if isinstance(source_items, list):
+                    provenance.update(
+                        item for item in source_items if isinstance(item, str) and item
+                    )
+            value = sorted(provenance)
         elif key in {"stacks", "stack_paths", "stack_order"} and stack_merge:
             value = {
                 "stacks": stack_merge[0],
@@ -414,6 +433,42 @@ class SidecarManager:
         self.data = self.load()
         # Three-way merge base: the disk state this process last incorporated.
         self._baseline_payload = _sidecar_to_json(self.data)
+        if self._record_ambiguous_legacy_keys():
+            # This is provenance, not ordinary editable metadata. Persist it at
+            # discovery time so removing one colliding JPEG in a later session
+            # cannot make the old entry appear safe to auto-migrate.
+            self.save()
+
+    def _record_ambiguous_legacy_keys(self) -> bool:
+        """Persist stem-only entries that currently match multiple JPEGs."""
+        recorded = set(self.data.ambiguous_legacy_keys)
+        changed = False
+        for key in self.data.entries:
+            if key in recorded or Path(key).suffix.lower() in KNOWN_IMAGE_EXTENSIONS:
+                continue
+            candidate = Path(key)
+            if not candidate.is_absolute():
+                candidate = self.directory / candidate
+            matches = {
+                os.path.normcase(os.path.abspath(str(path)))
+                for suffix in JPG_EXTENSIONS
+                for path in (
+                    candidate.with_suffix(suffix),
+                    candidate.with_suffix(suffix.upper()),
+                )
+                if path.is_file()
+            }
+            if len(matches) > 1:
+                recorded.add(key)
+                changed = True
+                log.warning(
+                    "Preserving ambiguous legacy metadata key %r; multiple JPEG "
+                    "extensions own that stem",
+                    key,
+                )
+        if changed:
+            self.data.ambiguous_legacy_keys[:] = sorted(recorded)
+        return changed
 
     def stop_watcher(self):
         if self.watcher:
@@ -609,6 +664,9 @@ class SidecarManager:
                     self.data.stacks[:] = merged_data.stacks
                     self.data.stack_paths[:] = merged_data.stack_paths
                     self.data.stack_order[:] = merged_data.stack_order
+                    self.data.ambiguous_legacy_keys[:] = (
+                        merged_data.ambiguous_legacy_keys
+                    )
                     for key in list(self.data.entries):
                         if key not in merged_data.entries:
                             del self.data.entries[key]
@@ -686,10 +744,13 @@ class SidecarManager:
             return None
 
         with self._state_lock:
+            ambiguous_legacy_keys = set(self.data.ambiguous_legacy_keys)
             meta = self.data.entries.get(stable_key)
             if meta is None:
                 for candidate_key in candidate_keys:
                     if candidate_key == stable_key:
+                        continue
+                    if candidate_key in ambiguous_legacy_keys:
                         continue
                     candidate_meta = self.data.entries.get(candidate_key)
                     if candidate_meta is None:
@@ -706,6 +767,8 @@ class SidecarManager:
             if meta is None and migrate:
                 for existing_key, existing_meta in list(self.data.entries.items()):
                     if existing_key == stable_key:
+                        continue
+                    if existing_key in ambiguous_legacy_keys:
                         continue
                     if (
                         self._stable_key_from_key(existing_key, check_fs=True)

@@ -216,14 +216,19 @@ Window {
         cacheUsageTimer.running = settingsDialog.visible
         if (settingsDialog.visible) {
             if (settingsDialog.controllerRef) {
-                settingsDialog.controllerRef.dialog_opened()
+                settingsDialog.controllerRef.dialog_opened("qml-settings")
             }
             settingsDialog.refreshTextFields()
         } else {
             if (settingsDialog.controllerRef) {
-                settingsDialog.controllerRef.dialog_closed()
+                settingsDialog.controllerRef.dialog_closed("qml-settings")
             }
         }
+    }
+
+    Component.onDestruction: {
+        if (settingsDialog.controllerRef)
+            settingsDialog.controllerRef.dialog_closed("qml-settings")
     }
 
     function saveSettings() {

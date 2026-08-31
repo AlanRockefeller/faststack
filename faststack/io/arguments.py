@@ -72,4 +72,3 @@ def parse_external_arguments(value: str, *, windows: bool | None = None) -> list
     if windows:
         return _split_windows_command_line(value)
     return shlex.split(value, posix=True)
-

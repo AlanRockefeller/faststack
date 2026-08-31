@@ -74,7 +74,9 @@ class TestFolderLoadState(unittest.TestCase):
                 side_effect=lambda *_args: calls.append("model"),
             ) as set_directories,
             patch.object(self.controller._thumbnail_model, "refresh") as refresh,
-            patch.object(self.controller._thumbnail_model, "navigate_to") as navigate_to,
+            patch.object(
+                self.controller._thumbnail_model, "navigate_to"
+            ) as navigate_to,
         ):
             self.controller._switch_to_directory(next_dir, update_base_directory=False)
 

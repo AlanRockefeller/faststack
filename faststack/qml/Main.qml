@@ -1495,7 +1495,9 @@ ApplicationWindow {
     Shortcut {
         sequence: "Escape"
         context: Qt.ApplicationShortcut
-        enabled: root.fullScreenLoupe && (!root.uiStateRef || !root.uiStateRef.isCropping)
+        enabled: root.fullScreenLoupe
+                 && (!root.uiStateRef
+                     || (!root.uiStateRef.isCropping && !root.uiStateRef.isDialogOpen))
         onActivated: root.exitFullScreenLoupe()
     }
 
@@ -1994,6 +1996,17 @@ ApplicationWindow {
                 Layout.rightMargin: 10
             }
 
+            Label {
+                text: "Automatic folder monitoring unavailable — use Refresh"
+                color: "#FFD54F"
+                font.pixelSize: 12
+                font.bold: true
+                visible: root.uiStateRef
+                         ? !root.uiStateRef.automaticMonitoringAvailable
+                         : false
+                Layout.rightMargin: 10
+            }
+
 
             // Saturation slider (only visible in saturation mode)
             Row {
@@ -2169,6 +2182,7 @@ ApplicationWindow {
     Dialog {
         id: aboutDialog
         Component.onCompleted: controller.markStartup("aboutDialog")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-about")
         title: "Key Bindings"
         standardButtons: Dialog.Ok
         modal: true
@@ -2176,6 +2190,9 @@ ApplicationWindow {
         focus: true
         width: 1000
         height: 750
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-about")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-about")
 
         background: Rectangle {
             color: root.currentBackgroundColor
@@ -2283,6 +2300,7 @@ ApplicationWindow {
     Dialog {
         id: readmeDialog
         Component.onCompleted: controller.markStartup("readmeDialog")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-readme")
         title: "FastStack Readme"
         standardButtons: Dialog.Ok
         modal: true
@@ -2292,6 +2310,9 @@ ApplicationWindow {
         height: Math.min(820, root.height - 100)
 
         property string readmeText: ""
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-readme")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-readme")
 
         background: Rectangle {
             color: root.currentBackgroundColor
@@ -2325,6 +2346,7 @@ ApplicationWindow {
     Dialog {
         id: showStacksDialog
         Component.onCompleted: controller.markStartup("showStacksDialog")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-stack-info")
         title: "Stack Information"
         standardButtons: Dialog.Ok
         modal: true
@@ -2332,6 +2354,9 @@ ApplicationWindow {
         focus: true
         width: 400
         height: 300
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-stack-info")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-stack-info")
 
         background: Rectangle {
             color: root.currentBackgroundColor
@@ -2485,11 +2510,12 @@ ApplicationWindow {
         readonly property string releaseSummary: updateInfo && updateInfo.summary ? updateInfo.summary : "Open the release page for details."
 
         onOpened: {
-            if (root.controllerRef) root.controllerRef.dialog_opened()
+            if (root.controllerRef) root.controllerRef.dialog_opened("qml-update")
         }
         onClosed: {
-            if (root.controllerRef) root.controllerRef.dialog_closed()
+            if (root.controllerRef) root.controllerRef.dialog_closed("qml-update")
         }
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-update")
 
         background: Rectangle {
             color: root.isDarkTheme ? "#1e1e1e" : "#fdfdfd"
@@ -2641,7 +2667,12 @@ ApplicationWindow {
             }
         }
 
-        onOpened: refreshBinInfo()
+        onOpened: {
+            if (root.controllerRef) root.controllerRef.dialog_opened("qml-recycle-cleanup")
+            refreshBinInfo()
+        }
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-recycle-cleanup")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-recycle-cleanup")
 
         // Ensure the dialog is fully opaque and has a solid background
         background: Rectangle {

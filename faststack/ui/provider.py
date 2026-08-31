@@ -631,6 +631,7 @@ class UIState(QObject):
     statusMessageColorChanged = (
         Signal()
     )  # Optional override color for the status message
+    automaticMonitoringAvailableChanged = Signal()
     resetZoomPanRequested = Signal()  # Signal to tell QML to reset zoom/pan
     absoluteZoomRequested = Signal(
         float
@@ -757,6 +758,7 @@ class UIState(QObject):
         self._theme = 1
         self._status_message = ""  # New private variable for status message
         self._status_message_color = ""  # "" means use the default text color
+        self._automatic_monitoring_available = True
         # Image Editor State
         self._is_editor_open = False
         self._is_editor_expanded = False
@@ -1202,6 +1204,17 @@ class UIState(QObject):
         if self._status_message_color != value:
             self._status_message_color = value
             self.statusMessageColorChanged.emit()
+
+    @Property(bool, notify=automaticMonitoringAvailableChanged)
+    def automaticMonitoringAvailable(self) -> bool:
+        return self._automatic_monitoring_available
+
+    @automaticMonitoringAvailable.setter
+    def automaticMonitoringAvailable(self, value: bool) -> None:
+        value = bool(value)
+        if self._automatic_monitoring_available != value:
+            self._automatic_monitoring_available = value
+            self.automaticMonitoringAvailableChanged.emit()
 
     @Property(str, notify=updateNoticeChanged)
     def updateNoticeVersion(self):

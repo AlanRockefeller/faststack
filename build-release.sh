@@ -122,6 +122,11 @@ version="$(show_target_file pyproject.toml | sed -n 's/^version = "\([^"]*\)"/\1
 [ -n "$version" ] || die "could not read project version from target pyproject.toml"
 
 if [ -z "$tag" ]; then
+  # buildN is a publication/rebuild counter for one pyproject application
+  # version, not an update-order component. Frozen bundles report only
+  # ``version`` below, and the updater intentionally compares that base version.
+  # Ship user-visible fixes under a new PEP 440 project version instead of
+  # expecting vX.Y.Z-build2 to upgrade users of vX.Y.Z-build1.
   prefix="v${version}-build"
   max_build=0
   while IFS= read -r existing_tag; do

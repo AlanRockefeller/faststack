@@ -93,4 +93,3 @@ def test_manual_refresh_failure_keeps_current_list(app_controller, failure):
     assert app_controller.image_files == [current]
     app_controller._on_index_scan_ready.assert_not_called()
     app_controller.update_status_message.assert_called_once()
-

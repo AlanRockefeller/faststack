@@ -59,4 +59,3 @@ def test_malformed_config_is_preserved_before_default_recovery(tmp_path):
     assert backups[0].read_bytes() == malformed
     assert recovered.get("core", "theme") is not None
     assert _read(config_path).has_section("core")
-

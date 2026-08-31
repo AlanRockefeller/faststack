@@ -389,6 +389,7 @@ def resolve_mask(
     shape: Tuple[int, int],
     edits: Dict[str, Any],
     cache: Optional["MaskRasterCache"] = None,
+    image_key: Any = None,
 ) -> np.ndarray:
     """Full mask resolution: strokes → confidence → feather → soft mask.
 
@@ -399,7 +400,10 @@ def resolve_mask(
     """
     geo_hash = _geometry_hash(edits)
     params_key = settings.params_tuple()
-    img_key = _image_content_key(image_arr)
+    # ImageEditor supplies a generation/revision identity for interactive and
+    # export renders. Standalone callers without trustworthy provenance retain
+    # the full-content fallback for correctness.
+    img_key = image_key if image_key is not None else _image_content_key(image_arr)
 
     if cache is not None:
         cached = cache.get_resolved(
@@ -573,7 +577,7 @@ class MaskRasterCache:
         shape: Tuple[int, int],
         geo_hash: int,
         params_key: tuple,
-        img_key: int,
+        img_key: Any,
     ) -> Optional[np.ndarray]:
         key = (revision, shape, geo_hash, params_key, img_key)
         if self._resolved_key == key:
@@ -586,7 +590,7 @@ class MaskRasterCache:
         shape: Tuple[int, int],
         geo_hash: int,
         params_key: tuple,
-        img_key: int,
+        img_key: Any,
         mask: np.ndarray,
     ) -> None:
         self._resolved_key = (revision, shape, geo_hash, params_key, img_key)

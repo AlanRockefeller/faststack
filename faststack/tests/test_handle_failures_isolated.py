@@ -26,6 +26,8 @@ class MockController:
         self._perm_delete_worker = MagicMock()
         self._register_pending_delete_paths = MagicMock()
         self._run_critical_user_data_operation = MagicMock()
+        # confirm_permanent_delete is handed the controller's modal-dialog runner.
+        self._exec_modal_dialog = MagicMock(return_value=0)
 
     def _key(self, p):
         return str(p) if p else None

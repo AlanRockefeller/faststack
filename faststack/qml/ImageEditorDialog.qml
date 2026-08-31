@@ -87,6 +87,7 @@ Window {
     Shortcut {
         sequence: "Escape"
         context: Qt.WindowShortcut
+        enabled: !discardDialog.opened
         onActivated: {
             imageEditorDialog.requestClose()
         }
@@ -94,7 +95,8 @@ Window {
     Shortcut {
         sequence: "S"
         context: Qt.WindowShortcut
-        enabled: imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isSaving : true
+        enabled: !discardDialog.opened
+                 && (imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isSaving : true)
         onActivated: {
             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.save_edited_image()
             // Note: Editor closes automatically via _on_save_finished callback
@@ -103,6 +105,7 @@ Window {
     Shortcut {
         sequence: "K"
         context: Qt.WindowShortcut
+        enabled: !discardDialog.opened
         onActivated: {
             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.toggle_darken_mode()
         }
@@ -115,6 +118,10 @@ Window {
         anchors.centerIn: parent
         width: 280
         standardButtons: Dialog.Yes | Dialog.No
+
+        onOpened: if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.dialog_opened("qml-expanded-discard")
+        onClosed: if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.dialog_closed("qml-expanded-discard")
+        Component.onDestruction: if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.dialog_closed("qml-expanded-discard")
 
         Label {
             text: "You have unsaved edits.\nDiscard and close?"

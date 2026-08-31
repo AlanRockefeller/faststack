@@ -27,18 +27,21 @@ Dialog {
     }
 
     onOpened: {
+        if (exifDialog.controllerRef) {
+            exifDialog.controllerRef.dialog_opened("qml-exif")
+        }
         // Reset to summary view when opened
         showFull = false
-        // Notify Python that a dialog is open
-        if (exifDialog.controllerRef) {
-            exifDialog.controllerRef.dialog_opened()
-        }
     }
     
     onClosed: {
         if (exifDialog.controllerRef) {
-            exifDialog.controllerRef.dialog_closed()
+            exifDialog.controllerRef.dialog_closed("qml-exif")
         }
+    }
+
+    Component.onDestruction: {
+        if (exifDialog.controllerRef) exifDialog.controllerRef.dialog_closed("qml-exif")
     }
 
     contentItem: ColumnLayout {

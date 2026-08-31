@@ -683,7 +683,7 @@ class AppConfig:
             "updates", "last_successful_update_check", fallback=""
         ).strip()
         if legacy_check and not current:
-            self.config.set("updates", "last_successful_update_check", legacy_check)
+            self.set("updates", "last_successful_update_check", legacy_check)
             changed = True
 
         for dead_key in ("last_check_at", "auto_update"):

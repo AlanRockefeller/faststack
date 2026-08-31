@@ -64,7 +64,12 @@ Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 # ⬇️ these are the ones that went missing
 from faststack.config import config
 from faststack.logging_setup import setup_logging
-from faststack.models import ImageFile, DecodedImage, EntryMetadata
+from faststack.models import (
+    ImageFile,
+    DecodedImage,
+    EntryMetadata,
+    ResolvedDarkenMask,
+)
 from faststack.io.indexer import (
     find_images,
     find_images_with_variants,
@@ -528,6 +533,14 @@ class AppController(QObject):
         # Token of the last display-capped full-resolution kick; its accepted
         # final frame defines _live_preview_target_dims for quick renders.
         self._preview_full_res_token = -1
+        # Background-darkening mask published by the most recently *accepted*
+        # preview frame, with the session it belongs to. Written only inside
+        # _apply_preview_result's accept block, under _preview_lock, so a
+        # worker result that loses the token race can never install its mask.
+        # The overlay is built from this instead of re-rendering the pre-darken
+        # stage on the GUI thread. See models.ResolvedDarkenMask for ownership.
+        self._accepted_darken_mask: Optional[ResolvedDarkenMask] = None
+        self._accepted_darken_mask_session: Optional[tuple] = None
         self._live_preview_target_dims: Optional[Tuple[int, int]] = None
         self._live_preview_target_session_key: Optional[tuple[str, Optional[str]]] = (
             None
@@ -735,7 +748,9 @@ class AppController(QObject):
         # In-progress background-darkening brush stroke; must exist before
         # the first navigation because _reset_darken_on_navigation reads it.
         self._current_darken_stroke: Optional[dict] = None
-        self._dialog_open_count = 0  # Track nested dialogs
+        self._dialog_open_count = 0  # Derived total of nested modal scopes.
+        self._anonymous_dialog_depth = 0
+        self._active_modal_tokens: set[str] = set()
         self._helicon_launches: Dict[int, HeliconLaunch] = {}
         self._helicon_launches_lock = threading.Lock()
 
@@ -2729,6 +2744,7 @@ class AppController(QObject):
             log.warning(
                 "Continuing without live file monitoring for %s", self.image_dir
             )
+        self.ui_state.automaticMonitoringAvailable = bool(watching)
 
         # Publish the new list only after its restored current index and decode
         # state are ready. An early imageCountChanged used to make QML request
@@ -3039,9 +3055,8 @@ class AppController(QObject):
 
         self._scan_count_variant += 1
         pending_snapshot = getattr(self, "_pending_directory_snapshot", None)
-        if (
-            pending_snapshot is not None
-            and pending_snapshot[0] == self._key(self.image_dir)
+        if pending_snapshot is not None and pending_snapshot[0] == self._key(
+            self.image_dir
         ):
             images, variant_map = pending_snapshot[1]
             self._pending_directory_snapshot = None
@@ -3142,9 +3157,7 @@ class AppController(QObject):
             log.error("Background directory scan failed: %s", e)
             result = None
             error = str(e)
-        self._indexScanReady.emit(
-            {"epoch": epoch, "result": result, "error": error}
-        )
+        self._indexScanReady.emit({"epoch": epoch, "result": result, "error": error})
 
     @Slot(object)
     def _on_index_scan_ready(self, payload) -> None:
@@ -8558,26 +8571,51 @@ class AppController(QObject):
                 "Cannot open EXIF dialog: main_window or openExifDialog not available"
             )
 
-    @Slot()
-    def dialog_opened(self):
-        """Called when any dialog opens to disable global keybindings."""
-        self._dialog_open_count += 1
-        if self._dialog_open_count == 1:
+    def _update_dialog_open_state(self) -> None:
+        """Publish modal state after a balanced token/depth change."""
+        count = self._anonymous_dialog_depth + len(self._active_modal_tokens)
+        was_open = self._dialog_open_count > 0
+        is_open = count > 0
+        self._dialog_open_count = count
+        if not was_open and is_open:
             self._begin_direct_image_transition("dialog opened")
             self._dialog_open = True
             self.dialogStateChanged.emit(True)
-            log.debug("Dialog opened (count=1), disabling global keybindings")
-
-    @Slot()
-    def dialog_closed(self):
-        """Called when any dialog closes to re-enable global keybindings."""
-        prev = self._dialog_open_count
-        self._dialog_open_count = max(0, self._dialog_open_count - 1)
-        if prev > 0 and self._dialog_open_count == 0:
+            log.debug("Dialog opened, disabling global keybindings")
+        elif was_open and not is_open:
             self._dialog_open = False
             self.dialogStateChanged.emit(False)
             self._restart_quality_decode_timer()
-            log.debug("Dialog closed (count=0), re-enabling global keybindings")
+            log.debug("All dialogs closed, re-enabling global keybindings")
+
+    @Slot()
+    @Slot(str)
+    def dialog_opened(self, token: str = ""):
+        """Register a modal scope, idempotently when a token is supplied."""
+        if token:
+            if token in self._active_modal_tokens:
+                log.warning("Ignoring duplicate dialog-open token %s", token)
+                return
+            self._active_modal_tokens.add(token)
+        else:
+            self._anonymous_dialog_depth += 1
+        self._update_dialog_open_state()
+
+    @Slot()
+    @Slot(str)
+    def dialog_closed(self, token: str = ""):
+        """Release a modal scope without allowing underflow or cross-close."""
+        if token:
+            if token not in self._active_modal_tokens:
+                log.debug("Ignoring unmatched dialog-close token %s", token)
+                return
+            self._active_modal_tokens.remove(token)
+        elif self._anonymous_dialog_depth > 0:
+            self._anonymous_dialog_depth -= 1
+        else:
+            log.warning("Ignoring unmatched anonymous dialog-close")
+            return
+        self._update_dialog_open_state()
 
     def toggle_grid_view(self):
         """Toggle between grid view and loupe (single image) view."""
@@ -11628,11 +11666,12 @@ class AppController(QObject):
 
     def _exec_modal_dialog(self, dialog) -> int:
         """Run a native modal dialog while global shortcuts are disabled."""
-        self.dialog_opened()
+        token = f"native:{id(dialog)}"
+        self.dialog_opened(token)
         try:
             return dialog.exec()
         finally:
-            self.dialog_closed()
+            self.dialog_closed(token)
 
     def _switch_to_directory(
         self, folder_path: Path, update_base_directory: bool = True
@@ -12703,10 +12742,16 @@ class AppController(QObject):
             reason = "Recycle bin failure"
             confirmed = False
             if len(candidate_imgs) == 1:
-                confirmed = confirm_permanent_delete(candidate_imgs[0], reason=reason)
+                confirmed = confirm_permanent_delete(
+                    candidate_imgs[0],
+                    reason=reason,
+                    dialog_exec=self._exec_modal_dialog,
+                )
             else:
                 confirmed = confirm_batch_permanent_delete(
-                    candidate_imgs, reason=reason
+                    candidate_imgs,
+                    reason=reason,
+                    dialog_exec=self._exec_modal_dialog,
                 )
 
             if confirmed:
@@ -15649,6 +15694,7 @@ class AppController(QObject):
         # Editor-level: clear mask assets, raster cache, and darken settings
         self.image_editor._mask_assets.clear()
         self.image_editor._mask_raster_cache.clear()
+        self._invalidate_accepted_darken_mask()
         if self.image_editor.current_edits.get("darken_settings") is not None:
             self.image_editor.current_edits["darken_settings"] = None
             self.image_editor._edits_rev += 1
@@ -15734,6 +15780,7 @@ class AppController(QObject):
             if ds is not None:
                 ds.enabled = False
                 self.image_editor._edits_rev += 1
+                self._invalidate_accepted_darken_mask()
                 self._kick_preview_worker()
         else:
             if not self._prepare_darken_image_state():
@@ -15882,8 +15929,10 @@ class AppController(QObject):
             f"darken param changed '{key}'",
             clear_editor=False,
         )
+        # Mask-resolution params change the mask without changing the stroke
+        # revision, so rebuilding the overlay now would just recolour the
+        # previous mask. The render this kick starts publishes the new one.
         self._kick_preview_worker()
-        self._update_darken_overlay()
 
     @Slot(str)
     def set_darken_mode(self, mode: str):
@@ -15898,13 +15947,24 @@ class AppController(QObject):
             "darken mode changed",
             clear_editor=False,
         )
+        # As with set_darken_param: the accepted frame brings the new mask.
         self._kick_preview_worker()
-        self._update_darken_overlay()
 
     @Slot(bool)
     def set_darken_overlay_visible(self, visible: bool):
-        """Toggle mask overlay visibility."""
+        """Toggle mask overlay visibility.
+
+        Pure UI state — showing the overlay resolves nothing. If no accepted
+        frame has published a mask yet, ask for one rather than rendering
+        synchronously; the overlay appears when that frame is accepted.
+        """
         self.ui_state.darkenOverlayVisible = visible
+        if (
+            visible
+            and self.ui_state._is_darkening
+            and self._accepted_darken_mask_for_display() is None
+        ):
+            self._kick_preview_worker()
 
     @Slot(int, int, int)
     def set_darken_overlay_color(self, r: int, g: int, b: int):
@@ -15914,35 +15974,79 @@ class AppController(QObject):
             mask_data.overlay_color = (r, g, b)
         self._update_darken_overlay()
 
+    def _clear_darken_overlay(self):
+        """Drop the overlay image and tell QML to re-fetch."""
+        self.ui_state._darken_overlay_image = None
+        self.ui_state._darken_overlay_generation += 1
+        self.ui_state.darken_overlay_generation_changed.emit()
+
+    def _accepted_darken_mask_for_display(self) -> Optional[ResolvedDarkenMask]:
+        """The published mask, if it still belongs to what is on screen.
+
+        The mask was published atomically with the accepted preview frame, so
+        the only way it can go stale is for the displayed image or edit session
+        to have moved on since — which the live-preview session key detects.
+        """
+        with self._preview_lock:
+            published = self._accepted_darken_mask
+            session = self._accepted_darken_mask_session
+        if published is None:
+            return None
+        if session != self._get_current_live_preview_session_key():
+            return None
+        return published
+
+    def _invalidate_accepted_darken_mask(self):
+        """Forget the published mask (image switch, darken off, editor close)."""
+        with self._preview_lock:
+            self._accepted_darken_mask = None
+            self._accepted_darken_mask_session = None
+
     def _update_darken_overlay(self):
-        """Generate the mask overlay QImage for display in QML."""
+        """Rebuild the overlay QImage from the accepted preview's own mask.
+
+        This runs on the GUI thread for every accepted preview frame while the
+        darken tool is open, so it does no image processing: the mask was
+        already resolved by the worker render that produced the frame beneath
+        it (pipeline step 19.5), and all that is left is colouring it into an
+        ARGB32 buffer. It must never call _apply_edits() or resolve_mask().
+
+        When no mask has been published yet — the tool was just opened, or the
+        first frame after a stroke is still rendering — the overlay is simply
+        left absent until the next accepted frame brings one. A brief gap beats
+        blocking the UI on a master-resolution render.
+        """
         try:
             from PySide6.QtGui import QImage
 
             mask_data = self.image_editor._mask_assets.get("darken")
             ds = self.image_editor.current_edits.get("darken_settings")
             if mask_data is None or ds is None or not mask_data.has_strokes():
-                self.ui_state._darken_overlay_image = None
-                self.ui_state._darken_overlay_generation += 1
-                self.ui_state.darken_overlay_generation_changed.emit()
+                self._clear_darken_overlay()
                 return
 
-            resolved = self.image_editor.resolve_darken_preview_mask()
-            if resolved is None:
+            published = self._accepted_darken_mask_for_display()
+            if published is None or published.mask_id != ds.mask_id:
+                return
+            if published.mask_revision != mask_data.revision:
+                # Strokes moved on; the render carrying the new mask is already
+                # in flight. Keep showing the last good overlay until it lands.
                 return
 
-            # Build ARGB32 overlay
-            h, w = resolved.shape
+            resolved = published.mask
+            h, w = published.height, published.width
             r, g, b = mask_data.overlay_color
             alpha = int(mask_data.overlay_opacity * 255)
 
             # Create ARGB buffer: (H, W, 4) uint8
-            overlay = np.zeros((h, w, 4), dtype=np.uint8)
-            mask_u8 = (np.clip(resolved, 0.0, 1.0) * alpha).astype(np.uint8)
+            overlay = np.empty((h, w, 4), dtype=np.uint8)
+            # The mask is published read-only and already clamped to [0, 1] by
+            # resolve_mask's final np.clip, so scale straight into the alpha
+            # plane without a defensive clip or copy.
+            np.multiply(resolved, alpha, out=overlay[:, :, 3], casting="unsafe")
             overlay[:, :, 0] = b  # QImage ARGB32 is BGRA in memory on little-endian
             overlay[:, :, 1] = g
             overlay[:, :, 2] = r
-            overlay[:, :, 3] = mask_u8
 
             buf = overlay.tobytes()
             self._darken_overlay_buffer = buf
@@ -16865,6 +16969,12 @@ class AppController(QObject):
                 and session_key == self._get_current_live_preview_session_key()
             ):
                 self._publish_last_rendered_preview_locked(decoded, session_key)
+                # Atomic with the pixels: this frame won the token race, so its
+                # mask (or its absence, when darkening is off) replaces whatever
+                # an earlier frame published. A late result from an older render
+                # never reaches here, so it cannot resurrect a stale overlay.
+                self._accepted_darken_mask = decoded.darken_mask
+                self._accepted_darken_mask_session = session_key
                 if is_final and token == self._preview_full_res_token:
                     # Display-capped full-res frame: its size becomes the
                     # target quick renders are matched to (shift-free swap).
@@ -18169,7 +18279,7 @@ class AppController(QObject):
         self._batch_al_cancelled = False
         self._batch_al_t_start = time.perf_counter()
 
-        self.dialog_opened()
+        self.dialog_opened("batch-auto-levels")
         self.batchAutoLevelsProgress.emit(0, len(batch_indices))
         QTimer.singleShot(0, self._batch_auto_levels_step)
 
@@ -18206,18 +18316,22 @@ class AppController(QObject):
         cancelled = self._batch_al_cancelled
         elapsed_ms = int((time.perf_counter() - self._batch_al_t_start) * 1000)
 
-        # Refresh display
-        self._bump_display_generation()
-        self.prefetcher.cancel_all()
-        self.prefetcher.update_prefetch(self.current_index)
-        self._metadata_cache_index = (-1, -1)
-        self.dataChanged.emit()
-        self.sync_ui_state()
-        if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
-            self._thumbnail_model.refresh()
-
-        self.dialog_closed()
-        self.batchAutoLevelsFinished.emit(processed, total)
+        try:
+            # Refresh display
+            self._bump_display_generation()
+            self.prefetcher.cancel_all()
+            self.prefetcher.update_prefetch(self.current_index)
+            self._metadata_cache_index = (-1, -1)
+            self.dataChanged.emit()
+            self.sync_ui_state()
+            if hasattr(self, "_thumbnail_model") and self._thumbnail_model:
+                self._thumbnail_model.refresh()
+        finally:
+            # The progress dialog is application-modal. Neither a failed refresh
+            # nor a failed QML completion handler may leave global shortcuts
+            # disabled for the rest of the process.
+            self.dialog_closed("batch-auto-levels")
+            self.batchAutoLevelsFinished.emit(processed, total)
 
         if cancelled:
             msg = f"Batch auto levels cancelled: {processed}/{total} processed ({elapsed_ms} ms)"
@@ -18779,21 +18893,9 @@ class AppController(QObject):
             original_name, operation_tag = parts
             known_timestamp = self._key(p) in history_timestamps
             timestamp_ns = history_timestamps.get(self._key(p), 0)
-            if not known_timestamp and os.name != "nt":
-                # POSIX ctime normally records the same-filesystem rename that
-                # recycled the entry. It remains only an approximation because
-                # later metadata changes can advance it. Native Windows ctime
-                # is creation time on supported Python versions, not recycle
-                # time, so it must not be used to order historical versions.
-                try:
-                    timestamp_ns = p.stat().st_ctime_ns
-                except OSError:
-                    timestamp_ns = 0
             operation_key = (
                 operation_tag,
-                self._restore_destination_identity(
-                    dest_dir, Path(original_name).stem
-                ),
+                self._restore_destination_identity(dest_dir, Path(original_name).stem),
             )
             operations.setdefault(operation_key, []).append(
                 (p, original_name, timestamp_ns, known_timestamp)
@@ -18871,15 +18973,14 @@ class AppController(QObject):
             tuple[str, list[tuple[Path, str, int, bool]], int, bool]
         ] = []
         for family_versions in versions.values():
-            if (
-                os.name == "nt"
-                and len(family_versions) > 1
-                and not all(version[3] for version in family_versions)
+            if len(family_versions) > 1 and not all(
+                version[3] for version in family_versions
             ):
                 ambiguous_entries = sum(len(version[1]) for version in family_versions)
                 result["ambiguous_count"] += ambiguous_entries
                 log.warning(
-                    "Leaving %d cross-session recycled files ambiguous on Windows",
+                    "Leaving %d cross-session recycled files ambiguous; no "
+                    "portable deletion chronology is available",
                     ambiguous_entries,
                 )
                 continue
@@ -18996,6 +19097,10 @@ def _prompt_reopen_sessions(records):
     ``records`` are stale session dicts (see ``SessionRegistry.scan_stale``).
     Returns the selected session records, or an empty list if the user opts to
     skip (cancel / "Open default instead").
+
+    This modal deliberately does not use AppController's gate: it runs before
+    the controller, QML engine, main window, event filter, and application
+    shortcuts exist, so there is no FastStack action behind it to suppress.
     """
     dialog = QDialog()
     dialog.setWindowTitle("Resume FastStack sessions")
@@ -19151,6 +19256,9 @@ def main(
     # PyInstaller's windowed Windows build has no stdout/stderr console. Make
     # debug mode discoverable when launched by double-clicking the executable.
     if debug_requested and (sys.stdout is None or sys.stderr is None):
+        # Pre-controller modal boundary: no QML engine, main window, keybinder,
+        # or AppController exists yet, so application actions cannot fire behind
+        # this dialog. Controller-owned native dialogs use _exec_modal_dialog.
         if log_file is not None:
             if os.name == "nt":
                 # PowerShell single-quoted strings escape apostrophes by
@@ -19279,6 +19387,8 @@ def main(
             log.warning(
                 "No image directory provided and no default directory set. Opening directory selection dialog."
             )
+            # This is the same pre-controller boundary as the recovery/debug
+            # prompts above; there are no FastStack shortcuts to gate yet.
             selected_dir = QFileDialog.getExistingDirectory(
                 None, "Select Image Directory"
             )

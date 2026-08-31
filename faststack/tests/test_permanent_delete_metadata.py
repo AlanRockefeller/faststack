@@ -22,4 +22,3 @@ def test_permanently_deleted_name_does_not_lend_metadata_to_future_file(
     path.write_bytes(b"unrelated new image")
     reloaded = SidecarManager(image_dir, None)
     assert reloaded.get_metadata(path, create=False) is None
-

@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtWidgets import QMessageBox
 
@@ -72,7 +72,11 @@ def ensure_recycle_bin_dir(recycle_bin_dir: Path) -> bool:
         return False
 
 
-def confirm_permanent_delete(image_file, reason: str = "") -> bool:
+def confirm_permanent_delete(
+    image_file,
+    reason: str = "",
+    dialog_exec: Optional[Callable[[QMessageBox], int]] = None,
+) -> bool:
     """Show a confirmation dialog for permanent deletion of a single image.
 
     Args:
@@ -123,12 +127,19 @@ def confirm_permanent_delete(image_file, reason: str = "") -> bool:
     cancel_btn = msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
     msg_box.setDefaultButton(cancel_btn)
 
-    msg_box.exec()
+    if dialog_exec is None:
+        msg_box.exec()
+    else:
+        dialog_exec(msg_box)
 
     return msg_box.clickedButton() == delete_btn
 
 
-def confirm_batch_permanent_delete(images: list, reason: str = "") -> bool:
+def confirm_batch_permanent_delete(
+    images: list,
+    reason: str = "",
+    dialog_exec: Optional[Callable[[QMessageBox], int]] = None,
+) -> bool:
     """Show a confirmation dialog for permanent deletion of multiple images.
 
     Args:
@@ -178,7 +189,10 @@ def confirm_batch_permanent_delete(images: list, reason: str = "") -> bool:
     cancel_btn = msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
     msg_box.setDefaultButton(cancel_btn)
 
-    msg_box.exec()
+    if dialog_exec is None:
+        msg_box.exec()
+    else:
+        dialog_exec(msg_box)
 
     return msg_box.clickedButton() == delete_btn
 

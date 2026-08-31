@@ -44,4 +44,3 @@ def test_posix_arguments_keep_empty_and_unicode_elements():
 def test_unclosed_quote_is_rejected():
     with pytest.raises(ValueError, match="closing quotation"):
         parse_external_arguments('"C:\\Program Files', windows=True)
-

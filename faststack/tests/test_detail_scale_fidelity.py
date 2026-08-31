@@ -36,4 +36,3 @@ def test_preview_detail_radii_match_downsampled_full_resolution_export():
 
     mean_error = float(np.mean(np.abs(preview - expected_preview)))
     assert mean_error < 0.015
-

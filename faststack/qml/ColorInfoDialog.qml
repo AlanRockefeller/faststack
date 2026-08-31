@@ -25,14 +25,19 @@ Dialog {
 
     onOpened: {
         if (colorInfoDialog.controllerRef) {
-            colorInfoDialog.controllerRef.dialog_opened()
+            colorInfoDialog.controllerRef.dialog_opened("qml-color-info")
         }
     }
 
     onClosed: {
         if (colorInfoDialog.controllerRef) {
-            colorInfoDialog.controllerRef.dialog_closed()
+            colorInfoDialog.controllerRef.dialog_closed("qml-color-info")
         }
+    }
+
+    Component.onDestruction: {
+        if (colorInfoDialog.controllerRef)
+            colorInfoDialog.controllerRef.dialog_closed("qml-color-info")
     }
 
     contentItem: ColumnLayout {

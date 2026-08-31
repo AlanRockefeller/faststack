@@ -26,4 +26,3 @@ def test_equal_size_equal_mtime_replacement_is_a_new_cache_identity(
     assert first_identity != second_identity
     assert app_controller.image_cache.pop_path.call_count == 2
     assert app_controller.prefetcher.invalidate_path.call_count == 2
-
