@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -85,6 +86,61 @@ def _mkdir(path: Path) -> None:
 def _unlink(path: Path) -> None:
     """Helper for mocking Path.unlink safely."""
     path.unlink()
+
+
+def _atomic_no_replace_link(source: Path, target: Path) -> None:
+    """Link *source* to *target*, failing if *target* already exists.
+
+    Hard linking is the atomic no-replace counterpart to ``os.replace``: it
+    restores an authorized pathname without any chance of overwriting a file
+    that appeared there concurrently. ``follow_symlinks=False`` keeps a staged
+    symlink a symlink, and is only passed where the platform supports it.
+    """
+    if os.link in os.supports_follow_symlinks:
+        os.link(source, target, follow_symlinks=False)
+    else:
+        os.link(source, target)
+
+
+def _verify_rollback_capability(
+    transaction_dir: Path, destinations: list[Path]
+) -> None:
+    """Raise OSError unless staged files can be rolled back atomically.
+
+    Filesystems such as exFAT do not support hard links, so the restore path
+    used by a failed transaction has to be proven *before* the first source
+    file is moved. The probe links out of the transaction directory into each
+    destination directory, exercising the same call the rollback would make.
+    """
+    for directory in destinations:
+        handle, probe_name = tempfile.mkstemp(
+            prefix=".faststack-linkprobe-", dir=transaction_dir
+        )
+        os.close(handle)
+        probe_source = Path(probe_name)
+        probe_target = directory / f".faststack-linkprobe-{uuid.uuid4().hex}"
+        linked = False
+        try:
+            try:
+                _atomic_no_replace_link(probe_source, probe_target)
+                linked = True
+            except NotImplementedError as exc:
+                raise OSError(
+                    f"Permanent deletion refused: {directory} does not support the "
+                    "atomic no-replace restore required to roll the deletion back."
+                ) from exc
+            except OSError as exc:
+                raise OSError(
+                    f"Permanent deletion refused: {directory} does not support the "
+                    "atomic no-replace restore required to roll the deletion back "
+                    f"({exc})."
+                ) from exc
+        finally:
+            for probe in ((probe_target,) if linked else ()) + (probe_source,):
+                try:
+                    probe.unlink()
+                except OSError:
+                    log.warning("Could not remove rollback probe %s", probe)
 
 
 def ensure_recycle_bin_dir(recycle_bin_dir: Path) -> bool:
@@ -274,7 +330,8 @@ def permanently_delete_image_files(
         try:
             # A hard link is an atomic no-replace restore: unlike os.replace,
             # it fails if another file appeared at the authorized pathname.
-            os.link(staged_path, original_path, follow_symlinks=False)
+            # Its availability was proven before the first file was staged.
+            _atomic_no_replace_link(staged_path, original_path)
         except FileExistsError as exc:
             raise SourceChangedError(
                 f"Cannot restore {original_path.name}: a replacement appeared. "
@@ -304,6 +361,13 @@ def permanently_delete_image_files(
         raise OSError(detail)
 
     try:
+        # Never stage a source file before the rollback path is proven usable.
+        destinations: list[Path] = []
+        for path, _identity in candidates:
+            if path.parent not in destinations:
+                destinations.append(path.parent)
+        _verify_rollback_capability(transaction_dir, destinations)
+
         try:
             for number, (original_path, identity) in enumerate(candidates):
                 validate_file_identity(original_path, identity)
@@ -325,7 +389,7 @@ def permanently_delete_image_files(
                 recovery_path = (
                     transaction_dir / f"rollback-{number}-{original_path.name}"
                 )
-                shutil.copy2(staged_path, recovery_path)
+                shutil.copy2(staged_path, recovery_path, follow_symlinks=False)
                 compensation.append((recovery_path, original_path))
         except BaseException:
             _restore_all(list(reversed(staged)))

@@ -226,15 +226,43 @@ def _project_stack_groups(
     return ranges, ordered_groups
 
 
+def _groups_overlap(groups: list[list[str]]) -> bool:
+    """Report whether any two groups claim the same image identity."""
+    seen: set[str] = set()
+    for group in groups:
+        members = set(group)
+        if seen & members:
+            return True
+        seen |= members
+    return False
+
+
+def _restrict_groups_to_order(
+    groups: list[list[str]], order: list[str]
+) -> list[list[str]]:
+    """Re-express *groups* over *order*, dropping images it no longer holds."""
+    known = set(order)
+    return [
+        [key for key in order if key in group]
+        for group in groups
+        if len(set(group) & known) >= 2
+    ]
+
+
 def _stack_merge_fail_safe(
     identity: tuple[list[list[str]], list[str]], reason: str
 ) -> tuple[list[list[int]], list[list[str]], list[str]]:
-    """Preserve lock-holder identities without inventing runtime ranges."""
+    """Preserve *identity* verbatim without inventing runtime ranges.
+
+    Callers pass the most complete identity state they have reached: the
+    merged groups and order when merging got that far, and the lock holder's
+    snapshot only when the two orders share no common image identities.
+    """
     groups, order = identity
     projected = _project_stack_groups(groups, order)
     log.warning(
         "Concurrent stack merge could not preserve group boundaries (%s); "
-        "preserving the lock holder's stack identities",
+        "preserving stack identities without runtime ranges",
         reason,
     )
     ranges = projected[0] if projected is not None else []
@@ -286,20 +314,33 @@ def _merge_stack_payloads(
             merged_group_set.add(group)
 
     merged_order_keys = set(merged_order)
+    merged_order_index = {key: index for index, key in enumerate(merged_order)}
     merged_groups = [
         [key for key in merged_order if key in group]
         for group in merged_group_set
         if len(group & merged_order_keys) >= 2
     ]
+    # Group presence was merged through an unordered set; sort by position in
+    # the merged order so the persisted identities are deterministic on every
+    # path, including the fail-safe below, which does not re-sort them.
+    merged_groups.sort(key=lambda group: merged_order_index[group[0]])
     projected = _project_stack_groups(merged_groups, merged_order)
     if projected is None:
-        # Overlapping concurrent edits to the same base group, a reordered
-        # non-contiguous group, or newly adjacent distinct groups cannot be
-        # expressed by FastStack's normalized runtime ranges. Lock-holder wins.
-        return _stack_merge_fail_safe(
-            our_identity,
-            "merged groups overlap, are non-contiguous, or became adjacent",
-        )
+        # A reordered non-contiguous group or newly adjacent distinct groups
+        # cannot be expressed by FastStack's normalized runtime ranges, but
+        # they are still a valid identity: keep the merged groups. Reverting
+        # to the lock holder's snapshot here would resurrect images the other
+        # writer concurrently removed.
+        fallback_groups = merged_groups
+        reason = "merged groups are non-contiguous or became adjacent"
+        if _groups_overlap(merged_groups):
+            # Concurrent edits to the same base group left images claimed by
+            # two groups, which is not a valid identity at all. Resolve that
+            # in the lock holder's favour, but only over images that survived
+            # into the merged order.
+            fallback_groups = _restrict_groups_to_order(our_groups, merged_order)
+            reason = "merged groups overlap"
+        return _stack_merge_fail_safe((fallback_groups, merged_order), reason)
     ranges, ordered_groups = projected
     return ranges, ordered_groups, merged_order
 

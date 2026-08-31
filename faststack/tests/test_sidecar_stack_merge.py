@@ -118,3 +118,53 @@ def test_startup_restoration_does_not_split_noncontiguous_group():
 
 def test_startup_restoration_does_not_merge_adjacent_groups():
     assert _restore([["a", "b"], ["d", "e"]], ["a", "b", "d", "e"]) == []
+
+
+def test_unprojectable_merge_does_not_resurrect_a_removed_image():
+    """A concurrently removed image must not come back through the fail-safe.
+
+    Ours (the lock holder) edits stack membership; theirs removes image "c",
+    which leaves the two surviving groups adjacent and therefore impossible to
+    express as runtime ranges.
+    """
+    base = payload([["a", "b"], ["d", "e"]])
+    ours = payload([["a", "b", "c"], ["d", "e"]])
+    without_c = ["a", "b", "d", "e", "f"]
+    theirs = payload([["a", "b"], ["d", "e"]], without_c)
+
+    result = merge(base, ours, theirs)
+
+    assert result["stack_order"] == without_c
+    assert "c" not in result["stack_order"]
+    assert all("c" not in group for group in result["stack_paths"])
+    # Surviving identities are retained even though no range can express them.
+    assert result["stack_paths"] == [["a", "b"], ["d", "e"]]
+    assert result["stacks"] == []
+
+
+def test_unprojectable_merge_keeps_reordered_identities_without_removed_image():
+    """Reordering by the other writer must not revive its removed image."""
+    base = payload([["a", "b"]], ["a", "b", "c", "d"])
+    ours = payload([["a", "b", "c"]], ["a", "b", "c", "d"])
+    reordered = ["a", "d", "b"]
+    theirs = payload([["a", "b"]], reordered)
+
+    result = merge(base, ours, theirs)
+
+    assert result["stack_order"] == reordered
+    assert result["stack_paths"] == [["a", "b"]]
+    assert result["stacks"] == []
+
+
+def test_overlapping_conflict_fallback_still_drops_a_removed_image():
+    """The lock holder wins an overlap, but only over surviving images."""
+    without_f = ["a", "b", "c", "d", "e"]
+    base = payload([["b", "c"]])
+    ours = payload([["a", "b", "c"]])
+    theirs = payload([["b", "c", "d"]], without_f)
+
+    result = merge(base, ours, theirs)
+
+    assert result["stack_order"] == without_f
+    assert result["stack_paths"] == [["a", "b", "c"]]
+    assert result["stacks"] == [[0, 2]]
