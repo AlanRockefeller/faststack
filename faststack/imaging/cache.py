@@ -12,20 +12,47 @@ from cachetools import Cache, LRUCache
 log = logging.getLogger(__name__)
 
 
+def get_retained_mask_size(item) -> int:
+    """Bytes of a published darkening mask the item keeps alive.
+
+    ``DecodedImage.darken_mask`` holds the float32 (H, W) mask the render that
+    produced the frame actually applied — 4/3 the size of the RGB888 buffer
+    beside it, so ignoring it under-reports a mask-bearing entry by 57%.
+
+    The array is shared with ``MaskRasterCache`` while the edit session is
+    live, but the only mask-bearing frames that reach a byte-budgeted cache are
+    the live-preview seeds written by ``_seed_decode_cache_from_live_preview``
+    on navigate-away — and ``_reset_darken_on_navigation``, which runs
+    immediately after, clears both the raster cache and the accepted-mask slot.
+    The cache is therefore the sole owner of what it is charged for.
+
+    This is deliberately a per-entry figure that never deduplicates against
+    other entries: cachetools records an entry's size at insert and reuses that
+    number on eviction, so a size that depended on the rest of the cache would
+    desynchronise ``currsize``. Two live entries cannot share one mask anyway —
+    seeds are keyed by path and display generation, and a change to either
+    forces a freshly resolved mask.
+    """
+    mask = getattr(getattr(item, "darken_mask", None), "mask", None)
+    nbytes = getattr(mask, "nbytes", None)
+    return nbytes if isinstance(nbytes, int) and nbytes > 0 else 0
+
+
 def get_decoded_image_size(item) -> int:
     """Calculates the size of a DecodedImage object or similar buffer-holding object."""
     # Use duck typing to support DecodedImage and similar objects (e.g. in tests)
     if hasattr(item, "buffer"):
+        mask_bytes = get_retained_mask_size(item)
         # Handle both numpy arrays and memoryview buffers
         if hasattr(item.buffer, "nbytes"):
-            return item.buffer.nbytes
+            return item.buffer.nbytes + mask_bytes
         if isinstance(item.buffer, (bytes, bytearray)):
-            return len(item.buffer)
+            return len(item.buffer) + mask_bytes
         # Fallback: estimate from dimensions (more accurate for image buffers than sys.getsizeof)
         width = getattr(item, "width", 0)
         height = getattr(item, "height", 0)
         if width <= 0 or height <= 0:
-            return 1  # No usable dimensions
+            return 1 + mask_bytes  # No usable dimensions
 
         if hasattr(item, "bytes_per_line") and item.bytes_per_line > 0:
             bytes_per_pixel = item.bytes_per_line // width
@@ -37,7 +64,7 @@ def get_decoded_image_size(item) -> int:
         # legitimate RGB (3 Bpp) buffers and causes premature evictions.
         bytes_per_pixel = max(1, min(bytes_per_pixel, 16))
 
-        return width * height * bytes_per_pixel
+        return width * height * bytes_per_pixel + mask_bytes
 
     log.warning(
         "Unexpected item type in cache: %s. Returning estimated size of 1.",

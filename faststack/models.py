@@ -161,5 +161,14 @@ class DecodedImage:
     darken_mask: Optional[ResolvedDarkenMask] = None
 
     def __sizeof__(self) -> int:
-        """Returns the size of the image buffer in bytes."""
-        return self.buffer.nbytes
+        """Returns the retained size of this frame in bytes.
+
+        Includes the published darkening mask, which is a float32 plane 4/3 the
+        size of the RGB888 buffer. Production cache budgeting goes through
+        ``faststack.imaging.cache.get_decoded_image_size`` rather than this
+        method; the two are kept in agreement so neither can under-report.
+        """
+        mask = getattr(self.darken_mask, "mask", None)
+        nbytes = getattr(mask, "nbytes", None)
+        mask_bytes = nbytes if isinstance(nbytes, int) and nbytes > 0 else 0
+        return self.buffer.nbytes + mask_bytes
