@@ -10836,6 +10836,9 @@ class AppController(QObject):
             # A success clears the backoff so the next failure starts fresh.
             config.set("updates", "last_failed_update_check", "")
         else:
+            # The latest outcome controls automatic retry pacing. Keeping an
+            # older success here would incorrectly retain the 24-hour cooldown.
+            config.set("updates", "last_successful_update_check", "")
             config.set("updates", "last_failed_update_check", now)
         config.save()
 

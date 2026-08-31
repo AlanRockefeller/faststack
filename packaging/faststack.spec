@@ -43,7 +43,7 @@ datas = [
 try:
     datas += copy_metadata("faststack")
 except Exception as exc:  # pragma: no cover - build-time diagnostics only
-    print(f"WARNING: could not bundle faststack metadata: {exc}")
+    raise RuntimeError("faststack distribution metadata is required") from exc
 
 datas += collect_data_files(
     "PySide6",

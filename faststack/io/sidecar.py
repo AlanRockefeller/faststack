@@ -198,7 +198,12 @@ def _project_stack_groups(
     projected = []
     seen_members = set()
     for group in groups:
-        group_members = set(group)
+        # Concurrent writers can legitimately remove an image while another
+        # writer is editing its stack. Project only members that still belong
+        # to the selected order; never resurrect a removed image or index it.
+        group_members = {key for key in group if key in order_index}
+        if len(group_members) < 2:
+            continue
         if seen_members & group_members:
             return None
         seen_members.update(group_members)
@@ -280,7 +285,12 @@ def _merge_stack_payloads(
         if keep:
             merged_group_set.add(group)
 
-    merged_groups = [list(group) for group in merged_group_set]
+    merged_order_keys = set(merged_order)
+    merged_groups = [
+        [key for key in merged_order if key in group]
+        for group in merged_group_set
+        if len(group & merged_order_keys) >= 2
+    ]
     projected = _project_stack_groups(merged_groups, merged_order)
     if projected is None:
         # Overlapping concurrent edits to the same base group, a reordered
@@ -737,7 +747,11 @@ class SidecarManager:
         User-action paths keep migrate=True so ancient entries still get
         migrated when an image is actually viewed or modified.
         """
-        stable_key, candidate_keys = self._lookup_keys(image_ref)
+        # Stable keys are authoritative and require no legacy filesystem
+        # ambiguity probes. Build the broader fallback list only after a miss.
+        stable_key, candidate_keys = self._lookup_keys(
+            image_ref, include_legacy_stems=False
+        )
         if not stable_key:
             if create:
                 raise ValueError(f"image_ref must not be empty: {image_ref!r}")
@@ -747,6 +761,7 @@ class SidecarManager:
             ambiguous_legacy_keys = set(self.data.ambiguous_legacy_keys)
             meta = self.data.entries.get(stable_key)
             if meta is None:
+                _stable_key, candidate_keys = self._lookup_keys(image_ref)
                 for candidate_key in candidate_keys:
                     if candidate_key == stable_key:
                         continue
@@ -820,7 +835,12 @@ class SidecarManager:
         self._stable_key_cache[cache_key] = result
         return result
 
-    def _lookup_keys(self, image_ref: Union[str, Path]) -> tuple[str, list[str]]:
+    def _lookup_keys(
+        self,
+        image_ref: Union[str, Path],
+        *,
+        include_legacy_stems: bool = True,
+    ) -> tuple[str, list[str]]:
         """Return (stable_key, migration_candidate_keys) for a metadata lookup."""
         if isinstance(image_ref, Path):
             if not image_ref.name:
@@ -828,7 +848,7 @@ class SidecarManager:
             stable_key = self.metadata_key_for_path(image_ref)
             full_name_key = self._metadata_filename_key(image_ref)
             legacy_keys = [full_name_key]
-            if not self._jpeg_stem_is_ambiguous(image_ref):
+            if include_legacy_stems and not self._jpeg_stem_is_ambiguous(image_ref):
                 legacy_keys.extend(self._legacy_stem_keys(image_ref, stable_key))
             return stable_key, legacy_keys
 
@@ -845,7 +865,7 @@ class SidecarManager:
             stable_key = self.metadata_key_for_path(path)
             full_name_key = self._metadata_filename_key(path)
             legacy_keys = [full_name_key]
-            if not self._jpeg_stem_is_ambiguous(path):
+            if include_legacy_stems and not self._jpeg_stem_is_ambiguous(path):
                 legacy_keys.extend(self._legacy_stem_keys(path, stable_key))
             return stable_key, legacy_keys
 

@@ -134,7 +134,9 @@ def build_variant_map(
 
         for info in infos:
             suffix = info.path.suffix.casefold()
-            extension_key = f"{stem_key}{suffix}"
+            # NUL cannot occur in a filesystem name, so an extension-qualified
+            # internal key cannot collide with any ordinary casefolded stem.
+            extension_key = f"{stem_key}\0{suffix}"
             group = groups.setdefault(
                 extension_key,
                 VariantGroup(group_key=f"{info.group_key}{suffix}"),

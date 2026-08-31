@@ -1003,6 +1003,9 @@ def _decode_buffer(
                                     ) * 1000.0
 
                         if buffer is not None:
+                            # A successful fresh snapshot is an ordinary decode,
+                            # even if the preceding snapshot was incomplete.
+                            placeholder_reason = None
                             try:
                                 _t_meta = (
                                     time.perf_counter() if stats is not None else None

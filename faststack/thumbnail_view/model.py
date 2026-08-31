@@ -18,7 +18,7 @@ from PySide6.QtCore import (
     Slot,
 )
 
-from faststack.io.indexer import find_images
+from faststack.io.indexer import DirectoryScanError, find_images
 from faststack.io.utils import compute_path_hash, normalize_path_key
 from faststack.thumbnail_view.folder_stats import (
     FolderStats,
@@ -341,12 +341,13 @@ class ThumbnailModel(QAbstractListModel):
         if refresh:
             self.refresh()
 
-    def _add_folders_to_entries(self):
-        """Scan for folders and add them to self._entries."""
+    def _scan_folder_entries(self) -> List[ThumbnailEntry]:
+        """Build folder entries without mutating the current model."""
+        entries: List[ThumbnailEntry] = []
         # Add parent folder entry if not at filesystem root
         if not _is_filesystem_root(self._current_directory):
             parent_path = self._current_directory.parent
-            self._entries.append(
+            entries.append(
                 ThumbnailEntry(
                     path=parent_path,
                     name="..",
@@ -385,7 +386,12 @@ class ThumbnailModel(QAbstractListModel):
 
         # Sort folders alphabetically
         folders.sort(key=lambda e: e.name.lower())
-        self._entries.extend(folders)
+        entries.extend(folders)
+        return entries
+
+    def _add_folders_to_entries(self):
+        """Scan for folders and add them to self._entries."""
+        self._entries.extend(self._scan_folder_entries())
 
     def refresh(self):
         """Refresh the model by rescanning the current directory."""
@@ -393,52 +399,53 @@ class ThumbnailModel(QAbstractListModel):
         assert (
             cur == own
         ), f"ThumbnailModel.refresh() thread mismatch: current={cur}, owner={own}"
-        self.beginResetModel()
         t0 = time.perf_counter()
         try:
-            self._entries.clear()
-            self._id_to_row.clear()
-            self._path_to_row.clear()
-            self._selected_indices.clear()
-            self._last_selected_index = None
-
-            self._add_folders_to_entries()
+            prospective_entries = self._scan_folder_entries()
             t1 = time.perf_counter()
 
             # Get images using existing indexer (respects filter rules)
             images = find_images(self._current_directory)
+        except DirectoryScanError as exc:
+            log.warning("Keeping existing thumbnail model after scan failure: %s", exc)
+            return
 
-            # Apply active filename filter if set
-            if self._active_filter:
-                needle = self._active_filter.lower()
-                images = [img for img in images if needle in img.path.stem.lower()]
+        # Apply active filename filter if set
+        if self._active_filter:
+            needle = self._active_filter.lower()
+            images = [img for img in images if needle in img.path.stem.lower()]
 
-            # Apply active flag filters (AND logic)
-            if self._active_filter_flags and self._get_metadata:
-                flags = self._active_filter_flags
-                filtered = []
-                for img in images:
-                    try:
-                        meta = self._get_metadata(img.path)
-                        if not isinstance(meta, dict):
-                            # Ensure it's a dict before .get()
-                            log.debug(
-                                "Metadata for %s is not a dict: %r", img.path, meta
-                            )
-                            continue
+        # Apply active flag filters (AND logic)
+        if self._active_filter_flags and self._get_metadata:
+            flags = self._active_filter_flags
+            filtered = []
+            for img in images:
+                try:
+                    meta = self._get_metadata(img.path)
+                    if not isinstance(meta, dict):
+                        # Ensure it's a dict before .get()
+                        log.debug("Metadata for %s is not a dict: %r", img.path, meta)
+                        continue
 
-                        if all(meta.get(flag, False) for flag in flags):
-                            filtered.append(img)
-                    except Exception as e:
-                        log.debug("Error filtering image %s: %s", img.path, e)
-                        # Skip images with metadata errors
-                images = filtered
+                    if all(meta.get(flag, False) for flag in flags):
+                        filtered.append(img)
+                except Exception as e:
+                    log.debug("Error filtering image %s: %s", img.path, e)
+                    # Skip images with metadata errors
+            images = filtered
 
-            self._add_images_to_entries(images)
-            t2 = time.perf_counter()
+        prospective_entries.extend(self._build_image_entries(images))
+        t2 = time.perf_counter()
+
+        self.beginResetModel()
+        try:
+            self._entries = prospective_entries
+            self._id_to_row.clear()
+            self._path_to_row.clear()
+            self._selected_indices.clear()
+            self._last_selected_index = None
             self._rebuild_id_mapping()
             t3 = time.perf_counter()
-
         finally:
             self.endResetModel()
 
@@ -686,6 +693,13 @@ class ThumbnailModel(QAbstractListModel):
         self, images: List, metadata_map: Optional[Dict[str, dict]] = None
     ):
         """Convert list of objects (ImageFile or similar) to ThumbnailEntry."""
+        self._entries.extend(self._build_image_entries(images, metadata_map))
+
+    def _build_image_entries(
+        self, images: List, metadata_map: Optional[Dict[str, dict]] = None
+    ) -> List[ThumbnailEntry]:
+        """Build image entries without mutating the current model."""
+        entries: List[ThumbnailEntry] = []
         # See refresh_from_controller: a non-None metadata_map is authoritative
         # and keyed by str(img.path).
         map_authoritative = metadata_map is not None
@@ -733,7 +747,7 @@ class ThumbnailModel(QAbstractListModel):
             has_backups = getattr(img, "has_backups", False)
             has_developed = getattr(img, "has_developed", False)
 
-            self._entries.append(
+            entries.append(
                 ThumbnailEntry(
                     path=img.path,
                     name=img.path.name,
@@ -749,6 +763,7 @@ class ThumbnailModel(QAbstractListModel):
                     mtime_ns=mtime_ns,
                 )
             )
+        return entries
 
     def _rebuild_id_mapping(self):
         """Rebuilds the path/stack_id -> row mapping."""

@@ -47,6 +47,36 @@ def validate_file_identity(path: Path, expected: FileIdentity) -> None:
         raise SourceChangedError(f"Deletion cancelled because {path.name} {detail}.")
 
 
+def _validate_staged_file_identity(path: Path, expected: FileIdentity) -> None:
+    """Validate the object moved from an authorized pathname.
+
+    Renaming can update ctime on POSIX, so ctime is intentionally unavailable
+    after staging. Device/file ID still identifies the moved filesystem object;
+    size and mtime retain the remaining portable modification checks. The full
+    identity, including ctime, is checked immediately before the move.
+    """
+    actual = capture_file_identity(path)
+    stable_expected = (
+        expected.exists,
+        expected.device,
+        expected.file_id,
+        expected.size,
+        expected.mtime_ns,
+    )
+    stable_actual = (
+        actual.exists,
+        actual.device,
+        actual.file_id,
+        actual.size,
+        actual.mtime_ns,
+    )
+    if stable_actual != stable_expected:
+        raise SourceChangedError(
+            f"Deletion cancelled because {path.name} was replaced or modified "
+            "while it was being staged."
+        )
+
+
 def _mkdir(path: Path) -> None:
     """Helper for mocking Path.mkdir safely."""
     path.mkdir(parents=True, exist_ok=True)
@@ -280,6 +310,10 @@ def permanently_delete_image_files(
                 staged_path = transaction_dir / f"{number}-{original_path.name}"
                 os.replace(original_path, staged_path)
                 staged.append((staged_path, original_path))
+                # The pathname can be replaced after the pre-move check but
+                # before os.replace() resolves it. Validate the object that was
+                # actually staged before anything can be unlinked permanently.
+                _validate_staged_file_identity(staged_path, identity)
         except BaseException:
             _restore_all(list(reversed(staged)))
             raise

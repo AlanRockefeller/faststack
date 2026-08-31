@@ -4182,21 +4182,35 @@ class ImageEditor:
             return numerator, denominator
 
         if exif_bytes:
+            values = {}
             try:
                 exif = Image.Exif()
                 exif.load(exif_bytes)
-                values = dict(exif.items())
-                exif_ifd = exif.get_ifd(0x8769)
-                if exif_ifd:
-                    values.update(exif_ifd)
-                for tag_id in safe_ascii_tags:
-                    value = values.get(tag_id)
-                    if value is not None:
+                values.update(exif.items())
+            except Exception:
+                log.debug("Could not read TIFF EXIF metadata", exc_info=True)
+            else:
+                try:
+                    exif_ifd = exif.get_ifd(0x8769)
+                    if exif_ifd:
+                        values.update(exif_ifd)
+                except Exception:
+                    log.debug("Could not read TIFF ExifIFD metadata", exc_info=True)
+
+            for tag_id in safe_ascii_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
                         ascii_value = str(value).encode("ascii", "replace").decode()
                         tags.append((tag_id, "s", 0, ascii_value, False))
-                for tag_id in safe_unsigned_rational_tags:
-                    value = values.get(tag_id)
-                    if value is not None:
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
+            for tag_id in safe_unsigned_rational_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
                         tags.append(
                             (
                                 tag_id,
@@ -4206,9 +4220,14 @@ class ImageEditor:
                                 False,
                             )
                         )
-                for tag_id in safe_signed_rational_tags:
-                    value = values.get(tag_id)
-                    if value is not None:
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
+            for tag_id in safe_signed_rational_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
                         tags.append(
                             (
                                 tag_id,
@@ -4218,19 +4237,33 @@ class ImageEditor:
                                 False,
                             )
                         )
-                for tag_id in safe_integer_tags:
-                    value = values.get(tag_id)
-                    if value is not None:
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
+            for tag_id in safe_integer_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
                         integer = int(value)
+                        if not 0 <= integer <= 0xFFFFFFFF:
+                            raise ValueError("EXIF integer is outside TIFF range")
                         dtype = "H" if 0 <= integer <= 0xFFFF else "I"
                         tags.append((tag_id, dtype, 1, integer, False))
-                for tag_id in safe_byte_tags:
-                    value = values.get(tag_id)
-                    if value is not None:
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
+            for tag_id in safe_byte_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
                         byte_value = bytes(value)
                         tags.append((tag_id, "B", len(byte_value), byte_value, False))
-            except Exception as exc:
-                raise RuntimeError("Could not prepare TIFF EXIF metadata") from exc
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
 
         # Orientation is always normalized because export bakes geometry into pixels.
         tags.append((274, "H", 1, 1, False))

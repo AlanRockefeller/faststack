@@ -598,7 +598,7 @@ class AppConfig:
     def __init__(self):
         self.config_path = get_app_data_dir() / "faststack.ini"
         self._write_lock_path = self.config_path.with_suffix(".ini.lock")
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(interpolation=None)
         self._changed_options: set[tuple[str, str]] = set()
         self._removed_options: set[tuple[str, str]] = set()
         self._load_failed = False
@@ -625,7 +625,7 @@ class AppConfig:
                     self.config_path,
                     exc,
                 )
-                self.config = configparser.ConfigParser()
+                self.config = configparser.ConfigParser(interpolation=None)
                 self.config.read_dict(DEFAULT_CONFIG)
                 self._load_failed = True
                 for section, keys in DEFAULT_CONFIG.items():
@@ -725,8 +725,8 @@ class AppConfig:
 
     def _read_latest_config(self) -> configparser.ConfigParser | None:
         if not self.config_path.exists():
-            return configparser.ConfigParser()
-        latest = configparser.ConfigParser()
+            return configparser.ConfigParser(interpolation=None)
+        latest = configparser.ConfigParser(interpolation=None)
         try:
             with self.config_path.open("r", encoding="utf-8") as config_file:
                 latest.read_file(config_file)
@@ -765,7 +765,7 @@ class AppConfig:
                         )
                         shutil.copy2(self.config_path, backup)
                         log.warning("Preserved unreadable config as %s", backup)
-                    latest = configparser.ConfigParser()
+                    latest = configparser.ConfigParser(interpolation=None)
 
                 for section, key in self._removed_options:
                     if latest.has_section(section):
