@@ -7,12 +7,64 @@ import os
 import re
 import shutil
 import sys
+import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
-from typing import overload
+from typing import BinaryIO, Iterator, overload
 
 from faststack.logging_setup import get_app_data_dir
 
 log = logging.getLogger(__name__)
+
+
+def _lock_config_file(lock_file: BinaryIO) -> None:
+    """Acquire an exclusive process lock on the first byte of ``lock_file``."""
+    lock_file.seek(0, os.SEEK_END)
+    if lock_file.tell() == 0:
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_config_file(lock_file: BinaryIO) -> None:
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _config_write_lock(lock_path: Path) -> Iterator[None]:
+    with lock_path.open("a+b") as lock_file:
+        _lock_config_file(lock_file)
+        try:
+            yield
+        finally:
+            _unlock_config_file(lock_file)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 _TOOL_LABELS = {
@@ -545,7 +597,11 @@ class AppConfig:
 
     def __init__(self):
         self.config_path = get_app_data_dir() / "faststack.ini"
+        self._write_lock_path = self.config_path.with_suffix(".ini.lock")
         self.config = configparser.ConfigParser()
+        self._changed_options: set[tuple[str, str]] = set()
+        self._removed_options: set[tuple[str, str]] = set()
+        self._load_failed = False
         self.load()
 
     def load(self):
@@ -553,11 +609,28 @@ class AppConfig:
         if not self.config_path.exists():
             log.info("Creating default config at %s", self.config_path)
             self.config.read_dict(DEFAULT_CONFIG)
+            for section, keys in DEFAULT_CONFIG.items():
+                for key in keys:
+                    self._changed_options.add((section, key))
             config_changed = True
             newly_created = True
         else:
             log.info("Loading config from %s", self.config_path)
-            self.config.read(self.config_path)
+            try:
+                with self.config_path.open("r", encoding="utf-8") as config_file:
+                    self.config.read_file(config_file)
+            except (OSError, configparser.Error) as exc:
+                log.warning(
+                    "Could not read config %s; preserving it and recovering defaults: %s",
+                    self.config_path,
+                    exc,
+                )
+                self.config = configparser.ConfigParser()
+                self.config.read_dict(DEFAULT_CONFIG)
+                self._load_failed = True
+                for section, keys in DEFAULT_CONFIG.items():
+                    for key in keys:
+                        self._changed_options.add((section, key))
             config_changed = False
             newly_created = False
             # Ensure all sections and keys exist
@@ -567,7 +640,7 @@ class AppConfig:
                     config_changed = True
                 for key, value in keys.items():
                     if not self.config.has_option(section, key):
-                        self.config.set(section, key, value)
+                        self.set(section, key, value)
                         config_changed = True
 
         if self._migrate_update_settings():
@@ -616,6 +689,8 @@ class AppConfig:
         for dead_key in ("last_check_at", "auto_update"):
             if self.config.has_option("updates", dead_key):
                 self.config.remove_option("updates", dead_key)
+                self._removed_options.add(("updates", dead_key))
+                self._changed_options.discard(("updates", dead_key))
                 changed = True
 
         return changed
@@ -648,15 +723,69 @@ class AppConfig:
 
         return changed
 
-    def save(self):
-        """Saves the current configuration to the INI file."""
+    def _read_latest_config(self) -> configparser.ConfigParser | None:
+        if not self.config_path.exists():
+            return configparser.ConfigParser()
+        latest = configparser.ConfigParser()
+        try:
+            with self.config_path.open("r", encoding="utf-8") as config_file:
+                latest.read_file(config_file)
+        except (OSError, configparser.Error) as exc:
+            log.warning("Current config is unreadable and cannot be merged: %s", exc)
+            return None
+        return latest
+
+    def _atomic_write(self, parser: configparser.ConfigParser) -> None:
+        temp_path = self.config_path.with_name(
+            f".{self.config_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with temp_path.open("w", encoding="utf-8") as config_file:
+                parser.write(config_file)
+                config_file.flush()
+                os.fsync(config_file.fileno())
+            os.replace(temp_path, self.config_path)
+            _fsync_directory(self.config_path.parent)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                log.debug("Could not clean config temp file %s", temp_path)
+
+    def save(self) -> bool:
+        """Merge changed keys and atomically persist the current configuration."""
         try:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.config_path.open("w") as f:
-                self.config.write(f)
+            with _config_write_lock(self._write_lock_path):
+                latest = self._read_latest_config()
+                if latest is None:
+                    if self.config_path.exists():
+                        backup = self.config_path.with_name(
+                            f"{self.config_path.name}.unreadable-{time.time_ns()}.bak"
+                        )
+                        shutil.copy2(self.config_path, backup)
+                        log.warning("Preserved unreadable config as %s", backup)
+                    latest = configparser.ConfigParser()
+
+                for section, key in self._removed_options:
+                    if latest.has_section(section):
+                        latest.remove_option(section, key)
+                for section, key in self._changed_options:
+                    if not latest.has_section(section):
+                        latest.add_section(section)
+                    latest.set(section, key, self.config.get(section, key))
+
+                self._atomic_write(latest)
+
+            self.config = latest
+            self._changed_options.clear()
+            self._removed_options.clear()
+            self._load_failed = False
             log.info("Saved config to %s", self.config_path)
-        except IOError as e:
+            return True
+        except (OSError, configparser.Error) as e:
             log.error("Failed to save config to %s: %s", self.config_path, e)
+            return False
 
     @overload
     def get(self, section, key, fallback: None = None) -> str | None: ...
@@ -698,7 +827,12 @@ class AppConfig:
         """Set a config value, creating the section if needed."""
         if not self.config.has_section(section):
             self.config.add_section(section)
-        self.config.set(section, key, str(value))
+        value = str(value)
+        if self.config.get(section, key, fallback=None) == value:
+            return
+        self.config.set(section, key, value)
+        self._changed_options.add((section, key))
+        self._removed_options.discard((section, key))
 
 
 # Global config instance

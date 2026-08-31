@@ -1508,6 +1508,7 @@ class ImageEditor:
         detail_source_scale: float = 1.0,
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
+        stop_before_darken: bool = False,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
         Returns float32 array (H, W, 3).
@@ -1536,6 +1537,10 @@ class ImageEditor:
         ``cancel_check`` is reserved for discardable display renders. It is
         sampled between expensive stages so idle refinement can yield when a
         newer edit revision arrives. Export callers never pass it.
+
+        ``stop_before_darken`` returns the authoritative content-analysis stage
+        used by the background-darkening mask. Overlay generation uses this
+        exact boundary so it cannot derive priors from a different edit stage.
         """
         cv2 = _get_cv2()
         if edits is None:
@@ -2257,6 +2262,9 @@ class ImageEditor:
         _check_cancelled()
 
         # 19.5. Background Darkening (masked, after levels, before vignette)
+        if stop_before_darken:
+            return arr
+
         darken = edits.get("darken_settings")
         if darken is not None and getattr(darken, "enabled", False):
             # Use override assets/cache if provided (export snapshot), else live state
@@ -2345,6 +2353,57 @@ class ImageEditor:
 
         return (
             arr  # May exceed 1.0 in preview/non-export; clipped for skip_linear export.
+        )
+
+    def resolve_darken_preview_mask(self) -> Optional[np.ndarray]:
+        """Resolve the live overlay from the renderer's pre-darken stage."""
+        with self._lock:
+            base = self.float_preview
+            edits = dict(self.current_edits)
+            settings = edits.get("darken_settings")
+            mask_data = (
+                self._mask_assets.get(settings.mask_id)
+                if settings is not None
+                else None
+            )
+            if base is None or mask_data is None or not mask_data.has_strokes():
+                return None
+
+            detail_source_scale = 1.0
+            if self.float_image is not None:
+                full_h, full_w = self.float_image.shape[:2]
+            elif self.original_image is not None:
+                full_w, full_h = self.original_image.size
+            else:
+                full_w = full_h = 0
+            if full_w > 0 and full_h > 0:
+                base_h, base_w = base.shape[:2]
+                detail_source_scale = min(
+                    base_w / full_w,
+                    base_h / full_h,
+                    1.0,
+                )
+
+        pre_darken = self._apply_edits(
+            base,
+            edits=edits,
+            for_export=False,
+            cache_context={},
+            update_highlight_state=False,
+            detail_source_scale=detail_source_scale,
+            protect_input=True,
+            stop_before_darken=True,
+        )
+
+        from faststack.imaging.mask_engine import resolve_mask
+
+        return resolve_mask(
+            mask_data,
+            settings,
+            pre_darken,
+            pre_darken.shape[:2],
+            edits,
+            cache=self._mask_raster_cache,
         )
 
     def auto_levels(

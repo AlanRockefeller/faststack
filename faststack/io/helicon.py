@@ -2,7 +2,6 @@
 
 import logging
 import os
-import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from faststack.config import config
+from faststack.io.arguments import parse_external_arguments
 from faststack.io.executable_validator import validate_executable_path
 
 log = logging.getLogger(__name__)
@@ -83,9 +83,7 @@ def launch_helicon_focus(raw_files: List[Path]) -> Tuple[bool, Optional[HeliconL
         extra_args = config.get("helicon", "args")
         if extra_args:
             try:
-                # Use shlex to properly parse arguments with quotes/escapes
-                # On Windows, use posix=False to handle Windows-style paths
-                parsed_args = shlex.split(extra_args, posix=(os.name != "nt"))
+                parsed_args = parse_external_arguments(extra_args)
                 args.extend(parsed_args)
             except ValueError as e:
                 log.exception(f"Invalid helicon args format: {e}")

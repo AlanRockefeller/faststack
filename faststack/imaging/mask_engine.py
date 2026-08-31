@@ -8,6 +8,7 @@ Layer 2 of the mask subsystem.  Provides:
 - MaskRasterCache     – disposable, resolution-keyed cache for raster products
 """
 
+import hashlib
 import logging
 import math
 from typing import Any, Dict, Optional, Tuple
@@ -361,21 +362,19 @@ def _edge_magnitude(image_arr: np.ndarray) -> np.ndarray:
 
 
 def _image_content_key(image_arr: np.ndarray) -> int:
-    """Fast in-process cache key for resolved-mask cache invalidation.
+    """Robust in-process cache key for resolved-mask cache invalidation.
 
     Priors (dark, neutral, edge) depend on image content, so the cache must
     be invalidated when edits change the image (exposure, WB, levels, etc.).
 
-    Samples a 4×4 spatial grid across all channels and hashes the raw bytes.
-    This catches both global adjustments and localised edits far more
-    reliably than a handful of single-channel pixel reads.
+    Content-derived priors can change at any pixel, so sampling cannot safely
+    identify the rendered stage. BLAKE2 scans the contiguous buffer without
+    allocating when the renderer already produced C-order output.
     """
-    h, w = image_arr.shape[:2]
-    # 4 evenly-spaced row/col indices (always includes first and last)
-    rows = [0, h // 3, 2 * h // 3, h - 1]
-    cols = [0, w // 3, 2 * w // 3, w - 1]
-    samples = b"".join(image_arr[r, c].tobytes() for r in rows for c in cols)
-    return hash(samples)
+    contiguous = np.ascontiguousarray(image_arr)
+    raw = memoryview(contiguous).cast("B")
+    digest = hashlib.blake2b(raw, digest_size=8).digest()
+    return int.from_bytes(digest, "little")
 
 
 # ---------------------------------------------------------------------------

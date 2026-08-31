@@ -79,6 +79,7 @@ from faststack.io.sidecar import SidecarManager
 from faststack.io.session import SessionRegistry, respawn_for_directory
 from faststack.io.watcher import Watcher
 from faststack.io.helicon import HeliconLaunch, launch_helicon_focus
+from faststack.io.arguments import parse_external_arguments
 from faststack.io.executable_validator import validate_executable_path
 from faststack.io.utils import normalize_path_key
 from faststack.imaging.cache import (
@@ -296,7 +297,7 @@ class LiveEditSessionState:
 @dataclass
 class PhotoshopHandoffState:
     jpg_path: Path
-    baseline_fingerprint: Optional[tuple[float, int]]
+    baseline_fingerprint: Optional[tuple[int, int, int, int, int]]
     launched_at: float
 
 
@@ -1775,7 +1776,7 @@ class AppController(QObject):
         )
         cancel_btn = msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         msg_box.setDefaultButton(cancel_btn)
-        msg_box.exec()
+        self._exec_modal_dialog(msg_box)
         return msg_box.clickedButton() == clear_btn
 
     def get_display_info(self):
@@ -2051,10 +2052,16 @@ class AppController(QObject):
 
     @staticmethod
     def _file_state_fingerprint(p: Path) -> Optional[tuple]:
-        """(mtime, size) identity of the file's current on-disk state."""
+        """Strong cheap identity of the file's current on-disk generation."""
         try:
             st = p.stat()
-            return (st.st_mtime, st.st_size)
+            return (
+                st.st_dev,
+                st.st_ino,
+                st.st_size,
+                st.st_mtime_ns,
+                st.st_ctime_ns,
+            )
         except OSError:
             return None
 
@@ -2126,7 +2133,7 @@ class AppController(QObject):
         pending prefetch for the path so it gets re-submitted fresh.
 
         A save is invalidated twice (save-completion handler + the watcher
-        events it triggers, in either order). The (mtime, size) fingerprint
+        events it triggers, in either order). The file-generation fingerprint
         dedupes watcher echoes only: if the file's on-disk state is the one
         we already invalidated, cached entries were decoded after that epoch
         and are coherent, so the duplicate watcher invalidation is skipped
@@ -3031,7 +3038,29 @@ class AppController(QObject):
         clear_raw_count_cache()
 
         self._scan_count_variant += 1
-        images, variant_map = find_images_with_variants(self.image_dir)
+        pending_snapshot = getattr(self, "_pending_directory_snapshot", None)
+        if (
+            pending_snapshot is not None
+            and pending_snapshot[0] == self._key(self.image_dir)
+        ):
+            images, variant_map = pending_snapshot[1]
+            self._pending_directory_snapshot = None
+        else:
+            try:
+                images, variant_map = find_images_with_variants(self.image_dir)
+            except OSError as exc:
+                log.error(
+                    "Directory scan failed; preserving the last known image list for %s: %s",
+                    self.image_dir,
+                    exc,
+                )
+                if notify:
+                    self.update_status_message(
+                        f"Could not refresh folder: {exc}",
+                        timeout=10000,
+                        color="#FFD54F",
+                    )
+                return False
         self._all_images = images
         self._variant_map = variant_map
         self._apply_filter_to_cached_list(notify=notify)
@@ -3042,6 +3071,7 @@ class AppController(QObject):
         # Refresh thumbnail model if it exists (for external file changes or startup)
         if self._thumbnail_model and self._is_grid_view_active:
             self._refresh_thumbnail_model_from_controller()
+        return True
 
     @Slot()
     def _on_watcher_refresh(self):
@@ -3105,12 +3135,16 @@ class AppController(QObject):
 
     def _on_index_scan_done(self, epoch: int, fut: concurrent.futures.Future) -> None:
         """Runs on the index executor's worker thread — no QObject access here."""
+        error = None
         try:
             result = fut.result()
         except Exception as e:
             log.error("Background directory scan failed: %s", e)
             result = None
-        self._indexScanReady.emit({"epoch": epoch, "result": result})
+            error = str(e)
+        self._indexScanReady.emit(
+            {"epoch": epoch, "result": result, "error": error}
+        )
 
     @Slot(object)
     def _on_index_scan_ready(self, payload) -> None:
@@ -3131,6 +3165,13 @@ class AppController(QObject):
         # that are not in self.image_dir any more — applying it would repopulate
         # the list with the old directory's images.
         if result is None or payload.get("epoch") != self._index_scan_epoch:
+            error = payload.get("error")
+            if error and payload.get("epoch") == self._index_scan_epoch:
+                self.update_status_message(
+                    f"Could not refresh folder: {error}",
+                    timeout=10000,
+                    color="#FFD54F",
+                )
             if self._index_rescan_needed:
                 self._maybe_start_index_scan()
             return
@@ -3225,6 +3266,23 @@ class AppController(QObject):
                 if self.image_files
                 else 0
             )
+
+        if self.view_override_path and self.image_files:
+            current_group_key = get_group_key_for_path(
+                self.image_files[self.current_index].path,
+                self._variant_map,
+            )
+            current_group = (
+                self._variant_map.get(current_group_key)
+                if current_group_key is not None
+                else None
+            )
+            override_norm = norm_path(Path(self.view_override_path))
+            if current_group is None or not any(
+                norm_path(info.path) == override_norm
+                for info in current_group.all_files
+            ):
+                self._clear_variant_override()
         self._notify_thumbnail_current_path_changed(
             provisional_current_path, force=True
         )
@@ -8534,8 +8592,33 @@ class AppController(QObject):
         might have missed.
         """
         log.info("Manual grid refresh requested (Full Rescan)")
-        # Ensure all images are rescanned from disk and the grid follows
-        self.refresh_image_list()
+        clear_raw_count_cache()
+        self._scan_count_variant += 1
+        try:
+            result = find_images_with_variants(self.image_dir)
+        except OSError as exc:
+            log.error(
+                "Manual directory scan failed; preserving the last known list: %s",
+                exc,
+            )
+            self.update_status_message(
+                f"Could not refresh folder: {exc}",
+                timeout=10000,
+                color="#FFD54F",
+            )
+            return
+
+        # Manual refresh is deliberately unattributed: it exists to recover
+        # changes the watcher missed, including a same-path replacement with
+        # unchanged stat metadata. Force both thumbnail and loupe pixels stale.
+        if self._thumbnail_cache:
+            self._thumbnail_cache.clear()
+        with self._watcher_changed_lock:
+            self._watcher_changed_paths.add(None)
+        self._index_scan_inflight = True
+        self._on_index_scan_ready(
+            {"epoch": self._index_scan_epoch, "result": result, "error": None}
+        )
 
     def switch_to_grid_view(self):
         """Switch to grid view (from loupe view). Called by Esc key."""
@@ -10469,7 +10552,7 @@ class AppController(QObject):
         start_dir = self._dialog_start_directory(current_path)
         if start_dir:
             dialog.setDirectory(start_dir)
-        if dialog.exec():
+        if self._exec_modal_dialog(dialog):
             return dialog.selectedFiles()[0]
         return ""
 
@@ -11539,9 +11622,17 @@ class AppController(QObject):
         start_dir = self._dialog_start_directory(current_path)
         if start_dir:
             dialog.setDirectory(start_dir)
-        if dialog.exec():
+        if self._exec_modal_dialog(dialog):
             return dialog.selectedFiles()[0]
         return ""
+
+    def _exec_modal_dialog(self, dialog) -> int:
+        """Run a native modal dialog while global shortcuts are disabled."""
+        self.dialog_opened()
+        try:
+            return dialog.exec()
+        finally:
+            self.dialog_closed()
 
     def _switch_to_directory(
         self, folder_path: Path, update_base_directory: bool = True
@@ -11554,6 +11645,32 @@ class AppController(QObject):
                                    (for File -> Open Folder). If False, keeps existing base
                                    (for grid navigation within current base).
         """
+        target_dir = Path(folder_path).expanduser().resolve()
+        target_watcher = Watcher(target_dir, self._request_watcher_refresh)
+        try:
+            target_watcher.start()
+        except Exception:
+            log.exception(
+                "Watcher failed to start during directory switch for %s",
+                target_dir,
+            )
+        try:
+            target_snapshot = find_images_with_variants(target_dir)
+        except OSError as exc:
+            # Do not commit a half-switched controller whose list still belongs
+            # to the old directory.
+            try:
+                target_watcher.stop()
+            except Exception:
+                pass
+            log.error("Could not switch to directory %s: %s", target_dir, exc)
+            self.update_status_message(
+                f"Could not open folder: {exc}",
+                timeout=10000,
+                color="#FFD54F",
+            )
+            return False
+
         self._begin_direct_image_transition("directory switched")
 
         # Stop the old watcher
@@ -11561,10 +11678,14 @@ class AppController(QObject):
             self.watcher.stop()
 
         # Update the directory path
-        self.image_dir = Path(folder_path).expanduser().resolve()
+        self.image_dir = target_dir
 
         # Reinitialize directory-bound components
-        self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
+        self.watcher = target_watcher
+        self._pending_directory_snapshot = (
+            self._key(self.image_dir),
+            target_snapshot,
+        )
         self.sidecar = SidecarManager(self.image_dir, self.watcher, debug=_debug_mode)
         self._adopt_saved_sort_mode()
         self.ui_state.sortModeChanged.emit()
@@ -11627,18 +11748,19 @@ class AppController(QObject):
         if self._thumbnail_model:
             if update_base_directory:
                 self._thumbnail_model.set_directories(self.image_dir, self.image_dir)
-                self._thumbnail_model.refresh()  # set_directories doesn't refresh
             else:
-                # navigate_to() already calls refresh() internally
-                self._thumbnail_model.navigate_to(self.image_dir)
-            self._path_resolver.update_from_model(self._thumbnail_model)
+                self._thumbnail_model.set_directories(
+                    self._thumbnail_model.base_directory,
+                    self.image_dir,
+                )
             self.ui_state.gridDirectoryChanged.emit(str(self.image_dir))
 
         # Notify that the current directory changed (for window title)
         self.ui_state.currentDirectoryChanged.emit()
 
-        # Load images from new directory (thumbnail model already refreshed above)
+        # Load the observed authoritative snapshot into both loupe and grid.
         self.load(skip_thumbnail_refresh=True)
+        return True
 
     def _set_folder_loaded(self, loaded: bool, *, notify: bool = True) -> bool:
         """Update the current-folder load state and notify QML when it changes."""
@@ -12354,6 +12476,9 @@ class AppController(QObject):
         # --- Phase 1.5: Handle Perm Delete Result ---
         if result.is_perm_result:
             if result.perm_success:
+                self._remove_permanently_deleted_metadata(
+                    [img for _index, img in result.perm_success]
+                )
                 self._record_permanently_deleted_identities(
                     [img.path for _index, img in result.perm_success]
                 )
@@ -12704,6 +12829,22 @@ class AppController(QObject):
             path = getattr(self, attr)
             if path is not None and self._key(path) in deleted_keys:
                 setattr(self, attr, None)
+
+    def _remove_permanently_deleted_metadata(self, images: List[ImageFile]) -> None:
+        """Forget metadata only after permanent deletion has actually succeeded."""
+        keys = {
+            self.sidecar.metadata_key_for_path(path)
+            for image in images
+            for path in (image.path, image.raw_pair)
+            if path is not None
+        }
+        removed = False
+        with self.sidecar._state_lock:
+            for key in keys:
+                if self.sidecar.data.entries.pop(key, None) is not None:
+                    removed = True
+        if removed:
+            self._persist_sidecar()
 
     def _clear_delete_identity_state_if_settled(self) -> None:
         if self._pending_delete_jobs:
@@ -14229,9 +14370,7 @@ class AppController(QObject):
             # Parse additional args safely using shlex (handles quotes and escapes properly)
             if photoshop_args:
                 try:
-                    # Use shlex to properly parse arguments with quotes/escapes
-                    # On Windows, use posix=False to handle Windows-style paths
-                    parsed_args = shlex.split(photoshop_args, posix=(os.name != "nt"))
+                    parsed_args = parse_external_arguments(photoshop_args)
                     command.extend(parsed_args)
                 except ValueError as e:
                     log.error("Invalid photoshop_args format: %s", e)
@@ -14903,7 +15042,7 @@ class AppController(QObject):
                 cmd = [rt_exe, "-t", "-b16", "-Y", "-o", str(tmp_tif_path)]
                 if rt_args:
                     try:
-                        cmd.extend(shlex.split(rt_args, posix=(os.name != "nt")))
+                        cmd.extend(parse_external_arguments(rt_args))
                     except ValueError as e:
                         log.error("Invalid rawtherapee args format: %s", e)
                 cmd.extend(["-c", str(raw_path)])
@@ -15788,22 +15927,9 @@ class AppController(QObject):
                 self.ui_state.darken_overlay_generation_changed.emit()
                 return
 
-            # Resolve mask at preview resolution
-            preview = self.image_editor.float_preview
-            if preview is None:
+            resolved = self.image_editor.resolve_darken_preview_mask()
+            if resolved is None:
                 return
-
-            from faststack.imaging.mask_engine import resolve_mask
-
-            edits = dict(self.image_editor.current_edits)
-            resolved = resolve_mask(
-                mask_data,
-                ds,
-                preview,
-                preview.shape[:2],
-                edits,
-                cache=self.image_editor._mask_raster_cache,
-            )
 
             # Build ARGB32 overlay
             h, w = resolved.shape
@@ -17494,7 +17620,7 @@ class AppController(QObject):
         msg_box.setInformativeText(details)
         msg_box.setDetailedText(detailed_locations)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg_box.exec()
+        self._exec_modal_dialog(msg_box)
         self.update_status_message("Stack input RAW files not found.", 6000)
 
     @Slot()
@@ -18479,6 +18605,11 @@ class AppController(QObject):
         parts = AppController._recycled_name_parts(recycled_path)
         return parts[0] if parts is not None else None
 
+    @staticmethod
+    def _restore_destination_identity(dest_dir: Path, original_name: str) -> str:
+        """Normalize restore conflicts with the destination filesystem policy."""
+        return normalize_path_key(dest_dir / original_name)
+
     def _recycle_history_timestamps(self) -> dict[str, int]:
         """Map known recycled paths to their actual in-session delete time."""
         timestamps: dict[str, int] = {}
@@ -18633,6 +18764,10 @@ class AppController(QObject):
             entries = []
 
         history_timestamps = self._recycle_history_timestamps()
+
+        def destination_identity(name: str) -> str:
+            return self._restore_destination_identity(dest_dir, name)
+
         operations: dict[tuple[str, str], list[tuple[Path, str, int, bool]]] = {}
         for p in entries:
             if not p.is_file():
@@ -18654,7 +18789,12 @@ class AppController(QObject):
                     timestamp_ns = p.stat().st_ctime_ns
                 except OSError:
                     timestamp_ns = 0
-            operation_key = (operation_tag, Path(original_name).stem.casefold())
+            operation_key = (
+                operation_tag,
+                self._restore_destination_identity(
+                    dest_dir, Path(original_name).stem
+                ),
+            )
             operations.setdefault(operation_key, []).append(
                 (p, original_name, timestamp_ns, known_timestamp)
             )
@@ -18666,7 +18806,7 @@ class AppController(QObject):
         raw_primary_names: dict[str, set[str]] = {}
         for operation_entries in operations.values():
             jpeg_names = {
-                entry[1].casefold()
+                destination_identity(entry[1])
                 for entry in operation_entries
                 if Path(entry[1]).suffix.casefold() in JPG_EXTENSIONS
             }
@@ -18675,9 +18815,9 @@ class AppController(QObject):
             primary_name = next(iter(jpeg_names))
             for entry in operation_entries:
                 if Path(entry[1]).suffix.casefold() in RAW_EXTENSIONS:
-                    raw_primary_names.setdefault(entry[1].casefold(), set()).add(
-                        primary_name
-                    )
+                    raw_primary_names.setdefault(
+                        destination_identity(entry[1]), set()
+                    ).add(primary_name)
 
         for (operation_tag, _stem), operation_entries in operations.items():
             image_entries = [
@@ -18691,7 +18831,7 @@ class AppController(QObject):
 
             if image_entries:
                 jpeg_names = {
-                    entry[1].casefold()
+                    destination_identity(entry[1])
                     for entry in image_entries
                     if Path(entry[1]).suffix.casefold() in JPG_EXTENSIONS
                 }
@@ -18701,11 +18841,11 @@ class AppController(QObject):
                         primary_name
                         for entry in image_entries
                         for primary_name in raw_primary_names.get(
-                            entry[1].casefold(), set()
+                            destination_identity(entry[1]), set()
                         )
                     }
                     primary_names = associated_primary_names or {
-                        entry[1].casefold() for entry in image_entries
+                        destination_identity(entry[1]) for entry in image_entries
                     }
                 if len(primary_names) != 1:
                     result["ambiguous_count"] += len(image_entries)
@@ -18722,7 +18862,7 @@ class AppController(QObject):
                     )
 
             for entry in other_entries:
-                family = ("file", entry[1].casefold())
+                family = ("file", destination_identity(entry[1]))
                 versions.setdefault(family, []).append(
                     (operation_tag, [entry], entry[2], entry[3])
                 )
@@ -18766,9 +18906,9 @@ class AppController(QObject):
         destination_operations: dict[str, set[str]] = {}
         for operation_tag, operation_entries, _rank, _known in selected_operations:
             for _path, original_name, _timestamp, _entry_known in operation_entries:
-                destination_operations.setdefault(original_name.casefold(), set()).add(
-                    operation_tag
-                )
+                destination_operations.setdefault(
+                    destination_identity(original_name), set()
+                ).add(operation_tag)
         conflicting_destinations = {
             destination
             for destination, tags in destination_operations.items()
@@ -18778,7 +18918,7 @@ class AppController(QObject):
         selected_entries: list[tuple[Path, str, int, bool]] = []
         for _tag, operation_entries, _rank, _known in selected_operations:
             for entry in operation_entries:
-                if entry[1].casefold() in conflicting_destinations:
+                if destination_identity(entry[1]) in conflicting_destinations:
                     result["ambiguous_count"] += 1
                     log.warning(
                         "Leaving conflicting paired destination in recycle bin: %s",

@@ -738,10 +738,18 @@ class SidecarManager:
 
         try:
             relative = abs_path.relative_to(self._base_dir_normcased)
-            stable_path = relative.parent / relative.stem
+            stable_path = (
+                relative
+                if relative.suffix.lower() in JPG_EXTENSIONS
+                else relative.parent / relative.stem
+            )
             result = str(stable_path).replace("\\", "/")
         except ValueError:
-            stable_path = abs_path.parent / abs_path.stem
+            stable_path = (
+                abs_path
+                if abs_path.suffix.lower() in JPG_EXTENSIONS
+                else abs_path.parent / abs_path.stem
+            )
             result = str(stable_path).replace("\\", "/")
 
         if len(self._stable_key_cache) >= self._key_cache_max:
@@ -756,7 +764,10 @@ class SidecarManager:
                 return "", []
             stable_key = self.metadata_key_for_path(image_ref)
             full_name_key = self._metadata_filename_key(image_ref)
-            return stable_key, [full_name_key, image_ref.stem]
+            legacy_keys = [full_name_key]
+            if not self._jpeg_stem_is_ambiguous(image_ref):
+                legacy_keys.extend(self._legacy_stem_keys(image_ref, stable_key))
+            return stable_key, legacy_keys
 
         value = str(image_ref)
         if not value:
@@ -770,9 +781,48 @@ class SidecarManager:
             path = Path(value)
             stable_key = self.metadata_key_for_path(path)
             full_name_key = self._metadata_filename_key(path)
-            return stable_key, [full_name_key, path.stem]
+            legacy_keys = [full_name_key]
+            if not self._jpeg_stem_is_ambiguous(path):
+                legacy_keys.extend(self._legacy_stem_keys(path, stable_key))
+            return stable_key, legacy_keys
 
         return value, [value]
+
+    def _legacy_stem_keys(self, path: Path, stable_key: str) -> list[str]:
+        """Return unambiguous extensionless/RAW keys used by older releases."""
+        if path.suffix.lower() not in JPG_EXTENSIONS:
+            return [path.stem]
+
+        stem_key = str(Path(stable_key).with_suffix("")).replace("\\", "/")
+        parent = Path(stable_key).parent
+        raw_keys = []
+        for suffix in sorted(RAW_EXTENSIONS):
+            raw_name = f"{path.stem}{suffix}"
+            raw_keys.append(
+                str(parent / raw_name).replace("\\", "/")
+                if str(parent) != "."
+                else raw_name
+            )
+            upper_name = f"{path.stem}{suffix.upper()}"
+            raw_keys.append(
+                str(parent / upper_name).replace("\\", "/")
+                if str(parent) != "."
+                else upper_name
+            )
+        return list(dict.fromkeys([stem_key, path.stem, *raw_keys]))
+
+    def _jpeg_stem_is_ambiguous(self, image_path: Path) -> bool:
+        """Return whether another JPEG extension owns the same stem."""
+        if image_path.suffix.lower() not in JPG_EXTENSIONS:
+            return False
+        path = image_path if image_path.is_absolute() else self.directory / image_path
+        suffix = path.suffix.lower()
+        for other_suffix in JPG_EXTENSIONS - {suffix}:
+            if path.with_suffix(other_suffix).exists():
+                return True
+            if path.with_suffix(other_suffix.upper()).exists():
+                return True
+        return False
 
     def _metadata_filename_key(self, image_path: Union[str, Path]) -> str:
         """Return the extension-preserving key used by the regressed patch."""

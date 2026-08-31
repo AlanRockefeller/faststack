@@ -1,6 +1,7 @@
 """Tests for the reusable mask subsystem and background darkening tool."""
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -390,9 +391,79 @@ class TestMaskRasterCache(unittest.TestCase):
         cache.clear()
         self.assertIsNone(cache.get_strokes(1, (10, 10), 42))
 
+    def test_resolved_cache_detects_change_outside_old_sample_grid(self):
+        mask_data = MaskData()
+        settings = DarkenSettings(
+            enabled=True,
+            mode="assisted",
+            feather=0.0,
+            neutrality_sensitivity=0.0,
+            auto_from_edges=0.0,
+        )
+        edits = {"rotation": 0, "straighten_angle": 0.0, "crop_box": None}
+        image = np.ones((12, 12, 3), dtype=np.float32)
+        cache = MaskRasterCache()
+
+        before = resolve_mask(
+            mask_data, settings, image, image.shape[:2], edits, cache=cache
+        )
+        # (5, 5) is outside the former 4x4 sample rows/columns (0, 4, 8, 11).
+        image[5, 5] = 0.0
+        cached = resolve_mask(
+            mask_data, settings, image, image.shape[:2], edits, cache=cache
+        )
+        uncached = resolve_mask(
+            mask_data, settings, image, image.shape[:2], edits, cache=None
+        )
+
+        self.assertTrue(np.array_equal(cached, uncached))
+        self.assertFalse(np.array_equal(before, cached))
+
 
 class TestEditorIntegration(unittest.TestCase):
     """Test that the editor pipeline integrates the darken step correctly."""
+
+    def test_applied_mask_and_overlay_use_same_pre_darken_stage(self):
+        from faststack.imaging.editor import ImageEditor
+
+        editor = ImageEditor()
+        source = np.linspace(0.05, 0.95, 48 * 32 * 3, dtype=np.float32).reshape(
+            32, 48, 3
+        )
+        mask_data = MaskData()
+        mask_data.add_stroke(MaskStroke([(0.5, 0.5)], 0.2, "add"))
+        settings = DarkenSettings(enabled=True, mode="assisted")
+        edits = dict(editor.current_edits)
+        edits.update(
+            {
+                "exposure": 0.4,
+                "crop_box": (100, 100, 900, 900),
+                "straighten_angle": 3.0,
+                "darken_settings": settings,
+            }
+        )
+        editor._mask_assets[settings.mask_id] = mask_data
+
+        expected_stage = editor._apply_edits(
+            source.copy(),
+            edits=edits,
+            for_export=True,
+            stop_before_darken=True,
+        )
+        captured = []
+
+        def capture_resolve(mask, darken, image, shape, current_edits, cache=None):
+            captured.append(image.copy())
+            return np.zeros(shape, dtype=np.float32)
+
+        with patch(
+            "faststack.imaging.mask_engine.resolve_mask",
+            side_effect=capture_resolve,
+        ):
+            editor._apply_edits(source.copy(), edits=edits, for_export=True)
+
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(np.array_equal(captured[0], expected_stage))
 
     def test_darken_settings_in_initial_edits(self):
         from faststack.imaging.editor import ImageEditor

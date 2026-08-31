@@ -588,6 +588,19 @@ class ThumbnailModel(QAbstractListModel):
         cur, own = QThread.currentThread(), self.thread()
         assert cur == own, "ThumbnailModel refresh thread mismatch"
 
+        selected_paths = {
+            normalize_path_key(self._entries[index].path)
+            for index in self._selected_indices
+            if 0 <= index < len(self._entries) and not self._entries[index].is_folder
+        }
+        anchor_path = (
+            normalize_path_key(self._entries[self._last_selected_index].path)
+            if self._last_selected_index is not None
+            and 0 <= self._last_selected_index < len(self._entries)
+            and not self._entries[self._last_selected_index].is_folder
+            else None
+        )
+
         self.beginResetModel()
         try:
             self._entries.clear()
@@ -644,6 +657,14 @@ class ThumbnailModel(QAbstractListModel):
             self._add_images_to_entries(images, metadata_map)
             t2 = time.perf_counter()
             self._rebuild_id_mapping()
+            self._selected_indices = {
+                self._path_to_row[path]
+                for path in selected_paths
+                if path in self._path_to_row
+            }
+            self._last_selected_index = (
+                self._path_to_row.get(anchor_path) if anchor_path is not None else None
+            )
             t3 = time.perf_counter()
         finally:
             self.endResetModel()
