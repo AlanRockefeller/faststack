@@ -597,6 +597,7 @@ class AppController(QObject):
         self._pending_edit_save_requests: Dict[str, dict] = {}
         self._last_save_prepare_error: Optional[str] = None
         self._shutdown_flush_prepared = False
+        self._shutdown_final_sidecar_attempted = False
 
         # Deferred-init state: set to safe defaults, populated later by their methods
         self._saves_in_flight: Dict[str, int] = {}
@@ -712,14 +713,11 @@ class AppController(QObject):
         # -- Backend Components --
         self.watcher = Watcher(self.image_dir, self._request_watcher_refresh)
         self._suppressed_paths: Dict[str, float] = {}  # key -> monotonic expiry time
-        # Normalized key -> [expected FileIdentity, refcount, monotonic deadline]
-        # for files a delete worker is about to move. A timed window cannot
-        # bound a batch whose per-file Windows retries run for seconds, so the
-        # entry lives for as long as the job does; the deadline is only a
-        # safety net for a job whose completion handler never runs. Suppression
-        # is identity-aware: a file that no longer matches what was authorized
-        # for deletion is an external replacement and must still refresh.
-        self._pending_delete_identities: Dict[str, list] = {}
+        # Normalized key -> {"identity": FileIdentity, "owners": set[job_id]}.
+        # Ownership is released only when a delete job settles; elapsed time
+        # cannot safely bound filesystem work. Identity awareness means an
+        # external replacement at the same path still reaches the watcher.
+        self._pending_delete_identities: Dict[str, dict] = {}
         # Normalized key -> in-flight save count. A timed suppression window
         # cannot bound a save of unknown duration, so writes we are performing
         # ourselves are suppressed for exactly as long as they are running.
@@ -1692,7 +1690,7 @@ class AppController(QObject):
             self.current_index,
             self._current_image_path(),
         )
-        self._persist_sidecar()
+        metadata_saved = self._persist_sidecar()
 
         if self._is_grid_view_active:
             self._thumbnail_prefetcher.cancel_all()
@@ -1708,6 +1706,7 @@ class AppController(QObject):
         self.dataChanged.emit()
         if hasattr(self, "ui_state") and self.ui_state:
             self.ui_state.sortModeChanged.emit()
+        return metadata_saved
 
     def _filtered_sorted_copy(self, mode: str) -> list:
         """Return a filtered and sorted copy of ``_all_images``.
@@ -2886,6 +2885,7 @@ class AppController(QObject):
                         )
                     return
                 if self._is_pending_delete_path(key, p, now):
+                    self._index_rescan_needed = True
                     if _debug_mode:
                         log.debug(
                             "Suppressing watcher refresh for in-flight delete: %s",
@@ -2958,15 +2958,13 @@ class AppController(QObject):
                 if key:
                     self._suppressed_paths[key] = now + ttl
 
-    def _register_pending_delete_paths(self, work_items) -> None:
+    def _register_pending_delete_paths(self, job_id: int, work_items) -> None:
         """Suppress watcher refreshes for files an in-flight delete job owns.
 
         Must run before the worker starts I/O: watchdog events for the first
         move can arrive while later files in the same batch are still on disk,
         and a rescan would reinsert rows the worker is about to remove.
         """
-        # Windows sharing-violation retries can add over a second per file.
-        deadline = time.monotonic() + 60.0 + 5.0 * len(work_items)
         with self._suppressed_paths_lock:
             for item in work_items:
                 for path, identity in (
@@ -2983,13 +2981,14 @@ class AppController(QObject):
                         continue
                     entry = self._pending_delete_identities.get(key)
                     if entry is None:
-                        self._pending_delete_identities[key] = [identity, 1, deadline]
+                        self._pending_delete_identities[key] = {
+                            "identity": identity,
+                            "owners": {job_id},
+                        }
                     else:
-                        entry[0] = identity
-                        entry[1] += 1
-                        entry[2] = max(entry[2], deadline)
+                        entry["owners"].add(job_id)
 
-    def _release_pending_delete_paths(self, work_items) -> None:
+    def _release_pending_delete_paths(self, job_id: int, work_items) -> None:
         """Drop the pending-delete suppression registered for *work_items*."""
         with self._suppressed_paths_lock:
             for item in work_items:
@@ -3003,11 +3002,11 @@ class AppController(QObject):
                     entry = self._pending_delete_identities.get(key)
                     if entry is None:
                         continue
-                    entry[1] -= 1
-                    if entry[1] <= 0:
+                    entry["owners"].discard(job_id)
+                    if not entry["owners"]:
                         del self._pending_delete_identities[key]
 
-    def _is_pending_delete_path(self, key: str, path: Path, now: float) -> bool:
+    def _is_pending_delete_path(self, key: str, path: Path, _now: float) -> bool:
         """Return True when *path* is a file our own delete worker is moving.
 
         Caller must hold ``_suppressed_paths_lock``. A path still registered but
@@ -3018,18 +3017,13 @@ class AppController(QObject):
         entry = self._pending_delete_identities.get(key)
         if entry is None:
             return False
-        if now >= entry[2]:
-            # Safety net: a completion handler that never ran must not
-            # suppress this path forever.
-            del self._pending_delete_identities[key]
-            return False
         try:
             current = capture_file_identity(path)
         except OSError:
             return True
         # Gone means our move already happened; unchanged means it is still
         # waiting its turn in the same job.
-        return not current.exists or current == entry[0]
+        return not current.exists or current == entry["identity"]
 
     @Slot()
     def _start_watcher_debounce_timer(self) -> None:
@@ -3502,7 +3496,7 @@ class AppController(QObject):
                 keys.add(key)
         return keys
 
-    def _persist_batch_flags(self) -> None:
+    def _persist_batch_flags(self) -> bool:
         """Write the current runtime batch selection to per-entry sidecar flags."""
         active_keys = self._current_batch_metadata_keys()
         # Only touch entries in the current (possibly filtered) view. active_keys
@@ -3530,8 +3524,7 @@ class AppController(QObject):
                 meta.batch = should_be_batched
                 changed = True
 
-        if changed:
-            self._persist_sidecar()
+        return not changed or self._persist_sidecar()
 
     def _restore_batches_from_sidecar_flags(self) -> None:
         """Rebuild runtime batch ranges from sidecar flags for image_files order."""
@@ -3546,7 +3539,7 @@ class AppController(QObject):
                 batched_indices.append(idx)
 
         self.batches = self._ranges_from_indices(batched_indices)
-        self._finalize_batch_state(
+        _ = self._finalize_batch_state(
             persist=False,
             emit=False,
             sync=False,
@@ -3562,13 +3555,12 @@ class AppController(QObject):
         notify_model: bool = True,
         reapply_filter: bool = False,
         preserved_path: Optional[Path] = None,
-    ) -> None:
+    ) -> bool:
         """Normalize batch state and fan out persistence/UI invalidations."""
         self._normalize_batches()
         self._invalidate_batch_cache()
         self._update_filter_identity_snapshot("batch")
-        if persist:
-            self._persist_batch_flags()
+        persisted = not persist or self._persist_batch_flags()
         filter_reapplied = False
         if reapply_filter and persist:
             if (
@@ -3591,6 +3583,7 @@ class AppController(QObject):
             self._thumbnail_model.notify_batch_state_changed()
         if sync:
             self.sync_ui_state(image_count_changed=filter_reapplied)
+        return persisted
 
     @staticmethod
     def _shift_ranges_after_insert(
@@ -4178,7 +4171,7 @@ class AppController(QObject):
             with self.sidecar._state_lock:
                 self.sidecar.data.sort_mode = self.sort_mode
             self.sidecar.set_last_position(self.current_index, current_path)
-            self._persist_sidecar()
+            _ = self._persist_sidecar()
         except Exception as e:
             log.warning("Error persisting sidecar position: %s", e)
         try:
@@ -5184,6 +5177,7 @@ class AppController(QObject):
                 retired_requests += 1
 
         cleared_persisted_state = False
+        cleanup_saved = True
         metadata_paths: dict[str, Path] = {}
         for path in (image_path, handoff_path):
             metadata_key = self.sidecar.metadata_key_for_path(path)
@@ -5199,7 +5193,7 @@ class AppController(QObject):
                 meta.edit_state = None
                 cleared_persisted_state = True
         if cleared_persisted_state:
-            self._persist_sidecar()
+            cleanup_saved = self._persist_sidecar()
 
         if retired_requests or cleared_persisted_state:
             log.info(
@@ -5207,7 +5201,7 @@ class AppController(QObject):
                 retired_requests,
                 " and persisted pending edit state" if cleared_persisted_state else "",
             )
-        return bool(retired_requests or cleared_persisted_state)
+        return bool(retired_requests or cleared_persisted_state) and cleanup_saved
 
     def _discard_current_live_edits_for_photoshop(self) -> bool:
         """Discard dirty FastStack state after handing the image to Photoshop."""
@@ -8900,6 +8894,7 @@ class AppController(QObject):
         self._all_images.insert(all_insert_index, duplicate_image)
 
         batch_changed = False
+        metadata_saved = True
         if self.batches:
             self.batches = self._shift_ranges_after_insert(self.batches, insert_index)
             batch_changed = True
@@ -8910,7 +8905,9 @@ class AppController(QObject):
             self.batch_start_index += 1
             batch_changed = True
         if batch_changed:
-            self._finalize_batch_state(emit=False, sync=False, notify_model=False)
+            metadata_saved = self._finalize_batch_state(
+                emit=False, sync=False, notify_model=False
+            )
 
         stacks_changed = False
         if self.stacks:
@@ -8925,7 +8922,7 @@ class AppController(QObject):
         if self.stack_end_index is not None and self.stack_end_index >= insert_index:
             self.stack_end_index += 1
         if stacks_changed:
-            self._persist_stack_state()
+            metadata_saved = self._persist_stack_state() and metadata_saved
             self._metadata_cache_index = (-1, -1)
 
         self.prefetcher.set_image_files(self.image_files)
@@ -8941,7 +8938,8 @@ class AppController(QObject):
             self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
         self._restart_quality_decode_timer()
-        self.update_status_message(f"Duplicated image as {duplicate_path.name}")
+        if metadata_saved:
+            self.update_status_message(f"Duplicated image as {duplicate_path.name}")
         log.info("Duplicated image %s -> %s", source_path, duplicate_path)
 
     @Slot(int)
@@ -9166,7 +9164,7 @@ class AppController(QObject):
         single_off_status: str,
         batch_on_status: str,
         batch_off_status: str,
-    ) -> None:
+    ) -> bool:
         """Toggle a user-facing flag for the current image or active batch.
 
         The current image determines the new state. When batch mode is active,
@@ -9174,7 +9172,7 @@ class AppController(QObject):
         """
         indices = self._get_user_flag_toggle_indices()
         if not indices:
-            return
+            return False
 
         current_path = self.image_files[self.current_index].path
         current_meta = self.sidecar.get_metadata(current_path)
@@ -9198,7 +9196,7 @@ class AppController(QObject):
         self.sync_ui_state(image_count_changed=filter_reapplied)
 
         if not metadata_saved:
-            return
+            return False
         if len(indices) == 1:
             self.update_status_message(
                 single_on_status if new_value else single_off_status
@@ -9218,10 +9216,11 @@ class AppController(QObject):
             "image" if len(indices) == 1 else "images",
             current_path,
         )
+        return True
 
     def toggle_uploaded(self):
         """Toggle uploaded flag for current image or active batch."""
-        self._toggle_user_flag(
+        return self._toggle_user_flag(
             flag_attr="uploaded",
             date_attr="uploaded_date",
             single_on_status="Marked as uploaded",
@@ -9232,7 +9231,7 @@ class AppController(QObject):
 
     def toggle_todo(self):
         """Toggle todo flag for current image or active batch."""
-        self._toggle_user_flag(
+        return self._toggle_user_flag(
             flag_attr="todo",
             date_attr="todo_date",
             single_on_status="Marked as todo",
@@ -9243,7 +9242,7 @@ class AppController(QObject):
 
     def toggle_edited(self):
         """Toggle edited flag for current image or active batch."""
-        self._toggle_user_flag(
+        return self._toggle_user_flag(
             flag_attr="edited",
             date_attr="edited_date",
             single_on_status="Marked as edited",
@@ -9284,7 +9283,7 @@ class AppController(QObject):
 
     def toggle_favorite(self):
         """Toggle favorite flag for current image or active batch."""
-        self._toggle_user_flag(
+        return self._toggle_user_flag(
             flag_attr="favorite",
             single_on_status="Favorited",
             single_off_status="Unfavorited",
@@ -9294,7 +9293,7 @@ class AppController(QObject):
 
     def toggle_stacked(self):
         """Toggle stacked flag for current image or active batch."""
-        self._toggle_user_flag(
+        return self._toggle_user_flag(
             flag_attr="stacked",
             date_attr="stacked_date",
             single_on_status="Marked as stacked",
@@ -9478,9 +9477,9 @@ class AppController(QObject):
                 merged.append([current_start, current_end])
         return merged
 
-    def _define_pending_stack(self) -> bool:
+    def _define_pending_stack(self) -> Optional[bool]:
         if self.stack_start_index is None or self.stack_end_index is None:
-            return False
+            return None
 
         start = min(self.stack_start_index, self.stack_end_index)
         end = max(self.stack_start_index, self.stack_end_index)
@@ -9516,8 +9515,9 @@ class AppController(QObject):
             return
         self.stack_start_index = self.current_index
         log.info("Stack start marked at index %d", self.stack_start_index)
-        if self._define_pending_stack():
-            return
+        defined = self._define_pending_stack()
+        if defined is not None:
+            return defined
         self._update_filter_identity_snapshot("stack")
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
         self.dataChanged.emit()  # Update UI to show start marker
@@ -9538,8 +9538,9 @@ class AppController(QObject):
             return
         self.stack_end_index = self.current_index
         log.info("Stack end marked at index %d", self.stack_end_index)
-        if self._define_pending_stack():
-            return
+        defined = self._define_pending_stack()
+        if defined is not None:
+            return defined
         self._update_filter_identity_snapshot("stack")
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
         self.dataChanged.emit()  # Update UI to show end marker
@@ -9556,7 +9557,7 @@ class AppController(QObject):
         self.sync_ui_state()
         self.update_status_message("Batch start marked")
 
-    def end_current_batch(self):
+    def end_current_batch(self) -> bool:
         """End the current batch and save the range."""
         log.info(
             "end_current_batch called. batch_start_index: %s", self.batch_start_index
@@ -9567,14 +9568,17 @@ class AppController(QObject):
             self.batches.append([start, end])
             log.info("Defined new batch: [%d, %d]", start, end)
             self.batch_start_index = None
-            self._finalize_batch_state(reapply_filter=True)
+            if not self._finalize_batch_state(reapply_filter=True):
+                return False
             count = self.get_batch_count_for_current_image()
             self.update_status_message(
                 f"Batch defined: {count} image{'' if count == 1 else 's'}"
             )
+            return True
         else:
             log.warning("No batch start marked. Press '{' first.")
             self.update_status_message("No batch start marked")
+            return False
 
     def grid_add_selection_to_batch(self):
         """Add grid-selected images to batch."""
@@ -9619,7 +9623,8 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state(reapply_filter=True)
+            if not self._finalize_batch_state(reapply_filter=True):
+                return False
             self.update_status_message(f"Added {added_count} image(s) to batch")
             log.info("Added %d image(s) to batch from grid selection", added_count)
         else:
@@ -9651,7 +9656,8 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state(reapply_filter=True)
+            if not self._finalize_batch_state(reapply_filter=True):
+                return False
             self.update_status_message(
                 f"Added {added_count} favorite(s) to batch ({len(indices_to_add)} total favorites)"
             )
@@ -9687,7 +9693,8 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state(reapply_filter=True)
+            if not self._finalize_batch_state(reapply_filter=True):
+                return False
             self.update_status_message(
                 f"Added {added_count} uploaded image(s) to batch ({len(indices_to_add)} total uploaded)"
             )
@@ -9721,7 +9728,8 @@ class AppController(QObject):
                 added_count += 1
 
         if added_count > 0:
-            self._finalize_batch_state(reapply_filter=True)
+            if not self._finalize_batch_state(reapply_filter=True):
+                return False
             self.update_status_message(
                 f"Added {added_count} edited image(s) to batch ({len(indices_to_add)} total edited)"
             )
@@ -9731,13 +9739,13 @@ class AppController(QObject):
                 f"All {len(indices_to_add)} edited image(s) already in batch."
             )
 
-    def _auto_add_edited_to_batch_if_enabled(self, image_path: Path):
+    def _auto_add_edited_to_batch_if_enabled(self, image_path: Path) -> bool:
         """If auto-add is enabled, add the edited image at this path to the batch."""
         if not self.ui_state.autoAddEditedToBatch:
-            return
+            return True
 
         if not self.image_files:
-            return
+            return True
 
         try:
             image_key = self.sidecar.metadata_key_for_path(image_path)
@@ -9764,9 +9772,11 @@ class AppController(QObject):
                 in_batch = any(start <= i <= end for start, end in self.batches)
                 if not in_batch:
                     self.batches.append([i, i])
-                    self._finalize_batch_state(reapply_filter=True)
+                    if not self._finalize_batch_state(reapply_filter=True):
+                        return False
                     log.info("Auto-added edited image to batch: %s", image_path.name)
-                break
+                return True
+        return True
 
     def remove_from_batch_or_stack(self):
         """Remove current image from any batch or stack it's in."""
@@ -9802,7 +9812,6 @@ class AppController(QObject):
                     start,
                     end,
                 )
-                self.update_status_message("Removed from batch")
                 removed = True
                 batch_modified = True
             else:
@@ -9810,7 +9819,9 @@ class AppController(QObject):
 
         if batch_modified:
             self.batches = new_batches
-            self._finalize_batch_state(emit=False, sync=False, reapply_filter=True)
+            persisted = self._finalize_batch_state(
+                emit=False, sync=False, reapply_filter=True
+            )
 
         # Check and remove from stacks
         # Check and remove from stacks
@@ -9841,7 +9852,6 @@ class AppController(QObject):
                         start,
                         end,
                     )
-                    self.update_status_message("Removed from stack")
                     removed = True
                     stack_modified = True
                 else:
@@ -9849,12 +9859,18 @@ class AppController(QObject):
 
             if stack_modified:
                 self.stacks = new_stacks
-                self._persist_stack_state()
+                persisted = self._persist_stack_state()
         if removed:
             self._metadata_cache_index = (-1, -1)
             self.dataChanged.emit()
             self.ui_state.stackSummaryChanged.emit()
             self.sync_ui_state()
+            if not persisted:
+                return False
+            self.update_status_message(
+                "Removed from batch" if batch_modified else "Removed from stack"
+            )
+            return True
         else:
             self.update_status_message("Not in any batch or stack")
 
@@ -9886,22 +9902,25 @@ class AppController(QObject):
                 else:
                     new_batches.append([start, end])
             self.batches = new_batches
-            self.update_status_message("Removed image from batch")
+            success_message = "Removed image from batch"
             log.info("Removed index %d from a batch.", index_to_toggle)
         else:
             had_batches = bool(self.batches)
             self.batches.append([index_to_toggle, index_to_toggle])
             if not had_batches:
-                self.update_status_message("Created new batch with current image.")
+                success_message = "Created new batch with current image."
                 log.info(
                     "No existing batches. Created new batch for index %d.",
                     index_to_toggle,
                 )
             else:
-                self.update_status_message("Added image to batch")
+                success_message = "Added image to batch"
                 log.info("Added index %d to batch.", index_to_toggle)
 
-        self._finalize_batch_state(reapply_filter=True)
+        if not self._finalize_batch_state(reapply_filter=True):
+            return False
+        self.update_status_message(success_message)
+        return True
 
     def toggle_stack_membership(self):
         """Toggles the current image's inclusion in a stack."""
@@ -10010,11 +10029,13 @@ class AppController(QObject):
                         new_stack_idx + 1,
                     )
 
-        self._persist_stack_state()
+        if not self._persist_stack_state():
+            return False
         self._metadata_cache_index = (-1, -1)
         self.dataChanged.emit()
         self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
+        return True
 
     @staticmethod
     def _normalize_crop_box_tuple(
@@ -10277,11 +10298,12 @@ class AppController(QObject):
                     failed_stacks.append([start, end])
 
             if launched:
+                stack_state_saved = True
                 if failed_stacks:
                     self.stacks = failed_stacks
                     self.stack_start_index = None
                     self.stack_end_index = None
-                    self._persist_stack_state()
+                    stack_state_saved = self._persist_stack_state()
                     self._metadata_cache_index = (-1, -1)
                     self.dataChanged.emit()
                     self.ui_state.stackSummaryChanged.emit()
@@ -10292,12 +10314,14 @@ class AppController(QObject):
                     self.stacks = []
                     self.stack_start_index = None
                     self.stack_end_index = None
-                    self._persist_stack_state()
+                    stack_state_saved = self._persist_stack_state()
                     self._metadata_cache_index = (-1, -1)
                     self.dataChanged.emit()
                     self.ui_state.stackSummaryChanged.emit()
                 else:
-                    self.clear_all_stacks()
+                    stack_state_saved = self.clear_all_stacks()
+                if not stack_state_saved:
+                    return False
 
             hidden_count = len(hidden_semantic_groups)
             if hidden_count:
@@ -10356,7 +10380,8 @@ class AppController(QObject):
                         meta.stacked = True
                         meta.stacked_date = today
                         break
-            self._persist_sidecar()
+            if not self._persist_sidecar():
+                return False
             self._metadata_cache_index = (-1, -1)  # Invalidate cache
 
         return success
@@ -10398,17 +10423,21 @@ class AppController(QObject):
         self.stack_end_index = None
         # Do NOT clear batches here
 
-        self._persist_stack_state(clear_all=True)
+        persisted = self._persist_stack_state(clear_all=True)
 
         self._metadata_cache_index = (-1, -1)
         self.dataChanged.emit()
         self.ui_state.stackSummaryChanged.emit()
         self.sync_ui_state()
+        if not persisted:
+            return False
         self.update_status_message("All stacks cleared")
+        return True
 
     def clear_all_batches(self):
         """Clear all defined batches."""
         log.info("Clearing all defined batches.")
+        preserved_path = self._current_image_path()
         for image in self._all_images:
             meta = self.sidecar.get_metadata(image.path, create=False, migrate=False)
             if meta is not None:
@@ -10418,9 +10447,16 @@ class AppController(QObject):
         if self._filter_identity_snapshot is not None:
             self._filter_identity_snapshot["batch_groups"] = []
             self._filter_identity_snapshot["batch_start"] = None
-        self._finalize_batch_state(reapply_filter=True)
-        self._persist_sidecar()
+        _ = self._finalize_batch_state(persist=False)
+        if not self._persist_sidecar():
+            return False
+        filter_reapplied = self._reapply_flag_filter_after_metadata_change(
+            "batch", preserved_path
+        )
+        if filter_reapplied:
+            self.sync_ui_state(image_count_changed=True)
         self.update_status_message("All batches cleared")
+        return True
 
     def get_helicon_path(self):
         return config.get("helicon", "exe")
@@ -12500,13 +12536,15 @@ class AppController(QObject):
         job = self._pending_delete_jobs.pop(result.job_id, None)
 
         if job:
-            self._release_pending_delete_paths(job.work_items)
-            # Remove pending_delete placeholders from undo history
-            self.undo_history = [
-                entry
-                for entry in self.undo_history
-                if not (entry[0] == "pending_delete" and entry[1] == job.job_id)
-            ]
+            self._release_pending_delete_paths(job.job_id, job.work_items)
+            pending_history_index = next(
+                (
+                    index
+                    for index, entry in enumerate(self.undo_history)
+                    if entry[0] == "pending_delete" and entry[1] == job.job_id
+                ),
+                None,
+            )
         else:
             # Job might have been popped by undo_delete logic already?
             # Or this is a stray signal.
@@ -12517,16 +12555,21 @@ class AppController(QObject):
 
         # --- Phase 1.5: Handle Perm Delete Result ---
         if result.is_perm_result:
+            if pending_history_index is not None:
+                self.undo_history[pending_history_index : pending_history_index + 1] = (
+                    job.completed_undo_actions
+                )
             if result.perm_success:
-                self._remove_permanently_deleted_metadata(
+                metadata_saved = self._remove_permanently_deleted_metadata(
                     [img for _index, img in result.perm_success]
                 )
                 self._record_permanently_deleted_identities(
                     [img.path for _index, img in result.perm_success]
                 )
-                self.update_status_message(
-                    f"Permanently deleted {len(result.perm_success)} images"
-                )
+                if metadata_saved:
+                    self.update_status_message(
+                        f"Permanently deleted {len(result.perm_success)} images"
+                    )
 
                 # Update suppression for permanent deletes (prevent watcher re-scans)
                 ttl = 2.0
@@ -12622,13 +12665,14 @@ class AppController(QObject):
         for w in result.warnings:
             log.warning("Partial delete warning for %s: %s", w.jpg, w.message)
 
-        # Add to undo history
+        # Replace this job's placeholder in place so history remains ordered by
+        # user action even when jobs complete out of order.
+        completed_actions = []
         for s in result.successes:
             # Store tuple of tuples: ((jpg, recycled_jpg), (raw, recycled_raw))
             record = ((s.jpg, s.recycled_jpg), (s.raw, s.recycled_raw))
             self.delete_history.append(record)
-            self.undo_history.append(("delete", record, job.timestamp))
-
+            completed_actions.append(("delete", record, job.timestamp))
         self._record_permanently_deleted_identities(
             [record.jpg for record in result.successes if record.jpg is not None]
         )
@@ -12637,6 +12681,12 @@ class AppController(QObject):
         # Only failed items need to be restored to UI.
         # Check for permanent delete candidates (recycle bin failures).
         self._handle_delete_failures(result, job)
+        if job.job_id in self._pending_delete_jobs:
+            job.completed_undo_actions = completed_actions
+        elif pending_history_index is not None:
+            self.undo_history[pending_history_index : pending_history_index + 1] = (
+                completed_actions
+            )
 
         # --- Phase 3: Post Actions ---
 
@@ -12648,7 +12698,8 @@ class AppController(QObject):
                 msg += " (some RAW moves failed)"
             elif count == 1:
                 msg = "Image moved to recycle bin"
-            self.update_status_message(msg)
+            if getattr(self.sidecar, "dirty", False) is not True:
+                self.update_status_message(msg)
         elif result.failures:
             source_changed = any(
                 failure.code == DeletionErrorCodes.SOURCE_CHANGED.value
@@ -12761,7 +12812,7 @@ class AppController(QObject):
                 # ASYNC permanent delete
                 # Put job back in pending map so _on_delete_finished can find it again
                 self._pending_delete_jobs[job.job_id] = job
-                self._register_pending_delete_paths(job.work_items)
+                self._register_pending_delete_paths(job.job_id, job.work_items)
 
                 # Define callback to bridge back to main thread
                 def _on_perm_done(future):
@@ -12878,7 +12929,7 @@ class AppController(QObject):
             if path is not None and self._key(path) in deleted_keys:
                 setattr(self, attr, None)
 
-    def _remove_permanently_deleted_metadata(self, images: List[ImageFile]) -> None:
+    def _remove_permanently_deleted_metadata(self, images: List[ImageFile]) -> bool:
         """Forget metadata only after permanent deletion has actually succeeded."""
         keys = {
             self.sidecar.metadata_key_for_path(path)
@@ -12891,8 +12942,7 @@ class AppController(QObject):
             for key in keys:
                 if self.sidecar.data.entries.pop(key, None) is not None:
                     removed = True
-        if removed:
-            self._persist_sidecar()
+        return not removed or self._persist_sidecar()
 
     def _clear_delete_identity_state_if_settled(self) -> None:
         if self._pending_delete_jobs:
@@ -12903,11 +12953,14 @@ class AppController(QObject):
         self._delete_batch_start_path = None
         self._delete_stack_start_path = None
         self._delete_stack_end_path = None
+        if self._index_rescan_needed and not self._index_scan_inflight:
+            self._maybe_start_index_scan()
 
-    def _rollback_ui_items(self, items: List[Tuple[int, Any]], job: DeleteJob) -> None:
+    def _rollback_ui_items(self, items: List[Tuple[int, Any]], job: DeleteJob) -> bool:
         """Restore items by stable path identity in the delete transaction order."""
         if not items:
-            return
+            return True
+        metadata_saved = True
         self._begin_direct_image_transition("delete rollback restored the image list")
 
         current_path = self._current_image_path()
@@ -12982,7 +13035,7 @@ class AppController(QObject):
                 if batch_start_path is not None
                 else None
             )
-            self._finalize_batch_state(emit=False, sync=False)
+            metadata_saved = self._finalize_batch_state(emit=False, sync=False)
 
             stack_groups = self._delete_stack_path_groups or ui.saved_stack_paths
             self.stacks = self._rebuild_ranges_from_paths(stack_groups)
@@ -13000,8 +13053,9 @@ class AppController(QObject):
                 if stack_end_path is not None
                 else None
             )
-            self._persist_stack_state()
+            metadata_saved = self._persist_stack_state()
             self._metadata_cache_index = (-1, -1)
+        return metadata_saved
 
     def _schedule_delete_refresh(self) -> None:
         """Debounce post-delete refresh: coalesce rapid deletes into one refresh."""
@@ -13023,12 +13077,6 @@ class AppController(QObject):
         Watcher events handle any true drift (external changes).
         """
         t_start = time.perf_counter()
-
-        # Coalesce with watcher: if we are doing a delete refresh, we don't
-        # need a separate watcher refresh immediately after.
-        self._watcher_debounce_timer.stop()
-        self._index_throttle_timer.stop()
-        self._index_rescan_needed = False
 
         clear_raw_count_cache()
         self._rebuild_path_to_index()
@@ -13066,6 +13114,7 @@ class AppController(QObject):
             "cancelled": False,
             "requested_count": 0,
             "queued": False,
+            "metadata_persisted": True,
         }
 
         if not self.image_files or not indices:
@@ -13233,9 +13282,12 @@ class AppController(QObject):
                     batch_changed = True
 
         if batch_changed:
-            self._finalize_batch_state(emit=False, sync=False, notify_model=False)
+            summary["metadata_persisted"] = self._finalize_batch_state(
+                emit=False, sync=False, notify_model=False
+            )
 
         # Adjust stack index ranges (same algorithm as batches).
+        stacks_changed = False
         if self.stacks:
             new_stacks = []
             for s_start, s_end in self.stacks:
@@ -13255,9 +13307,13 @@ class AppController(QObject):
                     new_stacks.append([ns, ne])
             if new_stacks != self.stacks:
                 self.stacks = new_stacks
-                with self.sidecar._state_lock:
-                    self.sidecar.data.stacks = self.stacks
+                stacks_changed = True
                 self._metadata_cache_index = (-1, -1)
+
+        if stacks_changed:
+            # A later successful sidecar save also durably includes any batch
+            # mutation whose earlier save attempt failed.
+            summary["metadata_persisted"] = self._persist_stack_state()
 
         # Adjust stack_start_index for removed entries
         if pre_stack_start_snapshot is not None:
@@ -13364,7 +13420,7 @@ class AppController(QObject):
         # Suppress watcher refreshes for these paths for as long as the job
         # runs, so a scan triggered by the first move cannot reinsert files
         # later in the same batch that are still on disk.
-        self._register_pending_delete_paths(worker_items)
+        self._register_pending_delete_paths(job_id, worker_items)
 
         log.info(
             "Delete enqueued: job_id=%d, type='%s', count=%d",
@@ -13479,8 +13535,11 @@ class AppController(QObject):
 
         self.batches = []
         self.batch_start_index = None
-        self._finalize_batch_state(emit=False, sync=False, notify_model=False)
+        metadata_persisted = self._finalize_batch_state(
+            emit=False, sync=False, notify_model=False
+        )
         log.info("Batch state cleared optimistically for delete job %d.", job_id)
+        return metadata_persisted and summary.get("metadata_persisted", True)
 
     def _restore_backup_safe(self, saved_path_str: str, backup_path_str: str) -> bool:
         """
@@ -13689,6 +13748,7 @@ class AppController(QObject):
             job = self._pending_delete_jobs.get(job_id)
 
             if job is not None:
+                metadata_saved = True
                 # Cancel the background worker (best-effort)
                 job.cancel_event.set()
                 # Mark as undo_requested so completion handler automatically restores files (Policy 1)
@@ -13739,22 +13799,23 @@ class AppController(QObject):
                 if ui is not None and ui.saved_batches is not None and removed_items:
                     self.batches = ui.saved_batches
                     self.batch_start_index = ui.saved_batch_start_index
-                    self._finalize_batch_state(emit=False, sync=False)
+                    metadata_saved = self._finalize_batch_state(emit=False, sync=False)
                 # Restore stack state that was shifted during _delete_indices
                 if ui is not None and ui.saved_stacks is not None and removed_items:
                     self.stacks = ui.saved_stacks
                     self.stack_start_index = ui.saved_stack_start_index
                     self.stack_end_index = ui.saved_stack_end_index
-                    with self.sidecar._state_lock:
-                        self.sidecar.data.stacks = self.stacks
+                    stack_saved = self._persist_stack_state()
+                    metadata_saved = stack_saved
                     self._metadata_cache_index = (-1, -1)
                 self.sync_ui_state()
                 self._restart_quality_decode_timer()
 
                 count = len(removed_items)
-                self.update_status_message(
-                    f"Cancel requested... restoring view ({count} item{'s' if count > 1 else ''})"
-                )
+                if metadata_saved:
+                    self.update_status_message(
+                        f"Cancel requested... restoring view ({count} item{'s' if count > 1 else ''})"
+                    )
                 log.info(
                     "Undo cancelled pending delete job %d (%d items)", job_id, count
                 )
@@ -13901,13 +13962,15 @@ class AppController(QObject):
                         "undo restored a prior image state",
                         clear_editor=True,
                     )
-                    self._restore_metadata_snapshot(
+                    metadata_restored = self._restore_metadata_snapshot(
                         restore_sidecar, restore_metadata_path, metadata_before
                     )
                     self._post_undo_refresh_and_select(
                         Path(saved_path),
                         update_hist=action_type != "crop",
                     )
+                    if not metadata_restored:
+                        return False
                     if action_type == "save_edit":
                         self.update_status_message("Undid saved edit")
                     elif action_type == "auto_white_balance":
@@ -14141,6 +14204,9 @@ class AppController(QObject):
                     "Recovered save for %s but sidecar bookkeeping failed", tgt
                 )
         self._pending_save_recovery.clear()
+        # Any remaining request has now received its one final shutdown path;
+        # retaining the bookkeeping must not make the watchdog wait forever.
+        self._pending_edit_save_requests.clear()
 
         # Shutdown prefetcher
         try:
@@ -14167,9 +14233,11 @@ class AppController(QObject):
             )
             if not self._persist_sidecar(notify=False) and self.sidecar.dirty:
                 log.warning("Retrying dirty sidecar once during shutdown")
-                self._persist_sidecar(notify=False)
+                _ = self._persist_sidecar(notify=False)
         except Exception as e:
             log.warning("Error saving sidecar during shutdown: %s", e)
+        finally:
+            self._shutdown_final_sidecar_attempted = True
 
         # Clean shutdown — remove this instance's crash-recovery record so it is
         # not offered for reopening on the next launch.
@@ -14223,7 +14291,72 @@ class AppController(QObject):
             if atype != "delete" or not _record_gone(adata)
         ]
 
-    def empty_recycle_bin(self):
+    def _purge_recycle_bins(self, bin_dirs: Set[Path]) -> bool:
+        """Delete bins, purge original metadata, then retire their history."""
+        removed_bins: Set[Path] = set()
+        failed = False
+        for bin_path in bin_dirs:
+            try:
+                if bin_path.exists():
+                    shutil.rmtree(bin_path)
+                removed_bins.add(bin_path)
+            except OSError:
+                failed = True
+                log.exception("Failed to delete recycle bin %s", bin_path)
+
+        resolved_bins = set()
+        for bin_path in removed_bins:
+            try:
+                resolved_bins.add(bin_path.resolve())
+            except OSError:
+                resolved_bins.add(bin_path)
+
+        original_paths: set[Path] = set()
+        delete_records = list(self.delete_history)
+        delete_records.extend(
+            action_data
+            for action_type, action_data, _timestamp in self.undo_history
+            if action_type == "delete" and action_data not in delete_records
+        )
+
+        def recycled_parent(recycled) -> Optional[Path]:
+            if recycled is None:
+                return None
+            parent = Path(recycled).parent
+            try:
+                return parent.resolve()
+            except OSError:
+                return parent
+
+        for record in delete_records:
+            try:
+                (jpg_src, jpg_bin), (raw_src, raw_bin) = record
+            except (TypeError, ValueError):
+                continue
+            if any(
+                recycled_parent(recycled) in resolved_bins
+                for recycled in (jpg_bin, raw_bin)
+            ):
+                original_paths.update(
+                    Path(path) for path in (jpg_src, raw_src) if path is not None
+                )
+
+        metadata_changed = False
+        with self.sidecar._state_lock:
+            for path in original_paths:
+                key = self.sidecar.metadata_key_for_path(path)
+                if self.sidecar.data.entries.pop(key, None) is not None:
+                    metadata_changed = True
+
+        if metadata_changed and not self._persist_sidecar():
+            return False
+
+        self._prune_delete_history_for_bins(removed_bins)
+        self.active_recycle_bins.difference_update(removed_bins)
+        clear_raw_count_cache()
+        return not failed
+
+    def empty_recycle_bin(self) -> bool:
         """Permanently deletes all files in all tracked recycle bins."""
         # Clean up tracked bins
         bins_to_clean = set(self.active_recycle_bins)
@@ -14233,20 +14366,11 @@ class AppController(QObject):
         except Exception:
             pass
 
-        removed_bins: Set[Path] = set()
-        for bin_path in bins_to_clean:
-            if bin_path.exists():
-                try:
-                    shutil.rmtree(bin_path)
-                    removed_bins.add(bin_path)
-                except OSError:
-                    log.exception("Failed to empty recycle bin %s", bin_path)
-
-        self._prune_delete_history_for_bins(removed_bins)
-        self.active_recycle_bins.clear()
-        self.delete_history.clear()
-        clear_raw_count_cache()
-        log.info("Emptied recycle bins and cleared delete history")
+        persisted = self._purge_recycle_bins(bins_to_clean)
+        if persisted:
+            self.update_status_message("Recycle bin emptied")
+            log.info("Emptied recycle bins and purged their metadata")
+        return persisted
 
     def _on_cache_evict(self, key, value, info):
         """Callback for when the image cache evicts an item.
@@ -14725,7 +14849,7 @@ class AppController(QObject):
 
     def _restore_metadata_snapshot(
         self, sidecar: SidecarManager, image_path: Path, snapshot: Optional[dict]
-    ) -> None:
+    ) -> bool:
         """Restore only the metadata fields owned by edit-save actions."""
         stable_key = sidecar.metadata_key_for_path(image_path)
         restored_edited = bool(snapshot.get("edited", False)) if snapshot else False
@@ -14737,7 +14861,7 @@ class AppController(QObject):
             current_meta = sidecar.data.entries.get(stable_key)
             if current_meta is None:
                 if not restored_edited and restored_edited_date is None:
-                    return
+                    return True
                 current_meta = sidecar.get_metadata(image_path, create=True)
                 changed = True
 
@@ -14757,8 +14881,7 @@ class AppController(QObject):
                     del sidecar.data.entries[stable_key]
                     changed = True
 
-        if changed:
-            self._persist_sidecar(sidecar)
+        return not changed or self._persist_sidecar(sidecar)
 
     def _is_image_saving(self, file_path_str: str) -> bool:
         if not file_path_str or not hasattr(self, "_saving_keys"):
@@ -14882,7 +15005,8 @@ class AppController(QObject):
             # Clear all batches after successful drag (like pressing \)
             self.batches = []
             self.batch_start_index = None
-            self._finalize_batch_state(reapply_filter=True)
+            if not self._finalize_batch_state(reapply_filter=True):
+                return False
             log.info(
                 "Marked %d file(s) as uploaded on %s. Cleared all batches.",
                 len(existing_indices),
@@ -17902,12 +18026,13 @@ class AppController(QObject):
         self.ui_state.resetZoomPan()
         # Cropping is a real edit, so keep batch tagging in sync immediately
         # instead of waiting for a later save/navigation refresh.
-        self._auto_add_edited_to_batch_if_enabled(filepath)
+        batch_saved = self._auto_add_edited_to_batch_if_enabled(filepath)
         if decoded is not None:
             self._emit_preview_accepted_side_effects()
         else:
             self._kick_preview_worker()
-        self.update_status_message("Crop applied", timeout=5000)
+        if batch_saved:
+            self.update_status_message("Crop applied", timeout=5000)
         # Pairs with the _begin_direct_image_transition performed when crop mode
         # was entered, which stopped the settled cover decode.
         self._restart_quality_decode_timer()
@@ -18674,24 +18799,10 @@ class AppController(QObject):
 
         return stats
 
-    def cleanup_recycle_bins(self):
+    def cleanup_recycle_bins(self) -> bool:
         """Delete all tracked recycle bins."""
-        active_bins = {p for p in self.active_recycle_bins if p.exists() and p.is_dir()}
-
-        removed_bins: Set[Path] = set()
-        for bin_path in active_bins:
-            try:
-                shutil.rmtree(bin_path)
-                log.info("Cleaned up recycle bin: %s", bin_path)
-                removed_bins.add(bin_path)
-            except OSError as e:
-                log.error("Failed to delete recycle bin %s: %s", bin_path, e)
-
-        self._prune_delete_history_for_bins(removed_bins)
-        self.active_recycle_bins.clear()
-
-        # Clear stats cache since we deleted files/folders
-        clear_raw_count_cache()
+        active_bins = set(self.active_recycle_bins)
+        return self._purge_recycle_bins(active_bins)
 
     # ---- regex for reversing UUID-suffixed recycle bin names ----
     # Current format uses ``._fs_`` marker: ``{stem}._fs_{8hex}{suffix}``
@@ -19201,11 +19312,27 @@ def _make_sigint_close_handler(app, window_holder):
     return _handle_sigint
 
 
+def _unresolved_shutdown_persistence(controller: AppController) -> bool:
+    """Whether accepted user data still awaits its final shutdown outcome."""
+    if controller._pending_save_recovery:
+        return True
+    if controller._pending_edit_save_requests or controller._saves_in_flight:
+        return True
+    sidecar = getattr(controller, "sidecar", None)
+    return bool(
+        getattr(controller, "_shutting_down", False)
+        and sidecar is not None
+        and sidecar.dirty
+        and not controller._shutdown_final_sidecar_attempted
+    )
+
+
 def _shutdown_force_exit_allowed(controller: AppController) -> bool:
-    """Return False while destructive work or delete reconciliation remains."""
+    """Return False while destructive work or persistence remains unresolved."""
     critical_io_active = bool(controller._critical_user_data_state())
     unresolved_delete_jobs = bool(controller._pending_delete_jobs)
-    return not critical_io_active and not unresolved_delete_jobs
+    unresolved_persistence = _unresolved_shutdown_persistence(controller)
+    return not any((critical_io_active, unresolved_delete_jobs, unresolved_persistence))
 
 
 def main(

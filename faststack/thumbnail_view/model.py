@@ -1,5 +1,6 @@
 """ThumbnailModel for QML GridView with file/folder entries."""
 
+import hashlib
 import logging
 import os
 import time
@@ -27,6 +28,23 @@ from faststack.thumbnail_view.folder_stats import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def filesystem_source_identity(stat_result: os.stat_result) -> str:
+    """Return a cheap stable token for the filesystem object behind an image.
+
+    This deliberately avoids content hashing. A same-size in-place rewrite
+    that preserves every cheap timestamp/file-id field (possible on Windows)
+    cannot be detected by this scheme and still requires manual refresh.
+    """
+    fields = (
+        getattr(stat_result, "st_mtime_ns", 0),
+        getattr(stat_result, "st_size", 0),
+        getattr(stat_result, "st_ino", 0),
+        getattr(stat_result, "st_ctime_ns", 0),
+    )
+    payload = ":".join(str(value or 0) for value in fields).encode("ascii")
+    return hashlib.blake2s(payload, digest_size=8).hexdigest()
 
 
 def _empty_folder_stats_payload() -> dict:
@@ -98,6 +116,7 @@ class ThumbnailEntry:
     has_backups: bool = False
     has_developed: bool = False
     mtime_ns: int = 0
+    source_identity: str = "0"
     thumb_rev: int = 0  # Bumped when thumbnail is ready, forces QML refresh
 
 
@@ -132,7 +151,8 @@ class ThumbnailModel(QAbstractListModel):
     HasDevelopedRole = Qt.ItemDataRole.UserRole + 19
     IsTodoRole = Qt.ItemDataRole.UserRole + 20
 
-    # Signal emitted when a thumbnail is ready (id = "{size}/{path_hash}/{mtime_ns}")
+    # Signal emitted when a thumbnail is ready
+    # (id = "{size}/{path_hash}/{mtime_ns}/{source_identity}")
     thumbnailReady = Signal(str)
     # Signal emitted when selection changes (for UIState to forward to QML)
     selectionChanged = Signal()
@@ -167,7 +187,7 @@ class ThumbnailModel(QAbstractListModel):
         )  # current flag filters (e.g. ["uploaded", "stacked"])
 
         # Mapping from thumbnail_id (without query params) to row index
-        # id format: "{size}/{path_hash}/{mtime_ns}"
+        # id format: "{size}/{path_hash}/{mtime_ns}/{source_identity}"
         self._id_to_row: Dict[str, int] = {}
         # Normalized-path → row index for O(1) find_image_index() lookups
         self._path_to_row: Dict[str, int] = {}
@@ -315,7 +335,7 @@ class ThumbnailModel(QAbstractListModel):
     ) -> str:
         """Build thumbnail URL for QML Image source.
 
-        Format: image://thumbnail/{size}/{path_hash}/{mtime_ns}?r={rev}&reason={reason}
+        Format: image://thumbnail/{size}/{path_hash}/{mtime_ns}/{source_identity}?r={rev}&reason={reason}
         Folders use: image://thumbnail/folder/{path_hash}/{mtime_ns}?r={rev}
         """
         path_hash = compute_path_hash(entry.path)
@@ -325,7 +345,7 @@ class ThumbnailModel(QAbstractListModel):
         if entry.is_folder:
             return f"image://thumbnail/folder/{path_hash}/{mtime_ns}?r={rev}"
         else:
-            return f"image://thumbnail/{self._thumbnail_size}/{path_hash}/{mtime_ns}?r={rev}&reason={reason}"
+            return f"image://thumbnail/{self._thumbnail_size}/{path_hash}/{mtime_ns}/{entry.source_identity}?r={rev}&reason={reason}"
 
     def set_filter(self, filter_string: str, refresh: bool = True) -> None:
         """Set the active filename filter and optionally refresh the model."""
@@ -705,13 +725,12 @@ class ThumbnailModel(QAbstractListModel):
         map_authoritative = metadata_map is not None
         for img in images:
             try:
-                # Use mtime from object if available to avoid stat()
-                if hasattr(img, "timestamp") and img.timestamp:
-                    mtime_ns = int(img.timestamp * 1e9)
-                else:
-                    mtime_ns = img.path.stat().st_mtime_ns
+                stat_info = img.path.stat()
+                mtime_ns = stat_info.st_mtime_ns
+                source_identity = filesystem_source_identity(stat_info)
             except OSError:
-                mtime_ns = 0
+                mtime_ns = int(getattr(img, "timestamp", 0) * 1e9)
+                source_identity = "0"
 
             # Get metadata
             is_stacked = False
@@ -761,6 +780,7 @@ class ThumbnailModel(QAbstractListModel):
                     has_backups=has_backups,
                     has_developed=has_developed,
                     mtime_ns=mtime_ns,
+                    source_identity=source_identity,
                 )
             )
         return entries
@@ -771,11 +791,15 @@ class ThumbnailModel(QAbstractListModel):
         self._path_to_row.clear()
 
         # Key must match the thumbnail_id format emitted by the prefetcher:
-        # "{size}/{path_hash}/{mtime_ns}" — same as _make_thumbnail_id()
+        # "{size}/{path_hash}/{mtime_ns}/{source_identity}" — same as
+        # _make_thumbnail_id().
         for i, e in enumerate(self._entries):
             if not e.is_folder:
                 tid = self._make_thumbnail_id(e)
                 self._id_to_row[tid] = i
+                if e.source_identity == "0":
+                    legacy_tid = f"{self._thumbnail_size}/{compute_path_hash(e.path)}/{e.mtime_ns}"
+                    self._id_to_row[legacy_tid] = i
                 # Normalized key for O(1) find_image_index() lookups
                 self._path_to_row[normalize_path_key(e.path)] = i
 
@@ -785,7 +809,7 @@ class ThumbnailModel(QAbstractListModel):
         if entry.is_folder:
             return f"folder/{path_hash}/{entry.mtime_ns}"
         else:
-            return f"{self._thumbnail_size}/{path_hash}/{entry.mtime_ns}"
+            return f"{self._thumbnail_size}/{path_hash}/{entry.mtime_ns}/{entry.source_identity}"
 
     @Slot(str)
     def _on_thumbnail_ready(self, thumbnail_id: str):

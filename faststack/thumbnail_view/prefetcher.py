@@ -84,7 +84,7 @@ class ThumbnailPrefetcher:
     - Non-blocking decode with callback on completion
     - De-duplication of in-flight jobs
     - EXIF orientation applied in exactly one place
-    - Cache key: (size, path_hash, mtime_ns)
+    - Cache key: (size, path_hash, mtime_ns, source_identity)
     """
 
     # Priority levels
@@ -122,17 +122,17 @@ class ThumbnailPrefetcher:
         )
 
         # Track in-flight jobs to avoid duplicates
-        # Key: (size, path_hash, mtime_ns)
+        # Key: (size, path_hash, mtime_ns, source_identity)
         # Value: (rid, ThumbTimer)
         self._inflight: Dict[
-            Tuple[int, str, int], Tuple[int, Optional["thumb_debug.ThumbTimer"]]
+            Tuple[int, str, int, str], Tuple[int, Optional["thumb_debug.ThumbTimer"]]
         ] = {}
         self._inflight_lock = Lock()
         self._debug_trace = debug_trace
 
         # Track futures for potential cancellation
-        self._futures: Dict[Tuple[int, str, int], Future] = {}
-        self._job_paths: Dict[Tuple[int, str, int], Path] = {}
+        self._futures: Dict[Tuple[int, str, int, str], Future] = {}
+        self._job_paths: Dict[Tuple[int, str, int, str], Path] = {}
 
         # If Qt is available AND a QApplication exists, forward ready notifications
         # to Qt/main thread. This prevents Qt warnings/crashes from worker-thread callbacks.
@@ -164,6 +164,7 @@ class ThumbnailPrefetcher:
         path: Path,
         mtime_ns: int,
         size: Optional[int] = None,
+        source_identity: Optional[str] = None,
         priority: int = PRIO_MED,
         timer: Optional["thumb_debug.ThumbTimer"] = None,
     ) -> bool:
@@ -187,8 +188,11 @@ class ThumbnailPrefetcher:
             size = self._target_size
 
         path_hash = compute_path_hash(path)
-        job_key = (size, path_hash, mtime_ns)
+        identity = source_identity or str(mtime_ns)
+        job_key = (size, path_hash, mtime_ns, identity)
         cache_key = f"{size}/{path_hash}/{mtime_ns}"
+        if source_identity:
+            cache_key += f"/{source_identity}"
 
         # Check cache first
         if self._cache.get(cache_key) is not None:
@@ -300,7 +304,11 @@ class ThumbnailPrefetcher:
         """
         for entry in entries:
             if not entry.is_folder:
-                self.submit(entry.path, entry.mtime_ns)
+                self.submit(
+                    entry.path,
+                    entry.mtime_ns,
+                    source_identity=entry.source_identity,
+                )
 
     def _decode_worker(
         self,

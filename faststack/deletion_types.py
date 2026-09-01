@@ -84,6 +84,7 @@ class DeleteJob:
     work_items: List[DeleteWorkItem] = field(default_factory=list)
     previous_path: Optional[Path] = None
     visible_order_paths: List[Path] = field(default_factory=list)
+    completed_undo_actions: List[tuple] = field(default_factory=list)
     future: Any = None
 
 
