@@ -113,14 +113,19 @@ Dialog {
     onOpened: {
         // Notify Python that a dialog is open
         if (deleteBatchDialog.controllerRef) {
-            deleteBatchDialog.controllerRef.dialog_opened()
+            deleteBatchDialog.controllerRef.dialog_opened("qml-delete-batch")
         }
     }
     
     onClosed: {
         // Notify Python that dialog is closed
         if (deleteBatchDialog.controllerRef) {
-            deleteBatchDialog.controllerRef.dialog_closed()
+            deleteBatchDialog.controllerRef.dialog_closed("qml-delete-batch")
         }
+    }
+
+    Component.onDestruction: {
+        if (deleteBatchDialog.controllerRef)
+            deleteBatchDialog.controllerRef.dialog_closed("qml-delete-batch")
     }
 }

@@ -37,6 +37,7 @@ Window {
     Shortcut {
         sequence: "Escape"
         context: Qt.WindowShortcut
+        enabled: darkenPanel.uiStateRef ? !darkenPanel.uiStateRef.isDialogOpen : false
         onActivated: {
             if (darkenPanel.controllerRef) darkenPanel.controllerRef.toggle_darken_mode()
         }

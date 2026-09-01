@@ -154,11 +154,8 @@ def test_favorite_toggle_roundtrip(mock_sidecar_dir):
 
 
 def test_legacy_stem_entry_migrates_to_path_key(mock_sidecar_dir):
-    """Legacy filename-keyed entries should migrate on first concrete path lookup."""
-    # Use a legacy key ("IMG_0001.jpg") that differs from the stable key
-    # returned by metadata_key_for_path (which strips the extension), so that
-    # get_metadata must actually perform migration.
-    legacy_key = "IMG_0001.jpg"
+    """Legacy extensionless entries should migrate on first concrete path lookup."""
+    legacy_key = "IMG_0001"
     content = {
         "version": 2,
         "entries": {
@@ -192,11 +189,11 @@ def test_bulk_iteration_finds_legacy_keyed_entries(mock_sidecar_dir):
     content = {
         "version": 2,
         "entries": {
-            # Legacy filename-keyed entry (has extension — differs from stable key)
+            # Current extension-aware entry
             "IMG_0001.jpg": {"favorite": True},
-            # Already-stable entry (bare stem, matches metadata_key_for_path)
+            # Legacy extensionless entry
             "IMG_0002": {"uploaded": True},
-            # Another legacy filename-keyed entry
+            # Another current extension-aware entry
             "IMG_0003.jpg": {"favorite": True, "uploaded": True},
         },
     }
@@ -227,8 +224,10 @@ def test_bulk_iteration_finds_legacy_keyed_entries(mock_sidecar_dir):
     stable_3 = sm.metadata_key_for_path(Path("IMG_0003.jpg"))
     assert stable_1 in sm.data.entries
     assert stable_3 in sm.data.entries
-    assert "IMG_0001.jpg" not in sm.data.entries
-    assert "IMG_0003.jpg" not in sm.data.entries
+    assert "IMG_0001.jpg" in sm.data.entries
+    assert "IMG_0003.jpg" in sm.data.entries
+    assert "IMG_0002" not in sm.data.entries
+    assert "IMG_0002.jpg" in sm.data.entries
 
 
 def test_raw_only_entry_survives_transition_to_visible_jpg(mock_sidecar_dir):
@@ -245,11 +244,11 @@ def test_raw_only_entry_survives_transition_to_visible_jpg(mock_sidecar_dir):
     assert jpg_meta is raw_meta
     assert jpg_meta.favorite is True
     assert jpg_meta.uploaded is True
-    assert list(sm.data.entries) == ["photo"]
+    assert list(sm.data.entries) == ["photo.jpg"]
 
 
-def test_regressed_filename_key_migrates_to_stable_stem_key(mock_sidecar_dir):
-    """Entries created by the filename-key regression should migrate back."""
+def test_raw_filename_key_migrates_to_extension_aware_jpeg_key(mock_sidecar_dir):
+    """A historical RAW key follows an unambiguous RAW-to-JPEG transition."""
     content = {
         "version": 2,
         "entries": {
@@ -263,9 +262,8 @@ def test_regressed_filename_key_migrates_to_stable_stem_key(mock_sidecar_dir):
 
     assert meta is not None
     assert meta.favorite is True
-    assert "photo" in sm.data.entries
+    assert "photo.jpg" in sm.data.entries
     assert "photo.CR2" not in sm.data.entries
-    assert "photo.jpg" not in sm.data.entries
 
 
 def test_same_stem_in_different_subfolders_do_not_collide(mock_sidecar_dir):
@@ -281,11 +279,11 @@ def test_same_stem_in_different_subfolders_do_not_collide(mock_sidecar_dir):
 
     assert first is not second
     assert sm.metadata_key_for_path(Path("a") / "photo.CR2") == "a/photo"
-    assert sm.metadata_key_for_path(Path("b") / "photo.jpg") == "b/photo"
+    assert sm.metadata_key_for_path(Path("b") / "photo.jpg") == "b/photo.jpg"
     assert sm.data.entries["a/photo"].favorite is True
     assert sm.data.entries["a/photo"].uploaded is False
-    assert sm.data.entries["b/photo"].favorite is False
-    assert sm.data.entries["b/photo"].uploaded is True
+    assert sm.data.entries["b/photo.jpg"].favorite is False
+    assert sm.data.entries["b/photo.jpg"].uploaded is True
 
 
 def test_semantic_dot_key_is_not_treated_as_path(mock_sidecar_dir):
@@ -357,7 +355,7 @@ def test_legacy_filename_key_migrates_via_path_lookup(mock_sidecar_dir):
 
     assert meta is not None
     assert meta.favorite is True
-    assert "photo" in sm.data.entries
+    assert "photo.jpg" in sm.data.entries
     assert "photo.CR2" not in sm.data.entries
 
 

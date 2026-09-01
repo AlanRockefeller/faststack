@@ -19,6 +19,10 @@ JPEG_DECODER, TURBO_AVAILABLE = create_turbojpeg()
 _PREMATURE_EOF_RETRY_DELAY = 0.15
 
 
+class IncompleteJPEGError(RuntimeError):
+    """TurboJPEG reported that the supplied snapshot may be incomplete."""
+
+
 def _decode_with_retry(
     jpeg_bytes: bytes,
     *,
@@ -26,35 +30,23 @@ def _decode_with_retry(
     decoder: Any = None,
     **decode_kwargs: Any,
 ) -> Optional[np.ndarray]:
-    """Call decoder.decode() with a single retry on 'Premature end of JPEG file'.
+    """Decode one immutable snapshot and reject truncation-tainted pixels.
 
-    TurboJPEG emits this as a Python warning (not an exception) when the
-    file is truncated.  We treat it as a soft/retryable condition — the
-    file may still be written by another process — and retry once after
-    a short delay.
+    Filesystem retries belong to the caller that owns the source path.  A
+    byte-only decoder cannot obtain a newer snapshot and must never turn a
+    warning-tainted result into an authoritative image.
     """
     dec = decoder or JPEG_DECODER
-    for attempt in range(2):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            result = dec.decode(jpeg_bytes, **decode_kwargs)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = dec.decode(jpeg_bytes, **decode_kwargs)
 
-        premature = any("Premature end of JPEG file" in str(w.message) for w in caught)
-
-        if not premature:
-            return result
-
-        if attempt == 0:
-            time.sleep(_PREMATURE_EOF_RETRY_DELAY)
-            continue
-
-        label = source_path or "<unknown>"
-        log.warning(
-            "TurboJPEG: 'Premature end of JPEG file' for %s "
-            "(retry also warned — file may be truncated)",
-            label,
+    if any("Premature end of JPEG file" in str(w.message) for w in caught):
+        raise IncompleteJPEGError(
+            f"TurboJPEG reported an incomplete JPEG snapshot for "
+            f"{source_path or '<unknown>'}"
         )
-        return result
+    return result
 
 
 def decode_jpeg_rgb(
@@ -80,6 +72,8 @@ def decode_jpeg_rgb(
                 stats["decoder"] = "turbojpeg"
                 stats["dct"] = (1, 1)
             return result
+        except IncompleteJPEGError:
+            raise
         except Exception as e:
             log.log(
                 logging.ERROR if log_errors else logging.DEBUG,
@@ -130,6 +124,8 @@ def decode_jpeg_thumb_rgb(
                 img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
                 return np.array(img)
             return decoded
+        except IncompleteJPEGError:
+            raise
         except Exception as e:
             log.exception(
                 "PyTurboJPEG failed to decode thumbnail: %s. Trying Pillow.", e
@@ -346,6 +342,8 @@ def decode_jpeg_resized(
                     stats["resize_ms"] = 0.0
                     stats["output"] = (decoded.shape[1], decoded.shape[0])
                 return decoded
+        except IncompleteJPEGError:
+            raise
         except Exception as e:
             log.log(
                 logging.ERROR if log_errors else logging.DEBUG,

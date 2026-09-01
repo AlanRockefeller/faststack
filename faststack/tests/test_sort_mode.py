@@ -1,5 +1,6 @@
 """Tests for sort-mode feature (default / filename / date)."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from faststack.models import ImageFile
@@ -87,6 +88,11 @@ def test_date_sort_uses_timestamp_field(app_controller, tmp_path):
 
     app_controller.set_sort_mode("date")
 
+    # "date" is chronological (oldest first); "date_reverse" is newest first.
+    names = [img.path.name for img in app_controller.image_files]
+    assert names == ["old.jpg", "mid.jpg", "new.jpg"]
+
+    app_controller.set_sort_mode("date_reverse")
     names = [img.path.name for img in app_controller.image_files]
     assert names == ["new.jpg", "mid.jpg", "old.jpg"]
 
@@ -112,8 +118,8 @@ def test_date_sort_oserror_does_not_crash(app_controller, tmp_path):
     app_controller.set_sort_mode("date")
 
     names = [img.path.name for img in app_controller.image_files]
-    # ok.jpg (ts=5000) first, gone.jpg (ts=0) last
-    assert names == ["ok.jpg", "gone.jpg"]
+    # Chronological: gone.jpg (ts=0) first, ok.jpg (ts=5000) last
+    assert names == ["gone.jpg", "ok.jpg"]
 
 
 # --- date sort determinism with equal mtimes ---
@@ -271,15 +277,15 @@ def test_sort_noncontiguous_stack_user_clears(app_controller, tmp_path):
     with patch.object(
         app_controller, "_confirm_clear_stacks_for_sort", return_value=True
     ):
-        app_controller.set_sort_mode("date")
+        app_controller.set_sort_mode("date_reverse")
 
-    assert app_controller.sort_mode == "date"
+    assert app_controller.sort_mode == "date_reverse"
     assert app_controller.stacks == []
     assert app_controller.stack_start_index is None
     # Sidecar must persist the cleared stacks
     assert app_controller.sidecar.data.stacks == []
     app_controller.sidecar.save.assert_called()
-    # Date order: b(3000), c(2000), a(1000)
+    # date_reverse order: b(3000), c(2000), a(1000)
     names = [img.path.name for img in app_controller.image_files]
     assert names == ["b.jpg", "c.jpg", "a.jpg"]
 
@@ -292,22 +298,27 @@ def test_batch_split_does_not_block_sort(app_controller, tmp_path):
     )
     _populate(app_controller, imgs)
     # Batch covers a,b (indices 0-1). No stacks defined.
-    app_controller.batches = [[0, 1]]
+    # Batch membership lives on the per-image sidecar flag; the controller
+    # rebuilds self.batches from those flags on every re-sort.
     app_controller.stacks = []
     app_controller.sidecar = MagicMock()
     app_controller.sidecar.data.stacks = []
-    app_controller.sidecar.get_metadata.return_value = None
+    batched_names = {"a.jpg", "b.jpg"}
+    app_controller.sidecar.get_metadata.side_effect = (
+        lambda path, **kwargs: SimpleNamespace(batch=path.name in batched_names)
+    )
+    app_controller._restore_batches_from_sidecar_flags()
 
-    app_controller.set_sort_mode("date")
+    app_controller.set_sort_mode("date_reverse")
 
-    assert app_controller.sort_mode == "date"
-    # Date order: b(3000), c(2000), a(1000) → a is at idx 2, b at idx 0
+    assert app_controller.sort_mode == "date_reverse"
+    # date_reverse order: b(3000), c(2000), a(1000) → a is at idx 2, b at idx 0
     # Batch should now contain both, possibly split into [0,0] and [2,2]
     batch_indices = set()
     for start, end in app_controller.batches:
         for i in range(start, end + 1):
             batch_indices.add(i)
-    # a.jpg → index 2, b.jpg → index 0 under date sort
+    # a.jpg → index 2, b.jpg → index 0 under date_reverse sort
     a_idx = next(
         i
         for i, img in enumerate(app_controller.image_files)
@@ -327,7 +338,7 @@ def test_pending_stack_start_remapped_without_completed_stacks(
     """A pending stack_start_index must follow its image through a sort,
     even when no completed stacks exist."""
     # Default order: a(idx0), b(idx1), c(idx2)
-    # Date order: b(3000)→idx0, c(2000)→idx1, a(1000)→idx2
+    # date_reverse order: b(3000)→idx0, c(2000)→idx1, a(1000)→idx2
     imgs = _make_images(
         tmp_path,
         [("a.jpg", 1000), ("b.jpg", 3000), ("c.jpg", 2000)],
@@ -339,10 +350,10 @@ def test_pending_stack_start_remapped_without_completed_stacks(
     app_controller.sidecar.data.stacks = []
     app_controller.sidecar.get_metadata.return_value = None
 
-    app_controller.set_sort_mode("date")
+    app_controller.set_sort_mode("date_reverse")
 
-    assert app_controller.sort_mode == "date"
-    # a.jpg moved to index 2 under date sort
+    assert app_controller.sort_mode == "date_reverse"
+    # a.jpg moved to index 2 under date_reverse sort
     assert app_controller.stack_start_index == 2
     assert (
         app_controller.image_files[app_controller.stack_start_index].path.name

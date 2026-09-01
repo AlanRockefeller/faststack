@@ -22,7 +22,12 @@ except ImportError:
 
 from faststack.config import config
 from faststack.imaging.cache import build_cache_key
-from faststack.imaging.jpeg import decode_jpeg_resized, decode_jpeg_rgb
+from faststack.imaging.jpeg import (
+    _PREMATURE_EOF_RETRY_DELAY,
+    IncompleteJPEGError,
+    decode_jpeg_resized,
+    decode_jpeg_rgb,
+)
 from faststack.imaging.orientation import apply_orientation_to_np
 from faststack.io.utils import normalize_path_key
 from faststack.models import DecodedImage, ImageFile
@@ -925,6 +930,7 @@ def _decode_buffer(
     decode_quality: DecodeQuality,
     index: int,
     stats: Optional[dict] = None,
+    is_current: Optional[Callable[[], bool]] = None,
 ) -> tuple[Optional[np.ndarray], int, Optional[bytes], int, int, Optional[str]]:
     """Decode an image to RGB pixels, returning EXIF orientation and optional ICC.
 
@@ -942,88 +948,115 @@ def _decode_buffer(
 
     if is_jpeg:
         icc_metadata_read = False
-        try:
-            _t_read = time.perf_counter() if stats is not None else None
-            with open(target_path, "rb") as f:
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
-                    snapshot_size = len(mmapped)
-                    if stats is not None and _t_read is not None:
-                        # Diagnostic-only (nav trace active): fault every page
-                        # in sequentially so file I/O and antivirus scan cost
-                        # land in read_ms instead of inflating jpeg_ms through
-                        # page faults taken inside the decoder.
-                        _faulted = mmapped[:: mmap.PAGESIZE]
-                        stats["read_ms"] = (time.perf_counter() - _t_read) * 1000.0
-                    if use_resized and should_resize:
-                        buffer = decode_jpeg_resized(
-                            mmapped,
-                            display_width,
-                            display_height,
-                            fast_dct=fast_dct,
-                            source_path=str(target_path),
-                            mode=decode_quality,
-                            stats=stats,
-                            log_errors=False,
-                        )
-                    else:
-                        _t_decode = time.perf_counter() if stats is not None else None
-                        buffer = decode_jpeg_rgb(
-                            mmapped,
-                            fast_dct=fast_dct,
-                            source_path=str(target_path),
-                            stats=stats,
-                            log_errors=False,
-                        )
-                        if stats is not None and _t_decode is not None:
-                            stats["jpeg_ms"] = (
-                                time.perf_counter() - _t_decode
-                            ) * 1000.0
-                        if buffer is not None and should_resize:
-                            _t_resize = (
+        for snapshot_attempt in range(2):
+            try:
+                _t_read = time.perf_counter() if stats is not None else None
+                with open(target_path, "rb") as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                        snapshot_size = len(mmapped)
+                        if stats is not None and _t_read is not None:
+                            # Diagnostic-only (nav trace active): fault every page
+                            # in sequentially so file I/O and antivirus scan cost
+                            # land in read_ms instead of inflating jpeg_ms through
+                            # page faults taken inside the decoder.
+                            _faulted = mmapped[:: mmap.PAGESIZE]
+                            stats["read_ms"] = (time.perf_counter() - _t_read) * 1000.0
+                        if use_resized and should_resize:
+                            buffer = decode_jpeg_resized(
+                                mmapped,
+                                display_width,
+                                display_height,
+                                fast_dct=fast_dct,
+                                source_path=str(target_path),
+                                mode=decode_quality,
+                                stats=stats,
+                                log_errors=False,
+                            )
+                        else:
+                            _t_decode = (
                                 time.perf_counter() if stats is not None else None
                             )
-                            img = PILImage.fromarray(buffer)
-                            img.thumbnail(
-                                (display_width, display_height),
-                                PILImage.Resampling.LANCZOS,
+                            buffer = decode_jpeg_rgb(
+                                mmapped,
+                                fast_dct=fast_dct,
+                                source_path=str(target_path),
+                                stats=stats,
+                                log_errors=False,
                             )
-                            buffer = np.array(img)
-                            if stats is not None and _t_resize is not None:
-                                stats["resize_ms"] = (
-                                    time.perf_counter() - _t_resize
+                            if stats is not None and _t_decode is not None:
+                                stats["jpeg_ms"] = (
+                                    time.perf_counter() - _t_decode
                                 ) * 1000.0
-
-                    if buffer is not None:
-                        try:
-                            _t_meta = time.perf_counter() if stats is not None else None
-                            mmapped.seek(0)
-                            with PILImage.open(mmapped) as pil_img:
-                                native_width, native_height = pil_img.size
-                                if want_icc:
-                                    icc_bytes = pil_img.info.get("icc_profile")
-                                orientation = pil_img.getexif().get(
-                                    _EXIF_ORIENTATION_TAG, 1
+                            if buffer is not None and should_resize:
+                                _t_resize = (
+                                    time.perf_counter() if stats is not None else None
                                 )
-                                icc_metadata_read = want_icc
-                            if stats is not None and _t_meta is not None:
-                                stats["metadata_ms"] = (
-                                    time.perf_counter() - _t_meta
-                                ) * 1000.0
-                        except Exception:
-                            log.debug(
-                                "Failed to read EXIF from mmap for %s",
-                                target_path,
-                                exc_info=True,
-                            )
-        except Exception as e:
-            log.warning(
-                "Decode failed (%s) index=%d path=%s: %s",
-                "ICC path" if want_icc else "mmap path",
-                index,
-                target_path,
-                e,
-            )
-            buffer = None
+                                img = PILImage.fromarray(buffer)
+                                img.thumbnail(
+                                    (display_width, display_height),
+                                    PILImage.Resampling.LANCZOS,
+                                )
+                                buffer = np.array(img)
+                                if stats is not None and _t_resize is not None:
+                                    stats["resize_ms"] = (
+                                        time.perf_counter() - _t_resize
+                                    ) * 1000.0
+
+                        if buffer is not None:
+                            # A successful fresh snapshot is an ordinary decode,
+                            # even if the preceding snapshot was incomplete.
+                            placeholder_reason = None
+                            try:
+                                _t_meta = (
+                                    time.perf_counter() if stats is not None else None
+                                )
+                                mmapped.seek(0)
+                                with PILImage.open(mmapped) as pil_img:
+                                    native_width, native_height = pil_img.size
+                                    if want_icc:
+                                        icc_bytes = pil_img.info.get("icc_profile")
+                                    orientation = pil_img.getexif().get(
+                                        _EXIF_ORIENTATION_TAG, 1
+                                    )
+                                    icc_metadata_read = want_icc
+                                if stats is not None and _t_meta is not None:
+                                    stats["metadata_ms"] = (
+                                        time.perf_counter() - _t_meta
+                                    ) * 1000.0
+                            except Exception:
+                                log.debug(
+                                    "Failed to read EXIF from mmap for %s",
+                                    target_path,
+                                    exc_info=True,
+                                )
+                break
+            except IncompleteJPEGError:
+                buffer = None
+                placeholder_reason = "incomplete-jpeg"
+                if snapshot_attempt == 1:
+                    log.warning(
+                        "JPEG remained incomplete after a fresh filesystem read: %s",
+                        target_path,
+                    )
+                    break
+                if is_current is not None and not is_current():
+                    placeholder_reason = "stale-jpeg-retry"
+                    break
+                time.sleep(_PREMATURE_EOF_RETRY_DELAY)
+                if is_current is not None and not is_current():
+                    placeholder_reason = "stale-jpeg-retry"
+                    break
+                continue
+            except Exception as e:
+                log.warning(
+                    "Decode failed (%s) index=%d path=%s: %s",
+                    "ICC path" if want_icc else "mmap path",
+                    index,
+                    target_path,
+                    e,
+                )
+                buffer = None
+                break
 
         if buffer is not None and want_icc and not icc_metadata_read:
             try:
@@ -1034,6 +1067,12 @@ def _decode_buffer(
                         orientation = orig.getexif().get(_EXIF_ORIENTATION_TAG, 1)
             except Exception as e:
                 log.warning("Failed to read metadata from %s: %s", target_path, e)
+
+        if buffer is None and placeholder_reason in {
+            "incomplete-jpeg",
+            "stale-jpeg-retry",
+        }:
+            return (None, orientation, None, 0, 0, placeholder_reason)
 
     if buffer is None:
         # A watcher refresh can expose a newly created JPEG while an importer is
@@ -2521,6 +2560,12 @@ class Prefetcher:
                 quality,
                 index,
                 stats=_stats if self.nav_trace is not None else None,
+                is_current=lambda: (
+                    generation == self.generation
+                    and not self._stop_event.is_set()
+                    and quality_work_is_current()
+                    and fast_work_is_relevant()
+                ),
             )
             if _t_decode_buffer is not None:
                 _stats["decode_ms"] = (time.perf_counter() - _t_decode_buffer) * 1000.0

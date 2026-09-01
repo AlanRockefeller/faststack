@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 sys.path.append(str(Path(__file__).parents[2]))
 
 from faststack.app import AppController
+from faststack.tests.conftest import make_config_mock
 
 
 class TestEditorIntegration(unittest.TestCase):
@@ -16,7 +17,9 @@ class TestEditorIntegration(unittest.TestCase):
         self.mock_config = MagicMock()
 
         # Patch config to avoid file I/O or errors
-        self.config_patcher = patch("faststack.app.config")
+        self.config_patcher = patch(
+            "faststack.app.config", new_callable=make_config_mock
+        )
         self.mock_config_module = self.config_patcher.start()
 
         # Instantiate AppController with a dummy path
@@ -68,6 +71,13 @@ class TestEditorIntegration(unittest.TestCase):
 
         self.controller._save_executor.submit.side_effect = mock_submit
 
+        # ui_state is a MagicMock, so flags read truthy unless set. The save and
+        # crop paths check these before doing any work.
+        self.controller.ui_state.isCropping = False
+        self.controller.ui_state.isSaving = False
+        self.controller.ui_state.isEditorOpen = True
+        self.controller.ui_state.isEditorExpanded = True
+
     def tearDown(self):
         self.config_patcher.stop()
 
@@ -113,11 +123,19 @@ class TestEditorIntegration(unittest.TestCase):
             self.controller.image_editor.snapshot_for_export.return_value = (
                 snapshot_sentinel
             )
+            # A successful save must report both the output and its backup;
+            # a None backup is treated as a failure and auto-retried once.
             self.controller.image_editor.save_from_snapshot.return_value = (
                 Path("test.jpg"),
-                None,
+                Path("test.jpg.bak"),
             )
             self.controller.ui_state.isSaving = False
+            # A save is only prepared for a session that has both a meaningful
+            # edit and a revision newer than the last submitted one.
+            self.controller.image_editor.current_edits = {"exposure": 0.5}
+            self.controller.image_editor._edits_rev = 1
+            self.controller._ensure_live_edit_session_state()
+            self.controller.image_editor._edits_rev = 2
             self.controller.save_edited_image()
             self.controller.image_editor.snapshot_for_export.assert_called_once()
             self.controller.image_editor.save_from_snapshot.assert_called_once_with(

@@ -16,6 +16,7 @@ confirm_batch_permanent_delete = MagicMock(return_value=True)
 class MockController:
     def __init__(self):
         self._pending_delete_jobs = {}
+        self._shutting_down = False
         self._deleteFinished = MagicMock()
         self._delete_executor = MagicMock()
         self._rollback_ui_items = MagicMock()
@@ -23,6 +24,10 @@ class MockController:
         self.sync_ui_state = MagicMock()
         self.update_status_message = MagicMock()
         self._perm_delete_worker = MagicMock()
+        self._register_pending_delete_paths = MagicMock()
+        self._run_critical_user_data_operation = MagicMock()
+        # confirm_permanent_delete is handed the controller's modal-dialog runner.
+        self._exec_modal_dialog = MagicMock(return_value=0)
 
     def _key(self, p):
         return str(p) if p else None

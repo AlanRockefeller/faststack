@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 sys.path.append(str(Path(__file__).parents[2]))
 
 from faststack.app import AppController
+from faststack.tests.conftest import make_config_mock
 
 
 class TestEditorLifecycleAndSafety(unittest.TestCase):
@@ -19,7 +20,9 @@ class TestEditorLifecycleAndSafety(unittest.TestCase):
         self.sidecar_patcher = patch("faststack.app.SidecarManager")
         self.prefetcher_patcher = patch("faststack.app.Prefetcher")
         self.cache_patcher = patch("faststack.app.ByteLRUCache")
-        self.config_patcher = patch("faststack.app.config")
+        self.config_patcher = patch(
+            "faststack.app.config", new_callable=make_config_mock
+        )
 
         self.mock_watcher = self.watcher_patcher.start()
         self.mock_sidecar = self.sidecar_patcher.start()
@@ -110,7 +113,10 @@ class TestEditorLifecycleAndSafety(unittest.TestCase):
         next_sidecar = MagicMock()
         self.mock_sidecar.side_effect = [next_sidecar]
 
-        with patch.object(self.controller, "load") as mock_load:
+        with (
+            patch.object(self.controller, "load") as mock_load,
+            patch("faststack.app.find_images_with_variants", return_value=([], {})),
+        ):
             self.controller._switch_to_directory(Path("other-folder"))
 
         self.assertIsNot(self.controller.sidecar, original_sidecar)

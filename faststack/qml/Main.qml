@@ -248,8 +248,8 @@ ApplicationWindow {
     background: Rectangle { color: root.currentBackgroundColor }
 
     function toggleTheme() {
-        if (root.uiStateRef) {
-            root.uiStateRef.theme = (root.uiStateRef.theme === 0 ? 1 : 0)
+        if (root.uiStateRef && root.controllerRef) {
+            root.controllerRef.set_theme(root.uiStateRef.theme === 0 ? 1 : 0)
         }
     }
 
@@ -845,7 +845,10 @@ ApplicationWindow {
                 width: 200
                 text: "Exit"
                 hoverFillColor: root.menuHoverColor
-                onClicked: Qt.quit()
+                // root.close() (not Qt.quit()) so onClosing runs: the recycle
+                // bin prompt and controller.prepare_for_app_close() must be
+                // able to veto the exit. See FS-P1-001.
+                onClicked: root.close()
                 defaultTextColor: root.currentTextColor
             }
         }
@@ -1258,7 +1261,7 @@ ApplicationWindow {
             }
             MenuActionItem {
                 width: 220
-                text: "Stack Source RAWs"
+                text: "Restack Source RAWs"
                 enabled: root.uiStateRef ? root.uiStateRef.isStackedJpg : false
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
@@ -1492,7 +1495,9 @@ ApplicationWindow {
     Shortcut {
         sequence: "Escape"
         context: Qt.ApplicationShortcut
-        enabled: root.fullScreenLoupe && (!root.uiStateRef || !root.uiStateRef.isCropping)
+        enabled: root.fullScreenLoupe
+                 && (!root.uiStateRef
+                     || (!root.uiStateRef.isCropping && !root.uiStateRef.isDialogOpen))
         onActivated: root.exitFullScreenLoupe()
     }
 
@@ -1669,6 +1674,87 @@ ApplicationWindow {
                     property: "isDarkTheme"
                     value: root.isDarkTheme
                     when: gridViewLoader.item
+                }
+            }
+        }
+    }
+
+    // -------- UPDATE NOTICE (unobtrusive, sits above the status bar) --------
+    // Automatic update checks land here instead of throwing a modal dialog at
+    // the user seconds after launch. Manual checks still open the dialog.
+    Rectangle {
+        id: updateNoticeBanner
+        z: 101
+        readonly property string pendingVersion: root.uiStateRef ? root.uiStateRef.updateNoticeVersion : ""
+
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: footerRect.top
+        height: visible ? 36 : 0
+        visible: !root.fullScreenLoupe && updateNoticeBanner.pendingVersion !== ""
+        color: root.isDarkTheme ? "#1f2c1f" : "#eaf5ea"
+        border.color: root.isDarkTheme ? "#3a5a3a" : "#bcd9bc"
+        border.width: 1
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 12
+            anchors.rightMargin: 8
+            spacing: 10
+
+            Label {
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                color: root.currentTextColor
+                font.pixelSize: 13
+                text: "FastStack " + updateNoticeBanner.pendingVersion + " is available"
+            }
+
+            Button {
+                id: updateNoticeDetailsButton
+                text: "What's New"
+                flat: true
+                implicitHeight: 26
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.show_pending_update()
+                }
+                background: Rectangle {
+                    color: updateNoticeDetailsButton.pressed ? "#30000000" : "transparent"
+                    border.color: root.isDarkTheme ? "#4c7a4c" : "#9cc49c"
+                    border.width: 1
+                    radius: 4
+                }
+                contentItem: Text {
+                    text: updateNoticeDetailsButton.text
+                    color: root.currentTextColor
+                    font.pixelSize: 12
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+
+            Button {
+                id: updateNoticeDismissButton
+                text: "\u2715"
+                flat: true
+                implicitWidth: 26
+                implicitHeight: 26
+                ToolTip.visible: updateNoticeDismissButton.hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Dismiss until the next check"
+                onClicked: {
+                    if (root.controllerRef) root.controllerRef.dismiss_pending_update()
+                }
+                background: Rectangle {
+                    color: updateNoticeDismissButton.pressed ? "#30000000" : "transparent"
+                    radius: 4
+                }
+                contentItem: Text {
+                    text: updateNoticeDismissButton.text
+                    color: root.currentTextColor
+                    font.pixelSize: 12
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
                 }
             }
         }
@@ -1910,6 +1996,17 @@ ApplicationWindow {
                 Layout.rightMargin: 10
             }
 
+            Label {
+                text: "Automatic folder monitoring unavailable — use Refresh"
+                color: "#FFD54F"
+                font.pixelSize: 12
+                font.bold: true
+                visible: root.uiStateRef
+                         ? !root.uiStateRef.automaticMonitoringAvailable
+                         : false
+                Layout.rightMargin: 10
+            }
+
 
             // Saturation slider (only visible in saturation mode)
             Row {
@@ -2085,6 +2182,7 @@ ApplicationWindow {
     Dialog {
         id: aboutDialog
         Component.onCompleted: controller.markStartup("aboutDialog")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-about")
         title: "Key Bindings"
         standardButtons: Dialog.Ok
         modal: true
@@ -2092,6 +2190,9 @@ ApplicationWindow {
         focus: true
         width: 1000
         height: 750
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-about")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-about")
 
         background: Rectangle {
             color: root.currentBackgroundColor
@@ -2199,6 +2300,7 @@ ApplicationWindow {
     Dialog {
         id: readmeDialog
         Component.onCompleted: controller.markStartup("readmeDialog")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-readme")
         title: "FastStack Readme"
         standardButtons: Dialog.Ok
         modal: true
@@ -2208,6 +2310,9 @@ ApplicationWindow {
         height: Math.min(820, root.height - 100)
 
         property string readmeText: ""
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-readme")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-readme")
 
         background: Rectangle {
             color: root.currentBackgroundColor
@@ -2241,6 +2346,7 @@ ApplicationWindow {
     Dialog {
         id: showStacksDialog
         Component.onCompleted: controller.markStartup("showStacksDialog")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-stack-info")
         title: "Stack Information"
         standardButtons: Dialog.Ok
         modal: true
@@ -2248,6 +2354,9 @@ ApplicationWindow {
         focus: true
         width: 400
         height: 300
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-stack-info")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-stack-info")
 
         background: Rectangle {
             color: root.currentBackgroundColor
@@ -2401,11 +2510,12 @@ ApplicationWindow {
         readonly property string releaseSummary: updateInfo && updateInfo.summary ? updateInfo.summary : "Open the release page for details."
 
         onOpened: {
-            if (root.controllerRef) root.controllerRef.dialog_opened()
+            if (root.controllerRef) root.controllerRef.dialog_opened("qml-update")
         }
         onClosed: {
-            if (root.controllerRef) root.controllerRef.dialog_closed()
+            if (root.controllerRef) root.controllerRef.dialog_closed("qml-update")
         }
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-update")
 
         background: Rectangle {
             color: root.isDarkTheme ? "#1e1e1e" : "#fdfdfd"
@@ -2498,6 +2608,9 @@ ApplicationWindow {
                 Button {
                     text: "Open Release"
                     highlighted: true
+                    // The release URL is dropped when it fails the GitHub
+                    // release allowlist, so there may be nothing to open.
+                    enabled: updateDialog.releaseUrl !== ""
                     Layout.preferredWidth: 120
                     onClicked: {
                         if (root.controllerRef) root.controllerRef.open_update_release(updateDialog.releaseUrl)
@@ -2554,7 +2667,12 @@ ApplicationWindow {
             }
         }
 
-        onOpened: refreshBinInfo()
+        onOpened: {
+            if (root.controllerRef) root.controllerRef.dialog_opened("qml-recycle-cleanup")
+            refreshBinInfo()
+        }
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-recycle-cleanup")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-recycle-cleanup")
 
         // Ensure the dialog is fully opaque and has a solid background
         background: Rectangle {
@@ -2871,7 +2989,10 @@ ApplicationWindow {
                         onClicked: {
                             root.allowCloseWithRecycleBins = true
                             recycleBinCleanupDialog.close()
-                            Qt.quit()
+                            // Re-enter onClosing: allowCloseWithRecycleBins
+                            // skips the bin prompt but prepare_for_app_close()
+                            // still gets to veto on a failed save (FS-P1-001).
+                            root.close()
                         }
                         cursorShape: Qt.PointingHandCursor
                         onEntered: parent.color = root.isDarkTheme ? "#444444" : "#d0d0d0"
@@ -2901,7 +3022,8 @@ ApplicationWindow {
                             if (root.uiStateRef) root.uiStateRef.cleanupRecycleBins()
                             root.allowCloseWithRecycleBins = true
                             recycleBinCleanupDialog.close()
-                            Qt.quit()
+                            // See "Keep and Quit" above (FS-P1-001).
+                            root.close()
                         }
                         cursorShape: Qt.PointingHandCursor
                         onEntered: parent.color = "#f44336"

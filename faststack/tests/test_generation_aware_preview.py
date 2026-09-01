@@ -41,7 +41,28 @@ class TestGenerationAwarePreview(unittest.TestCase):
         self.mock_controller._last_rendered_preview = self.mock_preview
         self.mock_controller.get_decoded_image.return_value = self.mock_decoded
 
+        # The provider only serves the editor preview when the buffer's stored
+        # session key matches the controller's current preview provenance. Wire
+        # a matching session so the index/generation checks below are what
+        # actually decides.
+        session_key = ("image-key", None)
+        self.mock_controller._get_current_preview_session_provenance.return_value = (
+            session_key[0],
+            session_key[1],
+            1,
+        )
+        self.mock_controller._last_rendered_preview_session_key = session_key
+        self.mock_controller._original_compare_active = False
+        # Not callable → the provider keeps its own expected path.
+        self.mock_controller._nav_expected_path = None
+
         self.provider = ImageProvider(self.mock_controller)
+
+    def _assert_decoded_for_index(self, index):
+        """get_decoded_image(index, nav_seq, gen, requested_path=...)."""
+        self.mock_controller.get_decoded_image.assert_called_once()
+        args, _kwargs = self.mock_controller.get_decoded_image.call_args
+        self.assertEqual(args[0], index)
 
     def test_matching_generation(self):
         """Should serve preview when generation matches."""
@@ -80,7 +101,7 @@ class TestGenerationAwarePreview(unittest.TestCase):
 
         self.provider.requestImage("0/5", None, None)
 
-        self.mock_controller.get_decoded_image.assert_called_with(0)
+        self._assert_decoded_for_index(0)
 
     def test_mismatched_index(self):
         """Should fallback when index does not match."""
@@ -90,7 +111,7 @@ class TestGenerationAwarePreview(unittest.TestCase):
         self.mock_controller.get_decoded_image.reset_mock()
         self.provider.requestImage("0/5", None, None)
 
-        self.mock_controller.get_decoded_image.assert_called_with(0)
+        self._assert_decoded_for_index(0)
 
     def test_no_generation_checking_if_not_provided(self):
         """If generation not provided in ID, should ignore tracking?

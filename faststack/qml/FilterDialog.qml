@@ -156,6 +156,10 @@ Dialog {
     }
 
     onOpened: {
+        // Register first: initialization below may call user/config code.
+        if (filterDialog.controllerRef && filterDialog.controllerRef.dialog_opened) {
+            filterDialog.controllerRef.dialog_opened("qml-filter")
+        }
         // Load current filter string from controller
         var current = filterDialog.controllerRef && filterDialog.controllerRef.get_filter_string ? filterDialog.controllerRef.get_filter_string() : ""
         filterDialog.filterString = current || ""
@@ -172,16 +176,17 @@ Dialog {
 
         filterField.forceActiveFocus()
         filterField.selectAll()
-        // Notify Python that a dialog is open
-        if (filterDialog.controllerRef && filterDialog.controllerRef.dialog_opened) {
-            filterDialog.controllerRef.dialog_opened()
-        }
     }
 
     onClosed: {
         // Notify Python that dialog is closed
         if (filterDialog.controllerRef && filterDialog.controllerRef.dialog_closed) {
-            filterDialog.controllerRef.dialog_closed()
+            filterDialog.controllerRef.dialog_closed("qml-filter")
         }
+    }
+
+    Component.onDestruction: {
+        if (filterDialog.controllerRef && filterDialog.controllerRef.dialog_closed)
+            filterDialog.controllerRef.dialog_closed("qml-filter")
     }
 }

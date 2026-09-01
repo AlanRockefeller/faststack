@@ -1,5 +1,6 @@
 """ThumbnailModel for QML GridView with file/folder entries."""
 
+import hashlib
 import logging
 import os
 import time
@@ -18,7 +19,7 @@ from PySide6.QtCore import (
     Slot,
 )
 
-from faststack.io.indexer import find_images
+from faststack.io.indexer import DirectoryScanError, find_images
 from faststack.io.utils import compute_path_hash, normalize_path_key
 from faststack.thumbnail_view.folder_stats import (
     FolderStats,
@@ -27,6 +28,23 @@ from faststack.thumbnail_view.folder_stats import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def filesystem_source_identity(stat_result: os.stat_result) -> str:
+    """Return a cheap stable token for the filesystem object behind an image.
+
+    This deliberately avoids content hashing. A same-size in-place rewrite
+    that preserves every cheap timestamp/file-id field (possible on Windows)
+    cannot be detected by this scheme and still requires manual refresh.
+    """
+    fields = (
+        getattr(stat_result, "st_mtime_ns", 0),
+        getattr(stat_result, "st_size", 0),
+        getattr(stat_result, "st_ino", 0),
+        getattr(stat_result, "st_ctime_ns", 0),
+    )
+    payload = ":".join(str(value or 0) for value in fields).encode("ascii")
+    return hashlib.blake2s(payload, digest_size=8).hexdigest()
 
 
 def _empty_folder_stats_payload() -> dict:
@@ -98,6 +116,7 @@ class ThumbnailEntry:
     has_backups: bool = False
     has_developed: bool = False
     mtime_ns: int = 0
+    source_identity: str = "0"
     thumb_rev: int = 0  # Bumped when thumbnail is ready, forces QML refresh
 
 
@@ -132,7 +151,8 @@ class ThumbnailModel(QAbstractListModel):
     HasDevelopedRole = Qt.ItemDataRole.UserRole + 19
     IsTodoRole = Qt.ItemDataRole.UserRole + 20
 
-    # Signal emitted when a thumbnail is ready (id = "{size}/{path_hash}/{mtime_ns}")
+    # Signal emitted when a thumbnail is ready
+    # (id = "{size}/{path_hash}/{mtime_ns}/{source_identity}")
     thumbnailReady = Signal(str)
     # Signal emitted when selection changes (for UIState to forward to QML)
     selectionChanged = Signal()
@@ -167,7 +187,7 @@ class ThumbnailModel(QAbstractListModel):
         )  # current flag filters (e.g. ["uploaded", "stacked"])
 
         # Mapping from thumbnail_id (without query params) to row index
-        # id format: "{size}/{path_hash}/{mtime_ns}"
+        # id format: "{size}/{path_hash}/{mtime_ns}/{source_identity}"
         self._id_to_row: Dict[str, int] = {}
         # Normalized-path → row index for O(1) find_image_index() lookups
         self._path_to_row: Dict[str, int] = {}
@@ -315,7 +335,7 @@ class ThumbnailModel(QAbstractListModel):
     ) -> str:
         """Build thumbnail URL for QML Image source.
 
-        Format: image://thumbnail/{size}/{path_hash}/{mtime_ns}?r={rev}&reason={reason}
+        Format: image://thumbnail/{size}/{path_hash}/{mtime_ns}/{source_identity}?r={rev}&reason={reason}
         Folders use: image://thumbnail/folder/{path_hash}/{mtime_ns}?r={rev}
         """
         path_hash = compute_path_hash(entry.path)
@@ -325,7 +345,7 @@ class ThumbnailModel(QAbstractListModel):
         if entry.is_folder:
             return f"image://thumbnail/folder/{path_hash}/{mtime_ns}?r={rev}"
         else:
-            return f"image://thumbnail/{self._thumbnail_size}/{path_hash}/{mtime_ns}?r={rev}&reason={reason}"
+            return f"image://thumbnail/{self._thumbnail_size}/{path_hash}/{mtime_ns}/{entry.source_identity}?r={rev}&reason={reason}"
 
     def set_filter(self, filter_string: str, refresh: bool = True) -> None:
         """Set the active filename filter and optionally refresh the model."""
@@ -341,12 +361,13 @@ class ThumbnailModel(QAbstractListModel):
         if refresh:
             self.refresh()
 
-    def _add_folders_to_entries(self):
-        """Scan for folders and add them to self._entries."""
+    def _scan_folder_entries(self) -> List[ThumbnailEntry]:
+        """Build folder entries without mutating the current model."""
+        entries: List[ThumbnailEntry] = []
         # Add parent folder entry if not at filesystem root
         if not _is_filesystem_root(self._current_directory):
             parent_path = self._current_directory.parent
-            self._entries.append(
+            entries.append(
                 ThumbnailEntry(
                     path=parent_path,
                     name="..",
@@ -385,60 +406,71 @@ class ThumbnailModel(QAbstractListModel):
 
         # Sort folders alphabetically
         folders.sort(key=lambda e: e.name.lower())
-        self._entries.extend(folders)
+        entries.extend(folders)
+        return entries
 
-    def refresh(self):
-        """Refresh the model by rescanning the current directory."""
+    def _add_folders_to_entries(self):
+        """Scan for folders and add them to self._entries."""
+        self._entries.extend(self._scan_folder_entries())
+
+    def refresh(self) -> bool:
+        """Refresh the model by rescanning the current directory.
+
+        Returns:
+            True if the rescan succeeded and the model was rebuilt, False if
+            the directory could not be scanned (existing state is kept).
+        """
         cur, own = QThread.currentThread(), self.thread()
         assert (
             cur == own
         ), f"ThumbnailModel.refresh() thread mismatch: current={cur}, owner={own}"
-        self.beginResetModel()
         t0 = time.perf_counter()
         try:
-            self._entries.clear()
-            self._id_to_row.clear()
-            self._path_to_row.clear()
-            self._selected_indices.clear()
-            self._last_selected_index = None
-
-            self._add_folders_to_entries()
+            prospective_entries = self._scan_folder_entries()
             t1 = time.perf_counter()
 
             # Get images using existing indexer (respects filter rules)
             images = find_images(self._current_directory)
+        except DirectoryScanError as exc:
+            log.warning("Keeping existing thumbnail model after scan failure: %s", exc)
+            return False
 
-            # Apply active filename filter if set
-            if self._active_filter:
-                needle = self._active_filter.lower()
-                images = [img for img in images if needle in img.path.stem.lower()]
+        # Apply active filename filter if set
+        if self._active_filter:
+            needle = self._active_filter.lower()
+            images = [img for img in images if needle in img.path.stem.lower()]
 
-            # Apply active flag filters (AND logic)
-            if self._active_filter_flags and self._get_metadata:
-                flags = self._active_filter_flags
-                filtered = []
-                for img in images:
-                    try:
-                        meta = self._get_metadata(img.path)
-                        if not isinstance(meta, dict):
-                            # Ensure it's a dict before .get()
-                            log.debug(
-                                "Metadata for %s is not a dict: %r", img.path, meta
-                            )
-                            continue
+        # Apply active flag filters (AND logic)
+        if self._active_filter_flags and self._get_metadata:
+            flags = self._active_filter_flags
+            filtered = []
+            for img in images:
+                try:
+                    meta = self._get_metadata(img.path)
+                    if not isinstance(meta, dict):
+                        # Ensure it's a dict before .get()
+                        log.debug("Metadata for %s is not a dict: %r", img.path, meta)
+                        continue
 
-                        if all(meta.get(flag, False) for flag in flags):
-                            filtered.append(img)
-                    except Exception as e:
-                        log.debug("Error filtering image %s: %s", img.path, e)
-                        # Skip images with metadata errors
-                images = filtered
+                    if all(meta.get(flag, False) for flag in flags):
+                        filtered.append(img)
+                except Exception as e:
+                    log.debug("Error filtering image %s: %s", img.path, e)
+                    # Skip images with metadata errors
+            images = filtered
 
-            self._add_images_to_entries(images)
-            t2 = time.perf_counter()
+        prospective_entries.extend(self._build_image_entries(images))
+        t2 = time.perf_counter()
+
+        self.beginResetModel()
+        try:
+            self._entries = prospective_entries
+            self._id_to_row.clear()
+            self._path_to_row.clear()
+            self._selected_indices.clear()
+            self._last_selected_index = None
             self._rebuild_id_mapping()
             t3 = time.perf_counter()
-
         finally:
             self.endResetModel()
 
@@ -460,6 +492,7 @@ class ThumbnailModel(QAbstractListModel):
             t3 - t0,
             len(images),
         )
+        return True
 
     def notify_batch_state_changed(self) -> None:
         """Refresh batch badges without resetting the model.
@@ -477,6 +510,31 @@ class ThumbnailModel(QAbstractListModel):
             self.index(len(self._entries) - 1, 0),
             [self.IsInBatchRole],
         )
+
+    def notify_current_paths_changed(
+        self,
+        old_path: Optional[Path],
+        new_path: Optional[Path],
+        *,
+        force: bool = False,
+    ) -> None:
+        """Invalidate only rows whose dynamic current-image role changed."""
+        old_key = normalize_path_key(old_path) if old_path is not None else None
+        new_key = normalize_path_key(new_path) if new_path is not None else None
+        if old_key == new_key and not force:
+            return
+
+        rows = set()
+        for path_key in (old_key, new_key):
+            if path_key is None:
+                continue
+            row = self._path_to_row.get(path_key)
+            if row is not None:
+                rows.add(row)
+
+        for row in sorted(rows):
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index, [self.IsCurrentRole])
 
     def remove_rows_by_path(self, paths: List[Path]) -> None:
         """Targeted removal of rows by path without full model reset."""
@@ -563,6 +621,19 @@ class ThumbnailModel(QAbstractListModel):
         cur, own = QThread.currentThread(), self.thread()
         assert cur == own, "ThumbnailModel refresh thread mismatch"
 
+        selected_paths = {
+            normalize_path_key(self._entries[index].path)
+            for index in self._selected_indices
+            if 0 <= index < len(self._entries) and not self._entries[index].is_folder
+        }
+        anchor_path = (
+            normalize_path_key(self._entries[self._last_selected_index].path)
+            if self._last_selected_index is not None
+            and 0 <= self._last_selected_index < len(self._entries)
+            and not self._entries[self._last_selected_index].is_folder
+            else None
+        )
+
         self.beginResetModel()
         try:
             self._entries.clear()
@@ -619,6 +690,14 @@ class ThumbnailModel(QAbstractListModel):
             self._add_images_to_entries(images, metadata_map)
             t2 = time.perf_counter()
             self._rebuild_id_mapping()
+            self._selected_indices = {
+                self._path_to_row[path]
+                for path in selected_paths
+                if path in self._path_to_row
+            }
+            self._last_selected_index = (
+                self._path_to_row.get(anchor_path) if anchor_path is not None else None
+            )
             t3 = time.perf_counter()
         finally:
             self.endResetModel()
@@ -640,18 +719,24 @@ class ThumbnailModel(QAbstractListModel):
         self, images: List, metadata_map: Optional[Dict[str, dict]] = None
     ):
         """Convert list of objects (ImageFile or similar) to ThumbnailEntry."""
+        self._entries.extend(self._build_image_entries(images, metadata_map))
+
+    def _build_image_entries(
+        self, images: List, metadata_map: Optional[Dict[str, dict]] = None
+    ) -> List[ThumbnailEntry]:
+        """Build image entries without mutating the current model."""
+        entries: List[ThumbnailEntry] = []
         # See refresh_from_controller: a non-None metadata_map is authoritative
         # and keyed by str(img.path).
         map_authoritative = metadata_map is not None
         for img in images:
             try:
-                # Use mtime from object if available to avoid stat()
-                if hasattr(img, "timestamp") and img.timestamp:
-                    mtime_ns = int(img.timestamp * 1e9)
-                else:
-                    mtime_ns = img.path.stat().st_mtime_ns
+                stat_info = img.path.stat()
+                mtime_ns = stat_info.st_mtime_ns
+                source_identity = filesystem_source_identity(stat_info)
             except OSError:
-                mtime_ns = 0
+                mtime_ns = int(getattr(img, "timestamp", 0) * 1e9)
+                source_identity = "0"
 
             # Get metadata
             is_stacked = False
@@ -687,7 +772,7 @@ class ThumbnailModel(QAbstractListModel):
             has_backups = getattr(img, "has_backups", False)
             has_developed = getattr(img, "has_developed", False)
 
-            self._entries.append(
+            entries.append(
                 ThumbnailEntry(
                     path=img.path,
                     name=img.path.name,
@@ -701,8 +786,10 @@ class ThumbnailModel(QAbstractListModel):
                     has_backups=has_backups,
                     has_developed=has_developed,
                     mtime_ns=mtime_ns,
+                    source_identity=source_identity,
                 )
             )
+        return entries
 
     def _rebuild_id_mapping(self):
         """Rebuilds the path/stack_id -> row mapping."""
@@ -710,11 +797,15 @@ class ThumbnailModel(QAbstractListModel):
         self._path_to_row.clear()
 
         # Key must match the thumbnail_id format emitted by the prefetcher:
-        # "{size}/{path_hash}/{mtime_ns}" — same as _make_thumbnail_id()
+        # "{size}/{path_hash}/{mtime_ns}/{source_identity}" — same as
+        # _make_thumbnail_id().
         for i, e in enumerate(self._entries):
             if not e.is_folder:
                 tid = self._make_thumbnail_id(e)
                 self._id_to_row[tid] = i
+                if e.source_identity == "0":
+                    legacy_tid = f"{self._thumbnail_size}/{compute_path_hash(e.path)}/{e.mtime_ns}"
+                    self._id_to_row[legacy_tid] = i
                 # Normalized key for O(1) find_image_index() lookups
                 self._path_to_row[normalize_path_key(e.path)] = i
 
@@ -724,7 +815,7 @@ class ThumbnailModel(QAbstractListModel):
         if entry.is_folder:
             return f"folder/{path_hash}/{entry.mtime_ns}"
         else:
-            return f"{self._thumbnail_size}/{path_hash}/{entry.mtime_ns}"
+            return f"{self._thumbnail_size}/{path_hash}/{entry.mtime_ns}/{entry.source_identity}"
 
     @Slot(str)
     def _on_thumbnail_ready(self, thumbnail_id: str):
@@ -764,8 +855,11 @@ class ThumbnailModel(QAbstractListModel):
         """
         self._base_directory = base_directory.resolve()
         self._current_directory = current_directory.resolve()
+        had_selection = bool(self._selected_indices)
         self._selected_indices.clear()
         self._last_selected_index = None
+        if had_selection:
+            self.selectionChanged.emit()
         # Don't call refresh() here - caller should do it after updating other state
 
     def navigate_to(self, path: Path, update_base_if_above: bool = False):
@@ -778,6 +872,7 @@ class ThumbnailModel(QAbstractListModel):
                                   "go up" navigation above initial directory.
         """
         resolved = path.resolve()
+        previous_base = self._base_directory
 
         if not resolved.is_dir():
             log.warning("Cannot navigate to non-directory: %s", resolved)
@@ -800,11 +895,16 @@ class ThumbnailModel(QAbstractListModel):
                 )
                 return
 
+        # Commit the directory change only if the rescan succeeds; refresh()
+        # clears the selection and emits selectionChanged itself on success.
+        previous_current = self._current_directory
         self._current_directory = resolved
-        self._selected_indices.clear()
-        self._last_selected_index = None
         self._next_source_reason = "jump"
-        self.refresh()
+        if not self.refresh():
+            self._current_directory = previous_current
+            self._base_directory = previous_base
+            self._next_source_reason = None
+            log.warning("Navigation to %s aborted: directory scan failed", resolved)
 
     def _clear_next_source_reason(self):
         """Deferred clear of _next_source_reason (called via QTimer.singleShot)."""

@@ -14,6 +14,11 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 - Fixed an occasional stutter while holding an arrow key. FastStack rechecks the folder for new photos in the background, and even when nothing had changed it was interrupting the flip and making the next photo load slowly.
 - Faster startup. Some of the image loading setup now happens in the background while the window is opening, instead of delaying the first photo.
 - Fixed the menus, text and photos turning tiny after waking the computer from sleep. Windows sometimes doesn't tell FastStack how much your screen is zoomed, and now FastStack notices and fixes it on its own instead of needing a restart.
+- Update notices are less annoying. FastStack no longer pops up a window a couple of seconds after it starts. When a new version is out you get a small bar just above the status bar with a "What's New" button, and you can close it with the X. Help > Check for Updates still opens the full window right away.
+- FastStack no longer tells you about an "update" that is really just a rebuild of the version you already have. Only a genuinely newer version counts.
+- If the update check can't reach the internet, FastStack tries again in about an hour instead of giving up for the whole day.
+- Removed the "Install Updates Automatically" checkbox from Settings. It never did anything - FastStack tells you when a new version is out, and you install it yourself.
+- Each download page on GitHub now lists what actually changed in that version, taken straight from this file.
 
 ## 1.6.7 (2026-08-03)
 

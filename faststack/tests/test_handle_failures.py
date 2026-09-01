@@ -47,6 +47,7 @@ def test_handle_delete_failures_recycle_codes():
     controller.delete_history = []
     controller.undo_history = []
     controller._pending_delete_jobs = {}
+    controller._shutting_down = False
 
     # Helpers / UI hooks used by the method
     controller._key = lambda p: str(p)
@@ -55,6 +56,10 @@ def test_handle_delete_failures_recycle_codes():
     controller._rollback_ui_items = MagicMock()
     controller._rebuild_path_to_index = MagicMock()
     controller.sync_ui_state = MagicMock()
+    controller._register_pending_delete_paths = MagicMock()
+    controller._run_critical_user_data_operation = MagicMock()
+    # confirm_permanent_delete is handed the controller's modal-dialog runner.
+    controller._exec_modal_dialog = MagicMock(return_value=0)
 
     # Signals / executor used by the method
     controller._deleteFinished = MagicMock()

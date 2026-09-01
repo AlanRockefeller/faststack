@@ -100,21 +100,61 @@ class Watcher:
         self.directory = directory
         self.callback = callback
 
-    def start(self):
-        """Starts watching the directory."""
+    def start(self) -> bool:
+        """Start watching the directory. Returns True when watching is active.
+
+        Filesystem watching is best-effort: the watchdog backend can fail to
+        allocate an inotify instance, hit a permission error, or refuse a
+        network/FUSE path. That must never abort folder loading, which happens
+        after the window is already on screen -- a raised exception there left
+        a visible but half-initialised app (FS-P1-005). Any failure is logged,
+        the half-built Observer is torn down, and ``self.observer`` is left
+        None so ``is_alive()`` never claims a healthy observer.
+        """
         if not self.directory.is_dir():
             log.warning(f"Cannot watch non-existent directory: {self.directory}")
-            return
+            return False
 
         if self.observer and self.observer.is_alive():
-            return  # Already running
+            return True  # Already running
 
-        # Create a new observer instance every time, as it cannot be restarted
-        obs = Observer()
-        obs.schedule(self.event_handler, str(self.directory), recursive=False)
-        obs.start()
+        # Create a new observer instance every time, as it cannot be restarted.
+        # Construction is inside the try too: selecting a backend can already
+        # fail (e.g. inotify instance limit reached).
+        obs = None
+        try:
+            obs = Observer()
+            obs.schedule(self.event_handler, str(self.directory), recursive=False)
+            obs.start()
+        except Exception as e:
+            log.warning(
+                "Filesystem watching unavailable for %s: %s. External file "
+                "changes will not be detected automatically.",
+                self.directory,
+                e,
+            )
+            if obs is not None:
+                self._discard_observer(obs)
+            self.observer = None
+            return False
+
         self.observer = obs
         log.info(f"Started watching directory: {self.directory}")
+        return True
+
+    @staticmethod
+    def _discard_observer(obs: BaseObserver) -> None:
+        """Tear down an Observer that failed to start. Never raises."""
+        try:
+            obs.unschedule_all()
+        except Exception:
+            log.debug("unschedule_all() failed on partial observer", exc_info=True)
+        try:
+            if obs.is_alive():
+                obs.stop()
+                obs.join(timeout=2.0)
+        except Exception:
+            log.debug("stop()/join() failed on partial observer", exc_info=True)
 
     def stop(self):
         """Stops watching the directory."""

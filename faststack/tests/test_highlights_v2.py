@@ -3,14 +3,12 @@ import os
 # Adjust import path if necessary, but faststack is likely installed or in pythonpath
 import sys
 import unittest
-from unittest.mock import MagicMock
 
 import numpy as np
 
-# Mock cv2 before importing faststack modules that depend on it
-sys.modules["cv2"] = MagicMock()
-sys.modules["turbojpeg"] = MagicMock()
-sys.modules["PyTurboJPEG"] = MagicMock()
+# cv2 / turbojpeg are real project dependencies. Replacing them in
+# sys.modules here leaks into every later test in the session, so import
+# them for real.
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -40,10 +38,11 @@ class TestHighlightsV2(unittest.TestCase):
     def test_analysis_decoupling(self):
         """Verify analysis runs before adjustments and is cached via preview path."""
         editor = ImageEditor()
-        # Create a linear image with some headroom
-        linear = np.ones((100, 100, 3), dtype=np.float32) * 1.2
-        # sRGB mock indicating some clipping (e.g. 255)
-        _srgb = np.ones((100, 100, 3), dtype=np.uint8) * 255
+        # _apply_edits takes sRGB-encoded floats in [0, 1]; headroom above 1.0
+        # is only created downstream, by the white-balance gains (it is measured
+        # post-WB, pre-exposure). A raw >1.0 input is out of contract and simply
+        # reads back as fully clipped with no headroom.
+        source = np.ones((100, 100, 3), dtype=np.float32)
 
         # Setup editor state to simulate the image being loaded
         # We need this because _apply_edits works on self.float_image/preview logic usually,
@@ -53,11 +52,12 @@ class TestHighlightsV2(unittest.TestCase):
         # Run _apply_edits flow
         edits = editor._initial_edits()
         edits["highlights"] = -0.5
+        edits["white_balance_by"] = 0.5
 
         # _apply_edits expects global self.float_image for some contexts?
         # No, it takes img_arr arg.
 
-        editor._apply_edits(linear, edits=edits, for_export=False)
+        editor._apply_edits(source, edits=edits, for_export=False)
 
         # Check cache
         self.assertIsNotNone(editor._last_highlight_state)

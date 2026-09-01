@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import os
 import sys
 import tomllib
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 
 ROOT = Path(SPECPATH).parent
@@ -36,6 +37,28 @@ datas = [
     # the frozen macOS/Windows builds (see resources.faststack_readme_path).
     (str(ROOT / "README.md"), "faststack"),
 ]
+# Ship faststack's own dist-info so importlib.metadata.version("faststack")
+# resolves inside the frozen build. Without it the updater cannot tell which
+# version is running and stops offering updates entirely (see
+# faststack/updater.get_current_version).
+try:
+    datas += copy_metadata("faststack")
+except Exception as exc:  # pragma: no cover - build-time diagnostics only
+    raise RuntimeError("faststack distribution metadata is required") from exc
+
+# copy_metadata() copies whatever dist-info is *installed*, which can lag the
+# checkout being frozen (a stale editable install, an old wheel in the build
+# environment). Bundling that would make the frozen app report the wrong
+# version and compare updates against it. Install the current checkout before
+# running PyInstaller; refuse to build if the two disagree.
+installed_version = importlib.metadata.version("faststack")
+if installed_version != project_version():
+    raise RuntimeError(
+        f"Installed faststack metadata is {installed_version!r} but "
+        f"pyproject.toml declares {project_version()!r}; reinstall the "
+        'current checkout (pip install -e ".[bundle]") before building.'
+    )
+
 datas += collect_data_files(
     "PySide6",
     includes=[

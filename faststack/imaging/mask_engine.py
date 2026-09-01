@@ -8,6 +8,7 @@ Layer 2 of the mask subsystem.  Provides:
 - MaskRasterCache     – disposable, resolution-keyed cache for raster products
 """
 
+import hashlib
 import logging
 import math
 from typing import Any, Dict, Optional, Tuple
@@ -361,21 +362,19 @@ def _edge_magnitude(image_arr: np.ndarray) -> np.ndarray:
 
 
 def _image_content_key(image_arr: np.ndarray) -> int:
-    """Fast in-process cache key for resolved-mask cache invalidation.
+    """Robust in-process cache key for resolved-mask cache invalidation.
 
     Priors (dark, neutral, edge) depend on image content, so the cache must
     be invalidated when edits change the image (exposure, WB, levels, etc.).
 
-    Samples a 4×4 spatial grid across all channels and hashes the raw bytes.
-    This catches both global adjustments and localised edits far more
-    reliably than a handful of single-channel pixel reads.
+    Content-derived priors can change at any pixel, so sampling cannot safely
+    identify the rendered stage. BLAKE2 scans the contiguous buffer without
+    allocating when the renderer already produced C-order output.
     """
-    h, w = image_arr.shape[:2]
-    # 4 evenly-spaced row/col indices (always includes first and last)
-    rows = [0, h // 3, 2 * h // 3, h - 1]
-    cols = [0, w // 3, 2 * w // 3, w - 1]
-    samples = b"".join(image_arr[r, c].tobytes() for r in rows for c in cols)
-    return hash(samples)
+    contiguous = np.ascontiguousarray(image_arr)
+    raw = memoryview(contiguous).cast("B")
+    digest = hashlib.blake2b(raw, digest_size=8).digest()
+    return int.from_bytes(digest, "little")
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +389,7 @@ def resolve_mask(
     shape: Tuple[int, int],
     edits: Dict[str, Any],
     cache: Optional["MaskRasterCache"] = None,
+    image_key: Any = None,
 ) -> np.ndarray:
     """Full mask resolution: strokes → confidence → feather → soft mask.
 
@@ -400,7 +400,10 @@ def resolve_mask(
     """
     geo_hash = _geometry_hash(edits)
     params_key = settings.params_tuple()
-    img_key = _image_content_key(image_arr)
+    # ImageEditor supplies a generation/revision identity for interactive and
+    # export renders. Standalone callers without trustworthy provenance retain
+    # the full-content fallback for correctness.
+    img_key = image_key if image_key is not None else _image_content_key(image_arr)
 
     if cache is not None:
         cached = cache.get_resolved(
@@ -574,7 +577,7 @@ class MaskRasterCache:
         shape: Tuple[int, int],
         geo_hash: int,
         params_key: tuple,
-        img_key: int,
+        img_key: Any,
     ) -> Optional[np.ndarray]:
         key = (revision, shape, geo_hash, params_key, img_key)
         if self._resolved_key == key:
@@ -587,7 +590,7 @@ class MaskRasterCache:
         shape: Tuple[int, int],
         geo_hash: int,
         params_key: tuple,
-        img_key: int,
+        img_key: Any,
         mask: np.ndarray,
     ) -> None:
         self._resolved_key = (revision, shape, geo_hash, params_key, img_key)

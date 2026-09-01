@@ -98,8 +98,12 @@ def build_variant_map(
     Returns:
         Dict keyed by group_key.casefold() -> VariantGroup with selection rules applied.
     """
-    # 1. Parse all files
-    groups: Dict[str, VariantGroup] = {}  # keyed by group_key.casefold()
+    # 1. Parse all files by extensionless logical stem first. Most folders have
+    # one ordinary image per stem and retain the historical extension-agnostic
+    # grouping. If multiple ordinary JPEGs differ only by extension, however,
+    # they are distinct physical images and each extension gets its own group.
+    groups: Dict[str, VariantGroup] = {}
+    stem_buckets: Dict[str, List[VariantInfo]] = {}
 
     # Sort paths to ensure deterministic behavior for group_key casing
     # (The first-seen case preserved stem sets the group's display key).
@@ -107,8 +111,6 @@ def build_variant_map(
 
     for path in sorted_paths:
         group_key, is_developed, backup_number = parse_variant_stem(path.stem)
-        key_cf = group_key.casefold()
-
         info = VariantInfo(
             path=Path(norm_path(path)),
             group_key=group_key,
@@ -116,9 +118,30 @@ def build_variant_map(
             backup_number=backup_number,
         )
 
-        if key_cf not in groups:
-            groups[key_cf] = VariantGroup(group_key=group_key)
-        groups[key_cf].all_files.append(info)
+        stem_buckets.setdefault(group_key.casefold(), []).append(info)
+
+    for stem_key, infos in stem_buckets.items():
+        main_suffixes = {
+            info.path.suffix.casefold()
+            for info in infos
+            if not info.is_developed and info.backup_number is None
+        }
+        if len(main_suffixes) <= 1:
+            group = VariantGroup(group_key=infos[0].group_key)
+            group.all_files.extend(infos)
+            groups[stem_key] = group
+            continue
+
+        for info in infos:
+            suffix = info.path.suffix.casefold()
+            # NUL cannot occur in a filesystem name, so an extension-qualified
+            # internal key cannot collide with any ordinary casefolded stem.
+            extension_key = f"{stem_key}\0{suffix}"
+            group = groups.setdefault(
+                extension_key,
+                VariantGroup(group_key=f"{info.group_key}{suffix}"),
+            )
+            group.all_files.append(info)
 
     # 2. Apply selection rules for each group
     for group in groups.values():
@@ -193,6 +216,11 @@ def get_group_key_for_path(
     variant_map: Dict[str, VariantGroup],
 ) -> Optional[str]:
     """Look up the casefolded group key for a file path."""
+    target = norm_path(path)
+    for key, group in variant_map.items():
+        if any(norm_path(info.path) == target for info in group.all_files):
+            return key
+
     group_key, _, _ = parse_variant_stem(path.stem)
     key_cf = group_key.casefold()
     if key_cf in variant_map:

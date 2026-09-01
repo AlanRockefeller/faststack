@@ -122,6 +122,11 @@ version="$(show_target_file pyproject.toml | sed -n 's/^version = "\([^"]*\)"/\1
 [ -n "$version" ] || die "could not read project version from target pyproject.toml"
 
 if [ -z "$tag" ]; then
+  # buildN is a publication/rebuild counter for one pyproject application
+  # version, not an update-order component. Frozen bundles report only
+  # ``version`` below, and the updater intentionally compares that base version.
+  # Ship user-visible fixes under a new PEP 440 project version instead of
+  # expecting vX.Y.Z-build2 to upgrade users of vX.Y.Z-build1.
   prefix="v${version}-build"
   max_build=0
   while IFS= read -r existing_tag; do
@@ -170,6 +175,10 @@ if show_target_file faststack/updater.py | grep -Eq 'FALLBACK_VERSION = "[0-9]';
 fi
 target_file_contains .github/workflows/build-executables.yml 'gh release create' \
   || die "target build workflow is not configured to publish GitHub Release assets"
+target_file_contains .github/workflows/build-executables.yml 'tools/release_notes.py' \
+  || die "target build workflow must build release notes from ChangeLog.md"
+target_file_contains tools/release_notes.py 'def render_release_notes' \
+  || die "target tools/release_notes.py is missing the release-notes builder"
 
 if [ "$skip_ruff" = false ]; then
   python_bin="$(find_venv_python)" \

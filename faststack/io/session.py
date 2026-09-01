@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import uuid
+from ctypes import wintypes
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -33,9 +34,14 @@ def _sessions_dir() -> Path:
 def _current_boot_id() -> str:
     """Return an identifier that is stable within a boot and changes on reboot.
 
-    Linux/WSL exposes a per-boot UUID. On Windows we derive a boot timestamp
-    from the system uptime. The exact value is irrelevant — only equality
-    against a stored value matters, so a mismatch reliably means "rebooted".
+    Linux/WSL exposes a per-boot UUID, which is exactly this. Windows has no
+    equivalent that is cheap to read, and the old derivation
+    ``int(time.time() - GetTickCount64()/1000)`` mixed the adjustable wall
+    clock with monotonic uptime: any clock correction changed the value
+    without a reboot, so a live sibling's stored id stopped matching and its
+    active session was offered as a crash survivor and then deleted
+    (FS-P1-004). Windows liveness is now decided by ``_process_identity()``
+    instead, and this function deliberately returns "" there.
     """
     # Linux / WSL
     boot_id_path = Path("/proc/sys/kernel/random/boot_id")
@@ -45,35 +51,134 @@ def _current_boot_id() -> str:
     except OSError:
         pass
 
-    # Windows: GetTickCount64() is milliseconds since boot; subtract from the
-    # wall clock to get an (approximate, second-rounded) boot timestamp.
-    windll = getattr(ctypes, "windll", None)
-    if windll is not None:
-        try:
-            get_tick_count64 = windll.kernel32.GetTickCount64
-            get_tick_count64.restype = ctypes.c_ulonglong
-            ticks_ms = get_tick_count64()
-            return f"boot:{int(time.time() - ticks_ms / 1000.0)}"
-        except (AttributeError, OSError):
-            pass
-
     return ""
+
+
+def _windows_kernel32():
+    """Return kernel32 with the process APIs declared, or None off Windows."""
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        return None
+    try:
+        kernel32 = win_dll("kernel32", use_last_error=True)
+    except (AttributeError, OSError):
+        return None
+
+    filetime_pointer = ctypes.POINTER(wintypes.FILETIME)
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        filetime_pointer,
+        filetime_pointer,
+        filetime_pointer,
+        filetime_pointer,
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    return kernel32
+
+
+def _windows_process_creation_time(pid: int) -> Optional[int]:
+    """Return a Windows process's creation time, or None if unavailable.
+
+    The (PID, creation time) pair is unique for the lifetime of a boot, so it
+    identifies the exact process even after PID reuse.
+    """
+    kernel32 = _windows_kernel32()
+    if kernel32 is None or pid <= 0:
+        return None
+    try:
+        # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            ok = kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            )
+            if not ok:
+                return None
+            return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _process_identity(pid: Optional[int] = None) -> str:
+    """Return a string identifying the exact process, not merely its PID.
+
+    Empty string means "this platform has no extra identity to record", in
+    which case callers fall back to the boot id + PID check.
+    """
+    target_pid = os.getpid() if pid is None else pid
+    creation = _windows_process_creation_time(target_pid)
+    if creation is None:
+        return ""
+    return f"win:{creation}"
+
+
+def _process_identity_matches(pid: int, stored_identity: str) -> Optional[bool]:
+    """Compare a stored process identity against the live process.
+
+    Returns True/False when a comparison was possible, and None when it was
+    not (non-Windows, a legacy record without the field, or an unreadable
+    process) so the caller can fall back to the previous heuristics.
+    """
+    if not stored_identity:
+        return None
+    current = _process_identity(pid)
+    if not current:
+        # PID is gone, or we cannot read it. _pid_alive() decides.
+        return None
+    return current == stored_identity
 
 
 def _pid_alive(pid: int) -> bool:
     """Best-effort check whether a process with ``pid`` is currently running."""
     if pid <= 0:
         return False
-    windll = getattr(ctypes, "windll", None)
-    if windll is not None:
+    if sys.platform == "win32":
+        kernel32 = _windows_kernel32()
+        if kernel32 is None:
+            return True
         try:
             # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = windll.kernel32.OpenProcess(0x1000, False, pid)
+            ctypes.set_last_error(0)
+            handle = kernel32.OpenProcess(0x1000, False, pid)
             if not handle:
-                return False
-            windll.kernel32.CloseHandle(handle)
-            return True
-        except (AttributeError, OSError):
+                # ERROR_INVALID_PARAMETER means that the PID does not exist.
+                # Other failures may be access restrictions, so stay
+                # conservative and treat the process as potentially alive.
+                return ctypes.get_last_error() != 87
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return True
+                # STILL_ACTIVE = 259
+                return exit_code.value == 259
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, ValueError):
             # If we can't tell, assume alive so we don't offer a live folder.
             return True
     try:
@@ -117,6 +222,12 @@ def _validated_session_payload(data: object) -> Optional[dict]:
     if not isinstance(boot_id, str):
         return None
 
+    # Legacy records predate proc_id. Missing or malformed simply means "no
+    # extra identity available"; it must never invalidate the whole record.
+    proc_id = data.get("proc_id", "")
+    if not isinstance(proc_id, str):
+        proc_id = ""
+
     updated = data.get("updated", 0.0)
     if isinstance(updated, bool) or not isinstance(updated, (int, float)):
         return None
@@ -128,8 +239,43 @@ def _validated_session_payload(data: object) -> Optional[dict]:
     normalized["grid"] = grid
     normalized["pid"] = pid
     normalized["boot_id"] = boot_id
+    normalized["proc_id"] = proc_id
     normalized["updated"] = float(updated)
     return normalized
+
+
+def _is_live_sibling(
+    *, pid: int, boot_id: str, proc_id: str, current_boot: str
+) -> bool:
+    """Is this session record owned by a FastStack process that is still running?
+
+    Decided in order of how much the evidence actually proves:
+
+    1. A recorded ``proc_id`` (Windows PID + process creation time) is the
+       strongest signal. It survives wall-clock changes and cannot be spoofed
+       by PID reuse, so when it can be compared at all it is authoritative --
+       a mismatch means the PID belongs to some *other* process and the record
+       really is stale.
+    2. Otherwise a stable boot id (Linux/WSL) plus a live PID.
+    3. Otherwise (legacy Windows record with no proc_id, or no boot id at all)
+       fall back to the bare PID check, which is what shipped before. It can
+       be fooled by PID reuse across a reboot, but erring toward "live" only
+       costs a missed recovery offer, whereas erring toward "stale" deletes a
+       running instance's session file.
+    """
+    if not _pid_alive(pid):
+        return False
+
+    identity_match = _process_identity_matches(pid, proc_id)
+    if identity_match is not None:
+        return identity_match
+
+    if current_boot:
+        # Unchanged Linux/WSL behaviour: a real per-boot UUID must match
+        # exactly, so a reboot survivor whose PID got reused is still stale.
+        return boot_id == current_boot
+
+    return True
 
 
 class SessionRegistry:
@@ -157,6 +303,9 @@ class SessionRegistry:
                 "grid": bool(grid),
                 "pid": os.getpid(),
                 "boot_id": _current_boot_id(),
+                # Distinguishes this exact process from a future PID reuse.
+                # Empty on platforms with a real boot id (Linux/WSL).
+                "proc_id": _process_identity(),
                 "updated": time.time(),
             }
             atomic_write_json(self.path, payload)
@@ -204,11 +353,11 @@ class SessionRegistry:
 
             boot_id = data["boot_id"]
             pid = data["pid"]
-            # Live sibling: same boot and process still running. If this
-            # platform has no stable boot id, fall back to the PID check so we
-            # do not offer or prune another active FastStack window.
-            if (current_boot and boot_id == current_boot and _pid_alive(pid)) or (
-                not current_boot and _pid_alive(pid)
+            if _is_live_sibling(
+                pid=pid,
+                boot_id=boot_id,
+                proc_id=data["proc_id"],
+                current_boot=current_boot,
             ):
                 continue
 
@@ -258,15 +407,22 @@ def respawn_for_directory(
     grid: Optional[bool],
     image_path: Optional[str] = None,
     index: Optional[int] = None,
-) -> None:
-    """Launch a new FastStack process for ``directory``.
+) -> bool:
+    """Launch a new FastStack process for ``directory``. Returns success.
 
     Used to reopen additional folders (one window each) selected at the
     crash-recovery prompt. The internal CLI options restore the exact image
     path, with the index retained as a fallback; ``--loupe`` is passed when
     the folder was last in loupe view so the view mode is preserved too.
+
+    The boolean matters: the caller must not prune a stale session record
+    whose respawn failed, or the user's selection is neither reopened nor
+    kept for another attempt (FS-P1-006).
     """
     import subprocess
+
+    if not directory:
+        return False
 
     args = [sys.executable, "-m", "faststack.app"]
     if grid is False:
@@ -280,3 +436,5 @@ def respawn_for_directory(
         subprocess.Popen(args, shell=False)
     except OSError as e:
         log.warning("Failed to respawn FastStack for %s: %s", directory, e)
+        return False
+    return True

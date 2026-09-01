@@ -25,6 +25,25 @@ def pytest_configure(config):
         signal.signal(signal.SIGUSR2, _dump_usr2)
 
 
+def make_config_mock() -> MagicMock:
+    """A stand-in for ``faststack.config`` that behaves like the real getters.
+
+    The real config returns the caller's ``fallback`` when a key is missing, so
+    production code can do arithmetic on the result. A bare ``MagicMock``
+    returns a mock instead, which blows up on the first comparison.
+    """
+
+    def _fallback(section, key, fallback=None):
+        return fallback
+
+    cfg = MagicMock()
+    cfg.get.side_effect = _fallback
+    cfg.getint.side_effect = _fallback
+    cfg.getfloat.side_effect = _fallback
+    cfg.getboolean.side_effect = _fallback
+    return cfg
+
+
 @pytest.fixture
 def app_controller(tmp_path):
     """Shared fixture: real AppController with all heavy dependencies mocked."""
@@ -46,7 +65,7 @@ def app_controller(tmp_path):
         patch("faststack.app.SidecarManager"),
         patch("faststack.app.Prefetcher"),
         patch("faststack.app.ByteLRUCache"),
-        patch("faststack.app.config"),
+        patch("faststack.app.config", new_callable=make_config_mock),
         patch("faststack.app.ThumbnailProvider"),
         patch("faststack.app.ThumbnailModel"),
         patch("faststack.app.ThumbnailPrefetcher"),

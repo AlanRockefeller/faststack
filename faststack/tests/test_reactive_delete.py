@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 from faststack.models import ImageFile
+from faststack.tests.conftest import make_config_mock
 
 
 @pytest.fixture
@@ -26,7 +27,7 @@ def app_controller(tmp_path):
         patch("faststack.app.SidecarManager"),
         patch("faststack.app.Prefetcher"),
         patch("faststack.app.ByteLRUCache"),
-        patch("faststack.app.config"),
+        patch("faststack.app.config", new_callable=make_config_mock),
         patch("faststack.app.ThumbnailProvider"),
         patch("faststack.app.ThumbnailModel"),
         patch("faststack.app.ThumbnailPrefetcher"),
