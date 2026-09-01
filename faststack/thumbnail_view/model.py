@@ -413,8 +413,13 @@ class ThumbnailModel(QAbstractListModel):
         """Scan for folders and add them to self._entries."""
         self._entries.extend(self._scan_folder_entries())
 
-    def refresh(self):
-        """Refresh the model by rescanning the current directory."""
+    def refresh(self) -> bool:
+        """Refresh the model by rescanning the current directory.
+
+        Returns:
+            True if the rescan succeeded and the model was rebuilt, False if
+            the directory could not be scanned (existing state is kept).
+        """
         cur, own = QThread.currentThread(), self.thread()
         assert (
             cur == own
@@ -428,7 +433,7 @@ class ThumbnailModel(QAbstractListModel):
             images = find_images(self._current_directory)
         except DirectoryScanError as exc:
             log.warning("Keeping existing thumbnail model after scan failure: %s", exc)
-            return
+            return False
 
         # Apply active filename filter if set
         if self._active_filter:
@@ -487,6 +492,7 @@ class ThumbnailModel(QAbstractListModel):
             t3 - t0,
             len(images),
         )
+        return True
 
     def notify_batch_state_changed(self) -> None:
         """Refresh batch badges without resetting the model.
@@ -849,8 +855,11 @@ class ThumbnailModel(QAbstractListModel):
         """
         self._base_directory = base_directory.resolve()
         self._current_directory = current_directory.resolve()
+        had_selection = bool(self._selected_indices)
         self._selected_indices.clear()
         self._last_selected_index = None
+        if had_selection:
+            self.selectionChanged.emit()
         # Don't call refresh() here - caller should do it after updating other state
 
     def navigate_to(self, path: Path, update_base_if_above: bool = False):
@@ -863,6 +872,7 @@ class ThumbnailModel(QAbstractListModel):
                                   "go up" navigation above initial directory.
         """
         resolved = path.resolve()
+        previous_base = self._base_directory
 
         if not resolved.is_dir():
             log.warning("Cannot navigate to non-directory: %s", resolved)
@@ -885,11 +895,16 @@ class ThumbnailModel(QAbstractListModel):
                 )
                 return
 
+        # Commit the directory change only if the rescan succeeds; refresh()
+        # clears the selection and emits selectionChanged itself on success.
+        previous_current = self._current_directory
         self._current_directory = resolved
-        self._selected_indices.clear()
-        self._last_selected_index = None
         self._next_source_reason = "jump"
-        self.refresh()
+        if not self.refresh():
+            self._current_directory = previous_current
+            self._base_directory = previous_base
+            self._next_source_reason = None
+            log.warning("Navigation to %s aborted: directory scan failed", resolved)
 
     def _clear_next_source_reason(self):
         """Deferred clear of _next_source_reason (called via QTimer.singleShot)."""
