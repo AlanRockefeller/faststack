@@ -254,9 +254,9 @@ def _stack_merge_fail_safe(
 ) -> tuple[list[list[int]], list[list[str]], list[str]]:
     """Preserve *identity* verbatim without inventing runtime ranges.
 
-    Callers pass the most complete identity state they have reached: the
-    merged groups and order when merging got that far, and the lock holder's
-    snapshot only when the two orders share no common image identities.
+    Callers pass the merged groups and order: presence has already been
+    three-way merged, so no identity the other writer removed can reappear
+    here, whatever the groups turn out to look like.
     """
     groups, order = identity
     projected = _project_stack_groups(groups, order)
@@ -267,6 +267,48 @@ def _stack_merge_fail_safe(
     )
     ranges = projected[0] if projected is not None else []
     return ranges, copy.deepcopy(groups), copy.deepcopy(order)
+
+
+def _merge_identity_presence(
+    base_order: list[str], our_order: list[str], their_order: list[str]
+) -> set[str]:
+    """Three-way merge which image identities still exist, ignoring order.
+
+    Presence is a per-identity boolean, so it cannot genuinely conflict: a
+    side that changed it relative to *base_order* wins, and if both changed it
+    they changed it the same way.
+    """
+    base_keys = set(base_order)
+    our_keys = set(our_order)
+    their_keys = set(their_order)
+    present = set()
+    for key in base_keys | our_keys | their_keys:
+        in_base = key in base_keys
+        in_ours = key in our_keys
+        in_theirs = key in their_keys
+        keep = in_theirs if in_ours == in_base else in_ours
+        if keep:
+            present.add(key)
+    return present
+
+
+def _order_present_identities(
+    present: set[str], sources: tuple[list[str], ...]
+) -> list[str]:
+    """Order *present* identities by the first *source* that mentions each.
+
+    The preferred source supplies the ordering; the remaining sources place
+    identities it does not list, such as images the other writer added while
+    this one reordered.
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        for key in source:
+            if key in present and key not in seen:
+                seen.add(key)
+                ordered.append(key)
+    return ordered
 
 
 def _merge_stack_payloads(
@@ -282,19 +324,21 @@ def _merge_stack_payloads(
     base_groups, base_order = base_identity
     our_groups, our_order = our_identity
     their_groups, their_order = their_identity
+    # Presence and ordering are merged separately. Deciding both from a single
+    # winning order would let the loser's removals be undone whenever the two
+    # writers also disagree about ordering: a concurrently deleted image would
+    # reappear in stack_order simply because our snapshot still lists it.
+    present = _merge_identity_presence(base_order, our_order, their_order)
     if our_order == base_order:
-        merged_order = their_order
-    elif their_order == base_order or our_order == their_order:
-        merged_order = our_order
-    elif set(our_order) == set(their_order):
-        # Both processes sorted the same images differently. Identity still
-        # makes membership safe; the lock holder's order is deterministic.
-        merged_order = our_order
+        order_source, order_other = their_order, our_order
     else:
-        return _stack_merge_fail_safe(
-            our_identity,
-            "image orders contain incompatible identities",
-        )
+        # Either we reordered and they did not, or both did. Ordering is not a
+        # data-integrity concern once presence is settled, so the lock holder's
+        # order wins deterministically.
+        order_source, order_other = our_order, their_order
+    merged_order = _order_present_identities(
+        present, (order_source, order_other, base_order)
+    )
 
     base_group_set = {frozenset(group) for group in base_groups}
     our_group_set = {frozenset(group) for group in our_groups}

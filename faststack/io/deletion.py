@@ -95,11 +95,26 @@ def _atomic_no_replace_link(source: Path, target: Path) -> None:
     restores an authorized pathname without any chance of overwriting a file
     that appeared there concurrently. ``follow_symlinks=False`` keeps a staged
     symlink a symlink, and is only passed where the platform supports it.
+
+    Where the platform does not support it, ``os.link`` follows the symlink
+    and would restore the *target* file under the authorized pathname. That
+    silently rewrites the user's directory, so a symlinked source is refused
+    instead (``symlinks_restorable`` rejects it before anything is staged).
     """
     if os.link in os.supports_follow_symlinks:
         os.link(source, target, follow_symlinks=False)
+    elif source.is_symlink():
+        raise NotImplementedError(
+            f"Cannot restore {target.name} as a symlink: this platform cannot "
+            "hard link a symlink without following it."
+        )
     else:
         os.link(source, target)
+
+
+def symlinks_restorable() -> bool:
+    """Report whether a symlinked source could be hard linked back verbatim."""
+    return os.link in os.supports_follow_symlinks
 
 
 def _verify_rollback_capability(
@@ -367,6 +382,17 @@ def permanently_delete_image_files(
             if path.parent not in destinations:
                 destinations.append(path.parent)
         _verify_rollback_capability(transaction_dir, destinations)
+        if not symlinks_restorable():
+            # A symlinked source can be staged, but not restored as a symlink
+            # (see _atomic_no_replace_link). Refuse before the first move
+            # rather than discover it mid-rollback.
+            for path, _identity in candidates:
+                if path.is_symlink():
+                    raise OSError(
+                        f"Permanent deletion refused: {path.name} is a symlink "
+                        "and this platform cannot restore it as one if the "
+                        "deletion has to be rolled back."
+                    )
 
         try:
             for number, (original_path, identity) in enumerate(candidates):
