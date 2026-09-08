@@ -22,6 +22,19 @@ JPG_EXTENSIONS = {".jpg", ".jpeg", ".jpe"}
 _BASE_SUFFIX_PREFERENCE = (".jpg", ".jpeg", ".jpe")
 
 
+class DirectoryScanError(OSError):
+    """A directory walk failed before a trustworthy snapshot was produced."""
+
+    def __init__(self, directory: Path, cause: OSError):
+        self.directory = Path(directory)
+        self.cause = cause
+        super().__init__(
+            getattr(cause, "errno", None),
+            f"Could not scan {self.directory}: {cause}",
+            str(self.directory),
+        )
+
+
 def _scan_directory(
     directory: Path,
     *,
@@ -220,9 +233,9 @@ def find_images(directory: Path) -> List[ImageFile]:
     t_phase = time.perf_counter()
     try:
         visible_jpgs, _, raws = _scan_directory(directory)
-    except OSError:
+    except OSError as exc:
         log.exception("Error scanning directory %s", directory)
-        return []
+        raise DirectoryScanError(directory, exc) from exc
     phase_timings["scandir_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
     image_files = _build_image_list(
@@ -259,9 +272,9 @@ def find_images_with_variants(
     t_phase = time.perf_counter()
     try:
         _, all_jpgs, raws = _scan_directory(directory, include_visible_jpgs=False)
-    except OSError:
+    except OSError as exc:
         log.exception("Error scanning directory %s", directory)
-        return [], {}
+        raise DirectoryScanError(directory, exc) from exc
     phase_timings["scandir_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
     # Build variant map from ALL jpgs (including backups)

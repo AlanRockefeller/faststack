@@ -61,12 +61,34 @@ class TestFolderLoadState(unittest.TestCase):
 
         self.controller._folder_loaded = True
         self.controller.ui_state.isFolderLoadedChanged.emit.reset_mock()
+        calls = []
+        self.mock_watcher.return_value.start.side_effect = lambda: calls.append(
+            "watcher"
+        )
 
-        with patch.object(self.controller, "load") as mock_load:
+        with (
+            patch.object(self.controller, "load") as mock_load,
+            patch.object(
+                self.controller._thumbnail_model,
+                "set_directories",
+                side_effect=lambda *_args: calls.append("model"),
+            ) as set_directories,
+            patch.object(self.controller._thumbnail_model, "refresh") as refresh,
+            patch.object(
+                self.controller._thumbnail_model, "navigate_to"
+            ) as navigate_to,
+        ):
             self.controller._switch_to_directory(next_dir, update_base_directory=False)
 
         self.assertFalse(self.controller._folder_loaded)
+        self.assertEqual(calls[:2], ["watcher", "model"])
         self.controller.ui_state.isFolderLoadedChanged.emit.assert_called_once()
+        set_directories.assert_called_once_with(
+            self.controller._thumbnail_model.base_directory,
+            next_dir.resolve(),
+        )
+        refresh.assert_not_called()
+        navigate_to.assert_not_called()
         mock_load.assert_called_once_with(skip_thumbnail_refresh=True)
 
     def test_load_marks_current_folder_loaded_when_scan_finishes(self):
@@ -77,6 +99,31 @@ class TestFolderLoadState(unittest.TestCase):
 
         self.assertTrue(self.controller._folder_loaded)
         self.controller.ui_state.isFolderLoadedChanged.emit.assert_called_once()
+
+    def test_failed_target_scan_does_not_commit_directory_switch(self):
+        next_dir = self.image_dir / "unreadable"
+        next_dir.mkdir()
+        old_dir = self.controller.image_dir
+        old_watcher = self.controller.watcher
+        candidate_watcher = MagicMock()
+
+        with (
+            patch("faststack.app.Watcher", return_value=candidate_watcher),
+            patch(
+                "faststack.app.find_images_with_variants",
+                side_effect=PermissionError("denied"),
+            ),
+            patch.object(self.controller, "load") as load,
+        ):
+            switched = self.controller._switch_to_directory(next_dir)
+
+        self.assertFalse(switched)
+        self.assertEqual(self.controller.image_dir, old_dir)
+        self.assertIs(self.controller.watcher, old_watcher)
+        old_watcher.stop.assert_not_called()
+        candidate_watcher.start.assert_called_once()
+        candidate_watcher.stop.assert_called_once()
+        load.assert_not_called()
 
 
 if __name__ == "__main__":

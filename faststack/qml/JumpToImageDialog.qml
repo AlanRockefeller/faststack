@@ -25,15 +25,18 @@ Dialog {
     }
 
     onOpened: {
+        if (jumpDialog.controllerRef) jumpDialog.controllerRef.dialog_opened("qml-jump")
         imageNumberField.text = ""
         imageNumberField.forceActiveFocus()
-        // Notify Python that a dialog is open
-        if (jumpDialog.controllerRef) jumpDialog.controllerRef.dialog_opened()
     }
     
     onClosed: {
         // Notify Python that dialog is closed
-        if (jumpDialog.controllerRef) jumpDialog.controllerRef.dialog_closed()
+        if (jumpDialog.controllerRef) jumpDialog.controllerRef.dialog_closed("qml-jump")
+    }
+
+    Component.onDestruction: {
+        if (jumpDialog.controllerRef) jumpDialog.controllerRef.dialog_closed("qml-jump")
     }
 
     onAccepted: {

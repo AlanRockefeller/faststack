@@ -6,69 +6,163 @@ import heapq
 import logging
 import queue
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+import weakref
+from concurrent.futures import Future
 from typing import Any, Callable, Optional
 
 log = logging.getLogger(__name__)
 
 
-import weakref
-from concurrent.futures.thread import _threads_queues, _worker
+class DaemonThreadPoolExecutor:
+    """A minimal thread pool whose workers are genuinely abandonable.
 
+    ``ThreadPoolExecutor`` registers every worker in
+    ``concurrent.futures.thread._threads_queues``, and CPython's
+    interpreter-exit hook joins those workers even when the threads are
+    daemon threads. A worker blocked in a long decode therefore keeps the
+    process alive during finalization -- after FastStack's os._exit backstop
+    has already been cancelled. See FS-P1-003.
 
-class DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    """ThreadPoolExecutor whose worker threads are daemon threads.
+    This class deliberately does NOT subclass ``ThreadPoolExecutor`` and does
+    not touch any private ``concurrent.futures`` state, so its workers never
+    enter that registry. It implements only the surface FastStack uses:
 
-    Near-literal copy of CPython 3.12.2 ``_adjust_thread_count``
-    (Lib/concurrent/futures/thread.py) with the sole change:
-    ``t.daemon = True`` before ``t.start()``.
+    * ``submit(fn, *args, **kwargs) -> Future``
+    * ``shutdown(wait=..., cancel_futures=...)``
 
-    No hasattr guard — if CPython internals change, this will raise
-    AttributeError immediately rather than silently falling back to
-    non-daemon threads.
+    Semantics that are preserved from ``ThreadPoolExecutor``:
 
-    Thread-safety note: ``_adjust_thread_count`` is only called from
-    ``submit()``, which already holds ``_global_shutdown_lock``, so the
-    mutation of ``_threads_queues`` is safe without acquiring it again.
+    * threads are spawned lazily, up to ``max_workers``;
+    * ``submit`` after ``shutdown`` raises ``RuntimeError``;
+    * ``shutdown(cancel_futures=True)`` cancels queued-but-unstarted work;
+    * ``shutdown(wait=True)`` joins the workers.
+
+    Semantics that intentionally differ: a task already running when the
+    interpreter exits is abandoned rather than joined. That is the whole
+    point of a daemon pool -- only use it for work that is safe to drop
+    (decode, preview, histogram, prefetch). The save and delete executors are
+    plain non-daemon ``ThreadPoolExecutor``s on purpose; never route those
+    through here.
     """
 
-    def _adjust_thread_count(self) -> None:
-        # if idle threads are available, don't spin new threads
+    # Deliberately no __slots__: callers (and tests) patch instance attributes
+    # such as .submit, which ThreadPoolExecutor also permits.
+
+    def __init__(self, max_workers: int, thread_name_prefix: str = ""):
+        if max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        self._max_workers = int(max_workers)
+        self._thread_name_prefix = thread_name_prefix or f"DaemonPool-{id(self):x}"
+        self._work_queue: queue.Queue = queue.Queue()
+        self._threads: list[threading.Thread] = []
+        # Counts workers parked on an empty queue, exactly like
+        # ThreadPoolExecutor: a positive count means a spawn can be skipped.
+        self._idle_semaphore = threading.Semaphore(0)
+        self._lock = threading.Lock()
+        self._shutdown = False
+
+    # ---- Worker ------------------------------------------------------------
+
+    @staticmethod
+    def _worker_loop(executor_ref: "weakref.ref[DaemonThreadPoolExecutor]", work_queue):
+        """Run queued items until told to exit.
+
+        ``executor_ref`` is a weak reference so an abandoned (never shut down)
+        executor can still be garbage collected; the weakref callback pushes
+        the ``None`` sentinel that wakes the parked workers.
+        """
+        while True:
+            try:
+                item = work_queue.get_nowait()
+            except queue.Empty:
+                executor = executor_ref()
+                if executor is not None:
+                    executor._idle_semaphore.release()
+                del executor
+                item = work_queue.get(block=True)
+
+            if item is not None:
+                fn, args, kwargs, future = item
+                try:
+                    if future.set_running_or_notify_cancel():
+                        try:
+                            future.set_result(fn(*args, **kwargs))
+                        except BaseException as e:  # noqa: BLE001 - mirrors stdlib
+                            future.set_exception(e)
+                except BaseException:
+                    log.exception("Error in DaemonThreadPoolExecutor worker")
+                finally:
+                    # Drop references before blocking again so a large result
+                    # is not pinned for the lifetime of the idle wait.
+                    del item, fn, args, kwargs, future
+                continue
+
+            executor = executor_ref()
+            if executor is None or executor._shutdown:
+                # Wake the next worker, then leave.
+                work_queue.put(None)
+                return
+            # Spurious sentinel (executor still live): keep working.
+            del executor
+
+    def _spawn_if_needed(self) -> None:
+        # An idle worker will pick the item up; no new thread needed.
         if self._idle_semaphore.acquire(timeout=0):
             return
+        if len(self._threads) >= self._max_workers:
+            return
 
-        # When the executor gets lost, the weakref callback will wake up
-        # the worker threads.
-        def weakref_cb(_, q=self._work_queue):
+        def weakref_cb(_ref, q=self._work_queue):
             q.put(None)
 
-        num_threads = len(self._threads)
-        if num_threads < self._max_workers:
-            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-            )
-            t.daemon = True
-            t.start()
-            self._threads.add(t)
-            # Safe without explicit locking: submit() already holds
-            # _global_shutdown_lock when calling _adjust_thread_count().
-            _threads_queues[t] = self._work_queue
+        t = threading.Thread(
+            name=f"{self._thread_name_prefix}_{len(self._threads)}",
+            target=self._worker_loop,
+            args=(weakref.ref(self, weakref_cb), self._work_queue),
+            daemon=True,
+        )
+        t.start()
+        self._threads.append(t)
+
+    # ---- Public API --------------------------------------------------------
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future:
+        future: Future = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._work_queue.put((fn, args, kwargs, future))
+            self._spawn_if_needed()
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._lock:
+            self._shutdown = True
+            threads = list(self._threads)
+
+        if cancel_futures:
+            while True:
+                try:
+                    item = self._work_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    item[3].cancel()
+
+        # One sentinel is enough: each exiting worker re-posts it.
+        self._work_queue.put(None)
+
+        if wait:
+            for t in threads:
+                t.join()
 
 
 def create_daemon_threadpool_executor(
     max_workers: int, thread_name_prefix: str = ""
 ) -> DaemonThreadPoolExecutor:
     """
-    Create a ThreadPoolExecutor whose worker threads are daemon threads.
-    Returns a DaemonThreadPoolExecutor instance which is a subclass of ThreadPoolExecutor.
+    Create a pool of daemon worker threads that the interpreter will not join
+    at exit (see :class:`DaemonThreadPoolExecutor`).
     """
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")

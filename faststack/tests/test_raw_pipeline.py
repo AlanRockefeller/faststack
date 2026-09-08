@@ -2,6 +2,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,15 +51,34 @@ class DummyImageFile:
         return self.path.with_name(f"{self.path.stem}-developed.jpg")
 
 
+def _stub_develop_guards(app):
+    """Neutralize the in-flight develop guards on a MagicMock controller.
+
+    ``_develop_raw_backend`` bails out early unless the guards report that no
+    development is running; on a bare MagicMock they return truthy mocks.
+    """
+    app._is_raw_development_in_flight.return_value = False
+    app._mark_raw_development_started.return_value = "develop-key"
+    app._raw_develop_lock = threading.Lock()
+    app._raw_development_operations = {}
+
+
 class TestRawPipeline(unittest.TestCase):
     @patch("faststack.app.os.path.exists")
-    @patch("faststack.app.subprocess.run")
+    @patch("faststack.app.subprocess.Popen")
     @patch("faststack.config.config.get")
     @patch("faststack.app.threading.Thread")
     def test_develop_raw_empty_output_cleanup(
         self, mock_thread, mock_config_get, mock_run, mock_exists
     ):
-        """Test garbage collection if RT exits 0 but produces 0-byte file."""
+        """RT exiting 0 with an empty output must not yield a usable working TIFF.
+
+        Development writes to a hidden temp file and only atomically replaces
+        the working TIFF once the output is non-empty, so an empty result
+        leaves no temp file behind and never promotes itself to the working
+        path. A pre-existing 0-byte file at that path stays where it is, but
+        never counts as valid (``has_working_tif`` requires a non-zero size).
+        """
         mock_config_get.return_value = "c:\\path\\to\\rawtherapee-cli.exe"
         mock_exists.return_value = True  # exe exists
 
@@ -71,14 +91,13 @@ class TestRawPipeline(unittest.TestCase):
 
         mock_thread.return_value.start.side_effect = side_effect_start
 
-        # Mock subprocess.run to return success (returncode=0)
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.communicate.return_value = ("", "")
 
         app = MagicMock()
         app.image_files = [self.image_file]
         app.current_index = 0
+        _stub_develop_guards(app)
         app.update_status_message = MagicMock()
 
         # Bind the real _develop_raw_backend method to our mock
@@ -94,12 +113,25 @@ class TestRawPipeline(unittest.TestCase):
 
         app._develop_raw_backend()
 
-        # Expect file to be DELETED because it was 0 bytes
-        self.assertFalse(tif_path.exists(), "Zombie 0-byte file should be cleaned up")
+        # The empty output was never promoted, so the working TIFF is still
+        # 0 bytes and still not usable.
+        self.assertEqual(tif_path.stat().st_size, 0)
+        self.assertFalse(
+            AppController.is_valid_working_tif(app, tif_path),
+            "A 0-byte working TIFF must not count as a valid one",
+        )
+
+        # No hidden temp file may leak from the failed run.
+        leftovers = [
+            q.name
+            for q in tif_path.parent.iterdir()
+            if q.name.startswith(f".{tif_path.stem}_")
+        ]
+        self.assertEqual(leftovers, [], f"Temp files left behind: {leftovers}")
 
     @patch("faststack.app.QTimer.singleShot")
     @patch("faststack.app.os.path.exists")
-    @patch("faststack.app.subprocess.run")
+    @patch("faststack.app.subprocess.Popen")
     @patch("faststack.config.config.get")
     @patch("faststack.app.threading.Thread")
     def test_develop_raw_timeout(
@@ -116,32 +148,27 @@ class TestRawPipeline(unittest.TestCase):
 
         mock_thread.return_value.start.side_effect = side_effect_start
 
-        mock_run.side_effect = subprocess.TimeoutExpired(
+        mock_run.return_value.communicate.side_effect = subprocess.TimeoutExpired(
             cmd="rawtherapee-cli", timeout=60
         )
 
         app = MagicMock()
         app.image_files = [self.image_file]
         app.current_index = 0
+        _stub_develop_guards(app)
         app._develop_raw_backend = AppController._develop_raw_backend.__get__(
             app, AppController
         )
 
         app._develop_raw_backend()
 
-        # Check QTimer call
-        mock_single_shot.assert_called()
-        # call_args[0] is (0, partial_obj)
-        _, callback = mock_single_shot.call_args[0]
-        # callback is functools.partial(self._on_develop_finished, False, err_msg)
-        # For a bound method, callback.func is the method
-        self.assertTrue(hasattr(callback, "func"))
-        self.assertTrue("_on_develop_finished" in str(callback.func))
-        self.assertEqual(callback.args[0], False)  # Success = False
-        self.assertIn("timed out", callback.args[1])  # Msg
+        mock_single_shot.assert_not_called()
+        completion = app._rawDevelopmentFinished.emit.call_args.args[0]
+        self.assertFalse(completion.success)
+        self.assertIn("timed out", completion.error)
 
     @patch("faststack.app.os.path.exists")
-    @patch("faststack.app.subprocess.run")
+    @patch("faststack.app.subprocess.Popen")
     @patch("faststack.config.config.get")
     @patch("faststack.app.threading.Thread")
     def test_develop_raw_with_custom_args(
@@ -169,14 +196,13 @@ class TestRawPipeline(unittest.TestCase):
 
         mock_thread.return_value.start.side_effect = side_effect_start
 
-        # Mock subprocess.run
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.communicate.return_value = ("", "")
 
         app = MagicMock()
         app.image_files = [self.image_file]
         app.current_index = 0
+        _stub_develop_guards(app)
         app._develop_raw_backend = AppController._develop_raw_backend.__get__(
             app, AppController
         )
@@ -239,7 +265,7 @@ class TestRawPipeline(unittest.TestCase):
         self.assertFalse(img2.has_raw)
 
     @patch("faststack.app.os.path.exists")
-    @patch("faststack.app.subprocess.run")
+    @patch("faststack.app.subprocess.Popen")
     @patch("faststack.config.config.get")
     def test_develop_raw_slot(self, mock_config_get, mock_run, mock_exists):
         """Test the develop_raw_for_current_image slot."""
@@ -275,14 +301,16 @@ class TestRawPipeline(unittest.TestCase):
         editor = ImageEditor()
 
         tif_path = self.tmp_path / "working-working.tif"
-        tif_path.touch()  # Ensure it exists for backup logic
+        # The atomic save transaction validates its rollback source, so use a
+        # minimal non-empty TIFF stand-in rather than a zero-byte zombie.
+        tif_path.write_bytes(b"II\x2a\x00")
 
         editor.load_image(str(self.jpg_path))
         editor.current_filepath = tif_path  # Trick it into "saving a TIFF"
 
         editor.current_edits["exposure"] = 1.0  # +1 EV -> 2x gain
 
-        def fake_write_tiff_16bit(path: Path, arr_float: np.ndarray):
+        def fake_write_tiff_16bit(path: Path, arr_float: np.ndarray, **_metadata):
             # Write a minimal TIFF header so downstream checks are meaningful.
             # Little-endian TIFF: "II*\x00"
             with open(path, "wb") as f:

@@ -5,6 +5,7 @@ import time
 import pytest
 
 from faststack.util.executors import (
+    DaemonThreadPoolExecutor,
     create_daemon_threadpool_executor,
     create_priority_executor,
 )
@@ -109,11 +110,12 @@ def test_spawn_overhead_and_error_handling():
     """Test that the creator correctly propagates errors if something was broken."""
     # This checks the defensive coding in create_daemon_threadpool_executor
 
-    # Since we can't easily inject a failure into ThreadPoolExecutor constructor directly
-    # without patching, we'll verify it works normally and has the expected structure.
-
+    # The daemon pool is deliberately NOT a ThreadPoolExecutor subclass any more
+    # (FS-P1-003: stdlib workers are joined at interpreter exit even when they
+    # are daemon threads). Assert the contract callers actually use instead.
     executor = create_daemon_threadpool_executor(max_workers=1)
-    assert isinstance(executor, concurrent.futures.ThreadPoolExecutor)
+    assert isinstance(executor, DaemonThreadPoolExecutor)
+    assert isinstance(executor.submit(lambda: 7), concurrent.futures.Future)
     executor.shutdown()
 
     # Verify ValueError on invalid workers

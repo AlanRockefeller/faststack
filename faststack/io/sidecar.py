@@ -5,6 +5,7 @@ import dataclasses
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from contextlib import contextmanager
@@ -71,6 +72,9 @@ def _sidecar_to_json(sidecar: Sidecar) -> dict:
             key: _entrymetadata_to_json(meta) for key, meta in sidecar.entries.items()
         },
         "stacks": copy.deepcopy(sidecar.stacks),
+        "stack_paths": copy.deepcopy(sidecar.stack_paths),
+        "stack_order": copy.deepcopy(sidecar.stack_order),
+        "ambiguous_legacy_keys": list(sidecar.ambiguous_legacy_keys),
     }
 
 
@@ -79,6 +83,9 @@ def _sidecar_from_json(data: dict) -> Sidecar:
     entries_data = data.get("entries", {})
     if not isinstance(entries_data, dict):
         raise TypeError("sidecar entries must be an object")
+    ambiguous_legacy_keys = data.get("ambiguous_legacy_keys", [])
+    if not isinstance(ambiguous_legacy_keys, list):
+        ambiguous_legacy_keys = []
     return Sidecar(
         version=data.get("version", 2),
         last_index=data.get("last_index", 0),
@@ -94,6 +101,11 @@ def _sidecar_from_json(data: dict) -> Sidecar:
             if isinstance(meta, dict)
         },
         stacks=copy.deepcopy(data.get("stacks", [])),
+        stack_paths=copy.deepcopy(data.get("stack_paths", [])),
+        stack_order=copy.deepcopy(data.get("stack_order", [])),
+        ambiguous_legacy_keys=[
+            key for key in ambiguous_legacy_keys if isinstance(key, str) and key
+        ],
     )
 
 
@@ -152,9 +164,235 @@ def _merge_entries(base, ours, theirs) -> dict:
     return merged
 
 
+def _valid_stack_identity(payload: dict) -> Optional[tuple[list[list[str]], list[str]]]:
+    """Return validated semantic stack groups and their image order."""
+    groups = payload.get("stack_paths")
+    order = payload.get("stack_order")
+    if not isinstance(groups, list) or not isinstance(order, list):
+        return None
+    # A serializer round-trip of a legacy, index-only sidecar adds empty
+    # identity fields.  Those fields are not semantic evidence that its
+    # still-present numeric stacks were intentionally cleared.
+    if payload.get("stacks") and not groups:
+        return None
+    if any(not isinstance(key, str) or not key for key in order):
+        return None
+    if len(order) != len(set(order)):
+        return None
+    known = set(order)
+    normalized = []
+    for group in groups:
+        if not isinstance(group, list) or not group:
+            return None
+        if any(not isinstance(key, str) or key not in known for key in group):
+            return None
+        normalized.append(list(dict.fromkeys(group)))
+    return normalized, list(order)
+
+
+def _project_stack_groups(
+    groups: list[list[str]], order: list[str]
+) -> Optional[tuple[list[list[int]], list[list[str]]]]:
+    """Project distinct groups to ranges, or reject an unsafe representation."""
+    order_index = {key: index for index, key in enumerate(order)}
+    projected = []
+    seen_members = set()
+    for group in groups:
+        # Concurrent writers can legitimately remove an image while another
+        # writer is editing its stack. Project only members that still belong
+        # to the selected order; never resurrect a removed image or index it.
+        group_members = {key for key in group if key in order_index}
+        if len(group_members) < 2:
+            continue
+        if seen_members & group_members:
+            return None
+        seen_members.update(group_members)
+        indices = sorted(order_index[key] for key in group_members)
+        if indices != list(range(indices[0], indices[-1] + 1)):
+            return None
+        projected.append((indices[0], indices[-1], group_members))
+
+    projected.sort(key=lambda item: item[0])
+    for previous, current in zip(projected, projected[1:]):
+        if current[0] <= previous[1] + 1:
+            # Runtime ranges normalize adjacency, which would erase the
+            # persisted boundary between these two logical groups.
+            return None
+    ranges = [[start, end] for start, end, _members in projected]
+    ordered_groups = [
+        [key for key in order[start : end + 1] if key in group_members]
+        for start, end, group_members in projected
+    ]
+    return ranges, ordered_groups
+
+
+def _groups_overlap(groups: list[list[str]]) -> bool:
+    """Report whether any two groups claim the same image identity."""
+    seen: set[str] = set()
+    for group in groups:
+        members = set(group)
+        if seen & members:
+            return True
+        seen |= members
+    return False
+
+
+def _restrict_groups_to_order(
+    groups: list[list[str]], order: list[str]
+) -> list[list[str]]:
+    """Re-express *groups* over *order*, dropping images it no longer holds."""
+    known = set(order)
+    return [
+        [key for key in order if key in group]
+        for group in groups
+        if len(set(group) & known) >= 2
+    ]
+
+
+def _stack_merge_fail_safe(
+    identity: tuple[list[list[str]], list[str]], reason: str
+) -> tuple[list[list[int]], list[list[str]], list[str]]:
+    """Preserve *identity* verbatim without inventing runtime ranges.
+
+    Callers pass the merged groups and order: presence has already been
+    three-way merged, so no identity the other writer removed can reappear
+    here, whatever the groups turn out to look like.
+    """
+    groups, order = identity
+    projected = _project_stack_groups(groups, order)
+    log.warning(
+        "Concurrent stack merge could not preserve group boundaries (%s); "
+        "preserving stack identities without runtime ranges",
+        reason,
+    )
+    ranges = projected[0] if projected is not None else []
+    return ranges, copy.deepcopy(groups), copy.deepcopy(order)
+
+
+def _merge_identity_presence(
+    base_order: list[str], our_order: list[str], their_order: list[str]
+) -> set[str]:
+    """Three-way merge which image identities still exist, ignoring order.
+
+    Presence is a per-identity boolean, so it cannot genuinely conflict: a
+    side that changed it relative to *base_order* wins, and if both changed it
+    they changed it the same way.
+    """
+    base_keys = set(base_order)
+    our_keys = set(our_order)
+    their_keys = set(their_order)
+    present = set()
+    for key in base_keys | our_keys | their_keys:
+        in_base = key in base_keys
+        in_ours = key in our_keys
+        in_theirs = key in their_keys
+        keep = in_theirs if in_ours == in_base else in_ours
+        if keep:
+            present.add(key)
+    return present
+
+
+def _order_present_identities(
+    present: set[str], sources: tuple[list[str], ...]
+) -> list[str]:
+    """Order *present* identities by the first *source* that mentions each.
+
+    The preferred source supplies the ordering; the remaining sources place
+    identities it does not list, such as images the other writer added while
+    this one reordered.
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        for key in source:
+            if key in present and key not in seen:
+                seen.add(key)
+                ordered.append(key)
+    return ordered
+
+
+def _merge_stack_payloads(
+    base: dict, ours: dict, theirs: dict
+) -> Optional[tuple[list[list[int]], list[list[str]], list[str]]]:
+    """Three-way merge distinct stack groups by stable image identity."""
+    base_identity = _valid_stack_identity(base)
+    our_identity = _valid_stack_identity(ours)
+    their_identity = _valid_stack_identity(theirs)
+    if base_identity is None or our_identity is None or their_identity is None:
+        return None
+
+    base_groups, base_order = base_identity
+    our_groups, our_order = our_identity
+    their_groups, their_order = their_identity
+    # Presence and ordering are merged separately. Deciding both from a single
+    # winning order would let the loser's removals be undone whenever the two
+    # writers also disagree about ordering: a concurrently deleted image would
+    # reappear in stack_order simply because our snapshot still lists it.
+    present = _merge_identity_presence(base_order, our_order, their_order)
+    if our_order == base_order:
+        order_source, order_other = their_order, our_order
+    else:
+        # Either we reordered and they did not, or both did. Ordering is not a
+        # data-integrity concern once presence is settled, so the lock holder's
+        # order wins deterministically.
+        order_source, order_other = our_order, their_order
+    merged_order = _order_present_identities(
+        present, (order_source, order_other, base_order)
+    )
+
+    base_group_set = {frozenset(group) for group in base_groups}
+    our_group_set = {frozenset(group) for group in our_groups}
+    their_group_set = {frozenset(group) for group in their_groups}
+    merged_group_set = set()
+    for group in base_group_set | our_group_set | their_group_set:
+        base_value = group in base_group_set
+        our_value = group in our_group_set
+        their_value = group in their_group_set
+        if our_value == base_value:
+            keep = their_value
+        elif their_value == base_value or our_value == their_value:
+            keep = our_value
+        else:  # Boolean group presence cannot reach a genuine conflict.
+            keep = our_value
+        if keep:
+            merged_group_set.add(group)
+
+    merged_order_keys = set(merged_order)
+    merged_order_index = {key: index for index, key in enumerate(merged_order)}
+    merged_groups = [
+        [key for key in merged_order if key in group]
+        for group in merged_group_set
+        if len(group & merged_order_keys) >= 2
+    ]
+    # Group presence was merged through an unordered set; sort by position in
+    # the merged order so the persisted identities are deterministic on every
+    # path, including the fail-safe below, which does not re-sort them.
+    merged_groups.sort(key=lambda group: merged_order_index[group[0]])
+    projected = _project_stack_groups(merged_groups, merged_order)
+    if projected is None:
+        # A reordered non-contiguous group or newly adjacent distinct groups
+        # cannot be expressed by FastStack's normalized runtime ranges, but
+        # they are still a valid identity: keep the merged groups. Reverting
+        # to the lock holder's snapshot here would resurrect images the other
+        # writer concurrently removed.
+        fallback_groups = merged_groups
+        reason = "merged groups are non-contiguous or became adjacent"
+        if _groups_overlap(merged_groups):
+            # Concurrent edits to the same base group left images claimed by
+            # two groups, which is not a valid identity at all. Resolve that
+            # in the lock holder's favour, but only over images that survived
+            # into the merged order.
+            fallback_groups = _restrict_groups_to_order(our_groups, merged_order)
+            reason = "merged groups overlap"
+        return _stack_merge_fail_safe((fallback_groups, merged_order), reason)
+    ranges, ordered_groups = projected
+    return ranges, ordered_groups, merged_order
+
+
 def _merge_sidecar_payloads(base: dict, ours: dict, theirs: dict) -> dict:
     """Merge changes made since ``base`` into the latest disk payload."""
     merged = {}
+    stack_merge = _merge_stack_payloads(base, ours, theirs)
     for key in base.keys() | ours.keys() | theirs.keys():
         if key == "entries":
             value = _merge_entries(
@@ -162,7 +400,38 @@ def _merge_sidecar_payloads(base: dict, ours: dict, theirs: dict) -> dict:
                 ours.get(key, {}),
                 theirs.get(key, {}),
             )
+        elif key == "ambiguous_legacy_keys":
+            # Ambiguity provenance is monotonic: once a legacy key was seen
+            # with multiple possible owners, no later process may make it safe
+            # merely by omitting that observation from its stale snapshot.
+            provenance = set()
+            for source in (base, ours, theirs):
+                source_items = source.get(key, [])
+                if isinstance(source_items, list):
+                    provenance.update(
+                        item for item in source_items if isinstance(item, str) and item
+                    )
+            value = sorted(provenance)
+        elif key in {"stacks", "stack_paths", "stack_order"} and stack_merge:
+            value = {
+                "stacks": stack_merge[0],
+                "stack_paths": stack_merge[1],
+                "stack_order": stack_merge[2],
+            }[key]
         else:
+            if key == "stacks" and stack_merge is None:
+                base_stacks = base.get(key, _MISSING)
+                our_stacks = ours.get(key, _MISSING)
+                their_stacks = theirs.get(key, _MISSING)
+                if (
+                    our_stacks != base_stacks
+                    and their_stacks != base_stacks
+                    and our_stacks != their_stacks
+                ):
+                    log.warning(
+                        "Concurrent legacy index-only stack edits cannot be merged "
+                        "safely; preserving the lock holder's ranges"
+                    )
             value = _select_three_way(
                 base.get(key, _MISSING),
                 ours.get(key, _MISSING),
@@ -252,9 +521,49 @@ class SidecarManager:
         # Identity of the disk file the baseline payload was taken from. Set by
         # load() and by every successful save; see _disk_matches_baseline.
         self._baseline_stamp: Optional[tuple[int, int, int]] = None
+        self._load_failed = False
+        self._dirty = False
+        self._last_save_error: Optional[str] = None
+        self._recovery_backup_notice: Optional[Path] = None
         self.data = self.load()
         # Three-way merge base: the disk state this process last incorporated.
         self._baseline_payload = _sidecar_to_json(self.data)
+        if self._record_ambiguous_legacy_keys():
+            # This is provenance, not ordinary editable metadata. Persist it at
+            # discovery time so removing one colliding JPEG in a later session
+            # cannot make the old entry appear safe to auto-migrate.
+            self.save()
+
+    def _record_ambiguous_legacy_keys(self) -> bool:
+        """Persist stem-only entries that currently match multiple JPEGs."""
+        recorded = set(self.data.ambiguous_legacy_keys)
+        changed = False
+        for key in self.data.entries:
+            if key in recorded or Path(key).suffix.lower() in KNOWN_IMAGE_EXTENSIONS:
+                continue
+            candidate = Path(key)
+            if not candidate.is_absolute():
+                candidate = self.directory / candidate
+            matches = {
+                os.path.normcase(os.path.abspath(str(path)))
+                for suffix in JPG_EXTENSIONS
+                for path in (
+                    candidate.with_suffix(suffix),
+                    candidate.with_suffix(suffix.upper()),
+                )
+                if path.is_file()
+            }
+            if len(matches) > 1:
+                recorded.add(key)
+                changed = True
+                log.warning(
+                    "Preserving ambiguous legacy metadata key %r; multiple JPEG "
+                    "extensions own that stem",
+                    key,
+                )
+        if changed:
+            self.data.ambiguous_legacy_keys[:] = sorted(recorded)
+        return changed
 
     def stop_watcher(self):
         if self.watcher:
@@ -320,10 +629,6 @@ class SidecarManager:
 
     def load(self) -> Sidecar:
         """Loads sidecar data from disk if it exists, otherwise returns a new object."""
-        if not self.path.exists():
-            log.info(f"No sidecar file found at {self.path}. Creating new one.")
-            self._baseline_stamp = None
-            return Sidecar()
         try:
             t_start = time.perf_counter()
             # Stamp before reading: if a foreign write lands in between we keep
@@ -342,25 +647,81 @@ class SidecarManager:
                 )
             if data.get("version") != 2:
                 log.warning("Old sidecar format detected. Starting fresh.")
+                self._load_failed = True
                 return Sidecar()
 
             return _sidecar_from_json(data)
-        except (json.JSONDecodeError, TypeError) as e:
-            log.error(f"Failed to load or parse sidecar file {self.path}: {e}")
-            # Consider backing up the corrupted file here
+        except FileNotFoundError:
+            log.info(f"No sidecar file found at {self.path}. Creating new one.")
+            self._baseline_stamp = None
+            return Sidecar()
+        except (OSError, json.JSONDecodeError, TypeError) as e:
+            self._load_failed = True
+            log.warning(
+                "Could not read sidecar %s; using safe in-memory state and "
+                "preserving the unreadable file: %s",
+                self.path,
+                e,
+            )
             return Sidecar()
 
-    def save(self):
-        """Merge this process's changes with disk, then save atomically."""
+    @property
+    def dirty(self) -> bool:
+        """Whether state still needs a successful durable write."""
+        return self._dirty
+
+    @property
+    def last_save_error(self) -> Optional[str]:
+        return self._last_save_error
+
+    def take_recovery_backup_notice(self) -> Optional[Path]:
+        """Return and clear the unreadable-sidecar backup notification."""
+        backup = self._recovery_backup_notice
+        self._recovery_backup_notice = None
+        return backup
+
+    def save(self, *, replace_unreadable: bool = False) -> bool:
+        """Merge and atomically persist state, returning durable success.
+
+        A sidecar that could not be read is never overwritten without recovery.
+        If a later read succeeds, normal merge/save resumes. Otherwise the
+        first requested write preserves the unknown original under a unique
+        backup name before atomically creating the new sidecar. The keyword is
+        retained for API compatibility; recovery is automatic either way.
+        """
         with self._save_lock:
+            self._dirty = True
             try:
                 with self._state_lock:
                     ours = _sidecar_to_json(self.data)
+                recovered_payload = None
                 with _sidecar_write_lock(self._write_lock_path):
+                    if self._load_failed:
+                        recovered_payload = self._read_disk_payload()
+                        if recovered_payload is not None:
+                            self._load_failed = False
+                        elif self.path.exists():
+                            recovery_backup = self.path.with_name(
+                                f"{self.path.name}.unreadable-{time.time_ns()}.bak"
+                            )
+                            shutil.copy2(self.path, recovery_backup)
+                            log.warning(
+                                "Preserved unreadable sidecar as %s before recovery",
+                                recovery_backup,
+                            )
+                            self._recovery_backup_notice = recovery_backup
+                            self._load_failed = False
+                        else:
+                            self._load_failed = False
+
                     theirs = (
-                        None
-                        if self._disk_matches_baseline()
-                        else self._read_disk_payload()
+                        recovered_payload
+                        if recovered_payload is not None
+                        else (
+                            None
+                            if self._disk_matches_baseline()
+                            else self._read_disk_payload()
+                        )
                     )
                     if theirs is None:
                         # Either nobody has touched the file since our baseline,
@@ -371,8 +732,10 @@ class SidecarManager:
                         atomic_write_json(self.path, ours)
                         self._baseline_payload = ours
                         self._baseline_stamp = self._disk_stamp()
+                        self._dirty = False
+                        self._last_save_error = None
                         log.debug(f"Saved sidecar file to {self.path}")
-                        return
+                        return True
 
                     merged = _merge_sidecar_payloads(
                         self._baseline_payload,
@@ -394,6 +757,11 @@ class SidecarManager:
                     # ``self.stacks``, so rebinding it would hide merged-in
                     # stacks from the UI and let the next save overwrite them.
                     self.data.stacks[:] = merged_data.stacks
+                    self.data.stack_paths[:] = merged_data.stack_paths
+                    self.data.stack_order[:] = merged_data.stack_order
+                    self.data.ambiguous_legacy_keys[:] = (
+                        merged_data.ambiguous_legacy_keys
+                    )
                     for key in list(self.data.entries):
                         if key not in merged_data.entries:
                             del self.data.entries[key]
@@ -411,9 +779,14 @@ class SidecarManager:
 
                     self._baseline_payload = _sidecar_to_json(self.data)
                 log.debug(f"Merged and saved sidecar file to {self.path}")
+                self._dirty = False
+                self._last_save_error = None
+                return True
 
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as e:
+                self._last_save_error = str(e)
                 log.error(f"Failed to merge or save sidecar file {self.path}: {e}")
+                return False
 
     @overload
     def get_metadata(
@@ -459,17 +832,25 @@ class SidecarManager:
         User-action paths keep migrate=True so ancient entries still get
         migrated when an image is actually viewed or modified.
         """
-        stable_key, candidate_keys = self._lookup_keys(image_ref)
+        # Stable keys are authoritative and require no legacy filesystem
+        # ambiguity probes. Build the broader fallback list only after a miss.
+        stable_key, candidate_keys = self._lookup_keys(
+            image_ref, include_legacy_stems=False
+        )
         if not stable_key:
             if create:
                 raise ValueError(f"image_ref must not be empty: {image_ref!r}")
             return None
 
         with self._state_lock:
+            ambiguous_legacy_keys = set(self.data.ambiguous_legacy_keys)
             meta = self.data.entries.get(stable_key)
             if meta is None:
+                _stable_key, candidate_keys = self._lookup_keys(image_ref)
                 for candidate_key in candidate_keys:
                     if candidate_key == stable_key:
+                        continue
+                    if candidate_key in ambiguous_legacy_keys:
                         continue
                     candidate_meta = self.data.entries.get(candidate_key)
                     if candidate_meta is None:
@@ -486,6 +867,8 @@ class SidecarManager:
             if meta is None and migrate:
                 for existing_key, existing_meta in list(self.data.entries.items()):
                     if existing_key == stable_key:
+                        continue
+                    if existing_key in ambiguous_legacy_keys:
                         continue
                     if (
                         self._stable_key_from_key(existing_key, check_fs=True)
@@ -518,10 +901,18 @@ class SidecarManager:
 
         try:
             relative = abs_path.relative_to(self._base_dir_normcased)
-            stable_path = relative.parent / relative.stem
+            stable_path = (
+                relative
+                if relative.suffix.lower() in JPG_EXTENSIONS
+                else relative.parent / relative.stem
+            )
             result = str(stable_path).replace("\\", "/")
         except ValueError:
-            stable_path = abs_path.parent / abs_path.stem
+            stable_path = (
+                abs_path
+                if abs_path.suffix.lower() in JPG_EXTENSIONS
+                else abs_path.parent / abs_path.stem
+            )
             result = str(stable_path).replace("\\", "/")
 
         if len(self._stable_key_cache) >= self._key_cache_max:
@@ -529,14 +920,22 @@ class SidecarManager:
         self._stable_key_cache[cache_key] = result
         return result
 
-    def _lookup_keys(self, image_ref: Union[str, Path]) -> tuple[str, list[str]]:
+    def _lookup_keys(
+        self,
+        image_ref: Union[str, Path],
+        *,
+        include_legacy_stems: bool = True,
+    ) -> tuple[str, list[str]]:
         """Return (stable_key, migration_candidate_keys) for a metadata lookup."""
         if isinstance(image_ref, Path):
             if not image_ref.name:
                 return "", []
             stable_key = self.metadata_key_for_path(image_ref)
             full_name_key = self._metadata_filename_key(image_ref)
-            return stable_key, [full_name_key, image_ref.stem]
+            legacy_keys = [full_name_key]
+            if include_legacy_stems and not self._jpeg_stem_is_ambiguous(image_ref):
+                legacy_keys.extend(self._legacy_stem_keys(image_ref, stable_key))
+            return stable_key, legacy_keys
 
         value = str(image_ref)
         if not value:
@@ -550,9 +949,48 @@ class SidecarManager:
             path = Path(value)
             stable_key = self.metadata_key_for_path(path)
             full_name_key = self._metadata_filename_key(path)
-            return stable_key, [full_name_key, path.stem]
+            legacy_keys = [full_name_key]
+            if include_legacy_stems and not self._jpeg_stem_is_ambiguous(path):
+                legacy_keys.extend(self._legacy_stem_keys(path, stable_key))
+            return stable_key, legacy_keys
 
         return value, [value]
+
+    def _legacy_stem_keys(self, path: Path, stable_key: str) -> list[str]:
+        """Return unambiguous extensionless/RAW keys used by older releases."""
+        if path.suffix.lower() not in JPG_EXTENSIONS:
+            return [path.stem]
+
+        stem_key = str(Path(stable_key).with_suffix("")).replace("\\", "/")
+        parent = Path(stable_key).parent
+        raw_keys = []
+        for suffix in sorted(RAW_EXTENSIONS):
+            raw_name = f"{path.stem}{suffix}"
+            raw_keys.append(
+                str(parent / raw_name).replace("\\", "/")
+                if str(parent) != "."
+                else raw_name
+            )
+            upper_name = f"{path.stem}{suffix.upper()}"
+            raw_keys.append(
+                str(parent / upper_name).replace("\\", "/")
+                if str(parent) != "."
+                else upper_name
+            )
+        return list(dict.fromkeys([stem_key, path.stem, *raw_keys]))
+
+    def _jpeg_stem_is_ambiguous(self, image_path: Path) -> bool:
+        """Return whether another JPEG extension owns the same stem."""
+        if image_path.suffix.lower() not in JPG_EXTENSIONS:
+            return False
+        path = image_path if image_path.is_absolute() else self.directory / image_path
+        suffix = path.suffix.lower()
+        for other_suffix in JPG_EXTENSIONS - {suffix}:
+            if path.with_suffix(other_suffix).exists():
+                return True
+            if path.with_suffix(other_suffix.upper()).exists():
+                return True
+        return False
 
     def _metadata_filename_key(self, image_path: Union[str, Path]) -> str:
         """Return the extension-preserving key used by the regressed patch."""
@@ -623,7 +1061,7 @@ class SidecarManager:
             self.data.last_index = index
             self.data.last_path = last_path
 
-    def update_metadata(self, image_ref: Union[str, Path], updates: dict):
+    def update_metadata(self, image_ref: Union[str, Path], updates: dict) -> bool:
         """Update multiple metadata fields for an image and save if changed."""
         meta = self.get_metadata(image_ref, create=True)
         changed = False
@@ -636,4 +1074,5 @@ class SidecarManager:
                 log.warning(f"Unknown metadata key: {key}")
 
         if changed:
-            self.save()
+            return self.save()
+        return True

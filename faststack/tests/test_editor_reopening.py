@@ -8,6 +8,7 @@ sys.path.append(str(Path(__file__).parents[2]))
 
 from faststack.app import AppController
 from faststack.models import EntryMetadata
+from faststack.tests.conftest import make_config_mock
 
 
 class TestEditorReopening(unittest.TestCase):
@@ -19,7 +20,7 @@ class TestEditorReopening(unittest.TestCase):
             patch("faststack.app.Prefetcher"),
             patch("faststack.app.ByteLRUCache"),
             patch("faststack.app.ThumbnailProvider"),
-            patch("faststack.app.config"),
+            patch("faststack.app.config", new_callable=make_config_mock),
             patch("faststack.app.setup_logging"),
             patch("faststack.app.UIState"),
             patch(
@@ -45,6 +46,13 @@ class TestEditorReopening(unittest.TestCase):
         mock_file.path = Path("test.jpg")
         self.controller.image_files = [mock_file]
         self.controller.current_index = 0
+
+        # ui_state is a MagicMock, so boolean flags read as truthy unless set.
+        # The editor-load guards check isCropping/isSaving before doing anything.
+        self.controller.ui_state.isCropping = False
+        self.controller.ui_state.isSaving = False
+        self.controller.ui_state.isEditorOpen = False
+        self.controller.ui_state.isEditorExpanded = False
 
     def tearDown(self):
         for p in self.patchers:
@@ -175,13 +183,23 @@ class TestEditorReopening(unittest.TestCase):
         # 1. Setup
         target = Path("test.jpg")
         target_abs = self.controller._key(target)
+        # save_edited_image only closes the UI when the editor is open *and*
+        # expanded, so both flags have to be set for this scenario.
         self.controller.ui_state.isEditorOpen = True
+        self.controller.ui_state.isEditorExpanded = True
         self.controller.image_editor.current_filepath = target
         self.controller.image_editor.session_id = "sess-1"
         self.controller.image_editor.current_mtime = 123.4
 
         # Mock snapshot
         self.controller.image_editor.snapshot_for_export.return_value = MagicMock()
+
+        # A save is only prepared when the editor's revision has advanced past
+        # the one the live session last submitted, so open the session at rev 1
+        # and then simulate an edit.
+        self.controller.image_editor._edits_rev = 1
+        self.controller._ensure_live_edit_session_state()
+        self.controller.image_editor._edits_rev = 2
 
         with patch.object(self.controller, "_save_executor"):
             # 2. CALL SAVE
@@ -249,7 +267,7 @@ class TestEditorReopening(unittest.TestCase):
 
         # Put the image key in saving_keys
         save_key = self.controller._key(target)
-        self.controller._saving_keys = {save_key}
+        self.controller._saving_keys = {save_key: 1}
         self.controller.ui_state.isCropping = False
 
         with patch.object(self.controller, "load_image_for_editing") as mock_load:
@@ -261,7 +279,7 @@ class TestEditorReopening(unittest.TestCase):
 
     def test_crop_mode_blocked_when_load_fails(self):
         """toggle_crop_mode must not set isCropping when load_image_for_editing fails."""
-        self.controller._saving_keys = set()
+        self.controller._saving_keys = {}
         self.controller.ui_state.isCropping = False
 
         with patch.object(
@@ -296,7 +314,7 @@ class TestEditorReopening(unittest.TestCase):
 
         save_result = {
             "success": True,
-            "result": (target, None),
+            "result": (target, Path("test.jpg.bak")),
             "target": target_abs,
             "save_image_key": target_abs,
             "session_token": (target_abs, None, "sess-1", save_rev),
@@ -325,7 +343,7 @@ class TestEditorReopening(unittest.TestCase):
 
         save_result = {
             "success": True,
-            "result": (target, None),
+            "result": (target, Path("test.jpg.bak")),
             "target": target_abs,
             "save_image_key": target_abs,
             "session_token": (target_abs, None, "sess-1", rev),
@@ -422,11 +440,13 @@ class TestEditorReopening(unittest.TestCase):
                 "uploaded_date": None,
                 "edited": False,
                 "edited_date": None,
+                "edit_state": None,
                 "restacked": False,
                 "restacked_date": None,
                 "favorite": True,
                 "todo": False,
                 "todo_date": None,
+                "batch": False,
             },
         )
         self.assertIs(action_data["sidecar"], origin_sidecar)
@@ -436,8 +456,8 @@ class TestEditorReopening(unittest.TestCase):
 
     def test_save_finished_malformed_result_clears_saving_status_message(self):
         target = self.controller._key(Path("test.jpg"))
-        self.controller._saves_in_flight = {target}
-        self.controller._saving_keys = {target}
+        self.controller._saves_in_flight = {target: 1}
+        self.controller._saving_keys = {target: 1}
         self.controller.ui_state.isSaving = True
 
         with patch.object(self.controller, "update_status_message") as mock_status:
@@ -452,13 +472,13 @@ class TestEditorReopening(unittest.TestCase):
 
         self.assertFalse(self.controller.ui_state.isSaving)
         mock_status.assert_called_once_with(
-            "Save finished, but the result payload was malformed.", timeout=5000
+            "Save failed: Save did not produce a valid output and backup", timeout=5000
         )
 
     def test_save_finished_oversized_tuple_uses_malformed_result_cleanup(self):
         target = self.controller._key(Path("test.jpg"))
-        self.controller._saves_in_flight = {target}
-        self.controller._saving_keys = {target}
+        self.controller._saves_in_flight = {target: 1}
+        self.controller._saving_keys = {target: 1}
         self.controller.ui_state.isSaving = True
 
         with patch.object(self.controller, "update_status_message") as mock_status:
@@ -473,7 +493,7 @@ class TestEditorReopening(unittest.TestCase):
 
         self.assertFalse(self.controller.ui_state.isSaving)
         mock_status.assert_called_once_with(
-            "Save finished, but the result payload was malformed.", timeout=5000
+            "Save failed: Save did not produce a valid output and backup", timeout=5000
         )
 
     def test_undo_save_edit_restores_only_owned_metadata_fields(self):
@@ -614,7 +634,10 @@ class TestEditorReopening(unittest.TestCase):
                 self.controller.quick_auto_white_balance()
 
         self.controller.image_editor.load_image.assert_called_once_with(
-            str(developed_path), cached_preview=unittest.mock.ANY, preview_only=True
+            str(developed_path),
+            cached_preview=unittest.mock.ANY,
+            source_exif=None,
+            preview_only=True,
         )
 
 

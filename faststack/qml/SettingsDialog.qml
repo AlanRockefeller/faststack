@@ -47,7 +47,6 @@ Window {
     property string secondaryRawSourceDir: ""
     property string optimizeFor: "speed"
     property bool updateCheckEnabled: true
-    property bool autoUpdateEnabled: false
 
     property string awbMode: "lab"
     property double awbStrength: 0.7
@@ -182,7 +181,6 @@ Window {
             settingsDialog.defaultDirectory = settingsDialog.uiStateRef.get_default_directory()
             settingsDialog.optimizeFor = settingsDialog.uiStateRef.get_optimize_for()
             settingsDialog.updateCheckEnabled = settingsDialog.uiStateRef.get_update_check_enabled()
-            settingsDialog.autoUpdateEnabled = settingsDialog.uiStateRef.get_auto_update_enabled()
             settingsDialog.autoLevelClippingThreshold = settingsDialog.uiStateRef.autoLevelClippingThreshold
             settingsDialog.autoLevelBlackThreshold = settingsDialog.uiStateRef.autoLevelBlackThreshold
             settingsDialog.autoLevelStrength = settingsDialog.uiStateRef.autoLevelStrength
@@ -218,14 +216,19 @@ Window {
         cacheUsageTimer.running = settingsDialog.visible
         if (settingsDialog.visible) {
             if (settingsDialog.controllerRef) {
-                settingsDialog.controllerRef.dialog_opened()
+                settingsDialog.controllerRef.dialog_opened("qml-settings")
             }
             settingsDialog.refreshTextFields()
         } else {
             if (settingsDialog.controllerRef) {
-                settingsDialog.controllerRef.dialog_closed()
+                settingsDialog.controllerRef.dialog_closed("qml-settings")
             }
         }
+    }
+
+    Component.onDestruction: {
+        if (settingsDialog.controllerRef)
+            settingsDialog.controllerRef.dialog_closed("qml-settings")
     }
 
     function saveSettings() {
@@ -249,7 +252,6 @@ Window {
         state.set_default_directory(settingsDialog.defaultDirectory)
         state.set_optimize_for(settingsDialog.optimizeFor)
         state.set_update_check_enabled(settingsDialog.updateCheckEnabled)
-        state.set_auto_update_enabled(settingsDialog.autoUpdateEnabled)
         state.autoLevelClippingThreshold = settingsDialog.autoLevelClippingThreshold
         state.autoLevelBlackThreshold = settingsDialog.autoLevelBlackThreshold
         state.autoLevelStrength = settingsDialog.autoLevelStrength
@@ -996,28 +998,13 @@ Window {
                             }
 
                             Label {
-                                text: "Install Updates Automatically"
+                                text: "FastStack tells you when a new version is out. It does not download or install updates."
                                 color: settingsDialog.textColor
-                                opacity: 0.55
-                            }
-                            CheckBox {
-                                id: autoUpdateBox
-                                text: "Unavailable"
-                                enabled: false
-                                checked: settingsDialog.autoUpdateEnabled
-                                opacity: 0.55
-                                hoverEnabled: true
-                                ToolTip.visible: hovered
-                                ToolTip.delay: 500
-                                ToolTip.text: "Automatic installation is disabled for source and virtualenv installs. FastStack can open the GitHub release page instead."
-                                contentItem: Text { text: autoUpdateBox.text; color: settingsDialog.textColor; leftPadding: autoUpdateBox.indicator.width + autoUpdateBox.spacing; verticalAlignment: Text.AlignVCenter }
-                                indicator: Rectangle {
-                                    implicitWidth: 18; implicitHeight: 18
-                                    x: autoUpdateBox.leftPadding; y: parent.height / 2 - height / 2
-                                    radius: 3
-                                    border.color: settingsDialog.controlBorder
-                                    color: "transparent"
-                                }
+                                opacity: 0.7
+                                font.pixelSize: 12
+                                wrapMode: Text.WordWrap
+                                Layout.columnSpan: 2
+                                Layout.fillWidth: true
                             }
 
                             Label {

@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from faststack.tests.conftest import make_config_mock
+
 # We mock AppController dependencies here
 # Assuming these tests are run in an environment where faststack is importable
 
@@ -28,7 +30,7 @@ def qapplication():
 @patch("faststack.app.find_images_with_variants")
 @patch("faststack.app.SidecarManager")
 @patch("faststack.app.ThumbnailModel")
-@patch("faststack.app.config")
+@patch("faststack.app.config", new_callable=make_config_mock)
 def test_startup_optimization(
     MockConfig,
     MockThumbnailModel,
@@ -87,7 +89,7 @@ def test_startup_optimization(
 @patch("faststack.app.find_images_with_variants")
 @patch("faststack.app.SidecarManager")
 @patch("faststack.app.ThumbnailModel")
-@patch("faststack.app.config")
+@patch("faststack.app.config", new_callable=make_config_mock)
 def test_filter_optimization(
     MockConfig,
     MockThumbnailModel,

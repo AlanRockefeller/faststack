@@ -2,7 +2,6 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 from PIL import ExifTags, Image
 
@@ -14,14 +13,12 @@ class TestExifOrientation(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.editor = ImageEditor()
 
-        # Patch cv2 in the editor module if needed for some tests,
-        # but ImageEditor logic mainly uses PIL/numpy unless specialized.
-        # If we really need to mock cv2, we should do it on the imported module attribute.
-        self.cv2_patch = patch("faststack.imaging.editor.cv2", MagicMock())
-        self.mock_cv2 = self.cv2_patch.start()
+        # cv2 is a hard dependency of the editor's decode, resize, warp and
+        # export paths, so these end-to-end save tests run against the real
+        # module — a MagicMock stand-in produces mock arrays that blow up on
+        # the first numpy conversion.
 
     def tearDown(self):
-        self.cv2_patch.stop()
         shutil.rmtree(self.test_dir)
 
     def _create_test_image(self, filename, orientation=1):

@@ -1,4 +1,5 @@
 import hashlib
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -69,6 +70,11 @@ def test_apply_edits_no_copy_does_not_mutate_input():
     ), "float_image was mutated by _apply_edits on the no-copy path"
 
 
+def _stub_pil_save(fp, *args, **kwargs):
+    """Stand in for ``PIL.Image.Image.save`` while still creating the file."""
+    Path(fp).write_bytes(b"stub-jpeg")
+
+
 def test_save_image_passes_float_image_without_copy_when_safe(tmp_path):
     """
     Wiring test: prove save_image uses the same float_image object when _edits_can_share_input is True.
@@ -120,6 +126,11 @@ def test_save_image_passes_float_image_without_copy_when_safe(tmp_path):
             seen["same_obj"] = True
         return real_apply(arr, for_export=for_export, *args, **kwargs)
 
+    def make_valid_backup(_source):
+        backup = tmp_path / "backup.jpg"
+        backup.write_bytes(b"backup")
+        return backup
+
     # Mock all the save_image I/O edges locally or on the instance
     # We no longer patch Path.exists or Path.stat globally!
 
@@ -131,9 +142,11 @@ def test_save_image_passes_float_image_without_copy_when_safe(tmp_path):
         patch.object(ed, "_apply_edits", side_effect=spy_apply),
         patch(
             "faststack.imaging.editor.create_backup_file",
-            return_value=tmp_path / "backup.jpg",
+            side_effect=make_valid_backup,
         ),
-        patch("PIL.Image.Image.save"),
+        # The export writes to a hidden temp file and then atomically replaces
+        # the target, so a save stub must still produce a file on disk.
+        patch("PIL.Image.Image.save", side_effect=_stub_pil_save),
         patch.object(ed, "_restore_file_times"),
         patch.object(ed, "_get_sanitized_exif_bytes", return_value=None),
     ):

@@ -1,4 +1,6 @@
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,8 +13,6 @@ project_root = str(Path(__file__).parents[1])
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# Pre-mock modules that might cause issues or aren't needed for this test
-sys.modules["cv2"] = MagicMock()
 # Mock faststack.models since it's used by editor.py
 # The instruction implies removing 'faststack.models' from a patch.dict,
 # but it's currently a direct assignment.
@@ -124,8 +124,12 @@ class TestExifCompat(unittest.TestCase):
     def test_save_uses_sanitizer_for_sidecar(self):
         """Verify save_image calls sanitizer for sidecar when rotation baked in."""
         # Setup: source bytes present, edits imply rotation (or not, since we always bake now)
+        # The save writes real files, so keep them inside a temp dir rather than
+        # dropping test.jpg into whatever the current working directory is.
+        tmp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
         self.editor._source_exif_bytes = b"source_bytes"
-        self.editor.current_filepath = Path("test.jpg")
+        self.editor.current_filepath = tmp_dir / "test.jpg"
         self.editor.float_image = np.zeros((10, 10, 3), dtype=np.float32)
 
         # Mock dependencies specifically for this test
@@ -140,7 +144,12 @@ class TestExifCompat(unittest.TestCase):
             patch("PIL.Image.fromarray") as mock_fromarray,
             patch.object(self.editor, "_write_tiff_16bit") as _mock_tiff,
         ):
+            # The export writes a hidden temp file then atomically replaces the
+            # target, so the stubbed image still has to produce a file on disk.
             mock_img = MagicMock()
+            mock_img.save.side_effect = lambda fp, *a, **k: Path(fp).write_bytes(
+                b"stub-jpeg"
+            )
             mock_fromarray.return_value = mock_img
 
             # Action: Save with sidecar

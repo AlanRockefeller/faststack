@@ -88,21 +88,35 @@ class _Qt(IntFlag):
 
 
 def _load_keybinder_class():
+    """Import keystrokes.py against a stub PySide6 so no real Qt is needed.
+
+    The stub modules are installed only for the duration of the import and
+    then restored — leaving them in ``sys.modules`` breaks every later test
+    in the session that imports real Qt symbols.
+    """
     qtcore = types.ModuleType("PySide6.QtCore")
     qtcore.Qt = _Qt
     pyside6 = types.ModuleType("PySide6")
     pyside6.QtCore = qtcore
+
+    saved = {name: sys.modules.get(name) for name in ("PySide6", "PySide6.QtCore")}
     sys.modules["PySide6"] = pyside6
     sys.modules["PySide6.QtCore"] = qtcore
-
-    spec = importlib.util.spec_from_file_location(
-        "faststack_test_keystrokes",
-        KEYSTROKES_PATH,
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module.Keybinder
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "faststack_test_keystrokes",
+            KEYSTROKES_PATH,
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module.Keybinder
+    finally:
+        for name, original in saved.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
 
 
 class _Event:
@@ -148,6 +162,7 @@ def test_clear_active_auto_adjust_state_clears_editor_even_if_editor_ui_is_open(
         _active_auto_adjust_state=object(),
         ui_state=SimpleNamespace(isEditorOpen=True),
         image_editor=SimpleNamespace(clear=Mock()),
+        _clear_crop_mode_snapshot=Mock(),
     )
 
     clear_active_auto_adjust_state(controller, clear_editor=True)
@@ -169,6 +184,7 @@ def test_undo_flushes_pending_auto_adjust_save_before_reporting_nothing_to_undo(
         _restore_metadata_snapshot=Mock(),
         _post_undo_refresh_and_select=Mock(),
         sidecar=object(),
+        _is_current_live_edit_session_dirty=Mock(return_value=False),
     )
 
     def flush_pending():
@@ -196,6 +212,7 @@ def test_quick_auto_levels_stays_preview_only():
     quick_auto_levels = _extract_app_method("quick_auto_levels")
     controller = SimpleNamespace(
         image_files=[object()],
+        _block_auto_adjust_during_crop=Mock(return_value=False),
         update_status_message=Mock(),
         _clear_active_auto_adjust_state=Mock(),
         _ensure_active_image_loaded_for_auto_adjust=Mock(
@@ -218,6 +235,7 @@ def test_quick_auto_adjust_stays_preview_only():
     quick_auto_adjust = _extract_app_method("quick_auto_adjust")
     controller = SimpleNamespace(
         image_files=[object()],
+        _block_auto_adjust_during_crop=Mock(return_value=False),
         _last_auto_levels_msg="",
         update_status_message=Mock(),
         _clear_active_auto_adjust_state=Mock(),
@@ -248,6 +266,7 @@ def test_quick_auto_white_balance_stays_preview_only():
     quick_auto_white_balance = _extract_app_method("quick_auto_white_balance")
     controller = SimpleNamespace(
         image_files=[object()],
+        _block_auto_adjust_during_crop=Mock(return_value=False),
         update_status_message=Mock(),
         _clear_active_auto_adjust_state=Mock(),
         _ensure_active_image_loaded_for_auto_adjust=Mock(

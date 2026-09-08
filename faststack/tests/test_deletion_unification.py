@@ -432,9 +432,11 @@ def test_recycle_failure_prompts_perm_delete(mock_controller, tmp_path):
         # Called twice: 1. initial delete, 2. perm delete
         assert mock_controller._delete_executor.submit.call_count == 2
 
-        # Verify the last call was for _perm_delete_worker
+        # Permanent deletion remains inside the existing critical-I/O wrapper;
+        # the worker itself is passed through as the wrapped operation.
         args, _ = mock_controller._delete_executor.submit.call_args
-        assert args[0] == AppController._perm_delete_worker
+        assert args[0] == mock_controller._run_critical_user_data_operation
+        assert args[2] == AppController._perm_delete_worker
 
         # Simulate async worker completion
         perm_result = {

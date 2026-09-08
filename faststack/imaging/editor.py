@@ -10,6 +10,7 @@ import shutil
 import threading
 import time
 import uuid
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -35,7 +36,7 @@ from faststack.imaging.math_utils import (
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
-from faststack.models import DecodedImage
+from faststack.models import DecodedImage, ResolvedDarkenMask
 from faststack.util.executors import create_daemon_threadpool_executor
 
 try:
@@ -279,6 +280,127 @@ def _safe_replace(tmp_path: Path, target_path: Path) -> None:
                 time.sleep(_REPLACE_RETRY_DELAY)
             else:
                 raise
+
+
+def _validate_temp_output(path: Path) -> None:
+    """Reject a missing or empty encoded output before a live file is touched."""
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise OSError(f"encoder did not produce a usable output: {path}")
+    except OSError as exc:
+        raise RuntimeError(f"Temporary output validation failed: {path}") from exc
+
+
+def _commit_temp_outputs(
+    outputs: List[Tuple[Path, Path]],
+    *,
+    rollback_sources: Optional[dict[Path, Path]] = None,
+) -> None:
+    """Commit encoded outputs as one rollback-capable filesystem transaction.
+
+    Every temporary file is validated before the first destination changes.
+    Existing destinations use either a supplied durable backup or a private
+    rollback file. If a later replacement fails, destinations already
+    committed by this call are restored in reverse order.
+    """
+    if not outputs:
+        raise ValueError("output transaction must contain at least one file")
+
+    for tmp_path, _destination in outputs:
+        _validate_temp_output(tmp_path)
+
+    supplied_sources = rollback_sources or {}
+    rollback_paths: dict[Path, Optional[Path]] = {}
+    owned_rollback_paths: set[Path] = set()
+    retained_rollback_paths: set[Path] = set()
+    committed: list[Path] = []
+    committed_identities: dict[Path, tuple[int, int, int, int, int]] = {}
+    try:
+        for _tmp_path, destination in outputs:
+            if destination.exists():
+                rollback_path = supplied_sources.get(destination)
+                if rollback_path is None:
+                    rollback_path = destination.with_name(
+                        f".{destination.name}.__faststack_rollback__{uuid.uuid4().hex}"
+                    )
+                    shutil.copy2(destination, rollback_path)
+                    owned_rollback_paths.add(rollback_path)
+                _validate_temp_output(rollback_path)
+                rollback_paths[destination] = rollback_path
+            else:
+                rollback_paths[destination] = None
+
+        for tmp_path, destination in outputs:
+            _safe_replace(tmp_path, destination)
+            committed.append(destination)
+            stat = destination.stat()
+            committed_identities[destination] = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+    except BaseException as commit_error:
+        rollback_errors = []
+        for destination in reversed(committed):
+            rollback_path = rollback_paths.get(destination)
+            try:
+                stat = destination.stat()
+                current_identity = (
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+                if current_identity != committed_identities[destination]:
+                    raise OSError(
+                        "destination changed after FastStack committed it; "
+                        "refusing to overwrite the replacement during rollback"
+                    )
+                if rollback_path is None:
+                    destination.unlink(missing_ok=True)
+                elif rollback_path in owned_rollback_paths:
+                    _safe_replace(rollback_path, destination)
+                    rollback_paths[destination] = None
+                else:
+                    # The normal user backup is an external rollback source:
+                    # copy it only on the failure path so successful saves do
+                    # not duplicate a large working TIFF twice, and never
+                    # consume the user's undo backup with os.replace.
+                    restore_tmp = destination.with_name(
+                        f".{destination.name}.__faststack_restore__{uuid.uuid4().hex}"
+                    )
+                    try:
+                        shutil.copy2(rollback_path, restore_tmp)
+                        _validate_temp_output(restore_tmp)
+                        _safe_replace(restore_tmp, destination)
+                    finally:
+                        restore_tmp.unlink(missing_ok=True)
+            except (OSError, RuntimeError) as rollback_error:
+                rollback_errors.append(f"{destination}: {rollback_error}")
+                if rollback_path is not None:
+                    retained_rollback_paths.add(rollback_path)
+                log.critical(
+                    "Could not roll back partially committed save destination %s; "
+                    "recovery artifact retained at %s",
+                    destination,
+                    rollback_path,
+                    exc_info=True,
+                )
+        if rollback_errors:
+            detail = "; ".join(rollback_errors)
+            raise RuntimeError(
+                f"Save commit failed and rollback was incomplete: {detail}"
+            ) from commit_error
+        raise
+    finally:
+        for tmp_path, _destination in outputs:
+            tmp_path.unlink(missing_ok=True)
+        for rollback_path in owned_rollback_paths:
+            if rollback_path not in retained_rollback_paths:
+                rollback_path.unlink(missing_ok=True)
 
 
 # Aspect Ratios for cropping
@@ -691,7 +813,10 @@ class ImageEditor:
         self._cached_highlight_analysis: Optional[Dict[str, Any]] = None
 
         # Cache for luma detail bands (pyramid blur decomposition)
-        # Stores: {'hash': int, 'Y20': ndarray, 'Y3': ndarray, 'Y1': ndarray}
+        # Stores hash/frozen upstream edits, effective detail scale, exposure
+        # gain, and the Y20/Y3/Y1 arrays. Scale is part of cache validity so a
+        # same-shaped buffer rendered against different source geometry cannot
+        # reuse spatial-frequency bands from another preview tier.
         self._cached_detail_bands: Optional[Dict[str, Any]] = None
 
         # Cached 768-entry LUT list for save_image_uint8_levels (R+G+B tables),
@@ -799,6 +924,87 @@ class ImageEditor:
             # Per-hue saturation bank (color mix); see _COLOR_MIX_BANDS.
             **{key: 0.0 for key in _COLOR_MIX_KEYS},
         }
+
+    @staticmethod
+    def _freeze_mask_identity_value(value: Any) -> Any:
+        """Freeze small edit-state values without scanning rendered pixels."""
+        if isinstance(value, dict):
+            return tuple(
+                sorted(
+                    (
+                        ImageEditor._freeze_mask_identity_value(key),
+                        ImageEditor._freeze_mask_identity_value(item),
+                    )
+                    for key, item in value.items()
+                )
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(
+                ImageEditor._freeze_mask_identity_value(item) for item in value
+            )
+        if isinstance(value, np.ndarray):
+            # Edit state should not contain pixel buffers. If a future tool adds
+            # one, its immutable object identity is still safer on the hot path
+            # than silently reintroducing an O(image-size) scan.
+            return ("array", id(value), value.shape, value.dtype.str)
+        if isinstance(value, float):
+            return round(value, 9)
+        return value
+
+    def _mask_render_identity(
+        self,
+        source: Any,
+        edits: Dict[str, Any],
+        *,
+        for_export: bool,
+        levels_soft_knee: bool,
+        downscale_long_edge: Optional[int],
+        detail_source_scale: float,
+        stage_stamps: tuple,
+    ) -> tuple:
+        """Identity of the immutable source and all pre-mask render inputs.
+
+        The resolved-mask cache must invalidate whenever the pre-darken image
+        could differ, and stay stable otherwise. Everything that can move those
+        pixels is enumerated here:
+
+        * the decoded source — ``session_id`` changes on every load and
+          ``_preview_master_generation`` on every preview-master rebuild, so a
+          recycled ``id()`` cannot alias a different buffer; ``current_mtime``
+          covers reload-in-place.
+        * every edit except ``darken_settings`` and ``vignette``, which are the
+          only pipeline stages at or after the darken step (19.5 and 20).
+          Rotation, straighten and crop are ordinary edit keys, so geometry —
+          the one group of content-*moving* rather than content-scaling
+          operations before the mask — is covered here too.
+        * the render parameters that change pixels without changing edits:
+          ``for_export`` (selects the export clipping/skip-linear branch),
+          ``levels_soft_knee``, ``downscale_long_edge`` and
+          ``detail_source_scale``.
+        * ``stage_stamps`` — see ``_render_cache_stamps``. Two renders with
+          identical edits can still differ where an upstream cache handed back
+          an approximate stage, so the stamps of any *reused* stage are part of
+          the identity.
+
+        Shape is not included because ``resolve_mask`` already keys on it.
+        """
+        upstream_edits = tuple(
+            (key, self._freeze_mask_identity_value(value))
+            for key, value in sorted(edits.items())
+            if key not in {"darken_settings", "vignette"}
+        )
+        return (
+            self.session_id,
+            id(source),
+            self._preview_master_generation,
+            self.current_mtime,
+            bool(for_export),
+            bool(levels_soft_knee),
+            downscale_long_edge,
+            round(float(detail_source_scale), 9),
+            stage_stamps,
+            upstream_edits,
+        )
 
     @staticmethod
     def _rotate_point_90_normalized(
@@ -1380,8 +1586,11 @@ class ImageEditor:
         cache_context: Optional[dict] = None,
         update_highlight_state: bool = True,
         downscale_long_edge: Optional[int] = None,
+        detail_source_scale: float = 1.0,
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
+        stop_before_darken: bool = False,
+        render_state_out: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
         Returns float32 array (H, W, 3).
@@ -1395,6 +1604,12 @@ class ImageEditor:
         renders use it so a full-resolution master is not processed at 20MP
         when the screen can only show a fraction of that.
 
+        ``detail_source_scale`` is the input buffer's pixel scale relative to
+        the full-resolution source. Geometry is scale-equivariant, so combining
+        this with the actual post-geometry downscale keeps detail blur radii in
+        the same physical image space for crop and rotation as well as full-frame
+        previews.
+
         ``protect_input`` lets callers pass a shared buffer (e.g.
         ``self.float_image``) without copying it first: after geometry and
         downscale, the working array is copied only if it still shares memory
@@ -1404,6 +1619,15 @@ class ImageEditor:
         ``cancel_check`` is reserved for discardable display renders. It is
         sampled between expensive stages so idle refinement can yield when a
         newer edit revision arrives. Export callers never pass it.
+
+        ``stop_before_darken`` returns the authoritative content-analysis stage
+        used by the background-darkening mask. Overlay generation uses this
+        exact boundary so it cannot derive priors from a different edit stage.
+
+        ``render_state_out`` receives this render's ``mask_render_identity``.
+        Callers that stop before the darken step and resolve the mask
+        themselves need it, because the identity depends on which upstream
+        stages this particular render reused rather than recomputed.
         """
         cv2 = _get_cv2()
         if edits is None:
@@ -1413,7 +1637,6 @@ class ImageEditor:
             if levels_soft_knee_override is None
             else bool(levels_soft_knee_override)
         )
-
         debug_enabled = log.isEnabledFor(logging.DEBUG)
         debug_t0 = time.perf_counter() if debug_enabled else None
         debug_stage_marks: list[tuple[str, float]] | None = (
@@ -1486,12 +1709,11 @@ class ImageEditor:
             if crop_box_vals == (0.0, 0.0, 1000.0, 1000.0):
                 crop_box_vals = None
 
-        # Straighten is baked into the buffer only for export, or when a crop
-        # box must be sliced in straightened space; plain previews leave
-        # free-rotation display to the QML layer.
-        apply_rotation = abs(straighten_angle) > 0.001 and (
-            for_export or crop_box_vals is not None
-        )
+        # Straighten is authoritative pixel geometry for both preview and
+        # export. During an active crop drag QML rotates the deliberately
+        # frozen pre-drag source for responsiveness; once that source is
+        # released, QML resets to zero and this baked geometry is displayed.
+        apply_rotation = abs(straighten_angle) > 0.001
 
         # Capture dimensions after 90-degree rotation and before free rotation.
         orig_h, orig_w = arr.shape[:2]
@@ -1571,6 +1793,7 @@ class ImageEditor:
         # downscale of the cropped master is visually equivalent to rendering
         # at full resolution and letting the GPU scale it down — and several
         # times cheaper.
+        detail_render_scale = max(0.0, min(float(detail_source_scale), 1.0))
         if downscale_long_edge and cv2 is not None:
             h, w = arr.shape[:2]
             long_edge = max(h, w)
@@ -1579,6 +1802,9 @@ class ImageEditor:
                 new_w = max(1, round(w * scale))
                 new_h = max(1, round(h * scale))
                 arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                # Use the realized pixel ratio after rounding, not merely the
+                # requested long-edge ratio.
+                detail_render_scale *= min(new_w / w, new_h / h)
 
         _mark("downscale")
         _check_cancelled()
@@ -1606,6 +1832,12 @@ class ImageEditor:
         # telemetry for the live clipping indicators, which the skip branch
         # computes from a 4x-strided view below.
         _skip_linear = self._edits_skip_linear(edits)
+
+        # Stamps of any *reused* (and therefore possibly approximate) upstream
+        # stage, for _mask_render_identity(). None means "computed exactly from
+        # source + edits", which needs no identity of its own.
+        highlight_stage_stamp: Optional[tuple] = None
+        detail_stage_stamp: Optional[tuple] = None
 
         if for_export:
             log.debug("_apply_edits for_export: skip_linear=%s", _skip_linear)
@@ -1647,6 +1879,7 @@ class ImageEditor:
                         "hash": upstream_hash,
                         "frozen": upstream_frozen,
                         "state": analysis_state,
+                        "measured_shape": arr.shape[:2],
                     }
                     if cache_context is not None:
                         cache_context["highlight_analysis"] = entry
@@ -1725,6 +1958,7 @@ class ImageEditor:
                 upstream_hash, upstream_frozen = self._get_upstream_edits_hash(edits)
 
                 cached_analysis = None
+                cached_analysis_shape = None
                 with self._lock:
                     cached_dict = (
                         cache_context.get("highlight_analysis")
@@ -1737,6 +1971,7 @@ class ImageEditor:
                         and cached_dict["frozen"] == upstream_frozen
                     ):
                         cached_analysis = cached_dict["state"]
+                        cached_analysis_shape = cached_dict.get("measured_shape")
 
                 if cached_analysis:
                     analysis_state = cached_analysis
@@ -1752,16 +1987,25 @@ class ImageEditor:
                         pre_exposure_linear=pre_exposure_linear_stride,
                     )
 
+                    cached_analysis_shape = arr.shape[:2]
                     with self._lock:
                         entry = {
                             "hash": upstream_hash,
                             "frozen": upstream_frozen,
                             "state": analysis_state,
+                            "measured_shape": cached_analysis_shape,
                         }
                         if cache_context is not None:
                             cache_context["highlight_analysis"] = entry
                         else:
                             self._cached_highlight_analysis = entry
+
+                # The state is measured from a 4x-strided view, and its cache
+                # key does not include resolution — so a hit across two render
+                # tiers hands back numbers this buffer would not have produced.
+                # It reaches pixels only through the highlights branch below.
+                if abs(highlights) > 0.001:
+                    highlight_stage_stamp = cached_analysis_shape
 
             if not for_export and update_highlight_state:
                 with self._lock:
@@ -1815,9 +2059,21 @@ class ImageEditor:
 
                 # Check cache for detail bands (hash + frozen tuple verification)
                 detail_hash, detail_frozen = self._get_detail_upstream_hash(edits)
+                detail_scale_key = round(detail_render_scale, 8)
                 Y20_cached = Y3_cached = Y1_cached = None
                 cache_hit = False
                 cached_exp_gain = 1.0
+                # Identity of each cached band: the conditions it was blurred
+                # under. The cache key (detail_frozen) deliberately excludes
+                # exposure, highlights and shadows so blurs survive a drag, so
+                # those are what a band's identity has to carry.
+                cached_band_ids: Dict[str, Any] = {}
+                blur_id = (
+                    detail_scale_key,
+                    round(float(current_exp_gain), 9),
+                    round(float(edits.get("highlights", 0.0)), 6),
+                    round(float(edits.get("shadows", 0.0)), 6),
+                )
 
                 with self._lock:
                     cached = (
@@ -1830,11 +2086,13 @@ class ImageEditor:
                         cached
                         and cached.get("hash") == detail_hash
                         and cached.get("frozen") == detail_frozen
+                        and cached.get("detail_scale") == detail_scale_key
                     ):
                         Y20_cached = cached.get("Y20")
                         Y3_cached = cached.get("Y3")
                         Y1_cached = cached.get("Y1")
                         cached_exp_gain = cached.get("exp_gain", 1.0)
+                        cached_band_ids = dict(cached.get("band_ids") or {})
                         cache_hit = True
 
                         # Validate cached array shapes match current Y dimensions
@@ -1844,6 +2102,7 @@ class ImageEditor:
                             if cached_arr is not None and cached_arr.shape != y_shape:
                                 # Shape mismatch - invalidate cache
                                 Y20_cached = Y3_cached = Y1_cached = None
+                                cached_band_ids = {}
                                 cache_hit = False
                                 break
 
@@ -1867,26 +2126,33 @@ class ImageEditor:
                 Y_3d = Y[..., None]  # (H, W, 1) for blur function
                 Y20 = Y3 = Y1 = None
                 newly_computed = {"Y20": None, "Y3": None, "Y1": None}
+                radius_scale = max(detail_render_scale, 0.001)
 
                 if need_Y20:
                     if Y20_cached is not None:
                         Y20 = Y20_cached * exp_scale
                     else:
-                        Y20 = _extract_2d(_gaussian_blur_float(Y_3d, radius=20.0))
+                        Y20 = _extract_2d(
+                            _gaussian_blur_float(Y_3d, radius=20.0 * radius_scale)
+                        )
                         newly_computed["Y20"] = Y20
 
                 if need_Y3:
                     if Y3_cached is not None:
                         Y3 = Y3_cached * exp_scale
                     else:
-                        Y3 = _extract_2d(_gaussian_blur_float(Y_3d, radius=3.0))
+                        Y3 = _extract_2d(
+                            _gaussian_blur_float(Y_3d, radius=3.0 * radius_scale)
+                        )
                         newly_computed["Y3"] = Y3
 
                 if need_Y1:
                     if Y1_cached is not None:
                         Y1 = Y1_cached * exp_scale
                     else:
-                        Y1 = _extract_2d(_gaussian_blur_float(Y_3d, radius=1.0))
+                        Y1 = _extract_2d(
+                            _gaussian_blur_float(Y_3d, radius=1.0 * radius_scale)
+                        )
                         newly_computed["Y1"] = Y1
 
                 # Update cache if we computed any new blurs
@@ -1898,7 +2164,9 @@ class ImageEditor:
                             new_cache = {
                                 "hash": detail_hash,
                                 "frozen": detail_frozen,
+                                "detail_scale": detail_scale_key,
                                 "exp_gain": cached_exp_gain,  # Keep original exp_gain for existing blurs
+                                "band_ids": dict(cached_band_ids),
                                 "Y20": Y20_cached,
                                 "Y3": Y3_cached,
                                 "Y1": Y1_cached,
@@ -1912,12 +2180,19 @@ class ImageEditor:
                             for key, val in newly_computed.items():
                                 if val is not None:
                                     new_cache[key] = val * rescale_to_cached
+                                    new_cache["band_ids"][key] = blur_id
                         else:
                             # Fresh cache at current exposure
                             new_cache = {
                                 "hash": detail_hash,
                                 "frozen": detail_frozen,
+                                "detail_scale": detail_scale_key,
                                 "exp_gain": current_exp_gain,
+                                "band_ids": {
+                                    key: blur_id
+                                    for key, val in newly_computed.items()
+                                    if val is not None
+                                },
                                 "Y20": newly_computed["Y20"],
                                 "Y3": newly_computed["Y3"],
                                 "Y1": newly_computed["Y1"],
@@ -1926,6 +2201,24 @@ class ImageEditor:
                             cache_context["detail_bands"] = new_cache
                         else:
                             self._cached_detail_bands = new_cache
+                        cached_band_ids = new_cache["band_ids"]
+
+                # A band this render used is its stored array rescaled from the
+                # gain it was blurred at to the current one, so its identity
+                # plus the current exposure (already in the key) pins its value
+                # exactly. A freshly blurred band and a reused band that was
+                # blurred under the same conditions therefore agree, while a
+                # band carried across an exposure or highlights/shadows change
+                # — where the rescale is only an approximation — does not.
+                detail_stage_stamp = tuple(
+                    (name, cached_band_ids.get(name))
+                    for name, needed in (
+                        ("Y20", need_Y20),
+                        ("Y3", need_Y3),
+                        ("Y1", need_Y1),
+                    )
+                    if needed
+                )
 
                 # Build hierarchical pyramid bands (non-overlapping frequency ranges)
                 detail = np.zeros_like(Y)
@@ -2111,6 +2404,21 @@ class ImageEditor:
         _check_cancelled()
 
         # 19.5. Background Darkening (masked, after levels, before vignette)
+        mask_render_identity = self._mask_render_identity(
+            img_arr,
+            edits,
+            for_export=for_export,
+            levels_soft_knee=use_levels_soft_knee,
+            downscale_long_edge=downscale_long_edge,
+            detail_source_scale=detail_source_scale,
+            stage_stamps=(highlight_stage_stamp, detail_stage_stamp),
+        )
+        if render_state_out is not None:
+            render_state_out["mask_render_identity"] = mask_render_identity
+
+        if stop_before_darken:
+            return arr
+
         darken = edits.get("darken_settings")
         if darken is not None and getattr(darken, "enabled", False):
             # Use override assets/cache if provided (export snapshot), else live state
@@ -2136,7 +2444,25 @@ class ImageEditor:
                     arr.shape[:2],
                     edits,
                     cache=_cache,
+                    image_key=mask_render_identity,
                 )
+                if render_state_out is not None:
+                    # Hand the overlay the mask this render actually applied,
+                    # rather than making it re-render the pre-darken stage to
+                    # resolve an equivalent one. Published read-only: the array
+                    # is shared with MaskRasterCache and, once emitted, with the
+                    # GUI thread. See models.ResolvedDarkenMask.
+                    try:
+                        resolved.flags.writeable = False
+                    except ValueError:  # pragma: no cover - non-owning array
+                        pass
+                    render_state_out["resolved_darken_mask"] = ResolvedDarkenMask(
+                        mask=resolved,
+                        width=resolved.shape[1],
+                        height=resolved.shape[0],
+                        mask_id=darken.mask_id,
+                        mask_revision=mask_data.revision,
+                    )
                 arr = apply_masked_darken(
                     arr,
                     resolved,
@@ -2942,6 +3268,7 @@ class ImageEditor:
                 discardable reduced-resolution drag render.
         """
         cached: Optional[DecodedImage] = None
+        detail_source_scale = 1.0
         with self._lock:
             # Check cache validity
             if (
@@ -2957,6 +3284,20 @@ class ImageEditor:
                 # is only ever reassigned, never mutated in place, so the render
                 # can share it; protect_input copies only the post-crop region.
                 base = self.float_preview
+                if base is not None:
+                    if self.float_image is not None:
+                        full_h, full_w = self.float_image.shape[:2]
+                    elif self.original_image is not None:
+                        full_w, full_h = self.original_image.size
+                    else:
+                        full_w = full_h = 0
+                    if full_w > 0 and full_h > 0:
+                        base_h, base_w = base.shape[:2]
+                        detail_source_scale = min(
+                            base_w / full_w,
+                            base_h / full_h,
+                            1.0,
+                        )
                 edits = (
                     dict(self.current_edits)
                     if edits_override is None
@@ -2982,6 +3323,7 @@ class ImageEditor:
             apply_loupe_color=True,
             icc_bytes=icc_bytes,
             downscale_long_edge=downscale_long_edge,
+            detail_source_scale=detail_source_scale,
             protect_input=True,
         )
 
@@ -3039,6 +3381,9 @@ class ImageEditor:
             height=target_h,
             bytes_per_line=resized.strides[0],
             format=decoded.format,
+            # Display resizing does not re-resolve the mask; it stays at the
+            # tier that produced it and QML scales the overlay to fit.
+            darken_mask=decoded.darken_mask,
         )
 
     def _render_decoded_from_float(
@@ -3051,6 +3396,7 @@ class ImageEditor:
         icc_bytes: Optional[bytes] = None,
         cache_context: Optional[dict] = None,
         downscale_long_edge: Optional[int] = None,
+        detail_source_scale: float = 1.0,
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> DecodedImage:
@@ -3059,14 +3405,17 @@ class ImageEditor:
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
+        render_state: Dict[str, Any] = {}
         arr = self._apply_edits(
             base,
             edits=edits,
             for_export=for_export,
             cache_context=cache_context,
             downscale_long_edge=downscale_long_edge,
+            detail_source_scale=detail_source_scale,
             protect_input=protect_input,
             cancel_check=cancel_check,
+            render_state_out=render_state,
         )
         if cancel_check is not None and cancel_check():
             raise EditRenderCancelled
@@ -3120,6 +3469,8 @@ class ImageEditor:
             height=arr_u8.shape[0],
             bytes_per_line=arr_u8.strides[0],
             format=QImage.Format.Format_RGB888,
+            # Pixels and the mask applied to them travel together from here on.
+            darken_mask=render_state.get("resolved_darken_mask"),
         )
 
     def get_full_resolution_preview_data(
@@ -3753,27 +4104,199 @@ class ImageEditor:
             )
         )
 
-    def _write_tiff_16bit(self, path: Path, arr_float: np.ndarray):
-        """
-        Writes a float32 (0-1) numpy array as an uncompressed 16-bit RGB TIFF using OpenCV.
-        arr_float shape: (H, W, 3)
-        """
-        cv2 = _get_cv2()
-        if cv2 is None:
-            raise RuntimeError("Saving 16-bit TIFF requires OpenCV")
+    @staticmethod
+    def _tiff_metadata_tags(
+        exif_bytes: Optional[bytes], icc_bytes: Optional[bytes]
+    ) -> list[tuple]:
+        """Build safe TIFF tags, excluding pixel-layout and geometry metadata."""
+        tags: list[tuple] = []
+        if icc_bytes:
+            tags.append((34675, "B", len(icc_bytes), icc_bytes, False))
 
-        # Convert to 16-bit
-        # Clip to safe range before scaling
-        arr = (np.clip(arr_float, 0.0, 1.0) * 65535).astype(np.uint16)
+        # These descriptive/capture tags remain meaningful after crop/rotation.
+        # Geometry, thumbnail, strip, dimension, and resolution tags are
+        # deliberately regenerated by tifffile instead of copied from source.
+        safe_ascii_tags = {
+            270,  # ImageDescription
+            271,  # Make
+            272,  # Model
+            305,  # Software
+            306,  # DateTime
+            315,  # Artist
+            33432,  # Copyright
+            36867,  # DateTimeOriginal
+            36868,  # DateTimeDigitized
+            42036,  # LensModel
+        }
+        safe_unsigned_rational_tags = {
+            33434,  # ExposureTime
+            33437,  # FNumber
+            37378,  # ApertureValue
+            37381,  # MaxApertureValue
+            37382,  # SubjectDistance
+            37386,  # FocalLength
+            41988,  # DigitalZoomRatio
+        }
+        safe_signed_rational_tags = {
+            37377,  # ShutterSpeedValue
+            37379,  # BrightnessValue
+            37380,  # ExposureBiasValue
+        }
+        safe_integer_tags = {
+            34850,  # ExposureProgram
+            34855,  # PhotographicSensitivity / ISO
+            34864,  # SensitivityType
+            37383,  # MeteringMode
+            37384,  # LightSource
+            37385,  # Flash
+            41495,  # SensingMethod
+            41986,  # ExposureMode
+            41987,  # WhiteBalance
+            41989,  # FocalLengthIn35mmFilm
+            41990,  # SceneCaptureType
+            41991,  # GainControl
+            41992,  # Contrast
+            41993,  # Saturation
+            41994,  # Sharpness
+        }
+        safe_byte_tags = {
+            36864,  # ExifVersion
+            40960,  # FlashpixVersion
+        }
 
-        # OpenCv expects BGR for imwrite
-        if len(arr.shape) == 3 and arr.shape[2] == 3:
-            arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            success = cv2.imwrite(str(path), arr_bgr)
-            if not success:
-                raise IOError(f"Failed to write TIFF -> {path}")
-        else:
+        def _rational_pair(value: Any, *, signed: bool) -> tuple[int, int]:
+            numerator = getattr(value, "numerator", None)
+            denominator = getattr(value, "denominator", None)
+            if numerator is None or denominator is None:
+                if isinstance(value, (tuple, list)) and len(value) == 2:
+                    numerator, denominator = value
+                else:
+                    fraction = Fraction(float(value)).limit_denominator(1_000_000)
+                    numerator, denominator = fraction.numerator, fraction.denominator
+            numerator = int(numerator)
+            denominator = int(denominator)
+            if denominator == 0:
+                raise ValueError("EXIF rational denominator is zero")
+            if not signed and numerator < 0:
+                raise ValueError("unsigned EXIF rational is negative")
+            return numerator, denominator
+
+        if exif_bytes:
+            values = {}
+            try:
+                exif = Image.Exif()
+                exif.load(exif_bytes)
+                values.update(exif.items())
+            except Exception:
+                log.debug("Could not read TIFF EXIF metadata", exc_info=True)
+            else:
+                try:
+                    exif_ifd = exif.get_ifd(0x8769)
+                    if exif_ifd:
+                        values.update(exif_ifd)
+                except Exception:
+                    log.debug("Could not read TIFF ExifIFD metadata", exc_info=True)
+
+            for tag_id in safe_ascii_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
+                        ascii_value = str(value).encode("ascii", "replace").decode()
+                        tags.append((tag_id, "s", 0, ascii_value, False))
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
+            for tag_id in safe_unsigned_rational_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
+                        tags.append(
+                            (
+                                tag_id,
+                                "2I",
+                                1,
+                                _rational_pair(value, signed=False),
+                                False,
+                            )
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
+            for tag_id in safe_signed_rational_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
+                        tags.append(
+                            (
+                                tag_id,
+                                "2i",
+                                1,
+                                _rational_pair(value, signed=True),
+                                False,
+                            )
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
+            for tag_id in safe_integer_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
+                        integer = int(value)
+                        if not 0 <= integer <= 0xFFFFFFFF:
+                            raise ValueError("EXIF integer is outside TIFF range")
+                        dtype = "H" if 0 <= integer <= 0xFFFF else "I"
+                        tags.append((tag_id, dtype, 1, integer, False))
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
+            for tag_id in safe_byte_tags:
+                value = values.get(tag_id)
+                if value is not None:
+                    try:
+                        byte_value = bytes(value)
+                        tags.append((tag_id, "B", len(byte_value), byte_value, False))
+                    except (TypeError, ValueError, OverflowError):
+                        log.debug(
+                            "Skipping malformed EXIF tag %d", tag_id, exc_info=True
+                        )
+
+        # Orientation is always normalized because export bakes geometry into pixels.
+        tags.append((274, "H", 1, 1, False))
+        return tags
+
+    def _write_tiff_16bit(
+        self,
+        path: Path,
+        arr_float: np.ndarray,
+        *,
+        exif_bytes: Optional[bytes] = None,
+        icc_bytes: Optional[bytes] = None,
+    ) -> None:
+        """Write 16-bit RGB TIFF pixels plus sanitized ICC/EXIF metadata."""
+        if arr_float.ndim != 3 or arr_float.shape[2] != 3:
             raise ValueError("Only RGB supported for TIFF writer")
+
+        try:
+            import tifffile
+        except ImportError as exc:
+            raise RuntimeError(
+                "Saving metadata-preserving TIFF requires tifffile"
+            ) from exc
+
+        arr = np.rint(np.clip(arr_float, 0.0, 1.0) * 65535).astype(np.uint16)
+        tifffile.imwrite(
+            path,
+            arr,
+            photometric="rgb",
+            compression=None,
+            metadata=None,
+            extratags=self._tiff_metadata_tags(exif_bytes, icc_bytes),
+        )
 
     def _get_sanitized_exif_bytes(self) -> Optional[bytes]:
         """
@@ -4079,15 +4602,10 @@ class ImageEditor:
             log.warning("Unable to read timestamps for %s: %s", original_path, e)
             original_stat = None
 
-        # 2. Backup
-        backup_path = create_backup_file(original_path)
-        if backup_path is None:
-            raise RuntimeError(f"Unable to create backup for {original_path}")
-        if _debug:
-            t_backup = time.perf_counter()
-
+        temp_outputs: list[tuple[Path, Path]] = []
         try:
-            # 3. Save Main File
+            # Encode every required output before creating the user backup or
+            # replacing any live destination.
             is_tiff = original_path.suffix.lower() in [".tif", ".tiff"]
 
             # 8-bit outputs (main JPEG and/or developed JPG) share one
@@ -4105,12 +4623,13 @@ class ImageEditor:
                 tmp_path = original_path.with_name(
                     f".{original_path.stem}_{uuid.uuid4().hex[:8]}{original_path.suffix}"
                 )
-                try:
-                    self._write_tiff_16bit(tmp_path, final_float)
-                    _safe_replace(tmp_path, original_path)
-                except BaseException:
-                    tmp_path.unlink(missing_ok=True)
-                    raise
+                temp_outputs.append((tmp_path, original_path))
+                self._write_tiff_16bit(
+                    tmp_path,
+                    final_float,
+                    exif_bytes=main_exif,
+                    icc_bytes=source_icc_bytes,
+                )
             else:
                 arr_u8 = _float01_to_u8(dithered_float)
                 img_u8 = Image.fromarray(arr_u8, mode="RGB")
@@ -4124,29 +4643,22 @@ class ImageEditor:
                 tmp_path = original_path.with_name(
                     f".{original_path.stem}_{uuid.uuid4().hex[:8]}{original_path.suffix}"
                 )
+                temp_outputs.append((tmp_path, original_path))
                 try:
-                    try:
-                        img_u8.save(tmp_path, **save_kwargs)
-                    except Exception as metadata_error:
-                        # Invalid legacy EXIF should not prevent saving, but the
-                        # source ICC profile must remain attached to source-space
-                        # pixels or other applications will misinterpret color.
-                        log.warning(
-                            "JPEG metadata save failed for %s (%s); retrying without EXIF",
-                            original_path,
-                            metadata_error,
-                        )
-                        fallback_kwargs = {"quality": 95}
-                        if source_icc_bytes:
-                            fallback_kwargs["icc_profile"] = source_icc_bytes
-                        img_u8.save(tmp_path, **fallback_kwargs)
-                    _safe_replace(tmp_path, original_path)
-                except BaseException:
-                    tmp_path.unlink(missing_ok=True)
-                    raise
-
-            if original_stat is not None:
-                self._restore_file_times(original_path, original_stat)
+                    img_u8.save(tmp_path, **save_kwargs)
+                except Exception as metadata_error:
+                    # Invalid legacy EXIF should not prevent saving, but the
+                    # source ICC profile must remain attached to source-space
+                    # pixels or other applications will misinterpret color.
+                    log.warning(
+                        "JPEG metadata save failed for %s (%s); retrying without EXIF",
+                        original_path,
+                        metadata_error,
+                    )
+                    fallback_kwargs = {"quality": 95}
+                    if source_icc_bytes:
+                        fallback_kwargs["icc_profile"] = source_icc_bytes
+                    img_u8.save(tmp_path, **fallback_kwargs)
 
             # 4. Save Sidecar JPG (-developed.jpg) — only when explicitly requested
             if write_developed_jpg:
@@ -4178,24 +4690,39 @@ class ImageEditor:
                 tmp_dev = developed_path.with_name(
                     f".{developed_path.stem}_{uuid.uuid4().hex[:8]}{developed_path.suffix}"
                 )
+                temp_outputs.append((tmp_dev, developed_path))
                 try:
-                    try:
-                        img_u8.save(tmp_dev, **dev_kwargs)
-                    except Exception as metadata_error:
-                        log.warning(
-                            "Developed JPEG metadata save failed for %s (%s); "
-                            "retrying without EXIF",
-                            developed_path,
-                            metadata_error,
-                        )
-                        fallback_kwargs = {"quality": 90}
-                        if source_icc_bytes:
-                            fallback_kwargs["icc_profile"] = source_icc_bytes
-                        img_u8.save(tmp_dev, **fallback_kwargs)
-                    _safe_replace(tmp_dev, developed_path)
-                except BaseException:
-                    tmp_dev.unlink(missing_ok=True)
-                    raise
+                    img_u8.save(tmp_dev, **dev_kwargs)
+                except Exception as metadata_error:
+                    log.warning(
+                        "Developed JPEG metadata save failed for %s (%s); "
+                        "retrying without EXIF",
+                        developed_path,
+                        metadata_error,
+                    )
+                    fallback_kwargs = {"quality": 90}
+                    if source_icc_bytes:
+                        fallback_kwargs["icc_profile"] = source_icc_bytes
+                    img_u8.save(tmp_dev, **fallback_kwargs)
+
+            for tmp_output, _destination in temp_outputs:
+                _validate_temp_output(tmp_output)
+
+            # Preserve the existing user-visible undo backup semantics, but
+            # create it only after all encoders have succeeded.
+            backup_path = create_backup_file(original_path)
+            if backup_path is None:
+                raise RuntimeError(f"Unable to create backup for {original_path}")
+            if _debug:
+                t_backup = time.perf_counter()
+
+            _commit_temp_outputs(
+                temp_outputs,
+                rollback_sources={original_path: backup_path},
+            )
+
+            if original_stat is not None:
+                self._restore_file_times(original_path, original_stat)
 
             if _debug:
                 t_write = time.perf_counter()
@@ -4215,6 +4742,9 @@ class ImageEditor:
         except Exception as e:
             log.exception("Failed to save %s: %s", original_path, e)
             raise RuntimeError(f"Save failed: {e}") from e
+        finally:
+            for tmp_output, _destination in temp_outputs:
+                tmp_output.unlink(missing_ok=True)
 
     def save_image(
         self,
@@ -4249,7 +4779,7 @@ class ImageEditor:
     def _save_u8_pil_image(
         self, img_u8: Image.Image, original_path: Path, log_prefix: str
     ) -> Tuple[Path, Path]:
-        """Save a prepared uint8 RGB image with backup, EXIF, and best-effort atomic replace."""
+        """Save a prepared uint8 RGB image with backup and atomic replacement."""
         try:
             original_stat = original_path.stat()
         except OSError:
@@ -4288,26 +4818,8 @@ class ImageEditor:
                 if icc_bytes:
                     fallback_kwargs["icc_profile"] = icc_bytes
                 img_u8.save(tmp_path, **fallback_kwargs)
-            try:
-                os.replace(tmp_path, original_path)
-            except OSError as e:
-                log.warning(
-                    "Atomic replace failed (%s); falling back to direct save", e
-                )
-                try:
-                    img_u8.save(original_path, **save_kwargs)
-                except Exception as metadata_error:
-                    log.warning(
-                        "%s direct metadata save failed for %s (%s); "
-                        "retrying without EXIF",
-                        log_prefix,
-                        original_path,
-                        metadata_error,
-                    )
-                    fallback_kwargs = {"quality": 95}
-                    if icc_bytes:
-                        fallback_kwargs["icc_profile"] = icc_bytes
-                    img_u8.save(original_path, **fallback_kwargs)
+            _validate_temp_output(tmp_path)
+            _safe_replace(tmp_path, original_path)
         finally:
             try:
                 if tmp_path.exists():

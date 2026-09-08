@@ -113,3 +113,99 @@ def test_get_decoded_image_size_fallback_default():
 
     # size = 10 * 10 * 4 = 400
     assert get_decoded_image_size(item) == 400
+
+
+def _decoded_with_mask(width=64, height=48):
+    """A DecodedImage shaped like one a darkened preview render produces."""
+    import numpy as np
+
+    from faststack.models import DecodedImage, ResolvedDarkenMask
+
+    pixels = bytes(width * height * 3)
+    mask = np.zeros((height, width), dtype=np.float32)
+    mask.flags.writeable = False
+    return (
+        DecodedImage(
+            buffer=memoryview(pixels),
+            width=width,
+            height=height,
+            bytes_per_line=width * 3,
+            format=None,
+            darken_mask=ResolvedDarkenMask(
+                mask=mask,
+                width=width,
+                height=height,
+                mask_id="darken",
+                mask_revision=1,
+            ),
+        ),
+        width * height * 3,
+        mask.nbytes,
+    )
+
+
+def test_decoded_image_size_counts_the_published_darken_mask():
+    """A mask-bearing frame is 7/3 of its buffer, not 3/3.
+
+    _seed_decode_cache_from_live_preview puts the last rendered preview into
+    the byte-budgeted image cache on navigate-away, and that frame carries the
+    float32 mask its render resolved. Charging only the RGB888 buffer would
+    under-report the entry by 57%.
+    """
+    from faststack.imaging.cache import get_decoded_image_size
+
+    item, buffer_bytes, mask_bytes = _decoded_with_mask()
+    assert mask_bytes == buffer_bytes * 4 // 3  # float32 plane vs RGB888
+    assert get_decoded_image_size(item) == buffer_bytes + mask_bytes
+    # __sizeof__ is not what production budgets on, but must not disagree.
+    assert item.__sizeof__() == buffer_bytes + mask_bytes
+
+
+def test_decoded_image_size_unchanged_without_a_mask():
+    """Ordinary decodes carry no mask and must not be charged for one."""
+    from faststack.imaging.cache import get_decoded_image_size
+    from faststack.models import DecodedImage
+
+    pixels = bytes(64 * 48 * 3)
+    item = DecodedImage(
+        buffer=memoryview(pixels),
+        width=64,
+        height=48,
+        bytes_per_line=64 * 3,
+        format=None,
+    )
+    assert item.darken_mask is None
+    assert get_decoded_image_size(item) == len(pixels)
+    assert item.__sizeof__() == len(pixels)
+
+
+def test_cache_budget_accounts_for_retained_masks():
+    """The budget must evict on real retained bytes, not just pixel bytes."""
+    from faststack.imaging.cache import ByteLRUCache
+
+    item, buffer_bytes, mask_bytes = _decoded_with_mask()
+    entry_bytes = buffer_bytes + mask_bytes
+
+    cache = ByteLRUCache(max_bytes=entry_bytes)
+    cache["a"] = item
+    assert cache.currsize == entry_bytes
+
+    # A second identical entry does not fit. Counting only the buffer would
+    # have let both in and overshot the budget by a whole mask.
+    other, _, _ = _decoded_with_mask()
+    cache["b"] = other
+    assert cache.currsize == entry_bytes
+    assert "a" not in cache
+    assert "b" in cache
+
+
+def test_eviction_releases_the_charged_bytes():
+    """Sizes stay stable across insert and delete, so currsize returns to 0."""
+    from faststack.imaging.cache import ByteLRUCache
+
+    item, buffer_bytes, mask_bytes = _decoded_with_mask()
+    cache = ByteLRUCache(max_bytes=10 * (buffer_bytes + mask_bytes))
+    cache["a"] = item
+    assert cache.currsize == buffer_bytes + mask_bytes
+    del cache["a"]
+    assert cache.currsize == 0

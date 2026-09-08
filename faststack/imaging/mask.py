@@ -155,9 +155,12 @@ class DarkenSettings:
     brush_radius: float = 0.03  # normalised
 
     def params_tuple(self) -> tuple:
-        """Frozen tuple of all scalar params — used as a cache key."""
+        """Frozen mask-resolution params used as a cache key.
+
+        ``darken_amount`` is applied after mask resolution and therefore must
+        not invalidate the expensive edge/prior mask while its slider moves.
+        """
         return (
-            self.darken_amount,
             self.edge_protection,
             self.subject_protection,
             self.feather,

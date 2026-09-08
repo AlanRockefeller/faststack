@@ -3,4 +3,5 @@ numpy==2.*
 cachetools==5.*
 watchdog==4.*
 Pillow==12.*      # fallback decode; keep it
+tifffile>=2025.5.10,<2027.0  # 16-bit TIFF with ICC/EXIF metadata
 packaging>=24,<26

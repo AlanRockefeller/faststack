@@ -365,7 +365,7 @@ Window {
     FocusScope {
         id: keyScope
         anchors.fill: parent
-        focus: compactEditor.visible
+        focus: compactEditor.visible && !discardDialog.opened
 
         Keys.onPressed: function(event) {
             if (compactEditor.cropActive) {
@@ -426,8 +426,12 @@ Window {
 
         onOpened: {
             if (compactEditor.controllerRef)
+                compactEditor.controllerRef.dialog_opened("qml-compact-discard")
+            if (compactEditor.controllerRef)
                 compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
         }
+        onClosed: if (compactEditor.controllerRef) compactEditor.controllerRef.dialog_closed("qml-compact-discard")
+        Component.onDestruction: if (compactEditor.controllerRef) compactEditor.controllerRef.dialog_closed("qml-compact-discard")
 
         Label {
             text: "You have unsaved edits.\nDiscard and close?"

@@ -1,10 +1,7 @@
-import sys
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock
 
-# Mock config before importing prefetcher
-sys.modules["faststack.config"] = MagicMock()
 from faststack.imaging.prefetch import Prefetcher
 
 
@@ -41,6 +38,9 @@ class TestPrefetcher(unittest.TestCase):
 
             prefetcher.futures[0] = f0
             prefetcher.futures[5] = f5
+            # Only tasks the prefetcher registered as navigation-cancellable
+            # are candidates for the priority cancellation sweep.
+            prefetcher._navigation_cancel_indices.update({0, 5})
 
             print("Submitting task 4...")
             # Submit priority task for index 4

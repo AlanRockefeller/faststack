@@ -34,6 +34,7 @@ class ParsedId(NamedTuple):
     thumb_size: Optional[int]
     path_hash: Optional[str]
     mtime_ns: Optional[int]
+    source_identity: Optional[str]
     reason: str
     is_folder: bool
     is_valid: bool
@@ -48,7 +49,7 @@ class ThumbnailProvider(QQuickImageProvider):
     - Schedules decode via prefetcher (does NOT decode inline)
 
     URL format:
-    - Files: image://thumbnail/{size}/{path_hash}/{mtime_ns}?r={rev}
+    - Files: image://thumbnail/{size}/{path_hash}/{mtime_ns}/{source_identity}?r={rev}
     - Folders: image://thumbnail/folder/{path_hash}/{mtime_ns}?r={rev}
     """
 
@@ -138,7 +139,7 @@ class ThumbnailProvider(QQuickImageProvider):
     def _parse_id(self, id_str: str) -> ParsedId:
         """Parse the thumbnail ID string.
 
-        Format: {size}/{path_hash}/{mtime_ns}?r={rev}
+        Format: {size}/{path_hash}/{mtime_ns}/{source_identity}?r={rev}
         Or: folder/{path_hash}/{mtime_ns}?r={rev}
 
         Returns:
@@ -158,7 +159,9 @@ class ThumbnailProvider(QQuickImageProvider):
 
         parts = id_clean.split("/")
         if len(parts) < 3:
-            return ParsedId(id_clean, parts, None, None, None, reason, False, False)
+            return ParsedId(
+                id_clean, parts, None, None, None, None, reason, False, False
+            )
 
         is_folder = parts[0] == "folder"
         try:
@@ -168,22 +171,27 @@ class ThumbnailProvider(QQuickImageProvider):
                 thumb_size = self._default_size
                 path_hash = parts[1]
                 mtime_ns = int(parts[2])
+                source_identity = None
             else:
                 thumb_size = int(parts[0])
                 path_hash = parts[1]
                 mtime_ns = int(parts[2])
+                source_identity = parts[3] if len(parts) > 3 else None
             return ParsedId(
                 id_clean,
                 parts,
                 thumb_size,
                 path_hash,
                 mtime_ns,
+                source_identity,
                 reason,
                 is_folder,
                 True,
             )
         except (ValueError, IndexError):
-            return ParsedId(id_clean, parts, None, None, None, reason, is_folder, False)
+            return ParsedId(
+                id_clean, parts, None, None, None, None, reason, is_folder, False
+            )
 
     def requestImage(self, id_str: str, size: QSize, _requestedSize: QSize) -> QImage:
         """Request an image for the given ID.
@@ -281,6 +289,7 @@ class ThumbnailProvider(QQuickImageProvider):
                 path,
                 parsed.mtime_ns,
                 parsed.thumb_size,
+                source_identity=parsed.source_identity,
                 priority=self._prefetcher.PRIO_HIGH,
                 timer=timer,
             )

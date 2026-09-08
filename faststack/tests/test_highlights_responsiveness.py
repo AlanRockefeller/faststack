@@ -1,14 +1,12 @@
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock
 
 import numpy as np
 
-# Mock dependencies
-sys.modules["cv2"] = MagicMock()
-sys.modules["turbojpeg"] = MagicMock()
-sys.modules["PyTurboJPEG"] = MagicMock()
+# cv2 / turbojpeg are real project dependencies. Replacing them in
+# sys.modules here leaks into every later test in the session, so import
+# them for real.
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 

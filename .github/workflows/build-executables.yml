@@ -44,10 +44,15 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[bundle]" ruff
+          python -m pip install -e ".[bundle,dev]"
 
       - name: Run Ruff
         run: python -m ruff check faststack/
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest
 
       - name: Build executable
         run: python -m PyInstaller packaging/faststack.spec --noconfirm --clean
@@ -88,6 +93,33 @@ jobs:
       GH_REPO: ${{ github.repository }}
 
     steps:
+      # Must run before the artifacts are downloaded: actions/checkout cleans
+      # the workspace and would delete them.
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Build release notes from ChangeLog.md
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          python3 tools/release_notes.py --tag "$TAG_NAME" \
+            --notes-output release-notes.md
+          python3 tools/release_notes.py --tag "$TAG_NAME" --print-title \
+            > release-title.txt
+          echo "::group::Release title"
+          cat release-title.txt
+          echo "::endgroup::"
+          echo "::group::Release notes"
+          cat release-notes.md
+          echo "::endgroup::"
+
       - name: Download build artifacts
         env:
           GH_TOKEN: ${{ github.token }}
@@ -108,10 +140,14 @@ jobs:
           fi
 
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            # The release already exists (workflow re-run, or notes someone
+            # wrote by hand). Refresh the assets only -- existing release
+            # notes are never overwritten.
+            echo "Release $TAG_NAME already exists; updating assets only."
             gh release upload "$TAG_NAME" "${assets[@]}" --clobber
           else
             gh release create "$TAG_NAME" "${assets[@]}" \
               --verify-tag \
-              --title "FastStack $TAG_NAME" \
-              --notes "Automated FastStack executable build for $TAG_NAME."
+              --title "$(cat release-title.txt)" \
+              --notes-file release-notes.md
           fi

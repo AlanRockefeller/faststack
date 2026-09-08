@@ -232,5 +232,7 @@ def test_thumbnail_tile_required_roles_have_values_for_all_entry_kinds(tmp_path,
         "edited_count": 0,
         "jpg_count": 0,
         "raw_count": 0,
+        "batch_count": 0,
         "coverage_buckets": [],
+        "batch_coverage_buckets": [],
     }

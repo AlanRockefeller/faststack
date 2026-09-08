@@ -631,6 +631,7 @@ class UIState(QObject):
     statusMessageColorChanged = (
         Signal()
     )  # Optional override color for the status message
+    automaticMonitoringAvailableChanged = Signal()
     resetZoomPanRequested = Signal()  # Signal to tell QML to reset zoom/pan
     absoluteZoomRequested = Signal(
         float
@@ -737,6 +738,8 @@ class UIState(QObject):
     batchAutoLevelsActiveChanged = Signal()
     autoAddEditedToBatchChanged = Signal()
 
+    updateNoticeChanged = Signal()  # Unobtrusive update banner state
+
     # Variant badges
     variantBadgesChanged = Signal()
     variantSaveHintChanged = Signal()
@@ -755,6 +758,7 @@ class UIState(QObject):
         self._theme = 1
         self._status_message = ""  # New private variable for status message
         self._status_message_color = ""  # "" means use the default text color
+        self._automatic_monitoring_available = True
         # Image Editor State
         self._is_editor_open = False
         self._is_editor_expanded = False
@@ -1200,6 +1204,29 @@ class UIState(QObject):
         if self._status_message_color != value:
             self._status_message_color = value
             self.statusMessageColorChanged.emit()
+
+    @Property(bool, notify=automaticMonitoringAvailableChanged)
+    def automaticMonitoringAvailable(self) -> bool:
+        return self._automatic_monitoring_available
+
+    @automaticMonitoringAvailable.setter
+    def automaticMonitoringAvailable(self, value: bool) -> None:
+        value = bool(value)
+        if self._automatic_monitoring_available != value:
+            self._automatic_monitoring_available = value
+            self.automaticMonitoringAvailableChanged.emit()
+
+    @Property(str, notify=updateNoticeChanged)
+    def updateNoticeVersion(self):
+        """Version for the update banner, or "" when nothing is pending.
+
+        Only automatic checks populate this; a manual check opens the dialog
+        directly instead of raising the banner.
+        """
+        getter = getattr(self.app_controller, "get_pending_update_version", None)
+        if callable(getter):
+            return getter()
+        return ""
 
     @Property(str, notify=variantSaveHintChanged)
     def variantSaveHint(self):
@@ -2866,6 +2893,8 @@ class UIState(QObject):
 
         restored = result["restored_count"]
         skipped = result["skipped_count"]
+        superseded = result["superseded_count"]
+        ambiguous = result["ambiguous_count"]
         legacy = result["legacy_remaining_count"]
         dest = result["dest_dir"]
 
@@ -2876,8 +2905,14 @@ class UIState(QObject):
                 f"Restored {restored} file{'s' if restored != 1 else ''} to {dest}"
             )
         if skipped > 0:
+            parts.append(f"{skipped} skipped (destination exists or restore failed)")
+        if superseded > 0:
             parts.append(
-                f"{skipped} skipped (already exist{'s' if skipped == 1 else ''})"
+                f"{superseded} older version{'s' if superseded != 1 else ''} kept"
+            )
+        if ambiguous > 0:
+            parts.append(
+                f"{ambiguous} ambiguous version{'s' if ambiguous != 1 else ''} kept"
             )
 
         msg = ", ".join(parts) if parts else "Nothing to restore"

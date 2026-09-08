@@ -2,6 +2,26 @@ import importlib
 import logging
 from types import SimpleNamespace
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_turbo_probe_state():
+    """Give each test a clean probe.
+
+    ``create_turbojpeg`` memoizes its result per candidate set, and the
+    user-facing fallback warning is emitted at most once per process. Both
+    survive across tests (and across the app import that already probed at
+    collection time), so they have to be reset for each case to observe a
+    real probe and its warning.
+    """
+    turbo = importlib.import_module("faststack.imaging.turbo")
+    turbo._create_turbojpeg_cached.cache_clear()
+    turbo._fallback_warnings_emitted.clear()
+    yield
+    turbo._create_turbojpeg_cached.cache_clear()
+    turbo._fallback_warnings_emitted.clear()
+
 
 def test_create_turbojpeg_prefers_explicit_env_path(monkeypatch):
     turbo = importlib.import_module("faststack.imaging.turbo")
