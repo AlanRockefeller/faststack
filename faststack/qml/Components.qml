@@ -39,11 +39,24 @@ Item {
     readonly property string requestedImageSource: loupeView.uiStateRef && loupeView.uiStateRef.isFolderLoaded && loupeView.uiStateRef.imageCount > 0 ? loupeView.uiStateRef.currentImageSource : ""
     property string cropDragImageSource: ""
     readonly property bool isCropSourceFrozen: cropDragImageSource !== "" && ((mainMouseArea && mainMouseArea.isCropDragging) || (loupeView.uiStateRef && loupeView.uiStateRef.isCropping))
-    readonly property string displayedImageSource: isCropSourceFrozen ? cropDragImageSource : requestedImageSource
+    property string displayedImageSource: ""
+
+    // Loading a source can synchronously reset rotation/zoom and make Python
+    // request another source. Apply it outside the binding evaluation so that
+    // feedback cannot re-enter displayedImageSource's binding. The named
+    // callback coalesces changes and reads the latest crop/source state.
+    function updateDisplayedImageSource() {
+        displayedImageSource = isCropSourceFrozen ? cropDragImageSource : requestedImageSource
+    }
+
+    onRequestedImageSourceChanged: Qt.callLater(loupeView.updateDisplayedImageSource)
+    onIsCropSourceFrozenChanged: Qt.callLater(loupeView.updateDisplayedImageSource)
+    onCropDragImageSourceChanged: Qt.callLater(loupeView.updateDisplayedImageSource)
 
     Component.onCompleted: {
         loupeView.uiStateRef = uiState
         loupeView.controllerRef = controller
+        Qt.callLater(loupeView.updateDisplayedImageSource)
         // mainImage may complete before uiStateRef is wired, so retry the
         // initial size report once from the parent if the child call no-op'd.
         if (mainImage && !mainImage.initialDisplaySizeReported) {

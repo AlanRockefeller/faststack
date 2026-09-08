@@ -424,7 +424,13 @@ def respawn_for_directory(
     if not directory:
         return False
 
-    args = [sys.executable, "-m", "faststack.app"]
+    # In a frozen build, ``sys.executable`` is the FastStack executable
+    # itself, so Python's ``-m`` launcher arguments are invalid.  The
+    # executable accepts the application arguments directly.
+    if getattr(sys, "frozen", False):
+        args = [sys.executable]
+    else:
+        args = [sys.executable, "-m", "faststack.app"]
     if grid is False:
         args.append("--loupe")
     if image_path:

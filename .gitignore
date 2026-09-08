@@ -8,7 +8,8 @@ AGENTS.md
 ANTIGRAVITY_RULES.md
 .claude/
 .agent/
-tools/
+tools/*
+!tools/release_notes.py
 git.instructions.txt
 
 # We don't have any good docs yet
