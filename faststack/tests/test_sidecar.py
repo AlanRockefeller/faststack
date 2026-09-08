@@ -224,10 +224,11 @@ def test_bulk_iteration_finds_legacy_keyed_entries(mock_sidecar_dir):
     stable_3 = sm.metadata_key_for_path(Path("IMG_0003.jpg"))
     assert stable_1 in sm.data.entries
     assert stable_3 in sm.data.entries
-    assert "IMG_0001.jpg" in sm.data.entries
-    assert "IMG_0003.jpg" in sm.data.entries
-    assert "IMG_0002" not in sm.data.entries
-    assert "IMG_0002.jpg" in sm.data.entries
+    # Stable keys are normcased, so they are lowercase on Windows.
+    assert os.path.normcase("IMG_0001.jpg") in sm.data.entries
+    assert os.path.normcase("IMG_0003.jpg") in sm.data.entries
+    assert os.path.normcase("IMG_0002") not in sm.data.entries
+    assert os.path.normcase("IMG_0002.jpg") in sm.data.entries
 
 
 def test_raw_only_entry_survives_transition_to_visible_jpg(mock_sidecar_dir):

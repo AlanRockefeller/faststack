@@ -197,6 +197,8 @@ class TestSymlinkPreservation:
 
         assert result is False
         assert link.is_symlink()
-        assert os.readlink(link) == str(target)
+        # Windows readlink returns an extended-length ("\\?\") path, so
+        # compare the file the link resolves to, not its literal spelling.
+        assert os.path.samefile(os.readlink(link), target)
         assert not link.is_dir()
         assert target.read_text() == "target-bytes"

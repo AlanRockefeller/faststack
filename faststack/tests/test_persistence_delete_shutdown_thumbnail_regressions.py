@@ -88,7 +88,8 @@ def test_overlapping_delete_completion_preserves_action_order(app_controller):
     job_a = app_controller._delete_indices([0], "a")["job_id"]
     job_b = app_controller._delete_indices([0], "b")["job_id"]
     bin_dir = app_controller.image_dir / "image recycle bin"
-    bin_dir.mkdir()
+    # The delete job enqueued above may already have created the bin.
+    bin_dir.mkdir(exist_ok=True)
     app_controller._on_delete_finished(
         _successful_delete(job_a, path_a, bin_dir / "a._fs_12345678.jpg")
     )
@@ -112,7 +113,8 @@ def test_overlapping_delete_reverse_completion_still_uses_action_order(app_contr
     job_a = app_controller._delete_indices([0], "a")["job_id"]
     job_b = app_controller._delete_indices([0], "b")["job_id"]
     bin_dir = app_controller.image_dir / "image recycle bin"
-    bin_dir.mkdir()
+    # The delete job enqueued above may already have created the bin.
+    bin_dir.mkdir(exist_ok=True)
 
     app_controller._on_delete_finished(
         _successful_delete(job_b, path_b, bin_dir / "b._fs_12345678.jpg")
@@ -163,7 +165,8 @@ def test_delete_placeholder_multi_image_and_failed_settlement(app_controller):
     app_controller.image_files = [ImageFile(path) for path in paths]
     job_id = app_controller._delete_indices([0, 1], "multi")["job_id"]
     bin_dir = app_controller.image_dir / "image recycle bin"
-    bin_dir.mkdir()
+    # The delete job enqueued above may already have created the bin.
+    bin_dir.mkdir(exist_ok=True)
     result = {
         "job_id": job_id,
         "successes": [
