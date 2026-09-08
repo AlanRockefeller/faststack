@@ -80,12 +80,21 @@ def test_distinct_groups_that_become_adjacent_are_not_merged():
     assert result["stacks"] == []
 
 
-def test_incompatible_image_identity_uses_deterministic_fail_safe():
+def test_wholly_disjoint_snapshots_resolve_by_identity_presence():
+    """Disjoint snapshots settle per identity, not by preferring a snapshot.
+
+    We kept only ``a, b, c`` of the base order while they replaced it with
+    ``x, y, z``.  Presence is merged one identity at a time, so every image we
+    still list reads as concurrently removed by them and every image they
+    added survives.  Preferring the lock holder's snapshot wholesale here
+    would resurrect images the other writer deleted.
+    """
     ours = payload([["a", "b"]], ["a", "b", "c"])
     theirs = payload([["x", "y"]], ["x", "y", "z"])
     result = merge(payload([]), ours, theirs)
-    assert result["stack_paths"] == ours["stack_paths"]
-    assert result["stack_order"] == ours["stack_order"]
+    assert result["stack_paths"] == theirs["stack_paths"]
+    assert result["stack_order"] == theirs["stack_order"]
+    assert result["stacks"] == [[0, 1]]
 
 
 def test_legacy_index_only_payload_remains_backward_compatible():
