@@ -85,4 +85,11 @@ def app_controller(tmp_path):
         controller._path_resolver = MagicMock()
         controller.dataChanged = MagicMock()
         controller.ui_state = MagicMock()
+        # Tests drive delete completion by calling _on_delete_finished()
+        # directly. The real background delete job is still submitted, and
+        # Future.add_done_callback() runs inline on the calling thread when the
+        # job has already finished, so on a fast machine the real completion
+        # could settle a placeholder before the test got to it. Disconnect the
+        # bridge so only explicit calls advance delete state.
+        controller._deleteFinished.disconnect(controller._on_delete_finished)
         yield controller
