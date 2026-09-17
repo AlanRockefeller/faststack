@@ -1,0 +1,784 @@
+<title>Silver Halide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#EDEEF0; --panel:#FFFFFF; --sunk:#E3E5E9; --line:#D2D6DC; --line2:#BFC5CD;
+  --text:#1B1D21; --dim:#5F646B; --faint:#8B9199;
+  --accent:#1F6F5C; --accent-soft:#DCEBE6; --accent-line:#8FC4B5;
+  --warn:#9A6B15; --bad:#A3423C; --good:#1F6F5C;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --cond:"IBM Plex Sans Condensed","IBM Plex Sans",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --dpr:1;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#16181B; --panel:#1E2125; --sunk:#131518; --line:#2E3238; --line2:#3C424A;
+    --text:#E6E8EA; --dim:#9AA0A8; --faint:#6E757D;
+    --accent:#4FB79C; --accent-soft:#16302A; --accent-line:#2C5F53;
+    --warn:#D3A24A; --bad:#D4726B; --good:#4FB79C;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#16181B; --panel:#1E2125; --sunk:#131518; --line:#2E3238; --line2:#3C424A;
+  --text:#E6E8EA; --dim:#9AA0A8; --faint:#6E757D;
+  --accent:#4FB79C; --accent-soft:#16302A; --accent-line:#2C5F53;
+  --warn:#D3A24A; --bad:#D4726B; --good:#4FB79C;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:1040px;margin:0 auto;padding-inline:16px;padding-block:20px 56px}
+h1,h2,h3{margin:0;text-wrap:balance}
+a{color:var(--accent)}
+
+/* ---------- masthead ---------- */
+.mast{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:baseline;
+  border-bottom:1px solid var(--line2);padding-bottom:14px;margin-bottom:22px}
+.mast h1{font-family:var(--cond);font-weight:700;font-size:26px;letter-spacing:.005em}
+.mast .sub{color:var(--dim);font-size:13px;max-width:56ch}
+.kicker{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--faint);display:block;margin-bottom:3px}
+
+/* ---------- setup ---------- */
+.setup{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:18px}
+.setup h2{font-family:var(--cond);font-size:15px;letter-spacing:.02em;margin-bottom:4px}
+.setup p.lede{color:var(--dim);margin:0 0 16px;font-size:13px;max-width:70ch}
+.modes{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));margin-bottom:18px}
+.mode{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:3px;
+  padding:12px 14px;cursor:pointer;background:var(--bg)}
+.mode:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
+.mode input{margin:3px 0 0;accent-color:var(--accent);flex:none}
+.mode .t{font-weight:600;font-size:13.5px;display:block}
+.mode .t em{font-style:normal;font-family:var(--mono);font-size:11px;color:var(--faint)}
+.mode .d{display:block;color:var(--dim);font-size:12.5px;margin-top:4px}
+.cmpgrid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));margin-bottom:18px}
+.cmp{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:3px;
+  padding:10px 12px;cursor:pointer;background:var(--bg)}
+.cmp:hover{border-color:var(--line2)}
+.cmp input{margin:3px 0 0;accent-color:var(--accent);flex:none}
+.cmp .t{font-weight:600;font-size:13px}
+.cmp .w{font-family:var(--mono);font-size:10.5px;color:var(--faint);letter-spacing:.04em;
+  text-transform:uppercase;margin-top:2px}
+.opts{display:flex;flex-wrap:wrap;gap:18px 26px;align-items:center;
+  border-top:1px solid var(--line);padding-top:14px;margin-top:4px}
+label.opt{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--dim)}
+label.opt input{accent-color:var(--accent)}
+select,button{font-family:inherit;font-size:13px;color:var(--text)}
+select{background:var(--bg);border:1px solid var(--line2);border-radius:3px;padding:5px 8px}
+.btn{background:var(--accent);color:#fff;border:1px solid transparent;border-radius:3px;
+  padding:9px 18px;font-weight:600;cursor:pointer}
+.btn:hover{filter:brightness(1.08)}
+.btn.ghost{background:transparent;color:var(--text);border-color:var(--line2);font-weight:500}
+.btn.ghost:hover{background:var(--sunk);filter:none}
+.btn:disabled{opacity:.42;cursor:not-allowed;filter:none}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---------- stage ---------- */
+.runbar{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;justify-content:space-between;
+  margin-bottom:12px}
+.counter{font-family:var(--mono);font-size:12px;color:var(--dim);letter-spacing:.03em}
+.counter b{color:var(--text);font-weight:600}
+.meter{height:3px;background:var(--sunk);border-radius:2px;overflow:hidden;margin-bottom:16px}
+.meter i{display:block;height:100%;background:var(--accent);width:0;transition:width .25s}
+
+/* full-bleed so a magnified crop is not boxed in by the text column */
+.stagewrap{overflow-x:auto;overflow-y:hidden;padding-bottom:4px;
+  margin-inline:calc(50% - 50vw);padding-inline:16px}
+.stage{position:relative;margin:0 auto;background:#7F7F7F;padding:26px;border-radius:2px;
+  width:max-content;line-height:0}
+.stage.mag img{image-rendering:pixelated}
+.zoombar{display:flex;gap:8px;align-items:center;justify-content:center;margin:14px 0 2px;
+  flex-wrap:wrap}
+.zoombar .lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--faint)}
+.zb{font-family:var(--mono);font-size:12.5px;background:var(--panel);border:1px solid var(--line2);
+  border-radius:3px;padding:5px 13px;cursor:pointer}
+.zb[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.zoomnote{text-align:center;font-size:12px;color:var(--warn);margin:6px 0 0}
+.stage[data-surround="black"]{background:#000}
+.stage[data-surround="white"]{background:#fff}
+.frame{position:relative;overflow:hidden}
+.frame img{position:absolute;inset:0;width:100%;height:100%;visibility:hidden;display:block}
+.frame img.on{visibility:visible}
+.tag{position:absolute;left:0;bottom:0;font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+  background:rgba(0,0,0,.62);color:#fff;padding:3px 8px;line-height:1.3;border-radius:0 3px 0 0}
+
+.switcher{display:flex;gap:8px;justify-content:center;margin:16px 0 6px;flex-wrap:wrap}
+.sw{font-family:var(--cond);font-weight:700;font-size:15px;letter-spacing:.05em;
+  background:var(--panel);border:1px solid var(--line2);border-radius:3px;padding:9px 26px;cursor:pointer}
+.sw[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
+.sw kbd{display:block;font-family:var(--mono);font-size:9.5px;font-weight:400;letter-spacing:.08em;
+  opacity:.72;margin-top:2px}
+.hint{text-align:center;color:var(--faint);font-size:12px;font-family:var(--mono);letter-spacing:.02em}
+
+/* ---------- answer ---------- */
+.answer{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:16px 18px;margin-top:20px}
+.answer h3{font-family:var(--cond);font-size:13px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--dim);margin-bottom:10px}
+.optional{font-family:var(--mono);font-size:10px;letter-spacing:.08em;color:var(--faint);
+  border:1px solid var(--line2);border-radius:2px;padding:1px 5px;margin-left:6px;
+  text-transform:uppercase}
+.choices{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.choices.neutral{margin-top:8px}
+.choice{flex:1 1 150px;background:var(--bg);border:1px solid var(--line2);border-radius:3px;
+  padding:12px;cursor:pointer;font-weight:600;font-family:var(--cond);font-size:15px;letter-spacing:.03em}
+.choices.neutral .choice{font-size:13.5px;border-style:dashed}
+.choice small{display:block;font-family:var(--sans);font-weight:400;font-size:11.5px;
+  letter-spacing:0;color:var(--dim);margin-top:3px}
+.choice[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.choice[aria-pressed="true"] small{color:var(--accent)}
+.notebox{margin-top:14px}
+.notebox label{display:block;font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--faint);margin-bottom:5px}
+.notebox input{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:3px;
+  padding:8px 10px;font-family:inherit;font-size:13px;color:var(--text)}
+.conf{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.cf{flex:1 1 110px;background:var(--bg);border:1px solid var(--line);border-radius:3px;padding:9px 6px;
+  cursor:pointer;font-size:12.5px;text-align:center}
+.cf[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
+.cf small{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.06em;opacity:.7;margin-top:2px}
+
+.feedback{margin-top:14px;padding:11px 13px;border-radius:3px;font-size:13px;border:1px solid var(--line)}
+.feedback.hit{border-color:var(--accent-line);background:var(--accent-soft)}
+.feedback.miss{border-color:var(--line2);background:var(--sunk)}
+.feedback b{font-family:var(--cond);letter-spacing:.03em}
+.feedback .met{font-family:var(--mono);font-size:11.5px;color:var(--dim);margin-top:5px;display:block}
+
+/* ---------- results ---------- */
+.results{margin-top:30px}
+.results h2{font-family:var(--cond);font-size:17px;letter-spacing:.02em;margin-bottom:3px}
+.results .lede{color:var(--dim);font-size:13px;margin:0 0 14px}
+.tblwrap{overflow-x:auto;border:1px solid var(--line);border-radius:4px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;min-width:660px;font-size:13px}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--faint);font-weight:500;background:var(--sunk)}
+tbody tr:last-child td{border-bottom:none}
+td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+.verdict{font-family:var(--cond);font-weight:700;font-size:12px;letter-spacing:.05em;text-transform:uppercase;
+  padding:2px 7px;border-radius:2px;display:inline-block}
+.verdict.same{background:var(--accent-soft);color:var(--accent)}
+.verdict.diff{background:var(--sunk);color:var(--bad);border:1px solid var(--bad)}
+.verdict.thin{color:var(--faint)}
+.foot{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}
+.note{color:var(--faint);font-size:12px;margin-top:12px;max-width:74ch}
+.note code{font-family:var(--mono);font-size:11.5px;background:var(--sunk);padding:1px 4px;border-radius:2px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <div class="mast">
+    <div>
+      <span class="kicker">FastStack · blind image evaluation</span>
+      <h1>Silver Halide</h1>
+    </div>
+    <div class="sub">Blind side-by-side for the resampling and colour decisions in FastStack's
+      display pipeline. Every pair is rendered at the same crop, scale and position, shown
+      one image pixel to one screen pixel, on a neutral grey surround.</div>
+  </div>
+
+  <!-- ===== setup ===== -->
+  <section class="setup" id="setup">
+    <h2>Choose what to test</h2>
+    <p class="lede">Each trial puts two versions of the same crop in exactly the same place.
+      Flip between them and answer. Which version is which is reshuffled every trial and is
+      never shown until the results.</p>
+    <div class="modes">
+      <label class="mode"><input type="radio" name="mode" value="pref" checked>
+        <span><span class="t">Which one looks better?</span>
+        <span class="d">Answer 1, 2, or “they look the same”. If you keep saying “the same”,
+          that settles it — and if you do have a preference, the tool checks whether it lands
+          on the same algorithm often enough to be real.</span></span></label>
+      <label class="mode"><input type="radio" name="mode" value="abx">
+        <span><span class="t">Can you tell them apart at all? <em>(ABX)</em></span>
+        <span class="d">Adds a hidden third image, X, which is secretly one of the two. You
+          say which. Harder, and it answers a narrower question — use it when “better” is
+          too close to call and you want a yes/no on whether you can see any difference.</span></span></label>
+    </div>
+    <div class="cmpgrid" id="cmpgrid"></div>
+    <div class="opts">
+      <label class="opt"><input type="checkbox" id="optLock1x"> Lock at 1&times; (decision-grade run)</label>
+      <label class="opt"><input type="checkbox" id="optFeedback"> Show what each version was after each trial</label>
+      <label class="opt">Trials
+        <select id="optCount">
+          <option value="12">12</option>
+          <option value="20" selected>20</option>
+          <option value="32">32</option>
+          <option value="0">every pair</option>
+        </select>
+      </label>
+      <label class="opt">Surround
+        <select id="optSurround">
+          <option value="grey" selected>Neutral grey (ISO 3664)</option>
+          <option value="black">Black</option>
+          <option value="white">White</option>
+        </select>
+      </label>
+      <button class="btn" id="start">Start session</button>
+    </div>
+    <p class="note" id="dprNote"></p>
+  </section>
+
+  <!-- ===== running ===== -->
+  <section id="run" hidden>
+    <div class="runbar">
+      <div class="counter">Trial <b id="tNow">1</b> of <b id="tAll">20</b>
+        <span id="tCond" style="color:var(--faint)"></span></div>
+      <button class="btn ghost" id="endEarly">End session</button>
+    </div>
+    <div class="meter"><i id="bar"></i></div>
+
+    <div class="stagewrap">
+      <div class="stage" id="stage" data-surround="grey">
+        <div class="frame" id="frame">
+          <img id="img1" alt="Version 1">
+          <img id="img2" alt="Version 2">
+          <span class="tag" id="tag">1</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="switcher">
+      <button class="sw" id="sw1" aria-pressed="true">1<kbd>1</kbd></button>
+      <button class="sw" id="swX" aria-pressed="false" hidden>X<kbd>3 / space</kbd></button>
+      <button class="sw" id="sw2" aria-pressed="false">2<kbd>2</kbd></button>
+    </div>
+    <p class="hint" id="hint">Press 1 and 2, or space, to flip between them as many times as you
+      like — nothing moves or rescales.</p>
+
+    <div class="zoombar">
+      <span class="lbl">Magnify</span>
+      <button class="zb" data-z="1" aria-pressed="false">1&times;<span class="sr"> actual size</span></button>
+      <button class="zb" data-z="2" aria-pressed="true">2&times;</button>
+      <button class="zb" data-z="3" aria-pressed="false">3&times;</button>
+      <button class="zb" data-z="4" aria-pressed="false">4&times;</button>
+      <span class="lbl" id="zoomPx"></span>
+    </div>
+    <p class="zoomnote" id="zoomNote"></p>
+
+    <div class="answer">
+      <h3 id="qHead">Which one looks better?</h3>
+      <div class="choices">
+        <button class="choice" id="pick1" aria-pressed="false">1 looks better</button>
+        <button class="choice" id="pick2" aria-pressed="false">2 looks better</button>
+      </div>
+      <div class="choices neutral" id="neutralRow">
+        <button class="choice" id="pickSame" aria-pressed="false">They look the same
+          <small>I can't see any difference</small></button>
+        <button class="choice" id="pickDiffer" aria-pressed="false">Different, neither is better
+          <small>I can see it, but I don't prefer either</small></button>
+      </div>
+      <div id="confBlock">
+        <h3 style="margin-top:16px" id="confHead">How sure are you?
+          <span class="optional">optional</span></h3>
+        <div class="conf" id="conf"></div>
+      </div>
+      <div class="notebox" id="noteBox">
+        <label for="trialNote">What did you notice? (optional)</label>
+        <input id="trialNote" type="text" autocomplete="off" spellcheck="false"
+               placeholder="e.g. 2 is softer on the gill edges, 1 has a faint halo">
+      </div>
+      <div id="fb"></div>
+      <div class="foot">
+        <button class="btn" id="next" disabled>Next trial</button>
+        <button class="btn ghost" id="skip">Skip this pair</button>
+        <span id="nextWhy" style="color:var(--faint);font-size:12.5px">Choose an answer above to continue.</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== results ===== -->
+  <section class="results" id="results" hidden>
+    <h2>Results</h2>
+    <p class="lede" id="resLede"></p>
+    <div class="tblwrap">
+      <table>
+        <thead><tr>
+          <th>Comparison</th><th>Viewing condition</th><th style="text-align:right">Trials</th>
+          <th style="text-align:right">A · B · differ · same</th><th style="text-align:right">p</th>
+          <th style="text-align:right">Mean clarity</th><th>Reading</th>
+        </tr></thead>
+        <tbody id="resBody"></tbody>
+      </table>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" id="copy">Copy raw results</button>
+      <button class="btn ghost" id="again">Run another session</button>
+      <button class="btn ghost" id="reset">Clear all recorded trials</button>
+      <span id="saveState" style="color:var(--faint);font-size:12px"></span>
+    </div>
+    <p class="note">The score counts how often you picked version&nbsp;A, version&nbsp;B,
+      “different but neither better”, and “the same” — A and B are named under each comparison.
+      Which one appeared as image&nbsp;1 was reshuffled every trial, so a preference only counts
+      if it keeps landing on the same algorithm: p is a two-sided binomial test over the trials
+      where you did pick a side, since neither version was predicted to win.
+      <b>“Different, neither better” is a result, not a missing answer</b> — it says the change is visible but not a loss, which is exactly the finding
+      that lets a cheaper path ship for thumbnails and rapid navigation while the settled view
+      keeps the careful one. Every verdict is tied to <em>that</em> viewing condition and says
+      nothing about a different size or zoom. ABX rows score correct identifications of X
+      instead. Trials accumulate across sessions and across modes.</p>
+    <p class="note">Magnification is flagged per row because it changes what a verdict means.
+      A difference you can only resolve at 3&times; or 4&times; is one FastStack's own display
+      will never show you — so a “prefers A (magnified)” row is grounds for looking again at
+      1&times;, not for keeping the slower path.</p>
+  </section>
+</div>
+
+<script>
+(function(){
+"use strict";
+var DATA=null, DB=null, saved=[], sess=[], queue=[], qi=0, cur=null, shown="1", picked=null, conf=null, answered=false;
+var flips=0, tStart=0, MODE="pref", lastRow=null, ZOOM=2, zoomUsed=2, LOCK1X=false;
+try{ var _z=+localStorage.getItem("fs_abx_zoom"); if(_z>=1&&_z<=4)ZOOM=_z; }catch(e){}
+
+var CONDLABEL={
+  zoom100:"100% zoom", settled_fit:"Fit to window", rapid_nav:"Rapid navigation",
+  thumbnail_200:"200 px thumbnail", editor_preview:"Editor preview"
+};
+var CATLABEL={
+  gills_fine_detail:"gills / fine detail", diagonal_edges:"diagonal edges",
+  hf_texture:"high-frequency texture", foliage_saturated:"saturated foliage",
+  shadow_detail:"shadow detail", highlight_rolloff:"highlight roll-off",
+  smooth_gradient:"smooth gradient", high_iso_noise:"high-ISO noise",
+  camera_rotated:"EXIF-rotated camera frame"
+};
+var CONF=[["Guessing","0"],["A hunch","1"],["Fairly sure","2"],["Certain","3"]];
+var CONF_KEYS=["z","x","c","v"];
+var CONF_PREF=["Barely there","Slight","Clear","Obvious"];
+var CONF_ABX=["Guessing","A hunch","Fairly sure","Certain"];
+
+function $(id){return document.getElementById(id);}
+function esc(s){var d=document.createElement("span");d.textContent=s;return d.innerHTML;}
+
+/* Thumbnail trials keep their own aspect ratio, so the frame follows the
+   current trial's recorded size; only the setup screen falls back to the
+   square crop. */
+function frameDims(){
+  var t=cur&&cur.t;
+  if(t&&t.w&&t.h)return [t.w,t.h];
+  var px=DATA?DATA.crop:592;
+  return [px,px];
+}
+/* ---- device-pixel-exact sizing ----
+   At 1x, one image pixel lands on one screen pixel. Above that the browser
+   scales by a whole number with nearest-neighbour, so each image pixel becomes
+   an NxN block: nothing is invented and nothing is averaged away, and both
+   versions get identical treatment. */
+function applyDpr(){
+  var dpr=window.devicePixelRatio||1;
+  document.documentElement.style.setProperty("--dpr",String(dpr));
+  var dim=frameDims(), px=DATA?DATA.crop:592;
+  var f=$("frame");
+  if(f){f.style.width=(dim[0]*ZOOM/dpr)+"px";f.style.height=(dim[1]*ZOOM/dpr)+"px";}
+  $("stage").classList.toggle("mag", ZOOM>1);
+  var zp=$("zoomPx");
+  if(zp)zp.textContent=(dim[0]*ZOOM)+" device px wide";
+  var zn=$("zoomNote");
+  if(zn){
+    zn.textContent = ZOOM>1
+      ? "Magnified "+ZOOM+"x — larger than FastStack ever shows this. A difference you can"
+        + " only find here is below the threshold that matters in the app."
+      : "";
+    zn.hidden = ZOOM<=1;
+  }
+  var n=$("dprNote");
+  if(n)n.innerHTML="Your display reports a device pixel ratio of <code>"+dpr+
+    "</code>, so a "+px+"-pixel crop fills "+(px/dpr).toFixed(0)+
+    " CSS pixels at 1&times; — one image pixel per screen pixel. There is a magnifier on the "+
+    "test screen for a closer look; it scales by whole numbers with nearest-neighbour, so it "+
+    "never invents or blurs detail. Don't zoom the browser itself: that resamples both versions "+
+    "and hides the thing you are judging.";
+}
+function setZoom(z){
+  if(LOCK1X&&z!==1)return;
+  ZOOM=z;
+  if(z>zoomUsed)zoomUsed=z;
+  document.querySelectorAll(".zb").forEach(function(b){
+    b.setAttribute("aria-pressed", String(+b.dataset.z===z));});
+  try{localStorage.setItem("fs_abx_zoom",String(z));}catch(e){}
+  applyDpr();
+}
+
+/* ---- storage ---- */
+function loadLocal(){
+  try{var r=localStorage.getItem("fs_abx");return r?JSON.parse(r):[];}catch(e){return [];}
+}
+function saveLocal(){
+  try{localStorage.setItem("fs_abx",JSON.stringify(saved.slice(-2000)));}catch(e){}
+}
+function record(row){
+  saved.push(row); sess.push(row); saveLocal();
+  if(DB){
+    try{ DB.collection("responses").doc(row.id).set(row).catch(function(){}); }
+    catch(e){ /* a store that rejects synchronously must not block the session */ }
+  }
+}
+
+/* ---- stats ---- */
+function lchoose(n,k){var s=0,i;for(i=0;i<k;i++)s+=Math.log(n-i)-Math.log(i+1);return s;}
+function binomP(k,n){ // one-sided P(X >= k) with p = 0.5
+  if(n===0)return 1; var s=0,i;
+  for(i=k;i<=n;i++)s+=Math.exp(lchoose(n,i)-n*Math.LN2);
+  return Math.min(1,s);
+}
+
+/* ---- setup ui ---- */
+function buildSetup(){
+  var counts={};
+  DATA.trials.forEach(function(t){counts[t.cmp]=(counts[t.cmp]||0)+1;});
+  var g=$("cmpgrid"), html="";
+  Object.keys(DATA.comparisons).forEach(function(k){
+    var c=DATA.comparisons[k], ts=DATA.trials.filter(function(t){return t.cmp===k;});
+    var cond=ts.length?CONDLABEL[ts[0].cond]:"";
+    html+='<label class="cmp"><input type="checkbox" class="cmpbox" value="'+k+'" checked>'+
+      '<span><span class="t">'+esc(c.title)+'</span>'+
+      '<span class="w">'+esc(cond)+' · '+(counts[k]||0)+' pairs</span></span></label>';
+  });
+  g.innerHTML=html;
+  var cf=$("conf"),h="";
+  CONF.forEach(function(c,i){h+='<button class="cf" data-c="'+i+'" aria-pressed="false">'+c[0]+
+    '<small>'+CONF_KEYS[i].toUpperCase()+'</small></button>';});
+  cf.innerHTML=h;
+  cf.querySelectorAll(".cf").forEach(function(b){
+    b.addEventListener("click",function(){setConf(+b.dataset.c);});
+  });
+}
+
+function shuffle(a){for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1));var t=a[i];a[i]=a[j];a[j]=t;}return a;}
+
+function start(){
+  var picks=[].slice.call(document.querySelectorAll(".cmpbox")).filter(function(b){return b.checked;})
+              .map(function(b){return b.value;});
+  if(!picks.length){alert("Pick at least one comparison to test.");return;}
+  var pool=DATA.trials.filter(function(t){return picks.indexOf(t.cmp)>=0;});
+  var want=+$("optCount").value;
+  // Take trials in rounds across the chosen comparisons: slicing a single
+  // shuffled pool can leave a comparison with one trial or none, and no
+  // amount of reshuffling afterwards puts those trials back.
+  var byCmp={};
+  pool.forEach(function(t){(byCmp[t.cmp]=byCmp[t.cmp]||[]).push(t);});
+  var keys=Object.keys(byCmp);
+  keys.forEach(function(k){shuffle(byCmp[k]);});
+  if(want>0&&want<pool.length){
+    queue=[];
+    for(var round=0;queue.length<want;round++){
+      var added=false;
+      for(var gi=0;gi<keys.length&&queue.length<want;gi++){
+        var grp=byCmp[keys[gi]];
+        if(round<grp.length){queue.push(grp[round]);added=true;}
+      }
+      if(!added)break;
+    }
+  }else{
+    queue=pool.slice();
+  }
+  // presentation order only -- the per-comparison balance above is preserved
+  shuffle(queue);
+  qi=0; sess=[];
+  MODE=document.querySelector('input[name="mode"]:checked').value;
+  $("swX").hidden = MODE!=="abx";
+  $("qHead").textContent = MODE==="abx" ? "Which one is X?" : "Which one looks better?";
+  $("pick1").textContent = MODE==="abx" ? "X is version 1" : "1 looks better";
+  $("pick2").textContent = MODE==="abx" ? "X is version 2" : "2 looks better";
+  LOCK1X=$("optLock1x").checked;
+  document.querySelectorAll(".zb").forEach(function(b){b.disabled=LOCK1X&&+b.dataset.z!==1;});
+  if(LOCK1X)setZoomForced(1);
+  $("neutralRow").hidden = MODE==="abx";
+  $("noteBox").hidden = MODE==="abx";
+  $("stage").dataset.surround=$("optSurround").value;
+  $("setup").hidden=true; $("results").hidden=true; $("run").hidden=false;
+  $("tAll").textContent=queue.length;
+  nextTrial();
+}
+
+function nextTrial(){
+  if(qi>=queue.length){finish();return;}
+  var t=queue[qi];
+  var swap=Math.random()<0.5;              // which file is shown as "version 1"
+  var xIs = Math.random()<0.5 ? "1" : "2"; // which version X really is
+  cur={t:t,swap:swap,xIs:xIs,
+       f1: swap? t.b : t.a, f2: swap? t.a : t.b,
+       v1: swap? "B" : "A", v2: swap? "A" : "B"};
+  applyDpr();                              // this trial's own pixel size
+  $("img1").src="img/"+cur.f1;
+  $("img2").src="img/"+cur.f2;
+  $("tNow").textContent=(qi+1);
+  $("tCond").textContent=" · "+(CONDLABEL[t.cond]||t.cond)+" · "+(CATLABEL[t.cat]||t.cat);
+  $("bar").style.width=(qi/queue.length*100)+"%";
+  picked=null;conf=null;answered=false;flips=0;zoomUsed=ZOOM;tStart=performance.now();
+  $("pick1").setAttribute("aria-pressed","false");
+  $("pick2").setAttribute("aria-pressed","false");
+  $("pickSame").setAttribute("aria-pressed","false");
+  $("pickDiffer").setAttribute("aria-pressed","false");
+  $("trialNote").value="";
+  document.querySelectorAll(".cf").forEach(function(b){b.setAttribute("aria-pressed","false");});
+  $("confBlock").hidden=false;
+  $("confHead").textContent = MODE==="abx" ? "How sure are you?" : "How clear was the difference?";
+  var names = MODE==="abx" ? CONF_ABX : CONF_PREF;
+  document.querySelectorAll(".cf").forEach(function(b){
+    b.childNodes[0].nodeValue = names[+b.dataset.c];
+  });
+  $("fb").innerHTML="";
+  $("next").disabled=true;
+  $("nextWhy").hidden=false;
+  $("next").textContent = (qi+1>=queue.length) ? "Finish session" : "Next trial";
+  show("1");
+}
+
+function show(which){
+  if(which!==shown)flips++;
+  shown=which;
+  var target = which==="X" ? cur.xIs : which;
+  $("img1").classList.toggle("on", target==="1");
+  $("img2").classList.toggle("on", target==="2");
+  $("tag").textContent = which;
+  $("sw1").setAttribute("aria-pressed", String(which==="1"));
+  $("sw2").setAttribute("aria-pressed", String(which==="2"));
+  $("swX").setAttribute("aria-pressed", String(which==="X"));
+}
+
+function setPick(p){
+  if(answered)return;
+  if((p==="same"||p==="differ")&&MODE==="abx")return;
+  picked=p;
+  $("pick1").setAttribute("aria-pressed",String(p==="1"));
+  $("pick2").setAttribute("aria-pressed",String(p==="2"));
+  $("pickSame").setAttribute("aria-pressed",String(p==="same"));
+  $("pickDiffer").setAttribute("aria-pressed",String(p==="differ"));
+  // "they look the same" is the whole answer -- there is no difference to rate
+  $("confBlock").hidden = (p==="same");
+  if(p==="same")conf=null;
+  maybeCommit();
+}
+function setConf(c){
+  conf=c;
+  document.querySelectorAll(".cf").forEach(function(b){
+    b.setAttribute("aria-pressed",String(+b.dataset.c===c));});
+  if(answered){
+    // rating arrived after the choice committed -- amend the stored row
+    if(lastRow){
+      lastRow.confidence=c; saveLocal();
+      if(DB){try{DB.collection("responses").doc(lastRow.id).set(lastRow).catch(function(){});}
+             catch(e){}}
+    }
+    return;
+  }
+  maybeCommit();
+}
+
+function maybeCommit(){
+  if(picked===null||answered)return;
+  // The choice IS the answer. Clarity is optional colour on top of it, so the
+  // trial commits and Next unlocks the moment a side is picked -- never wait on
+  // a second click the screen does not insist on.
+  answered=true;
+  $("next").disabled=false;
+  $("nextWhy").hidden=true;
+  var c=DATA.comparisons[cur.t.cmp];
+  var row={id:"t"+Date.now()+"_"+Math.random().toString(36).slice(2,8),
+    ts:new Date().toISOString(), mode:MODE, cmp:cur.t.cmp, cond:cur.t.cond, cat:cur.t.cat,
+    scene:cur.t.scene, confidence:conf, flips:flips,
+    seconds:+((performance.now()-tStart)/1000).toFixed(1),
+    zoom:ZOOM,            // magnification at the moment of answering
+    zoomUsed:zoomUsed,    // the largest used at any point in this trial
+    v1:cur.v1, v2:cur.v2, // which algorithm was on screen as 1 and as 2
+    surround:$("stage").dataset.surround, dpr:window.devicePixelRatio||1};
+  if(MODE==="abx"){
+    row.correct = picked===cur.xIs;
+  }else if(picked==="same"||picked==="differ"){
+    row.preferred = picked;
+  }else{
+    // translate "version 1/2 on screen" back to which algorithm that was
+    row.preferred = picked==="1" ? cur.v1 : cur.v2;
+  }
+  lastRow=row;
+  // A storage failure must never be able to strand the session on a trial.
+  try{ record(row); }
+  catch(err){
+    $("fb").innerHTML='<div class="feedback miss"><b>Answer kept locally</b> — saving to the '+
+      'artifact store failed, so use “Copy raw results” before you close the page.</div>';
+  }
+  if($("optFeedback").checked){
+    var m=cur.t.m, met="";
+    if(m&&m.psnr_db!=null) met="PSNR "+m.psnr_db+" dB · SSIM "+m.ssim+
+      " · max channel difference "+Math.round(m.max_abs_diff)+"/255 · "+m.pct_pixels_differing+"% of pixels differ";
+    var head, body;
+    if(MODE==="abx"){
+      head = row.correct ? "Correct" : "Not this time";
+      body = "X was version "+cur.xIs+". ";
+    }else if(row.preferred==="same"){ head="Called identical"; body=""; }
+    else if(row.preferred==="differ"){ head="Visible, but no preference"; body=""; }
+    else { head = "You picked "+esc(row.preferred==="A"?c.a:c.b); body=""; }
+    body += "Version "+(cur.v1==="A"?"1":"2")+" was "+esc(c.a)+
+            "; version "+(cur.v1==="A"?"2":"1")+" was "+esc(c.b)+".";
+    $("fb").innerHTML='<div class="feedback '+(MODE==="abx"&&!row.correct?"miss":"hit")+
+      '"><b>'+head+'</b> — '+body+(met?'<span class="met">'+esc(met)+'</span>':'')+'</div>';
+  }
+}
+
+function finish(){
+  $("run").hidden=true; $("results").hidden=false;
+  $("bar").style.width="100%";
+  render();
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+
+function render(){
+  var groups={};
+  saved.forEach(function(r){
+    var mode=r.mode||"abx";
+    var k=mode+"|"+r.cmp+"|"+r.cond;
+    if(!groups[k])groups[k]={mode:mode,cmp:r.cmp,cond:r.cond,n:0,ok:0,A:0,B:0,same:0,differ:0,
+                             conf:0,cn:0,zmax:1,zsum:0};
+    var g=groups[k];g.n++;
+    var z=r.zoomUsed||r.zoom||1; g.zmax=Math.max(g.zmax,z); g.zsum+=z;
+    if(mode==="abx"){g.ok+=r.correct?1:0;}
+    else if(r.preferred==="A")g.A++;
+    else if(r.preferred==="B")g.B++;
+    else if(r.preferred==="differ")g.differ++;
+    else g.same++;
+    if(typeof r.confidence==="number"){g.conf+=r.confidence;g.cn++;}
+  });
+  var html="";
+  Object.keys(groups).sort().forEach(function(k){
+    var g=groups[k], c=DATA.comparisons[g.cmp]||{};
+    var score, p, v, vc;
+    if(g.mode==="abx"){
+      p=binomP(g.ok,g.n);
+      score=g.ok+" of "+g.n+" correct";
+      if(g.n<10){v="Too few trials";vc="thin";}
+      else if(p<0.05){v="You can see a difference";vc="diff";}
+      else {v="Indistinguishable";vc="same";}
+    }else{
+      var dec=g.A+g.B, hi=Math.max(g.A,g.B);
+      // No direction is predicted here, and hi is whichever side happened to
+      // win, so the tail has to be counted on both sides.
+      p=Math.min(1,2*binomP(hi,dec));
+      score=g.A+" · "+g.B+" · "+g.differ+" · "+g.same;
+      if(g.n<10){v="Too few trials";vc="thin";}
+      else if(dec>=8&&p<0.05){v=(g.A>g.B?"Prefers A":"Prefers B")+(g.zmax>1?" (magnified)":"");vc="diff";}
+      else if(g.same>=g.n*0.6){v="No visible difference";vc="same";}
+      else if(g.differ+g.same>=g.n*0.7){v="Visible, neither better";vc="same";}
+      else {v="No reliable preference";vc="same";}
+    }
+    html+="<tr><td>"+esc(c.title||g.cmp)+
+      '<br><span style="color:var(--faint);font-size:11.5px">'+
+      (g.mode==="abx"?"ABX":"A = "+esc(c.a||"")+" &nbsp;·&nbsp; B = "+esc(c.b||""))+"</span></td>"+
+      "<td>"+esc(CONDLABEL[g.cond]||g.cond)+
+      (g.zmax>1?'<br><span style="color:var(--warn);font-size:11.5px">inspected up to '+
+        (g.zsum/g.n).toFixed(1)+"&times;</span>":"")+"</td>"+
+      '<td class="num">'+g.n+'</td>'+
+      '<td class="num">'+score+"</td>"+
+      '<td class="num">'+(dec===0&&g.mode!=="abx"?"—":(p<0.001?"&lt;0.001":p.toFixed(3)))+'</td>'+
+      '<td class="num">'+(g.cn?(g.conf/g.cn).toFixed(1)+"/3":"—")+"</td>"+
+      '<td><span class="verdict '+vc+'">'+v+"</span>"+
+      (vc==="same"&&c.win?'<br><span style="color:var(--faint);font-size:11.5px">'+esc(c.win)+"</span>":"")+
+      "</td></tr>";
+  });
+  if(!html)html='<tr><td colspan="7" style="color:var(--dim)">No trials recorded yet.</td></tr>';
+  $("resBody").innerHTML=html;
+  var s="";
+  if(sess.length){
+    var pref=sess.filter(function(r){return r.mode==="pref";});
+    if(pref.length) s=pref.filter(function(r){return r.preferred==="same";}).length+
+      " of "+pref.length+" called the same this session. ";
+    else s=sess.filter(function(r){return r.correct;}).length+" of "+sess.length+" correct this session. ";
+  }
+  $("resLede").textContent=s+saved.length+" trials recorded in total.";
+  $("saveState").textContent = DB ? "Saved to this artifact's store." : "Saved in this browser only.";
+}
+
+/* ---- wiring ---- */
+$("start").addEventListener("click",start);
+$("sw1").addEventListener("click",function(){show("1");});
+$("sw2").addEventListener("click",function(){show("2");});
+$("swX").addEventListener("click",function(){show("X");});
+$("pick1").addEventListener("click",function(){setPick("1");});
+$("pick2").addEventListener("click",function(){setPick("2");});
+$("pickSame").addEventListener("click",function(){setPick("same");});
+function commitNote(){
+  var v=$("trialNote").value.trim();
+  if(v&&lastRow){
+    lastRow.note=v; saveLocal();
+    if(DB)DB.collection("responses").doc(lastRow.id).set(lastRow).catch(function(){});
+  }
+  $("trialNote").value="";
+}
+$("next").addEventListener("click",function(){if(answered){commitNote();qi++;nextTrial();}});
+$("skip").addEventListener("click",function(){qi++;nextTrial();});
+$("endEarly").addEventListener("click",finish);
+$("again").addEventListener("click",function(){
+  $("results").hidden=true;$("setup").hidden=false;window.scrollTo({top:0,behavior:"smooth"});});
+$("reset").addEventListener("click",function(){
+  if(!confirm("Delete every recorded trial, including earlier sessions?"))return;
+  saved=[];sess=[];saveLocal();
+  if(DB)DB.collection("responses").get().then(function(snap){
+    (snap&&snap.docs||[]).forEach(function(d){DB.doc("responses/"+d.id).delete().catch(function(){});});
+  }).catch(function(){});
+  render();});
+$("copy").addEventListener("click",function(){
+  var txt=JSON.stringify(saved,null,1);
+  navigator.clipboard.writeText(txt).then(function(){
+    $("copy").textContent="Copied "+saved.length+" rows";
+    setTimeout(function(){$("copy").textContent="Copy raw results";},1800);
+  },function(){ $("copy").textContent="Clipboard blocked"; });});
+$("optSurround").addEventListener("change",function(){$("stage").dataset.surround=this.value;});
+function setZoomForced(z){var l=LOCK1X;LOCK1X=false;setZoom(z);LOCK1X=l;}
+document.querySelectorAll(".zb").forEach(function(b){
+  b.addEventListener("click",function(){setZoom(+b.dataset.z);});});
+
+document.addEventListener("keydown",function(e){
+  if($("run").hidden)return;
+  var k=e.key.toLowerCase();
+  if(e.target===$("trialNote")){
+    // typing a note must not drive the viewer; Enter still advances
+    if(k==="enter"&&answered){commitNote();qi++;nextTrial();e.preventDefault();}
+    return;
+  }
+  if(k==="1"){show("1");e.preventDefault();}
+  else if(k==="2"){show("2");e.preventDefault();}
+  else if((k==="3"||k===" ")&&MODE==="abx"){show("X");e.preventDefault();}
+  else if(k===" "){show(shown==="1"?"2":"1");e.preventDefault();}
+  else if(k==="arrowright"||k==="enter"){ if(answered){commitNote();qi++;nextTrial();} }
+  else if(k==="q"){setPick("1");}
+  else if(k==="e"){setPick("2");}
+  else if(k==="w"){setPick("same");}
+  else if(k==="d"){setPick("differ");}
+  else if(k==="+"||k==="="){ setZoom(Math.min(4,ZOOM+1)); e.preventDefault(); }
+  else if(k==="-"||k==="_"){ setZoom(Math.max(1,ZOOM-1)); e.preventDefault(); }
+  else if(CONF_KEYS.indexOf(k)>=0){ setConf(CONF_KEYS.indexOf(k)); }
+});
+
+window.addEventListener("resize",applyDpr);
+
+/* ---- boot ---- */
+saved=loadLocal();
+setZoom(ZOOM);
+fetch("data.json").then(function(r){return r.json();}).then(function(d){
+  DATA=d; applyDpr(); buildSetup(); render();
+}).catch(function(){
+  $("setup").innerHTML='<h2>Could not load the trial set</h2><p class="lede">'+
+    'data.json did not load, so there is nothing to compare.</p>';
+});
+
+if(window.claude&&window.claude.use){
+  window.claude.use("db").then(function(db){
+    if(!db)return; DB=db;
+    return db.collection("responses").get().then(function(snap){
+      var docs=(snap&&snap.docs)||[];
+      if(docs.length){
+        var have={};saved.forEach(function(r){have[r.id]=1;});
+        docs.forEach(function(d){var v=d.data();if(v&&v.id&&!have[v.id])saved.push(v);});
+        saved.sort(function(a,b){return (a.ts<b.ts)?-1:1;});
+        saveLocal();
+      }
+      render();
+    });
+  }).catch(function(){});
+}
+})();
+</script>

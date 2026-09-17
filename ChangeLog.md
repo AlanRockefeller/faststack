@@ -2,6 +2,11 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## 1.6.9 (2026-09-12)
+
+- Improved Brightness and positive Contrast adjustments, with gentler protection of bright and dark detail. Blacks and Whites set the brightness range before the new curves are applied, so lowering Whites can still bring bright detail back into range. Reducing Contrast keeps its previous response. Previews and saved JPGs use the same adjustments.
+- Previously saved edits keep their original appearance. When resuming an older edit, "Use improved adjustments" switches to the new curves without resetting the crop or slider settings. Edits from an unsupported version show a warning instead of being silently converted.
+
 ## 1.6.8 (2026-08-10)
 
 - Auto levels (L) no longer washes out photos. It used to judge brightness from the whole picture, so a mushroom on a black background looked "too dark" and got brightened way too much. It now looks at the subject instead of the background, and turns the brightness up much more gently.

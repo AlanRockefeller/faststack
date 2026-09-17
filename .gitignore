@@ -10,6 +10,7 @@ ANTIGRAVITY_RULES.md
 .agent/
 tools/*
 !tools/release_notes.py
+!tools/quality-harness/
 git.instructions.txt
 
 # We don't have any good docs yet
@@ -106,3 +107,8 @@ OpenFocus/
 faststack-fix/
 .exe-test/
 py-spy-profiles/
+
+# Runtime sidecar written when the checkout itself is opened as an image
+# directory (intentional test fixtures under faststack/tests/ stay tracked)
+/faststack.json
+/faststack.json.lock

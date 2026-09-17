@@ -1,5 +1,6 @@
 """Main application entry point for FastStack."""
 
+import copy
 import io
 import logging
 import sys
@@ -4587,6 +4588,31 @@ class AppController(QObject):
         if not isinstance(serialized, dict):
             return edits
 
+        # Recipes saved before tone curves were versioned used linear
+        # brightness/contrast. Reopening them must not change their appearance.
+        # New sessions and Reset use the latest version from _initial_edits().
+        try:
+            edits["tone_curve_version"] = ImageEditor.tone_curve_version(serialized)
+        except RuntimeError as exc:
+            # Keep the entire unknown recipe (including future fields), not a
+            # lossy subset stamped with an older renderer. Rendering and export
+            # reject this version; simply viewing its saved JPEG is still safe.
+            log.warning("Cannot resume image edits: %s", exc)
+            self.update_status_message(str(exc), timeout=10000)
+            fallback = copy.deepcopy(serialized)
+            # Typed fields still have to be typed: the darken tool reads
+            # current_edits["darken_settings"].enabled directly, so leaving a
+            # raw dict here turns pressing K into an AttributeError.
+            raw_darken = fallback.get("darken_settings")
+            if isinstance(raw_darken, dict):
+                try:
+                    fallback["darken_settings"] = DarkenSettings.from_dict(raw_darken)
+                except (TypeError, ValueError, KeyError):
+                    log.warning(
+                        "Ignoring invalid pending darken settings: %r", raw_darken
+                    )
+                    fallback["darken_settings"] = None
+            return fallback
         numeric_keys = {
             "brightness",
             "contrast",
@@ -4607,6 +4633,8 @@ class AppController(QObject):
             *ImageEditor._COLOR_MIX_KEYS,
         }
         for key in edits:
+            if key == "tone_curve_version":
+                continue  # Already resolved centrally above.
             if key not in serialized:
                 continue
             value = serialized[key]
@@ -15725,8 +15753,37 @@ class AppController(QObject):
                     self._auto_add_edited_to_batch_if_enabled(
                         Path(self.image_editor.current_filepath)
                     )
+        except RuntimeError as e:
+            self.update_status_message(str(e), timeout=10000)
+            log.warning("Cannot change edit parameter %s: %s", key, e)
         except Exception as e:
             log.error("Error setting edit parameter %s=%s: %s", key, value, e)
+
+    @Slot()
+    def use_improved_adjustments(self):
+        """Opt a legacy recipe into current tones without resetting any edits."""
+        if self.ui_state.isCropping:
+            self.update_status_message(
+                "Apply or cancel the crop before upgrading edits"
+            )
+            return
+        # Compact-editor navigation defers its reload. Resolve the selected
+        # photo now so a click cannot upgrade the previous photo's session.
+        if not self.load_image_for_editing():
+            return
+        try:
+            if ImageEditor.tone_curve_version(self.image_editor.current_edits) != 1:
+                return
+        except RuntimeError as exc:
+            self.update_status_message(str(exc), timeout=10000)
+            return
+        version = self.image_editor._initial_edits()["tone_curve_version"]
+        # Use the same revision/preview/batch path as an ordinary slider edit.
+        self.set_edit_parameter("tone_curve_version", version)
+        if self.image_editor.get_edit_value("tone_curve_version") == version:
+            self.update_status_message(
+                "Using improved adjustments; crop and slider settings kept"
+            )
 
     @Slot(int, int, int, int)
     def set_crop_box(self, left: int, top: int, right: int, bottom: int):

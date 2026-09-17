@@ -22,6 +22,7 @@ except ImportError:
 
 from faststack.config import config
 from faststack.imaging.cache import build_cache_key
+from faststack.imaging.exif_fast import read_orientation
 from faststack.imaging.jpeg import (
     _PREMATURE_EOF_RETRY_DELAY,
     IncompleteJPEGError,
@@ -57,6 +58,9 @@ HELD_NAVIGATION_QUALITY_DIMENSIONS = {
     "highest": 3200,
 }
 _MIN_DIRECTION_TAIL = 4
+
+# EXPERIMENTAL gate: transpose the decode target box for EXIF-rotated frames.
+_ORIENT_TARGET = os.environ.get("FASTSTACK_ORIENT_TARGET", "") not in ("", "0", "false")
 
 # Speculative decodes allowed while latency-sensitive foreground work runs.
 # Profiling showed 11 concurrent native TurboJPEG/ICC decodes saturating CPU
@@ -669,13 +673,25 @@ def prewarm_decode_stack() -> None:
 
 
 # Strip-parallel ICC apply. An lcms transform is immutable once built, so the
-# same transform can convert independent row bands concurrently; measured
-# byte-identical to the single-shot path and ~3x faster on a 6MP cover
-# (tools/bench_decode.py). Small (fast-tier) frames stay single-shot: the
-# fan-out overhead and contention with busy decode workers outweigh the win,
-# and their latency is hidden by the look-ahead buffer anyway.
-_ICC_STRIP_MIN_PIXELS = 2_000_000
-_ICC_STRIP_COUNT = 4
+# same transform can convert independent row bands concurrently; the result is
+# byte-identical to the single-shot path.
+#
+# This used to skip frames under 2MP, on the reasoning that fan-out overhead
+# and contention with busy decode workers would outweigh the win and that the
+# look-ahead buffer hid the latency anyway. Measured 2026-09-17, that is wrong
+# for the frame the user is actually waiting on:
+#
+#   1.26MP (fast tier)  single-shot 38ms -> 8 strips 10.8ms
+#   3.85MP (cover)      4 strips    42ms -> 8 strips 27.6ms
+#
+# and in the running app the icc stage fell from 65.3ms to 19.5ms (median over
+# ~170 real navigation frames, colour management on). Held-navigation
+# throughput was unchanged, so the feared contention does not materialise: the
+# decode pool is rarely saturated at the look-ahead depths FastStack uses.
+# 8 strips is near the knee for both sizes; 16 buys under 10% at 3.85MP and
+# nothing at 1.26MP.
+_ICC_STRIP_MIN_PIXELS = 200_000
+_ICC_STRIP_COUNT = 8
 _icc_strip_pool = None
 _icc_strip_pool_lock = threading.Lock()
 
@@ -961,11 +977,19 @@ def _decode_buffer(
                             # page faults taken inside the decoder.
                             _faulted = mmapped[:: mmap.PAGESIZE]
                             stats["read_ms"] = (time.perf_counter() - _t_read) * 1000.0
+                        dw, dh = display_width, display_height
+                        if _ORIENT_TARGET and use_resized and should_resize:
+                            # EXIF-rotated frames are displayed transposed, so
+                            # the decode box has to be transposed too -- else
+                            # the buffer comes out ~1.8x larger than the
+                            # viewport can ever show.
+                            if read_orientation(mmapped[:65536]) in (5, 6, 7, 8):
+                                dw, dh = dh, dw
                         if use_resized and should_resize:
                             buffer = decode_jpeg_resized(
                                 mmapped,
-                                display_width,
-                                display_height,
+                                dw,
+                                dh,
                                 fast_dct=fast_dct,
                                 source_path=str(target_path),
                                 mode=decode_quality,
