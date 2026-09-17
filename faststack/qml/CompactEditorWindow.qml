@@ -773,6 +773,12 @@ Window {
                 }
             }
 
+            ToneCurveNotice {
+                id: toneNotice
+                uiStateRef: compactEditor.uiStateRef
+                controllerRef: compactEditor.controllerRef
+            }
+
             ListModel {
                 id: lightModel
                 ListElement { name: "Exposure"; key: "exposure"; min: -100; max: 100 }
@@ -933,7 +939,7 @@ Window {
                     Layout.preferredWidth: 80
                     Layout.preferredHeight: 28
                     font.pixelSize: 11
-                    enabled: compactEditor.uiStateRef ? (!compactEditor.uiStateRef.isSaving && !compactEditor.cropActive) : true
+                    enabled: toneNotice.supported && (compactEditor.uiStateRef ? (!compactEditor.uiStateRef.isSaving && !compactEditor.cropActive) : true)
                     onClicked: {
                         compactEditor.ensureEditorLoaded("save")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.save_edited_image()

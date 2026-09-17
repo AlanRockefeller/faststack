@@ -151,6 +151,27 @@ _COLOR_MIX_KEYS: Tuple[str, ...] = tuple(f"color_sat_{n}" for n, _ in _COLOR_MIX
 
 
 _REC601_LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+# Stored with edit recipes so existing saved edits retain their tone response.
+_TONE_CURVE_VERSION = 2
+
+
+def _resolve_tone_curve_version(value: Any = 1) -> int:
+    """Unversioned recipes are legacy; never guess at an unknown renderer."""
+    if type(value) is int and value in (1, _TONE_CURVE_VERSION):
+        return value
+    raise RuntimeError(
+        f"Unsupported tone curve version {value!r}. "
+        "Use a compatible FastStack version to edit or save this photo."
+    )
+
+
+def _apply_levels_ramp(arr: np.ndarray, blacks: float, whites: float) -> np.ndarray:
+    """Set the working black/white range without clipping or mutating input."""
+    bp = -blacks * 0.15
+    wp = 1.0 - whites * 0.15
+    if abs(wp - bp) < 0.0001:
+        wp = bp + 0.0001
+    return (arr - bp) / (wp - bp)
 
 
 def _rec601_gray(arr: np.ndarray) -> np.ndarray:
@@ -172,14 +193,45 @@ def _apply_basic_srgb_adjustments(
     contrast: float,
     saturation: float,
     vibrance: float,
+    tone_curve_version: int = 1,
 ) -> np.ndarray:
-    """Apply the common per-pixel sRGB chain to one independent row band."""
+    """Apply the common per-pixel sRGB chain without modifying the input band."""
+    tone_curve_version = _resolve_tone_curve_version(tone_curve_version)
     cv2 = _get_cv2()
     if abs(brightness) > 0.001:
-        arr = arr * (1.0 + brightness)
+        gain = 1.0 + brightness
+        brightened = arr * gain
+        if tone_curve_version != 1 and brightness > 0.0:
+            # Keep the familiar gain until output reaches 90%, then roll off
+            # smoothly to white. The join preserves both value and slope;
+            # delaying protection keeps pale midtone texture from flattening.
+            knee = 0.90
+            source_knee = knee / gain
+            exponent = gain * (1.0 - source_knee) / (1.0 - knee)
+            upper = arr > source_knee
+            remaining = (1.0 - arr[upper]) / (1.0 - source_knee)
+            # Levels has already had the chance to bring WB/exposure headroom
+            # into range. Guard any remaining out-of-range input before powers.
+            np.maximum(remaining, 0.0, out=remaining)
+            brightened[upper] = 1.0 - (1.0 - knee) * np.power(remaining, exponent)
+        # Darkening retains the original gain, including its black endpoint.
+        arr = brightened
     if abs(contrast) > 0.001:
         contrast_factor = 1.0 + contrast * 0.4
-        arr = (arr - 0.5) * contrast_factor + 0.5
+        if tone_curve_version == 1 or contrast < 0.0:
+            arr = (arr - 0.5) * contrast_factor + 0.5
+        else:
+            # An S-curve with the old slope at mid-gray, but fixed black/white
+            # endpoints instead of pushing more values past the clipping limits.
+            # Clip working copies for safe powers after WB/exposure headroom;
+            # never mutate the source shared by the no-copy export path.
+            upper = np.clip(arr, 0.0, 1.0)
+            lower = 1.0 - upper
+            np.power(upper, contrast_factor, out=upper)
+            np.power(lower, contrast_factor, out=lower)
+            lower += upper
+            upper /= lower
+            arr = upper
 
     if abs(saturation) > 0.001:
         factor = 1.0 + saturation * 0.5
@@ -902,6 +954,7 @@ class ImageEditor:
 
     def _initial_edits(self) -> Dict[str, Any]:
         return {
+            "tone_curve_version": _TONE_CURVE_VERSION,
             "brightness": 0.0,
             "contrast": 0.0,
             "saturation": 0.0,
@@ -924,6 +977,11 @@ class ImageEditor:
             # Per-hue saturation bank (color mix); see _COLOR_MIX_BANDS.
             **{key: 0.0 for key in _COLOR_MIX_KEYS},
         }
+
+    @staticmethod
+    def tone_curve_version(edits: Dict[str, Any]) -> int:
+        """Resolve a recipe consistently for preview, export and migration."""
+        return _resolve_tone_curve_version(edits.get("tone_curve_version", 1))
 
     @staticmethod
     def _freeze_mask_identity_value(value: Any) -> Any:
@@ -1632,6 +1690,7 @@ class ImageEditor:
         cv2 = _get_cv2()
         if edits is None:
             edits = self.current_edits
+        tone_curve_version = self.tone_curve_version(edits)
         use_levels_soft_knee = (
             self.levels_soft_knee
             if levels_soft_knee_override is None
@@ -2290,13 +2349,28 @@ class ImageEditor:
         c_val = edits.get("contrast", 0.0)
         sat_val = edits.get("saturation", 0.0)
         vibrance = edits.get("vibrance", 0.0)
+        blacks = edits.get("blacks", 0.0)
+        whites = edits.get("whites", 0.0)
+        levels_active = abs(blacks) > 0.001 or abs(whites) > 0.001
+        # Let Levels bring recoverable WB/exposure headroom into range BEFORE
+        # the bounded positive tone curves. Otherwise distinct highlights can
+        # collapse to white before a lowered Whites setting can recover them.
+        # With neutral Levels the approved standalone curves are unchanged.
+        # Legacy recipes and negative-only adjustments retain the old ordering.
+        levels_before_tones = tone_curve_version == 2 and (
+            b_val > 0.001 or c_val > 0.001
+        )
+        if levels_active and levels_before_tones:
+            arr = _cancellable_rows(
+                lambda band: _apply_levels_ramp(band, blacks, whites), arr
+            )
         basic_srgb_active = any(
             abs(value) > 0.001 for value in (b_val, c_val, sat_val, vibrance)
         )
         if basic_srgb_active and cancel_check is not None:
             arr = _cancellable_rows(
                 lambda band: _apply_basic_srgb_adjustments(
-                    band, b_val, c_val, sat_val, vibrance
+                    band, b_val, c_val, sat_val, vibrance, tone_curve_version
                 ),
                 arr,
             )
@@ -2322,6 +2396,7 @@ class ImageEditor:
                         c_val,
                         sat_val,
                         vibrance,
+                        tone_curve_version,
                     )
                     futures.append((top, bottom, future))
                 for top, bottom, future in futures:
@@ -2330,7 +2405,9 @@ class ImageEditor:
             finally:
                 executor.shutdown(wait=True, cancel_futures=True)
         elif basic_srgb_active:
-            arr = _apply_basic_srgb_adjustments(arr, b_val, c_val, sat_val, vibrance)
+            arr = _apply_basic_srgb_adjustments(
+                arr, b_val, c_val, sat_val, vibrance, tone_curve_version
+            )
 
         _check_cancelled()
 
@@ -2389,16 +2466,11 @@ class ImageEditor:
         _check_cancelled()
 
         # 19. Levels (Blacks/Whites)
-        blacks = edits.get("blacks", 0.0)
-        whites = edits.get("whites", 0.0)
-        if abs(blacks) > 0.001 or abs(whites) > 0.001:
-            bp = -blacks * 0.15
-            wp = 1.0 - (whites * 0.15)
-            if abs(wp - bp) < 0.0001:
-                wp = bp + 0.0001
-            arr = (arr - bp) / (wp - bp)
+        if levels_active:
+            if not levels_before_tones:
+                arr = _apply_levels_ramp(arr, blacks, whites)
             if use_levels_soft_knee:
-                # The ramp above allocates, so in-place soft clip is safe.
+                # Either ramp placement allocates, so in-place soft clip is safe.
                 arr = _apply_levels_soft_clip(arr)
 
         _check_cancelled()
@@ -3682,6 +3754,9 @@ class ImageEditor:
     def set_edit_param(self, key: str, value: Any) -> bool:
         """Update a single edit parameter."""
         with self._lock:
+            self.tone_curve_version(self.current_edits)
+            if key == "tone_curve_version":
+                value = _resolve_tone_curve_version(value)
             if key == "rotation":
                 # Guard against arbitrary angles in 'rotation'. It expects 90-degree steps.
                 # For arbitrary rotation (drag to rotate), use 'straighten_angle'.
@@ -4411,6 +4486,10 @@ class ImageEditor:
         if self.original_image is None:
             raise RuntimeError("No image loaded")
 
+        # Refuse unknown recipes before allocating or preparing save metadata.
+        with self._lock:
+            self.tone_curve_version(self.current_edits)
+
         # Ensure float master exists (preview_only loads may not have it)
         self._ensure_float_image()
 
@@ -4864,7 +4943,7 @@ class ImageEditor:
             edits = self.current_edits.copy()
 
         for key, default in self._initial_edits().items():
-            if key in ("blacks", "whites"):
+            if key in ("blacks", "whites", "tone_curve_version"):
                 continue
             val = edits.get(key, default)
             if isinstance(default, float):
@@ -4876,6 +4955,7 @@ class ImageEditor:
             elif val != default:
                 return None
 
+        self.tone_curve_version(edits)
         try:
             blacks = float(edits.get("blacks", 0.0))
             whites = float(edits.get("whites", 0.0))
@@ -4963,7 +5043,7 @@ class ImageEditor:
             edits = self.current_edits.copy()
 
         for key, default in self._initial_edits().items():
-            if key in ("white_balance_by", "white_balance_mg"):
+            if key in ("white_balance_by", "white_balance_mg", "tone_curve_version"):
                 continue
             val = edits.get(key, default)
             if isinstance(default, float):
@@ -4975,6 +5055,7 @@ class ImageEditor:
             elif val != default:
                 return None
 
+        self.tone_curve_version(edits)
         try:
             by = float(edits.get("white_balance_by", 0.0))
             mg = float(edits.get("white_balance_mg", 0.0))
