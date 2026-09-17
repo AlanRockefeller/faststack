@@ -673,15 +673,25 @@ def prewarm_decode_stack() -> None:
 
 
 # Strip-parallel ICC apply. An lcms transform is immutable once built, so the
-# same transform can convert independent row bands concurrently; measured
-# byte-identical to the single-shot path and ~3x faster on a 6MP cover
-# (tools/bench_decode.py). Small (fast-tier) frames stay single-shot: the
-# fan-out overhead and contention with busy decode workers outweigh the win,
-# and their latency is hidden by the look-ahead buffer anyway.
-# EXPERIMENTAL gate: strip-parallel ICC for every frame, not just >=2MP ones.
-_ICC_AGGRESSIVE = os.environ.get("FASTSTACK_ICC_STRIPS", "") not in ("", "0", "false")
-_ICC_STRIP_MIN_PIXELS = 200_000 if _ICC_AGGRESSIVE else 2_000_000
-_ICC_STRIP_COUNT = 8 if _ICC_AGGRESSIVE else 4
+# same transform can convert independent row bands concurrently; the result is
+# byte-identical to the single-shot path.
+#
+# This used to skip frames under 2MP, on the reasoning that fan-out overhead
+# and contention with busy decode workers would outweigh the win and that the
+# look-ahead buffer hid the latency anyway. Measured 2026-09-17, that is wrong
+# for the frame the user is actually waiting on:
+#
+#   1.26MP (fast tier)  single-shot 38ms -> 8 strips 10.8ms
+#   3.85MP (cover)      4 strips    42ms -> 8 strips 27.6ms
+#
+# and in the running app the icc stage fell from 65.3ms to 19.5ms (median over
+# ~170 real navigation frames, colour management on). Held-navigation
+# throughput was unchanged, so the feared contention does not materialise: the
+# decode pool is rarely saturated at the look-ahead depths FastStack uses.
+# 8 strips is near the knee for both sizes; 16 buys under 10% at 3.85MP and
+# nothing at 1.26MP.
+_ICC_STRIP_MIN_PIXELS = 200_000
+_ICC_STRIP_COUNT = 8
 _icc_strip_pool = None
 _icc_strip_pool_lock = threading.Lock()
 

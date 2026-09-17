@@ -83,8 +83,19 @@ def _parse(jpeg) -> Optional[tuple]:
                     # are bit-identical at every scaling factor.
                     return None
                 sof = (i + 5, w, h, hmax, vmax)
-            elif m in (0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD,
-                       0xCE, 0xCF):
+            elif m in (
+                0xC2,
+                0xC3,
+                0xC5,
+                0xC6,
+                0xC7,
+                0xC9,
+                0xCA,
+                0xCB,
+                0xCD,
+                0xCE,
+                0xCF,
+            ):
                 return None  # progressive / arithmetic / lossless
             elif m == 0xDD:
                 dri = struct.unpack(">H", jpeg[i + 4 : i + 6])[0]
@@ -159,8 +170,9 @@ def build_chunks(jpeg, nchunks: int):
     return parts, w, h
 
 
-def decode_parallel(decoder, jpeg, scaling_factor, pixel_format, flags=0,
-                    nchunks: int = 0):
+def decode_parallel(
+    decoder, jpeg, scaling_factor, pixel_format, flags=0, nchunks: int = 0
+):
     """Bit-identical parallel replacement for ``decoder.decode``.
 
     Returns ``None`` when the file is not splittable; the caller falls back to

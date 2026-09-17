@@ -28,9 +28,7 @@ def read_orientation(data) -> int:
                 return 1
             seg_len = struct.unpack(">H", data[i + 2 : i + 4])[0]
             if marker == 0xE1 and data[i + 4 : i + 10] == b"Exif\x00\x00":
-                return _orientation_from_tiff(
-                    bytes(data[i + 10 : i + 2 + seg_len])
-                )
+                return _orientation_from_tiff(bytes(data[i + 10 : i + 2 + seg_len]))
             i += 2 + seg_len
     except Exception:
         return 1

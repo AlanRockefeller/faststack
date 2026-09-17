@@ -90,7 +90,9 @@ def decode_at(data, box_w, box_h, transpose_for_orientation=False, orientation=1
     else:
         target, constraining = box_h, h
     dec = _TJ.decode(
-        data, scaling_factor=covering_factor(constraining, target), pixel_format=TJPF_RGB
+        data,
+        scaling_factor=covering_factor(constraining, target),
+        pixel_format=TJPF_RGB,
     )
     return dec, (box_w, box_h)
 
@@ -250,7 +252,9 @@ def _thumb_embedded(ctx):
         return None
     emb = ctx.orient(np.asarray(best.convert("RGB")))
     tw, th = fit_screen(
-        *fit_down(emb.shape[1], emb.shape[0], ctx.thumb, ctx.thumb), ctx.thumb, ctx.thumb
+        *fit_down(emb.shape[1], emb.shape[0], ctx.thumb, ctx.thumb),
+        ctx.thumb,
+        ctx.thumb,
     )
     return cv2.resize(emb, (tw, th), interpolation=cv2.INTER_LINEAR)
 
@@ -285,7 +289,10 @@ COMPARISONS = {
         cond="settled_fit",
         crop=True,
         rotated_only=True,
-        a=("Oversized buffer, GPU downscales (current)", _settled(cv2.INTER_AREA, False)),
+        a=(
+            "Oversized buffer, GPU downscales (current)",
+            _settled(cv2.INTER_AREA, False),
+        ),
         b=("Exact-size buffer, CPU downscales", _settled(cv2.INTER_AREA, True)),
         win="B uses 44% less memory per frame",
     ),
@@ -455,7 +462,11 @@ def main():
         return name
 
     trials, refs, failures = [], {}, []
-    jobs = [(f"{cat}_{i}", t["path"], t) for cat, ts in scenes.items() for i, t in enumerate(ts)]
+    jobs = [
+        (f"{cat}_{i}", t["path"], t)
+        for cat, ts in scenes.items()
+        for i, t in enumerate(ts)
+    ]
     jobs += [(f"camera_rotated_{i}", t["path"], t) for i, t in enumerate(rotated)]
 
     for scene, path, tile in jobs:
@@ -521,8 +532,10 @@ def main():
     (out / "data.json").write_text(json.dumps(data, separators=(",", ":")))
 
     total = sum(f.stat().st_size for f in (out / "img").glob("*.webp"))
-    print(f"\n{len(trials)} trials, {len(list((out/'img').glob('*.webp')))} images, "
-          f"{total/1e6:.1f} MB")
+    print(
+        f"\n{len(trials)} trials, {len(list((out/'img').glob('*.webp')))} images, "
+        f"{total/1e6:.1f} MB"
+    )
     by_cmp = collections.Counter(t["cmp"] for t in trials)
     for k, n in by_cmp.items():
         print(f"  {k:18s} {n} pairs")
@@ -531,7 +544,9 @@ def main():
         for f in failures:
             print("  ", f)
     if total > 60e6:
-        print("\nWARNING: over the 64 MB artifact budget -- lower --crop or --per-category")
+        print(
+            "\nWARNING: over the 64 MB artifact budget -- lower --crop or --per-category"
+        )
 
 
 if __name__ == "__main__":

@@ -62,8 +62,7 @@ def _decode_with_retry(
                     decode_kwargs.get("flags", 0),
                 )
             except Exception:
-                log.debug("restart-parallel decode failed; falling back",
-                          exc_info=True)
+                log.debug("restart-parallel decode failed; falling back", exc_info=True)
                 result = None
         if result is None:
             result = dec.decode(jpeg_bytes, **decode_kwargs)
