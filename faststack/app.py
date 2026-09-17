@@ -4599,7 +4599,20 @@ class AppController(QObject):
             # reject this version; simply viewing its saved JPEG is still safe.
             log.warning("Cannot resume image edits: %s", exc)
             self.update_status_message(str(exc), timeout=10000)
-            return copy.deepcopy(serialized)
+            fallback = copy.deepcopy(serialized)
+            # Typed fields still have to be typed: the darken tool reads
+            # current_edits["darken_settings"].enabled directly, so leaving a
+            # raw dict here turns pressing K into an AttributeError.
+            raw_darken = fallback.get("darken_settings")
+            if isinstance(raw_darken, dict):
+                try:
+                    fallback["darken_settings"] = DarkenSettings.from_dict(raw_darken)
+                except (TypeError, ValueError, KeyError):
+                    log.warning(
+                        "Ignoring invalid pending darken settings: %r", raw_darken
+                    )
+                    fallback["darken_settings"] = None
+            return fallback
         numeric_keys = {
             "brightness",
             "contrast",

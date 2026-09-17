@@ -95,7 +95,8 @@ Window {
     Shortcut {
         sequence: "S"
         context: Qt.WindowShortcut
-        enabled: !discardDialog.opened
+        // Matches the Save button: an unsupported tone curve cannot be written.
+        enabled: !discardDialog.opened && toneNotice.supported
                  && (imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isSaving : true)
         onActivated: {
             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.save_edited_image()

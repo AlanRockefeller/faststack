@@ -401,9 +401,13 @@ Window {
                 event.accepted = true
             } else if (event.key === Qt.Key_S) {
                 // S or Ctrl+S both save the live edits from the compact editor.
-                compactEditor.ensureEditorLoaded("save")
-                if (compactEditor.uiStateRef && !compactEditor.uiStateRef.isSaving && compactEditor.controllerRef)
-                    compactEditor.controllerRef.save_edited_image()
+                // Matches the Save button: an unsupported tone curve cannot be
+                // written, so don't load the image just to fail preparing it.
+                if (toneNotice.supported) {
+                    compactEditor.ensureEditorLoaded("save")
+                    if (compactEditor.uiStateRef && !compactEditor.uiStateRef.isSaving && compactEditor.controllerRef)
+                        compactEditor.controllerRef.save_edited_image()
+                }
                 event.accepted = true
             } else {
                 // Forward every other key (B, F, D, I, G, etc.) to the main

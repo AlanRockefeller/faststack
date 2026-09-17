@@ -1,6 +1,7 @@
 """High-performance JPEG decoding using PyTurboJPEG with a Pillow fallback."""
 
 import logging
+import threading
 import time
 import warnings
 from io import BytesIO
@@ -9,6 +10,7 @@ from typing import Any, Literal, Optional, Tuple
 import numpy as np
 from PIL import Image
 
+from faststack.imaging import rst_parallel
 from faststack.imaging.optional_deps import get_cv2
 from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
 
@@ -17,6 +19,16 @@ log = logging.getLogger(__name__)
 JPEG_DECODER, TURBO_AVAILABLE = create_turbojpeg()
 
 _PREMATURE_EOF_RETRY_DELAY = 0.15
+
+
+class _RstSuppressed(threading.local):
+    """Per-thread opt-out so worker threads do not nest split pools."""
+
+    def __init__(self) -> None:
+        self.value = False
+
+
+_RST_SUPPRESSED = _RstSuppressed()
 
 
 class IncompleteJPEGError(RuntimeError):
@@ -39,7 +51,22 @@ def _decode_with_retry(
     dec = decoder or JPEG_DECODER
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        result = dec.decode(jpeg_bytes, **decode_kwargs)
+        result = None
+        if rst_parallel.ENABLED and not _RST_SUPPRESSED.value:
+            try:
+                result = rst_parallel.decode_parallel(
+                    dec,
+                    jpeg_bytes,
+                    decode_kwargs.get("scaling_factor"),
+                    decode_kwargs.get("pixel_format", TJPF_RGB),
+                    decode_kwargs.get("flags", 0),
+                )
+            except Exception:
+                log.debug("restart-parallel decode failed; falling back",
+                          exc_info=True)
+                result = None
+        if result is None:
+            result = dec.decode(jpeg_bytes, **decode_kwargs)
 
     if any("Premature end of JPEG file" in str(w.message) for w in caught):
         raise IncompleteJPEGError(
