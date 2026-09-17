@@ -65,6 +65,9 @@ def _decode_with_retry(
                 log.debug("restart-parallel decode failed; falling back", exc_info=True)
                 result = None
         if result is None:
+            # A split worker that bailed may have left a truncation warning
+            # behind; the whole-file decode below answers for itself.
+            caught.clear()
             result = dec.decode(jpeg_bytes, **decode_kwargs)
 
     if any("Premature end of JPEG file" in str(w.message) for w in caught):

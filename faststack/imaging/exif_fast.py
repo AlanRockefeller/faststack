@@ -44,6 +44,9 @@ def _orientation_from_tiff(tiff: bytes) -> int:
         end = ">"
     else:
         return 1
+    (magic,) = struct.unpack(end + "H", tiff[2:4])
+    if magic != 42:
+        return 1
     (ifd0,) = struct.unpack(end + "I", tiff[4:8])
     if ifd0 + 2 > len(tiff):
         return 1
@@ -55,7 +58,9 @@ def _orientation_from_tiff(tiff: bytes) -> int:
             return 1
         tag, typ, _num = struct.unpack(end + "HHI", tiff[off : off + 8])
         if tag == _ORIENTATION_TAG:
-            if typ != 3:  # SHORT
+            if typ != 3 or _num != 1:
+                # Anything but a single SHORT keeps its value out of line, so
+                # those 4 bytes are a file offset, not an orientation.
                 return 1
             (value,) = struct.unpack(end + "H", tiff[off + 8 : off + 10])
             return value if 1 <= value <= 8 else 1

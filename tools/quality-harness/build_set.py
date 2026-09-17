@@ -513,6 +513,11 @@ def main():
                     scene=scene,
                     a=save(f"{scene}__{key}__A.webp", a),
                     b=save(f"{scene}__{key}__B.webp", b),
+                    # Thumbnail variants keep their aspect ratio, so they are
+                    # not the square crop size. The page frames each trial at
+                    # its own size or the comparison stops being pixel-exact.
+                    w=int(a.shape[1]),
+                    h=int(a.shape[0]),
                     m=metrics(a, b),
                 )
             )

@@ -82,7 +82,7 @@ def _parse(jpeg) -> Optional[tuple]:
                     # 4:4:4 and 4:2:2 have no vertical chroma dependency and
                     # are bit-identical at every scaling factor.
                     return None
-                sof = (i + 5, w, h, hmax, vmax)
+                sof = (i + 5, w, h, hmax, vmax, nc)
             elif m in (
                 0xC2,
                 0xC3,
@@ -102,7 +102,13 @@ def _parse(jpeg) -> Optional[tuple]:
             elif m == 0xDA:
                 if sof is None or not dri:
                     return None
-                return sof + (dri, i + 2 + ln)
+                if i + 5 > n or jpeg[i + 4] != sof[5]:
+                    # A sequential file may still be non-interleaved: a scan
+                    # covering fewer components than the frame means more
+                    # scans follow, which this splitter would swallow into the
+                    # first entropy stream. Let the ordinary decoder have it.
+                    return None
+                return sof[:5] + (dri, i + 2 + ln)
             i += 2 + ln
     except Exception:
         return None

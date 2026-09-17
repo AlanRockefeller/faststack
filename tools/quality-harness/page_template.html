@@ -314,9 +314,9 @@ td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:righ
     <p class="note">The score counts how often you picked version&nbsp;A, version&nbsp;B,
       “different but neither better”, and “the same” — A and B are named under each comparison.
       Which one appeared as image&nbsp;1 was reshuffled every trial, so a preference only counts
-      if it keeps landing on the same algorithm: p is a one-sided binomial test over the trials
-      where you did pick a side. <b>“Different, neither better” is a result, not a missing
-      answer</b> — it says the change is visible but not a loss, which is exactly the finding
+      if it keeps landing on the same algorithm: p is a two-sided binomial test over the trials
+      where you did pick a side, since neither version was predicted to win.
+      <b>“Different, neither better” is a result, not a missing answer</b> — it says the change is visible but not a loss, which is exactly the finding
       that lets a cheaper path ship for thumbnails and rapid navigation while the settled view
       keeps the careful one. Every verdict is tied to <em>that</em> viewing condition and says
       nothing about a different size or zoom. ABX rows score correct identifications of X
@@ -347,12 +347,22 @@ var CATLABEL={
   camera_rotated:"EXIF-rotated camera frame"
 };
 var CONF=[["Guessing","0"],["A hunch","1"],["Fairly sure","2"],["Certain","3"]];
+var CONF_KEYS=["z","x","c","v"];
 var CONF_PREF=["Barely there","Slight","Clear","Obvious"];
 var CONF_ABX=["Guessing","A hunch","Fairly sure","Certain"];
 
 function $(id){return document.getElementById(id);}
 function esc(s){var d=document.createElement("span");d.textContent=s;return d.innerHTML;}
 
+/* Thumbnail trials keep their own aspect ratio, so the frame follows the
+   current trial's recorded size; only the setup screen falls back to the
+   square crop. */
+function frameDims(){
+  var t=cur&&cur.t;
+  if(t&&t.w&&t.h)return [t.w,t.h];
+  var px=DATA?DATA.crop:592;
+  return [px,px];
+}
 /* ---- device-pixel-exact sizing ----
    At 1x, one image pixel lands on one screen pixel. Above that the browser
    scales by a whole number with nearest-neighbour, so each image pixel becomes
@@ -361,12 +371,12 @@ function esc(s){var d=document.createElement("span");d.textContent=s;return d.in
 function applyDpr(){
   var dpr=window.devicePixelRatio||1;
   document.documentElement.style.setProperty("--dpr",String(dpr));
-  var px=DATA?DATA.crop:592, css=px*ZOOM/dpr;
+  var dim=frameDims(), px=DATA?DATA.crop:592;
   var f=$("frame");
-  if(f){f.style.width=css+"px";f.style.height=css+"px";}
+  if(f){f.style.width=(dim[0]*ZOOM/dpr)+"px";f.style.height=(dim[1]*ZOOM/dpr)+"px";}
   $("stage").classList.toggle("mag", ZOOM>1);
   var zp=$("zoomPx");
-  if(zp)zp.textContent=(px*ZOOM)+" device px wide";
+  if(zp)zp.textContent=(dim[0]*ZOOM)+" device px wide";
   var zn=$("zoomNote");
   if(zn){
     zn.textContent = ZOOM>1
@@ -431,7 +441,7 @@ function buildSetup(){
   g.innerHTML=html;
   var cf=$("conf"),h="";
   CONF.forEach(function(c,i){h+='<button class="cf" data-c="'+i+'" aria-pressed="false">'+c[0]+
-    '<small>KEY '+(i+1)+'</small></button>';});
+    '<small>'+CONF_KEYS[i].toUpperCase()+'</small></button>';});
   cf.innerHTML=h;
   cf.querySelectorAll(".cf").forEach(function(b){
     b.addEventListener("click",function(){setConf(+b.dataset.c);});
@@ -445,10 +455,28 @@ function start(){
               .map(function(b){return b.value;});
   if(!picks.length){alert("Pick at least one comparison to test.");return;}
   var pool=DATA.trials.filter(function(t){return picks.indexOf(t.cmp)>=0;});
-  shuffle(pool);
   var want=+$("optCount").value;
-  queue = want>0 ? pool.slice(0,want) : pool;
-  // spread comparisons evenly through the block rather than clustering
+  // Take trials in rounds across the chosen comparisons: slicing a single
+  // shuffled pool can leave a comparison with one trial or none, and no
+  // amount of reshuffling afterwards puts those trials back.
+  var byCmp={};
+  pool.forEach(function(t){(byCmp[t.cmp]=byCmp[t.cmp]||[]).push(t);});
+  var keys=Object.keys(byCmp);
+  keys.forEach(function(k){shuffle(byCmp[k]);});
+  if(want>0&&want<pool.length){
+    queue=[];
+    for(var round=0;queue.length<want;round++){
+      var added=false;
+      for(var gi=0;gi<keys.length&&queue.length<want;gi++){
+        var grp=byCmp[keys[gi]];
+        if(round<grp.length){queue.push(grp[round]);added=true;}
+      }
+      if(!added)break;
+    }
+  }else{
+    queue=pool.slice();
+  }
+  // presentation order only -- the per-comparison balance above is preserved
   shuffle(queue);
   qi=0; sess=[];
   MODE=document.querySelector('input[name="mode"]:checked').value;
@@ -475,6 +503,7 @@ function nextTrial(){
   cur={t:t,swap:swap,xIs:xIs,
        f1: swap? t.b : t.a, f2: swap? t.a : t.b,
        v1: swap? "B" : "A", v2: swap? "A" : "B"};
+  applyDpr();                              // this trial's own pixel size
   $("img1").src="img/"+cur.f1;
   $("img2").src="img/"+cur.f2;
   $("tNow").textContent=(qi+1);
@@ -626,7 +655,9 @@ function render(){
       else {v="Indistinguishable";vc="same";}
     }else{
       var dec=g.A+g.B, hi=Math.max(g.A,g.B);
-      p=binomP(hi,dec);
+      // No direction is predicted here, and hi is whichever side happened to
+      // win, so the tail has to be counted on both sides.
+      p=Math.min(1,2*binomP(hi,dec));
       score=g.A+" · "+g.B+" · "+g.differ+" · "+g.same;
       if(g.n<10){v="Too few trials";vc="thin";}
       else if(dec>=8&&p<0.05){v=(g.A>g.B?"Prefers A":"Prefers B")+(g.zmax>1?" (magnified)":"");vc="diff";}
@@ -719,7 +750,7 @@ document.addEventListener("keydown",function(e){
   else if(k==="d"){setPick("differ");}
   else if(k==="+"||k==="="){ setZoom(Math.min(4,ZOOM+1)); e.preventDefault(); }
   else if(k==="-"||k==="_"){ setZoom(Math.max(1,ZOOM-1)); e.preventDefault(); }
-  else if(["z","x","c","v"].indexOf(k)>=0){ setConf(["z","x","c","v"].indexOf(k)); }
+  else if(CONF_KEYS.indexOf(k)>=0){ setConf(CONF_KEYS.indexOf(k)); }
 });
 
 window.addEventListener("resize",applyDpr);
