@@ -95,8 +95,7 @@ Window {
     Shortcut {
         sequence: "S"
         context: Qt.WindowShortcut
-        // Matches the Save button: an unsupported tone curve cannot be written.
-        enabled: !discardDialog.opened && toneNotice.supported
+        enabled: !discardDialog.opened
                  && (imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isSaving : true)
         onActivated: {
             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.save_edited_image()
@@ -198,11 +197,6 @@ Window {
                     sourceComponent: sectionHeader 
                     Layout.topMargin: 0 // Remove top margin for the very first item
                     onLoaded: item.text = "LIGHT"
-                }
-                ToneCurveNotice {
-                    id: toneNotice
-                    uiStateRef: imageEditorDialog.uiStateRef
-                    controllerRef: imageEditorDialog.controllerRef
                 }
                 ListModel {
                     id: lightModel
@@ -617,7 +611,7 @@ Window {
                         text: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isSaving ? "Saving..." : "Save"
                         Layout.preferredWidth: 100
                         highlighted: true
-                        enabled: toneNotice.supported && (imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isSaving : true)
+                        enabled: imageEditorDialog.uiStateRef ? !imageEditorDialog.uiStateRef.isSaving : true
                         Material.background: imageEditorDialog.accentColor
                         onClicked: {
                             if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.save_edited_image()

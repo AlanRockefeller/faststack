@@ -401,13 +401,9 @@ Window {
                 event.accepted = true
             } else if (event.key === Qt.Key_S) {
                 // S or Ctrl+S both save the live edits from the compact editor.
-                // Matches the Save button: an unsupported tone curve cannot be
-                // written, so don't load the image just to fail preparing it.
-                if (toneNotice.supported) {
-                    compactEditor.ensureEditorLoaded("save")
-                    if (compactEditor.uiStateRef && !compactEditor.uiStateRef.isSaving && compactEditor.controllerRef)
-                        compactEditor.controllerRef.save_edited_image()
-                }
+                compactEditor.ensureEditorLoaded("save")
+                if (compactEditor.uiStateRef && !compactEditor.uiStateRef.isSaving && compactEditor.controllerRef)
+                    compactEditor.controllerRef.save_edited_image()
                 event.accepted = true
             } else {
                 // Forward every other key (B, F, D, I, G, etc.) to the main
@@ -777,12 +773,6 @@ Window {
                 }
             }
 
-            ToneCurveNotice {
-                id: toneNotice
-                uiStateRef: compactEditor.uiStateRef
-                controllerRef: compactEditor.controllerRef
-            }
-
             ListModel {
                 id: lightModel
                 ListElement { name: "Exposure"; key: "exposure"; min: -100; max: 100 }
@@ -943,7 +933,7 @@ Window {
                     Layout.preferredWidth: 80
                     Layout.preferredHeight: 28
                     font.pixelSize: 11
-                    enabled: toneNotice.supported && (compactEditor.uiStateRef ? (!compactEditor.uiStateRef.isSaving && !compactEditor.cropActive) : true)
+                    enabled: compactEditor.uiStateRef ? (!compactEditor.uiStateRef.isSaving && !compactEditor.cropActive) : true
                     onClicked: {
                         compactEditor.ensureEditorLoaded("save")
                         if (compactEditor.controllerRef) compactEditor.controllerRef.save_edited_image()
