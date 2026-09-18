@@ -151,7 +151,11 @@ _COLOR_MIX_KEYS: Tuple[str, ...] = tuple(f"color_sat_{n}" for n, _ in _COLOR_MIX
 
 
 _REC601_LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
-# Stored with edit recipes so existing saved edits retain their tone response.
+# Recorded on every recipe as provenance -- which curve generation the edit was
+# authored under. It no longer selects a renderer: v2's bounded brightness
+# roll-off and contrast S-curve are applied to every recipe, including ones
+# stamped v1, so a photo looks the same wherever it is opened. Values outside
+# the known set are still rejected rather than guessed at.
 _TONE_CURVE_VERSION = 2
 
 
@@ -195,13 +199,19 @@ def _apply_basic_srgb_adjustments(
     vibrance: float,
     tone_curve_version: int = 1,
 ) -> np.ndarray:
-    """Apply the common per-pixel sRGB chain without modifying the input band."""
-    tone_curve_version = _resolve_tone_curve_version(tone_curve_version)
+    """Apply the common per-pixel sRGB chain without modifying the input band.
+
+    ``tone_curve_version`` no longer selects a curve -- every recipe renders
+    with the v2 response. It is still resolved here so a recipe written by a
+    newer FastStack fails loudly instead of being silently rendered with
+    curves it was not authored for.
+    """
+    _resolve_tone_curve_version(tone_curve_version)
     cv2 = _get_cv2()
     if abs(brightness) > 0.001:
         gain = 1.0 + brightness
         brightened = arr * gain
-        if tone_curve_version != 1 and brightness > 0.0:
+        if brightness > 0.0:
             # Keep the familiar gain until output reaches 90%, then roll off
             # smoothly to white. The join preserves both value and slope;
             # delaying protection keeps pale midtone texture from flattening.
@@ -218,7 +228,7 @@ def _apply_basic_srgb_adjustments(
         arr = brightened
     if abs(contrast) > 0.001:
         contrast_factor = 1.0 + contrast * 0.4
-        if tone_curve_version == 1 or contrast < 0.0:
+        if contrast < 0.0:
             arr = (arr - 0.5) * contrast_factor + 0.5
         else:
             # An S-curve with the old slope at mid-gray, but fixed black/white
@@ -2356,10 +2366,8 @@ class ImageEditor:
         # the bounded positive tone curves. Otherwise distinct highlights can
         # collapse to white before a lowered Whites setting can recover them.
         # With neutral Levels the approved standalone curves are unchanged.
-        # Legacy recipes and negative-only adjustments retain the old ordering.
-        levels_before_tones = tone_curve_version == 2 and (
-            b_val > 0.001 or c_val > 0.001
-        )
+        # Negative-only adjustments retain the old ordering.
+        levels_before_tones = b_val > 0.001 or c_val > 0.001
         if levels_active and levels_before_tones:
             arr = _cancellable_rows(
                 lambda band: _apply_levels_ramp(band, blacks, whites), arr
