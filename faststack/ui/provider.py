@@ -7,7 +7,6 @@ import threading
 import time
 from numbers import Real
 from pathlib import Path
-from typing import Any
 
 from PySide6.QtCore import Property, QObject, Qt, Signal, Slot
 from PySide6.QtGui import QImage
@@ -698,7 +697,6 @@ class UIState(QObject):
     whites_changed = Signal(float)
     clarity_changed = Signal(float)
     texture_changed = Signal(float)
-    tone_curve_version_changed = Signal()
 
     # Per-hue saturation (color mix) signals
     color_sat_red_changed = Signal(float)
@@ -770,7 +768,6 @@ class UIState(QObject):
         self._is_histogram_visible = False
         self._histogram_data = {}  # Will be a dict with 'r', 'g', 'b' arrays
         self._brightness = 0.0
-        self._tone_curve_version = 2
         self._contrast = 0.0
         self._saturation = 0.0
         self._white_balance_by = 0.0
@@ -1874,7 +1871,6 @@ class UIState(QObject):
     @Slot()
     def reset_editor_state(self):
         """Resets all editor-related properties to their default values."""
-        self.tone_curve_version = 2
         self.brightness = 0.0
         self.contrast = 0.0
         self.saturation = 0.0
@@ -1963,16 +1959,6 @@ class UIState(QObject):
             "source_clipped_pct": state.get("source_clipped_pct", 0.0),
             "current_nearwhite_pct": state.get("current_nearwhite_pct", 0.0),
         }
-
-    @Property("QVariant", notify=tone_curve_version_changed)
-    def tone_curve_version(self) -> Any:
-        return self._tone_curve_version
-
-    @tone_curve_version.setter
-    def tone_curve_version(self, new_value: Any):
-        if self._tone_curve_version != new_value:
-            self._tone_curve_version = new_value
-            self.tone_curve_version_changed.emit()
 
     @Property(float, notify=brightness_changed)
     def brightness(self) -> float:

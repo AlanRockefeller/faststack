@@ -15759,32 +15759,6 @@ class AppController(QObject):
         except Exception as e:
             log.error("Error setting edit parameter %s=%s: %s", key, value, e)
 
-    @Slot()
-    def use_improved_adjustments(self):
-        """Opt a legacy recipe into current tones without resetting any edits."""
-        if self.ui_state.isCropping:
-            self.update_status_message(
-                "Apply or cancel the crop before upgrading edits"
-            )
-            return
-        # Compact-editor navigation defers its reload. Resolve the selected
-        # photo now so a click cannot upgrade the previous photo's session.
-        if not self.load_image_for_editing():
-            return
-        try:
-            if ImageEditor.tone_curve_version(self.image_editor.current_edits) != 1:
-                return
-        except RuntimeError as exc:
-            self.update_status_message(str(exc), timeout=10000)
-            return
-        version = self.image_editor._initial_edits()["tone_curve_version"]
-        # Use the same revision/preview/batch path as an ordinary slider edit.
-        self.set_edit_parameter("tone_curve_version", version)
-        if self.image_editor.get_edit_value("tone_curve_version") == version:
-            self.update_status_message(
-                "Using improved adjustments; crop and slider settings kept"
-            )
-
     @Slot(int, int, int, int)
     def set_crop_box(self, left: int, top: int, right: int, bottom: int):
         """Sets the normalized crop box (0-1000) in the editor."""
