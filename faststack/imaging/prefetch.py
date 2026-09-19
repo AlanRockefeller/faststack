@@ -30,6 +30,12 @@ from faststack.imaging.jpeg import (
     decode_jpeg_rgb,
 )
 from faststack.imaging.orientation import apply_orientation_to_np
+from faststack.imaging.rst_parallel import (
+    PRIORITY_BACKGROUND as _RST_PRIORITY_BACKGROUND,
+)
+from faststack.imaging.rst_parallel import (
+    PRIORITY_FOREGROUND as _RST_PRIORITY_FOREGROUND,
+)
 from faststack.io.utils import normalize_path_key
 from faststack.models import DecodedImage, ImageFile
 from faststack.util.executors import (
@@ -46,6 +52,13 @@ _PRIORITY_COVER = 5
 _PRIORITY_PREFETCH_BASE = 10
 _QUEUE_GROUP_INTERACTIVE = 0
 _QUEUE_GROUP_PRELOAD = 1
+
+# Roles whose decode the user is actually waiting on, and the wider set allowed
+# to split one JPEG across cores. Speculative prefetches stay whole-image: the
+# outer pool already saturates the CPU with them, so splitting only steals
+# cores from the frame in front of the user.
+_DEMAND_ROLES = frozenset({"demand", "demand-reused", "demand-migrated"})
+_RST_PARALLEL_ROLES = _DEMAND_ROLES | {"cover"}
 
 # Held-key browsing deliberately uses a much smaller source than the physical
 # viewport. The settled cover decode replaces it visually after navigation
@@ -943,6 +956,7 @@ def _decode_buffer(
     decode_quality: DecodeQuality,
     index: int,
     use_rst_parallel: bool | Callable[[], bool] = True,
+    rst_parallel_priority: int | Callable[[], int] = _RST_PRIORITY_FOREGROUND,
     stats: Optional[dict] = None,
     is_current: Optional[Callable[[], bool]] = None,
 ) -> tuple[Optional[np.ndarray], int, Optional[bytes], int, int, Optional[str]]:
@@ -986,13 +1000,23 @@ def _decode_buffer(
                             # so transpose the box before choosing the DCT
                             # scale. Keep this header-only: opening the mmap
                             # with Pillow would close it before JPEG decode.
-                            if read_orientation(mmapped[:65536]) in (5, 6, 7, 8):
+                            # read_orientation() bounds its own scan to 1 MiB,
+                            # so hand it the whole mapping: an Exif APP1 that
+                            # sits behind a large XMP/ICC segment starts past
+                            # the first 64 KiB, and missing it silently decodes
+                            # the oversized untransposed box again.
+                            if read_orientation(mmapped) in (5, 6, 7, 8):
                                 dw, dh = dh, dw
                         if use_resized and should_resize:
                             rst_parallel_requested = (
                                 use_rst_parallel()
                                 if callable(use_rst_parallel)
                                 else use_rst_parallel
+                            )
+                            rst_priority = (
+                                rst_parallel_priority()
+                                if callable(rst_parallel_priority)
+                                else rst_parallel_priority
                             )
                             buffer = decode_jpeg_resized(
                                 mmapped,
@@ -1004,12 +1028,18 @@ def _decode_buffer(
                                 stats=stats,
                                 log_errors=False,
                                 use_rst_parallel=rst_parallel_requested,
+                                rst_parallel_priority=rst_priority,
                             )
                         else:
                             rst_parallel_requested = (
                                 use_rst_parallel()
                                 if callable(use_rst_parallel)
                                 else use_rst_parallel
+                            )
+                            rst_priority = (
+                                rst_parallel_priority()
+                                if callable(rst_parallel_priority)
+                                else rst_parallel_priority
                             )
                             _t_decode = (
                                 time.perf_counter() if stats is not None else None
@@ -1021,6 +1051,7 @@ def _decode_buffer(
                                 stats=stats,
                                 log_errors=False,
                                 use_rst_parallel=rst_parallel_requested,
+                                rst_parallel_priority=rst_priority,
                             )
                             if stats is not None and _t_decode is not None:
                                 stats["jpeg_ms"] = (
@@ -2598,9 +2629,11 @@ class Prefetcher:
                 want_icc,
                 quality,
                 index,
-                use_rst_parallel=lambda: (
-                    _meta.get("role")
-                    in {"demand", "demand-reused", "demand-migrated", "cover"}
+                use_rst_parallel=lambda: (_meta.get("role") in _RST_PARALLEL_ROLES),
+                rst_parallel_priority=lambda: (
+                    _RST_PRIORITY_FOREGROUND
+                    if _meta.get("role") in _DEMAND_ROLES
+                    else _RST_PRIORITY_BACKGROUND
                 ),
                 stats=_stats if self.nav_trace is not None else None,
                 is_current=lambda: (

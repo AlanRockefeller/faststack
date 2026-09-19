@@ -32,7 +32,7 @@ import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
 import PySide6
-from PySide6.QtGui import QDesktopServices, QDrag, QPixmap
+from PySide6.QtGui import QDesktopServices, QDrag, QGuiApplication, QPixmap
 from PySide6.QtCore import (
     QUrl,
     QTimer,
@@ -335,6 +335,32 @@ def make_hdrop(paths):
 log = logging.getLogger(__name__)
 
 
+class DragPayloadMimeData(QMimeData):
+    """Mime data that reports when a drop target actually reads the payload.
+
+    On Wayland ``QDrag.exec()`` only returns once the compositor delivers
+    ``dnd_finished`` back to the source, and a target that never sends
+    ``wl_data_offer.finish`` (Firefox among them) leaves the drag's nested
+    event loop spinning forever. The payload read is the last signal the
+    source gets that the drop really happened, so drag bookkeeping keys off
+    it there instead of off the return value of ``exec()``.
+    """
+
+    def __init__(self, on_data_requested):
+        super().__init__()
+        self._on_data_requested = on_data_requested
+
+    def retrieveData(self, mime_type, preferred_type):
+        data = super().retrieveData(mime_type, preferred_type)
+        callback, self._on_data_requested = self._on_data_requested, None
+        if callback is not None:
+            log.info("Drop target read %s; treating the drag as accepted", mime_type)
+            # The plugin is still inside the transfer; finish on the next tick,
+            # on this object's thread.
+            QTimer.singleShot(0, self, callback)
+        return data
+
+
 def _keyboard_repeat_delay_ms() -> int:
     """Return the OS keyboard-repeat delay, with a portable config fallback."""
     fallback = config.getint(
@@ -371,6 +397,10 @@ _debug_thumb_trace = False
 CACHE_THRASH_WINDOW_SECS = 2.0
 CACHE_THRASH_THRESHOLD = 5
 CACHE_WARNING_COOLDOWN_SECS = 300
+
+# Grace period before cancelling a Wayland drag whose target read the payload
+# but never sent wl_data_offer.finish; long enough for the transfer to drain.
+WAYLAND_DRAG_CANCEL_DELAY_MS = 500
 
 # Sort modes accepted from the sidecar and from set_sort_mode().
 SUPPORTED_SORT_MODES = ("default", "filename", "date", "date_reverse")
@@ -14989,7 +15019,29 @@ class AppController(QObject):
             return
 
         drag = QDrag(self.main_window)
-        mime_data = QMimeData()
+
+        # Paths, not indices: the list can shift while the drag's nested event
+        # loop runs (a watcher refresh, a delete), and the bookkeeping below may
+        # fire from inside that loop.
+        dragged_paths = [self.image_files[idx].path for idx in existing_indices]
+        completed = False
+
+        def complete_drag(trigger: str) -> None:
+            nonlocal completed
+            if completed:
+                return
+            completed = True
+            self._mark_drag_uploaded(dragged_paths, trigger)
+
+        # On Wayland the drop target may never release exec() (see
+        # DragPayloadMimeData), so treat the payload read as the success signal.
+        on_wayland = QGuiApplication.platformName().startswith("wayland")
+        if on_wayland:
+            mime_data = DragPayloadMimeData(
+                lambda: self._finish_wayland_drag(complete_drag)
+            )
+        else:
+            mime_data = QMimeData()
 
         # Use Qt's standard setUrls - it handles both browser and native app compatibility
         urls = [QUrl.fromLocalFile(str(p)) for p in file_paths]
@@ -15018,28 +15070,49 @@ class AppController(QObject):
         # Reset zoom/pan after drag completes (drag can cause unwanted panning)
         self.ui_state.resetZoomPan()
 
-        # Mark all dragged files as uploaded if drag was successful
+        # Mark all dragged files as uploaded if drag was successful. On Wayland
+        # this has usually already happened from the payload read.
         if result in (Qt.CopyAction, Qt.MoveAction):
-            today = datetime.now().strftime("%Y-%m-%d")
+            complete_drag("exec result")
 
-            for idx in existing_indices:
-                meta = self.sidecar.get_metadata(self.image_files[idx].path)
-                meta.uploaded = True
-                meta.uploaded_date = today
+    def _finish_wayland_drag(self, complete_drag) -> None:
+        """Run drag bookkeeping, then unwind the drag loop Wayland left open."""
+        complete_drag("payload read")
 
-            if not self._persist_sidecar():
-                return
+        # exec() is still blocked in its nested loop; cancelling releases it so
+        # the next drag does not nest inside this one. Delayed so the payload
+        # transfer to the target finishes first.
+        def release_stuck_drag() -> None:
+            try:
+                QDrag.cancel()
+            except RuntimeError:
+                log.debug("Could not cancel the drag", exc_info=True)
 
-            # Clear all batches after successful drag (like pressing \)
-            self.batches = []
-            self.batch_start_index = None
-            if not self._finalize_batch_state(reapply_filter=True):
-                return False
-            log.info(
-                "Marked %d file(s) as uploaded on %s. Cleared all batches.",
-                len(existing_indices),
-                today,
-            )
+        QTimer.singleShot(WAYLAND_DRAG_CANCEL_DELAY_MS, release_stuck_drag)
+
+    def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
+        """Mark dragged files uploaded and clear batches after an accepted drop."""
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        for path in dragged_paths:
+            meta = self.sidecar.get_metadata(path)
+            meta.uploaded = True
+            meta.uploaded_date = today
+
+        if not self._persist_sidecar():
+            return
+
+        # Clear all batches after successful drag (like pressing \)
+        self.batches = []
+        self.batch_start_index = None
+        if not self._finalize_batch_state(reapply_filter=True):
+            return
+        log.info(
+            "Marked %d file(s) as uploaded on %s (%s). Cleared all batches.",
+            len(dragged_paths),
+            today,
+            trigger,
+        )
 
     @Slot()
     def enable_raw_editing(self):

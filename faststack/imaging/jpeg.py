@@ -30,6 +30,7 @@ def _decode_with_retry(
     source_path: Optional[str] = None,
     decoder: Any = None,
     use_rst_parallel: bool = True,
+    rst_parallel_priority: int = rst_parallel.PRIORITY_FOREGROUND,
     **decode_kwargs: Any,
 ) -> Optional[np.ndarray]:
     """Decode one immutable snapshot and reject truncation-tainted pixels.
@@ -50,6 +51,7 @@ def _decode_with_retry(
                     decode_kwargs.get("scaling_factor"),
                     decode_kwargs.get("pixel_format", TJPF_RGB),
                     decode_kwargs.get("flags", 0),
+                    priority=rst_parallel_priority,
                 )
             except Exception:
                 log.debug("restart-parallel decode failed; falling back", exc_info=True)
@@ -75,6 +77,7 @@ def decode_jpeg_rgb(
     stats: Optional[dict] = None,
     log_errors: bool = True,
     use_rst_parallel: bool = True,
+    rst_parallel_priority: int = rst_parallel.PRIORITY_FOREGROUND,
 ) -> Optional[np.ndarray]:
     """Decodes JPEG bytes into an RGB numpy array."""
     if TURBO_AVAILABLE and JPEG_DECODER:
@@ -86,6 +89,7 @@ def decode_jpeg_rgb(
                 jpeg_bytes,
                 source_path=source_path,
                 use_rst_parallel=use_rst_parallel,
+                rst_parallel_priority=rst_parallel_priority,
                 pixel_format=TJPF_RGB,
                 flags=flags,
             )
@@ -259,6 +263,7 @@ def decode_jpeg_resized(
     stats: Optional[dict] = None,
     log_errors: bool = True,
     use_rst_parallel: bool = True,
+    rst_parallel_priority: int = rst_parallel.PRIORITY_FOREGROUND,
 ) -> Optional[np.ndarray]:
     """Decodes and resizes a JPEG to fit within the given dimensions.
 
@@ -277,6 +282,7 @@ def decode_jpeg_resized(
             stats=stats,
             log_errors=log_errors,
             use_rst_parallel=use_rst_parallel,
+            rst_parallel_priority=rst_parallel_priority,
         )
 
     if TURBO_AVAILABLE and JPEG_DECODER:
@@ -320,6 +326,7 @@ def decode_jpeg_resized(
                     jpeg_bytes,
                     source_path=source_path,
                     use_rst_parallel=use_rst_parallel,
+                    rst_parallel_priority=rst_parallel_priority,
                     scaling_factor=scale_factor,
                     pixel_format=TJPF_RGB,
                     flags=flags,
