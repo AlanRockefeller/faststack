@@ -57,7 +57,7 @@ Window {
     }
 
     function positionAtRightGutter() {
-        var mainWin = Application.windows[0]
+        var mainWin = compactEditor.transientParent
         if (mainWin) {
             compactEditor.x = mainWin.x + mainWin.width - compactEditor.width - 10
             compactEditor.y = mainWin.y + 40
