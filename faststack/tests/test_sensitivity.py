@@ -73,6 +73,22 @@ def test_tone_curve_version_does_not_change_rendering():
             f"(max delta {np.abs(rendered[1] - rendered[2]).max()})"
         )
 
+    rendered = {}
+    for version in (1, 2):
+        edits = editor._initial_edits()
+        edits.update(
+            tone_curve_version=version,
+            blacks=0.2,
+            whites=-0.2,
+            brightness=0.5,
+        )
+        rendered[version] = editor._apply_edits(arr.copy(), edits=edits)
+    assert np.array_equal(rendered[1], rendered[2])
+
+    # Levels maps 0.8 to (0.8 + 0.03) / 1.06 before the positive brightness
+    # roll-off. Reversing those stages would produce about 0.9702 instead.
+    assert np.allclose(rendered[2][0, 0, 0], 0.9974522, atol=1e-6)
+
 
 def test_unsupported_tone_curve_version_is_rejected():
     """A recipe from a newer FastStack must fail loudly, not be guessed at."""

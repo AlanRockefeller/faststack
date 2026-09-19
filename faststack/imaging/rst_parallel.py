@@ -1,4 +1,4 @@
-"""EXPERIMENTAL: restart-marker-parallel baseline JPEG decoding.
+"""Restart-marker-parallel baseline JPEG decoding.
 
 Most real camera and Lightroom JPEGs carry a DRI (restart interval) marker.
 Every restart interval resets the entropy decoder's DC predictors and bit
@@ -10,39 +10,47 @@ are stacked back together.
 The result is *bit-identical* to a single-threaded decode of the whole file,
 at any libjpeg-turbo scaling factor, because nothing about the coefficients or
 the IDCT changes -- only which thread runs which MCU rows.
-
-Enabled by FASTSTACK_RST_PARALLEL=1 (prototype gate).
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import struct
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
 
+from faststack.util.executors import (
+    DaemonThreadPoolExecutor,
+    create_daemon_threadpool_executor,
+)
+
 log = logging.getLogger(__name__)
 
-ENABLED = os.environ.get("FASTSTACK_RST_PARALLEL", "") not in ("", "0", "false")
-MAX_CHUNKS = int(os.environ.get("FASTSTACK_RST_CHUNKS", "8"))
+# This was initially gated because splitting one image across cores could have
+# reduced whole-folder throughput. Measurements found no gain when the outer
+# prefetch pool already saturates the CPU, so callers reserve it for demand,
+# settled-cover, and editor decodes. In those latency-sensitive paths, eight
+# chunks cut real OM-1/Lightroom JPEG decode from 90-144 ms to 30-56 ms
+# (2.6-3.0x). Comparing 150 files at three DCT scales produced zero pixel
+# mismatches; eight chunks was retained as the measured default.
+_MAX_CHUNKS = 8
 
-_pool: Optional[ThreadPoolExecutor] = None
+_pool: Optional[DaemonThreadPoolExecutor] = None
 _pool_lock = threading.Lock()
 
 
-def _get_pool() -> ThreadPoolExecutor:
+def _get_pool() -> DaemonThreadPoolExecutor:
     global _pool
-    with _pool_lock:
-        if _pool is None:
-            _pool = ThreadPoolExecutor(
-                max_workers=max(2, (os.cpu_count() or 8)),
-                thread_name_prefix="rstsplit",
-            )
-        return _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = create_daemon_threadpool_executor(
+                    max_workers=_MAX_CHUNKS,
+                    thread_name_prefix="RstSplit",
+                )
+    return _pool
 
 
 def _parse(jpeg) -> Optional[tuple]:
@@ -184,7 +192,7 @@ def decode_parallel(
     Returns ``None`` when the file is not splittable; the caller falls back to
     the ordinary single-threaded decode.
     """
-    built = build_chunks(jpeg, nchunks or MAX_CHUNKS)
+    built = build_chunks(jpeg, nchunks or _MAX_CHUNKS)
     if built is None:
         return None
     parts, w, h = built
@@ -199,7 +207,8 @@ def decode_parallel(
         )
 
     pool = _get_pool()
-    outs = list(pool.map(work, parts))
+    futures = [pool.submit(work, part) for part in parts]
+    outs = [future.result() for future in futures]
     out_h = -(-h * num // den)
     merged = np.concatenate(outs, axis=0)
     return merged[:out_h] if merged.shape[0] > out_h else merged

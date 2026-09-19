@@ -59,9 +59,6 @@ HELD_NAVIGATION_QUALITY_DIMENSIONS = {
 }
 _MIN_DIRECTION_TAIL = 4
 
-# EXPERIMENTAL gate: transpose the decode target box for EXIF-rotated frames.
-_ORIENT_TARGET = os.environ.get("FASTSTACK_ORIENT_TARGET", "") not in ("", "0", "false")
-
 # Speculative decodes allowed while latency-sensitive foreground work runs.
 # Profiling showed 11 concurrent native TurboJPEG/ICC decodes saturating CPU
 # and memory bandwidth on a 16-thread machine, which is what made the UI
@@ -945,6 +942,7 @@ def _decode_buffer(
     want_icc: bool,
     decode_quality: DecodeQuality,
     index: int,
+    use_rst_parallel: bool | Callable[[], bool] = True,
     stats: Optional[dict] = None,
     is_current: Optional[Callable[[], bool]] = None,
 ) -> tuple[Optional[np.ndarray], int, Optional[bytes], int, int, Optional[str]]:
@@ -978,14 +976,24 @@ def _decode_buffer(
                             _faulted = mmapped[:: mmap.PAGESIZE]
                             stats["read_ms"] = (time.perf_counter() - _t_read) * 1000.0
                         dw, dh = display_width, display_height
-                        if _ORIENT_TARGET and use_resized and should_resize:
-                            # EXIF-rotated frames are displayed transposed, so
-                            # the decode box has to be transposed too -- else
-                            # the buffer comes out ~1.8x larger than the
-                            # viewport can ever show.
+                        if use_resized and should_resize:
+                            # The decode box originally used stored dimensions
+                            # even though EXIF orientations 5-8 transpose the
+                            # displayed frame. Real portrait files therefore
+                            # decoded buffers 1.78x larger than the viewport
+                            # could show (18.7 vs 10.5 MB at 4K). A blind
+                            # display comparison found no visible difference,
+                            # so transpose the box before choosing the DCT
+                            # scale. Keep this header-only: opening the mmap
+                            # with Pillow would close it before JPEG decode.
                             if read_orientation(mmapped[:65536]) in (5, 6, 7, 8):
                                 dw, dh = dh, dw
                         if use_resized and should_resize:
+                            rst_parallel_requested = (
+                                use_rst_parallel()
+                                if callable(use_rst_parallel)
+                                else use_rst_parallel
+                            )
                             buffer = decode_jpeg_resized(
                                 mmapped,
                                 dw,
@@ -995,8 +1003,14 @@ def _decode_buffer(
                                 mode=decode_quality,
                                 stats=stats,
                                 log_errors=False,
+                                use_rst_parallel=rst_parallel_requested,
                             )
                         else:
+                            rst_parallel_requested = (
+                                use_rst_parallel()
+                                if callable(use_rst_parallel)
+                                else use_rst_parallel
+                            )
                             _t_decode = (
                                 time.perf_counter() if stats is not None else None
                             )
@@ -1006,6 +1020,7 @@ def _decode_buffer(
                                 source_path=str(target_path),
                                 stats=stats,
                                 log_errors=False,
+                                use_rst_parallel=rst_parallel_requested,
                             )
                             if stats is not None and _t_decode is not None:
                                 stats["jpeg_ms"] = (
@@ -2583,6 +2598,10 @@ class Prefetcher:
                 want_icc,
                 quality,
                 index,
+                use_rst_parallel=lambda: (
+                    _meta.get("role")
+                    in {"demand", "demand-reused", "demand-migrated", "cover"}
+                ),
                 stats=_stats if self.nav_trace is not None else None,
                 is_current=lambda: (
                     generation == self.generation
