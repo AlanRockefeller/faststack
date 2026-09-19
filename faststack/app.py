@@ -336,29 +336,53 @@ log = logging.getLogger(__name__)
 
 
 class DragPayloadMimeData(QMimeData):
-    """Mime data that reports when a drop target actually reads the payload.
+    """Mime data that reports when a drop target reads the payload.
 
-    On Wayland ``QDrag.exec()`` only returns once the compositor delivers
-    ``dnd_finished`` back to the source, and a target that never sends
-    ``wl_data_offer.finish`` (Firefox among them) leaves the drag's nested
-    event loop spinning forever. The payload read is the last signal the
-    source gets that the drop really happened, so drag bookkeeping keys off
-    it there instead of off the return value of ``exec()``.
+    A read means a target is interested, not that a drop happened: Firefox
+    reads ``text/uri-list`` while merely hovering. It is recorded as one half
+    of the evidence that a Wayland drag succeeded, paired with the pointer
+    release, because on Wayland ``QDrag.exec()`` can stay in its nested event
+    loop forever when the target never sends ``wl_data_offer.finish``.
     """
 
-    def __init__(self, on_data_requested):
+    def __init__(self, on_payload_read):
         super().__init__()
-        self._on_data_requested = on_data_requested
+        self._on_payload_read = on_payload_read
 
     def retrieveData(self, mime_type, preferred_type):
         data = super().retrieveData(mime_type, preferred_type)
-        callback, self._on_data_requested = self._on_data_requested, None
-        if callback is not None:
-            log.info("Drop target read %s; treating the drag as accepted", mime_type)
-            # The plugin is still inside the transfer; finish on the next tick,
-            # on this object's thread.
-            QTimer.singleShot(0, self, callback)
+        if self._on_payload_read is not None:
+            self._on_payload_read(mime_type)
         return data
+
+
+class DragReleaseWatcher(QObject):
+    """Application filter spotting the pointer release that ends a drag.
+
+    Qt does not surface the Wayland ``dnd_drop_performed`` event to Python, so
+    the release is the best drop evidence the source has.
+    """
+
+    RELEASE_EVENTS = frozenset(
+        {
+            QEvent.MouseButtonRelease,
+            QEvent.NonClientAreaMouseButtonRelease,
+            QEvent.TabletRelease,
+            QEvent.Drop,
+            QEvent.UngrabMouse,
+        }
+    )
+
+    def __init__(self, parent, on_release):
+        super().__init__(parent)
+        self._on_release = on_release
+
+    def eventFilter(self, watched, event):
+        event_type = event.type()
+        if event_type in self.RELEASE_EVENTS:
+            log.info("[drag] release-class event during drag: %s", event_type)
+            self._on_release(event_type)
+        return False
 
 
 def _keyboard_repeat_delay_ms() -> int:
@@ -15024,22 +15048,57 @@ class AppController(QObject):
         # loop runs (a watcher refresh, a delete), and the bookkeeping below may
         # fire from inside that loop.
         dragged_paths = [self.image_files[idx].path for idx in existing_indices]
-        completed = False
+        drag_state = {"payload_read": False, "completed": False, "action": None}
 
         def complete_drag(trigger: str) -> None:
-            nonlocal completed
-            if completed:
+            if drag_state["completed"]:
                 return
-            completed = True
+            drag_state["completed"] = True
             self._mark_drag_uploaded(dragged_paths, trigger)
 
-        # On Wayland the drop target may never release exec() (see
-        # DragPayloadMimeData), so treat the payload read as the success signal.
+        def release_stuck_drag() -> None:
+            try:
+                QDrag.cancel()
+            except RuntimeError:
+                log.debug("Could not cancel the drag", exc_info=True)
+
+        def note_payload_read(mime_type: str) -> None:
+            if not drag_state["payload_read"]:
+                log.info("[drag] drop target read %s", mime_type)
+            drag_state["payload_read"] = True
+
+        def note_action(action) -> None:
+            if action != drag_state["action"]:
+                log.info("[drag] target action now %s", action)
+            drag_state["action"] = action
+
+        def note_release(event_type) -> None:
+            # A read alone is not a drop -- Firefox reads on hover -- and a
+            # release alone may be an aborted drag over empty desktop.
+            if not drag_state["payload_read"]:
+                return
+            # Released over something that refused the files (the user hovered
+            # a target, thought better of it, and let go elsewhere).
+            if drag_state["action"] == Qt.IgnoreAction:
+                log.info("[drag] release over a target refusing the drop")
+                return
+            complete_drag("payload read + pointer release")
+            # exec() is still parked in its nested loop; release it so the next
+            # drag does not nest inside this one.
+            QTimer.singleShot(WAYLAND_DRAG_CANCEL_DELAY_MS, release_stuck_drag)
+
+        # On Wayland a target that never sends wl_data_offer.finish leaves
+        # exec() blocked forever, so the drop is inferred from those two signals
+        # instead of from the return value.
         on_wayland = QGuiApplication.platformName().startswith("wayland")
+        watcher = None
         if on_wayland:
-            mime_data = DragPayloadMimeData(
-                lambda: self._finish_wayland_drag(complete_drag)
-            )
+            drag.actionChanged.connect(note_action)
+            mime_data = DragPayloadMimeData(note_payload_read)
+            app = QGuiApplication.instance()
+            if app is not None:
+                watcher = DragReleaseWatcher(self, note_release)
+                app.installEventFilter(watcher)
         else:
             mime_data = QMimeData()
 
@@ -15064,31 +15123,23 @@ class AppController(QObject):
             [str(p) for p in file_paths],
         )
         # Support both Copy and Move actions for browser compatibility
-        result = drag.exec(Qt.CopyAction | Qt.MoveAction)
+        try:
+            result = drag.exec(Qt.CopyAction | Qt.MoveAction)
+        finally:
+            if watcher is not None:
+                app = QGuiApplication.instance()
+                if app is not None:
+                    app.removeEventFilter(watcher)
+                watcher.deleteLater()
         log.info("Drag completed with result: %s", result)
 
         # Reset zoom/pan after drag completes (drag can cause unwanted panning)
         self.ui_state.resetZoomPan()
 
         # Mark all dragged files as uploaded if drag was successful. On Wayland
-        # this has usually already happened from the payload read.
+        # this has usually already happened, keyed off the release.
         if result in (Qt.CopyAction, Qt.MoveAction):
             complete_drag("exec result")
-
-    def _finish_wayland_drag(self, complete_drag) -> None:
-        """Run drag bookkeeping, then unwind the drag loop Wayland left open."""
-        complete_drag("payload read")
-
-        # exec() is still blocked in its nested loop; cancelling releases it so
-        # the next drag does not nest inside this one. Delayed so the payload
-        # transfer to the target finishes first.
-        def release_stuck_drag() -> None:
-            try:
-                QDrag.cancel()
-            except RuntimeError:
-                log.debug("Could not cancel the drag", exc_info=True)
-
-        QTimer.singleShot(WAYLAND_DRAG_CANCEL_DELAY_MS, release_stuck_drag)
 
     def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
         """Mark dragged files uploaded and clear batches after an accepted drop."""
