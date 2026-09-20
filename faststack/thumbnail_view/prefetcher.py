@@ -416,6 +416,12 @@ class ThumbnailPrefetcher:
                         decoder=_tj,
                         pixel_format=TJPF_RGB,
                         scaling_factor=scaling_factor,
+                        # Grid thumbnails are already spread across this pool's
+                        # own workers and carry their own visible/prefetch
+                        # priority. Splitting them into the shared RST pool at
+                        # foreground priority would throw that distinction away
+                        # and crowd out demand and editor decodes.
+                        use_rst_parallel=False,
                     )
 
                 # Further resize with PIL if needed

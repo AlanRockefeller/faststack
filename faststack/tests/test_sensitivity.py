@@ -73,16 +73,24 @@ def test_tone_curve_version_does_not_change_rendering():
             f"(max delta {np.abs(rendered[1] - rendered[2]).max()})"
         )
 
-    rendered = {}
-    for version in (1, 2):
-        edits = editor._initial_edits()
-        edits.update(
-            tone_curve_version=version,
-            blacks=0.2,
-            whites=-0.2,
-            brightness=0.5,
-        )
-        rendered[version] = editor._apply_edits(arr.copy(), edits=edits)
+    # The soft knee is a later stage that compresses the highlights, so it
+    # would mask the ordering this checks; turn it off to isolate levels vs.
+    # brightness.
+    previous_soft_knee = editor.levels_soft_knee
+    editor.levels_soft_knee = False
+    try:
+        rendered = {}
+        for version in (1, 2):
+            edits = editor._initial_edits()
+            edits.update(
+                tone_curve_version=version,
+                blacks=0.2,
+                whites=-0.2,
+                brightness=0.5,
+            )
+            rendered[version] = editor._apply_edits(arr.copy(), edits=edits)
+    finally:
+        editor.levels_soft_knee = previous_soft_knee
     assert np.array_equal(rendered[1], rendered[2])
 
     # Levels maps 0.8 to (0.8 + 0.03) / 1.06 before the positive brightness

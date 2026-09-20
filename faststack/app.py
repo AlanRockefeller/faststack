@@ -15048,7 +15048,12 @@ class AppController(QObject):
         # loop runs (a watcher refresh, a delete), and the bookkeeping below may
         # fire from inside that loop.
         dragged_paths = [self.image_files[idx].path for idx in existing_indices]
-        drag_state = {"payload_read": False, "completed": False, "action": None}
+        drag_state = {
+            "payload_read": False,
+            "completed": False,
+            "action": None,
+            "exec_returned": False,
+        }
 
         def complete_drag(trigger: str) -> None:
             if drag_state["completed"]:
@@ -15057,6 +15062,12 @@ class AppController(QObject):
             self._mark_drag_uploaded(dragged_paths, trigger)
 
         def release_stuck_drag() -> None:
+            # QDrag.cancel() is global: it cancels whatever drag is current,
+            # not the one that armed this timer. If exec() already returned
+            # (the target finished the drop properly), a drag the user started
+            # in the meantime would be the one cancelled.
+            if drag_state["exec_returned"]:
+                return
             try:
                 QDrag.cancel()
             except RuntimeError:
@@ -15076,6 +15087,7 @@ class AppController(QObject):
             # A read alone is not a drop -- Firefox reads on hover -- and a
             # release alone may be an aborted drag over empty desktop.
             if not drag_state["payload_read"]:
+                log.info("[drag] release before any payload read; not a drop")
                 return
             # Released over something that refused the files (the user hovered
             # a target, thought better of it, and let go elsewhere).
@@ -15126,6 +15138,7 @@ class AppController(QObject):
         try:
             result = drag.exec(Qt.CopyAction | Qt.MoveAction)
         finally:
+            drag_state["exec_returned"] = True
             if watcher is not None:
                 app = QGuiApplication.instance()
                 if app is not None:
