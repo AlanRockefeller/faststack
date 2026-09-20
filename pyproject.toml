@@ -10,7 +10,7 @@ authors = [
 ]
 description = "Ultra-fast JPG Viewer for Focus Stacking Selection"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",

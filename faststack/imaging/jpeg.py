@@ -1,7 +1,6 @@
 """High-performance JPEG decoding using PyTurboJPEG with a Pillow fallback."""
 
 import logging
-import threading
 import time
 import warnings
 from io import BytesIO
@@ -21,16 +20,6 @@ JPEG_DECODER, TURBO_AVAILABLE = create_turbojpeg()
 _PREMATURE_EOF_RETRY_DELAY = 0.15
 
 
-class _RstSuppressed(threading.local):
-    """Per-thread opt-out so worker threads do not nest split pools."""
-
-    def __init__(self) -> None:
-        self.value = False
-
-
-_RST_SUPPRESSED = _RstSuppressed()
-
-
 class IncompleteJPEGError(RuntimeError):
     """TurboJPEG reported that the supplied snapshot may be incomplete."""
 
@@ -40,6 +29,8 @@ def _decode_with_retry(
     *,
     source_path: Optional[str] = None,
     decoder: Any = None,
+    use_rst_parallel: bool = True,
+    rst_parallel_priority: int = rst_parallel.PRIORITY_FOREGROUND,
     **decode_kwargs: Any,
 ) -> Optional[np.ndarray]:
     """Decode one immutable snapshot and reject truncation-tainted pixels.
@@ -52,7 +43,7 @@ def _decode_with_retry(
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         result = None
-        if rst_parallel.ENABLED and not _RST_SUPPRESSED.value:
+        if use_rst_parallel:
             try:
                 result = rst_parallel.decode_parallel(
                     dec,
@@ -60,6 +51,7 @@ def _decode_with_retry(
                     decode_kwargs.get("scaling_factor"),
                     decode_kwargs.get("pixel_format", TJPF_RGB),
                     decode_kwargs.get("flags", 0),
+                    priority=rst_parallel_priority,
                 )
             except Exception:
                 log.debug("restart-parallel decode failed; falling back", exc_info=True)
@@ -84,6 +76,8 @@ def decode_jpeg_rgb(
     source_path: Optional[str] = None,
     stats: Optional[dict] = None,
     log_errors: bool = True,
+    use_rst_parallel: bool = True,
+    rst_parallel_priority: int = rst_parallel.PRIORITY_FOREGROUND,
 ) -> Optional[np.ndarray]:
     """Decodes JPEG bytes into an RGB numpy array."""
     if TURBO_AVAILABLE and JPEG_DECODER:
@@ -94,6 +88,8 @@ def decode_jpeg_rgb(
             result = _decode_with_retry(
                 jpeg_bytes,
                 source_path=source_path,
+                use_rst_parallel=use_rst_parallel,
+                rst_parallel_priority=rst_parallel_priority,
                 pixel_format=TJPF_RGB,
                 flags=flags,
             )
@@ -144,6 +140,7 @@ def decode_jpeg_thumb_rgb(
             decoded = _decode_with_retry(
                 jpeg_bytes,
                 source_path=source_path,
+                use_rst_parallel=False,
                 scaling_factor=scaling_factor,
                 pixel_format=TJPF_RGB,
                 flags=0,
@@ -265,6 +262,8 @@ def decode_jpeg_resized(
     mode: Literal["fast", "cover"] = "cover",
     stats: Optional[dict] = None,
     log_errors: bool = True,
+    use_rst_parallel: bool = True,
+    rst_parallel_priority: int = rst_parallel.PRIORITY_FOREGROUND,
 ) -> Optional[np.ndarray]:
     """Decodes and resizes a JPEG to fit within the given dimensions.
 
@@ -282,6 +281,8 @@ def decode_jpeg_resized(
             source_path=source_path,
             stats=stats,
             log_errors=log_errors,
+            use_rst_parallel=use_rst_parallel,
+            rst_parallel_priority=rst_parallel_priority,
         )
 
     if TURBO_AVAILABLE and JPEG_DECODER:
@@ -324,6 +325,8 @@ def decode_jpeg_resized(
                 decoded = _decode_with_retry(
                     jpeg_bytes,
                     source_path=source_path,
+                    use_rst_parallel=use_rst_parallel,
+                    rst_parallel_priority=rst_parallel_priority,
                     scaling_factor=scale_factor,
                     pixel_format=TJPF_RGB,
                     flags=flags,

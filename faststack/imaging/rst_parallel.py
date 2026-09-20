@@ -1,4 +1,4 @@
-"""EXPERIMENTAL: restart-marker-parallel baseline JPEG decoding.
+"""Restart-marker-parallel baseline JPEG decoding.
 
 Most real camera and Lightroom JPEGs carry a DRI (restart interval) marker.
 Every restart interval resets the entropy decoder's DC predictors and bit
@@ -10,8 +10,6 @@ are stacked back together.
 The result is *bit-identical* to a single-threaded decode of the whole file,
 at any libjpeg-turbo scaling factor, because nothing about the coefficients or
 the IDCT changes -- only which thread runs which MCU rows.
-
-Enabled by FASTSTACK_RST_PARALLEL=1 (prototype gate).
 """
 
 from __future__ import annotations
@@ -20,29 +18,53 @@ import logging
 import os
 import struct
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
 
+from faststack.util.executors import PriorityExecutor, create_priority_executor
+
 log = logging.getLogger(__name__)
 
-ENABLED = os.environ.get("FASTSTACK_RST_PARALLEL", "") not in ("", "0", "false")
-MAX_CHUNKS = int(os.environ.get("FASTSTACK_RST_CHUNKS", "8"))
+# This was initially gated because splitting one image across cores could have
+# reduced whole-folder throughput. Measurements found no gain when the outer
+# prefetch pool already saturates the CPU, so callers reserve it for demand,
+# settled-cover, and editor decodes. In those latency-sensitive paths, eight
+# chunks cut real OM-1/Lightroom JPEG decode from 90-144 ms to 30-56 ms
+# (2.6-3.0x). Comparing 150 files at three DCT scales produced zero pixel
+# mismatches; eight chunks was retained as the measured default.
+_MAX_CHUNKS = 8
 
-_pool: Optional[ThreadPoolExecutor] = None
+# Chunk count and worker count are separate knobs: eight cuts are what the
+# measurements above used, but running eight CPU-bound TurboJPEG jobs at once
+# on a 4-thread laptop oversubscribes the cores the rest of the UI needs, which
+# is why the pool was originally sized from os.cpu_count(). Keep eight chunks,
+# cap concurrency at the logical CPUs, and let the extra chunks queue.
+_MAX_WORKERS = max(2, min(_MAX_CHUNKS, os.cpu_count() or _MAX_CHUNKS))
+
+# Lower runs first. A demand decode is the image the user is waiting on, so its
+# chunks must not queue behind an obsolete cover decode that prefetch.py
+# deliberately left running -- the reserved single demand worker would then be
+# blocked on background work, which is exactly what it exists to avoid. With a
+# priority queue a late demand decode waits at most for the chunks already
+# executing, never for every chunk of every stale cover.
+PRIORITY_FOREGROUND = 0
+PRIORITY_BACKGROUND = 10
+
+_pool: Optional[PriorityExecutor] = None
 _pool_lock = threading.Lock()
 
 
-def _get_pool() -> ThreadPoolExecutor:
+def _get_pool() -> PriorityExecutor:
     global _pool
-    with _pool_lock:
-        if _pool is None:
-            _pool = ThreadPoolExecutor(
-                max_workers=max(2, (os.cpu_count() or 8)),
-                thread_name_prefix="rstsplit",
-            )
-        return _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = create_priority_executor(
+                    max_workers=_MAX_WORKERS,
+                    thread_name_prefix="RstSplit",
+                )
+    return _pool
 
 
 def _parse(jpeg) -> Optional[tuple]:
@@ -177,14 +199,23 @@ def build_chunks(jpeg, nchunks: int):
 
 
 def decode_parallel(
-    decoder, jpeg, scaling_factor, pixel_format, flags=0, nchunks: int = 0
+    decoder,
+    jpeg,
+    scaling_factor,
+    pixel_format,
+    flags=0,
+    nchunks: int = 0,
+    priority: int = PRIORITY_FOREGROUND,
 ):
     """Bit-identical parallel replacement for ``decoder.decode``.
 
     Returns ``None`` when the file is not splittable; the caller falls back to
     the ordinary single-threaded decode.
+
+    ``priority`` orders this decode's chunks against the chunks of other
+    in-flight split decodes; see ``PRIORITY_FOREGROUND``/``PRIORITY_BACKGROUND``.
     """
-    built = build_chunks(jpeg, nchunks or MAX_CHUNKS)
+    built = build_chunks(jpeg, nchunks or _MAX_CHUNKS)
     if built is None:
         return None
     parts, w, h = built
@@ -199,7 +230,10 @@ def decode_parallel(
         )
 
     pool = _get_pool()
-    outs = list(pool.map(work, parts))
+    # The caller blocks on these futures from its own thread -- never from a
+    # worker of this pool -- so waiting here cannot starve the pool.
+    futures = [pool.submit(work, part, priority=priority) for part in parts]
+    outs = [future.result() for future in futures]
     out_h = -(-h * num // den)
     merged = np.concatenate(outs, axis=0)
     return merged[:out_h] if merged.shape[0] > out_h else merged
