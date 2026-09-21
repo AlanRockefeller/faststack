@@ -31,7 +31,6 @@ import concurrent.futures
 import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
-from faststack.drag_logic import wayland_ignore_action_completes
 import PySide6
 from PySide6.QtGui import QDesktopServices, QDrag, QGuiApplication, QPixmap
 from PySide6.QtCore import (
@@ -66,6 +65,7 @@ Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 # ⬇️ these are the ones that went missing
 from faststack.config import config
 from faststack.logging_setup import setup_logging
+from faststack.wayland_drag import install_wayland_drag_monitor
 from faststack.models import (
     ImageFile,
     DecodedImage,
@@ -334,6 +334,7 @@ def make_hdrop(paths):
 
 
 log = logging.getLogger(__name__)
+_wayland_drag_monitor = None
 
 
 class DragPayloadMimeData(QMimeData):
@@ -15053,7 +15054,6 @@ class AppController(QObject):
             "payload_read": False,
             "completed": False,
             "action": None,
-            "accepted_action_seen": False,
             "exec_returned": False,
         }
 
@@ -15084,11 +15084,6 @@ class AppController(QObject):
             if action != drag_state["action"]:
                 log.info("[drag] target action now %s", action)
             drag_state["action"] = action
-            # Wayland can reset the current action to IgnoreAction while the
-            # drag is finishing. Preserve the earlier acceptance so the
-            # exec-return fallback does not lose the target's positive signal.
-            if action in (Qt.CopyAction, Qt.MoveAction):
-                drag_state["accepted_action_seen"] = True
 
         def note_release(event_type) -> None:
             # A read alone is not a drop -- Firefox reads on hover -- and a
@@ -15142,10 +15137,16 @@ class AppController(QObject):
             [str(p) for p in file_paths],
         )
         # Support both Copy and Move actions for browser compatibility
+        protocol_monitor = _wayland_drag_monitor if on_wayland else None
+        if protocol_monitor is not None:
+            protocol_monitor.begin()
         try:
             result = drag.exec(Qt.CopyAction | Qt.MoveAction)
         finally:
             drag_state["exec_returned"] = True
+            protocol_finished = (
+                protocol_monitor.end() if protocol_monitor is not None else False
+            )
             if watcher is not None:
                 app = QGuiApplication.instance()
                 if app is not None:
@@ -15156,19 +15157,11 @@ class AppController(QObject):
         # Reset zoom/pan after drag completes (drag can cause unwanted panning)
         self.ui_state.resetZoomPan()
 
-        # Some Wayland browser drops read the URI list and open the files, but
-        # deliver neither a release event to our filter nor an accepted action
-        # to Qt. In that case IgnoreAction is not a reliable failure signal.
         if result in (Qt.CopyAction, Qt.MoveAction):
             complete_drag("exec result")
-        elif on_wayland and wayland_ignore_action_completes(
-            drag_state["payload_read"], drag_state["accepted_action_seen"]
-        ):
-            log.info(
-                "[drag] Wayland target accepted and read payload; "
-                "accepting IgnoreAction fallback"
-            )
-            complete_drag("Wayland accepted action + payload read + exec return")
+        elif on_wayland and protocol_finished:
+            log.info("[drag] Wayland data source finished after accepted drop")
+            complete_drag("Wayland dnd_finished")
 
     def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
         """Mark dragged files uploaded and clear batches after an accepted drop."""
@@ -19532,6 +19525,7 @@ def main(
 ):
     """FastStack Application Entry Point"""
     global _debug_mode, _debug_thumb_timing, _debug_thumb_trace
+    global _wayland_drag_monitor
     _debug_mode = debug
     _debug_thumb_timing = debug_thumb_timing
     _debug_thumb_trace = debug_thumb_trace
@@ -19551,6 +19545,7 @@ def main(
     if debug_requested:
         log.info("Startup: after setup_logging: %.3fs", time.perf_counter() - t0)
     log.info("Starting FastStack")
+    _wayland_drag_monitor = install_wayland_drag_monitor()
 
     os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
     app_qml_dir = faststack_qml_dir()
