@@ -31,6 +31,7 @@ import concurrent.futures
 import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
+from faststack.drag_logic import wayland_ignore_action_completes
 import PySide6
 from PySide6.QtGui import QDesktopServices, QDrag, QGuiApplication, QPixmap
 from PySide6.QtCore import (
@@ -15052,6 +15053,7 @@ class AppController(QObject):
             "payload_read": False,
             "completed": False,
             "action": None,
+            "accepted_action_seen": False,
             "exec_returned": False,
         }
 
@@ -15082,6 +15084,11 @@ class AppController(QObject):
             if action != drag_state["action"]:
                 log.info("[drag] target action now %s", action)
             drag_state["action"] = action
+            # Wayland can reset the current action to IgnoreAction while the
+            # drag is finishing. Preserve the earlier acceptance so the
+            # exec-return fallback does not lose the target's positive signal.
+            if action in (Qt.CopyAction, Qt.MoveAction):
+                drag_state["accepted_action_seen"] = True
 
         def note_release(event_type) -> None:
             # A read alone is not a drop -- Firefox reads on hover -- and a
@@ -15154,11 +15161,14 @@ class AppController(QObject):
         # to Qt. In that case IgnoreAction is not a reliable failure signal.
         if result in (Qt.CopyAction, Qt.MoveAction):
             complete_drag("exec result")
-        elif on_wayland and drag_state["payload_read"]:
+        elif on_wayland and wayland_ignore_action_completes(
+            drag_state["payload_read"], drag_state["accepted_action_seen"]
+        ):
             log.info(
-                "[drag] Wayland target read payload; accepting IgnoreAction fallback"
+                "[drag] Wayland target accepted and read payload; "
+                "accepting IgnoreAction fallback"
             )
-            complete_drag("Wayland payload read + exec return")
+            complete_drag("Wayland accepted action + payload read + exec return")
 
     def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
         """Mark dragged files uploaded and clear batches after an accepted drop."""

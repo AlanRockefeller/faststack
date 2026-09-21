@@ -1,3 +1,4 @@
+from faststack.drag_logic import wayland_ignore_action_completes
 from faststack.models import ImageFile
 
 # We can't easily instantiate AppController without complex mocks for QML engine, etc.
@@ -72,3 +73,11 @@ def test_drag_logic_raw_mode_missing_developed(tmp_path):
 
     paths = get_drag_paths([img], 0, [0], "raw")
     assert paths == [jpg_path]
+
+
+def test_wayland_ignore_action_requires_payload_and_prior_acceptance():
+    """A target read or accepted action alone is not evidence of a drop."""
+    assert not wayland_ignore_action_completes(False, False)
+    assert not wayland_ignore_action_completes(True, False)
+    assert not wayland_ignore_action_completes(False, True)
+    assert wayland_ignore_action_completes(True, True)
