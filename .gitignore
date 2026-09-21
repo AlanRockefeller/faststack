@@ -74,6 +74,14 @@ error_log.txt
 Thumbs.db
 
 # ----------------------------
+# AI assistant scratch / context (not for the public repo)
+# ----------------------------
+.ai/
+chatgpt_project_context.txt
+.codex
+*.works2
+
+# ----------------------------
 # IDE / editor
 # ----------------------------
 .vscode/

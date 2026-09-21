@@ -15149,10 +15149,16 @@ class AppController(QObject):
         # Reset zoom/pan after drag completes (drag can cause unwanted panning)
         self.ui_state.resetZoomPan()
 
-        # Mark all dragged files as uploaded if drag was successful. On Wayland
-        # this has usually already happened, keyed off the release.
+        # Some Wayland browser drops read the URI list and open the files, but
+        # deliver neither a release event to our filter nor an accepted action
+        # to Qt. In that case IgnoreAction is not a reliable failure signal.
         if result in (Qt.CopyAction, Qt.MoveAction):
             complete_drag("exec result")
+        elif on_wayland and drag_state["payload_read"]:
+            log.info(
+                "[drag] Wayland target read payload; accepting IgnoreAction fallback"
+            )
+            complete_drag("Wayland payload read + exec return")
 
     def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
         """Mark dragged files uploaded and clear batches after an accepted drop."""
