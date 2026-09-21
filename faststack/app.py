@@ -65,6 +65,7 @@ Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 # ⬇️ these are the ones that went missing
 from faststack.config import config
 from faststack.logging_setup import setup_logging
+from faststack.wayland_drag import install_wayland_drag_monitor
 from faststack.models import (
     ImageFile,
     DecodedImage,
@@ -333,6 +334,7 @@ def make_hdrop(paths):
 
 
 log = logging.getLogger(__name__)
+_wayland_drag_monitor = None
 
 
 class DragPayloadMimeData(QMimeData):
@@ -15135,10 +15137,16 @@ class AppController(QObject):
             [str(p) for p in file_paths],
         )
         # Support both Copy and Move actions for browser compatibility
+        protocol_monitor = _wayland_drag_monitor if on_wayland else None
+        if protocol_monitor is not None:
+            protocol_monitor.begin()
         try:
             result = drag.exec(Qt.CopyAction | Qt.MoveAction)
         finally:
             drag_state["exec_returned"] = True
+            protocol_finished = (
+                protocol_monitor.end() if protocol_monitor is not None else False
+            )
             if watcher is not None:
                 app = QGuiApplication.instance()
                 if app is not None:
@@ -15149,10 +15157,11 @@ class AppController(QObject):
         # Reset zoom/pan after drag completes (drag can cause unwanted panning)
         self.ui_state.resetZoomPan()
 
-        # Mark all dragged files as uploaded if drag was successful. On Wayland
-        # this has usually already happened, keyed off the release.
         if result in (Qt.CopyAction, Qt.MoveAction):
             complete_drag("exec result")
+        elif on_wayland and protocol_finished:
+            log.info("[drag] Wayland data source finished after accepted drop")
+            complete_drag("Wayland dnd_finished")
 
     def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
         """Mark dragged files uploaded and clear batches after an accepted drop."""
@@ -19516,6 +19525,7 @@ def main(
 ):
     """FastStack Application Entry Point"""
     global _debug_mode, _debug_thumb_timing, _debug_thumb_trace
+    global _wayland_drag_monitor
     _debug_mode = debug
     _debug_thumb_timing = debug_thumb_timing
     _debug_thumb_trace = debug_thumb_trace
@@ -19535,6 +19545,7 @@ def main(
     if debug_requested:
         log.info("Startup: after setup_logging: %.3fs", time.perf_counter() - t0)
     log.info("Starting FastStack")
+    _wayland_drag_monitor = install_wayland_drag_monitor()
 
     os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
     app_qml_dir = faststack_qml_dir()
