@@ -12,6 +12,9 @@ _WAYLAND_LINE = re.compile(rb"^\[\d\d:\d\d:")
 _START_DRAG = re.compile(rb"start_drag\(wl_data_source#(\d+),")
 _FINISHED = re.compile(rb"wl_data_source#(\d+)\.dnd_finished\(\)")
 _CANCELLED = re.compile(rb"wl_data_source#(\d+)\.cancelled\(\)")
+# Data-transfer traffic worth keeping for --debug drag diagnostics.
+_DND_TRACE = re.compile(rb"wl_data_(source|device|offer)|zwp_primary_selection")
+_DND_TRACE_LIMIT = 400
 
 
 class WaylandDragOutcomeMonitor:
@@ -27,6 +30,7 @@ class WaylandDragOutcomeMonitor:
         self._active = False
         self._finished = False
         self._cancelled = False
+        self._trace: list[str] = []
         threading.Thread(target=self._read_stderr, daemon=True).start()
 
     def begin(self) -> None:
@@ -34,6 +38,7 @@ class WaylandDragOutcomeMonitor:
             self._source_id = None
             self._finished = False
             self._cancelled = False
+            self._trace = []
             self._outcome_ready.clear()
             self._active = True
 
@@ -45,10 +50,33 @@ class WaylandDragOutcomeMonitor:
             finished = self._finished and not self._cancelled
         return finished
 
+    def outcome(self) -> str:
+        """Describe the protocol outcome of the last drag, for diagnostics."""
+        with self._lock:
+            if self._source_id is None:
+                return "no start_drag request seen"
+            if self._cancelled:
+                return "wl_data_source cancelled"
+            if self._finished:
+                return "wl_data_source dnd_finished"
+            return "no finish or cancel event"
+
+    def take_trace(self) -> list[str]:
+        """Return and clear the data-transfer protocol lines of the last drag.
+
+        Lines are buffered rather than logged as they arrive: logging from the
+        reader thread would write back into the pipe that thread drains.
+        """
+        with self._lock:
+            trace, self._trace = self._trace, []
+        return trace
+
     def _record(self, line: bytes) -> None:
         with self._lock:
             if not self._active:
                 return
+            if _DND_TRACE.search(line) and len(self._trace) < _DND_TRACE_LIMIT:
+                self._trace.append(line.decode("utf-8", "replace"))
             if self._source_id is None:
                 match = _START_DRAG.search(line)
                 if match:

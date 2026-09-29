@@ -32,7 +32,7 @@ import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
 import PySide6
-from PySide6.QtGui import QDesktopServices, QDrag, QGuiApplication, QPixmap
+from PySide6.QtGui import QCursor, QDesktopServices, QDrag, QGuiApplication, QPixmap
 from PySide6.QtCore import (
     QUrl,
     QTimer,
@@ -44,6 +44,7 @@ from PySide6.QtCore import (
     QMimeData,
     Qt,
     QPoint,
+    qVersion,
     QCoreApplication,  # noqa: F401 — patched by tests
 )
 from PySide6.QtWidgets import (
@@ -354,7 +355,7 @@ class DragPayloadMimeData(QMimeData):
     def retrieveData(self, mime_type, preferred_type):
         data = super().retrieveData(mime_type, preferred_type)
         if self._on_payload_read is not None:
-            self._on_payload_read(mime_type)
+            self._on_payload_read(mime_type, data)
         return data
 
 
@@ -15055,12 +15056,20 @@ class AppController(QObject):
             "completed": False,
             "action": None,
             "exec_returned": False,
+            "trigger": None,
         }
+        # --debug only: a timeline of what the drop target and Qt did.
+        drag_t0 = time.perf_counter()
+        drag_diag = {"reads": [], "actions": [], "releases": []}
+
+        def drag_elapsed_ms() -> float:
+            return (time.perf_counter() - drag_t0) * 1000.0
 
         def complete_drag(trigger: str) -> None:
             if drag_state["completed"]:
                 return
             drag_state["completed"] = True
+            drag_state["trigger"] = trigger
             self._mark_drag_uploaded(dragged_paths, trigger)
 
         def release_stuck_drag() -> None:
@@ -15075,17 +15084,44 @@ class AppController(QObject):
             except RuntimeError:
                 log.debug("Could not cancel the drag", exc_info=True)
 
-        def note_payload_read(mime_type: str) -> None:
+        def note_payload_read(mime_type: str, data) -> None:
             if not drag_state["payload_read"]:
                 log.info("[drag] drop target read %s", mime_type)
             drag_state["payload_read"] = True
+            if _debug_mode:
+                size = len(data) if isinstance(data, (bytes, bytearray)) else None
+                drag_diag["reads"].append(mime_type)
+                log.debug(
+                    "[drag +%.0fms] payload read: %s (%s, %s bytes)",
+                    drag_elapsed_ms(),
+                    mime_type,
+                    type(data).__name__,
+                    size,
+                )
 
         def note_action(action) -> None:
             if action != drag_state["action"]:
                 log.info("[drag] target action now %s", action)
             drag_state["action"] = action
+            if _debug_mode:
+                drag_diag["actions"].append(str(action))
+                log.debug("[drag +%.0fms] actionChanged: %s", drag_elapsed_ms(), action)
+
+        def note_target(target) -> None:
+            # Only fires for targets inside this process; external targets
+            # (Firefox) show up as None.
+            log.debug(
+                "[drag +%.0fms] targetChanged: %s", drag_elapsed_ms(), target
+            )
 
         def note_release(event_type) -> None:
+            if _debug_mode:
+                drag_diag["releases"].append(str(event_type))
+                log.debug(
+                    "[drag +%.0fms] release-class event: %s",
+                    drag_elapsed_ms(),
+                    event_type,
+                )
             # A read alone is not a drop -- Firefox reads on hover -- and a
             # release alone may be an aborted drag over empty desktop.
             if not drag_state["payload_read"]:
@@ -15113,8 +15149,14 @@ class AppController(QObject):
             if app is not None:
                 watcher = DragReleaseWatcher(self, note_release)
                 app.installEventFilter(watcher)
+        elif _debug_mode:
+            # Instrumented for the timeline only; outcome still comes from exec().
+            drag.actionChanged.connect(note_action)
+            mime_data = DragPayloadMimeData(note_payload_read)
         else:
             mime_data = QMimeData()
+        if _debug_mode:
+            drag.targetChanged.connect(note_target)
 
         # Use Qt's standard setUrls - it handles both browser and native app compatibility
         urls = [QUrl.fromLocalFile(str(p)) for p in file_paths]
@@ -15132,12 +15174,18 @@ class AppController(QObject):
             drag.setHotSpot(QPoint(scaled.width() // 2, scaled.height() // 2))
 
         log.info(
-            "Starting drag for %d file(s): %s",
+            "Starting drag for %d file(s) on platform %r with formats %s: %s",
             len(file_paths),
+            QGuiApplication.platformName(),
+            mime_data.formats(),
             [str(p) for p in file_paths],
         )
-        # Support both Copy and Move actions for browser compatibility
         protocol_monitor = _wayland_drag_monitor if on_wayland else None
+        if _debug_mode:
+            self._log_drag_start_diagnostics(
+                file_paths, urls, pix, on_wayland, protocol_monitor
+            )
+        # Support both Copy and Move actions for browser compatibility
         if protocol_monitor is not None:
             protocol_monitor.begin()
         try:
@@ -15162,6 +15210,79 @@ class AppController(QObject):
         elif on_wayland and protocol_finished:
             log.info("[drag] Wayland data source finished after accepted drop")
             complete_drag("Wayland dnd_finished")
+
+        if _debug_mode:
+            elapsed = drag_elapsed_ms()
+            if protocol_monitor is not None:
+                for line in protocol_monitor.take_trace():
+                    log.debug("[drag wayland] %s", line)
+                protocol_outcome = protocol_monitor.outcome()
+            elif on_wayland:
+                protocol_outcome = "monitor not installed"
+            else:
+                protocol_outcome = "n/a (not Wayland)"
+            log.debug(
+                "[drag] summary: exec=%.0fms result=%s reads=%s actions=%s "
+                "releases=%s protocol=%s marked_uploaded=%s",
+                elapsed,
+                result,
+                drag_diag["reads"] or "none",
+                drag_diag["actions"] or "none",
+                drag_diag["releases"] or "none",
+                protocol_outcome,
+                drag_state["trigger"] or "no",
+            )
+            if not drag_diag["reads"] and not drag_diag["actions"]:
+                log.debug(
+                    "[drag] no target ever saw the drag: it was cancelled by the "
+                    "compositor/Qt or released without crossing a drop target"
+                )
+
+    def _log_drag_start_diagnostics(
+        self, file_paths, urls, pix, on_wayland, protocol_monitor
+    ) -> None:
+        """--debug: record the environment a drag starts in."""
+        env = {
+            key: os.environ.get(key)
+            for key in (
+                "QT_QPA_PLATFORM",
+                "XDG_SESSION_TYPE",
+                "XDG_CURRENT_DESKTOP",
+                "WAYLAND_DISPLAY",
+                "DISPLAY",
+            )
+        }
+        log.debug(
+            "[drag] platform=%s on_wayland=%s protocol_monitor=%s qt=%s env=%s",
+            QGuiApplication.platformName(),
+            on_wayland,
+            protocol_monitor is not None,
+            qVersion(),
+            env,
+        )
+        window = self.main_window
+        log.debug(
+            "[drag] cursor=%s window_visible=%s window_active=%s focus_window=%s "
+            "mouse_buttons=%s pixmap=%s",
+            QCursor.pos(),
+            window.isVisible() if window is not None else None,
+            window.isActive() if window is not None else None,
+            QGuiApplication.focusWindow(),
+            QGuiApplication.mouseButtons(),
+            "none" if pix.isNull() else f"{pix.width()}x{pix.height()}",
+        )
+        for path, url in zip(file_paths, urls):
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                size = f"stat failed: {exc}"
+            log.debug(
+                "[drag] file %s size=%s readable=%s url=%s",
+                path,
+                size,
+                os.access(path, os.R_OK),
+                url.toString(),
+            )
 
     def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
         """Mark dragged files uploaded and clear batches after an accepted drop."""
