@@ -11,13 +11,13 @@ ANTIGRAVITY_RULES.md
 tools/*
 !tools/release_notes.py
 !tools/quality-harness/
+!tools/lightroom-catalog-import/
+!tools/profile-faststack.ps1
 git.instructions.txt
 
-# We don't have any good docs yet
-docs/
-
-# Fix noisy/perms tool output dir
-faststack.working-menus/
+# Local working notes live in docs/; only the install guides are published
+docs/*
+!docs/install/
 
 # ----------------------------
 # Python / virtualenvs
@@ -47,9 +47,7 @@ htmlcov/
 # ----------------------------
 # Build / packaging outputs
 # ----------------------------
-build/*
-!build/
-!build/INSTALL-*.md
+build/
 dist/
 *.spec
 !packaging/*.spec
@@ -91,29 +89,25 @@ chatgpt_project_context.txt
 pyrightconfig.json
 
 # ----------------------------
-# Local scratch / test / debug outputs (anywhere)
+# Local scratch / test / debug outputs
 # ----------------------------
+# Anchored to the repo root so they can't hide real files elsewhere
+# (e.g. a new faststack/tests/test_image_*.py).
+/debug_*.txt
+/output*.txt
+/test_out*.txt
+/test_output*.txt
+/test_results.txt
+/smoke_test_output.txt
+/verify_result.txt
+/*test_output.txt
+/test_image*
+/*fail*.txt
+/*final*.txt
 **/debug_test.py
-debug_*.txt
-output*.txt
-test_fail*.log
-test_out*.txt
-test_output*.txt
-test_report*.log
-test_results.txt
-smoke_test_output.txt
-verify_result.txt
-*test_output.txt
-test_image*
-
-
-**/*fail*.txt
-**/*final*.txt
 green.txt
 
 OpenFocus/
-faststack-fix/
-.exe-test/
 py-spy-profiles/
 
 # Runtime sidecar written when the checkout itself is opened as an image

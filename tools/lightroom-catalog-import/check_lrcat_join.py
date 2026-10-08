@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_lrcat_join.py — Schema-discovery helper for Lightroom catalog path reconstruction
+check_lrcat_join.py — Schema-discovery helper for Lightroom catalog path reconstruction
 
 PURPOSE:
   Given a Lightroom Classic .lrcat catalog and an Adobe_images.id_local value,
@@ -31,8 +31,8 @@ HOW TO FIND AN IMAGE ID:
   lrcat_diff.py to find rows that changed after a known edit.
 
 EXAMPLES:
-  python test_lrcat_join.py catalog.lrcat 12345
-  python test_lrcat_join.py "Alan Rockefeller-v13-3.lrcat" 99
+  python check_lrcat_join.py catalog.lrcat 12345
+  python check_lrcat_join.py "Alan Rockefeller-v13-3.lrcat" 99
 
 OBSERVED SCHEMA NOTES:
   - AgLibraryFile.baseName is the filename without extension.
@@ -68,7 +68,7 @@ def connect_ro(path: str) -> sqlite3.Connection:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        prog="test_lrcat_join",
+        prog="check_lrcat_join",
         description=(
             "Test the 4-table join that reconstructs file paths from a Lightroom\n"
             "Classic .lrcat catalog.\n"

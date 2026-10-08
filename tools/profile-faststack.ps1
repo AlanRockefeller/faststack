@@ -16,7 +16,7 @@ matched --debugcache-trace workflow for cold/warm cache and decode analysis.
 
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = "C:\code\faststack",
+    [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$ImageDirectory = "",
     [string]$OutputRoot = "",
     [ValidateRange(3, 120)]

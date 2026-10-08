@@ -44,7 +44,7 @@ OBSERVED SCHEMA:
 
   These observations are from specific Lightroom Classic catalogs. Other
   versions may differ. Use the helper scripts (inspect_lrcat_photo.py,
-  lrcat_diff.py, test_lrcat_join.py) to verify against your own catalog.
+  lrcat_diff.py, check_lrcat_join.py) to verify against your own catalog.
 """
 
 from __future__ import annotations
@@ -172,9 +172,9 @@ Cross-platform path resolution:
 
   The target directory for matching is determined by resolving the --json path's
   parent directory with Path.resolve(), which follows symlinks. For example, if
-  ~/pictures is a symlink to /mnt/c/Users/alanr/Pictures, the resolved path is
-  /mnt/c/Users/alanr/Pictures/..., which correctly matches green-list entries
-  stored as C:/Users/alanr/Pictures/....
+  ~/pictures is a symlink to /mnt/c/Users/you/Pictures, the resolved path is
+  /mnt/c/Users/you/Pictures/..., which correctly matches green-list entries
+  stored as C:/Users/you/Pictures/....
 
   Strategies tried for file existence checks:
     1. The path exactly as stored in the catalog.
@@ -200,7 +200,7 @@ Examples:
 Helper scripts:
   inspect_lrcat_photo.py — Inspect a single image record across all catalog tables.
   lrcat_diff.py          — Compare two catalog snapshots to discover schema changes.
-  test_lrcat_join.py     — Test the 4-table path-reconstruction join for one image.
+  check_lrcat_join.py     — Test the 4-table path-reconstruction join for one image.
 """.strip()
 
 
@@ -621,8 +621,8 @@ def _normalize_dir_for_comparison(path_str: str) -> str:
     """Normalize a directory path to lowercase /mnt/<drive>/... form for comparison.
 
     The caller is expected to pass a resolved path (symlinks followed via
-    Path.resolve()). For example, if ~/pictures -> /mnt/c/Users/alanr/Pictures,
-    the caller passes the resolved /mnt/c/Users/alanr/Pictures/... form.
+    Path.resolve()). For example, if ~/pictures -> /mnt/c/Users/you/Pictures,
+    the caller passes the resolved /mnt/c/Users/you/Pictures/... form.
 
     This function then handles the remaining conversion: Windows drive paths
     (C:/...) become /mnt/c/..., and everything is lowercased. The result can
@@ -722,9 +722,9 @@ def update_faststack_json(
         )
 
     # Filter green paths to only those in the target directory.
-    # resolve() follows symlinks, so ~/pictures -> /mnt/c/Users/alanr/Pictures
+    # resolve() follows symlinks, so ~/pictures -> /mnt/c/Users/you/Pictures
     # yields the real /mnt/c/... path, which can then be compared against
-    # green-list entries stored as C:/Users/alanr/Pictures/... after both
+    # green-list entries stored as C:/Users/you/Pictures/... after both
     # sides are normalized to /mnt/<drive>/... form.
     target_dir = json_path.parent.resolve()
     target_dir_normalized = _normalize_dir_for_comparison(str(target_dir))
