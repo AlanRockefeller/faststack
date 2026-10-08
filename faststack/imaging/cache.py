@@ -112,9 +112,30 @@ class ByteLRUCache(LRUCache):
 
     @max_bytes.setter
     def max_bytes(self, value: int) -> None:
-        """Set the maximum cache size in bytes."""
+        """Resize atomically, preserving LRU order and deferring callbacks."""
         v = max(0, int(value))
-        self.maxsize = v
+        pending_callbacks = []
+        with self._lock:
+            # cachetools 5.x (pinned in pyproject.toml) exposes maxsize as a
+            # read-only property, and insertion reads this private field
+            # directly. Updating it retains cached buffers and their LRU order.
+            self._Cache__maxsize = v
+            self._pending_callbacks = pending_callbacks
+            self._pending_callbacks_owner = threading.get_ident()
+            try:
+                while self.currsize > v:
+                    self.popitem()
+            finally:
+                self._pending_callbacks = None
+                self._pending_callbacks_owner = None
+
+        # Shrinking is intentional removal, not evidence of cache thrashing.
+        # Callbacks run outside the lock, as with capacity-pressure evictions.
+        for callback in pending_callbacks:
+            try:
+                callback()
+            except Exception:
+                log.exception("Error in eviction callback")
         log.debug("Cache max_bytes updated to %.2f MB", v / 1024**2)
 
     @staticmethod

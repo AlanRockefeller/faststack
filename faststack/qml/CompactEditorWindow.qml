@@ -253,10 +253,6 @@ Window {
                 compactEditor.lastLoadWasFull = false
                 return
             }
-            compactEditor.lastLoadedIndex = idx
-            compactEditor.lastLoadWasFull = false
-            compactEditor.controllerRef.update_histogram()
-            compactEditor.updatePulse++
         }
     }
 
@@ -286,6 +282,19 @@ Window {
             compactEditor.lastLoadWasFull = true
             compactEditor.controllerRef.update_histogram()
             compactEditor.updatePulse++
+        }
+    }
+
+    Connections {
+        target: compactEditor.controllerRef
+        function onEditorPreviewLoaded(index, loaded) {
+            if (!compactEditor.visible || !compactEditor.uiStateRef || index !== compactEditor.uiStateRef.currentIndex) return
+            compactEditor.lastLoadedIndex = loaded ? index : -1
+            compactEditor.lastLoadWasFull = false
+            if (loaded) {
+                compactEditor.controllerRef.update_histogram()
+                compactEditor.updatePulse++
+            }
         }
     }
 

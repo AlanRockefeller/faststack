@@ -317,6 +317,34 @@ Item {
         }
     }
 
+    // Mouse wheel: scroll exactly one row per notch. Lives on a transparent
+    // overlay above the grid because Flickable steals wheel events from
+    // handlers declared inside it. The overlay has no MouseArea, so clicks and
+    // drags still reach the tiles. Qt on Wayland reports plain mouse wheels as
+    // device type TouchPad, so device type can't be trusted: notched wheels
+    // arrive with pixelDelta == 0, real touchpad scrolls with pixelDelta set,
+    // and only the latter fall through to default smooth Flickable scrolling.
+    Item {
+        anchors.fill: thumbnailGrid
+        WheelHandler {
+            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+            property real angleAccum: 0
+            onWheel: (event) => {
+                if (event.pixelDelta.y !== 0) {
+                    event.accepted = false
+                    return
+                }
+                angleAccum += event.angleDelta.y
+                var notches = Math.trunc(angleAccum / 120)
+                if (notches === 0) return
+                angleAccum -= notches * 120
+                thumbnailGrid.cancelFlick()
+                thumbnailGrid.contentY = gridViewRoot.clampContentY(
+                    thumbnailGrid.contentY - notches * thumbnailGrid.cellHeight)
+            }
+        }
+    }
+
     // Focus and layout triggers
     onWidthChanged: { if (thumbnailGrid.prefetchEnabled) prefetchTimer.restart() }
     onHeightChanged: { if (thumbnailGrid.prefetchEnabled) prefetchTimer.restart() }

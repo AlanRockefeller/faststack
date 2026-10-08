@@ -2,20 +2,34 @@
 
 import logging
 import os
+import stat
 from pathlib import Path, PureWindowsPath
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Known safe installation directories for common applications on Windows
-KNOWN_SAFE_PATHS = [
-    r"C:\Program Files",
-    r"C:\Program Files (x86)",
-]
+# Installation locations are trust hints, not guarantees about a program.
+# Resolve symlinks and check Unix ownership/permissions before trusting them.
+if os.name == "nt":
+    KNOWN_SAFE_PATHS = [
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+    ]
+else:
+    KNOWN_SAFE_PATHS = [
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/opt",
+        str(Path.home() / ".local" / "bin"),
+        str(Path.home() / "bin"),
+    ]
 
 # Known executable names that are safe to run
 KNOWN_SAFE_EXECUTABLES = {
-    "photoshop": ["Photoshop.exe"],
     "helicon": ["HeliconFocus.exe"],
 }
 
@@ -28,7 +42,7 @@ def validate_executable_path(
 
     Args:
         exe_path: Path to the executable to validate
-        app_type: Type of application (e.g., 'photoshop', 'helicon') for additional checks
+        app_type: Type of application (e.g., 'image_editor', 'helicon') for additional checks
         allow_custom_paths: Whether to allow executables outside known safe paths
 
     Returns:
@@ -41,7 +55,7 @@ def validate_executable_path(
 
     try:
         path = Path(exe_path).resolve()
-    except (ValueError, OSError) as e:
+    except (ValueError, OSError, RuntimeError) as e:
         log.exception(f"Invalid path format: {exe_path}")
         return False, f"Invalid path format: {e}"
 
@@ -67,7 +81,21 @@ def validate_executable_path(
             if not allow_custom_paths:
                 return False, f"Executable name mismatch: {path.name}"
 
-    # Check if in known safe directory
+    # Configured custom builds are valid. Warn about a concrete permission or
+    # ownership risk, rather than treating every nonstandard location as unsafe.
+    if os.name != "nt":
+        risk = _unix_path_risk(Path(os.path.abspath(exe_path)), path)
+        if risk:
+            if not allow_custom_paths:
+                return False, f"Unsafe executable path: {risk}"
+            log.warning(
+                "Executable '%s' has a potentially unsafe path: %s. "
+                "Allowing configured custom path.",
+                path,
+                risk,
+            )
+
+    # Check if in a recognized installation directory.
     in_safe_path = any(
         _is_subpath(path, Path(safe_path)) for safe_path in KNOWN_SAFE_PATHS
     )
@@ -76,10 +104,7 @@ def validate_executable_path(
         if not allow_custom_paths:
             return False, f"Executable not in allowed directory: {exe_path}"
         else:
-            log.warning(
-                f"Executable '{exe_path}' is not in a known safe directory. "
-                f"Proceeding with caution."
-            )
+            log.debug("Allowing executable in custom location: %s", path)
 
     # Check for suspicious paths (explicit parent traversal segments).
     # Do not reject valid segment names that merely contain ".." (e.g. "v1..2").
@@ -112,6 +137,34 @@ def _is_executable(path: Path) -> bool:
         return path.suffix.lower() == ".exe"
     else:  # Unix-like
         return os.access(path, os.X_OK)
+
+
+def _unix_path_risk(original_path: Path, resolved_path: Path) -> Optional[str]:
+    """Identify replaceable executables, including their symlink locations.
+
+    The current user's private builds are intentional custom installations.
+    Root and the current user are trusted owners; group/other write access is
+    reported even inside a standard installation directory. These mode checks
+    are advisory and do not inspect ACLs or authenticate executable contents.
+    """
+    trusted_owners = {0, os.getuid()}
+    checked: set[Path] = set()
+    for path in (original_path, resolved_path):
+        for component in (path, *path.parents):
+            if component in checked:
+                continue
+            checked.add(component)
+            try:
+                info = component.stat()
+            except OSError as exc:
+                return f"cannot inspect {component}: {exc}"
+            if info.st_mode & stat.S_IWOTH:
+                return f"{component} is writable by other users"
+            if info.st_mode & stat.S_IWGRP:
+                return f"{component} is writable by its group"
+            if info.st_uid not in trusted_owners:
+                return f"{component} is owned by another user (uid {info.st_uid})"
+    return None
 
 
 def _is_subpath(path: Path, parent: Path) -> bool:

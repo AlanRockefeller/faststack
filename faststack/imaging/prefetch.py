@@ -1731,6 +1731,7 @@ class Prefetcher:
         current_index: int,
         is_navigation: bool = False,
         direction: Optional[int] = None,
+        radius_limit: Optional[int] = None,
     ):
         """Updates the prefetching queue based on the current image index.
 
@@ -1771,6 +1772,8 @@ class Prefetcher:
             if not self._radius_expanded
             else self.prefetch_radius
         )
+        if radius_limit is not None:
+            effective_radius = min(effective_radius, max(0, radius_limit))
         display_width, display_height, display_generation = self.get_display_info()
         cache_quality: DecodeQuality = (
             "fast" if display_width > 0 and display_height > 0 else "cover"

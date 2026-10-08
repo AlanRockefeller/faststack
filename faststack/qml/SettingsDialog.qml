@@ -41,7 +41,8 @@ Window {
     readonly property var editorPreviewValues: [0, 1920, 2560, 3840]
     property int theme: 0
     property string defaultDirectory: ""
-    property string photoshopPath: ""
+    property string imageEditorPath: ""
+    property var imageEditorHistory: []
     property string rawtherapeePath: ""
     property string rawSourceDir: ""
     property string secondaryRawSourceDir: ""
@@ -150,7 +151,7 @@ Window {
 
     function refreshTextFields() {
         settingsDialog.setLoaderProperty(heliconField, "text", settingsDialog.heliconPath)
-        settingsDialog.setLoaderProperty(photoshopField, "text", settingsDialog.photoshopPath)
+        imageEditorField.editText = settingsDialog.imageEditorPath
         settingsDialog.setLoaderProperty(rawtherapeeField, "text", settingsDialog.rawtherapeePath)
         settingsDialog.setLoaderProperty(rawSourceDirField, "text", settingsDialog.rawSourceDir)
         settingsDialog.setLoaderProperty(secondaryRawSourceDirField, "text", settingsDialog.secondaryRawSourceDir)
@@ -168,7 +169,8 @@ Window {
         // Reload all properties from uiState to ensure Cancel discards edits
         if (settingsDialog.uiStateRef) {
             settingsDialog.heliconPath = settingsDialog.uiStateRef.get_helicon_path()
-            settingsDialog.photoshopPath = settingsDialog.uiStateRef.get_photoshop_path()
+            settingsDialog.imageEditorPath = settingsDialog.uiStateRef.get_image_editor_path()
+            settingsDialog.imageEditorHistory = settingsDialog.uiStateRef.get_image_editor_history()
             settingsDialog.rawtherapeePath = settingsDialog.uiStateRef.get_rawtherapee_path()
             settingsDialog.rawSourceDir = settingsDialog.uiStateRef.get_raw_source_dir()
             settingsDialog.secondaryRawSourceDir = settingsDialog.uiStateRef.get_secondary_raw_source_dir()
@@ -239,7 +241,7 @@ Window {
         }
 
         state.set_helicon_path(settingsDialog.heliconPath)
-        state.set_photoshop_path(settingsDialog.photoshopPath)
+        state.set_image_editor_path(settingsDialog.imageEditorPath)
         state.set_rawtherapee_path(settingsDialog.rawtherapeePath)
         state.set_raw_source_dir(settingsDialog.rawSourceDir)
         state.set_secondary_raw_source_dir(settingsDialog.secondaryRawSourceDir)
@@ -578,39 +580,56 @@ Window {
                             }
                         }
 
-                        // Photoshop Path
-                        Label { text: "Photoshop Path"; color: "#aaaaaa"; font.pixelSize: 12; Layout.topMargin: 5 }
+                        // Image Editor Path
+                        Label { text: "Image Editor Path"; color: "#aaaaaa"; font.pixelSize: 12; Layout.topMargin: 5 }
                         RowLayout {
                             Layout.fillWidth: true
-                            Loader {
-                                id: photoshopField
-                                sourceComponent: styledTextField
+                            ComboBox {
+                                id: imageEditorField
                                 Layout.fillWidth: true
-                                onLoaded: {
-                                    settingsDialog.setLoaderProperty(photoshopField, "text", settingsDialog.photoshopPath)
-                                    settingsDialog.connectLoaderSignal(photoshopField, "textEdited", function() {
-                                        settingsDialog.photoshopPath = settingsDialog.loaderProperty(photoshopField, "text", settingsDialog.photoshopPath)
-                                    })
+                                editable: true
+                                model: settingsDialog.imageEditorHistory
+                                currentIndex: -1
+                                editText: settingsDialog.imageEditorPath
+                                onActivated: {
+                                    settingsDialog.imageEditorPath = model[index]
+                                    editText = settingsDialog.imageEditorPath
+                                }
+                                contentItem: TextField {
+                                    text: imageEditorField.editText
+                                    color: settingsDialog.textColor
+                                    selectByMouse: true
+                                    background: null
+                                    onTextEdited: {
+                                        settingsDialog.imageEditorPath = text
+                                        imageEditorField.editText = text
+                                    }
+                                }
+                                delegate: ItemDelegate {
+                                    required property string modelData
+                                    width: imageEditorField.width
+                                    text: modelData
+                                    highlighted: imageEditorField.highlightedIndex === index
                                 }
                             }
                             Button {
-                                id: photoshopBrowseButton
+                                id: imageEditorBrowseButton
                                 text: "Browse"
                                 flat: true
                                 onClicked: {
-                                    var path = settingsDialog.openFileDialog(settingsDialog.loaderProperty(photoshopField, "text", settingsDialog.photoshopPath))
+                                    var path = settingsDialog.openFileDialog(settingsDialog.imageEditorPath)
                                     if (path) {
-                                        settingsDialog.photoshopPath = path
-                                        settingsDialog.setLoaderProperty(photoshopField, "text", path)
+                                        settingsDialog.imageEditorPath = path
+                                        imageEditorField.editText = path
                                     }
                                 }
-                                background: Rectangle { color: photoshopBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
-                                contentItem: Text { text: photoshopBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                background: Rectangle { color: imageEditorBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: imageEditorBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                             }
                             Label {
                                 text: "✔"
                                 color: "#4ade80"
-                                visible: settingsDialog.pathIsExecutable(settingsDialog.photoshopPath)
+                                visible: settingsDialog.pathIsExecutable(settingsDialog.imageEditorPath)
                             }
                         }
 
