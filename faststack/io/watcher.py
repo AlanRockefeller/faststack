@@ -6,7 +6,16 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import (
+    DirCreatedEvent,
+    DirDeletedEvent,
+    DirMovedEvent,
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileModifiedEvent,
+    FileMovedEvent,
+    FileSystemEventHandler,
+)
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
@@ -21,6 +30,21 @@ _TEMP_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _WATCHED_IMAGE_EXTENSIONS = frozenset(JPG_EXTENSIONS | RAW_EXTENSIONS)
+
+# Only the event types ImageDirectoryEventHandler reacts to. On inotify this
+# also narrows the kernel subscription, so FastStack's own reads (every
+# prefetch decode is an IN_OPEN) no longer wake the watcher thread.
+# FileModifiedEvent still covers IN_ATTRIB, so in-place external writes and
+# timestamp-only changes keep arriving.
+_WATCHED_EVENT_TYPES = [
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileMovedEvent,
+    FileModifiedEvent,
+    DirCreatedEvent,
+    DirDeletedEvent,
+    DirMovedEvent,
+]
 
 
 def _is_ignored_path(path: str) -> bool:
@@ -67,17 +91,22 @@ class ImageDirectoryEventHandler(FileSystemEventHandler):
         self.callback(event.src_path)
 
     def on_moved(self, event):
+        # Treat the endpoints independently. Applications commonly save by moving
+        # an ignored temporary file over the real image; the destination still
+        # needs to invalidate its cached pixels.
+        src_relevant = not _is_ignored_path(event.src_path)
+        dest_relevant = not _is_ignored_path(event.dest_path)
+        if not (src_relevant or dest_relevant):
+            # e.g. our own sidecar write: faststack.<uuid>.tmp -> faststack.json
+            return
         log.info(
             "Detected file move: %s -> %s. Requesting refresh.",
             event.src_path,
             event.dest_path,
         )
-        # Treat the endpoints independently. Applications commonly save by moving
-        # an ignored temporary file over the real image; the destination still
-        # needs to invalidate its cached pixels.
-        if not _is_ignored_path(event.src_path):
+        if src_relevant:
             self.callback(event.src_path)
-        if not _is_ignored_path(event.dest_path):
+        if dest_relevant:
             self.callback(event.dest_path)
 
     def on_modified(self, event):
@@ -124,7 +153,12 @@ class Watcher:
         obs = None
         try:
             obs = Observer()
-            obs.schedule(self.event_handler, str(self.directory), recursive=False)
+            obs.schedule(
+                self.event_handler,
+                str(self.directory),
+                recursive=False,
+                event_filter=_WATCHED_EVENT_TYPES,
+            )
             obs.start()
         except Exception as e:
             log.warning(

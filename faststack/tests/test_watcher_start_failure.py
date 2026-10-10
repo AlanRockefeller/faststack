@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from faststack.io.watcher import Watcher
+from faststack.io.watcher import _WATCHED_EVENT_TYPES, Watcher
 
 
 @pytest.fixture
@@ -100,7 +100,10 @@ def test_successful_start_is_unchanged(watch_dir):
     assert watcher.observer is observer
     assert watcher.is_alive() is True
     observer.schedule.assert_called_once_with(
-        watcher.event_handler, str(watch_dir), recursive=False
+        watcher.event_handler,
+        str(watch_dir),
+        recursive=False,
+        event_filter=_WATCHED_EVENT_TYPES,
     )
     observer.start.assert_called_once()
     observer.unschedule_all.assert_not_called()

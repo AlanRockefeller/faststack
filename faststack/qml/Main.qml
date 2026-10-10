@@ -1559,6 +1559,13 @@ ApplicationWindow {
         }
     }
 
+    Connections {
+        target: root.uiStateRef
+        function onSettingsDialogRequested() {
+            root.openSettingsDialog()
+        }
+    }
+
     // Handle View Switching and Prefetch Gating
     Connections {
         target: root.uiStateRef

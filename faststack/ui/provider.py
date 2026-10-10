@@ -651,6 +651,7 @@ class UIState(QObject):
     awbRgbUpperBoundChanged = Signal()
     currentDirectoryChanged = Signal()  # Signal when working directory changes
     stackDirectorySwitchChanged = Signal()
+    settingsDialogRequested = Signal()  # Ask QML to open the Settings dialog
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelBlackThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
@@ -1450,6 +1451,15 @@ class UIState(QObject):
     @Slot(str)
     def set_raw_source_dir(self, path):
         self.app_controller.set_raw_source_dir(path)
+        self.stackDirectorySwitchChanged.emit()
+
+    @Slot(result=str)
+    def get_main_photo_dir(self):
+        return self.app_controller.get_main_photo_dir()
+
+    @Slot(str)
+    def set_main_photo_dir(self, path):
+        self.app_controller.set_main_photo_dir(path)
         self.stackDirectorySwitchChanged.emit()
 
     @Slot(result=str)

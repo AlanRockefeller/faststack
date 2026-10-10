@@ -4794,6 +4794,8 @@ class ImageEditor:
 
             for tmp_output, _destination in temp_outputs:
                 _validate_temp_output(tmp_output)
+            if _debug:
+                t_encode = time.perf_counter()
 
             # Preserve the existing user-visible undo backup semantics, but
             # create it only after all encoders have succeeded.
@@ -4814,10 +4816,14 @@ class ImageEditor:
             if _debug:
                 t_write = time.perf_counter()
                 h, w = source_shape
+                # encode = JPEG encode + temp-file write + validation;
+                # commit = atomic rename(s) + restoring the original mtime.
                 log.debug(
-                    "[SAVE_IMAGE] apply_edits=%dms backup=%dms write=%dms total=%dms  (%dx%d, %s)",
+                    "[SAVE_IMAGE] apply_edits=%dms encode=%dms backup=%dms "
+                    "commit=%dms total=%dms  (%dx%d, %s)",
                     int((t_edits - t0) * 1000),
-                    int((t_backup - t_edits) * 1000),
+                    int((t_encode - t_edits) * 1000),
+                    int((t_backup - t_encode) * 1000),
                     int((t_write - t_backup) * 1000),
                     int((t_write - t0) * 1000),
                     w,

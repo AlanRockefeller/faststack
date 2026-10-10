@@ -2984,7 +2984,8 @@ class AppController(QObject):
                         ):
                             if _debug_mode:
                                 log.debug(
-                                    "Suppressing watcher refresh for recently deleted path: %s",
+                                    "Suppressing watcher refresh within own-write window "
+                                    "(recent save/delete/restore): %s",
                                     path,
                                 )
                             return
@@ -10621,6 +10622,13 @@ class AppController(QObject):
         config.set("raw", "source_dir", path)
         config.save()
 
+    def get_main_photo_dir(self):
+        return config.get("raw", "mirror_base", fallback="")
+
+    def set_main_photo_dir(self, path):
+        config.set("raw", "mirror_base", path)
+        config.save()
+
     def get_secondary_raw_source_dir(self):
         return config.get("raw", "secondary_source_dir", fallback="")
 
@@ -10748,9 +10756,29 @@ class AppController(QObject):
 
         return ""
 
-    def open_file_dialog(self, current_path: str = ""):
+    @staticmethod
+    def _make_file_dialog(file_mode: QFileDialog.FileMode) -> QFileDialog:
+        """Create a file dialog that stays usable over FastStack's QML windows."""
         dialog = QFileDialog()
-        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setFileMode(file_mode)
+        if sys.platform.startswith("linux"):
+            # The GTK3 native dialog keeps Open/Cancel in its header bar. When it
+            # opens over another window, tiling compositors (e.g. Hyprland) can
+            # fullscreen it, GTK hides the header bar, and nothing can be
+            # selected. Qt's own dialog keeps its buttons in the window body.
+            dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+            dialog.resize(900, 600)
+            parent_window = QGuiApplication.focusWindow()
+            if parent_window is not None:
+                # Make it a transient child so compositors float it as a dialog.
+                dialog.winId()
+                handle = dialog.windowHandle()
+                if handle is not None:
+                    handle.setTransientParent(parent_window)
+        return dialog
+
+    def open_file_dialog(self, current_path: str = ""):
+        dialog = self._make_file_dialog(QFileDialog.FileMode.ExistingFile)
         # On Windows tool executables end in .exe, so lead with that filter.
         # On macOS/Linux the binaries are extensionless (e.g. inside a .app
         # bundle), so default to All Files or the dialog would appear empty.
@@ -11825,8 +11853,8 @@ class AppController(QObject):
         config.save()
 
     def open_directory_dialog(self, current_path: str = ""):
-        dialog = QFileDialog()
-        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog = self._make_file_dialog(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
         start_dir = self._dialog_start_directory(current_path)
         if start_dir:
             dialog.setDirectory(start_dir)
@@ -18150,8 +18178,8 @@ class AppController(QObject):
         base_number_str = match.group(2)  # e.g., "210633"
         base_number = int(base_number_str)
 
-        # Get the mirror base from config
-        mirror_base_str = config.get("raw", "mirror_base")
+        # Get the mirror base (main photo directory) from config
+        mirror_base_str = self.get_main_photo_dir().strip().strip('"')
         if not mirror_base_str:
             self._show_missing_restack_raws_dialog(
                 filename=filename,
@@ -18159,31 +18187,13 @@ class AppController(QObject):
                     base_prefix, base_number
                 ),
                 search_locations=[],
-                reason="The RAW mirror base directory is not configured.",
+                reason="The Main Photo Directory is not configured.",
             )
             log.warning("RAW mirror base (raw.mirror_base) is not set in config.")
             return
 
-        mirror_base_dir = Path(mirror_base_str)
-        if not mirror_base_dir.is_dir():
-            self._show_missing_restack_raws_dialog(
-                filename=filename,
-                expected_stems=self._expected_restack_raw_stems(
-                    base_prefix, base_number
-                ),
-                search_locations=[],
-                reason=f"The RAW mirror base directory does not exist: {mirror_base_dir}",
-            )
-            log.warning(
-                "Configured RAW mirror base directory does not exist: %s",
-                mirror_base_dir,
-            )
-            return
-
-        # The date structure in the RAW directory mirrors the structure relative to the mirror_base
-        try:
-            relative_part = current_image_path.parent.relative_to(mirror_base_dir)
-        except ValueError:
+        mirror_base_dir = self._main_photo_directory()
+        if mirror_base_dir is None or not mirror_base_dir.is_dir():
             self._show_missing_restack_raws_dialog(
                 filename=filename,
                 expected_stems=self._expected_restack_raw_stems(
@@ -18191,8 +18201,32 @@ class AppController(QObject):
                 ),
                 search_locations=[],
                 reason=(
-                    "The current image folder is not inside the configured RAW "
-                    f"mirror base directory: {mirror_base_dir}"
+                    "The configured Main Photo Directory does not exist: "
+                    f"{mirror_base_str}"
+                ),
+            )
+            log.warning(
+                "Configured RAW mirror base directory does not exist: %s",
+                mirror_base_str,
+            )
+            return
+
+        # The date structure in the RAW directory mirrors the structure relative to the mirror_base
+        try:
+            relative_part = current_image_path.parent.resolve().relative_to(
+                mirror_base_dir
+            )
+        except (OSError, ValueError):
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason=(
+                    f"The current image folder ({current_image_path.parent}) is "
+                    "not inside the configured Main Photo Directory: "
+                    f"{mirror_base_dir}"
                 ),
             )
             log.error(
@@ -18395,12 +18429,15 @@ class AppController(QObject):
         )
         details = (
             summary
-            + "\n\nConfigure these folders in Settings > General > Restack RAW Locations. "
-            "Set the primary and secondary RAW source directories to folders that "
-            "mirror the same date/subfolder structure as the configured RAW mirror base."
+            + "\n\nConfigure these folders in Settings > Restack RAW Locations. "
+            "Set the Main Photo Directory to the root folder of your stacked "
+            "images, and set the primary and secondary RAW source directories to "
+            "folders that mirror the same date/subfolder structure."
         )
-        detailed_locations = (
-            f"Stacked image: {filename}\n\n"
+        detailed_locations = f"Stacked image: {filename}\n\n"
+        if reason:
+            detailed_locations += f"Problem:\n{reason}\n\n"
+        detailed_locations += (
             "Search locations:\n"
             + "\n\n".join(location_detail_lines)
             + "\n\nExpected RAW stems:\n"
@@ -18415,9 +18452,14 @@ class AppController(QObject):
         msg_box.setText("FastStack could not find the stack input RAW files.")
         msg_box.setInformativeText(details)
         msg_box.setDetailedText(detailed_locations)
-        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        settings_button = msg_box.addButton(
+            "Open Settings", QMessageBox.ButtonRole.ActionRole
+        )
+        msg_box.addButton(QMessageBox.StandardButton.Ok)
         self._exec_modal_dialog(msg_box)
         self.update_status_message("Stack input RAW files not found.", 6000)
+        if msg_box.clickedButton() is settings_button:
+            self.ui_state.settingsDialogRequested.emit()
 
     @Slot()
     def execute_crop(self):

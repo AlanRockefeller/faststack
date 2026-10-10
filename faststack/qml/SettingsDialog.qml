@@ -44,6 +44,7 @@ Window {
     property string imageEditorPath: ""
     property var imageEditorHistory: []
     property string rawtherapeePath: ""
+    property string mainPhotoDir: ""
     property string rawSourceDir: ""
     property string secondaryRawSourceDir: ""
     property string optimizeFor: "speed"
@@ -153,6 +154,7 @@ Window {
         settingsDialog.setLoaderProperty(heliconField, "text", settingsDialog.heliconPath)
         imageEditorField.editText = settingsDialog.imageEditorPath
         settingsDialog.setLoaderProperty(rawtherapeeField, "text", settingsDialog.rawtherapeePath)
+        settingsDialog.setLoaderProperty(mainPhotoDirField, "text", settingsDialog.mainPhotoDir)
         settingsDialog.setLoaderProperty(rawSourceDirField, "text", settingsDialog.rawSourceDir)
         settingsDialog.setLoaderProperty(secondaryRawSourceDirField, "text", settingsDialog.secondaryRawSourceDir)
         settingsDialog.setLoaderProperty(defaultDirField, "text", settingsDialog.defaultDirectory)
@@ -172,6 +174,7 @@ Window {
             settingsDialog.imageEditorPath = settingsDialog.uiStateRef.get_image_editor_path()
             settingsDialog.imageEditorHistory = settingsDialog.uiStateRef.get_image_editor_history()
             settingsDialog.rawtherapeePath = settingsDialog.uiStateRef.get_rawtherapee_path()
+            settingsDialog.mainPhotoDir = settingsDialog.uiStateRef.get_main_photo_dir()
             settingsDialog.rawSourceDir = settingsDialog.uiStateRef.get_raw_source_dir()
             settingsDialog.secondaryRawSourceDir = settingsDialog.uiStateRef.get_secondary_raw_source_dir()
             settingsDialog.cacheSize = settingsDialog.uiStateRef.get_cache_size()
@@ -243,6 +246,7 @@ Window {
         state.set_helicon_path(settingsDialog.heliconPath)
         state.set_image_editor_path(settingsDialog.imageEditorPath)
         state.set_rawtherapee_path(settingsDialog.rawtherapeePath)
+        state.set_main_photo_dir(settingsDialog.mainPhotoDir)
         state.set_raw_source_dir(settingsDialog.rawSourceDir)
         state.set_secondary_raw_source_dir(settingsDialog.secondaryRawSourceDir)
         state.set_cache_size(settingsDialog.cacheSize)
@@ -534,6 +538,9 @@ Window {
                     anchors.margins: 20
                     clip: true
                     contentWidth: availableWidth
+                    // Keep the scrollbar visible so it is obvious the page scrolls.
+                    ScrollBar.vertical.policy: contentHeight > availableHeight ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+                    rightPadding: effectiveScrollBarWidth + 8
 
                     ColumnLayout {
                         width: parent.width
@@ -707,7 +714,37 @@ Window {
                             onLoaded: item.text = "Restack RAW Locations"
                         }
 
-                        Label { text: "Primary RAW Source Directory"; color: "#aaaaaa"; font.pixelSize: 12 }
+                        Label { text: "Main Photo Directory (root of your stacked images)"; color: "#aaaaaa"; font.pixelSize: 12 }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Loader {
+                                id: mainPhotoDirField
+                                sourceComponent: styledTextField
+                                Layout.fillWidth: true
+                                onLoaded: {
+                                    settingsDialog.setLoaderProperty(mainPhotoDirField, "text", settingsDialog.mainPhotoDir)
+                                    settingsDialog.connectLoaderSignal(mainPhotoDirField, "textEdited", function() {
+                                        settingsDialog.mainPhotoDir = settingsDialog.loaderProperty(mainPhotoDirField, "text", settingsDialog.mainPhotoDir)
+                                    })
+                                }
+                            }
+                            Button {
+                                id: mainPhotoDirBrowseButton
+                                text: "Browse"
+                                flat: true
+                                onClicked: {
+                                    var path = settingsDialog.openDirectoryDialog(settingsDialog.loaderProperty(mainPhotoDirField, "text", settingsDialog.mainPhotoDir))
+                                    if (path) {
+                                        settingsDialog.mainPhotoDir = path
+                                        settingsDialog.setLoaderProperty(mainPhotoDirField, "text", path)
+                                    }
+                                }
+                                background: Rectangle { color: mainPhotoDirBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: mainPhotoDirBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            }
+                        }
+
+                        Label { text: "Primary RAW Source Directory"; color: "#aaaaaa"; font.pixelSize: 12; Layout.topMargin: 5 }
                         RowLayout {
                             Layout.fillWidth: true
                             Loader {
@@ -1057,6 +1094,9 @@ Window {
                     anchors.margins: 20
                     clip: true
                     contentWidth: availableWidth
+                    // Keep the scrollbar visible so it is obvious the page scrolls.
+                    ScrollBar.vertical.policy: contentHeight > availableHeight ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+                    rightPadding: effectiveScrollBarWidth + 8
 
                     ColumnLayout {
                         width: parent.width
