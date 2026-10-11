@@ -4,11 +4,33 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Union
 
 log = logging.getLogger(__name__)
+
+_WINDOWS_DRIVE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/]*(.*)$")
+
+
+def resolve_configured_path(value: str) -> Path:
+    """Turn a user-configured directory string into a usable local Path.
+
+    Strips quotes/whitespace and expands ``~`` and environment variables. On
+    Linux (WSL, or a dual-boot machine sharing its config with Windows), a
+    Windows drive path such as ``C:\\Users\\me\\Pictures`` can never resolve
+    as written, so it is mapped to the conventional mount point
+    ``/mnt/c/Users/me/Pictures``.
+    """
+    cleaned = os.path.expanduser(os.path.expandvars(str(value).strip().strip('"')))
+    if os.name != "nt":
+        match = _WINDOWS_DRIVE_PATH_RE.match(cleaned)
+        if match:
+            rest = match.group(2).replace("\\", "/").strip("/")
+            mounted = Path("/mnt") / match.group(1).lower()
+            return mounted / rest if rest else mounted
+    return Path(cleaned)
 
 
 def fsync_directory(path: Path) -> None:

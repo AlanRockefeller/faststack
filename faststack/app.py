@@ -89,7 +89,7 @@ from faststack.io.watcher import Watcher
 from faststack.io.helicon import HeliconLaunch, launch_helicon_focus
 from faststack.io.arguments import parse_external_arguments
 from faststack.io.executable_validator import validate_executable_path
-from faststack.io.utils import normalize_path_key
+from faststack.io.utils import normalize_path_key, resolve_configured_path
 from faststack.imaging.cache import (
     ByteLRUCache,
     get_decoded_image_size,
@@ -10643,9 +10643,8 @@ class AppController(QObject):
         if not cleaned:
             return None
 
-        expanded = os.path.expanduser(os.path.expandvars(cleaned))
         try:
-            return Path(expanded).resolve()
+            return resolve_configured_path(cleaned).resolve()
         except (OSError, RuntimeError, ValueError):
             return None
 
@@ -18328,12 +18327,12 @@ class AppController(QObject):
             cleaned = str(raw_path or "").strip().strip('"')
             if not cleaned:
                 continue
-            expanded = os.path.expanduser(os.path.expandvars(cleaned))
-            normalized = os.path.normcase(os.path.normpath(expanded))
+            resolved = resolve_configured_path(cleaned)
+            normalized = os.path.normcase(os.path.normpath(str(resolved)))
             if normalized in seen:
                 continue
             seen.add(normalized)
-            locations.append((label, Path(expanded)))
+            locations.append((label, resolved))
         return locations
 
     def _expected_restack_raw_stems(
