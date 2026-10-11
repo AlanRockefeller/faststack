@@ -2,6 +2,8 @@ from typing import Optional
 
 import numpy as np
 
+from faststack.imaging.optional_deps import get_cv2
+
 # ----------------------------
 # sRGB ↔ Linear Conversion Helpers
 # ----------------------------
@@ -42,6 +44,7 @@ _LINEAR_TO_SRGB_DOMAIN = 1.06
 
 _srgb_to_linear_lut: Optional[np.ndarray] = None
 _linear_to_srgb_lut: Optional[np.ndarray] = None
+_srgb_u8_to_linear_lut: Optional[np.ndarray] = None
 
 
 def _srgb_to_linear_fast(x: np.ndarray) -> np.ndarray:
@@ -87,6 +90,34 @@ def _linear_to_srgb_fast(x: np.ndarray) -> np.ndarray:
         _TRANSFER_LUT_SIZE - 1,
     ).astype(np.uint16)
     return lut[idx]
+
+
+def _srgb_u8_exact_to_linear(x: np.ndarray) -> np.ndarray:
+    """`_srgb_to_linear` for float data that holds exact 8-bit values (k/255).
+
+    Recovers each u8 code with one rounding pass, then looks it up in a
+    256-entry table. Several times faster than `_srgb_to_linear_fast` on
+    full-resolution exports, and exact at every code. Only valid when every
+    value is k/255 in [0, 1] -- an 8-bit source after lossless geometry
+    (90-degree rotation, crop). Interpolated data (straighten, resize) must
+    use the general path.
+    """
+    global _srgb_u8_to_linear_lut
+    lut = _srgb_u8_to_linear_lut
+    if lut is None:
+        codes = np.arange(256, dtype=np.float64) / 255.0
+        lut = _srgb_to_linear(codes).astype(np.float32)
+        _srgb_u8_to_linear_lut = lut
+    cv2 = get_cv2()
+    if cv2 is not None and x.dtype == np.float32 and x.ndim in (2, 3):
+        # Round-to-nearest with u8 saturation; the input is never negative
+        # here, so convertScaleAbs's abs() is a no-op.
+        codes_u8 = cv2.convertScaleAbs(x, alpha=255.0)
+        return cv2.LUT(codes_u8, lut)
+    codes_u8 = np.clip(x * np.float32(255.0) + np.float32(0.5), 0, 255).astype(
+        np.uint8
+    )
+    return lut[codes_u8]
 
 
 def _smoothstep01(x: np.ndarray) -> np.ndarray:

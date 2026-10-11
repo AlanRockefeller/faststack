@@ -33,6 +33,7 @@ from faststack.imaging.math_utils import (
     _smoothstep01,
     _srgb_to_linear,
     _srgb_to_linear_fast,
+    _srgb_u8_exact_to_linear,
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
@@ -1659,6 +1660,7 @@ class ImageEditor:
         cancel_check: Optional[Callable[[], bool]] = None,
         stop_before_darken: bool = False,
         render_state_out: Optional[Dict[str, Any]] = None,
+        source_exact_u8: bool = False,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
         Returns float32 array (H, W, 3).
@@ -1735,6 +1737,15 @@ class ImageEditor:
         # Alias
         arr = img_arr
 
+        # True while every value is still an exact 8-bit code (k/255): an 8-bit
+        # source (``source_exact_u8`` from the caller, or a uint8/PIL input)
+        # that has only been through lossless geometry. Lets the linear
+        # conversion use the exact 256-entry path. Straighten and resize
+        # interpolate, so they clear it.
+        exact_u8 = bool(source_exact_u8) or isinstance(arr, Image.Image)
+        if isinstance(arr, np.ndarray) and arr.dtype == np.uint8:
+            exact_u8 = True
+
         # ENSURE we are working with a float32 numpy array
         if isinstance(arr, Image.Image):
             arr = np.array(arr.convert("RGB")).astype(np.float32) / 255.0
@@ -1805,6 +1816,7 @@ class ImageEditor:
 
             # Perform rotation (Expanded)
             arr = self._rotate_float_image(arr, -straighten_angle, expand=True)
+            exact_u8 = False
 
             # Apply Auto-Crop if calculated
             if crop_rect:
@@ -1871,6 +1883,7 @@ class ImageEditor:
                 new_w = max(1, round(w * scale))
                 new_h = max(1, round(h * scale))
                 arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                exact_u8 = False
                 # Use the realized pixel ratio after rounding, not merely the
                 # requested long-edge ratio.
                 detail_render_scale *= min(new_w / w, new_h / h)
@@ -1878,13 +1891,18 @@ class ImageEditor:
         _mark("downscale")
         _check_cancelled()
 
+        _skip_linear = self._edits_skip_linear(edits)
+
         # Detach from a shared input buffer before any tonal op can touch it.
         # Everything below either reassigns or mutates `arr` in place (vignette,
         # the caller's final in-place clip), so from here on the array must be
         # private memory when the caller didn't pass a copy. may_share_memory
         # is a cheap bounds check; a false positive just costs the copy the
-        # caller would otherwise have made up front.
-        if protect_input and np.may_share_memory(arr, img_arr):
+        # caller would otherwise have made up front. The linear path needs no
+        # copy: its first step (sRGB -> linear) writes a fresh array before
+        # anything is modified, so copying here would only add a full-size
+        # allocation.
+        if protect_input and _skip_linear and np.may_share_memory(arr, img_arr):
             arr = arr.copy()
 
         # 5. Conversion to Linear Light
@@ -1899,8 +1917,8 @@ class ImageEditor:
         # no-op that costs ~3.5s on large images (and ~120ms per preview
         # render). Skip it entirely. Previews still need the highlight
         # telemetry for the live clipping indicators, which the skip branch
-        # computes from a 4x-strided view below.
-        _skip_linear = self._edits_skip_linear(edits)
+        # computes from a 4x-strided view below. (_skip_linear is computed
+        # above, before the protect_input check.)
 
         # Stamps of any *reused* (and therefore possibly approximate) upstream
         # stage, for _mask_render_identity(). None means "computed exactly from
@@ -1991,7 +2009,12 @@ class ImageEditor:
 
             # Base image data is always in [0, 1], so the clamped LUT version
             # is safe here; headroom (>1.0) only appears later, in linear space.
-            arr = _cancellable_rows(_srgb_to_linear_fast, arr)
+            # Exact 8-bit data takes the 256-entry path: same values, several
+            # times faster on full-resolution exports.
+            arr = _cancellable_rows(
+                _srgb_u8_exact_to_linear if exact_u8 else _srgb_to_linear_fast,
+                arr,
+            )
             _mark("linear_convert")
             _check_cancelled()
 
@@ -4506,14 +4529,13 @@ class ImageEditor:
                 raise RuntimeError("snapshot_for_export called with no float_image")
 
             # --- Source image ---
-            _safe_no_copy = self._edits_can_share_input(self.current_edits)
-            if _safe_no_copy:
-                source_arr = self.float_image
-                log.debug(
-                    "snapshot_for_export: skipping float_image.copy() (safe no-copy path)"
-                )
-            else:
-                source_arr = self.float_image.copy()
+            # Always shared, never copied here: this runs on the UI thread
+            # (navigation flush, save), and a full-resolution float copy is
+            # ~240 MB, which stalls for seconds under memory pressure.
+            # float_image is only ever reassigned, never mutated in place, and
+            # save_from_snapshot renders with protect_input=True, so any copy
+            # the edits need happens on the save worker instead.
+            source_arr = self.float_image
 
             source_shape = self.float_image.shape[:2]  # for debug logging
 
@@ -4678,6 +4700,11 @@ class ImageEditor:
             cache_override=export_cache,
             cache_context=export_cache_context,
             update_highlight_state=False,
+            # The snapshot shares the live editor's float_image (see
+            # snapshot_for_export); never write into it.
+            protect_input=True,
+            # 8-bit masters are built as u8/255 on every load/restore path.
+            source_exact_u8=snapshot.get("bit_depth") == 8,
         )  # (H,W,3) float32
 
         if _debug:
