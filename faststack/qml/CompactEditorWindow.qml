@@ -151,24 +151,20 @@ Window {
     // Whether the per-hue COLOR MIX section is expanded (collapsed by default).
     property bool colorMixExpanded: false
     readonly property bool cropActive: compactEditor.uiStateRef ? compactEditor.uiStateRef.isCropping : false
-    readonly property bool plainArrowNavigationEnabled: visible
-                                                        && controllerRef
-                                                        && uiStateRef
-                                                        && !cropActive
-                                                        && !discardDialog.opened
-    onPlainArrowNavigationEnabledChanged: {
-        if (!plainArrowNavigationEnabled && compactEditor.controllerRef)
-            compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
-    }
+    // Plain Left/Right belong to this window (they move the slider
+    // highlight), so the controller's arrow-navigation event filter lets them
+    // through to QML instead of turning them into image navigation.
+    readonly property bool handlesPlainArrowKeys: true
     property int lastLoadedIndex: -1
     property bool lastLoadWasFull: false
     property bool forceNextPreviewLoad: false
     property string closeTooltip: "Close editor"
 
     // Key of the slider that the Up/Down arrow keys will adjust. The matching
-    // row is highlighted so the user can see which control is targeted. Click a
-    // slider's label (or value) to retarget. Defaults to the first slider so the
-    // arrow keys work immediately when the editor opens.
+    // row is highlighted so the user can see which control is targeted.
+    // Left/Right move the highlight; clicking a slider's label (or value) also
+    // retargets. Defaults to the first slider so the arrow keys work
+    // immediately when the editor opens.
     property string highlightedSliderKey: "exposure"
     property bool keyboardHandlerReady: false
 
@@ -190,6 +186,42 @@ Window {
         sliderVal = Math.max(-100, Math.min(100, sliderVal + delta))
         compactEditor.controllerRef.set_edit_parameter(key, sliderVal / 100 * scale)
         compactEditor.updatePulse++  // refreshes sliders + histogram
+    }
+
+    // Slider keys in on-screen order (collapsed COLOR MIX rows excluded), so
+    // Left/Right walk the highlight through exactly what the user can see.
+    function visibleSliderKeys() {
+        var models = [lightModel, colorModel]
+        if (compactEditor.colorMixExpanded) models.push(colorMixModel)
+        var keys = []
+        for (var m = 0; m < models.length; ++m) {
+            for (var i = 0; i < models[m].count; ++i) keys.push(models[m].get(i).key)
+        }
+        return keys
+    }
+
+    // Move the highlight `step` rows (wrapping at either end).
+    function moveSliderHighlight(step) {
+        if (compactEditor.cropActive) return
+        var keys = compactEditor.visibleSliderKeys()
+        if (keys.length === 0) return
+        var idx = keys.indexOf(compactEditor.highlightedSliderKey)
+        if (idx < 0) idx = step > 0 ? -1 : 0
+        idx = (idx + step + keys.length) % keys.length
+        compactEditor.highlightedSliderKey = keys[idx]
+    }
+
+    // Scroll the editor so `item` (a slider row) is fully visible.
+    function ensureRowVisible(item) {
+        var flick = editorScroll.contentItem
+        if (!item || !flick || flick.contentY === undefined) return
+        var top = item.mapToItem(flick.contentItem, 0, 0).y
+        var bottom = top + item.height
+        var maxY = Math.max(0, flick.contentHeight - flick.height)
+        if (top < flick.contentY)
+            flick.contentY = Math.max(0, top - 4)
+        else if (bottom > flick.contentY + flick.height)
+            flick.contentY = Math.min(maxY, bottom - flick.height + 4)
     }
 
     function refreshCloseTooltip() {
@@ -215,10 +247,22 @@ Window {
         if (modifiers === undefined) modifiers = Qt.NoModifier
         if (compactEditor.cropActive || discardDialog.opened) return false
         if (key === Qt.Key_Left || key === Qt.Key_Right) {
-            // Plain arrows are owned by the controller's physical
-            // press/hold/release event filter. Only modifier shortcuts are
-            // forwarded through the synthetic key path.
-            if (modifiers === Qt.NoModifier) return true
+            var step = key === Qt.Key_Right ? 1 : -1
+            if (modifiers === Qt.NoModifier) {
+                // Plain Left/Right: move the slider highlight.
+                compactEditor.moveSliderHighlight(step)
+                return true
+            }
+            if (modifiers === Qt.ControlModifier) {
+                // Ctrl+Left/Right: previous/next image while editing.
+                if (compactEditor.uiStateRef) {
+                    if (step > 0) compactEditor.uiStateRef.nextImage()
+                    else compactEditor.uiStateRef.prevImage()
+                }
+                return true
+            }
+            // Other modifiers (Shift = jump 10 images) keep the main-window
+            // bindings.
             if (compactEditor.controllerRef)
                 compactEditor.controllerRef.handle_key_from_compact_editor(key, modifiers, "")
             return true
@@ -362,9 +406,9 @@ Window {
 
     // Keyboard handling for the compact editor window.
     //
-    // Plain Left / Right are handled by the controller's QWindow event filter
-    // so physical release is observable even when a child control has focus.
-    // Modifier Left / Right and Up / Down retain their shortcuts/local handling.
+    // Arrow keys (see handleArrowKey): Left / Right move the slider highlight,
+    // Up / Down adjust the highlighted slider, Ctrl+Left / Right switch images,
+    // Shift+Left / Right keep the main window's jump-by-10 binding.
     //
     // This focus scope handles the remaining compact-editor keys:
     //   - Esc / E / S / O  -> editor-local actions (close / save / crop)
@@ -978,6 +1022,11 @@ Window {
 
             Layout.fillWidth: true
             spacing: 6
+
+            readonly property bool isHighlighted: compactEditor.highlightedSliderKey === sliderRow.key
+            onIsHighlightedChanged: {
+                if (sliderRow.isHighlighted) Qt.callLater(compactEditor.ensureRowVisible, sliderRow)
+            }
 
             // Clickable label. Clicking it makes this the slider that the
             // Up/Down arrow keys adjust; the highlighted row is tinted.
