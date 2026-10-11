@@ -18,7 +18,7 @@ import shutil
 import uuid
 import functools
 from contextlib import contextmanager
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 from itertools import pairwise
 
@@ -32,7 +32,7 @@ import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
 import PySide6
-from PySide6.QtGui import QDesktopServices, QDrag, QGuiApplication, QPixmap
+from PySide6.QtGui import QCursor, QDesktopServices, QDrag, QGuiApplication, QPixmap
 from PySide6.QtCore import (
     QUrl,
     QTimer,
@@ -44,6 +44,7 @@ from PySide6.QtCore import (
     QMimeData,
     Qt,
     QPoint,
+    qVersion,
     QCoreApplication,  # noqa: F401 — patched by tests
 )
 from PySide6.QtWidgets import (
@@ -63,7 +64,7 @@ from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 # ⬇️ these are the ones that went missing
-from faststack.config import config
+from faststack.config import DEFAULT_CONFIG, config, detect_image_editor_path
 from faststack.logging_setup import setup_logging
 from faststack.wayland_drag import install_wayland_drag_monitor
 from faststack.models import (
@@ -88,7 +89,7 @@ from faststack.io.watcher import Watcher
 from faststack.io.helicon import HeliconLaunch, launch_helicon_focus
 from faststack.io.arguments import parse_external_arguments
 from faststack.io.executable_validator import validate_executable_path
-from faststack.io.utils import normalize_path_key
+from faststack.io.utils import normalize_path_key, resolve_configured_path
 from faststack.imaging.cache import (
     ByteLRUCache,
     get_decoded_image_size,
@@ -354,7 +355,7 @@ class DragPayloadMimeData(QMimeData):
     def retrieveData(self, mime_type, preferred_type):
         data = super().retrieveData(mime_type, preferred_type)
         if self._on_payload_read is not None:
-            self._on_payload_read(mime_type)
+            self._on_payload_read(mime_type, data)
         return data
 
 
@@ -419,7 +420,7 @@ _debug_mode = False
 _debug_thumb_timing = False
 _debug_thumb_trace = False
 
-# Cache Thrashing Detection Constants
+# Warn about repeated eviction/reinsertion cycles, not ordinary LRU turnover.
 CACHE_THRASH_WINDOW_SECS = 2.0
 CACHE_THRASH_THRESHOLD = 5
 CACHE_WARNING_COOLDOWN_SECS = 300
@@ -464,12 +465,17 @@ class AppController(QObject):
         object
     )  # Signal for async delete completion (result dict from worker)
     _exifBriefReady = Signal(object, str)  # (cache_key, brief) from background thread
+    # (SidecarManager, outcome) from the background session-position write
+    _sessionSidecarWriteFinished = Signal(object, str)
     _updateCheckFinished = Signal(object)  # Update check result from background thread
     _qualityDecodeFinished = Signal(object)  # Settled cover-quality decode result
     _pacedNavigationReady = Signal(object)  # Exact fast-tier target is cache-ready
     _frameSwapObserved = Signal(float)  # render-thread timestamp -> GUI thread
+    _cacheWarningRaised = Signal(str)  # cache workers -> GUI status message
     _preloadProgressReady = Signal(object)  # Worker counters -> GUI thread
     _indexScanReady = Signal(object)  # {"epoch", "result"} payload -> GUI thread
+    _editorLoadReady = Signal(object)
+    editorPreviewLoaded = Signal(int, bool)
 
     def __init__(
         self,
@@ -548,6 +554,12 @@ class AppController(QObject):
         self._editor_prewarm_executor = create_daemon_threadpool_executor(
             max_workers=1, thread_name_prefix="EditPrewarm"
         )
+        self._editor_load_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="EditorLoad"
+        )
+        self._editor_load_token = 0
+        self._editor_load_future = None
+        self._editorLoadReady.connect(self._on_editor_load_ready)
         self._update_executor = create_daemon_threadpool_executor(
             max_workers=1, thread_name_prefix="UpdateCheck"
         )
@@ -754,9 +766,11 @@ class AppController(QObject):
         self._last_cache_warning_time = 0
         self._last_cache_stats_update = 0.0
         self._eviction_lock = threading.Lock()
-        self._eviction_timestamps: deque[float] = (
-            deque()
-        )  # Rolling window for rate detection
+        self._eviction_events: deque[tuple[float, str]] = deque()
+        self._eviction_counts: Counter[str] = Counter()
+        self._cacheWarningRaised.connect(
+            self.update_status_message, Qt.ConnectionType.QueuedConnection
+        )
         self.display_ready = False  # Track if display size has been reported
         self.pending_prefetch_index: Optional[int] = None  # Deferred prefetch index
 
@@ -1127,6 +1141,16 @@ class AppController(QObject):
         self._session_save_timer.setSingleShot(True)
         self._session_save_timer.setInterval(1000)
         self._session_save_timer.timeout.connect(self._persist_session_state)
+        # The writes themselves (sidecar position + session record, each an
+        # fsync'd atomic replace) run here so they never stall the UI. One
+        # worker keeps them FIFO; shutdown drains it before the final
+        # synchronous save and the session-record removal.
+        self._session_write_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="SessionWrite"
+        )
+        self._sessionSidecarWriteFinished.connect(
+            self._on_session_sidecar_write_finished
+        )
 
         # Debounce timer for EXIF reads — only fires after user stops scrolling
         self._exif_debounce_timer = QTimer(self)
@@ -1497,8 +1521,8 @@ class AppController(QObject):
         self, current_path: Optional[Path], previous_index: int
     ) -> None:
         if not self.image_files:
-            self._clear_variant_override()
             self.current_index = 0
+            self._clear_variant_override()
             return
         new_index = (
             self._path_to_index.get(self._key(current_path))
@@ -1506,8 +1530,8 @@ class AppController(QObject):
             else None
         )
         if new_index is None:
-            self._clear_variant_override()
             self.current_index = min(max(previous_index, 0), len(self.image_files) - 1)
+            self._clear_variant_override()
         else:
             self.current_index = new_index
 
@@ -2349,7 +2373,7 @@ class AppController(QObject):
                 priority=True,
                 quality="fast",
             )
-            self.prefetcher.update_prefetch(self.current_index)
+            self.prefetcher.update_prefetch(self.current_index, radius_limit=2)
 
         # Force QML to reload the image at the new resolution
         if self.image_files and self.main_window:
@@ -2489,6 +2513,14 @@ class AppController(QObject):
             blocked_modifiers = event.modifiers() & (
                 Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier
             )
+            if not blocked_modifiers and bool(
+                watched.property("handlesPlainArrowKeys")
+            ):
+                # The window uses plain Left/Right itself (the compact editor
+                # moves its slider highlight): deliver the press to QML instead
+                # of starting image navigation.
+                self._end_navigation_hold(0, source=watched)
+                return False
             if not blocked_modifiers:
                 navigation_enabled = bool(
                     watched.property("plainArrowNavigationEnabled")
@@ -2972,7 +3004,8 @@ class AppController(QObject):
                         ):
                             if _debug_mode:
                                 log.debug(
-                                    "Suppressing watcher refresh for recently deleted path: %s",
+                                    "Suppressing watcher refresh within own-write window "
+                                    "(recent save/delete/restore): %s",
                                     path,
                                 )
                             return
@@ -3214,9 +3247,8 @@ class AppController(QObject):
     def _on_index_scan_ready(self, payload) -> None:
         """GUI-thread continuation of a watcher-triggered background scan.
 
-        Unlike bare refresh_image_list(), this clamps current_index,
-        updates the prefetcher, and syncs the UI so the display never
-        references an out-of-bounds index.
+        The list rebuild repairs current_index; this also primes decoding and
+        publishes the final count, index, and source together.
         """
         if getattr(self, "_shutting_down", False):
             self._index_scan_inflight = False
@@ -3275,7 +3307,7 @@ class AppController(QObject):
             photoshop_overwrites
         )
         for path in photoshop_overwrites:
-            log.info("Detected completed Photoshop overwrite: %s", path)
+            log.info("Detected completed image editor overwrite: %s", path)
 
         self._all_images = images
         self._variant_map = variant_map
@@ -3360,7 +3392,7 @@ class AppController(QObject):
             self.ui_state.stackSummaryChanged.emit()
         if photoshop_batch_additions:
             self.update_status_message(
-                "Photoshop edit reloaded and added to batch",
+                "Image editor edit reloaded and added to batch",
                 timeout=5000,
             )
 
@@ -3370,6 +3402,8 @@ class AppController(QObject):
 
     def _apply_filter_to_cached_list(self, *, notify: bool = True):
         """Applies current filter to cached image list without disk I/O."""
+        current_path = self._current_image_path()
+        previous_index = self.current_index
         old_batch_start_path = (
             self.image_files[self.batch_start_index].path
             if self.batch_start_index is not None
@@ -3378,6 +3412,10 @@ class AppController(QObject):
         )
         self.image_files = self._filtered_sorted_copy(self.sort_mode)
         self._rebuild_path_to_index()
+        # A rescan may shrink/reorder the list while delete jobs are still
+        # moving files. Repair the selection before any signal can expose the
+        # new list to QML, even when the caller's preferred target is absent.
+        self._restore_filter_current_image(current_path, previous_index)
         self._restore_batches_from_sidecar_flags()
         if old_batch_start_path:
             self.batch_start_index = self._path_to_index.get(
@@ -4224,23 +4262,102 @@ class AppController(QObject):
         error must never disrupt navigation.
         """
         current_path = self._current_image_path()
+        manager = self.sidecar
+        prepared = None
         try:
-            with self.sidecar._state_lock:
-                self.sidecar.data.sort_mode = self.sort_mode
-            self.sidecar.set_last_position(self.current_index, current_path)
-            _ = self._persist_sidecar()
+            with manager._state_lock:
+                manager.data.sort_mode = self.sort_mode
+            manager.set_last_position(self.current_index, current_path)
+            # Snapshot only; the write happens on the session-write worker.
+            prepared = manager.prepare_background_write()
         except Exception as e:
             log.warning("Error persisting sidecar position: %s", e)
-        try:
-            self._session_registry.update(
+        self._queue_session_write(
+            manager,
+            prepared,
+            (
                 self.image_dir,
                 self.current_index,
                 self._is_grid_view_active,
                 current_path,
-            )
-        except Exception as e:
-            log.warning("Error updating session record: %s", e)
+            ),
+        )
         self._remember_last_directory()
+
+    def _queue_session_write(self, manager, prepared, record_args) -> None:
+        """Run a sidecar snapshot write and/or session-record update off-thread.
+
+        ``prepared`` is a ``SidecarManager.prepare_background_write()`` result
+        (or None to skip the sidecar). ``record_args`` are the
+        ``SessionRegistry.update`` arguments (or None). If the worker is
+        unavailable, the work runs inline, except during shutdown, which does
+        its own final save and removes the session record.
+        """
+        registry = self._session_registry
+        signal = self._sessionSidecarWriteFinished
+
+        def _worker():
+            outcome = None
+            if manager is not None and prepared is not None:
+                outcome = manager.write_prepared(*prepared)
+            if record_args is not None:
+                try:
+                    registry.update(*record_args)
+                except Exception as e:
+                    log.warning("Error updating session record: %s", e)
+            return outcome
+
+        def _done(fut):
+            if fut.cancelled():
+                return  # superseded by the shutdown save
+            try:
+                outcome = fut.result()
+            except Exception:
+                log.exception("Background session write failed")
+                outcome = "failed"
+            if outcome is None:
+                return
+            try:
+                signal.emit(manager, outcome)
+            except RuntimeError:
+                pass  # controller already destroyed during shutdown
+
+        executor = getattr(self, "_session_write_executor", None)
+        try:
+            if executor is None:
+                raise RuntimeError("session write executor unavailable")
+            future = executor.submit(_worker)
+        except RuntimeError:
+            if self._shutting_down:
+                # The shutdown path saves the sidecar itself, and a session
+                # record written now could outlive SessionRegistry.close().
+                return
+            # Executor unexpectedly unavailable: write inline, as before.
+            outcome = _worker()
+            if outcome is not None and outcome not in (
+                "written",
+                "unchanged",
+                "superseded",
+            ):
+                self._on_session_sidecar_write_finished(manager, outcome)
+            return
+        future.add_done_callback(_done)
+
+    @Slot(object, str)
+    def _on_session_sidecar_write_finished(self, manager, outcome: str) -> None:
+        """Main thread: fall back to a full merge-save when the fast write could not."""
+        if outcome in ("written", "unchanged", "superseded"):
+            return
+        if self._shutting_down:
+            return  # the shutdown path does its own final synchronous save
+        log.info(
+            "Background sidecar position write returned %s; saving synchronously",
+            outcome,
+        )
+        try:
+            _ = self._persist_sidecar(manager)
+        except Exception as e:
+            log.warning("Error persisting sidecar position: %s", e)
 
     def _remember_last_directory(self):
         """Persist the open folder so a no-argument launch resumes here.
@@ -5281,7 +5398,7 @@ class AppController(QObject):
 
         if retired_requests or cleared_persisted_state:
             log.info(
-                "Photoshop handoff retired %d deferred save request(s)%s",
+                "Image editor handoff retired %d deferred save request(s)%s",
                 retired_requests,
                 " and persisted pending edit state" if cleared_persisted_state else "",
             )
@@ -5298,7 +5415,7 @@ class AppController(QObject):
             self._clear_crop_mode_snapshot()
 
         self._clear_active_auto_adjust_state(
-            "Photoshop handoff discarded unsaved FastStack edits",
+            "Image editor handoff discarded unsaved FastStack edits",
             clear_editor=False,
         )
         if self.image_editor:
@@ -5329,7 +5446,7 @@ class AppController(QObject):
         if self.ui_state.isHistogramVisible:
             self.update_histogram()
 
-        log.info("Discarded unsaved FastStack edits for Photoshop handoff")
+        log.info("Discarded unsaved FastStack edits for image editor handoff")
         return True
 
     def _mark_current_live_edit_session_save_failed(self, revision: int) -> None:
@@ -8232,12 +8349,23 @@ class AppController(QObject):
             gate = self._paced_present_gate
             if gate is None:
                 return
+            if not self._paced_present_ready:
+                waiting_for = "Image.Ready"
+            elif gate.get("sync_t") is None:
+                waiting_for = "scene-graph synchronization"
+            else:
+                waiting_for = "frame swap"
             self._paced_present_gate = None
             self._paced_present_ready = False
+        elapsed_ms = (time.perf_counter() - gate["started_t"]) * 1000.0
         log.warning(
-            "Navigation presentation acknowledgement timed out for seq=%s; "
+            "Navigation presentation acknowledgement timed out for seq=%s "
+            "waiting for %s after %.0fms (watchdog budget %dms); "
             "continuing held navigation",
             gate.get("seq"),
+            waiting_for,
+            elapsed_ms,
+            self._navigation_gate_watchdog_timer.interval(),
         )
         if self._held_navigation_direction:
             # The watchdog interval already includes the initial keyboard repeat
@@ -8410,6 +8538,7 @@ class AppController(QObject):
         with self._nav_trace_lock:
             self._paced_present_gate = {
                 "seq": self._current_nav_seq,
+                "started_t": commit_started,
                 "due_t": commit_started
                 + self._effective_navigation_interval_ms() / 1000.0,
                 "sync_t": None,
@@ -10549,10 +10678,32 @@ class AppController(QObject):
         config.set("helicon", "exe", path)
         config.save()
 
-    def get_photoshop_path(self):
+    def get_image_editor_path(self):
         return config.get("photoshop", "exe")
 
-    def set_photoshop_path(self, path):
+    def get_image_editor_history(self) -> List[str]:
+        import json
+
+        try:
+            saved = json.loads(config.get("photoshop", "history", fallback="[]"))
+        except (TypeError, ValueError):
+            saved = []
+        if not isinstance(saved, list):
+            saved = []
+        paths = [self.get_image_editor_path()]
+        paths.extend(path for path in saved if isinstance(path, str))
+        return list(
+            dict.fromkeys(path.strip() for path in paths if path and path.strip())
+        )
+
+    def set_image_editor_path(self, path):
+        import json
+
+        history = self.get_image_editor_history()
+        path = path.strip()
+        if path:
+            history = [path] + [previous for previous in history if previous != path]
+        config.set("photoshop", "history", json.dumps(history))
         config.set("photoshop", "exe", path)
         config.save()
 
@@ -10570,6 +10721,13 @@ class AppController(QObject):
         config.set("raw", "source_dir", path)
         config.save()
 
+    def get_main_photo_dir(self):
+        return config.get("raw", "mirror_base", fallback="")
+
+    def set_main_photo_dir(self, path):
+        config.set("raw", "mirror_base", path)
+        config.save()
+
     def get_secondary_raw_source_dir(self):
         return config.get("raw", "secondary_source_dir", fallback="")
 
@@ -10584,9 +10742,8 @@ class AppController(QObject):
         if not cleaned:
             return None
 
-        expanded = os.path.expanduser(os.path.expandvars(cleaned))
         try:
-            return Path(expanded).resolve()
+            return resolve_configured_path(cleaned).resolve()
         except (OSError, RuntimeError, ValueError):
             return None
 
@@ -10697,9 +10854,29 @@ class AppController(QObject):
 
         return ""
 
-    def open_file_dialog(self, current_path: str = ""):
+    @staticmethod
+    def _make_file_dialog(file_mode: QFileDialog.FileMode) -> QFileDialog:
+        """Create a file dialog that stays usable over FastStack's QML windows."""
         dialog = QFileDialog()
-        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setFileMode(file_mode)
+        if sys.platform.startswith("linux"):
+            # The GTK3 native dialog keeps Open/Cancel in its header bar. When it
+            # opens over another window, tiling compositors (e.g. Hyprland) can
+            # fullscreen it, GTK hides the header bar, and nothing can be
+            # selected. Qt's own dialog keeps its buttons in the window body.
+            dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+            dialog.resize(900, 600)
+            parent_window = QGuiApplication.focusWindow()
+            if parent_window is not None:
+                # Make it a transient child so compositors float it as a dialog.
+                dialog.winId()
+                handle = dialog.windowHandle()
+                if handle is not None:
+                    handle.setTransientParent(parent_window)
+        return dialog
+
+    def open_file_dialog(self, current_path: str = ""):
+        dialog = self._make_file_dialog(QFileDialog.FileMode.ExistingFile)
         # On Windows tool executables end in .exe, so lead with that filter.
         # On macOS/Linux the binaries are extensionless (e.g. inside a .app
         # bundle), so default to All Files or the dialog would appear empty.
@@ -10733,27 +10910,23 @@ class AppController(QObject):
     def set_cache_size(self, size):
         """Update cache size at runtime and persist to config."""
         size = max(0.5, min(size, 16.0))  # enforce sane bounds
-        config.set("core", "cache_size_gb", size)
-        config.save()
-
         old_max_bytes = self.image_cache.max_bytes
         new_max_bytes = int(size * 1024**3)
-        if old_max_bytes == new_max_bytes:
-            return
+        if old_max_bytes != new_max_bytes:
+            self.image_cache.max_bytes = new_max_bytes
+            log.info(
+                "Resized decoded image cache from %.2f GB to %.2f GB",
+                old_max_bytes / (1024**3),
+                size,
+            )
+            with self._eviction_lock:
+                self._eviction_events.clear()
+                self._eviction_counts.clear()
 
-        log.info(
-            "Resizing decoded image cache from %.2f GB to %.2f GB",
-            old_max_bytes / (1024**3),
-            size,
-        )
-        self.image_cache.max_bytes = new_max_bytes
-
-        # If the new size is smaller than current usage, evict until under limit
-        while self.image_cache.currsize > new_max_bytes and len(self.image_cache) > 0:
-            try:
-                self.image_cache.popitem()
-            except KeyError:
-                break
+        # Apply successfully before persisting, so a failed resize cannot leave
+        # Settings reporting a saved size that the running cache did not adopt.
+        config.set("core", "cache_size_gb", size)
+        config.save()
 
         # Allow future warnings after expanding the cache
         if new_max_bytes > old_max_bytes:
@@ -11778,8 +11951,8 @@ class AppController(QObject):
         config.save()
 
     def open_directory_dialog(self, current_path: str = ""):
-        dialog = QFileDialog()
-        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog = self._make_file_dialog(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
         start_dir = self._dialog_start_directory(current_path)
         if start_dir:
             dialog.setDirectory(start_dir)
@@ -12839,7 +13012,7 @@ class AppController(QObject):
         if self._shutting_down:
             self._rollback_ui_items(failed_indices_and_imgs, job)
             self._rebuild_path_to_index()
-            self.sync_ui_state()
+            self.sync_ui_state(image_count_changed=True)
             return
 
         # Check if we should offer permanent delete (recycle bin error)
@@ -12937,7 +13110,7 @@ class AppController(QObject):
             self._rollback_ui_items(failed_indices_and_imgs, job)
 
         self._rebuild_path_to_index()
-        self.sync_ui_state()
+        self.sync_ui_state(image_count_changed=True)
 
     @staticmethod
     def _recompute_batches_after_deletions(
@@ -13464,7 +13637,7 @@ class AppController(QObject):
                     model_rows,
                 )
 
-        self.sync_ui_state()
+        self.sync_ui_state(image_count_changed=True)
         self._restart_quality_decode_timer()
 
         # Create job record for tracking/undo
@@ -13753,7 +13926,10 @@ class AppController(QObject):
         with self._preview_lock:
             self._clear_last_rendered_preview_locked()
 
-        self.refresh_image_list()
+        # Publish only after the final selection and decode state are ready.
+        # The list rebuild preserves/clamps the old selection, providing a
+        # valid fallback if the restored target is hidden by a filter/variant.
+        self.refresh_image_list(notify=False)
         provisional_current_path = self._current_image_path()
 
         # Use _key-based lookup (consistent with _reindex_after_save) for
@@ -13778,7 +13954,7 @@ class AppController(QObject):
         self.image_cache.release_tombstones([target])
         self.prefetcher.cancel_all()
         self.prefetcher.update_prefetch(self.current_index)
-        self.sync_ui_state()
+        self.sync_ui_state(image_count_changed=True)
         self._restart_quality_decode_timer()
 
         if update_hist and self.ui_state.isHistogramVisible:
@@ -13892,7 +14068,7 @@ class AppController(QObject):
                     stack_saved = self._persist_stack_state()
                     metadata_saved = stack_saved
                     self._metadata_cache_index = (-1, -1)
-                self.sync_ui_state()
+                self.sync_ui_state(image_count_changed=True)
                 self._restart_quality_decode_timer()
 
                 count = len(removed_items)
@@ -14215,6 +14391,9 @@ class AppController(QObject):
         self._safe_shutdown_executor(self._hist_executor, "histogram", wait=False)
         self._safe_shutdown_executor(self._preview_executor, "preview", wait=False)
         self._safe_shutdown_executor(
+            self._editor_load_executor, "editor load", wait=False
+        )
+        self._safe_shutdown_executor(
             getattr(self, "_preview_refine_executor", None),
             "preview refinement",
             wait=False,
@@ -14304,6 +14483,16 @@ class AppController(QObject):
                 self._thumbnail_prefetcher.shutdown()
         except Exception as e:
             log.warning("Error shutting down thumbnail prefetcher: %s", e)
+
+        # Drain the session-write worker first: a queued position write is
+        # superseded by the save below, and a late session-record update must
+        # not recreate the record after close() removes it.
+        self._safe_shutdown_executor(
+            getattr(self, "_session_write_executor", None),
+            "session write",
+            wait=True,
+            cancel_futures=True,
+        )
 
         # Save sidecar state
         # NOTE: This runs on the main thread during shutdown (via main() -> shutdown_nonqt()).
@@ -14517,40 +14706,120 @@ class AppController(QObject):
                 info.get("thread_id", "?"),
             )
 
-        now = time.time()
-
+        key_name = str(key)
+        msg = None
         with self._eviction_lock:
-            # 1. Record eviction timestamp / prune oldest outside window
-            self._eviction_timestamps.append(now)
+            # Timestamp under the lock so worker callbacks cannot append events
+            # out of order and prevent expired entries from being pruned.
+            now = time.monotonic()
             cutoff = now - CACHE_THRASH_WINDOW_SECS
-            while self._eviction_timestamps and self._eviction_timestamps[0] <= cutoff:
-                self._eviction_timestamps.popleft()
+            while self._eviction_events and self._eviction_events[0][0] <= cutoff:
+                _, expired_key = self._eviction_events.popleft()
+                self._eviction_counts[expired_key] -= 1
+                if self._eviction_counts[expired_key] == 0:
+                    del self._eviction_counts[expired_key]
+            self._eviction_events.append((now, key_name))
+            self._eviction_counts[key_name] += 1
 
-            # 2. Check for thrashing (e.g., > threshold evictions in window)
-            if len(self._eviction_timestamps) > CACHE_THRASH_THRESHOLD:
-                # 3. Rate limit the warning
-                if now - self._last_cache_warning_time > CACHE_WARNING_COOLDOWN_SECS:
-                    self._last_cache_warning_time = now
-                    self._has_warned_cache_full = True
+            # One eviction per key is normal turnover. Evicting the SAME key
+            # again proves it was reinserted and lost to capacity pressure
+            # repeatedly. Full keys distinguish generations and quality tiers,
+            # so resize/zoom changes do not look like repeated decode churn.
+            repeat_evictions = len(self._eviction_events) - len(self._eviction_counts)
+            if (
+                repeat_evictions > CACHE_THRASH_THRESHOLD
+                and now - self._last_cache_warning_time > CACHE_WARNING_COOLDOWN_SECS
+            ):
+                self._last_cache_warning_time = now
+                self._has_warned_cache_full = True
+                repeated_keys = sum(
+                    count > 1 for count in self._eviction_counts.values()
+                )
+                used_gb = eviction_usage / (1024**3)
+                max_gb = eviction_max / (1024**3)
+                msg = (
+                    f"Cache thrashing: {repeat_evictions} repeat capacity evictions "
+                    f"across {repeated_keys} entries in {CACHE_THRASH_WINDOW_SECS}s. "
+                    f"Usage: {used_gb:.1f}GB / {max_gb:.1f}GB. "
+                    "Consider increasing Cache Size in Settings."
+                )
 
-                    # Use captured usage from eviction time for accurate reporting
-                    used_gb = eviction_usage / (1024**3)
-                    max_gb = eviction_max / (1024**3)
+        if msg is not None:
+            log.warning(msg)
+            self._cacheWarningRaised.emit(msg)
 
-                    # Include key/value summary for context
-                    val_summary = ""
-                    if hasattr(value, "width") and hasattr(value, "height"):
-                        val_summary = f" ({value.width}x{value.height})"
-                    elif hasattr(value, "__len__"):
-                        val_summary = f" (len={len(value)})"
+    @Slot()
+    def open_raw_in_rawtherapee(self):
+        """Open the current RAW in RawTherapee's interactive editor."""
+        if not self.image_files or not 0 <= self.current_index < len(self.image_files):
+            self.update_status_message("No image selected.")
+            return
 
-                    key_name = getattr(key, "name", str(key))
-                    msg = f"Cache thrashing! {len(self._eviction_timestamps)} evictions in {CACHE_THRASH_WINDOW_SECS}s. Evicted {key_name}{val_summary}. Usage: {used_gb:.1f}GB / {max_gb:.1f}GB."
+        image = self.image_files[self.current_index]
+        raw_path = image.raw_pair
+        if raw_path is None and image.path.suffix.lower() in RAW_EXTENSIONS:
+            raw_path = image.path
+        if raw_path is None or not raw_path.is_file():
+            self.update_status_message("No RAW file exists for the current image.")
+            return
 
-                    # Schedule UI work safely on main thread
-                    # QTimer.singleShot(0, ...) is thread-safe entry to main loop
-                    QTimer.singleShot(0, lambda: self.update_status_message(msg))
-                    log.warning(msg)
+        configured = config.get("rawtherapee", "exe") or ""
+        executable = os.path.expanduser(os.path.expandvars(configured.strip('" ')))
+        # Development uses the CLI binary; interactive editing needs its GUI sibling.
+        if executable:
+            path = Path(executable)
+            if path.stem.lower() == "rawtherapee-cli":
+                executable = str(path.with_name(f"rawtherapee{path.suffix}"))
+        if not executable or not Path(executable).is_file():
+            executable = shutil.which("rawtherapee") or shutil.which("rawtherapee.exe")
+        if not executable:
+            self.update_status_message("RawTherapee editor not found. Check Settings.")
+            return
+        valid, error = validate_executable_path(
+            executable, app_type="rawtherapee", allow_custom_paths=True
+        )
+        if not valid:
+            self.update_status_message(f"RawTherapee validation failed: {error}")
+            return
+        try:
+            subprocess.Popen(
+                [executable, str(raw_path.resolve())],
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            self.update_status_message(f"Opened {raw_path.name} in RawTherapee.")
+        except OSError as exc:
+            log.exception("Failed to launch RawTherapee")
+            self.update_status_message(f"Could not open RawTherapee: {exc}")
+
+    def _resolve_image_editor_path(self) -> Optional[str]:
+        """Return the configured image editor, or detect one if it is missing.
+
+        A configured path that exists is always used. Otherwise look for
+        Photoshop, then GIMP. Remember the detected path only when the
+        configured value is empty or the bundled default placeholder, so a
+        temporarily unavailable custom path remains saved.
+        """
+        configured = config.get("photoshop", "exe")
+        if configured:
+            expanded = os.path.expanduser(os.path.expandvars(configured.strip('" ')))
+            if os.path.isfile(expanded):
+                return expanded
+
+        detected = detect_image_editor_path()
+        if detected:
+            log.info(
+                "Image editor path %r not found; using detected %s",
+                configured,
+                detected,
+            )
+            if not configured or configured == DEFAULT_CONFIG["photoshop"]["exe"]:
+                config.set("photoshop", "exe", detected)
+                config.save()
+        return detected
 
     @Slot()
     def edit_in_photoshop(self):
@@ -14591,24 +14860,39 @@ class AppController(QObject):
 
         if raw_path and raw_path.exists():
             current_image_path = raw_path
-            log.info("Using RAW file for Photoshop: %s", raw_path)
+            log.info("Using RAW file for image editor: %s", raw_path)
         else:
             current_image_path = jpg_path
             log.info(
-                "Using JPG file for Photoshop (no RAW found): %s", current_image_path
+                "Using JPG file for image editor (no RAW found): %s", current_image_path
             )
 
-        photoshop_exe = config.get("photoshop", "exe")
+        photoshop_exe = self._resolve_image_editor_path()
         photoshop_args = config.get("photoshop", "args")
+        if not photoshop_exe:
+            self.update_status_message(
+                "No image editor found. Set the Image Editor path in Settings."
+            )
+            log.error("No image editor configured or detected")
+            return
+
+        # GIMP has no native camera-RAW support (it only redirects to a RAW
+        # developer plug-in when one is installed), so hand it the JPG. Keep the
+        # RAW for RAW-only entries, whose same-stem JPG does not exist yet.
+        editor_name = Path(photoshop_exe).name.lower()
+        is_gimp = editor_name.startswith("gimp") or editor_name.startswith("org.gimp.")
+        if is_gimp and current_image_path != jpg_path and jpg_path.is_file():
+            current_image_path = jpg_path
+            log.info("Using JPG file for GIMP: %s", current_image_path)
 
         # Validate executable path securely
         is_valid, error_msg = validate_executable_path(
-            photoshop_exe, app_type="photoshop", allow_custom_paths=True
+            photoshop_exe, app_type="image_editor", allow_custom_paths=True
         )
 
         if not is_valid:
-            self.update_status_message(f"Photoshop validation failed: {error_msg}")
-            log.error("Photoshop executable validation failed: %s", error_msg)
+            self.update_status_message(f"Image editor validation failed: {error_msg}")
+            log.error("Image editor executable validation failed: %s", error_msg)
             return
 
         # Validate that the file path exists and is a file
@@ -14629,8 +14913,10 @@ class AppController(QObject):
                     parsed_args = parse_external_arguments(photoshop_args)
                     command.extend(parsed_args)
                 except ValueError as e:
-                    log.error("Invalid photoshop_args format: %s", e)
-                    self.update_status_message("Invalid Photoshop arguments configured")
+                    log.error("Invalid image editor args format: %s", e)
+                    self.update_status_message(
+                        "Invalid image editor arguments configured"
+                    )
                     return
 
             # Add the file path as the last argument
@@ -14661,7 +14947,7 @@ class AppController(QObject):
             jpg_clipboard_path = str(jpg_path)
             QApplication.clipboard().setText(jpg_clipboard_path)
             log.info(
-                "Copied JPG path to clipboard after Photoshop launch: %s",
+                "Copied JPG path to clipboard after image editor launch: %s",
                 jpg_clipboard_path,
             )
 
@@ -14677,24 +14963,22 @@ class AppController(QObject):
 
             if discarded_faststack_edits:
                 status = (
-                    f"Opened {current_image_path.name} in Photoshop. "
+                    f"Opened {current_image_path.name} in image editor. "
                     "Discarded unsaved FastStack edits. Copied JPG path."
                 )
             else:
-                status = (
-                    f"Opened {current_image_path.name} in Photoshop. Copied JPG path."
-                )
+                status = f"Opened {current_image_path.name} in image editor. Copied JPG path."
             if metadata_saved:
                 self.update_status_message(status)
-            log.info("Launched Photoshop with: %s", command)
+            log.info("Launched image editor with: %s", command)
         except FileNotFoundError as e:
-            self.update_status_message(f"Photoshop executable not found: {e}")
-            log.exception("Photoshop executable not found")
+            self.update_status_message(f"Image editor executable not found: {e}")
+            log.exception("Image editor executable not found")
             # Don't mark as edited if launch failed
             return
         except (OSError, subprocess.SubprocessError) as e:
-            self.update_status_message(f"Failed to open in Photoshop: {e}")
-            log.exception("Error launching Photoshop")
+            self.update_status_message(f"Failed to open in image editor: {e}")
+            log.exception("Error launching image editor")
             # Don't mark as edited if launch failed
             return
 
@@ -15055,12 +15339,20 @@ class AppController(QObject):
             "completed": False,
             "action": None,
             "exec_returned": False,
+            "trigger": None,
         }
+        # --debug only: a timeline of what the drop target and Qt did.
+        drag_t0 = time.perf_counter()
+        drag_diag = {"reads": [], "actions": [], "releases": []}
+
+        def drag_elapsed_ms() -> float:
+            return (time.perf_counter() - drag_t0) * 1000.0
 
         def complete_drag(trigger: str) -> None:
             if drag_state["completed"]:
                 return
             drag_state["completed"] = True
+            drag_state["trigger"] = trigger
             self._mark_drag_uploaded(dragged_paths, trigger)
 
         def release_stuck_drag() -> None:
@@ -15075,17 +15367,42 @@ class AppController(QObject):
             except RuntimeError:
                 log.debug("Could not cancel the drag", exc_info=True)
 
-        def note_payload_read(mime_type: str) -> None:
+        def note_payload_read(mime_type: str, data) -> None:
             if not drag_state["payload_read"]:
                 log.info("[drag] drop target read %s", mime_type)
             drag_state["payload_read"] = True
+            if _debug_mode:
+                size = len(data) if isinstance(data, (bytes, bytearray)) else None
+                drag_diag["reads"].append(mime_type)
+                log.debug(
+                    "[drag +%.0fms] payload read: %s (%s, %s bytes)",
+                    drag_elapsed_ms(),
+                    mime_type,
+                    type(data).__name__,
+                    size,
+                )
 
         def note_action(action) -> None:
             if action != drag_state["action"]:
                 log.info("[drag] target action now %s", action)
             drag_state["action"] = action
+            if _debug_mode:
+                drag_diag["actions"].append(str(action))
+                log.debug("[drag +%.0fms] actionChanged: %s", drag_elapsed_ms(), action)
+
+        def note_target(target) -> None:
+            # Only fires for targets inside this process; external targets
+            # (Firefox) show up as None.
+            log.debug("[drag +%.0fms] targetChanged: %s", drag_elapsed_ms(), target)
 
         def note_release(event_type) -> None:
+            if _debug_mode:
+                drag_diag["releases"].append(str(event_type))
+                log.debug(
+                    "[drag +%.0fms] release-class event: %s",
+                    drag_elapsed_ms(),
+                    event_type,
+                )
             # A read alone is not a drop -- Firefox reads on hover -- and a
             # release alone may be an aborted drag over empty desktop.
             if not drag_state["payload_read"]:
@@ -15113,8 +15430,14 @@ class AppController(QObject):
             if app is not None:
                 watcher = DragReleaseWatcher(self, note_release)
                 app.installEventFilter(watcher)
+        elif _debug_mode:
+            # Instrumented for the timeline only; outcome still comes from exec().
+            drag.actionChanged.connect(note_action)
+            mime_data = DragPayloadMimeData(note_payload_read)
         else:
             mime_data = QMimeData()
+        if _debug_mode:
+            drag.targetChanged.connect(note_target)
 
         # Use Qt's standard setUrls - it handles both browser and native app compatibility
         urls = [QUrl.fromLocalFile(str(p)) for p in file_paths]
@@ -15132,12 +15455,18 @@ class AppController(QObject):
             drag.setHotSpot(QPoint(scaled.width() // 2, scaled.height() // 2))
 
         log.info(
-            "Starting drag for %d file(s): %s",
+            "Starting drag for %d file(s) on platform %r with formats %s: %s",
             len(file_paths),
+            QGuiApplication.platformName(),
+            mime_data.formats(),
             [str(p) for p in file_paths],
         )
-        # Support both Copy and Move actions for browser compatibility
         protocol_monitor = _wayland_drag_monitor if on_wayland else None
+        if _debug_mode:
+            self._log_drag_start_diagnostics(
+                file_paths, urls, pix, on_wayland, protocol_monitor
+            )
+        # Support both Copy and Move actions for browser compatibility
         if protocol_monitor is not None:
             protocol_monitor.begin()
         try:
@@ -15162,6 +15491,79 @@ class AppController(QObject):
         elif on_wayland and protocol_finished:
             log.info("[drag] Wayland data source finished after accepted drop")
             complete_drag("Wayland dnd_finished")
+
+        if _debug_mode:
+            elapsed = drag_elapsed_ms()
+            if protocol_monitor is not None:
+                for line in protocol_monitor.take_trace():
+                    log.debug("[drag wayland] %s", line)
+                protocol_outcome = protocol_monitor.outcome()
+            elif on_wayland:
+                protocol_outcome = "monitor not installed"
+            else:
+                protocol_outcome = "n/a (not Wayland)"
+            log.debug(
+                "[drag] summary: exec=%.0fms result=%s reads=%s actions=%s "
+                "releases=%s protocol=%s marked_uploaded=%s",
+                elapsed,
+                result,
+                drag_diag["reads"] or "none",
+                drag_diag["actions"] or "none",
+                drag_diag["releases"] or "none",
+                protocol_outcome,
+                drag_state["trigger"] or "no",
+            )
+            if not drag_diag["reads"] and not drag_diag["actions"]:
+                log.debug(
+                    "[drag] no target ever saw the drag: it was cancelled by the "
+                    "compositor/Qt or released without crossing a drop target"
+                )
+
+    def _log_drag_start_diagnostics(
+        self, file_paths, urls, pix, on_wayland, protocol_monitor
+    ) -> None:
+        """--debug: record the environment a drag starts in."""
+        env = {
+            key: os.environ.get(key)
+            for key in (
+                "QT_QPA_PLATFORM",
+                "XDG_SESSION_TYPE",
+                "XDG_CURRENT_DESKTOP",
+                "WAYLAND_DISPLAY",
+                "DISPLAY",
+            )
+        }
+        log.debug(
+            "[drag] platform=%s on_wayland=%s protocol_monitor=%s qt=%s env=%s",
+            QGuiApplication.platformName(),
+            on_wayland,
+            protocol_monitor is not None,
+            qVersion(),
+            env,
+        )
+        window = self.main_window
+        log.debug(
+            "[drag] cursor=%s window_visible=%s window_active=%s focus_window=%s "
+            "mouse_buttons=%s pixmap=%s",
+            QCursor.pos(),
+            window.isVisible() if window is not None else None,
+            window.isActive() if window is not None else None,
+            QGuiApplication.focusWindow(),
+            QGuiApplication.mouseButtons(),
+            "none" if pix.isNull() else f"{pix.width()}x{pix.height()}",
+        )
+        for path, url in zip(file_paths, urls):
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                size = f"stat failed: {exc}"
+            log.debug(
+                "[drag] file %s size=%s readable=%s url=%s",
+                path,
+                size,
+                os.access(path, os.R_OK),
+                url.toString(),
+            )
 
     def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
         """Mark dragged files uploaded and clear batches after an accepted drop."""
@@ -15586,29 +15988,155 @@ class AppController(QObject):
 
     @Slot(result=bool)
     def load_image_for_editing_preview(self):
-        """Load the current image for compact navigation using preview buffers only."""
-        t0 = time.perf_counter()
+        """Prepare a detached editor on a worker; install it on the Qt thread."""
+        self._editor_load_token += 1
+        token = self._editor_load_token
         index = self.current_index
-        result = self._load_image_for_editing(preview_only=True)
-        result_label = (
-            "reused"
-            if result is self._REUSED
-            else "loaded" if result is True else "failed"
+        if (
+            self._shutting_down
+            or self.ui_state.isCropping
+            or not 0 <= index < len(self.image_files)
+        ):
+            return False
+        active_path = (
+            Path(self.view_override_path)
+            if self.view_override_path
+            else self.get_active_edit_path(index)
         )
-        log.debug(
-            "[COMPACT_EDITOR_RELOAD] preview-only load index=%d "
-            "result=%s total=%dms",
+        if (
+            self.current_edit_source_mode == "raw"
+            and active_path.suffix.lower() in RAW_EXTENSIONS
+        ):
+            self._develop_raw_backend()
+            return False
+        load_path, _ = self._active_edit_load_path(active_path)
+        original_editor = self.image_editor
+        revision = original_editor._edits_rev
+        editor = ImageEditor()
+        editor.preview_master_box = original_editor.preview_master_box
+        editor.levels_soft_knee = original_editor.levels_soft_knee
+        editor.export_dither = original_editor.export_dither
+        source_exif_path = (
+            self.image_files[index].path
+            if self.current_edit_source_mode == "raw"
+            else None
+        )
+        if self._editor_load_future is not None:
+            self._editor_load_future.cancel()
+
+        def prepare():
+            started = time.perf_counter()
+            source_exif = None
+            if source_exif_path is not None and source_exif_path.suffix.lower() not in (
+                ".tif",
+                ".tiff",
+            ):
+                try:
+                    with Image.open(source_exif_path) as source_image:
+                        source_exif = source_image.info.get("exif")
+                except OSError:
+                    log.warning("Could not read source EXIF for %s", source_exif_path)
+            loaded = editor.load_image(
+                str(load_path), source_exif=source_exif, preview_only=True
+            )
+            if loaded:
+                # Prepare real pixels here too, so opening crop/edit controls
+                # after navigation does not promote buffers on the UI thread.
+                editor._ensure_float_image()
+            log.debug(
+                "[COMPACT_EDITOR_RELOAD] background load index=%d total=%dms",
+                index,
+                int((time.perf_counter() - started) * 1000),
+            )
+            return loaded
+
+        def finished(future):
+            if future.cancelled():
+                return
+            try:
+                loaded = future.result()
+            except Exception:
+                log.exception("Background editor load failed for %s", load_path)
+                loaded = False
+            try:
+                self._editorLoadReady.emit(
+                    (
+                        token,
+                        index,
+                        active_path,
+                        load_path,
+                        original_editor,
+                        revision,
+                        editor,
+                        loaded,
+                    )
+                )
+            except RuntimeError:
+                pass  # Qt objects already destroyed during shutdown.
+
+        self._editor_load_future = self._editor_load_executor.submit(prepare)
+        self._editor_load_future.add_done_callback(finished)
+        return True
+
+    @Slot(object)
+    def _on_editor_load_ready(self, result):
+        (
+            token,
             index,
-            result_label,
-            int((time.perf_counter() - t0) * 1000),
+            active_path,
+            load_path,
+            original_editor,
+            revision,
+            editor,
+            loaded,
+        ) = result
+        if (
+            self._shutting_down
+            or token != self._editor_load_token
+            or index != self.current_index
+        ):
+            return
+        if not 0 <= index < len(self.image_files):
+            return
+        current_path = (
+            Path(self.view_override_path)
+            if self.view_override_path
+            else self.get_active_edit_path(index)
         )
-        return result
+        if (
+            current_path != active_path
+            or self._active_edit_load_path(current_path)[0] != load_path
+        ):
+            return
+        if (
+            self.ui_state.isCropping
+            or self.image_editor is not original_editor
+            or original_editor._edits_rev != revision
+        ):
+            return
+        if editor.preview_master_box != original_editor.preview_master_box:
+            self.load_image_for_editing_preview()
+            return
+        if loaded:
+            try:
+                if load_path.stat().st_mtime != editor.current_mtime:
+                    self.load_image_for_editing_preview()
+                    return
+            except OSError:
+                loaded = False
+        installed = loaded and bool(
+            self._load_image_for_editing(preview_only=True, prepared_editor=editor)
+        )
+        self.editorPreviewLoaded.emit(index, installed)
 
     @Slot(result=bool)
     def load_image_for_editing(self):
+        self._editor_load_token += 1
         return self._load_image_for_editing(preview_only=False)
 
-    def _load_image_for_editing(self, *, preview_only: bool):
+    def _load_image_for_editing(
+        self, *, preview_only: bool, prepared_editor: Optional[ImageEditor] = None
+    ):
         """Load the currently viewed image into the editor.
 
         Returns True on real reload, _REUSED when the existing session
@@ -15709,12 +16237,14 @@ class AppController(QObject):
                         )
 
             # Load into editor
-            if self.image_editor.load_image(
+            if prepared_editor is not None or self.image_editor.load_image(
                 load_filepath,
                 cached_preview=None,
                 source_exif=source_exif,
                 preview_only=preview_only,
             ):
+                if prepared_editor is not None:
+                    self.image_editor = prepared_editor
                 log.debug(
                     "load_image_for_editing: loaded %s for %s (preview_only=%s)",
                     load_filepath,
@@ -17768,8 +18298,8 @@ class AppController(QObject):
         base_number_str = match.group(2)  # e.g., "210633"
         base_number = int(base_number_str)
 
-        # Get the mirror base from config
-        mirror_base_str = config.get("raw", "mirror_base")
+        # Get the mirror base (main photo directory) from config
+        mirror_base_str = self.get_main_photo_dir().strip().strip('"')
         if not mirror_base_str:
             self._show_missing_restack_raws_dialog(
                 filename=filename,
@@ -17777,31 +18307,13 @@ class AppController(QObject):
                     base_prefix, base_number
                 ),
                 search_locations=[],
-                reason="The RAW mirror base directory is not configured.",
+                reason="The Main Photo Directory is not configured.",
             )
             log.warning("RAW mirror base (raw.mirror_base) is not set in config.")
             return
 
-        mirror_base_dir = Path(mirror_base_str)
-        if not mirror_base_dir.is_dir():
-            self._show_missing_restack_raws_dialog(
-                filename=filename,
-                expected_stems=self._expected_restack_raw_stems(
-                    base_prefix, base_number
-                ),
-                search_locations=[],
-                reason=f"The RAW mirror base directory does not exist: {mirror_base_dir}",
-            )
-            log.warning(
-                "Configured RAW mirror base directory does not exist: %s",
-                mirror_base_dir,
-            )
-            return
-
-        # The date structure in the RAW directory mirrors the structure relative to the mirror_base
-        try:
-            relative_part = current_image_path.parent.relative_to(mirror_base_dir)
-        except ValueError:
+        mirror_base_dir = self._main_photo_directory()
+        if mirror_base_dir is None or not mirror_base_dir.is_dir():
             self._show_missing_restack_raws_dialog(
                 filename=filename,
                 expected_stems=self._expected_restack_raw_stems(
@@ -17809,8 +18321,32 @@ class AppController(QObject):
                 ),
                 search_locations=[],
                 reason=(
-                    "The current image folder is not inside the configured RAW "
-                    f"mirror base directory: {mirror_base_dir}"
+                    "The configured Main Photo Directory does not exist: "
+                    f"{mirror_base_str}"
+                ),
+            )
+            log.warning(
+                "Configured RAW mirror base directory does not exist: %s",
+                mirror_base_str,
+            )
+            return
+
+        # The date structure in the RAW directory mirrors the structure relative to the mirror_base
+        try:
+            relative_part = current_image_path.parent.resolve().relative_to(
+                mirror_base_dir
+            )
+        except (OSError, ValueError):
+            self._show_missing_restack_raws_dialog(
+                filename=filename,
+                expected_stems=self._expected_restack_raw_stems(
+                    base_prefix, base_number
+                ),
+                search_locations=[],
+                reason=(
+                    f"The current image folder ({current_image_path.parent}) is "
+                    "not inside the configured Main Photo Directory: "
+                    f"{mirror_base_dir}"
                 ),
             )
             log.error(
@@ -17912,12 +18448,12 @@ class AppController(QObject):
             cleaned = str(raw_path or "").strip().strip('"')
             if not cleaned:
                 continue
-            expanded = os.path.expanduser(os.path.expandvars(cleaned))
-            normalized = os.path.normcase(os.path.normpath(expanded))
+            resolved = resolve_configured_path(cleaned)
+            normalized = os.path.normcase(os.path.normpath(str(resolved)))
             if normalized in seen:
                 continue
             seen.add(normalized)
-            locations.append((label, Path(expanded)))
+            locations.append((label, resolved))
         return locations
 
     def _expected_restack_raw_stems(
@@ -18013,12 +18549,15 @@ class AppController(QObject):
         )
         details = (
             summary
-            + "\n\nConfigure these folders in Settings > General > Restack RAW Locations. "
-            "Set the primary and secondary RAW source directories to folders that "
-            "mirror the same date/subfolder structure as the configured RAW mirror base."
+            + "\n\nConfigure these folders in Settings > Restack RAW Locations. "
+            "Set the Main Photo Directory to the root folder of your stacked "
+            "images, and set the primary and secondary RAW source directories to "
+            "folders that mirror the same date/subfolder structure."
         )
-        detailed_locations = (
-            f"Stacked image: {filename}\n\n"
+        detailed_locations = f"Stacked image: {filename}\n\n"
+        if reason:
+            detailed_locations += f"Problem:\n{reason}\n\n"
+        detailed_locations += (
             "Search locations:\n"
             + "\n\n".join(location_detail_lines)
             + "\n\nExpected RAW stems:\n"
@@ -18033,9 +18572,14 @@ class AppController(QObject):
         msg_box.setText("FastStack could not find the stack input RAW files.")
         msg_box.setInformativeText(details)
         msg_box.setDetailedText(detailed_locations)
-        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        settings_button = msg_box.addButton(
+            "Open Settings", QMessageBox.ButtonRole.ActionRole
+        )
+        msg_box.addButton(QMessageBox.StandardButton.Ok)
         self._exec_modal_dialog(msg_box)
         self.update_status_message("Stack input RAW files not found.", 6000)
+        if msg_box.clickedButton() is settings_button:
+            self.ui_state.settingsDialogRequested.emit()
 
     @Slot()
     def execute_crop(self):

@@ -651,6 +651,7 @@ class UIState(QObject):
     awbRgbUpperBoundChanged = Signal()
     currentDirectoryChanged = Signal()  # Signal when working directory changes
     stackDirectorySwitchChanged = Signal()
+    settingsDialogRequested = Signal()  # Ask QML to open the Settings dialog
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelBlackThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
@@ -1424,12 +1425,16 @@ class UIState(QObject):
         self.app_controller.set_helicon_path(path)
 
     @Slot(result=str)
-    def get_photoshop_path(self):
-        return self.app_controller.get_photoshop_path()
+    def get_image_editor_path(self):
+        return self.app_controller.get_image_editor_path()
+
+    @Slot(result="QStringList")
+    def get_image_editor_history(self):
+        return self.app_controller.get_image_editor_history()
 
     @Slot(str)
-    def set_photoshop_path(self, path):
-        self.app_controller.set_photoshop_path(path)
+    def set_image_editor_path(self, path):
+        self.app_controller.set_image_editor_path(path)
 
     @Slot(result=str)
     def get_rawtherapee_path(self):
@@ -1446,6 +1451,15 @@ class UIState(QObject):
     @Slot(str)
     def set_raw_source_dir(self, path):
         self.app_controller.set_raw_source_dir(path)
+        self.stackDirectorySwitchChanged.emit()
+
+    @Slot(result=str)
+    def get_main_photo_dir(self):
+        return self.app_controller.get_main_photo_dir()
+
+    @Slot(str)
+    def set_main_photo_dir(self, path):
+        self.app_controller.set_main_photo_dir(path)
         self.stackDirectorySwitchChanged.emit()
 
     @Slot(result=str)

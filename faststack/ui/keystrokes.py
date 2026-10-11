@@ -43,6 +43,7 @@ class Keybinder:
             Qt.Key_Enter: "launch_helicon",
             Qt.Key_Return: "launch_helicon",
             Qt.Key_P: "edit_in_photoshop",
+            Qt.Key_R: "open_raw_in_rawtherapee",
             Qt.Key_C: "clear_all_stacks",
             Qt.Key_A: "quick_auto_white_balance",
             Qt.Key_O: "toggle_crop_mode",

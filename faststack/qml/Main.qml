@@ -1559,6 +1559,13 @@ ApplicationWindow {
         }
     }
 
+    Connections {
+        target: root.uiStateRef
+        function onSettingsDialogRequested() {
+            root.openSettingsDialog()
+        }
+    }
+
     // Handle View Switching and Prefetch Gating
     Connections {
         target: root.uiStateRef
@@ -2285,7 +2292,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;&nbsp;&nbsp;Esc: Cancel crop<br><br>" +
                           "<b>Other Actions:</b><br>" +
                           "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
-                          "&nbsp;&nbsp;P: Edit in Photoshop<br>" +
+                          "&nbsp;&nbsp;P: Edit in image editor (Photoshop/GIMP)<br>" +
                           "&nbsp;&nbsp;H: Toggle histogram window<br>" +
                           "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
                           "&nbsp;&nbsp;Esc: Close dialog/editor, switch to grid view, or exit fullscreen"

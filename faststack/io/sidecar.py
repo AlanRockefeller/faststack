@@ -501,6 +501,10 @@ class SidecarManager:
         self._filename_key_cache: dict[str, str] = {}
         self._key_cache_max = 8192
         self._save_lock = threading.RLock()
+        # Serialization order of saves. Assigned under _state_lock together
+        # with the payload snapshot, so a higher number always means newer
+        # state; write_prepared() drops a snapshot once a newer save started.
+        self._latest_save_seq = 0
         # Guards the structure of ``self.data`` (entry dict, stacks list, the
         # scalar position fields) so a background save cannot serialize or
         # merge-back a half-updated state while another thread is adding or
@@ -693,7 +697,22 @@ class SidecarManager:
             self._dirty = True
             try:
                 with self._state_lock:
+                    self._latest_save_seq += 1
                     ours = _sidecar_to_json(self.data)
+                if (
+                    not self._load_failed
+                    and ours == self._baseline_payload
+                    and self._disk_matches_baseline()
+                ):
+                    # Nothing changed since our last durable write and nobody
+                    # else has touched the file: skip the lock, write and two
+                    # fsyncs. Session-position timers, folder refreshes and
+                    # shutdown all call save() back to back, usually with no
+                    # new state. A foreign write after this stat cannot lose
+                    # anything of ours, since we have nothing new to contribute.
+                    self._dirty = False
+                    self._last_save_error = None
+                    return True
                 recovered_payload = None
                 with _sidecar_write_lock(self._write_lock_path):
                     if self._load_failed:
@@ -1040,6 +1059,60 @@ class SidecarManager:
             if candidate_path.exists():
                 return self.metadata_key_for_path(candidate_path)
         return key
+
+    def prepare_background_write(self) -> tuple[int, dict]:
+        """Snapshot state for write_prepared() on a worker thread.
+
+        Call on the main thread (the only thread that mutates ``self.data``).
+        Cheap: serialization only, no file I/O and no _save_lock, so it never
+        waits behind an in-flight write.
+        """
+        with self._state_lock:
+            self._latest_save_seq += 1
+            seq = self._latest_save_seq
+            payload = _sidecar_to_json(self.data)
+        self._dirty = True
+        return seq, payload
+
+    def write_prepared(self, seq: int, ours: dict) -> str:
+        """Write a prepare_background_write() snapshot. Safe off the main thread.
+
+        Handles only the common case: nobody else has written the file since
+        our baseline, so ``ours`` can be written straight out. It never merges,
+        because merging updates ``self.data``, which only the main thread may
+        touch. Returns:
+
+        - ``"written"`` / ``"unchanged"``: the file now holds ``ours``.
+        - ``"superseded"``: a newer save started; it covers this snapshot.
+        - ``"conflict"``: another process wrote the file, or the last load
+          failed; the caller must fall back to a synchronous ``save()``.
+        - ``"failed"``: I/O error (recorded in ``last_save_error``); the
+          caller should retry with ``save()``, which reports it.
+        """
+        with self._save_lock:
+            if seq != self._latest_save_seq:
+                return "superseded"
+            if self._load_failed:
+                return "conflict"
+            try:
+                if ours == self._baseline_payload and self._disk_matches_baseline():
+                    self._dirty = False
+                    self._last_save_error = None
+                    return "unchanged"
+                with _sidecar_write_lock(self._write_lock_path):
+                    if not self._disk_matches_baseline():
+                        return "conflict"
+                    atomic_write_json(self.path, ours)
+                    self._baseline_payload = ours
+                    self._baseline_stamp = self._disk_stamp()
+            except (OSError, TypeError, ValueError) as e:
+                self._last_save_error = str(e)
+                log.error(f"Failed to write sidecar file {self.path}: {e}")
+                return "failed"
+            self._dirty = False
+            self._last_save_error = None
+            log.debug(f"Saved sidecar file to {self.path} (background)")
+            return "written"
 
     def set_last_index(self, index: int):
         with self._state_lock:

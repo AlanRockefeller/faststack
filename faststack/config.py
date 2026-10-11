@@ -69,7 +69,8 @@ def _fsync_directory(path: Path) -> None:
 
 _TOOL_LABELS = {
     "helicon": "Helicon Focus",
-    "photoshop": "Photoshop",
+    "photoshop": "Image Editor",
+    "gimp": "GIMP",
     "rawtherapee": "RawTherapee",
 }
 
@@ -213,6 +214,17 @@ def _windows_tool_patterns(tool_name: str, *, wsl: bool = False) -> list[str]:
             )
         return patterns
 
+    if tool_name == "gimp":
+        patterns = []
+        for root in [*program_roots, *local_roots]:
+            patterns.extend(
+                [
+                    _join(root, "GIMP*", "bin", "gimp.exe"),
+                    _join(root, "GIMP*", "bin", "gimp-[0-9]*.exe"),
+                ]
+            )
+        return patterns
+
     if tool_name == "rawtherapee":
         patterns = []
         for root in [*program_roots, *local_roots]:
@@ -269,6 +281,19 @@ def _macos_tool_patterns(tool_name: str) -> list[str]:
                         "Contents",
                         "MacOS",
                         "Helicon*",
+                    ),
+                ]
+            )
+        elif tool_name == "gimp":
+            patterns.extend(
+                [
+                    _join(applications_dir, "GIMP*.app", "Contents", "MacOS", "gimp"),
+                    _join(
+                        applications_dir,
+                        "GIMP*.app",
+                        "Contents",
+                        "MacOS",
+                        "gimp-[0-9]*",
                     ),
                 ]
             )
@@ -331,6 +356,21 @@ def _linux_tool_patterns(tool_name: str) -> list[str]:
             "/usr/bin/heliconfocus",
         ]
 
+    if tool_name == "gimp":
+        return [
+            "/usr/bin/gimp",
+            "/usr/bin/gimp-[0-9]*",
+            "/usr/local/bin/gimp",
+            "/usr/local/bin/gimp-[0-9]*",
+            "/snap/bin/gimp",
+            "/var/lib/flatpak/exports/bin/org.gimp.GIMP",
+            _join(
+                home, ".local", "share", "flatpak", "exports", "bin", "org.gimp.GIMP"
+            ),
+            _join(home, "Applications", "GIMP*.AppImage"),
+            _join(home, ".local", "bin", "GIMP*.AppImage"),
+        ]
+
     if tool_name == "rawtherapee":
         return [
             "/opt/homebrew/bin/rawtherapee-cli",
@@ -346,6 +386,20 @@ def _linux_tool_patterns(tool_name: str) -> list[str]:
 def _tool_candidates(tool_name: str, os_name: str) -> tuple[list[str], list[str]]:
     if tool_name == "photoshop":
         path_candidates = _which_candidates(["Photoshop.exe", "photoshop"])
+    elif tool_name == "gimp":
+        path_candidates = _which_candidates(
+            [
+                "gimp",
+                "gimp-3",
+                "gimp-3.0",
+                "gimp-2.10",
+                "org.gimp.GIMP",
+                "gimp.exe",
+                "gimp-3.exe",
+                "gimp-3.0.exe",
+                "gimp-2.10.exe",
+            ]
+        )
     elif tool_name == "helicon":
         path_candidates = _which_candidates(
             ["HeliconFocus.exe", "HeliconFocus", "heliconfocus"]
@@ -448,6 +502,29 @@ def detect_photoshop_path():
     return detect_external_tool_path("photoshop")
 
 
+def detect_gimp_path():
+    """Attempts to find the GIMP executable for the current OS.
+
+    An unversioned launcher (``gimp``, usually a symlink to the installed
+    version) is preferred so the saved path survives GIMP upgrades.
+    """
+    for name in ("gimp", "gimp.exe", "org.gimp.GIMP"):
+        for candidate in [
+            shutil.which(name),
+            f"/usr/bin/{name}",
+            f"/usr/local/bin/{name}",
+        ]:
+            existing = _existing_file(candidate)
+            if existing:
+                return existing
+    return detect_external_tool_path("gimp")
+
+
+def detect_image_editor_path():
+    """Find an external image editor: Photoshop if installed, else GIMP."""
+    return detect_photoshop_path() or detect_gimp_path()
+
+
 def detect_helicon_path():
     """Attempts to find the Helicon Focus executable for the current OS."""
     return detect_external_tool_path("helicon")
@@ -458,9 +535,14 @@ def detect_rawtherapee_path():
     return detect_external_tool_path("rawtherapee")
 
 
+# Increment when detection logic changes so existing configs re-detect once.
+_EXTERNAL_TOOL_DETECTION_VERSION = 2
+
 _TOOL_DETECTORS = {
     "helicon": detect_helicon_path,
-    "photoshop": detect_photoshop_path,
+    # The [photoshop] section holds the generic image editor path; the
+    # section name is kept so existing configs keep working.
+    "photoshop": detect_image_editor_path,
     "rawtherapee": detect_rawtherapee_path,
 }
 
@@ -512,8 +594,9 @@ DEFAULT_CONFIG = {
         "last_directory": "",
         "optimize_for": "speed",  # "speed" or "quality"
         # Set once external-tool auto-detection has run, so we don't re-scan the
-        # filesystem for Helicon/Photoshop/RawTherapee on every launch.
+        # filesystem for Helicon/image editor/RawTherapee on every launch.
         "external_tools_detected": "False",
+        "external_tools_detection_version": "0",
         # --- Auto Levels Configuration ---
         #
         # Behavior:
@@ -579,7 +662,7 @@ DEFAULT_CONFIG = {
     "raw": {
         "source_dir": "C:\\Users\\alanr\\pictures\\olympus.stack.input.photos",
         "secondary_source_dir": "H:\\olympus.stack.input.photos",
-        "mirror_base": "C:\\Users\\alanr\\Pictures\\Lightroom",
+        "mirror_base": "",
     },
     "updates": {
         "check_for_updates": "true",
@@ -650,13 +733,23 @@ class AppConfig:
         # migration for configs created before detection existed. Doing this on
         # every launch would re-scan the filesystem (slow on WSL/network mounts)
         # and could silently replace a path the user configured.
-        detection_needed = newly_created or not self.getboolean(
-            "core", "external_tools_detected", fallback=False
+        # Bumping _EXTERNAL_TOOL_DETECTION_VERSION re-runs detection once for
+        # existing configs, so new detectors (e.g. the GIMP fallback) apply.
+        detection_needed = (
+            newly_created
+            or not self.getboolean("core", "external_tools_detected", fallback=False)
+            or self.getint("core", "external_tools_detection_version", fallback=0)
+            < _EXTERNAL_TOOL_DETECTION_VERSION
         )
         if detection_needed:
             if self._detect_external_tool_paths():
                 config_changed = True
             self.set("core", "external_tools_detected", "True")
+            self.set(
+                "core",
+                "external_tools_detection_version",
+                str(_EXTERNAL_TOOL_DETECTION_VERSION),
+            )
             config_changed = True
 
         if config_changed:

@@ -24,7 +24,7 @@ There are four scripts:
 
 1. `lrcat_diff.py`
 2. `inspect_lrcat_photo.py`
-3. `test_lrcat_join.py`
+3. `check_lrcat_join.py`
 4. `green2faststack.py`
 
 They were written in that order of discovery:
@@ -173,11 +173,11 @@ That gave the next script a clear join target.
 
 ---
 
-## 3. `test_lrcat_join.py`
+## 3. `check_lrcat_join.py`
 
 ### Purpose
 
-`test_lrcat_join.py` tests the likely Lightroom join chain for one known image and prints the reconstructed path fields.
+`check_lrcat_join.py` tests the likely Lightroom join chain for one known image and prints the reconstructed path fields.
 
 ### Why this script matters
 
@@ -186,7 +186,7 @@ This is the bridge between “we think these tables connect” and “yes, this 
 ### Typical usage
 
 ```bash
-/usr/bin/python3 test_lrcat_join.py catalog.lrcat 32638618
+/usr/bin/python3 check_lrcat_join.py catalog.lrcat 32638618
 ```
 
 ### What it helped discover
@@ -371,13 +371,13 @@ Example:
 
 ### 3. Inspect one known changed image
 
-Use `inspect_lrcat_photo.py` and `test_lrcat_join.py` to verify that the same join strategy works on your catalog.
+Use `inspect_lrcat_photo.py` and `check_lrcat_join.py` to verify that the same join strategy works on your catalog.
 
 Examples:
 
 ```bash
 /usr/bin/python3 inspect_lrcat_photo.py after.lrcat 32638618
-/usr/bin/python3 test_lrcat_join.py after.lrcat 32638618
+/usr/bin/python3 check_lrcat_join.py after.lrcat 32638618
 ```
 
 ### 4. Export Green-labeled paths
