@@ -14764,6 +14764,17 @@ class AppController(QObject):
             log.error("No image editor configured or detected")
             return
 
+        # GIMP has no native camera-RAW support (it only redirects to a RAW
+        # developer plug-in when one is installed), so hand it the JPG. Keep the
+        # RAW for RAW-only entries, whose same-stem JPG does not exist yet.
+        editor_name = Path(photoshop_exe).name.lower()
+        is_gimp = editor_name.startswith("gimp") or editor_name.startswith(
+            "org.gimp."
+        )
+        if is_gimp and current_image_path != jpg_path and jpg_path.is_file():
+            current_image_path = jpg_path
+            log.info("Using JPG file for GIMP: %s", current_image_path)
+
         # Validate executable path securely
         is_valid, error_msg = validate_executable_path(
             photoshop_exe, app_type="image_editor", allow_custom_paths=True

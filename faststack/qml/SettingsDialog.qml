@@ -614,6 +614,7 @@ Window {
                                 }
                                 delegate: ItemDelegate {
                                     required property string modelData
+                                    required property int index
                                     width: imageEditorField.width
                                     text: modelData
                                     highlighted: imageEditorField.highlightedIndex === index
