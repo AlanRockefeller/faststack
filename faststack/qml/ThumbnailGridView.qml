@@ -322,8 +322,10 @@ Item {
     // handlers declared inside it. The overlay has no MouseArea, so clicks and
     // drags still reach the tiles. Qt on Wayland reports plain mouse wheels as
     // device type TouchPad, so device type can't be trusted: notched wheels
-    // arrive with pixelDelta == 0, real touchpad scrolls with pixelDelta set,
-    // and only the latter fall through to default smooth Flickable scrolling.
+    // arrive with pixelDelta == 0, real touchpad scrolls with pixelDelta set.
+    // Touchpad deltas are applied here pixel-for-pixel: once this handler has
+    // taken the event, setting event.accepted = false does not reliably hand
+    // it back to the GridView, so "falling through" would drop the scroll.
     Item {
         anchors.fill: thumbnailGrid
         WheelHandler {
@@ -331,7 +333,10 @@ Item {
             property real angleAccum: 0
             onWheel: (event) => {
                 if (event.pixelDelta.y !== 0) {
-                    event.accepted = false
+                    angleAccum = 0
+                    thumbnailGrid.cancelFlick()
+                    thumbnailGrid.contentY = gridViewRoot.clampContentY(
+                        thumbnailGrid.contentY - event.pixelDelta.y)
                     return
                 }
                 angleAccum += event.angleDelta.y
