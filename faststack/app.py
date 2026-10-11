@@ -465,6 +465,8 @@ class AppController(QObject):
         object
     )  # Signal for async delete completion (result dict from worker)
     _exifBriefReady = Signal(object, str)  # (cache_key, brief) from background thread
+    # (SidecarManager, outcome) from the background session-position write
+    _sessionSidecarWriteFinished = Signal(object, str)
     _updateCheckFinished = Signal(object)  # Update check result from background thread
     _qualityDecodeFinished = Signal(object)  # Settled cover-quality decode result
     _pacedNavigationReady = Signal(object)  # Exact fast-tier target is cache-ready
@@ -1139,6 +1141,16 @@ class AppController(QObject):
         self._session_save_timer.setSingleShot(True)
         self._session_save_timer.setInterval(1000)
         self._session_save_timer.timeout.connect(self._persist_session_state)
+        # The writes themselves (sidecar position + session record, each an
+        # fsync'd atomic replace) run here so they never stall the UI. One
+        # worker keeps them FIFO; shutdown drains it before the final
+        # synchronous save and the session-record removal.
+        self._session_write_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="SessionWrite"
+        )
+        self._sessionSidecarWriteFinished.connect(
+            self._on_session_sidecar_write_finished
+        )
 
         # Debounce timer for EXIF reads — only fires after user stops scrolling
         self._exif_debounce_timer = QTimer(self)
@@ -4250,23 +4262,102 @@ class AppController(QObject):
         error must never disrupt navigation.
         """
         current_path = self._current_image_path()
+        manager = self.sidecar
+        prepared = None
         try:
-            with self.sidecar._state_lock:
-                self.sidecar.data.sort_mode = self.sort_mode
-            self.sidecar.set_last_position(self.current_index, current_path)
-            _ = self._persist_sidecar()
+            with manager._state_lock:
+                manager.data.sort_mode = self.sort_mode
+            manager.set_last_position(self.current_index, current_path)
+            # Snapshot only; the write happens on the session-write worker.
+            prepared = manager.prepare_background_write()
         except Exception as e:
             log.warning("Error persisting sidecar position: %s", e)
-        try:
-            self._session_registry.update(
+        self._queue_session_write(
+            manager,
+            prepared,
+            (
                 self.image_dir,
                 self.current_index,
                 self._is_grid_view_active,
                 current_path,
-            )
-        except Exception as e:
-            log.warning("Error updating session record: %s", e)
+            ),
+        )
         self._remember_last_directory()
+
+    def _queue_session_write(self, manager, prepared, record_args) -> None:
+        """Run a sidecar snapshot write and/or session-record update off-thread.
+
+        ``prepared`` is a ``SidecarManager.prepare_background_write()`` result
+        (or None to skip the sidecar). ``record_args`` are the
+        ``SessionRegistry.update`` arguments (or None). If the worker is
+        unavailable, the work runs inline, except during shutdown, which does
+        its own final save and removes the session record.
+        """
+        registry = self._session_registry
+        signal = self._sessionSidecarWriteFinished
+
+        def _worker():
+            outcome = None
+            if manager is not None and prepared is not None:
+                outcome = manager.write_prepared(*prepared)
+            if record_args is not None:
+                try:
+                    registry.update(*record_args)
+                except Exception as e:
+                    log.warning("Error updating session record: %s", e)
+            return outcome
+
+        def _done(fut):
+            if fut.cancelled():
+                return  # superseded by the shutdown save
+            try:
+                outcome = fut.result()
+            except Exception:
+                log.exception("Background session write failed")
+                outcome = "failed"
+            if outcome is None:
+                return
+            try:
+                signal.emit(manager, outcome)
+            except RuntimeError:
+                pass  # controller already destroyed during shutdown
+
+        executor = getattr(self, "_session_write_executor", None)
+        try:
+            if executor is None:
+                raise RuntimeError("session write executor unavailable")
+            future = executor.submit(_worker)
+        except RuntimeError:
+            if self._shutting_down:
+                # The shutdown path saves the sidecar itself, and a session
+                # record written now could outlive SessionRegistry.close().
+                return
+            # Executor unexpectedly unavailable: write inline, as before.
+            outcome = _worker()
+            if outcome is not None and outcome not in (
+                "written",
+                "unchanged",
+                "superseded",
+            ):
+                self._on_session_sidecar_write_finished(manager, outcome)
+            return
+        future.add_done_callback(_done)
+
+    @Slot(object, str)
+    def _on_session_sidecar_write_finished(self, manager, outcome: str) -> None:
+        """Main thread: fall back to a full merge-save when the fast write could not."""
+        if outcome in ("written", "unchanged", "superseded"):
+            return
+        if self._shutting_down:
+            return  # the shutdown path does its own final synchronous save
+        log.info(
+            "Background sidecar position write returned %s; saving synchronously",
+            outcome,
+        )
+        try:
+            _ = self._persist_sidecar(manager)
+        except Exception as e:
+            log.warning("Error persisting sidecar position: %s", e)
 
     def _remember_last_directory(self):
         """Persist the open folder so a no-argument launch resumes here.
@@ -14393,6 +14484,16 @@ class AppController(QObject):
         except Exception as e:
             log.warning("Error shutting down thumbnail prefetcher: %s", e)
 
+        # Drain the session-write worker first: a queued position write is
+        # superseded by the save below, and a late session-record update must
+        # not recreate the record after close() removes it.
+        self._safe_shutdown_executor(
+            getattr(self, "_session_write_executor", None),
+            "session write",
+            wait=True,
+            cancel_futures=True,
+        )
+
         # Save sidecar state
         # NOTE: This runs on the main thread during shutdown (via main() -> shutdown_nonqt()).
         # It needs to be robust against file I/O errors to avoid hanging the exit.
@@ -14776,9 +14877,7 @@ class AppController(QObject):
         # developer plug-in when one is installed), so hand it the JPG. Keep the
         # RAW for RAW-only entries, whose same-stem JPG does not exist yet.
         editor_name = Path(photoshop_exe).name.lower()
-        is_gimp = editor_name.startswith("gimp") or editor_name.startswith(
-            "org.gimp."
-        )
+        is_gimp = editor_name.startswith("gimp") or editor_name.startswith("org.gimp.")
         if is_gimp and current_image_path != jpg_path and jpg_path.is_file():
             current_image_path = jpg_path
             log.info("Using JPG file for GIMP: %s", current_image_path)

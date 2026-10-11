@@ -114,9 +114,7 @@ def _srgb_u8_exact_to_linear(x: np.ndarray) -> np.ndarray:
         # here, so convertScaleAbs's abs() is a no-op.
         codes_u8 = cv2.convertScaleAbs(x, alpha=255.0)
         return cv2.LUT(codes_u8, lut)
-    codes_u8 = np.clip(x * np.float32(255.0) + np.float32(0.5), 0, 255).astype(
-        np.uint8
-    )
+    codes_u8 = np.clip(x * np.float32(255.0) + np.float32(0.5), 0, 255).astype(np.uint8)
     return lut[codes_u8]
 
 
