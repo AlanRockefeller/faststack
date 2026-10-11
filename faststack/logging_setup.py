@@ -198,4 +198,7 @@ def setup_logging(debug: bool = False, *, diagnostic: bool = False) -> Path | No
         logging.getLogger("faststack.imaging.cache").setLevel(logging.ERROR)
         logging.getLogger("faststack.imaging.prefetch").setLevel(logging.ERROR)
     logging.getLogger("PIL").setLevel(logging.INFO if debug else logging.WARNING)
+    # watchdog logs every raw inotify event at DEBUG ("in-event ..."), which
+    # buried --debug output; FastStack's own watcher logs what it acts on.
+    logging.getLogger("watchdog").setLevel(logging.INFO if debug else logging.WARNING)
     return log_file
