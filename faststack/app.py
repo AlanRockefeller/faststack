@@ -64,7 +64,7 @@ from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels, enough for most photos
 # ⬇️ these are the ones that went missing
-from faststack.config import config, detect_image_editor_path
+from faststack.config import DEFAULT_CONFIG, config, detect_image_editor_path
 from faststack.logging_setup import setup_logging
 from faststack.wayland_drag import install_wayland_drag_monitor
 from faststack.models import (
@@ -14799,7 +14799,9 @@ class AppController(QObject):
         """Return the configured image editor, or detect one if it is missing.
 
         A configured path that exists is always used. Otherwise look for
-        Photoshop, then GIMP, and remember whatever is found.
+        Photoshop, then GIMP. Remember the detected path only when the
+        configured value is empty or the bundled default placeholder, so a
+        temporarily unavailable custom path remains saved.
         """
         configured = config.get("photoshop", "exe")
         if configured:
@@ -14814,8 +14816,9 @@ class AppController(QObject):
                 configured,
                 detected,
             )
-            config.set("photoshop", "exe", detected)
-            config.save()
+            if not configured or configured == DEFAULT_CONFIG["photoshop"]["exe"]:
+                config.set("photoshop", "exe", detected)
+                config.save()
         return detected
 
     @Slot()
