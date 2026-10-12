@@ -1,5 +1,6 @@
 """Regression coverage for FS-P11-001's Qt completion handoff."""
 
+import os
 import subprocess
 import threading
 import time
@@ -99,6 +100,20 @@ def _config_value(executable):
     return get
 
 
+def _rawtherapee_exists(executable):
+    """Pretend only the configured RawTherapee executable exists.
+
+    Patching os.path.exists wholesale also fakes Path.exists() on Python
+    3.14+, which hides missing-output checks in the worker.
+    """
+    real_exists = os.path.exists
+    target = str(executable)
+    return patch(
+        "faststack.app.os.path.exists",
+        side_effect=lambda path: path == target or real_exists(path),
+    )
+
+
 def _write_worker_output(cmd, contents=b"tiff"):
     Path(cmd[cmd.index("-o") + 1]).write_bytes(contents)
 
@@ -123,7 +138,7 @@ def test_success_is_queued_to_controller_thread_and_loads_current(qt_app, tmp_pa
 
     with (
         patch.object(config, "get", side_effect=_config_value(tmp_path / "rt")),
-        patch("faststack.app.os.path.exists", return_value=True),
+        _rawtherapee_exists(tmp_path / "rt"),
         patch("faststack.app.subprocess.Popen", side_effect=_popen_from(run)),
     ):
         assert controller._develop_raw_backend() is True
@@ -165,7 +180,7 @@ def test_failure_paths_clear_state_and_emit_once(qt_app, tmp_path, outcome, mess
 
     with (
         patch.object(config, "get", side_effect=_config_value(tmp_path / "rt")),
-        patch("faststack.app.os.path.exists", return_value=True),
+        _rawtherapee_exists(tmp_path / "rt"),
         patch("faststack.app.subprocess.Popen", side_effect=_popen_from(run)),
     ):
         assert controller._develop_raw_backend() is True
@@ -190,7 +205,7 @@ def test_replacement_failure_cleans_temp_and_clears_state(qt_app, tmp_path):
 
     with (
         patch.object(config, "get", side_effect=_config_value(tmp_path / "rt")),
-        patch("faststack.app.os.path.exists", return_value=True),
+        _rawtherapee_exists(tmp_path / "rt"),
         patch("faststack.app.subprocess.Popen", side_effect=_popen_from(run)),
         patch("faststack.app._safe_replace", side_effect=OSError("locked")),
     ):
@@ -216,7 +231,7 @@ def test_navigation_makes_success_stale(qt_app, tmp_path):
 
     with (
         patch.object(config, "get", side_effect=_config_value(tmp_path / "rt")),
-        patch("faststack.app.os.path.exists", return_value=True),
+        _rawtherapee_exists(tmp_path / "rt"),
         patch("faststack.app.subprocess.Popen", side_effect=_popen_from(run)),
     ):
         controller._develop_raw_backend()
@@ -247,7 +262,7 @@ def test_duplicate_guard_releases_after_real_worker_completion(qt_app, tmp_path)
 
     with (
         patch.object(config, "get", side_effect=_config_value(tmp_path / "rt")),
-        patch("faststack.app.os.path.exists", return_value=True),
+        _rawtherapee_exists(tmp_path / "rt"),
         patch("faststack.app.subprocess.Popen", side_effect=_popen_from(run)),
     ):
         assert controller._develop_raw_backend() is True
@@ -275,7 +290,7 @@ def test_late_completion_during_shutdown_is_harmless(qt_app, tmp_path):
 
     with (
         patch.object(config, "get", side_effect=_config_value(tmp_path / "rt")),
-        patch("faststack.app.os.path.exists", return_value=True),
+        _rawtherapee_exists(tmp_path / "rt"),
         patch("faststack.app.subprocess.Popen", side_effect=_popen_from(run)),
     ):
         controller._develop_raw_backend()
@@ -298,7 +313,7 @@ def test_failure_before_process_creation_cleans_state(qt_app, tmp_path):
     controller = _controller(image)
     with (
         patch.object(config, "get", side_effect=_config_value(tmp_path / "rt")),
-        patch("faststack.app.os.path.exists", return_value=True),
+        _rawtherapee_exists(tmp_path / "rt"),
         patch("faststack.app.subprocess.Popen", side_effect=OSError("no process")),
     ):
         assert controller._develop_raw_backend() is True
@@ -336,7 +351,7 @@ def test_shutdown_cancels_owned_process_and_removes_partial_output(qt_app, tmp_p
 
     with (
         patch.object(config, "get", side_effect=_config_value(tmp_path / "rt")),
-        patch("faststack.app.os.path.exists", return_value=True),
+        _rawtherapee_exists(tmp_path / "rt"),
         patch("faststack.app.subprocess.Popen", side_effect=popen),
     ):
         controller._develop_raw_backend()
