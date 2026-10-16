@@ -931,6 +931,55 @@ Item {
         property real cropStartAngle: 0
         property real cropStartRotation: 0
         property real cropStartAspect: -1
+
+        // Handle a real two-finger pinch independently from wheel scrolling.
+        // Keep the image point under the gesture centroid fixed so pinching
+        // feels anchored to the fingers instead of jumping around the view.
+        PinchHandler {
+            id: loupePinchHandler
+            target: null
+            enabled: !mainMouseArea.isCropDragging && !mainMouseArea.isDarkenPainting
+
+            property real startZoomScale: 1
+            property real startImagePointX: 0
+            property real startImagePointY: 0
+
+            onActiveChanged: {
+                if (active) {
+                    startZoomScale = imageRotator.zoomScale
+
+                    var p = mainMouseArea.mapToItem(
+                        imageViewport, centroid.position.x, centroid.position.y
+                    )
+                    var centerX = imageViewport.width / 2
+                    var centerY = imageViewport.height / 2
+                    startImagePointX = (p.x - centerX - panTransform.x) / startZoomScale
+                    startImagePointY = (p.y - centerY - panTransform.y) / startZoomScale
+                    mainImage.isZooming = true
+                } else {
+                    zoomSmoothTimer.restart()
+                }
+            }
+
+            onUpdated: {
+                if (!active) return
+
+                // activeScale grows when the fingers move apart and shrinks
+                // when they move together.
+                var newScale = Math.max(
+                    0.05, Math.min(20.0, startZoomScale * activeScale)
+                )
+                var p = mainMouseArea.mapToItem(
+                    imageViewport, centroid.position.x, centroid.position.y
+                )
+                var centerX = imageViewport.width / 2
+                var centerY = imageViewport.height / 2
+
+                imageRotator.zoomScale = newScale
+                panTransform.x = p.x - centerX - startImagePointX * newScale
+                panTransform.y = p.y - centerY - startImagePointY * newScale
+            }
+        }
         
         // Reset rotation when image changes or updates (e.g. after crop save) to avoid persistence
         Connections {
