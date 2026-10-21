@@ -21,7 +21,7 @@ Window {
     }
     
     // Properties matching the original dialog
-    property string heliconPath: ""
+    property string focusStackerPath: ""
     property double cacheSize: 1.5
     property double autoLevelClippingThreshold: 0.1
     property double autoLevelBlackThreshold: 0.0
@@ -150,8 +150,12 @@ Window {
         return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.check_executable_path(path) : false
     }
 
+    function focusStackerPathIsValid(path) {
+        return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.check_focus_stacker_path(path) : false
+    }
+
     function refreshTextFields() {
-        settingsDialog.setLoaderProperty(heliconField, "text", settingsDialog.heliconPath)
+        settingsDialog.setLoaderProperty(focusStackerField, "text", settingsDialog.focusStackerPath)
         imageEditorField.editText = settingsDialog.imageEditorPath
         settingsDialog.setLoaderProperty(rawtherapeeField, "text", settingsDialog.rawtherapeePath)
         settingsDialog.setLoaderProperty(mainPhotoDirField, "text", settingsDialog.mainPhotoDir)
@@ -170,7 +174,7 @@ Window {
     function open() {
         // Reload all properties from uiState to ensure Cancel discards edits
         if (settingsDialog.uiStateRef) {
-            settingsDialog.heliconPath = settingsDialog.uiStateRef.get_helicon_path()
+            settingsDialog.focusStackerPath = settingsDialog.uiStateRef.get_focus_stacker_path()
             settingsDialog.imageEditorPath = settingsDialog.uiStateRef.get_image_editor_path()
             settingsDialog.imageEditorHistory = settingsDialog.uiStateRef.get_image_editor_history()
             settingsDialog.rawtherapeePath = settingsDialog.uiStateRef.get_rawtherapee_path()
@@ -243,7 +247,7 @@ Window {
             return
         }
 
-        state.set_helicon_path(settingsDialog.heliconPath)
+        state.set_focus_stacker_path(settingsDialog.focusStackerPath)
         state.set_image_editor_path(settingsDialog.imageEditorPath)
         state.set_rawtherapee_path(settingsDialog.rawtherapeePath)
         state.set_main_photo_dir(settingsDialog.mainPhotoDir)
@@ -551,40 +555,45 @@ Window {
                             onLoaded: item.text = "General Settings"
                         }
 
-                        // Helicon Path
-                        Label { text: "Helicon Focus Path"; color: "#aaaaaa"; font.pixelSize: 12 }
+                        // Focus stacker path
+                        Label { text: "Focus Stacker Path"; color: "#aaaaaa"; font.pixelSize: 12 }
                         RowLayout {
                             Layout.fillWidth: true
                             Loader {
-                                id: heliconField
+                                id: focusStackerField
                                 sourceComponent: styledTextField
                                 Layout.fillWidth: true
                                 onLoaded: {
-                                    settingsDialog.setLoaderProperty(heliconField, "text", settingsDialog.heliconPath)
-                                    settingsDialog.connectLoaderSignal(heliconField, "textEdited", function() {
-                                        settingsDialog.heliconPath = settingsDialog.loaderProperty(heliconField, "text", settingsDialog.heliconPath)
+                                    settingsDialog.setLoaderProperty(focusStackerField, "text", settingsDialog.focusStackerPath)
+                                    settingsDialog.connectLoaderSignal(focusStackerField, "textEdited", function() {
+                                        settingsDialog.focusStackerPath = settingsDialog.loaderProperty(focusStackerField, "text", settingsDialog.focusStackerPath)
                                     })
                                 }
                             }
                             Button {
-                                id: heliconBrowseButton
+                                id: focusStackerBrowseButton
                                 text: "Browse"
                                 flat: true
                                 onClicked: {
-                                    var path = settingsDialog.openFileDialog(settingsDialog.loaderProperty(heliconField, "text", settingsDialog.heliconPath))
+                                    var path = settingsDialog.openFileDialog(settingsDialog.loaderProperty(focusStackerField, "text", settingsDialog.focusStackerPath))
                                     if (path) {
-                                        settingsDialog.heliconPath = path
-                                        settingsDialog.setLoaderProperty(heliconField, "text", path)
+                                        settingsDialog.focusStackerPath = path
+                                        settingsDialog.setLoaderProperty(focusStackerField, "text", path)
                                     }
                                 }
-                                background: Rectangle { color: heliconBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
-                                contentItem: Text { text: heliconBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                background: Rectangle { color: focusStackerBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: focusStackerBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                             }
                             Label {
                                 text: "✔"
                                 color: "#4ade80"
-                                visible: settingsDialog.pathIsExecutable(settingsDialog.heliconPath)
+                                visible: settingsDialog.focusStackerPathIsValid(settingsDialog.focusStackerPath)
                             }
+                        }
+                        Label {
+                            text: "OpenFocus: select main.py or enter its project folder. Helicon: select its executable."
+                            color: "#777777"
+                            font.pixelSize: 11
                         }
 
                         // Image Editor Path

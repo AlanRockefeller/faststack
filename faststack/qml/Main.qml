@@ -2291,7 +2291,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;&nbsp;&nbsp;Enter: Apply crop to live session<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;Esc: Cancel crop<br><br>" +
                           "<b>Other Actions:</b><br>" +
-                          "&nbsp;&nbsp;Enter: Launch Helicon Focus<br>" +
+                          "&nbsp;&nbsp;Enter: Launch Focus Stacker<br>" +
                           "&nbsp;&nbsp;P: Edit in image editor (Photoshop/GIMP)<br>" +
                           "&nbsp;&nbsp;H: Toggle histogram window<br>" +
                           "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +

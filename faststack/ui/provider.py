@@ -1417,6 +1417,14 @@ class UIState(QObject):
         self.app_controller.switch_stack_input_directory()
 
     @Slot(result=str)
+    def get_focus_stacker_path(self):
+        return self.app_controller.get_focus_stacker_path()
+
+    @Slot(str)
+    def set_focus_stacker_path(self, path):
+        self.app_controller.set_focus_stacker_path(path)
+
+    @Slot(result=str)
     def get_helicon_path(self):
         return self.app_controller.get_helicon_path()
 
@@ -1478,6 +1486,10 @@ class UIState(QObject):
     @Slot(str, result=bool)
     def check_executable_path(self, path):
         return self.app_controller.check_executable_path(path)
+
+    @Slot(str, result=bool)
+    def check_focus_stacker_path(self, path):
+        return self.app_controller.check_focus_stacker_path(path)
 
     @Slot(result=float)
     def get_cache_size(self):
