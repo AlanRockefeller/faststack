@@ -83,7 +83,7 @@ def validate_focus_stacker_path(path: str) -> Tuple[bool, str]:
         return False, "Focus stacker path is not configured."
 
     configured = os.path.expanduser(os.path.expandvars(path.strip().strip('"')))
-    target = Path(configured)
+    target = Path(configured).absolute()
     if _is_openfocus_target(target):
         if target.is_dir() or target.name.casefold() == "main.py":
             if _openfocus_source_command(target, []):
@@ -109,7 +109,9 @@ def launch_focus_stacker(
         return False, None
 
     configured = os.path.expanduser(os.path.expandvars(configured.strip().strip('"')))
-    target = Path(configured)
+    # Popen resolves argv[0] relative to ``cwd``. Keep this absolute before
+    # changing the child directory, while leaving interpreter symlinks intact.
+    target = Path(configured).absolute()
 
     if not input_files:
         log.warning("No files selected to open in the focus stacker.")
@@ -147,7 +149,7 @@ def launch_focus_stacker(
             if not is_valid:
                 log.error("OpenFocus executable validation failed: %s", error_msg)
                 return False, None
-            args = [configured, *(str(path) for path in validated_files)]
+            args = [str(target), *(str(path) for path in validated_files)]
             working_directory = target.parent
 
         log.info("Launching OpenFocus with %d files: %s", len(validated_files), args)

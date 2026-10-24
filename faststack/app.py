@@ -470,6 +470,7 @@ class AppController(QObject):
         object
     )  # Signal for async delete completion (result dict from worker)
     _exifBriefReady = Signal(object, str)  # (cache_key, brief) from background thread
+    _restackOrderReady = Signal(object)  # Restack EXIF ordering result
     # (SidecarManager, outcome) from the background session-position write
     _sessionSidecarWriteFinished = Signal(object, str)
     _updateCheckFinished = Signal(object)  # Update check result from background thread
@@ -556,6 +557,8 @@ class AppController(QObject):
         self._exif_executor = create_daemon_threadpool_executor(
             max_workers=2, thread_name_prefix="EXIF"
         )
+        self._restack_order_token = 0
+        self._restackOrderReady.connect(self._on_restack_order_ready)
         self._editor_prewarm_executor = create_daemon_threadpool_executor(
             max_workers=1, thread_name_prefix="EditPrewarm"
         )
@@ -18303,6 +18306,8 @@ class AppController(QObject):
         """
         Finds source RAW files for the current stacked JPG and launches the focus stacker.
         """
+        self._restack_order_token += 1
+        token = self._restack_order_token
         if not self.image_files or self.current_index >= len(self.image_files):
             self.update_status_message("No image selected.")
             return
@@ -18437,7 +18442,68 @@ class AppController(QObject):
         # This happens before the generic launcher so every configured focus
         # stacker receives the same sequence.
         found_raw_files.sort(key=lambda path: path.name.casefold())
-        found_raw_files, focus_order = order_focus_stack_inputs(found_raw_files)
+        self.update_status_message(
+            f"Reading focus metadata for {len(found_raw_files)} RAWs..."
+        )
+
+        def _on_order_done(future: concurrent.futures.Future) -> None:
+            try:
+                ordered_files, focus_order = future.result()
+                error = None
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                ordered_files = found_raw_files
+                focus_order = None
+                error = exc
+            self._restackOrderReady.emit(
+                {
+                    "token": token,
+                    "source_image_path": current_image_path,
+                    "files": ordered_files,
+                    "focus_order": focus_order,
+                    "error": error,
+                    "found_label": found_label,
+                    "found_search_dir": found_search_dir,
+                }
+            )
+
+        try:
+            future = self._exif_executor.submit(
+                order_focus_stack_inputs, list(found_raw_files)
+            )
+        except RuntimeError:
+            if not self._shutting_down:
+                self.update_status_message("Could not read RAW focus metadata.")
+            return
+        future.add_done_callback(_on_order_done)
+
+    @Slot(object)
+    def _on_restack_order_ready(self, payload) -> None:
+        """Launch a restack after background focus ordering completes."""
+        if self._shutting_down or not payload:
+            return
+        if payload.get("token") != self._restack_order_token:
+            return
+
+        source_image_path = payload["source_image_path"]
+        if (
+            not self.image_files
+            or self.current_index >= len(self.image_files)
+            or self._key(self.image_files[self.current_index].path)
+            != self._key(source_image_path)
+        ):
+            log.info(
+                "Discarding Restack focus order because the selected image changed."
+            )
+            return
+
+        found_raw_files = payload["files"]
+        focus_order = payload.get("focus_order")
+        error = payload.get("error")
+        if error is not None:
+            log.error(
+                "Restack focus metadata ordering failed; retaining filename order: %s",
+                error,
+            )
         if focus_order:
             log.info(
                 "Restack inputs ordered by %s: %s",
@@ -18456,9 +18522,9 @@ class AppController(QObject):
         )
         log.info(
             "Launching focus stacker for %s with RAWs from %s (%s): %s",
-            filename,
-            found_label,
-            found_search_dir,
+            source_image_path.name,
+            payload["found_label"],
+            payload["found_search_dir"],
             [str(p) for p in found_raw_files],
         )
         success = self._launch_helicon_with_files(found_raw_files)
@@ -18466,7 +18532,7 @@ class AppController(QObject):
         if success:
             # Mark as restacked on success
             today = datetime.now().strftime("%Y-%m-%d")
-            meta = self.sidecar.get_metadata(self.image_files[self.current_index].path)
+            meta = self.sidecar.get_metadata(source_image_path)
             meta.restacked = True
             meta.restacked_date = today
             metadata_saved = self._persist_sidecar()
