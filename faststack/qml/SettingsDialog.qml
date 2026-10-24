@@ -47,6 +47,7 @@ Window {
     property string mainPhotoDir: ""
     property string rawSourceDir: ""
     property string secondaryRawSourceDir: ""
+    property string additionalRawSourceDirs: ""
     property string optimizeFor: "speed"
     property bool updateCheckEnabled: true
 
@@ -160,6 +161,7 @@ Window {
         settingsDialog.setLoaderProperty(rawtherapeeField, "text", settingsDialog.rawtherapeePath)
         settingsDialog.setLoaderProperty(mainPhotoDirField, "text", settingsDialog.mainPhotoDir)
         settingsDialog.setLoaderProperty(rawSourceDirField, "text", settingsDialog.rawSourceDir)
+        settingsDialog.setLoaderProperty(additionalRawSourceDirsField, "text", settingsDialog.additionalRawSourceDirs)
         settingsDialog.setLoaderProperty(secondaryRawSourceDirField, "text", settingsDialog.secondaryRawSourceDir)
         settingsDialog.setLoaderProperty(defaultDirField, "text", settingsDialog.defaultDirectory)
         settingsDialog.setLoaderProperty(cacheSizeField, "text", settingsDialog.cacheSize.toFixed(1))
@@ -181,6 +183,7 @@ Window {
             settingsDialog.mainPhotoDir = settingsDialog.uiStateRef.get_main_photo_dir()
             settingsDialog.rawSourceDir = settingsDialog.uiStateRef.get_raw_source_dir()
             settingsDialog.secondaryRawSourceDir = settingsDialog.uiStateRef.get_secondary_raw_source_dir()
+            settingsDialog.additionalRawSourceDirs = settingsDialog.uiStateRef.get_additional_raw_source_dirs()
             settingsDialog.cacheSize = settingsDialog.uiStateRef.get_cache_size()
             settingsDialog.prefetchRadius = settingsDialog.uiStateRef.get_prefetch_radius()
             settingsDialog.navigationRateFps = settingsDialog.uiStateRef.get_navigation_rate_fps()
@@ -253,6 +256,7 @@ Window {
         state.set_main_photo_dir(settingsDialog.mainPhotoDir)
         state.set_raw_source_dir(settingsDialog.rawSourceDir)
         state.set_secondary_raw_source_dir(settingsDialog.secondaryRawSourceDir)
+        state.set_additional_raw_source_dirs(settingsDialog.additionalRawSourceDirs)
         state.set_cache_size(settingsDialog.cacheSize)
         state.set_prefetch_radius(settingsDialog.prefetchRadius)
         state.set_navigation_rate_fps(settingsDialog.navigationRateFps)
@@ -811,6 +815,38 @@ Window {
                                 }
                                 background: Rectangle { color: secondaryRawSourceDirBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
                                 contentItem: Text { text: secondaryRawSourceDirBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            }
+                        }
+
+                        Label { text: "Additional RAW Source Directories (; separated)"; color: "#aaaaaa"; font.pixelSize: 12; Layout.topMargin: 5 }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Loader {
+                                id: additionalRawSourceDirsField
+                                sourceComponent: styledTextField
+                                Layout.fillWidth: true
+                                onLoaded: {
+                                    settingsDialog.setLoaderProperty(additionalRawSourceDirsField, "text", settingsDialog.additionalRawSourceDirs)
+                                    settingsDialog.connectLoaderSignal(additionalRawSourceDirsField, "textEdited", function() {
+                                        settingsDialog.additionalRawSourceDirs = settingsDialog.loaderProperty(additionalRawSourceDirsField, "text", settingsDialog.additionalRawSourceDirs)
+                                    })
+                                }
+                            }
+                            Button {
+                                id: additionalRawSourceDirsBrowseButton
+                                text: "Add"
+                                flat: true
+                                onClicked: {
+                                    var path = settingsDialog.openDirectoryDialog("")
+                                    if (path) {
+                                        var current = settingsDialog.loaderProperty(additionalRawSourceDirsField, "text", settingsDialog.additionalRawSourceDirs).trim()
+                                        var updated = current ? current + "; " + path : path
+                                        settingsDialog.additionalRawSourceDirs = updated
+                                        settingsDialog.setLoaderProperty(additionalRawSourceDirsField, "text", updated)
+                                    }
+                                }
+                                background: Rectangle { color: additionalRawSourceDirsBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: additionalRawSourceDirsBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                             }
                         }
 

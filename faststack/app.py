@@ -10752,6 +10752,13 @@ class AppController(QObject):
         config.set("raw", "secondary_source_dir", path)
         config.save()
 
+    def get_additional_raw_source_dirs(self):
+        return config.get("raw", "additional_source_dirs", fallback="")
+
+    def set_additional_raw_source_dirs(self, paths):
+        config.set("raw", "additional_source_dirs", paths)
+        config.save()
+
     @staticmethod
     def _resolve_configured_directory(path_value: str | Path | None) -> Path | None:
         """Expand and resolve a configured directory path without requiring it to exist."""
@@ -18475,9 +18482,18 @@ class AppController(QObject):
     def _configured_restack_raw_locations(self) -> list[tuple[str, Path]]:
         raw_source_dir = config.get("raw", "source_dir", fallback="")
         secondary_source_dir = config.get("raw", "secondary_source_dir", fallback="")
-        configured = (
+        additional_source_dirs = config.get(
+            "raw", "additional_source_dirs", fallback=""
+        )
+        configured = [
             ("Primary", raw_source_dir),
             ("Secondary", secondary_source_dir),
+        ]
+        configured.extend(
+            (f"Additional {index}", raw_path)
+            for index, raw_path in enumerate(
+                re.split(r"[;\r\n]+", additional_source_dirs), start=1
+            )
         )
         locations: list[tuple[str, Path]] = []
         seen: set[str] = set()
@@ -18596,8 +18612,8 @@ class AppController(QObject):
             summary
             + "\n\nConfigure these folders in Settings > Restack RAW Locations. "
             "Set the Main Photo Directory to the root folder of your stacked "
-            "images, and set the primary and secondary RAW source directories to "
-            "folders that mirror the same date/subfolder structure."
+            "images, and set the primary, secondary, or additional RAW source "
+            "directories to folders that mirror the same date/subfolder structure."
         )
         detailed_locations = f"Stacked image: {filename}\n\n"
         if reason:

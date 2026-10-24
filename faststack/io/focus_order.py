@@ -103,9 +103,7 @@ def _read_om_system_orf_focus(path: Path) -> Optional[FocusPosition]:
     # an offset relative to the MakerNote start.
     root_ifd = header + 4
     focus_ifd = None
-    for tag, _field_type, item_count, value in _ifd_entries(
-        data, root_ifd, byte_order
-    ):
+    for tag, _field_type, item_count, value in _ifd_entries(data, root_ifd, byte_order):
         if tag == 0x2050 and item_count == 1:
             focus_ifd = maker_base + _inline_uint(value, byte_order)
             break
@@ -113,9 +111,7 @@ def _read_om_system_orf_focus(path: Path) -> Optional[FocusPosition]:
         return None
 
     values: dict[int, float] = {}
-    for tag, field_type, item_count, value in _ifd_entries(
-        data, focus_ifd, byte_order
-    ):
+    for tag, field_type, item_count, value in _ifd_entries(data, focus_ifd, byte_order):
         if tag in (0x0301, 0x0303, 0x0304) and item_count == 1:
             if field_type in (3, 8):  # SHORT / SSHORT
                 values[tag] = _inline_short(value, field_type, byte_order)
@@ -175,9 +171,7 @@ def _read_focus_with_exiftool(paths: list[Path]) -> list[FocusPosition]:
         log.info("Could not run ExifTool for Restack focus ordering: %s", exc)
         return []
     if process.returncode != 0:
-        log.info(
-            "ExifTool could not read Restack focus metadata: %s", stderr.strip()
-        )
+        log.info("ExifTool could not read Restack focus metadata: %s", stderr.strip())
         return []
 
     try:

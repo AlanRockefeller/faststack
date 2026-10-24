@@ -1479,6 +1479,15 @@ class UIState(QObject):
         self.app_controller.set_secondary_raw_source_dir(path)
         self.stackDirectorySwitchChanged.emit()
 
+    @Slot(result=str)
+    def get_additional_raw_source_dirs(self):
+        return self.app_controller.get_additional_raw_source_dirs()
+
+    @Slot(str)
+    def set_additional_raw_source_dirs(self, paths):
+        self.app_controller.set_additional_raw_source_dirs(paths)
+        self.stackDirectorySwitchChanged.emit()
+
     @Slot(str, result=str)
     def open_file_dialog(self, current_path):
         return self.app_controller.open_file_dialog(current_path)
