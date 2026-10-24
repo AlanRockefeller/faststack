@@ -141,7 +141,13 @@ def test_strict_mode_allows_double_dot_in_segment_name():
         mock_path_instance.name = "Photoshop.exe"
         mock_path_instance.__str__ = lambda self: safe_versioned
 
-        with patch("faststack.io.executable_validator._is_subpath", return_value=True):
+        # Isolate path-segment validation from Unix filesystem permissions.
+        with (
+            patch("faststack.io.executable_validator._is_subpath", return_value=True),
+            patch(
+                "faststack.io.executable_validator._unix_path_risk", return_value=None
+            ),
+        ):
             is_valid, error = validate_executable_path(
                 safe_versioned, app_type="photoshop", allow_custom_paths=False
             )
@@ -162,7 +168,13 @@ def test_strict_mode_rejects_parent_traversal_segment():
         mock_path_instance.name = "malware.exe"
         mock_path_instance.__str__ = lambda self: r"C:\Windows\System32\malware.exe"
 
-        with patch("faststack.io.executable_validator._is_subpath", return_value=True):
+        # Isolate path-segment validation from Unix filesystem permissions.
+        with (
+            patch("faststack.io.executable_validator._is_subpath", return_value=True),
+            patch(
+                "faststack.io.executable_validator._unix_path_risk", return_value=None
+            ),
+        ):
             is_valid, error = validate_executable_path(
                 suspicious_path, allow_custom_paths=False
             )

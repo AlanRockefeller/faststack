@@ -1417,6 +1417,14 @@ class UIState(QObject):
         self.app_controller.switch_stack_input_directory()
 
     @Slot(result=str)
+    def get_focus_stacker_path(self):
+        return self.app_controller.get_focus_stacker_path()
+
+    @Slot(str)
+    def set_focus_stacker_path(self, path):
+        self.app_controller.set_focus_stacker_path(path)
+
+    @Slot(result=str)
     def get_helicon_path(self):
         return self.app_controller.get_helicon_path()
 
@@ -1471,6 +1479,15 @@ class UIState(QObject):
         self.app_controller.set_secondary_raw_source_dir(path)
         self.stackDirectorySwitchChanged.emit()
 
+    @Slot(result=str)
+    def get_additional_raw_source_dirs(self):
+        return self.app_controller.get_additional_raw_source_dirs()
+
+    @Slot(str)
+    def set_additional_raw_source_dirs(self, paths):
+        self.app_controller.set_additional_raw_source_dirs(paths)
+        self.stackDirectorySwitchChanged.emit()
+
     @Slot(str, result=str)
     def open_file_dialog(self, current_path):
         return self.app_controller.open_file_dialog(current_path)
@@ -1478,6 +1495,10 @@ class UIState(QObject):
     @Slot(str, result=bool)
     def check_executable_path(self, path):
         return self.app_controller.check_executable_path(path)
+
+    @Slot(str, result=bool)
+    def check_focus_stacker_path(self, path):
+        return self.app_controller.check_focus_stacker_path(path)
 
     @Slot(result=float)
     def get_cache_size(self):

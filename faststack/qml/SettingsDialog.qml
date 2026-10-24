@@ -21,7 +21,7 @@ Window {
     }
     
     // Properties matching the original dialog
-    property string heliconPath: ""
+    property string focusStackerPath: ""
     property double cacheSize: 1.5
     property double autoLevelClippingThreshold: 0.1
     property double autoLevelBlackThreshold: 0.0
@@ -47,6 +47,7 @@ Window {
     property string mainPhotoDir: ""
     property string rawSourceDir: ""
     property string secondaryRawSourceDir: ""
+    property string additionalRawSourceDirs: ""
     property string optimizeFor: "speed"
     property bool updateCheckEnabled: true
 
@@ -150,12 +151,17 @@ Window {
         return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.check_executable_path(path) : false
     }
 
+    function focusStackerPathIsValid(path) {
+        return settingsDialog.uiStateRef ? settingsDialog.uiStateRef.check_focus_stacker_path(path) : false
+    }
+
     function refreshTextFields() {
-        settingsDialog.setLoaderProperty(heliconField, "text", settingsDialog.heliconPath)
+        settingsDialog.setLoaderProperty(focusStackerField, "text", settingsDialog.focusStackerPath)
         imageEditorField.editText = settingsDialog.imageEditorPath
         settingsDialog.setLoaderProperty(rawtherapeeField, "text", settingsDialog.rawtherapeePath)
         settingsDialog.setLoaderProperty(mainPhotoDirField, "text", settingsDialog.mainPhotoDir)
         settingsDialog.setLoaderProperty(rawSourceDirField, "text", settingsDialog.rawSourceDir)
+        settingsDialog.setLoaderProperty(additionalRawSourceDirsField, "text", settingsDialog.additionalRawSourceDirs)
         settingsDialog.setLoaderProperty(secondaryRawSourceDirField, "text", settingsDialog.secondaryRawSourceDir)
         settingsDialog.setLoaderProperty(defaultDirField, "text", settingsDialog.defaultDirectory)
         settingsDialog.setLoaderProperty(cacheSizeField, "text", settingsDialog.cacheSize.toFixed(1))
@@ -170,13 +176,14 @@ Window {
     function open() {
         // Reload all properties from uiState to ensure Cancel discards edits
         if (settingsDialog.uiStateRef) {
-            settingsDialog.heliconPath = settingsDialog.uiStateRef.get_helicon_path()
+            settingsDialog.focusStackerPath = settingsDialog.uiStateRef.get_focus_stacker_path()
             settingsDialog.imageEditorPath = settingsDialog.uiStateRef.get_image_editor_path()
             settingsDialog.imageEditorHistory = settingsDialog.uiStateRef.get_image_editor_history()
             settingsDialog.rawtherapeePath = settingsDialog.uiStateRef.get_rawtherapee_path()
             settingsDialog.mainPhotoDir = settingsDialog.uiStateRef.get_main_photo_dir()
             settingsDialog.rawSourceDir = settingsDialog.uiStateRef.get_raw_source_dir()
             settingsDialog.secondaryRawSourceDir = settingsDialog.uiStateRef.get_secondary_raw_source_dir()
+            settingsDialog.additionalRawSourceDirs = settingsDialog.uiStateRef.get_additional_raw_source_dirs()
             settingsDialog.cacheSize = settingsDialog.uiStateRef.get_cache_size()
             settingsDialog.prefetchRadius = settingsDialog.uiStateRef.get_prefetch_radius()
             settingsDialog.navigationRateFps = settingsDialog.uiStateRef.get_navigation_rate_fps()
@@ -243,12 +250,13 @@ Window {
             return
         }
 
-        state.set_helicon_path(settingsDialog.heliconPath)
+        state.set_focus_stacker_path(settingsDialog.focusStackerPath)
         state.set_image_editor_path(settingsDialog.imageEditorPath)
         state.set_rawtherapee_path(settingsDialog.rawtherapeePath)
         state.set_main_photo_dir(settingsDialog.mainPhotoDir)
         state.set_raw_source_dir(settingsDialog.rawSourceDir)
         state.set_secondary_raw_source_dir(settingsDialog.secondaryRawSourceDir)
+        state.set_additional_raw_source_dirs(settingsDialog.additionalRawSourceDirs)
         state.set_cache_size(settingsDialog.cacheSize)
         state.set_prefetch_radius(settingsDialog.prefetchRadius)
         state.set_navigation_rate_fps(settingsDialog.navigationRateFps)
@@ -551,40 +559,45 @@ Window {
                             onLoaded: item.text = "General Settings"
                         }
 
-                        // Helicon Path
-                        Label { text: "Helicon Focus Path"; color: "#aaaaaa"; font.pixelSize: 12 }
+                        // Focus stacker path
+                        Label { text: "Focus Stacker Path"; color: "#aaaaaa"; font.pixelSize: 12 }
                         RowLayout {
                             Layout.fillWidth: true
                             Loader {
-                                id: heliconField
+                                id: focusStackerField
                                 sourceComponent: styledTextField
                                 Layout.fillWidth: true
                                 onLoaded: {
-                                    settingsDialog.setLoaderProperty(heliconField, "text", settingsDialog.heliconPath)
-                                    settingsDialog.connectLoaderSignal(heliconField, "textEdited", function() {
-                                        settingsDialog.heliconPath = settingsDialog.loaderProperty(heliconField, "text", settingsDialog.heliconPath)
+                                    settingsDialog.setLoaderProperty(focusStackerField, "text", settingsDialog.focusStackerPath)
+                                    settingsDialog.connectLoaderSignal(focusStackerField, "textEdited", function() {
+                                        settingsDialog.focusStackerPath = settingsDialog.loaderProperty(focusStackerField, "text", settingsDialog.focusStackerPath)
                                     })
                                 }
                             }
                             Button {
-                                id: heliconBrowseButton
+                                id: focusStackerBrowseButton
                                 text: "Browse"
                                 flat: true
                                 onClicked: {
-                                    var path = settingsDialog.openFileDialog(settingsDialog.loaderProperty(heliconField, "text", settingsDialog.heliconPath))
+                                    var path = settingsDialog.openFileDialog(settingsDialog.loaderProperty(focusStackerField, "text", settingsDialog.focusStackerPath))
                                     if (path) {
-                                        settingsDialog.heliconPath = path
-                                        settingsDialog.setLoaderProperty(heliconField, "text", path)
+                                        settingsDialog.focusStackerPath = path
+                                        settingsDialog.setLoaderProperty(focusStackerField, "text", path)
                                     }
                                 }
-                                background: Rectangle { color: heliconBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
-                                contentItem: Text { text: heliconBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                background: Rectangle { color: focusStackerBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: focusStackerBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                             }
                             Label {
                                 text: "✔"
                                 color: "#4ade80"
-                                visible: settingsDialog.pathIsExecutable(settingsDialog.heliconPath)
+                                visible: settingsDialog.focusStackerPathIsValid(settingsDialog.focusStackerPath)
                             }
+                        }
+                        Label {
+                            text: "OpenFocus: select main.py or enter its project folder. Helicon: select its executable."
+                            color: "#777777"
+                            font.pixelSize: 11
                         }
 
                         // Image Editor Path
@@ -802,6 +815,38 @@ Window {
                                 }
                                 background: Rectangle { color: secondaryRawSourceDirBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
                                 contentItem: Text { text: secondaryRawSourceDirBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            }
+                        }
+
+                        Label { text: "Additional RAW Source Directories (; separated)"; color: "#aaaaaa"; font.pixelSize: 12; Layout.topMargin: 5 }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Loader {
+                                id: additionalRawSourceDirsField
+                                sourceComponent: styledTextField
+                                Layout.fillWidth: true
+                                onLoaded: {
+                                    settingsDialog.setLoaderProperty(additionalRawSourceDirsField, "text", settingsDialog.additionalRawSourceDirs)
+                                    settingsDialog.connectLoaderSignal(additionalRawSourceDirsField, "textEdited", function() {
+                                        settingsDialog.additionalRawSourceDirs = settingsDialog.loaderProperty(additionalRawSourceDirsField, "text", settingsDialog.additionalRawSourceDirs)
+                                    })
+                                }
+                            }
+                            Button {
+                                id: additionalRawSourceDirsBrowseButton
+                                text: "Add"
+                                flat: true
+                                onClicked: {
+                                    var path = settingsDialog.openDirectoryDialog("")
+                                    if (path) {
+                                        var current = settingsDialog.loaderProperty(additionalRawSourceDirsField, "text", settingsDialog.additionalRawSourceDirs).trim()
+                                        var updated = current ? current + "; " + path : path
+                                        settingsDialog.additionalRawSourceDirs = updated
+                                        settingsDialog.setLoaderProperty(additionalRawSourceDirsField, "text", updated)
+                                    }
+                                }
+                                background: Rectangle { color: additionalRawSourceDirsBrowseButton.pressed ? "#20ffffff" : "#10ffffff"; radius: 4 }
+                                contentItem: Text { text: additionalRawSourceDirsBrowseButton.text; color: settingsDialog.textColor; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                             }
                         }
 

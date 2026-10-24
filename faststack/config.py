@@ -662,6 +662,7 @@ DEFAULT_CONFIG = {
     "raw": {
         "source_dir": "C:\\Users\\alanr\\pictures\\olympus.stack.input.photos",
         "secondary_source_dir": "H:\\olympus.stack.input.photos",
+        "additional_source_dirs": "",
         "mirror_base": "",
     },
     "updates": {

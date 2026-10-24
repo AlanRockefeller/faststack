@@ -86,7 +86,12 @@ from faststack.io.variants import (
 from faststack.io.sidecar import SidecarManager
 from faststack.io.session import SessionRegistry, respawn_for_directory
 from faststack.io.watcher import Watcher
-from faststack.io.helicon import HeliconLaunch, launch_helicon_focus
+from faststack.io.helicon import (
+    FocusStackerLaunch,
+    launch_focus_stacker,
+    validate_focus_stacker_path,
+)
+from faststack.io.focus_order import order_focus_stack_inputs
 from faststack.io.arguments import parse_external_arguments
 from faststack.io.executable_validator import validate_executable_path
 from faststack.io.utils import normalize_path_key, resolve_configured_path
@@ -465,6 +470,7 @@ class AppController(QObject):
         object
     )  # Signal for async delete completion (result dict from worker)
     _exifBriefReady = Signal(object, str)  # (cache_key, brief) from background thread
+    _restackOrderReady = Signal(object)  # Restack EXIF ordering result
     # (SidecarManager, outcome) from the background session-position write
     _sessionSidecarWriteFinished = Signal(object, str)
     _updateCheckFinished = Signal(object)  # Update check result from background thread
@@ -551,6 +557,8 @@ class AppController(QObject):
         self._exif_executor = create_daemon_threadpool_executor(
             max_workers=2, thread_name_prefix="EXIF"
         )
+        self._restack_order_token = 0
+        self._restackOrderReady.connect(self._on_restack_order_ready)
         self._editor_prewarm_executor = create_daemon_threadpool_executor(
             max_workers=1, thread_name_prefix="EditPrewarm"
         )
@@ -820,7 +828,7 @@ class AppController(QObject):
         self._dialog_open_count = 0  # Derived total of nested modal scopes.
         self._anonymous_dialog_depth = 0
         self._active_modal_tokens: set[str] = set()
-        self._helicon_launches: Dict[int, HeliconLaunch] = {}
+        self._helicon_launches: Dict[int, FocusStackerLaunch] = {}
         self._helicon_launches_lock = threading.Lock()
 
         # -- Caching & Prefetching --
@@ -10430,7 +10438,7 @@ class AppController(QObject):
 
     @Slot(bool)
     def launch_helicon(self, use_raw: bool = True):
-        """Launches Helicon with selected files (RAW preferred if use_raw=True, else JPG) or stacks."""
+        """Launch the focus stacker with defined stacks, preferring RAW if asked."""
         semantic_stack_groups = (
             self._filter_identity_snapshot["stack_groups"]
             if self._filter_enabled and self._filter_identity_snapshot is not None
@@ -10438,7 +10446,7 @@ class AppController(QObject):
         )
         if self.stacks or semantic_stack_groups:
             log.info(
-                "Launching Helicon for %d defined stacks (use_raw=%s).",
+                "Launching focus stacker for %d defined stacks (use_raw=%s).",
                 len(semantic_stack_groups) or len(self.stacks),
                 use_raw,
             )
@@ -10565,20 +10573,20 @@ class AppController(QObject):
                 )
 
         else:
-            log.warning("No selection or stacks defined to launch Helicon Focus.")
+            log.warning("No selection or stacks defined to launch the focus stacker.")
             return
 
         self.sync_ui_state()
 
     def _launch_helicon_with_files(self, files: List[Path]) -> bool:
-        """Helper to launch Helicon with a specific list of files (RAW or JPG).
+        """Launch the configured focus stacker with RAW or JPG files.
 
         Returns:
-            True if Helicon was successfully launched, False otherwise.
+            True if the focus stacker was successfully launched, otherwise False.
         """
-        log.info("Launching Helicon Focus with %d files.", len(files))
+        log.info("Launching focus stacker with %d files.", len(files))
         unique_files = list(dict.fromkeys(files))
-        success, launch = launch_helicon_focus(unique_files)
+        success, launch = launch_focus_stacker(unique_files)
         if success and launch:
             self._track_helicon_launch(launch)
 
@@ -10599,26 +10607,30 @@ class AppController(QObject):
 
         return success
 
-    def _track_helicon_launch(self, launch: HeliconLaunch) -> None:
-        """Retain one manifest until its owning Helicon child exits."""
+    def _track_helicon_launch(self, launch: FocusStackerLaunch) -> None:
+        """Track a stacker child and retain any Helicon manifest until exit."""
         launch_key = id(launch.process)
         with self._helicon_launches_lock:
             self._helicon_launches[launch_key] = launch
 
         def cleanup_after_exit() -> None:
             try:
-                launch.process.wait()
-            except (OSError, subprocess.SubprocessError):
-                log.warning("Error waiting for Helicon Focus process", exc_info=True)
-                return
-            try:
-                launch.manifest_path.unlink(missing_ok=True)
-            except OSError:
-                log.warning(
-                    "Helicon manifest cleanup failed; artifact remains at %s",
-                    launch.manifest_path,
-                    exc_info=True,
-                )
+                try:
+                    launch.process.wait()
+                except (OSError, subprocess.SubprocessError):
+                    log.warning(
+                        "Error waiting for focus stacker process", exc_info=True
+                    )
+                    return
+                if launch.manifest_path is not None:
+                    try:
+                        launch.manifest_path.unlink(missing_ok=True)
+                    except OSError:
+                        log.warning(
+                            "Helicon manifest cleanup failed; artifact remains at %s",
+                            launch.manifest_path,
+                            exc_info=True,
+                        )
             finally:
                 with self._helicon_launches_lock:
                     self._helicon_launches.pop(launch_key, None)
@@ -10626,7 +10638,7 @@ class AppController(QObject):
         threading.Thread(
             target=cleanup_after_exit,
             daemon=True,
-            name="HeliconManifestCleanup",
+            name="FocusStackerCleanup",
         ).start()
 
     def clear_all_stacks(self):
@@ -10671,12 +10683,20 @@ class AppController(QObject):
         self.update_status_message("All batches cleared")
         return True
 
-    def get_helicon_path(self):
+    def get_focus_stacker_path(self):
         return config.get("helicon", "exe")
 
-    def set_helicon_path(self, path):
+    def set_focus_stacker_path(self, path):
         config.set("helicon", "exe", path)
         config.save()
+
+    # Compatibility for older QML/plugins; the persisted config key remains
+    # [helicon] exe so existing Windows and macOS installations keep working.
+    def get_helicon_path(self):
+        return self.get_focus_stacker_path()
+
+    def set_helicon_path(self, path):
+        self.set_focus_stacker_path(path)
 
     def get_image_editor_path(self):
         return config.get("photoshop", "exe")
@@ -10733,6 +10753,13 @@ class AppController(QObject):
 
     def set_secondary_raw_source_dir(self, path):
         config.set("raw", "secondary_source_dir", path)
+        config.save()
+
+    def get_additional_raw_source_dirs(self):
+        return config.get("raw", "additional_source_dirs", fallback="")
+
+    def set_additional_raw_source_dirs(self, paths):
+        config.set("raw", "additional_source_dirs", paths)
         config.save()
 
     @staticmethod
@@ -10898,6 +10925,10 @@ class AppController(QObject):
         # never disagrees with whether the tool can actually be launched.
         expanded = os.path.expanduser(os.path.expandvars(path.strip().strip('"')))
         is_valid, _ = validate_executable_path(expanded, allow_custom_paths=True)
+        return is_valid
+
+    def check_focus_stacker_path(self, path):
+        is_valid, _ = validate_focus_stacker_path(path)
         return is_valid
 
     def get_cache_size(self):
@@ -18273,8 +18304,10 @@ class AppController(QObject):
     @Slot()
     def stack_source_raws(self):
         """
-        Finds the source RAW files for the current stacked JPG and launches Helicon Focus.
+        Finds source RAW files for the current stacked JPG and launches the focus stacker.
         """
+        self._restack_order_token += 1
+        token = self._restack_order_token
         if not self.image_files or self.current_index >= len(self.image_files):
             self.update_status_message("No image selected.")
             return
@@ -18404,17 +18437,94 @@ class AppController(QObject):
             )
             return
 
-        # Sort the files by name to ensure Helicon Focus receives them in sequence
-        found_raw_files.sort()
+        # Start from deterministic filename order, then replace it with a
+        # near-to-far EXIF focus order when all frames provide reliable data.
+        # This happens before the generic launcher so every configured focus
+        # stacker receives the same sequence.
+        found_raw_files.sort(key=lambda path: path.name.casefold())
+        self.update_status_message(
+            f"Reading focus metadata for {len(found_raw_files)} RAWs..."
+        )
+
+        def _on_order_done(future: concurrent.futures.Future) -> None:
+            try:
+                ordered_files, focus_order = future.result()
+                error = None
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                ordered_files = found_raw_files
+                focus_order = None
+                error = exc
+            self._restackOrderReady.emit(
+                {
+                    "token": token,
+                    "source_image_path": current_image_path,
+                    "files": ordered_files,
+                    "focus_order": focus_order,
+                    "error": error,
+                    "found_label": found_label,
+                    "found_search_dir": found_search_dir,
+                }
+            )
+
+        try:
+            future = self._exif_executor.submit(
+                order_focus_stack_inputs, list(found_raw_files)
+            )
+        except RuntimeError:
+            if not self._shutting_down:
+                self.update_status_message("Could not read RAW focus metadata.")
+            return
+        future.add_done_callback(_on_order_done)
+
+    @Slot(object)
+    def _on_restack_order_ready(self, payload) -> None:
+        """Launch a restack after background focus ordering completes."""
+        if self._shutting_down or not payload:
+            return
+        if payload.get("token") != self._restack_order_token:
+            return
+
+        source_image_path = payload["source_image_path"]
+        if (
+            not self.image_files
+            or self.current_index >= len(self.image_files)
+            or self._key(self.image_files[self.current_index].path)
+            != self._key(source_image_path)
+        ):
+            log.info(
+                "Discarding Restack focus order because the selected image changed."
+            )
+            return
+
+        found_raw_files = payload["files"]
+        focus_order = payload.get("focus_order")
+        error = payload.get("error")
+        if error is not None:
+            log.error(
+                "Restack focus metadata ordering failed; retaining filename order: %s",
+                error,
+            )
+        if focus_order:
+            log.info(
+                "Restack inputs ordered by %s: %s",
+                focus_order,
+                [path.name for path in found_raw_files],
+            )
+        else:
+            log.info(
+                "Restack focus metadata was incomplete; retaining filename order: %s",
+                [path.name for path in found_raw_files],
+            )
 
         self.update_status_message(
-            f"Launching Helicon Focus with {len(found_raw_files)} RAWs..."
+            f"Launching focus stacker with {len(found_raw_files)} RAWs"
+            + (" in EXIF focus order..." if focus_order else "...")
         )
         log.info(
-            "Launching Helicon Focus for %s with RAWs from %s (%s): %s",
-            filename,
-            found_label,
-            found_search_dir,
+            "Launching focus stacker for %s with RAWs from %s (%s): %s",
+            source_image_path.name,
+            payload["found_label"],
+            payload["found_search_dir"],
             [str(p) for p in found_raw_files],
         )
         success = self._launch_helicon_with_files(found_raw_files)
@@ -18422,7 +18532,7 @@ class AppController(QObject):
         if success:
             # Mark as restacked on success
             today = datetime.now().strftime("%Y-%m-%d")
-            meta = self.sidecar.get_metadata(self.image_files[self.current_index].path)
+            meta = self.sidecar.get_metadata(source_image_path)
             meta.restacked = True
             meta.restacked_date = today
             metadata_saved = self._persist_sidecar()
@@ -18431,16 +18541,25 @@ class AppController(QObject):
             self.sync_ui_state()
 
             if metadata_saved:
-                self.update_status_message("Helicon Focus launched successfully.")
+                self.update_status_message("Focus stacker launched successfully.")
         else:
-            self.update_status_message("Failed to launch Helicon Focus.")
+            self.update_status_message("Failed to launch focus stacker.")
 
     def _configured_restack_raw_locations(self) -> list[tuple[str, Path]]:
         raw_source_dir = config.get("raw", "source_dir", fallback="")
         secondary_source_dir = config.get("raw", "secondary_source_dir", fallback="")
-        configured = (
+        additional_source_dirs = config.get(
+            "raw", "additional_source_dirs", fallback=""
+        )
+        configured = [
             ("Primary", raw_source_dir),
             ("Secondary", secondary_source_dir),
+        ]
+        configured.extend(
+            (f"Additional {index}", raw_path)
+            for index, raw_path in enumerate(
+                re.split(r"[;\r\n]+", additional_source_dirs), start=1
+            )
         )
         locations: list[tuple[str, Path]] = []
         seen: set[str] = set()
@@ -18480,6 +18599,13 @@ class AppController(QObject):
         *,
         max_raw_search: int = 15,
     ) -> list[Path]:
+        # Camera extensions are commonly uppercase. Windows path lookup hid that
+        # distinction, but Linux/WSL filesystems are case-sensitive.
+        files_by_name = {
+            candidate.name.casefold(): candidate
+            for candidate in raw_search_dir.iterdir()
+            if candidate.is_file()
+        }
         found_raw_files: list[Path] = []
         for raw_stem in self._expected_restack_raw_stems(
             base_prefix,
@@ -18487,9 +18613,9 @@ class AppController(QObject):
             max_raw_search=max_raw_search,
         ):
             found_this_number = False
-            for ext in RAW_EXTENSIONS:
-                potential_raw = raw_search_dir / f"{raw_stem}{ext}"
-                if potential_raw.is_file():
+            for ext in sorted(RAW_EXTENSIONS):
+                potential_raw = files_by_name.get(f"{raw_stem}{ext}".casefold())
+                if potential_raw is not None:
                     found_raw_files.append(potential_raw)
                     found_this_number = True
                     break
@@ -18535,7 +18661,8 @@ class AppController(QObject):
         summary = (
             f"Stacked image: {filename}\n\n"
             "The stack input RAW files could not be found. FastStack needs those "
-            "original RAW frames to reopen this stack in Helicon Focus.\n\n"
+            "original RAW frames to reopen this stack in the configured focus "
+            "stacker.\n\n"
         )
         if reason:
             summary += f"Problem:\n{reason}\n\n"
@@ -18551,8 +18678,8 @@ class AppController(QObject):
             summary
             + "\n\nConfigure these folders in Settings > Restack RAW Locations. "
             "Set the Main Photo Directory to the root folder of your stacked "
-            "images, and set the primary and secondary RAW source directories to "
-            "folders that mirror the same date/subfolder structure."
+            "images, and set the primary, secondary, or additional RAW source "
+            "directories to folders that mirror the same date/subfolder structure."
         )
         detailed_locations = f"Stacked image: {filename}\n\n"
         if reason:

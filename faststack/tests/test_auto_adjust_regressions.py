@@ -85,6 +85,9 @@ class _Qt(IntFlag):
     Key_2 = 132
     Key_3 = 133
     Key_4 = 134
+    Key_R = 135
+    Key_Underscore = 136
+    Key_Plus = 137
 
 
 def _load_keybinder_class():

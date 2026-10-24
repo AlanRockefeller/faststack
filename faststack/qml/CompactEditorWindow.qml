@@ -291,8 +291,8 @@ Window {
                 compactEditor.controllerRef.note_compact_editor_reload_skipped(idx, "already-loaded")
                 return
             }
-            // A discarded request may never emit editorPreviewLoaded. Clear
-            // the old state now so returning to that image requests a reload.
+            // The result can be discarded without an editorPreviewLoaded
+            // signal, so don't keep claiming the previous load is current.
             compactEditor.lastLoadedIndex = -1
             compactEditor.lastLoadWasFull = false
             var loaded = compactEditor.controllerRef.load_image_for_editing_preview()
