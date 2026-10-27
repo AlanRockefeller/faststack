@@ -2,6 +2,10 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## 1.7.0 (2026-10-29)
+
+- When in crop mode, you can now toggle the grid visibility.  Nice for lining things up / keeping edges equal.
+
 ## 1.6.9 (2026-09-12)
 
 - Improved Brightness and positive Contrast adjustments, with gentler protection of bright and dark detail. Blacks and Whites set the brightness range before the new curves are applied, so lowering Whites can still bring bright detail back into range. Reducing Contrast keeps its previous response. Previews and saved JPGs use the same adjustments.

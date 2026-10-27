@@ -259,8 +259,11 @@ keyboard — only the editor-specific keys above behave differently.
 
 Press `O` (or right-click the image) to enter crop mode. Drag the crop
 rectangle, optionally press `1`/`2`/`3`/`4` to lock a 1:1, 4:3, 3:2, or 16:9
-aspect ratio, then press `Enter` to apply the crop to the live session or `Esc`
-to cancel. You must apply or cancel a crop before you can save.
+aspect ratio, and use the **Grid** switch in the Aspect Ratio panel when you
+want alignment guides. The grid still defaults to on in rotate mode, but the
+switch can show or hide it at any time. Press `Enter` to apply the crop
+to the live session or `Esc` to cancel. You must apply or cancel a crop before
+you can save.
 
 ### Saving
 

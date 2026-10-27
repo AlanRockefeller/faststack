@@ -2524,9 +2524,8 @@ class AppController(QObject):
             if not blocked_modifiers and bool(
                 watched.property("handlesPlainArrowKeys")
             ):
-                # The window uses plain Left/Right itself (the compact editor
-                # moves its slider highlight): deliver the press to QML instead
-                # of starting image navigation.
+                # The window uses plain Left/Right itself: deliver the press to
+                # QML instead of starting image navigation.
                 self._end_navigation_hold(0, source=watched)
                 return False
             if not blocked_modifiers:

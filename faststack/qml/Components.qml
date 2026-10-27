@@ -16,6 +16,15 @@ Item {
     property var controllerRef: null
     property bool isDarkTheme: true
     property int footerHeight: 60
+    // Until the user touches the Grid switch, preserve the legacy behavior:
+    // hidden for ordinary cropping and visible while rotating. A boolean
+    // override makes the grid independently toggleable for this crop session.
+    property var cropGridOverride: null
+    readonly property bool cropGridVisible: uiStateRef
+                                            && uiStateRef.isCropping
+                                            && (cropGridOverride === null
+                                                ? mainMouseArea.isRotating
+                                                : Boolean(cropGridOverride))
 
     // Expose zoom state to parent (Main.qml title bar)
     readonly property real currentZoomScale: imageRotator.zoomScale
@@ -128,6 +137,7 @@ Item {
                 // Capture the session's visual source when crop mode turns on,
                 // then keep it stable until crop mode exits.
                 loupeView.freezeCropImageSource()
+                loupeView.cropGridOverride = null
                 aspectRatioWindow.dismissed = false
             } else {
                 if (mainMouseArea) {
@@ -137,6 +147,7 @@ Item {
                     mainMouseArea.resetCropRotation()
                 }
                 if (loupeView.uiStateRef) loupeView.uiStateRef.isCropRotating = false
+                loupeView.cropGridOverride = null
                 loupeView.releaseCropImageSource()
             }
         }
@@ -836,43 +847,43 @@ Item {
             }
         }
 
-        // Alignment grid for rotate mode. Lives in the viewport (NOT inside
+        // Crop alignment grid. Lives in the viewport (NOT inside
         // imageRotator/mainImage) so the lines stay screen-horizontal and
         // screen-vertical while the image rotates underneath them.
         Item {
-            id: rotateAlignGrid
+            id: cropAlignGrid
             anchors.fill: parent
             z: 10
-            visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping && mainMouseArea.isRotating
+            visible: loupeView.cropGridVisible
             property real gridSpacing: 56
             property color lineColor: "#59ffffff"
             property color centerLineColor: "#b3ffffff"
 
             Repeater {
-                id: rotateGridVLines
-                model: rotateAlignGrid.visible ? 2 * Math.ceil(rotateAlignGrid.width / (2 * rotateAlignGrid.gridSpacing)) + 1 : 0
+                id: cropGridVLines
+                model: cropAlignGrid.visible ? 2 * Math.ceil(cropAlignGrid.width / (2 * cropAlignGrid.gridSpacing)) + 1 : 0
                 Rectangle {
                     required property int index
-                    property int centerIndex: (rotateGridVLines.count - 1) / 2
-                    x: rotateAlignGrid.width / 2 + (index - centerIndex) * rotateAlignGrid.gridSpacing - width / 2
+                    property int centerIndex: (cropGridVLines.count - 1) / 2
+                    x: cropAlignGrid.width / 2 + (index - centerIndex) * cropAlignGrid.gridSpacing - width / 2
                     y: 0
                     width: 1
-                    height: rotateAlignGrid.height
-                    color: index === centerIndex ? rotateAlignGrid.centerLineColor : rotateAlignGrid.lineColor
+                    height: cropAlignGrid.height
+                    color: index === centerIndex ? cropAlignGrid.centerLineColor : cropAlignGrid.lineColor
                 }
             }
 
             Repeater {
-                id: rotateGridHLines
-                model: rotateAlignGrid.visible ? 2 * Math.ceil(rotateAlignGrid.height / (2 * rotateAlignGrid.gridSpacing)) + 1 : 0
+                id: cropGridHLines
+                model: cropAlignGrid.visible ? 2 * Math.ceil(cropAlignGrid.height / (2 * cropAlignGrid.gridSpacing)) + 1 : 0
                 Rectangle {
                     required property int index
-                    property int centerIndex: (rotateGridHLines.count - 1) / 2
+                    property int centerIndex: (cropGridHLines.count - 1) / 2
                     x: 0
-                    y: rotateAlignGrid.height / 2 + (index - centerIndex) * rotateAlignGrid.gridSpacing - height / 2
-                    width: rotateAlignGrid.width
+                    y: cropAlignGrid.height / 2 + (index - centerIndex) * cropAlignGrid.gridSpacing - height / 2
+                    width: cropAlignGrid.width
                     height: 1
-                    color: index === centerIndex ? rotateAlignGrid.centerLineColor : rotateAlignGrid.lineColor
+                    color: index === centerIndex ? cropAlignGrid.centerLineColor : cropAlignGrid.lineColor
                 }
             }
         }
@@ -1914,31 +1925,100 @@ Item {
                     }
                 }
             }
-            
-                Rectangle {
-                    width: parent.width
-                    height: 30
-                    color: mainMouseArea.isRotating ? "#555555" : "transparent"
-                    radius: 3
-                    
-                    Text {
-                        anchors.left: parent.left
-                        anchors.leftMargin: 10
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "Rotate"
-                        color: aspectRatioWindow.isDark ? "white" : "black"
-                        font.pixelSize: 11
-                        font.bold: mainMouseArea.isRotating
-                    }
-                    
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            mainMouseArea.isRotating = !mainMouseArea.isRotating
-                            mainMouseArea.cropDragMode = "none"
-                        }
+
+            Rectangle {
+                id: gridToggleRow
+                width: parent.width
+                height: 30
+                radius: 3
+                activeFocusOnTab: true
+                color: gridToggleMouse.containsMouse || activeFocus
+                       ? (aspectRatioWindow.isDark ? "#484848" : "#dddddd")
+                       : "transparent"
+
+                function toggleGrid() {
+                    loupeView.cropGridOverride = !loupeView.cropGridVisible
+                }
+
+                Accessible.name: "Crop alignment grid"
+                Accessible.role: Accessible.CheckBox
+                Accessible.checked: loupeView.cropGridVisible
+                Accessible.onPressAction: gridToggleRow.toggleGrid()
+
+                Keys.onPressed: (event) => {
+                    if (event.key === Qt.Key_Enter
+                            || event.key === Qt.Key_Return
+                            || event.key === Qt.Key_Space) {
+                        gridToggleRow.toggleGrid()
+                        event.accepted = true
                     }
                 }
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Grid"
+                    color: aspectRatioWindow.isDark ? "white" : "black"
+                    font.pixelSize: 11
+                }
+
+                Rectangle {
+                    id: gridToggleTrack
+                    anchors.right: parent.right
+                    anchors.rightMargin: 6
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 30
+                    height: 16
+                    radius: height / 2
+                    color: loupeView.cropGridVisible ? "#6366f1"
+                                                      : (aspectRatioWindow.isDark ? "#666666" : "#aaaaaa")
+
+                    Rectangle {
+                        width: 12
+                        height: 12
+                        radius: width / 2
+                        y: 2
+                        x: loupeView.cropGridVisible ? parent.width - width - 2 : 2
+                        color: "white"
+                    }
+                }
+
+                MouseArea {
+                    id: gridToggleMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    onClicked: {
+                        gridToggleRow.forceActiveFocus()
+                        gridToggleRow.toggleGrid()
+                    }
+                }
+            }
+
+            Rectangle {
+                width: parent.width
+                height: 30
+                color: mainMouseArea.isRotating ? "#555555" : "transparent"
+                radius: 3
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Rotate"
+                    color: aspectRatioWindow.isDark ? "white" : "black"
+                    font.pixelSize: 11
+                    font.bold: mainMouseArea.isRotating
+                }
+                    
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        mainMouseArea.isRotating = !mainMouseArea.isRotating
+                        mainMouseArea.cropDragMode = "none"
+                    }
+                }
+            }
         }
     }
 

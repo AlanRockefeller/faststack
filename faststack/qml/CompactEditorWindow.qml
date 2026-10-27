@@ -151,10 +151,17 @@ Window {
     // Whether the per-hue COLOR MIX section is expanded (collapsed by default).
     property bool colorMixExpanded: false
     readonly property bool cropActive: compactEditor.uiStateRef ? compactEditor.uiStateRef.isCropping : false
-    // Plain Left/Right belong to this window (they move the slider
-    // highlight), so the controller's arrow-navigation event filter lets them
-    // through to QML instead of turning them into image navigation.
-    readonly property bool handlesPlainArrowKeys: true
+    // Let the controller own plain Left/Right so presses and holds navigate
+    // images with the same cadence as they do in the loupe window.
+    readonly property bool plainArrowNavigationEnabled: visible
+                                                        && controllerRef
+                                                        && uiStateRef
+                                                        && !cropActive
+                                                        && !discardDialog.opened
+    onPlainArrowNavigationEnabledChanged: {
+        if (!plainArrowNavigationEnabled && compactEditor.controllerRef)
+            compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
+    }
     property int lastLoadedIndex: -1
     property bool lastLoadWasFull: false
     property bool forceNextPreviewLoad: false
@@ -162,9 +169,8 @@ Window {
 
     // Key of the slider that the Up/Down arrow keys will adjust. The matching
     // row is highlighted so the user can see which control is targeted.
-    // Left/Right move the highlight; clicking a slider's label (or value) also
-    // retargets. Defaults to the first slider so the arrow keys work
-    // immediately when the editor opens.
+    // Clicking a slider's label (or value) retargets it. Defaults to the first
+    // slider so Up/Down work immediately when the editor opens.
     property string highlightedSliderKey: "exposure"
     property bool keyboardHandlerReady: false
 
@@ -186,29 +192,6 @@ Window {
         sliderVal = Math.max(-100, Math.min(100, sliderVal + delta))
         compactEditor.controllerRef.set_edit_parameter(key, sliderVal / 100 * scale)
         compactEditor.updatePulse++  // refreshes sliders + histogram
-    }
-
-    // Slider keys in on-screen order (collapsed COLOR MIX rows excluded), so
-    // Left/Right walk the highlight through exactly what the user can see.
-    function visibleSliderKeys() {
-        var models = [lightModel, colorModel]
-        if (compactEditor.colorMixExpanded) models.push(colorMixModel)
-        var keys = []
-        for (var m = 0; m < models.length; ++m) {
-            for (var i = 0; i < models[m].count; ++i) keys.push(models[m].get(i).key)
-        }
-        return keys
-    }
-
-    // Move the highlight `step` rows (wrapping at either end).
-    function moveSliderHighlight(step) {
-        if (compactEditor.cropActive) return
-        var keys = compactEditor.visibleSliderKeys()
-        if (keys.length === 0) return
-        var idx = keys.indexOf(compactEditor.highlightedSliderKey)
-        if (idx < 0) idx = step > 0 ? -1 : 0
-        idx = (idx + step + keys.length) % keys.length
-        compactEditor.highlightedSliderKey = keys[idx]
     }
 
     // Scroll the editor so `item` (a slider row) is fully visible.
@@ -249,8 +232,12 @@ Window {
         if (key === Qt.Key_Left || key === Qt.Key_Right) {
             var step = key === Qt.Key_Right ? 1 : -1
             if (modifiers === Qt.NoModifier) {
-                // Plain Left/Right: move the slider highlight.
-                compactEditor.moveSliderHighlight(step)
+                // Normally the controller's event filter handles physical
+                // plain arrows. Keep this fallback for synthetic QML events.
+                if (compactEditor.uiStateRef) {
+                    if (step > 0) compactEditor.uiStateRef.nextImage()
+                    else compactEditor.uiStateRef.prevImage()
+                }
                 return true
             }
             if (modifiers === Qt.ControlModifier) {
@@ -410,8 +397,9 @@ Window {
 
     // Keyboard handling for the compact editor window.
     //
-    // Arrow keys (see handleArrowKey): Left / Right move the slider highlight,
-    // Up / Down adjust the highlighted slider, Ctrl+Left / Right switch images,
+    // Arrow keys (see handleArrowKey): Left / Right switch images using the
+    // controller's loupe-navigation hold behavior, Up / Down adjust the
+    // highlighted slider, Ctrl+Left / Right also switch images, and
     // Shift+Left / Right keep the main window's jump-by-10 binding.
     //
     // This focus scope handles the remaining compact-editor keys:
