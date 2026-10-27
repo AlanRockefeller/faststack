@@ -14009,6 +14009,8 @@ class AppController(QObject):
             )
             if self.image_editor:
                 self.image_editor.reset_edits()
+            if hasattr(self.ui_state, "reset_editor_state"):
+                self.ui_state.reset_editor_state()
             self._clear_live_edit_session_state()
             with self._preview_lock:
                 self._clear_last_rendered_preview_locked()
