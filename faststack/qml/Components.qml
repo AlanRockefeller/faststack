@@ -418,18 +418,61 @@ Item {
                     angle: mainMouseArea.cropRotation
                 }
                 
-                // Darken mask overlay - anchored to mainImage, rotates/scales with it
+                // Dodge & burn mask overlay - anchored to mainImage, rotates/scales with it
                 Image {
-                    id: darkenOverlay
+                    id: localMaskOverlay
+                    readonly property bool shown: !!loupeView.uiStateRef
+                                                  && loupeView.uiStateRef.isBrushMode
+                                                  && (loupeView.uiStateRef.localOverlayVisible || loupeView.uiStateRef.localOverlayHeld)
+                                                  && !loupeView.uiStateRef.originalCompareActive
                     anchors.fill: parent
                     z: 90
-                    visible: loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible && !loupeView.uiStateRef.originalCompareActive
-                    source: (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible && !loupeView.uiStateRef.originalCompareActive)
-                            ? "image://provider/mask_overlay/" + loupeView.uiStateRef.darkenOverlayGeneration
+                    visible: localMaskOverlay.shown
+                    source: localMaskOverlay.shown
+                            ? "image://provider/mask_overlay/" + loupeView.uiStateRef.localOverlayGeneration
                             : ""
                     fillMode: Image.Stretch
                     cache: false
                     opacity: 1.0  // Opacity is baked into the ARGB32 image
+                }
+
+                // Brush outline. Lives in mainImage coordinates so it scales
+                // with zoom; the inner ring marks where the falloff starts.
+                Item {
+                    id: brushCursor
+                    z: 95
+                    readonly property var cropScale: loupeView.uiStateRef ? loupeView.uiStateRef.brushCropScale : [1, 1]
+                    readonly property real radius: loupeView.uiStateRef
+                        ? loupeView.uiStateRef.brushRadius * Math.sqrt(
+                              Math.pow(mainImage.width / Math.max(0.001, brushCursor.cropScale[0]), 2)
+                              + Math.pow(mainImage.height / Math.max(0.001, brushCursor.cropScale[1]), 2))
+                        : 0
+                    readonly property real lineWidth: 1.25 / Math.max(0.01, imageRotator.zoomScale)
+                    visible: !!loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode
+                             && !loupeView.uiStateRef.brushPanHeld && mainMouseArea.brushCursorInside
+                    x: mainMouseArea.brushCursorX
+                    y: mainMouseArea.brushCursorY
+
+                    Rectangle {
+                        x: -brushCursor.radius; y: -brushCursor.radius
+                        width: brushCursor.radius * 2; height: width; radius: width / 2
+                        color: "transparent"
+                        border.color: "#c0000000"; border.width: brushCursor.lineWidth * 3
+                    }
+                    Rectangle {
+                        x: -brushCursor.radius; y: -brushCursor.radius
+                        width: brushCursor.radius * 2; height: width; radius: width / 2
+                        color: "transparent"
+                        border.color: "white"; border.width: brushCursor.lineWidth
+                    }
+                    Rectangle {
+                        readonly property real r: brushCursor.radius * (loupeView.uiStateRef ? loupeView.uiStateRef.brushHardness : 0.5)
+                        visible: r > brushCursor.lineWidth * 3
+                        x: -r; y: -r
+                        width: r * 2; height: width; radius: width / 2
+                        color: "transparent"
+                        border.color: "#90ffffff"; border.width: brushCursor.lineWidth
+                    }
                 }
 
                 source: loupeView.displayedImageSource
@@ -899,13 +942,35 @@ Item {
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             hoverEnabled: true
             cursorShape: {
-                if (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening) return Qt.CrossCursor
+                if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode && !loupeView.uiStateRef.isCropping) {
+                    if (loupeView.uiStateRef.brushPanHeld) return mainMouseArea.pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+                    return Qt.CrossCursor
+                }
                 if (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping) return Qt.ArrowCursor
                 return Qt.CrossCursor
             }
 
-        // Darken painting state
-        property bool isDarkenPainting: false
+        // Dodge & burn painting state; the cursor position is in mainImage
+        // coordinates.
+        property bool isBrushPainting: false
+        property real brushCursorX: 0
+        property real brushCursorY: 0
+        property bool brushCursorInside: false
+        onContainsMouseChanged: if (!containsMouse) brushCursorInside = false
+        // A grab stolen mid-stroke (window switch, popup) still commits it.
+        onCanceled: {
+            if (isBrushPainting) {
+                isBrushPainting = false
+                if (loupeView.controllerRef) loupeView.controllerRef.finish_local_stroke()
+            }
+        }
+
+        function updateBrushCursor(mx, my) {
+            var p = mainImage.mapFromItem(mainMouseArea, mx, my)
+            brushCursorX = p.x
+            brushCursorY = p.y
+            brushCursorInside = true
+        }
         
         // Drag-to-pan with drag-and-drop when dragging outside window
         property real lastX: 0
@@ -949,7 +1014,7 @@ Item {
         PinchHandler {
             id: loupePinchHandler
             target: null
-            enabled: !mainMouseArea.isCropDragging && !mainMouseArea.isDarkenPainting
+            enabled: !mainMouseArea.isCropDragging && !mainMouseArea.isBrushPainting
 
             property real startZoomScale: 1
             property real startImagePointX: 0
@@ -1158,17 +1223,19 @@ Item {
                 endCropInteraction()
             }
 
-            // Darken painting mode
-            if (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && !loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
+            // Dodge & burn: left paints, right or Alt+left erases, and
+            // Space+left pans (handled by the normal pan path below).
+            if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode && !loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
+                updateBrushCursor(mouse.x, mouse.y)
+                if (loupeView.uiStateRef.brushPanHeld) return
                 var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
-                var sx = Math.max(0, Math.min(1, imgCoords.x))
-                var sy = Math.max(0, Math.min(1, imgCoords.y))
-                if (imgCoords.x < 0 || imgCoords.x > 1 || imgCoords.y < 0 || imgCoords.y > 1) {
-                    return  // click outside image bounds
+                // Points just outside the frame still paint up to its edge.
+                if (imgCoords.x < -0.05 || imgCoords.x > 1.05 || imgCoords.y < -0.05 || imgCoords.y > 1.05) {
+                    return
                 }
-                var strokeType = (mouse.button === Qt.RightButton) ? "protect" : "add"
-                loupeView.controllerRef.start_darken_stroke(sx, sy, strokeType)
-                isDarkenPainting = true
+                var erase = mouse.button === Qt.RightButton || (mouse.modifiers & Qt.AltModifier)
+                loupeView.controllerRef.start_local_stroke(imgCoords.x, imgCoords.y, !!erase)
+                isBrushPainting = true
                 return
             }
 
@@ -1303,12 +1370,19 @@ Item {
             return { x: p.x / w, y: p.y / h }
         }
         onPositionChanged: function(mouse) {
-            // Darken painting drag — clamp to image bounds
-            if (isDarkenPainting && loupeView.controllerRef) {
+            if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode)
+                updateBrushCursor(mouse.x, mouse.y)
+
+            // Dodge & burn painting drag
+            if (isBrushPainting && loupeView.controllerRef) {
                 var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
-                var cx = Math.max(0, Math.min(1, imgCoords.x))
-                var cy = Math.max(0, Math.min(1, imgCoords.y))
-                loupeView.controllerRef.continue_darken_stroke(cx, cy)
+                loupeView.controllerRef.continue_local_stroke(imgCoords.x, imgCoords.y)
+                return
+            }
+            // In brush mode a plain drag must not fall through to panning or
+            // drag-and-drop; only Space+drag pans.
+            if (pressed && loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode
+                    && !loupeView.uiStateRef.brushPanHeld && !loupeView.uiStateRef.isCropping) {
                 return
             }
 
@@ -1415,10 +1489,10 @@ Item {
         }
         
         onReleased: function(mouse) {
-            // Darken painting release
-            if (isDarkenPainting) {
-                isDarkenPainting = false
-                if (loupeView.controllerRef) loupeView.controllerRef.finish_darken_stroke()
+            // Dodge & burn stroke release
+            if (isBrushPainting) {
+                isBrushPainting = false
+                if (loupeView.controllerRef) loupeView.controllerRef.finish_local_stroke()
                 return
             }
 

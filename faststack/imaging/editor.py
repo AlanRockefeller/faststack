@@ -19,9 +19,20 @@ from PIL import ExifTags, Image, ImageFilter, ImageOps
 
 from faststack.imaging.jpeg import TURBO_AVAILABLE, decode_jpeg_rgb
 
-# Mask subsystem (lazy imports avoided — lightweight dataclasses)
+# Local adjustment layers (dodge & burn)
+from faststack.imaging.local_adjust import (
+    LOCAL_GAIN_KEYS,
+    LOCAL_LINEAR_KEYS,
+    LOCAL_SRGB_KEYS,
+    apply_local_shadows,
+    apply_local_srgb_block,
+    build_local_adjustments,
+    effective_layers,
+    layers_use_keys,
+    local_linear_gain_ratio,
+)
 from faststack.imaging.mask import MaskData
-from faststack.imaging.mask_engine import MaskRasterCache
+from faststack.imaging.mask_engine import LayerDensityCache
 from faststack.imaging.math_utils import (
     _analyze_highlight_state,
     _apply_headroom_shoulder,
@@ -37,7 +48,7 @@ from faststack.imaging.math_utils import (
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
-from faststack.models import DecodedImage, ResolvedDarkenMask
+from faststack.models import DecodedImage
 from faststack.util.executors import create_daemon_threadpool_executor
 
 try:
@@ -190,6 +201,36 @@ def _rec601_gray(arr: np.ndarray) -> np.ndarray:
     if cv2 is not None and arr.flags["C_CONTIGUOUS"]:
         return cv2.transform(arr, _REC601_LUMA.reshape(1, 3)).reshape(arr.shape[:2])
     return arr @ _REC601_LUMA
+
+
+def _hsv_hue_degrees(arr: np.ndarray) -> np.ndarray:
+    """HSV hue in degrees [0, 360) of an (H, W, 3) float RGB array."""
+    cv2 = _get_cv2()
+    if cv2 is not None:
+        # Clip first: arr can hold out-of-[0,1] values here (headroom from
+        # earlier contrast/brightness overshoot), where HSV hue is
+        # ill-defined. np.clip also returns a C-contiguous copy, so no
+        # separate contiguity check is needed for cv2.cvtColor.
+        return cv2.cvtColor(
+            np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False),
+            cv2.COLOR_RGB2HSV,
+        )[:, :, 0]
+    hue_source = np.clip(arr, 0.0, 1.0)
+    cmax = hue_source.max(axis=2)
+    cmin = hue_source.min(axis=2)
+    delta = cmax - cmin
+    safe = delta > 1e-6
+    r, g, b = hue_source[:, :, 0], hue_source[:, :, 1], hue_source[:, :, 2]
+    hue = np.zeros_like(cmax)
+    # Standard HSV hue (degrees), guarding the achromatic case.
+    rmax = safe & (cmax == r)
+    gmax = safe & (cmax == g) & ~rmax
+    bmax = safe & (cmax == b) & ~rmax & ~gmax
+    with np.errstate(invalid="ignore", divide="ignore"):
+        hue[rmax] = (60.0 * ((g - b)[rmax] / delta[rmax]) + 360.0) % 360.0
+        hue[gmax] = 60.0 * ((b - r)[gmax] / delta[gmax]) + 120.0
+        hue[bmax] = 60.0 * ((r - g)[bmax] / delta[bmax]) + 240.0
+    return hue
 
 
 def _apply_basic_srgb_adjustments(
@@ -889,9 +930,11 @@ class ImageEditor:
         )
         self._cached_u8_wb_lut: Optional[Tuple[Tuple[float, float], List[int]]] = None
 
-        # Mask subsystem — generic mask assets keyed by tool id
+        # Dodge & burn: stroke masks keyed by local layer id (the recipes
+        # live in current_edits["local_layers"]) and the preview thread's
+        # raster cache for them.
         self._mask_assets: Dict[str, MaskData] = {}
-        self._mask_raster_cache = MaskRasterCache()
+        self._local_density_cache = LayerDensityCache()
 
         # Rendering preferences pushed in from AppController config:
         # soft shoulder/toe on the levels ramp, and TPDF dither on 8-bit
@@ -926,7 +969,7 @@ class ImageEditor:
                 and self._cached_u8_lut is None
                 and self._cached_u8_wb_lut is None
                 and not self._mask_assets
-                and not self._mask_raster_cache
+                and not self._local_density_cache
             ):
                 return
             self.original_image = None
@@ -947,7 +990,7 @@ class ImageEditor:
             self._cached_u8_lut = None
             self._cached_u8_wb_lut = None
             self._mask_assets.clear()
-            self._mask_raster_cache.clear()
+            self._local_density_cache.clear()
 
     def set_source_exif(self, exif_bytes: Optional[bytes]):
         """Store EXIF bytes from the original source (e.g., paired JPEG).
@@ -958,9 +1001,11 @@ class ImageEditor:
         self._source_exif_bytes = exif_bytes
 
     def reset_edits(self):
-        """Reset edits to initial values and bump revision."""
+        """Reset edits (including dodge & burn layers) and bump revision."""
         with self._lock:
             self.current_edits = self._initial_edits()
+            self._mask_assets.clear()
+            self._local_density_cache.clear()
             self._edits_rev += 1
 
     def _initial_edits(self) -> Dict[str, Any]:
@@ -984,7 +1029,8 @@ class ImageEditor:
             "clarity": 0.0,
             "texture": 0.0,
             "straighten_angle": 0.0,
-            "darken_settings": None,  # DarkenSettings or None
+            # Dodge & burn layers; see faststack.imaging.local_adjust.
+            "local_layers": [],
             # Per-hue saturation bank (color mix); see _COLOR_MIX_BANDS.
             **{key: 0.0 for key in _COLOR_MIX_KEYS},
         }
@@ -993,87 +1039,6 @@ class ImageEditor:
     def tone_curve_version(edits: Dict[str, Any]) -> int:
         """Resolve a recipe consistently for preview, export and migration."""
         return _resolve_tone_curve_version(edits.get("tone_curve_version", 1))
-
-    @staticmethod
-    def _freeze_mask_identity_value(value: Any) -> Any:
-        """Freeze small edit-state values without scanning rendered pixels."""
-        if isinstance(value, dict):
-            return tuple(
-                sorted(
-                    (
-                        ImageEditor._freeze_mask_identity_value(key),
-                        ImageEditor._freeze_mask_identity_value(item),
-                    )
-                    for key, item in value.items()
-                )
-            )
-        if isinstance(value, (list, tuple)):
-            return tuple(
-                ImageEditor._freeze_mask_identity_value(item) for item in value
-            )
-        if isinstance(value, np.ndarray):
-            # Edit state should not contain pixel buffers. If a future tool adds
-            # one, its immutable object identity is still safer on the hot path
-            # than silently reintroducing an O(image-size) scan.
-            return ("array", id(value), value.shape, value.dtype.str)
-        if isinstance(value, float):
-            return round(value, 9)
-        return value
-
-    def _mask_render_identity(
-        self,
-        source: Any,
-        edits: Dict[str, Any],
-        *,
-        for_export: bool,
-        levels_soft_knee: bool,
-        downscale_long_edge: Optional[int],
-        detail_source_scale: float,
-        stage_stamps: tuple,
-    ) -> tuple:
-        """Identity of the immutable source and all pre-mask render inputs.
-
-        The resolved-mask cache must invalidate whenever the pre-darken image
-        could differ, and stay stable otherwise. Everything that can move those
-        pixels is enumerated here:
-
-        * the decoded source — ``session_id`` changes on every load and
-          ``_preview_master_generation`` on every preview-master rebuild, so a
-          recycled ``id()`` cannot alias a different buffer; ``current_mtime``
-          covers reload-in-place.
-        * every edit except ``darken_settings`` and ``vignette``, which are the
-          only pipeline stages at or after the darken step (19.5 and 20).
-          Rotation, straighten and crop are ordinary edit keys, so geometry —
-          the one group of content-*moving* rather than content-scaling
-          operations before the mask — is covered here too.
-        * the render parameters that change pixels without changing edits:
-          ``for_export`` (selects the export clipping/skip-linear branch),
-          ``levels_soft_knee``, ``downscale_long_edge`` and
-          ``detail_source_scale``.
-        * ``stage_stamps`` — see ``_render_cache_stamps``. Two renders with
-          identical edits can still differ where an upstream cache handed back
-          an approximate stage, so the stamps of any *reused* stage are part of
-          the identity.
-
-        Shape is not included because ``resolve_mask`` already keys on it.
-        """
-        upstream_edits = tuple(
-            (key, self._freeze_mask_identity_value(value))
-            for key, value in sorted(edits.items())
-            if key not in {"darken_settings", "vignette"}
-        )
-        return (
-            self.session_id,
-            id(source),
-            self._preview_master_generation,
-            self.current_mtime,
-            bool(for_export),
-            bool(levels_soft_knee),
-            downscale_long_edge,
-            round(float(detail_source_scale), 9),
-            stage_stamps,
-            upstream_edits,
-        )
 
     @staticmethod
     def _rotate_point_90_normalized(
@@ -1152,6 +1117,7 @@ class ImageEditor:
             and abs(_get_f("clarity")) <= 0.001
             and abs(_get_f("texture")) <= 0.001
             and abs(_get_f("sharpness")) <= 0.001
+            and not layers_use_keys(edits, LOCAL_LINEAR_KEYS)
         )
 
     @staticmethod
@@ -1165,6 +1131,7 @@ class ImageEditor:
         - No vignette (uses in-place ``arr *=``).
         - No geometry ops — rotation, straighten, crop create views/slices; later
           in-place ops on those views would mutate the backing array.
+        - No dodge & burn layers (their region is pasted back in place).
 
         All remaining sRGB-space ops (brightness, contrast, saturation, vibrance,
         levels) use reassignment (``arr = arr * factor``), which is safe.
@@ -1176,16 +1143,13 @@ class ImageEditor:
             except (ValueError, TypeError):
                 return 1.0  # Safe default: treat as "active" to skip optimization
 
-        darken = edits.get("darken_settings")
-        darken_active = darken is not None and getattr(darken, "enabled", False)
-
         return (
             ImageEditor._edits_skip_linear(edits)
             and abs(_get_f("vignette")) <= 0.001
             and edits.get("rotation", 0) == 0
             and abs(_get_f("straighten_angle")) <= 0.001
             and not edits.get("crop_box")
-            and not darken_active
+            and not effective_layers(edits)
         )
 
     def load_image(
@@ -1221,7 +1185,7 @@ class ImageEditor:
                 self._cached_rev = -1
                 # Clear mask state from previous image
                 self._mask_assets.clear()
-                self._mask_raster_cache.clear()
+                self._local_density_cache.clear()
             log.error("Image file not found: %s", filepath)
             return False
 
@@ -1241,7 +1205,7 @@ class ImageEditor:
             self._source_exif_bytes = source_exif
             # Clear mask state from previous image
             self._mask_assets.clear()
-            self._mask_raster_cache.clear()
+            self._local_density_cache.clear()
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
         _is_png = load_filepath.suffix.lower() == ".png"
@@ -1579,7 +1543,7 @@ class ImageEditor:
                 self._cached_highlight_analysis = None
                 self._cached_detail_bands = None
                 self._mask_assets.clear()
-                self._mask_raster_cache.clear()
+                self._local_density_cache.clear()
             return False
 
     def _rotate_float_image(
@@ -1651,15 +1615,13 @@ class ImageEditor:
         for_export: bool = False,
         levels_soft_knee_override: Optional[bool] = None,
         mask_assets_override: Optional[Dict[str, "MaskData"]] = None,
-        cache_override: Optional["MaskRasterCache"] = None,
+        cache_override: Optional["LayerDensityCache"] = None,
         cache_context: Optional[dict] = None,
         update_highlight_state: bool = True,
         downscale_long_edge: Optional[int] = None,
         detail_source_scale: float = 1.0,
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
-        stop_before_darken: bool = False,
-        render_state_out: Optional[Dict[str, Any]] = None,
         source_exact_u8: bool = False,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
@@ -1690,14 +1652,9 @@ class ImageEditor:
         sampled between expensive stages so idle refinement can yield when a
         newer edit revision arrives. Export callers never pass it.
 
-        ``stop_before_darken`` returns the authoritative content-analysis stage
-        used by the background-darkening mask. Overlay generation uses this
-        exact boundary so it cannot derive priors from a different edit stage.
-
-        ``render_state_out`` receives this render's ``mask_render_identity``.
-        Callers that stop before the darken step and resolve the mask
-        themselves need it, because the identity depends on which upstream
-        stages this particular render reused rather than recomputed.
+        ``mask_assets_override`` / ``cache_override`` supply the dodge & burn
+        stroke masks and their raster cache (export snapshots); by default the
+        live ``_mask_assets`` and the preview-thread cache are used.
         """
         cv2 = _get_cv2()
         if edits is None:
@@ -1891,6 +1848,27 @@ class ImageEditor:
         _mark("downscale")
         _check_cancelled()
 
+        # Dodge & burn: per-pixel recipe deltas at this render's resolution.
+        # Each stage below renders globally first; stages a layer touches are
+        # then re-rendered over the painted bounding box with per-pixel values.
+        local = None
+        if effective_layers(edits):
+            local = build_local_adjustments(
+                edits,
+                (
+                    mask_assets_override
+                    if mask_assets_override is not None
+                    else self._mask_assets
+                ),
+                arr.shape[:2],
+                (
+                    cache_override
+                    if cache_override is not None
+                    else self._local_density_cache
+                ),
+            )
+            _mark("local_masks")
+
         _skip_linear = self._edits_skip_linear(edits)
 
         # Detach from a shared input buffer before any tonal op can touch it.
@@ -1919,12 +1897,6 @@ class ImageEditor:
         # telemetry for the live clipping indicators, which the skip branch
         # computes from a 4x-strided view below. (_skip_linear is computed
         # above, before the protect_input check.)
-
-        # Stamps of any *reused* (and therefore possibly approximate) upstream
-        # stage, for _mask_render_identity(). None means "computed exactly from
-        # source + edits", which needs no identity of its own.
-        highlight_stage_stamp: Optional[tuple] = None
-        detail_stage_stamp: Optional[tuple] = None
 
         if for_export:
             log.debug("_apply_edits for_export: skip_linear=%s", _skip_linear)
@@ -2092,16 +2064,25 @@ class ImageEditor:
                         else:
                             self._cached_highlight_analysis = entry
 
-                # The state is measured from a 4x-strided view, and its cache
-                # key does not include resolution — so a hit across two render
-                # tiers hands back numbers this buffer would not have produced.
-                # It reaches pixels only through the highlights branch below.
-                if abs(highlights) > 0.001:
-                    highlight_stage_stamp = cached_analysis_shape
-
             if not for_export and update_highlight_state:
                 with self._lock:
                     self._last_highlight_state = analysis_state
+
+            # 6-7 (local). WB and exposure are pure gains, so painted pixels
+            # just take the ratio to the global gain. Applied after the
+            # highlight analysis so its cache stays valid across strokes.
+            if local is not None and local.has_any(LOCAL_GAIN_KEYS):
+                ratio = local_linear_gain_ratio(edits, local)
+                if ratio is not None:
+                    arr[local.roi] *= ratio
+
+            # 8 (local). Shadows depends on the pixel's own luminance, so keep
+            # the painted region's input to re-render it per pixel below.
+            local_shadows_in = (
+                arr[local.roi].copy()
+                if local is not None and "shadows" in local.maps
+                else None
+            )
 
             # 8. Highlights/Shadows - Using linear light and brightness-based processing
             if abs(highlights) > 0.001 or abs(shadows) > 0.001:
@@ -2114,6 +2095,24 @@ class ImageEditor:
                     edits=edits,
                     cache_context=cache_context,
                 )
+
+            if local_shadows_in is not None:
+                region = apply_local_shadows(
+                    local_shadows_in, local.value("shadows", shadows)
+                )
+                if abs(highlights) > 0.001:
+                    # Shadows runs before highlights inside the helper; the
+                    # analysis/headroom caches were primed by the call above.
+                    region = self._apply_highlights_shadows(
+                        region,
+                        highlights,
+                        0.0,
+                        srgb_u8_stride=srgb_u8_stride,
+                        analysis_state=analysis_state,
+                        edits=edits,
+                        cache_context=cache_context,
+                    )
+                arr[local.roi] = region
 
             _mark("linear_tone")
             _check_cancelled()
@@ -2151,6 +2150,10 @@ class ImageEditor:
 
                 # Check cache for detail bands (hash + frozen tuple verification)
                 detail_hash, detail_frozen = self._get_detail_upstream_hash(edits)
+                if local is not None and local.linear_identity:
+                    # Painted WB/exposure/shadows change the detail input.
+                    detail_frozen = detail_frozen + (local.linear_identity,)
+                    detail_hash = hash(detail_frozen)
                 detail_scale_key = round(detail_render_scale, 8)
                 Y20_cached = Y3_cached = Y1_cached = None
                 cache_hit = False
@@ -2295,23 +2298,6 @@ class ImageEditor:
                             self._cached_detail_bands = new_cache
                         cached_band_ids = new_cache["band_ids"]
 
-                # A band this render used is its stored array rescaled from the
-                # gain it was blurred at to the current one, so its identity
-                # plus the current exposure (already in the key) pins its value
-                # exactly. A freshly blurred band and a reused band that was
-                # blurred under the same conditions therefore agree, while a
-                # band carried across an exposure or highlights/shadows change
-                # — where the rescale is only an approximation — does not.
-                detail_stage_stamp = tuple(
-                    (name, cached_band_ids.get(name))
-                    for name, needed in (
-                        ("Y20", need_Y20),
-                        ("Y3", need_Y3),
-                        ("Y1", need_Y1),
-                    )
-                    if needed
-                )
-
                 # Build hierarchical pyramid bands (non-overlapping frequency ranges)
                 detail = np.zeros_like(Y)
 
@@ -2374,6 +2360,14 @@ class ImageEditor:
         # NOTE: All operations below must be non-mutating (use reassignment) when
         # _skip_linear=True and for_export=True to avoid corrupting self.float_image.
         # Vignette is excluded from the no-copy path because it uses in-place math.
+
+        # 14-19 (local). Keep the painted region's input; the whole sRGB block
+        # is re-rendered for it with per-pixel values after step 19.
+        local_srgb_in = (
+            arr[local.roi].copy()
+            if local is not None and local.has_any(LOCAL_SRGB_KEYS)
+            else None
+        )
 
         # 14-17. Common scalar sRGB adjustments. Export processes independent
         # row bands on a small scoped daemon pool; the save worker waits for
@@ -2453,28 +2447,7 @@ class ImageEditor:
             for key, (_name, center) in zip(_COLOR_MIX_KEYS, _COLOR_MIX_BANDS)
         ]
         if any(abs(v) > 0.001 for _c, v in color_mix_vals):
-            if cv2 is not None:
-                # Clip first: arr can hold out-of-[0,1] values here (headroom from
-                # earlier contrast/brightness overshoot), where HSV hue is
-                # ill-defined. np.clip also returns a C-contiguous copy, so no
-                # separate contiguity check is needed for cv2.cvtColor.
-                hue = cv2.cvtColor(np.clip(arr, 0.0, 1.0), cv2.COLOR_RGB2HSV)[:, :, 0]
-            else:
-                hue_source = np.clip(arr, 0.0, 1.0)
-                cmax = hue_source.max(axis=2)
-                cmin = hue_source.min(axis=2)
-                delta = cmax - cmin
-                safe = delta > 1e-6
-                r, g, b = hue_source[:, :, 0], hue_source[:, :, 1], hue_source[:, :, 2]
-                hue = np.zeros_like(cmax)
-                # Standard HSV hue (degrees), guarding the achromatic case.
-                rmax = safe & (cmax == r)
-                gmax = safe & (cmax == g) & ~rmax
-                bmax = safe & (cmax == b) & ~rmax & ~gmax
-                with np.errstate(invalid="ignore", divide="ignore"):
-                    hue[rmax] = (60.0 * ((g - b)[rmax] / delta[rmax]) + 360.0) % 360.0
-                    hue[gmax] = 60.0 * ((b - r)[gmax] / delta[gmax]) + 120.0
-                    hue[bmax] = 60.0 * ((r - g)[bmax] / delta[bmax]) + 240.0
+            hue = _hsv_hue_degrees(arr)
 
             factor = np.zeros(arr.shape[:2], dtype=np.float32)
             for center, value in color_mix_vals:
@@ -2506,72 +2479,16 @@ class ImageEditor:
 
         _check_cancelled()
 
-        # 19.5. Background Darkening (masked, after levels, before vignette)
-        mask_render_identity = self._mask_render_identity(
-            img_arr,
-            edits,
-            for_export=for_export,
-            levels_soft_knee=use_levels_soft_knee,
-            downscale_long_edge=downscale_long_edge,
-            detail_source_scale=detail_source_scale,
-            stage_stamps=(highlight_stage_stamp, detail_stage_stamp),
-        )
-        if render_state_out is not None:
-            render_state_out["mask_render_identity"] = mask_render_identity
-
-        if stop_before_darken:
-            return arr
-
-        darken = edits.get("darken_settings")
-        if darken is not None and getattr(darken, "enabled", False):
-            # Use override assets/cache if provided (export snapshot), else live state
-            _assets = (
-                mask_assets_override
-                if mask_assets_override is not None
-                else self._mask_assets
+        if local_srgb_in is not None:
+            region = apply_local_srgb_block(
+                local_srgb_in,
+                edits,
+                local,
+                levels_soft_knee=use_levels_soft_knee,
             )
-            _cache = (
-                cache_override
-                if cache_override is not None
-                else self._mask_raster_cache
-            )
-            mask_data = _assets.get(darken.mask_id)
-            if mask_data is not None and mask_data.has_strokes():
-                from faststack.imaging.mask_engine import resolve_mask
-                from faststack.imaging.masked_ops import apply_masked_darken
-
-                resolved = resolve_mask(
-                    mask_data,
-                    darken,
-                    arr,
-                    arr.shape[:2],
-                    edits,
-                    cache=_cache,
-                    image_key=mask_render_identity,
-                )
-                if render_state_out is not None:
-                    # Hand the overlay the mask this render actually applied,
-                    # rather than making it re-render the pre-darken stage to
-                    # resolve an equivalent one. Published read-only: the array
-                    # is shared with MaskRasterCache and, once emitted, with the
-                    # GUI thread. See models.ResolvedDarkenMask.
-                    try:
-                        resolved.flags.writeable = False
-                    except ValueError:  # pragma: no cover - non-owning array
-                        pass
-                    render_state_out["resolved_darken_mask"] = ResolvedDarkenMask(
-                        mask=resolved,
-                        width=resolved.shape[1],
-                        height=resolved.shape[0],
-                        mask_id=darken.mask_id,
-                        mask_revision=mask_data.revision,
-                    )
-                arr = apply_masked_darken(
-                    arr,
-                    resolved,
-                    darken_amount=darken.darken_amount,
-                    edge_protection=darken.edge_protection,
-                )
+            if np.may_share_memory(arr, img_arr):
+                arr = arr.copy()  # never write into a shared input buffer
+            arr[local.roi] = region
 
         _check_cancelled()
 
@@ -3484,9 +3401,6 @@ class ImageEditor:
             height=target_h,
             bytes_per_line=resized.strides[0],
             format=decoded.format,
-            # Display resizing does not re-resolve the mask; it stays at the
-            # tier that produced it and QML scales the overlay to fit.
-            darken_mask=decoded.darken_mask,
         )
 
     def _render_decoded_from_float(
@@ -3508,7 +3422,6 @@ class ImageEditor:
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
-        render_state: Dict[str, Any] = {}
         arr = self._apply_edits(
             base,
             edits=edits,
@@ -3518,7 +3431,6 @@ class ImageEditor:
             detail_source_scale=detail_source_scale,
             protect_input=protect_input,
             cancel_check=cancel_check,
-            render_state_out=render_state,
         )
         if cancel_check is not None and cancel_check():
             raise EditRenderCancelled
@@ -3572,8 +3484,6 @@ class ImageEditor:
             height=arr_u8.shape[0],
             bytes_per_line=arr_u8.strides[0],
             format=QImage.Format.Format_RGB888,
-            # Pixels and the mask applied to them travel together from here on.
-            darken_mask=render_state.get("resolved_darken_mask"),
         )
 
     def get_full_resolution_preview_data(
@@ -3781,6 +3691,21 @@ class ImageEditor:
         """Thread-safe retrieval of an edit parameter."""
         with self._lock:
             return self.current_edits.get(key, default)
+
+    def set_local_layers(self, layers: List[Dict[str, Any]]) -> None:
+        """Replace the dodge & burn layer list.
+
+        The list and its dicts are never mutated after this call (callers
+        build new ones), so shallow edit snapshots stay consistent.
+        """
+        with self._lock:
+            self.current_edits["local_layers"] = layers
+            self._edits_rev += 1
+
+    def touch_local_masks(self) -> None:
+        """Invalidate renders after a stroke change in ``_mask_assets``."""
+        with self._lock:
+            self._edits_rev += 1
 
     def set_edit_param(self, key: str, value: Any) -> bool:
         """Update a single edit parameter."""
@@ -4542,33 +4467,16 @@ class ImageEditor:
             # --- Edits (shallow dict copy) ---
             edits_snapshot = self.current_edits.copy()
 
-            # --- Deep-snapshot mutable darken state ---
-            # Always deepcopy DarkenSettings when present so the background
-            # thread never reads the live object (which the main thread can
-            # mutate, e.g. enabling/disabling or changing params).
-            ds = edits_snapshot.get("darken_settings")
-            if ds is not None:
-                edits_snapshot["darken_settings"] = copy.deepcopy(ds)
-                if getattr(ds, "enabled", False):
-                    live_mask = self._mask_assets.get(ds.mask_id)
-                    mask_snapshot = (
-                        copy.deepcopy(live_mask) if live_mask is not None else None
-                    )
-                    export_cache = MaskRasterCache()
-                else:
-                    # Darken disabled — record the absence explicitly so
-                    # save_from_snapshot does not fall back to live assets.
-                    mask_snapshot = None
-                    export_cache = None
-            else:
-                mask_snapshot = None
-                export_cache = None
-
-            mask_assets_snapshot = {
-                key: copy.deepcopy(mask)
-                for key, mask in self._mask_assets.items()
-                if mask is not None
-            }
+            # --- Dodge & burn stroke masks ---
+            # Deep copies, minus any half-painted stroke, so the save worker
+            # never reads MaskData the GUI thread is still painting into.
+            mask_assets_snapshot = {}
+            for key, mask in self._mask_assets.items():
+                if mask is None:
+                    continue
+                mask_copy = copy.deepcopy(mask)
+                mask_copy.live_stroke = None
+                mask_assets_snapshot[key] = mask_copy
 
             # --- Paths ---
             filepath_snapshot = self.current_filepath
@@ -4581,16 +4489,10 @@ class ImageEditor:
             levels_soft_knee = bool(self.levels_soft_knee)
             export_dither = bool(self.export_dither)
 
-        # Build mask override dict.  When darken is present but disabled (or
-        # has no mask), provide an empty dict so _apply_edits uses it instead
-        # of falling back to the live self._mask_assets.
-        ds_snap = edits_snapshot.get("darken_settings")
-        if ds_snap is not None:
-            mask_override = (
-                {ds_snap.mask_id: mask_snapshot} if mask_snapshot is not None else {}
-            )
-        else:
-            mask_override = None
+        # Always an explicit dict, so the export never falls back to the live
+        # self._mask_assets; a fresh raster cache keeps it off the preview's.
+        mask_override = mask_assets_snapshot
+        export_cache = LayerDensityCache()
 
         original_path = save_target_path if save_target_path else filepath_snapshot
 

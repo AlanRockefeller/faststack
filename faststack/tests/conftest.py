@@ -3,9 +3,19 @@ import faulthandler
 import os
 import signal
 import sys
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# Point the app data dir (config INI, session records, logs) at a throwaway
+# directory before any faststack module is imported, so the suite never reads
+# or overwrites the developer's real ~/.faststack or %APPDATA%\faststack.
+# get_app_data_dir() skips candidates that don't exist yet, so create it.
+_TEST_APP_DATA = tempfile.mkdtemp(prefix="faststack-test-appdata-")
+os.makedirs(os.path.join(_TEST_APP_DATA, "faststack"), exist_ok=True)
+os.environ["APPDATA"] = _TEST_APP_DATA
+os.environ.pop("LOCALAPPDATA", None)
 
 
 def _dump_usr2(signum, frame):

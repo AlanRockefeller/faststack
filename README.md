@@ -18,7 +18,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Instant Navigation:** Sub-10ms next/previous image switching, high performance decoding via `PyTurboJPEG`.
 - **Drag & Drop:** Drag images to external applications. Press { and } to batch files to drag & drop multiple images.
 - **Image Editor:** Built-in editor with exposure, contrast, white balance, sharpness, and more (E key)
-- **Background Darkening:** Mask-based background darkening tool (K key) with smart edge detection, subject protection, and multiple modes. Paint rough background hints and the tool refines them into natural-looking dark backgrounds.
+- **Dodge & Burn:** Paint any compact-editor slider (exposure, contrast, shadows, white balance, vibrance, color mix…) onto part of the photo (Shift+D). Each stroke adds one coat, so overlapping strokes build up; strokes are kept as layers you can re-edit, hide, or delete.
 - **Quick Auto Adjust:** Press `l` for quick auto-levels, `L` for auto white balance + auto-levels together, `A` for auto white balance, `-`/`_` to keep adjusting the highlight/white side in 14-point steps, and `=`/`+` to adjust the shadow/black side in 7-point steps. These update the live in-memory edit session immediately and save once when you navigate away, start a drag, or explicitly save. Auto-levels treats its clip threshold as a budget (a few already-clipped specular pixels won't disable the stretch), brightens underexposed midtones toward a configurable target, and rolls off stretched highlights smoothly instead of hard-clipping them. Auto white balance analyzes only the cropped area, fades its correction when the scene lacks reliable neutrals, and damps magenta/green corrections so foliage isn't mistaken for a color cast. The midtone target, channel clip budget, highlight rolloff, export dithering, and tint correction strength are all adjustable in Settings.
 - **Photoshop / Gimp Integration:** Edit current image in Photoshop or Gimp (P key) - always uses RAW files when available.
 - **Image Filtering:** Filter images by filename
@@ -129,7 +129,8 @@ python -m faststack.app [options] [image_dir]
 ```
 
 - `image_dir`: Optional directory of images to open. If omitted, FastStack uses
-  the configured default directory or prompts for one.
+  the default directory set in Settings, else the last folder you had open,
+  else prompts for one.
 - `--loupe`: Start directly in single-image loupe view and skip the initial
   thumbnail grid refresh for faster startup on large folders.
 - `--debug`: Enable verbose debug logging and timing information.
@@ -168,7 +169,7 @@ faststack "C:\path\to\photos"
 - `Left Arrow`: Previous Image
 - `Shift+Right Arrow`: Jump forward 10 images in loupe view
 - `Shift+Left Arrow`: Jump back 10 images in loupe view
-- `K`: Mask-based background darkening (smart edge detection, subject protection, multiple modes)
+- `Shift+D`: Dodge & burn brush in the compact editor. Sliders set the brush recipe; left-drag paints, right/Alt-drag erases, `[`/`]` brush size, Space+drag pans, Ctrl+Z undoes a stroke, `M` (or hold Ctrl) shows the mask, Esc leaves brush mode
 - `G`: Jump to Image Number
 - `I`: Show EXIF Data
 - `F11`: Toggle Fullscreen (Loupe View)

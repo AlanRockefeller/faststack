@@ -102,15 +102,6 @@ Window {
             // Note: Editor closes automatically via _on_save_finished callback
         }
     }
-    Shortcut {
-        sequence: "K"
-        context: Qt.WindowShortcut
-        enabled: !discardDialog.opened
-        onActivated: {
-            if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.toggle_darken_mode()
-        }
-    }
-
     Dialog {
         id: discardDialog
         title: "Discard Edits?"
@@ -486,28 +477,6 @@ Window {
                     ListElement { name: "Vignette"; key: "vignette"; reverse: false; min: 0; max: 100 }
                 }
                 Repeater { model: effectsModel; delegate: editSlider }
-
-                Button {
-                    id: darkenModeButton
-                    text: "Darken Background (K)"
-                    Layout.fillWidth: true
-                    font.pixelSize: 12
-                    onClicked: {
-                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.toggle_darken_mode()
-                    }
-                    contentItem: Text {
-                        text: darkenModeButton.text
-                        font: darkenModeButton.font
-                        color: (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isDarkening) ? "white" : imageEditorDialog.textColor
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                    background: Rectangle {
-                        color: (imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.isDarkening) ? imageEditorDialog.accentColor : (darkenModeButton.down ? "#40ffffff" : "#20ffffff")
-                        radius: 4
-                        border.color: darkenModeButton.hovered ? "#60ffffff" : "transparent"
-                    }
-                }
 
                 Loader { sourceComponent: sectionSeparator }
 
