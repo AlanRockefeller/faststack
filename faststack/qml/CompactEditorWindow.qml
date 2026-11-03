@@ -1256,6 +1256,7 @@ Window {
                 ListElement { name: "Exposure"; key: "exposure"; min: -100; max: 100 }
                 ListElement { name: "Brightness"; key: "brightness"; min: -100; max: 100 }
                 ListElement { name: "Contrast"; key: "contrast"; min: -100; max: 100 }
+                ListElement { name: "Highlights"; key: "highlights"; min: -100; max: 100 }
                 ListElement { name: "Whites"; key: "whites"; min: -100; max: 100 }
                 ListElement { name: "Shadows"; key: "shadows"; min: -100; max: 100 }
                 ListElement { name: "Blacks"; key: "blacks"; min: -100; max: 100 }

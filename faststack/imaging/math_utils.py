@@ -149,11 +149,6 @@ def _apply_headroom_shoulder(x: np.ndarray, max_overshoot: float = 0.05) -> np.n
     return out
 
 
-# Constants for chroma rolloff
-_CHROMA_ROLLOFF_START = 0.85
-_CHROMA_ROLLOFF_WIDTH = 0.15
-
-
 # Precomputed thresholds for JPEG clipping detection in linear space
 # These correspond to sRGB u8 values 250, 253, 254 converted to linear
 _LINEAR_THRESHOLD_250 = ((250.0 / 255.0 + 0.055) / 1.055) ** 2.4  # ~0.871
@@ -246,150 +241,245 @@ def _analyze_highlight_state(
     }
 
 
-def _lerp(a: float, b: float, t: float) -> float:
-    """Linear interpolation between a and b by t (clamped 0-1)."""
-    t_clamped = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-    return a + (b - a) * t_clamped
+# ----------------------------
+# Highlights: edge-aware local tone mapping
+# ----------------------------
+#
+# A global tone curve cannot recover highlight detail: to darken the bright
+# band it must flatten its slope there, which compresses exactly the tonal
+# differences that carry the detail (petal veins, cloud texture). Instead the
+# brightness is split into a smooth, edge-preserving *base* (the illumination
+# of each bright region) and the *detail* riding on it. Only the base is
+# compressed, so a bright region gets darker as a whole while the texture
+# inside keeps its full amplitude -- plus a mild boost to make it read on
+# screen. This is the same base/detail approach as raw converters' Highlights
+# slider.
+#
+# All of it runs on a perceptual brightness ``p = sqrt(v)`` (gamma 2, close to
+# how JPEG codes are spaced), where ``v`` mixes luminance and the max channel
+# so saturated colours near clipping count as bright. The result goes back to
+# RGB as one gain per pixel, which keeps hue and saturation.
+
+# Perceptual base level where the effect begins (about sRGB 0.45). The curve
+# deviates quadratically from identity, so the onset is very gentle.
+HIGHLIGHT_PIVOT = 0.45
+# At -100 a base at display white (p = 1.0) comes down to 1.0 - this.
+_HIGHLIGHT_WHITE_DROP = 0.20
+# Over-white (exposure headroom) is pulled down until the brightest 0.5% of
+# the base lands here; reached by -50 so moderate settings tame the clipping.
+_HIGHLIGHT_HEADROOM_TARGET = 0.95
+# Detail amplitude gain inside bright regions at -100, and the soft limit on
+# how large a deviation counts as "detail" (larger ones pass through unboosted).
+_HIGHLIGHT_DETAIL_BOOST = 0.6
+_HIGHLIGHT_DETAIL_LIMIT = 0.08
+# Positive slider: base expansion strength at +100.
+_HIGHLIGHT_BOOST_GAIN = 0.45
+# Edge-aware base: guided-filter coefficients are solved on a small copy (so
+# preview and export see the same regions) and applied at full resolution.
+_HIGHLIGHT_BASE_LONG_EDGE = 768
+_HIGHLIGHT_BASE_RADIUS_FRAC = 0.012
+_HIGHLIGHT_BASE_EPS = 0.006
+
+_LUMA_709 = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 
-def _highlight_recover_linear(
+def _highlight_brightness(rgb_linear: np.ndarray) -> np.ndarray:
+    """Linear highlight brightness: mean of Rec.709 luminance and max channel."""
+    cv2 = get_cv2()
+    if (
+        cv2 is not None
+        and rgb_linear.dtype == np.float32
+        and rgb_linear.flags.c_contiguous
+    ):
+        luma = cv2.transform(rgb_linear, _LUMA_709.reshape(1, 3))
+        # Channel max as a row reduction over (pixels, 3): several times
+        # faster than splitting the channels first.
+        peak = cv2.reduce(rgb_linear.reshape(-1, 3), 1, cv2.REDUCE_MAX)
+        v = cv2.addWeighted(luma, 0.5, peak.reshape(luma.shape), 0.5, 0.0)
+    else:
+        r = rgb_linear[..., 0]
+        g = rgb_linear[..., 1]
+        b = rgb_linear[..., 2]
+        # ndarray.max(axis=2) is an order of magnitude slower than this on
+        # interleaved float32 images.
+        v = np.maximum(np.maximum(r, g), b).astype(np.float32)
+        v += r * _LUMA_709[0] + g * _LUMA_709[1] + b * _LUMA_709[2]
+        v *= np.float32(0.5)
+    np.maximum(v, 0.0, out=v)
+    return v
+
+
+def _box_mean(arr: np.ndarray, radius: int) -> np.ndarray:
+    """Mean over a (2r+1)^2 window with reflected borders."""
+    cv2 = get_cv2()
+    k = 2 * radius + 1
+    if cv2 is not None:
+        return cv2.boxFilter(arr, -1, (k, k), borderType=cv2.BORDER_REFLECT)
+    padded = np.pad(arr, radius, mode="symmetric").astype(np.float64)
+    c = np.cumsum(np.cumsum(padded, axis=0), axis=1)
+    c = np.pad(c, ((1, 0), (1, 0)))
+    h, w = arr.shape
+    total = c[k : k + h, k : k + w] - c[:h, k : k + w] - c[k : k + h, :w] + c[:h, :w]
+    return (total / (k * k)).astype(np.float32)
+
+
+def _resize_2d(arr: np.ndarray, size: tuple, *, shrink: bool) -> np.ndarray:
+    """Resize a float32 plane to ``size`` = (width, height)."""
+    cv2 = get_cv2()
+    if cv2 is not None:
+        interp = cv2.INTER_AREA if shrink else cv2.INTER_LINEAR
+        return cv2.resize(arr, size, interpolation=interp)
+    from PIL import Image
+
+    resample = Image.Resampling.BOX if shrink else Image.Resampling.BILINEAR
+    img = Image.fromarray(np.ascontiguousarray(arr, dtype=np.float32), mode="F")
+    return np.asarray(img.resize(size, resample=resample), dtype=np.float32)
+
+
+def compute_highlight_base(rgb_linear: np.ndarray) -> tuple:
+    """Edge-aware base layer for the Highlights slider.
+
+    Returns ``(p, base, headroom)``: the perceptual brightness ``p``, its
+    edge-preserving smooth ``base`` (both H x W float32), and ``headroom``,
+    the 99.5th percentile of the base (> 1.0 when exposure pushed whole
+    regions past display white).
+
+    The self-guided filter keeps strong edges (a branch against the sky) in
+    the base, so compressing the base does not halo, while fine texture is
+    left in ``p - base``. Its coefficients are solved at a fixed small size
+    and upsampled -- a "fast guided filter" -- which keeps the regions the
+    same for the preview and the full-resolution export.
+    """
+    p = np.sqrt(_highlight_brightness(rgb_linear))
+    h, w = p.shape
+    scale = max(1.0, max(h, w) / _HIGHLIGHT_BASE_LONG_EDGE)
+    small_size = (max(1, round(w / scale)), max(1, round(h / scale)))
+    small = _resize_2d(p, small_size, shrink=True) if scale > 1.0 else p
+    radius = max(1, round(_HIGHLIGHT_BASE_RADIUS_FRAC * max(small.shape)))
+    mean = _box_mean(small, radius)
+    var = np.maximum(_box_mean(small * small, radius) - mean * mean, 0.0)
+    a = var / (var + np.float32(_HIGHLIGHT_BASE_EPS))
+    b = mean - a * mean
+    a = _box_mean(a, radius)
+    b = _box_mean(b, radius)
+
+    small_base = a * small + b
+    flat = small_base.ravel()
+    k = min(flat.size - 1, int(flat.size * 0.995))
+    headroom = float(np.partition(flat, k)[k]) if flat.size else 1.0
+
+    if scale > 1.0:
+        a = _resize_2d(a, (w, h), shrink=False)
+        b = _resize_2d(b, (w, h), shrink=False)
+    # Reuse the upsampled coefficient buffer for the full-resolution base.
+    a *= p
+    a += b
+    return p, a, headroom
+
+
+def _highlight_compress_strength(amount, headroom: float):
+    """Rational-curve strength ``c`` for a recovery amount in [0, 1]."""
+    span = 1.0 - HIGHLIGHT_PIVOT
+    c_white = 1.0 / (span - _HIGHLIGHT_WHITE_DROP) - 1.0 / span
+    c = amount * c_white
+    excess = headroom - HIGHLIGHT_PIVOT
+    target = _HIGHLIGHT_HEADROOM_TARGET - HIGHLIGHT_PIVOT
+    if excess > target:
+        c_head = (excess / target - 1.0) / excess
+        c = np.maximum(c, np.minimum(2.0 * amount, 1.0) * c_head)
+    return c
+
+
+def apply_highlight_tone(
     rgb_linear: np.ndarray,
-    amount: float,
-    *,
-    pivot: float = 0.7,
-    k: float = 8.0,
-    chroma_rolloff: float = 0.15,
-    headroom_ceiling: float = 1.0,
+    amount,
+    base: np.ndarray,
+    headroom: float = 1.0,
+    p: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Apply highlight recovery using brightness-based rescaling to preserve hue.
-
-    Why brightness-based rescale?
-    - Per-channel compression causes hue/chroma shifts (e.g., bright red becomes pink).
-    - By computing a single brightness metric and rescaling all channels equally,
-      we preserve the original RGB color ratios (hue and relative saturation).
-
-    The curve keeps normal whites bright, avoids changing midtones, and rolls
-    over values above display white into visible highlight range instead of
-    crushing them toward the pivot.
+    """Apply the Highlights slider in linear light.
 
     Args:
-        rgb_linear: Float32 RGB array (H, W, 3) in linear light, may have values > 1.0
-        amount: Recovery strength 0.0-1.0 (mapped from slider -100 to 0)
-        pivot: Brightness threshold below which no recovery occurs
-        k: Compression factor for values above display white.
-        chroma_rolloff: Desaturation amount in extreme highlights (0-1)
-        headroom_ceiling: Estimated source headroom used to size the over-white shoulder
+        rgb_linear: (H, W, 3) float32 linear RGB, may exceed 1.0.
+        amount: Slider value in [-1, 1] (negative recovers), either a scalar
+            or an (H, W) per-pixel map for brushed adjustments.
+        base: Edge-aware base from ``compute_highlight_base`` for these
+            pixels (a crop of the full-image base is fine).
+        headroom: Base headroom level from ``compute_highlight_base``.
+        p: Perceptual brightness of ``rgb_linear`` if already computed.
 
     Returns:
-        Recovered float32 RGB array (linear)
+        New float32 linear RGB array.
     """
-    amount = float(np.clip(amount, 0.0, 1.0))
-    if amount < 0.001:
+    scalar = np.ndim(amount) == 0
+    if scalar:
+        amount = float(np.clip(amount, -1.0, 1.0))
+        if abs(amount) <= 0.001:
+            return rgb_linear
+    else:
+        amount = np.clip(np.asarray(amount, dtype=np.float32), -1.0, 1.0)
+        amount = np.broadcast_to(amount, base.shape)
+
+    if p is None:
+        p = np.sqrt(_highlight_brightness(rgb_linear))
+
+    # Every term below scales with the base's height over the pivot, so
+    # only pixels in regions above it change. They are usually a minority:
+    # work on just those and leave the rest untouched.
+    active = base > np.float32(HIGHLIGHT_PIVOT)
+    n_active = int(np.count_nonzero(active))
+    if n_active == 0:
         return rgb_linear
+    if n_active < active.size // 2:
+        idx = np.flatnonzero(active)
+        amount_px = amount if scalar else amount.ravel()[idx]
+        gain = _highlight_gain(p.ravel()[idx], base.ravel()[idx], amount_px, headroom)
+        out = np.array(rgb_linear, dtype=np.float32, order="C")
+        flat = out.reshape(-1, 3)
+        flat[idx] *= gain[:, None]
+        return out
+    gain = _highlight_gain(p, base, amount, headroom)
+    out = rgb_linear * gain[..., None]
+    return out.astype(np.float32, copy=False)
 
-    eps = 1e-7
-    pivot = float(np.clip(pivot, 0.0, 0.95))
-    headroom_ceiling = max(float(headroom_ceiling), 1.0)
-    overwhite_k = max(float(k), eps)
 
-    # Use max-channel as brightness metric - handles saturated highlights better than luminance
-    brightness = rgb_linear.max(axis=2)
+def _highlight_gain(p: np.ndarray, base: np.ndarray, amount, headroom: float):
+    """Per-pixel linear gain for ``apply_highlight_tone`` (any matching shapes)."""
+    t = np.maximum(base - np.float32(HIGHLIGHT_PIVOT), 0.0)
+    amount = np.asarray(amount, dtype=np.float32)
+    recover = np.maximum(-amount, 0.0)
+    boost = np.maximum(amount, 0.0)
+    any_recover = bool(np.any(recover > 0.001))
 
-    # The old rational curve moved display white near the pivot at full strength,
-    # which made recovered highlights look dull. Use a bounded shoulder instead:
-    # 1. Below display white, subtract a small smooth rolloff that is strongest
-    #    at white and zero at the pivot.
-    # 2. Above display white, compress exposure/headroom overshoot back below
-    #    clipping while keeping tonal separation.
-    normal_range = max(1.0 - pivot, eps)
-    white_drop = min(0.20, normal_range * 0.45) * amount
-    target_at_white = 1.0 - white_drop
-
-    highlight_mask = _smoothstep01((brightness - pivot) / normal_range)
-    target_brightness = brightness - white_drop * highlight_mask
-
-    overwhite_mask = brightness > 1.0
-    if np.any(overwhite_mask):
-        excess = brightness[overwhite_mask] - 1.0
-        retained_excess = (
-            excess * (1.0 - amount) / (1.0 + overwhite_k * amount * excess)
+    # Base tone curve over the pivot, as a shift to add. Recovery uses
+    # t / (1 + c t): identity slope at the pivot, smoothly flattening, and
+    # bounded so any amount of headroom lands below white. Boost uses
+    # t (1 + c t), its mirror image.
+    shift = np.zeros_like(t)
+    if any_recover:
+        c = np.asarray(
+            _highlight_compress_strength(recover, headroom), dtype=np.float32
         )
-        headroom_span = min(max(headroom_ceiling - 1.0, 0.0), 2.0)
-        visible_span = white_drop * (1.0 + 0.25 * headroom_span)
-        shoulder_width = 0.25 + 0.35 * (1.0 - amount) + 0.10 * headroom_span
-        visible_excess = visible_span * excess / (excess + shoulder_width + eps)
-        overwhite_target = target_at_white + retained_excess + visible_excess
-        target_brightness[overwhite_mask] = np.minimum(
-            overwhite_target,
-            brightness[overwhite_mask],
-        )
+        shift -= c * t * t / (1.0 + c * t)
+    if np.any(boost > 0.001):
+        shift += np.float32(_HIGHLIGHT_BOOST_GAIN) * boost * t * t
 
-    # Rescale RGB to preserve hue/chroma
-    # Protect against div-by-zero or huge scale factors for near-black pixels
-    scale = np.clip(target_brightness / (brightness + eps), 0.0, 2.0)
-    scale = np.expand_dims(scale, axis=2)
-    recovered = rgb_linear * scale
+    # Pixels much darker than their region (a twig against the sky) keep
+    # most of their level instead of being pushed toward black.
+    shift *= _smoothstep01((p - np.float32(0.15)) / np.float32(0.45))
 
-    # Optional chroma rolloff in extreme highlights to reduce "neon" colors
-    if chroma_rolloff > 0.001:
-        # Use target_brightness (post-compression) for the mask to maintain monotonicity
-        # Normalize against headroom_ceiling for consistent behavior
-        extreme_mask = _smoothstep01(
-            (target_brightness - _CHROMA_ROLLOFF_START * headroom_ceiling)
-            / (_CHROMA_ROLLOFF_WIDTH * headroom_ceiling)
-        )
-        extreme_mask = np.expand_dims(extreme_mask, axis=2)
+    p_new = p + shift
+    if any_recover:
+        weight = _smoothstep01(t / np.float32(1.0 - HIGHLIGHT_PIVOT))
+        # Soft-limit the deviation (rational, cheaper than tanh) so only
+        # texture-scale detail is amplified, not real edges.
+        detail = p - base
+        detail /= 1.0 + np.abs(detail) * np.float32(1.0 / _HIGHLIGHT_DETAIL_LIMIT)
+        p_new += np.float32(_HIGHLIGHT_DETAIL_BOOST) * recover * weight * detail
+    np.maximum(p_new, 0.0, out=p_new)
 
-        # Compute grayscale (luminance) of recovered image
-        gray = (
-            recovered[:, :, 0:1] * 0.2126
-            + recovered[:, :, 1:2] * 0.7152
-            + recovered[:, :, 2:3] * 0.0722
-        )
-
-        # Desaturate in extreme highlights
-        # Note: This preserves monotonicity because both recovered and gray are
-        # monotonic with respect to input brightness, and we blend between them.
-        desat_amount = chroma_rolloff * amount * extreme_mask
-        recovered = recovered * (1.0 - desat_amount) + gray * desat_amount
-
-    return recovered
-
-
-def _highlight_boost_linear(
-    rgb_linear: np.ndarray,
-    amount: float,
-    *,
-    pivot: float = 0.5,
-) -> np.ndarray:
-    """Apply highlight boost using brightness-based rescaling to preserve hue.
-
-    Uses same hue-preserving approach as recovery for symmetry.
-
-    Args:
-        rgb_linear: Float32 RGB array (H, W, 3) in linear light
-        amount: Boost strength 0.0-1.0 (mapped from slider 0 to 100)
-        pivot: Brightness threshold below which minimal boost occurs
-
-    Returns:
-        Boosted float32 RGB array (linear)
-    """
-    if amount < 0.001:
-        return rgb_linear
-
-    eps = 1e-7
-
-    brightness = rgb_linear.max(axis=2)
-
-    # Build mask for highlights
-    mask = _smoothstep01((brightness - pivot) / (1.0 - pivot + eps))
-
-    # Target brightness: lift with curve
-    target_brightness = brightness * (1.0 + amount * 1.5 * mask)
-
-    # Rescale RGB to preserve hue, cap scale at 1.5x to prevent blowout
-    scale = np.clip(target_brightness / (brightness + eps), 0.0, 2.0)
-    scale = np.minimum(scale, 1.5)  # Direct cap on scale
-    scale = np.expand_dims(scale, axis=2)
-
-    return rgb_linear * scale
+    # Back to linear as a gain on brightness (p is its square root).
+    v = p * p
+    return np.divide(
+        p_new * p_new, v, out=np.ones_like(v), where=v > np.float32(1e-8)
+    )

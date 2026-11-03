@@ -36,15 +36,14 @@ from faststack.imaging.mask_engine import LayerDensityCache
 from faststack.imaging.math_utils import (
     _analyze_highlight_state,
     _apply_headroom_shoulder,
-    _highlight_boost_linear,
-    _highlight_recover_linear,
-    _lerp,
     _linear_to_srgb,
     _linear_to_srgb_fast,
     _smoothstep01,
     _srgb_to_linear,
     _srgb_to_linear_fast,
     _srgb_u8_exact_to_linear,
+    apply_highlight_tone,
+    compute_highlight_base,
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
@@ -573,39 +572,6 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
         return None
 
 
-# ----------------------------
-# sRGB ↔ Linear Conversion Helpers
-# ----------------------------
-
-
-# Constants for Highlight Recovery
-
-# Highlight Compression Curve
-HEADROOM_COMPRESSION_STEEPNESS = 2.0
-
-# Adaptive Parameters (tuned by image content analysis)
-# Pivot: Linear-light brightness where recovery starts to take hold. The effect
-# tapers in smoothly (smoothstep) from zero at the pivot to full at display
-# white, so a low pivot widens the affected band across all bright pixels
-# (Photoshop-style) while still leaving midtones near the pivot essentially
-# untouched. linear 0.30/0.50 ≈ sRGB 0.58/0.74.
-ADAPTIVE_PIVOT_MIN = 0.30
-ADAPTIVE_PIVOT_MAX = 0.50
-
-# K Factor: Steepness of the over-white compression shoulder
-ADAPTIVE_K_BASE = 8.0
-ADAPTIVE_K_SCALING = 4.0
-ADAPTIVE_K_HEADROOM_BASE = 8.0
-ADAPTIVE_K_HEADROOM_SCALING = 4.0
-
-# Chroma Rolloff: Desaturation in extreme highlights
-ADAPTIVE_ROLLOFF_MIN = 0.02
-ADAPTIVE_ROLLOFF_MAX = 0.12
-
-# Analysis Safety
-HEADROOM_MAX_BRIGHTNESS_PERCENTILE = 99.5
-
-
 def _gaussian_blur_float(arr: np.ndarray, radius: float) -> np.ndarray:
     """Apply Gaussian Blur to a float32 array using OpenCV.
 
@@ -907,13 +873,9 @@ class ImageEditor:
         # Timestamp of the currently loaded file (for cache invalidation)
         self.current_mtime: float = 0.0
 
-        # Caching for expensive percentile calculation in highlight recovery.
-        # Stores: {'hash': int, 'frozen': tuple, 'max_brightness': float}. Keyed
-        # on _get_upstream_edits_hash() rather than _edits_rev, because the
-        # input to highlight recovery only depends on geometry/WB/exposure
-        # (plus file/mtime), not on the highlights slider itself — moving
-        # just that slider must not invalidate this cache.
-        self._cached_max_brightness_state: Optional[Dict[str, Any]] = None
+        # Clipping/headroom telemetry for the editor's indicators, keyed on
+        # _get_upstream_edits_hash() (geometry/WB/exposure plus file/mtime) so
+        # moving tone sliders does not recompute it.
         self._cached_highlight_analysis: Optional[Dict[str, Any]] = None
 
         # Cache for luma detail bands (pyramid blur decomposition)
@@ -965,7 +927,6 @@ class ImageEditor:
                 and self._last_highlight_state is None
                 and self._cached_highlight_analysis is None
                 and self._cached_detail_bands is None
-                and self._cached_max_brightness_state is None
                 and self._cached_u8_lut is None
                 and self._cached_u8_wb_lut is None
                 and not self._mask_assets
@@ -986,7 +947,6 @@ class ImageEditor:
             self._last_highlight_state = None  # Explicit reset
             self._cached_highlight_analysis = None
             self._cached_detail_bands = None
-            self._cached_max_brightness_state = None
             self._cached_u8_lut = None
             self._cached_u8_wb_lut = None
             self._mask_assets.clear()
@@ -1539,7 +1499,6 @@ class ImageEditor:
                 self._edits_rev += 1
                 self._cached_preview = None
                 self._cached_rev = -1
-                self._cached_max_brightness_state = None
                 self._cached_highlight_analysis = None
                 self._cached_detail_bands = None
                 self._mask_assets.clear()
@@ -1953,16 +1912,11 @@ class ImageEditor:
             _check_cancelled()
 
         if not _skip_linear:
-            # Capture strided view for analysis ONLY if needed
-            # We need analysis if:
-            # 1. We are in preview (not for_export) -> To show UI indicators.
-            # 2. OR if we have highlights/shadows active -> To drive adaptive params.
-
+            # The clipping/headroom analysis only feeds the editor's UI
+            # indicators, so exports skip it.
             highlights = float(edits.get("highlights", 0.0))
             shadows = float(edits.get("shadows", 0.0))
-            should_analyze = (not for_export) or (
-                abs(highlights) > 0.001 or abs(shadows) > 0.001
-            )
+            should_analyze = not for_export
 
             arr_stride = None
             srgb_u8_stride = None
@@ -2076,41 +2030,42 @@ class ImageEditor:
                 if ratio is not None:
                     arr[local.roi] *= ratio
 
-            # 8 (local). Shadows depends on the pixel's own luminance, so keep
-            # the painted region's input to re-render it per pixel below.
-            local_shadows_in = (
-                arr[local.roi].copy()
-                if local is not None and "shadows" in local.maps
-                else None
-            )
+            # 8. Shadows, then Highlights (edge-aware local tone mapping).
+            #
+            # Both depend on each pixel's own brightness, so painted layers
+            # re-render their region per pixel: keep the ROI's input from
+            # before the first stage the layers touch.
+            local_shadows = local is not None and "shadows" in local.maps
+            local_highlights = local is not None and "highlights" in local.maps
+            local_tone_in = arr[local.roi].copy() if local_shadows else None
 
-            # 8. Highlights/Shadows - Using linear light and brightness-based processing
-            if abs(highlights) > 0.001 or abs(shadows) > 0.001:
-                arr = self._apply_highlights_shadows(
-                    arr,
-                    highlights,
-                    shadows,
-                    srgb_u8_stride=srgb_u8_stride,  # Pass if we need to recompute analysis
-                    analysis_state=analysis_state,
-                    edits=edits,
-                    cache_context=cache_context,
-                )
+            arr = self._apply_shadows_linear(arr, shadows)
+            if local_highlights and local_tone_in is None:
+                local_tone_in = arr[local.roi].copy()
 
-            if local_shadows_in is not None:
-                region = apply_local_shadows(
-                    local_shadows_in, local.value("shadows", shadows)
-                )
+            highlights_active = abs(highlights) > 0.001 or local_highlights
+            if highlights_active:
+                # The base layer is solved over the whole frame, so a painted
+                # region sees the same regions (and no seam at its edge).
+                hl_p, hl_base, hl_headroom = compute_highlight_base(arr)
                 if abs(highlights) > 0.001:
-                    # Shadows runs before highlights inside the helper; the
-                    # analysis/headroom caches were primed by the call above.
-                    region = self._apply_highlights_shadows(
+                    arr = apply_highlight_tone(
+                        arr, highlights, hl_base, hl_headroom, p=hl_p
+                    )
+                del hl_p
+
+            if local_tone_in is not None:
+                region = local_tone_in
+                if local_shadows:
+                    region = apply_local_shadows(
+                        region, local.value("shadows", shadows)
+                    )
+                if highlights_active:
+                    region = apply_highlight_tone(
                         region,
-                        highlights,
-                        0.0,
-                        srgb_u8_stride=srgb_u8_stride,
-                        analysis_state=analysis_state,
-                        edits=edits,
-                        cache_context=cache_context,
+                        local.value("highlights", highlights),
+                        hl_base[local.roi],
+                        hl_headroom,
                     )
                 arr[local.roi] = region
 
@@ -3772,208 +3727,42 @@ class ImageEditor:
                 return True
             return False
 
+    @staticmethod
+    def _apply_shadows_linear(arr: np.ndarray, shadows: float) -> np.ndarray:
+        """Shadows slider in linear light: gain below mid-gray luminance."""
+        if abs(shadows) <= 0.001:
+            return arr
+        lum = arr[:, :, 0] * 0.2126 + arr[:, :, 1] * 0.7152 + arr[:, :, 2] * 0.0722
+        lum = np.clip(lum, 1e-10, None)
+        shadow_mask = _smoothstep01(1.0 - lum / 0.18)  # 0.18 = linear mid-gray
+        shadow_factor = 1.0 + (shadows * 0.5) * shadow_mask
+        return arr * np.expand_dims(shadow_factor, axis=2)
+
     def _apply_highlights_shadows(
         self,
         linear: np.ndarray,
         highlights: float,
         shadows: float,
-        *,
-        srgb_u8_stride: Optional[np.ndarray] = None,
-        analysis_state: Optional[Dict[str, float]] = None,
-        edits: Optional[Dict[str, Any]] = None,
-        cache_context: Optional[dict] = None,
     ) -> np.ndarray:
-        """Apply highlights and shadows adjustments using brightness-based processing in linear light.
+        """Apply Shadows, then Highlights, to a linear-light RGB array.
 
-        Highlights slider semantics:
-        - Negative (e.g., -100): Compress bright regions, recover detail if headroom exists.
-          Uses brightness-based rescaling to preserve hue/chroma.
-        - Positive (e.g., +100): Lift highlights (brighten bright areas).
-
-        For JPEG (no headroom): Applies perceptual rolloff + optional desaturation
-        (artistic fallback) to simulate recovery of micro-contrast.
+        Highlights is an edge-aware local tone operator (see
+        ``math_utils.compute_highlight_base``): negative values darken bright
+        regions while keeping -- and mildly boosting -- the texture inside
+        them; positive values brighten them.
 
         Args:
-            linear: Float32 RGB array (H, W, 3) in linear light, may have values > 1.0
+            linear: Float32 RGB array (H, W, 3) in linear light, may exceed 1.0
             highlights: -1.0 to 1.0, negative recovers highlights, positive boosts
             shadows: -1.0 to 1.0, positive lifts shadows, negative crushes
-            srgb_u8_stride: Optional uint8 sRGB array (strided) for accurate JPEG clipping detection
-                     (should be the image BEFORE linearization)
-            analysis_state: Optional pre-computed analysis state to avoid re-work.
 
         Returns:
             Adjusted float32 RGB array (linear)
         """
-        arr = linear
-
-        # Analyze highlight state if needed
-        # If caller passed analysis_state, usage that.
-        state = analysis_state
-        if state is None:
-            # Re-compute locally if not provided
-            # We assume srgb_u8_stride is ALREADY STRIDED if passed
-            arr_stride = arr[::4, ::4, :]
-            # If srgb_u8_stride was passed, use it directly (it's already small).
-            # If it wasn't passed, we can't easily recreate the source state here without the original source buffer.
-            # But the caller (_apply_edits) usually provides it.
-            state = _analyze_highlight_state(arr_stride, srgb_u8=srgb_u8_stride)
-
-        # Ensure we have edits dict to check upstream hash
-        if edits is None:
-            # Fallback to current_edits if not provided (cached preview path passes it)
-            # But access under lock to be safe from modifications
-            with self._lock:
-                edits = self.current_edits.copy()
-
-        # We DO NOT update self._last_highlight_state here to avoid race/staleness during export.
-        # The preview path in _apply_edits handles the UI state update.
-
-        # --- Shadows Adjustment (unchanged approach) ---
-        if abs(shadows) > 0.001:
-            # Compute luminance for shadow mask
-            lum = arr[:, :, 0] * 0.2126 + arr[:, :, 1] * 0.7152 + arr[:, :, 2] * 0.0722
-            lum = np.clip(lum, 1e-10, None)
-
-            pivot = 0.18  # Mid-gray in linear
-            shadow_mask = _smoothstep01(1.0 - lum / pivot)
-
-            shadow_adj = shadows * 0.5
-            shadow_factor = 1.0 + shadow_adj * shadow_mask
-            shadow_factor = np.expand_dims(shadow_factor, axis=2)
-            arr = arr * shadow_factor
-
-        # --- Highlights Adjustment (new brightness-based approach) ---
+        arr = self._apply_shadows_linear(linear, shadows)
         if abs(highlights) > 0.001:
-            headroom_pct = state["headroom_pct"]
-
-            # Use specific keys from new analysis logic
-            # source_clipped_pct: True JPEG flat-top clipping
-            # current_nearwhite_pct: Current brightness distribution near 1.0
-            clipped_pct = state.get("source_clipped_pct", state.get("clipped_pct", 0.0))
-            near_white_pct = state.get(
-                "current_nearwhite_pct", state.get("near_white_pct", 0.0)
-            )
-
-            if highlights < 0:
-                # Negative: compress/recover highlights
-                amount = -highlights  # 0 to 1
-
-                # Adaptive parameters based on headroom and clipping
-                # More clipping (source) → later pivot (only affect very top end)
-                pivot = _lerp(ADAPTIVE_PIVOT_MIN, ADAPTIVE_PIVOT_MAX, clipped_pct)
-
-                # k increases with near_white_pct (recoverable micro-contrast)
-                # BUT also increase k when headroom exists for stronger compression
-                k = ADAPTIVE_K_BASE + ADAPTIVE_K_SCALING * near_white_pct
-                if headroom_pct > 0.01:
-                    k = max(
-                        k,
-                        ADAPTIVE_K_HEADROOM_BASE
-                        + ADAPTIVE_K_HEADROOM_SCALING * headroom_pct,
-                    )  # Stronger k for headroom
-
-                # More clipping → more chroma rolloff
-                chroma_rolloff = _lerp(
-                    ADAPTIVE_ROLLOFF_MIN, ADAPTIVE_ROLLOFF_MAX, clipped_pct
-                )
-
-                # Headroom ceiling: preserve some tonal separation above 1.0
-                # Robustify: use percentile to ignore hot pixels, clamped to valid range
-                if headroom_pct > 0.01:
-                    # Check cache for max_brightness
-                    # Compute hash of upstream params
-                    current_hash, current_frozen = self._get_upstream_edits_hash(edits)
-
-                    max_brightness = 1.0
-                    hit = False
-                    with self._lock:
-                        cached = (
-                            cache_context.get("max_brightness_state")
-                            if cache_context is not None
-                            else self._cached_max_brightness_state
-                        )
-                        if (
-                            cached
-                            and cached.get("hash") == current_hash
-                            and cached.get("frozen") == current_frozen
-                        ):
-                            max_brightness = cached["value"]
-                            hit = True
-
-                    if not hit:
-                        # Use 99.5th percentile of max-channel brightness to avoid hot pixels
-                        max_rgb = arr.max(axis=2)
-                        if max_rgb.size > 0:
-                            # Optimize: Use much coarser stride and np.partition for speed
-                            # We only need an estimate for headroom, so we don't need high precision
-                            # Stride ::10 reduces data by 100x vs full, 6x faster than ::4
-                            view = max_rgb[::10, ::10]
-                            if view.size > 0:
-                                # np.partition is O(N) vs np.percentile O(N log N)
-                                # We want 99.5th percentile roughly.
-                                # Index for 99.5% = size * 0.995 => size - (size * 0.005)
-                                k_index = int(view.size * 0.995)
-                                # Clamp to valid range
-                                k_index = min(max(0, k_index), view.size - 1)
-
-                                partitioned = np.partition(view.flatten(), k_index)
-                                max_brightness = float(partitioned[k_index])
-                            else:
-                                max_brightness = 1.0
-                        else:
-                            max_brightness = 1.0
-
-                        with self._lock:
-                            entry = {
-                                "hash": current_hash,
-                                "frozen": current_frozen,
-                                "value": max_brightness,
-                            }
-                            if cache_context is not None:
-                                cache_context["max_brightness_state"] = entry
-                            else:
-                                self._cached_max_brightness_state = entry
-
-                    # Clamp to avoid crazy values from single hot pixels or artifacts
-                    max_brightness = min(max_brightness, 100.0)
-
-                    if max_brightness > 1.0:
-                        # Preserve some headroom detail, reduced by amount
-                        headroom_ceiling = 1.0 + (max_brightness - 1.0) * 0.3 * (
-                            1.0 - amount * 0.7
-                        )
-                        pivot = min(pivot, 0.5 + 0.25 * (1.0 - headroom_pct))
-                    else:
-                        headroom_ceiling = 1.0
-                else:
-                    headroom_ceiling = 1.0
-
-                # JPEG fallback: when near_white is high but clipping is low,
-                # nudge pivot earlier to expose micro-contrast (Photoshop-like feel)
-                if headroom_pct < 0.01:
-                    if near_white_pct > 0.05 and clipped_pct < 0.05:
-                        # Lots of recoverable near-white, not much flat clipping:
-                        # nudge the pivot earlier so the broad highlight band is
-                        # engaged, floored low enough to keep covering ordinary
-                        # bright pixels rather than just the clipped top end.
-                        pivot = max(0.28, pivot - 0.12 * near_white_pct)
-                    if clipped_pct > 0.02:
-                        # Increase chroma rolloff for flat-clipped JPEGs
-                        chroma_rolloff = max(chroma_rolloff, 0.14)
-
-                arr = _highlight_recover_linear(
-                    arr,
-                    amount,
-                    pivot=pivot,
-                    k=k,
-                    chroma_rolloff=chroma_rolloff,
-                    headroom_ceiling=headroom_ceiling,
-                )
-            else:
-                # Positive: boost highlights (hue-preserving)
-                amount = highlights  # 0 to 1
-                arr = _highlight_boost_linear(arr, amount, pivot=0.5)
-
+            p, base, headroom = compute_highlight_base(arr)
+            arr = apply_highlight_tone(arr, highlights, base, headroom, p=p)
         return arr
 
     def set_crop_box(self, crop_box: Tuple[int, int, int, int]):

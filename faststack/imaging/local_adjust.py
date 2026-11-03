@@ -53,6 +53,7 @@ LOCAL_ADJUST_KEYS: Tuple[str, ...] = (
     "brightness",
     "contrast",
     "whites",
+    "highlights",
     "shadows",
     "blacks",
     "white_balance_by",
@@ -64,7 +65,7 @@ LOCAL_ADJUST_KEYS: Tuple[str, ...] = (
 # Recipe keys rendered in linear light (pipeline steps 6-8); the rest are
 # sRGB-stage keys (steps 14-19).
 LOCAL_GAIN_KEYS = frozenset({"white_balance_by", "white_balance_mg", "exposure"})
-LOCAL_LINEAR_KEYS = LOCAL_GAIN_KEYS | {"shadows"}
+LOCAL_LINEAR_KEYS = LOCAL_GAIN_KEYS | {"shadows", "highlights"}
 LOCAL_SRGB_KEYS = frozenset(LOCAL_ADJUST_KEYS) - LOCAL_LINEAR_KEYS
 
 _EPS = 1e-6
@@ -270,7 +271,7 @@ def local_linear_gain_ratio(
 
 
 def apply_local_shadows(arr: np.ndarray, shadows: np.ndarray) -> np.ndarray:
-    """Per-pixel mirror of the shadows half of ``_apply_highlights_shadows``."""
+    """Per-pixel mirror of ``ImageEditor._apply_shadows_linear``."""
     from faststack.imaging.math_utils import _smoothstep01
 
     lum = arr[:, :, 0] * 0.2126 + arr[:, :, 1] * 0.7152 + arr[:, :, 2] * 0.0722

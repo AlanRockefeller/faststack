@@ -224,8 +224,9 @@ The editor applies a _live, non-destructive_ session on top of the current
 image: nothing is written to disk until you save. The panel shows a live
 histogram (overlay or per-channel R/G/B) and grouped adjustments:
 
-- **Light** — Exposure, Contrast, Whites, Shadows, Blacks (the full editor
-  also adds Brightness and Highlights).
+- **Light** — Exposure, Brightness, Contrast, Highlights, Whites, Shadows,
+  Blacks. Lowering Highlights darkens bright areas while keeping the detail
+  inside them.
 - **Color** — Temp (Blue/Yellow), Tint (Green/Magenta), and Vibrance (the full
   editor adds Saturation, Clarity, Texture, Sharpness, Vignette, and more).
 - **Auto** buttons next to each group apply auto-levels or auto white balance.

@@ -16971,6 +16971,7 @@ class AppController(QObject):
             "brightness": ("Bri", 1.0),
             "contrast": ("Con", 0.5),
             "whites": ("Wht", 2.0),
+            "highlights": ("Hi", 1.0),
             "shadows": ("Shd", 1.0),
             "blacks": ("Blk", 1.0),
             "white_balance_by": ("Temp", 1.0),
