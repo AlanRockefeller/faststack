@@ -2672,6 +2672,19 @@ class UIState(QObject):
         if hasattr(self.app_controller, "grid_navigate_to"):
             self.app_controller.grid_navigate_to(path)
 
+    @Slot(str, result="QVariantMap")
+    def gridInspectFolderForDelete(self, path: str) -> dict:
+        """Check whether a grid folder is empty enough to offer deletion."""
+        if hasattr(self.app_controller, "grid_inspect_folder_for_delete"):
+            return self.app_controller.grid_inspect_folder_for_delete(path)
+        return {"deletable": False}
+
+    @Slot(str, "QVariantList")
+    def gridDeleteFolder(self, path: str, expectedItems: list):
+        """Delete an empty / almost-empty folder shown in the grid."""
+        if hasattr(self.app_controller, "grid_delete_folder"):
+            self.app_controller.grid_delete_folder(path, list(expectedItems or []))
+
     @Slot()
     def gridClearSelection(self):
         """Clear all selections in grid view."""

@@ -73,6 +73,10 @@ from faststack.models import (
     EntryMetadata,
     ResolvedDarkenMask,
 )
+from faststack.io.folder_delete import (
+    delete_inspected_folder,
+    inspect_folder_for_delete,
+)
 from faststack.io.indexer import (
     find_images,
     find_images_with_variants,
@@ -8928,6 +8932,36 @@ class AppController(QObject):
 
         # Notify UI state via signal
         self.ui_state.isGridViewActiveChanged.emit(active)
+
+    def grid_inspect_folder_for_delete(self, path: str) -> dict:
+        """Report whether a grid folder is empty / almost empty (no images)."""
+        folder_path = Path(path)
+        if (
+            self._thumbnail_model
+            and folder_path.parent != self._thumbnail_model.current_directory
+        ):
+            # Only child folders of the grid's directory (never "..").
+            return {"deletable": False, "reason": "not a child folder"}
+        return inspect_folder_for_delete(folder_path).to_qml()
+
+    def grid_delete_folder(self, path: str, expected_items: list) -> None:
+        """Delete a folder previously reported deletable by the inspector."""
+        folder_path = Path(path)
+        if (
+            self._thumbnail_model
+            and folder_path.parent != self._thumbnail_model.current_directory
+        ):
+            log.warning("Refusing to delete non-child folder %s", path)
+            return
+        error = delete_inspected_folder(
+            folder_path, [str(item) for item in expected_items]
+        )
+        if error:
+            self.update_status_message(error, timeout=6000, color="#FFD54F")
+        else:
+            self.update_status_message(f"Deleted folder {folder_path.name}")
+        if self._thumbnail_model and self._is_grid_view_active:
+            self._thumbnail_model.refresh()
 
     def grid_navigate_to(self, path: str):
         """Navigate to a folder in grid view.

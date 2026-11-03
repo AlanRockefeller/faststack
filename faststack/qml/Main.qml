@@ -2230,6 +2230,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;Space: Toggle selection on current image<br>" +
                           "&nbsp;&nbsp;Click: Open image in single view<br>" +
                           "&nbsp;&nbsp;Right-click / Ctrl+Click: Toggle selection<br>" +
+                          "&nbsp;&nbsp;Right-click empty folder: Delete empty folder<br>" +
                           "&nbsp;&nbsp;Shift+Click: Select range<br>" +
                           "&nbsp;&nbsp;B: Add selected images to batch<br>" +
                           "&nbsp;&nbsp;Delete/Backspace: Delete selected or cursor image<br>" +

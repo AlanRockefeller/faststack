@@ -5,6 +5,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 ## 1.7.0 (2026-10-29)
 
 - When in crop mode, you can now toggle the grid visibility.  Nice for lining things up / keeping edges equal.
+- In the thumbnail grid, right-click an empty folder to delete it. Folders with no images but a few small leftover files (like faststack.json) can be deleted too - FastStack lists what is in them and asks first. Folders with images show no menu.
 
 ## 1.6.9 (2026-09-12)
 
