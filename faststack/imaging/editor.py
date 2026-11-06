@@ -969,6 +969,7 @@ class ImageEditor:
         self._edits_rev = 0
         self._cached_rev = -1
         self._cached_preview = None
+        self._render_cache_generation = 0
 
         # Bit depth of the loaded image (8 or 16)
         self.bit_depth: int = 8
@@ -3465,6 +3466,7 @@ class ImageEditor:
                     else None
                 )
                 rev = self._edits_rev
+                cache_generation = self._render_cache_generation
 
         if cached is not None:
             return self._resize_decoded_for_display(cached, output_size)
@@ -3492,6 +3494,7 @@ class ImageEditor:
                 edits_override is None
                 and downscale_long_edge is None
                 and self._edits_rev == rev
+                and self._render_cache_generation == cache_generation
             ):
                 self._cached_preview = decoded
                 self._cached_rev = rev
@@ -3922,6 +3925,7 @@ class ImageEditor:
     def invalidate_render_cache(self) -> None:
         """Discard rendered pixels without recording a user edit."""
         with self._lock:
+            self._render_cache_generation += 1
             self._cached_preview = None
             self._cached_rev = -1
 

@@ -23,9 +23,7 @@ def test_every_visible_quality_choice_responds_to_click():
     }
     assert set(choice_ids) == set(expected)
 
-    wiring = "\n".join(
-        line for line in page.splitlines() if line.startswith('$("pick')
-    )
+    wiring = "\n".join(line for line in page.splitlines() if line.startswith('$("pick'))
     app = QCoreApplication.instance() or QCoreApplication([])
     assert app is not None
     engine = QJSEngine()
@@ -64,9 +62,7 @@ def test_every_visible_quality_choice_responds_to_click():
 def _relative_luminance(color: str) -> float:
     channels = [int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)]
     linear = [
-        channel / 12.92
-        if channel <= 0.04045
-        else ((channel + 0.055) / 1.055) ** 2.4
+        channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
         for channel in channels
     ]
     return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]

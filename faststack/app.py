@@ -14707,6 +14707,9 @@ class AppController(QObject):
                         Path(meta_path_str),
                         completed_edit_state_request_id=ctx.get("save_request_id"),
                         saved_edit_state=saved_edit_state,
+                        clear_saved_edit_state=not bool(
+                            ctx.get("save_has_meaningful_edits", True)
+                        ),
                     )
                     self._forget_pending_edit_save_request(
                         ctx.get("save_image_key"), ctx.get("save_request_id")
