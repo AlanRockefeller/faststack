@@ -25,6 +25,7 @@ ApplicationWindow {
     property var savedWindowGeometry: ({})
     property bool windowGeometryReady: false
     property bool suppressWindowGeometrySave: false
+    property bool histogramOverlaidMode: true
 
     Settings {
         id: mainWindowSettings
@@ -40,6 +41,13 @@ ApplicationWindow {
         property real savedWidth: -1
         property real savedHeight: -1
         property bool savedMaximized: false
+    }
+
+    // One live owner for both histogram views. Separate Settings objects that
+    // target the same key do not receive each other's changes.
+    Settings {
+        category: "histogram"
+        property alias overlaidMode: root.histogramOverlaidMode
     }
 
     function enterFullScreenLoupe() {
@@ -99,9 +107,10 @@ ApplicationWindow {
         // (falling back to the current screen). Using root.screen alone would
         // pull a window restored onto a secondary monitor back to the primary,
         // because root.screen is the primary until the window is mapped.
-        var screen = WP.screenContaining(Application.screens, root.x, root.y)
-                     || root.screen
-        WP.clampToScreen(root, screen, {
+        var geometry = root.controllerRef
+                     ? root.controllerRef.available_screen_geometry(root.x, root.y)
+                     : null
+        WP.clampToScreen(root, geometry, {
             minWidth: root.minimumWidth,
             minHeight: root.minimumHeight
         })
@@ -126,9 +135,15 @@ ApplicationWindow {
             // First run: center on the active screen rather than pinning the
             // window to (0, 0). Retry after showing in case no screen was
             // available yet.
-            var centered = WP.centerOnScreen(root, root.screen)
+            var geometry = root.controllerRef
+                         ? root.controllerRef.available_screen_geometry(root.x, root.y)
+                         : null
+            var centered = WP.centerOnScreen(root, geometry)
             root.visible = true
-            if (!centered) WP.centerOnScreen(root, root.screen)
+            if (!centered && root.controllerRef) {
+                geometry = root.controllerRef.available_screen_geometry(root.x, root.y)
+                WP.centerOnScreen(root, geometry)
+            }
             root.clampWindowToVisibleScreen(true)
             // Persist the initial centered placement so the next launch
             // restores it instead of treating geometry as unsaved.
@@ -2245,7 +2260,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;{: Begin new batch<br>" +
                           "&nbsp;&nbsp;B: Toggle current image in/out of batch<br>" +
                           "&nbsp;&nbsp;}: End current batch<br>" +
-                          "&nbsp;&nbsp;\\: Clear all batches<br><br>" +
+                          "&nbsp;&nbsp;|: Clear all batches<br><br>" +
                           "<b>Flag Toggles:</b><br>" +
                           "&nbsp;&nbsp;D: Toggle todo flag<br>" +
                           "&nbsp;&nbsp;F: Toggle favorite flag<br>" +
@@ -2406,6 +2421,7 @@ ApplicationWindow {
 
     HistogramWindow {
         id: histogramWindow
+        histogramModeOwner: root
         windowBackgroundColor: root.currentBackgroundColor
         primaryTextColor: root.currentTextColor
         gridLineColor: root.isDarkTheme ? "#454545" : "#dcdcdc"
@@ -2440,6 +2456,7 @@ ApplicationWindow {
         onLoaded: {
             item.backgroundColor = Qt.binding(function() { return root.currentBackgroundColor })
             item.textColor = Qt.binding(function() { return root.currentTextColor })
+            item.histogramModeOwner = root
             Qt.callLater(function() { imageEditorLoader.loadedOnce = true })
         }
     }

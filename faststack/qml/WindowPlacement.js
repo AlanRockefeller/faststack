@@ -4,33 +4,18 @@
 // All functions are pure: they operate on the window/screen objects passed in
 // so the same persistence policy lives in one place.
 
-// Return the ScreenInfo from `screens` (Application.screens) whose geometry
-// contains the given virtual-desktop point, or null if the point is off every
-// screen (e.g. a monitor that was unplugged since the geometry was saved).
-function screenContaining(screens, px, py) {
-    if (!screens) return null
-    for (var i = 0; i < screens.length; i++) {
-        var s = screens[i]
-        if (px >= s.virtualX && px < s.virtualX + s.width
-                && py >= s.virtualY && py < s.virtualY + s.height) {
-            return s
-        }
-    }
-    return null
-}
-
-// Clamp `win`'s geometry so it fits within `screen`'s available area. `opts`
+// Clamp `win`'s geometry so it fits within `geometry`'s available area. `opts`
 // may define minWidth, maxWidth, minHeight, maxHeight; any omitted bound is
-// ignored. Clamping against an explicit screen (rather than win.screen) lets
-// callers keep a window on the monitor its saved coordinates fall on, even
-// before the window has been mapped.
-function clampToScreen(win, screen, opts) {
-    if (!screen) return
+// ignored. The geometry comes from QScreen.availableGeometry(), because QML's
+// desktopAvailableWidth/Height describe the whole virtual desktop rather than
+// the selected physical screen.
+function clampToScreen(win, geometry, opts) {
+    if (!geometry) return
 
-    var screenX = screen.virtualX
-    var screenY = screen.virtualY
-    var screenWidth = screen.desktopAvailableWidth
-    var screenHeight = screen.desktopAvailableHeight
+    var screenX = geometry.x
+    var screenY = geometry.y
+    var screenWidth = geometry.width
+    var screenHeight = geometry.height
     if (screenWidth <= 0 || screenHeight <= 0) return
 
     opts = opts || {}
@@ -56,11 +41,11 @@ function clampToScreen(win, screen, opts) {
 
 // Center `win` on `screen`'s available area. Returns false if no screen is
 // available yet (caller can retry after the window is shown).
-function centerOnScreen(win, screen) {
-    if (!screen) return false
-    var availW = screen.desktopAvailableWidth
-    var availH = screen.desktopAvailableHeight
-    win.x = screen.virtualX + Math.max(0, Math.round((availW - win.width) / 2))
-    win.y = screen.virtualY + Math.max(0, Math.round((availH - win.height) / 2))
+function centerOnScreen(win, geometry) {
+    if (!geometry) return false
+    var availW = geometry.width
+    var availH = geometry.height
+    win.x = geometry.x + Math.max(0, Math.round((availW - win.width) / 2))
+    win.y = geometry.y + Math.max(0, Math.round((availH - win.height) / 2))
     return true
 }

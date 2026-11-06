@@ -480,6 +480,21 @@ class AppController(QObject):
 
     MAX_FAILED_RESTORATIONS_TO_LOG = 10
 
+    @Slot(float, float, result="QVariantMap")
+    def available_screen_geometry(self, x: float, y: float) -> dict[str, int]:
+        """Return one screen's usable geometry for a virtual-desktop point."""
+        point = QPoint(round(x), round(y))
+        screen = QGuiApplication.screenAt(point) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return {}
+        geometry = screen.availableGeometry()
+        return {
+            "x": geometry.x(),
+            "y": geometry.y(),
+            "width": geometry.width(),
+            "height": geometry.height(),
+        }
+
     @staticmethod
     def _key(p: Optional[Path]) -> Optional[str]:
         """Normalize path for consistent comparison without slow resolve()."""

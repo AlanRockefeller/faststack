@@ -5,7 +5,6 @@ import QtQuick.Controls 2.15
 import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
-import QtCore
 
 Window {
     id: imageEditorDialog
@@ -13,15 +12,13 @@ Window {
     height: 820
     property var uiStateRef: null
     property var controllerRef: null
+    property var histogramModeOwner: null
+    readonly property bool histogramOverlaidMode: histogramModeOwner
+                                                   ? histogramModeOwner.histogramOverlaidMode
+                                                   : true
     title: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.editorFilename ? "Image Editor - " + imageEditorDialog.uiStateRef.editorFilename + " (" + imageEditorDialog.uiStateRef.editorBitDepth + "-bit)" : "Image Editor"
     visible: imageEditorDialog.uiStateRef ? (imageEditorDialog.uiStateRef.isEditorOpen && imageEditorDialog.uiStateRef.isEditorExpanded) : false
     flags: Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
-    Settings {
-        id: histSettings
-        category: "histogram"
-        property bool overlaidMode: true
-    }
-
     property int updatePulse: 0
     property color backgroundColor: "#1e1e1e" // Default dark background
     property color textColor: "white" // Default text color
@@ -35,6 +32,15 @@ Window {
     readonly property color controlBg: "#10ffffff"
     readonly property color controlBorder: "#30ffffff"
     readonly property color separatorColor: "#20ffffff"
+    readonly property bool darkTheme: imageEditorDialog.uiStateRef
+                                      ? imageEditorDialog.uiStateRef.theme === 0
+                                      : true
+    readonly property color sliderTrackColor: darkTheme ? "#2e2e2e" : "#d9d6d2"
+    readonly property color sliderTrackBorderColor: darkTheme ? "#383838" : "#aaa5a1"
+    readonly property color sliderHandleColor: darkTheme ? "#e8e6e3" : "#3f3b39"
+    readonly property color sliderHandleBorderColor: darkTheme ? "#5a5755" : "#7a7470"
+    readonly property color sliderValueColor: darkTheme ? "#e8e6e3" : "#292624"
+    readonly property color sliderZeroValueColor: darkTheme ? "#9a9591" : "#6b6764"
 
     Component.onCompleted: {
         imageEditorDialog.uiStateRef = uiState
@@ -219,8 +225,11 @@ Window {
                 HistogramModeToggle {
                     Layout.fillWidth: true
                     Layout.topMargin: 8
-                    overlaidMode: histSettings.overlaidMode
-                    onModeRequested: (overlaid) => histSettings.overlaidMode = overlaid
+                    overlaidMode: imageEditorDialog.histogramOverlaidMode
+                    onModeRequested: (overlaid) => {
+                        if (imageEditorDialog.histogramModeOwner)
+                            imageEditorDialog.histogramModeOwner.histogramOverlaidMode = overlaid
+                    }
                 }
 
                 // Histogram display (overlaid or 3-channel)
@@ -230,7 +239,7 @@ Window {
 
                     OverlaidHistogram {
                         anchors.fill: parent
-                        visible: histSettings.overlaidMode
+                        visible: imageEditorDialog.histogramOverlaidMode
                         rData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["r"] || []) : []
                         gData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["g"] || []) : []
                         bData: imageEditorDialog.uiStateRef && imageEditorDialog.uiStateRef.histogramData ? (imageEditorDialog.uiStateRef.histogramData["b"] || []) : []
@@ -245,7 +254,7 @@ Window {
 
                     RowLayout {
                         anchors.fill: parent
-                        visible: !histSettings.overlaidMode
+                        visible: !imageEditorDialog.histogramOverlaidMode
                         spacing: 5
 
                         SingleChannelHistogram {
@@ -797,8 +806,8 @@ Window {
                     Rectangle {
                         anchors.fill: parent
                         radius: 3
-                        color: "#2e2e2e"
-                        border.color: "#383838"
+                        color: imageEditorDialog.sliderTrackColor
+                        border.color: imageEditorDialog.sliderTrackBorderColor
                         border.width: 1
                     }
 
@@ -828,8 +837,9 @@ Window {
                      width: 12
                      height: 12
                      radius: 6
-                     color: "#e8e6e3"
-                     border.color: slider.pressed ? imageEditorDialog.accentColor : "#5a5755"
+                     color: imageEditorDialog.sliderHandleColor
+                     border.color: slider.pressed ? imageEditorDialog.accentColor
+                                                  : imageEditorDialog.sliderHandleBorderColor
                      border.width: 1
                      
                      // Glow/Scale effect on hover
@@ -854,7 +864,8 @@ Window {
                 verticalAlignment: Text.AlignVCenter
                 font.family: "IBM Plex Mono"
                 font.pixelSize: 11
-                color: displayValue === 0 ? "#6b6764" : "#e8e6e3"
+                color: displayValue === 0 ? imageEditorDialog.sliderZeroValueColor
+                                         : imageEditorDialog.sliderValueColor
 
                 MouseArea {
                     anchors.fill: parent
