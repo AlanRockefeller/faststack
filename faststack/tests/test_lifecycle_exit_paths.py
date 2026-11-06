@@ -230,8 +230,9 @@ def test_recycle_bin_exit_choices_honour_the_veto(window, action):
 
     assert window.property("prepareCalls") == 1, "recycle-bin exit bypassed the flush"
     assert not _closed(window)
-    # The bin decision is remembered, so the prompt does not reappear.
-    assert window.property("allowCloseWithRecycleBins") is True
+    # The choice only bypasses the prompt for this close attempt. A save veto
+    # must restore the prompt for the next attempt.
+    assert window.property("allowCloseWithRecycleBins") is False
     assert window.property("dialogCloseCalls") == 1
 
 

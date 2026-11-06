@@ -4,6 +4,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 
 ## 1.7.0 (2026-11-06)
 
+- Added Python 3.14 support. Release builds are now tested and packaged with Python 3.14.8.
 - New stack paint brush for in-camera focus stacks (the "... stacked.JPG" files Olympus / OM cameras make). Press "Stack" in the compact editor and paint one of the photos the stack was made from back over the stacked result - handy for bringing back a clean background, or fixing halos and smeared spots the camera's stacking left behind. The little dropdown next to the button picks which photo to paint from: 1 is the one focused closest, and it starts on the one focused furthest back. "S: Stack output" paints the stacked photo itself back over anything you painted before. FastStack lines each photo up with the stack automatically (the camera crops and enlarges them a little differently each time), so the painted parts fit in without seams. While you hover, the brush circle shows exactly what a click would paint. Any slider changes you make apply to the painted parts too, and dodge & burn works on top. Right-drag or Alt-drag puts the stack back. The button is grey when the photo is not an in-camera stack or its input JPGs can't be found - FastStack looks in the same stack input folders Restack uses, and next to the stacked photo.
 - The "Dodge & Burn" button is now just "Burn" to make room for "Stack".
 - In both brushes you can now pan by dragging with the middle mouse button, as well as with Space+drag.

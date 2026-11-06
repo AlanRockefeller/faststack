@@ -3290,6 +3290,10 @@ class AppController(QObject):
                         color="#FFD54F",
                     )
                 return False
+        # This synchronous snapshot is newer than any watcher scan already in
+        # flight. Invalidate those results before publishing it so an older
+        # worker cannot overwrite the refreshed list when it finishes later.
+        self._index_scan_epoch += 1
         self._all_images = images
         self._variant_map = variant_map
         self._apply_filter_to_cached_list(notify=notify)
@@ -3380,11 +3384,14 @@ class AppController(QObject):
         The list rebuild repairs current_index; this also primes decoding and
         publishes the final count, index, and source together.
         """
+        background_result = payload.get("background", True)
         if getattr(self, "_shutting_down", False):
-            self._index_scan_inflight = False
+            if background_result:
+                self._index_scan_inflight = False
             return
 
-        self._index_scan_inflight = False
+        if background_result:
+            self._index_scan_inflight = False
 
         result = payload.get("result")
         # A scan submitted for a directory we have since left describes files
@@ -3398,6 +3405,12 @@ class AppController(QObject):
                     timeout=10000,
                     color="#FFD54F",
                 )
+            # A newer synchronous refresh made this result stale, but watcher
+            # paths collected for cache invalidation and Photoshop handoff
+            # handling still need a current-generation scan to consume them.
+            with self._watcher_changed_lock:
+                if self._watcher_changed_paths:
+                    self._index_rescan_needed = True
             if self._index_rescan_needed:
                 self._maybe_start_index_scan()
             return
@@ -9040,9 +9053,18 @@ class AppController(QObject):
             self._thumbnail_cache.clear()
         with self._watcher_changed_lock:
             self._watcher_changed_paths.add(None)
-        self._index_scan_inflight = True
+        # The manual result was obtained after any already-running watcher
+        # scan. Give it a new generation so the older result is discarded.
+        # It does not own the background inflight flag; that worker will clear
+        # its own flag when its stale result arrives.
+        self._index_scan_epoch += 1
         self._on_index_scan_ready(
-            {"epoch": self._index_scan_epoch, "result": result, "error": None}
+            {
+                "epoch": self._index_scan_epoch,
+                "result": result,
+                "error": None,
+                "background": False,
+            }
         )
 
     def switch_to_grid_view(self):
@@ -19357,55 +19379,53 @@ class AppController(QObject):
             )
             return
 
-        found_raw_files: List[Path] = []
-        found_label = ""
-        found_search_dir = None
-        for label, _base_dir, raw_search_dir in search_locations:
-            if not raw_search_dir.is_dir():
-                log.info("RAW search directory does not exist: %s", raw_search_dir)
-                continue
-            found_raw_files = self._find_restack_raws_in_dir(
-                raw_search_dir,
-                base_prefix,
-                base_number,
-            )
+        expected_stems = self._expected_restack_raw_stems(base_prefix, base_number)
+        self.update_status_message("Finding source RAWs...")
+
+        def _find_and_order_restack_inputs():
+            found_raw_files: List[Path] = []
+            found_label = ""
+            found_search_dir = None
+            for label, _base_dir, raw_search_dir in search_locations:
+                found_raw_files = self._find_restack_raws_in_dir(
+                    raw_search_dir,
+                    base_prefix,
+                    base_number,
+                )
+                if found_raw_files:
+                    found_label = label
+                    found_search_dir = raw_search_dir
+                    break
+
+            # Start from deterministic filename order, then replace it with a
+            # near-to-far EXIF focus order when every frame has reliable data.
+            found_raw_files.sort(key=lambda path: path.name.casefold())
+            focus_order = None
+            error = None
             if found_raw_files:
-                found_label = label
-                found_search_dir = raw_search_dir
-                break
-
-        if not found_raw_files:
-            self._show_missing_restack_raws_dialog(
-                filename=filename,
-                expected_stems=self._expected_restack_raw_stems(
-                    base_prefix, base_number
-                ),
-                search_locations=search_locations,
-            )
-            log.info(
-                "No source RAWs found for %s in %s",
-                filename,
-                [str(location[2]) for location in search_locations],
-            )
-            return
-
-        # Start from deterministic filename order, then replace it with a
-        # near-to-far EXIF focus order when all frames provide reliable data.
-        # This happens before the generic launcher so every configured focus
-        # stacker receives the same sequence.
-        found_raw_files.sort(key=lambda path: path.name.casefold())
-        self.update_status_message(
-            f"Reading focus metadata for {len(found_raw_files)} RAWs..."
-        )
+                try:
+                    found_raw_files, focus_order = order_focus_stack_inputs(
+                        found_raw_files
+                    )
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    error = exc
+            return found_raw_files, focus_order, error, found_label, found_search_dir
 
         def _on_order_done(future: concurrent.futures.Future) -> None:
             try:
-                ordered_files, focus_order = future.result()
-                error = None
+                (
+                    ordered_files,
+                    focus_order,
+                    error,
+                    found_label,
+                    found_search_dir,
+                ) = future.result()
             except Exception as exc:  # pylint: disable=broad-exception-caught
-                ordered_files = found_raw_files
+                ordered_files = []
                 focus_order = None
                 error = exc
+                found_label = ""
+                found_search_dir = None
             self._restackOrderReady.emit(
                 {
                     "token": token,
@@ -19415,16 +19435,17 @@ class AppController(QObject):
                     "error": error,
                     "found_label": found_label,
                     "found_search_dir": found_search_dir,
+                    "filename": filename,
+                    "expected_stems": expected_stems,
+                    "search_locations": search_locations,
                 }
             )
 
         try:
-            future = self._exif_executor.submit(
-                order_focus_stack_inputs, list(found_raw_files)
-            )
+            future = self._exif_executor.submit(_find_and_order_restack_inputs)
         except RuntimeError:
             if not self._shutting_down:
-                self.update_status_message("Could not read RAW focus metadata.")
+                self.update_status_message("Could not find source RAWs.")
             return
         future.add_done_callback(_on_order_done)
 
@@ -19451,6 +19472,19 @@ class AppController(QObject):
         found_raw_files = payload["files"]
         focus_order = payload.get("focus_order")
         error = payload.get("error")
+        if not found_raw_files:
+            self._show_missing_restack_raws_dialog(
+                filename=payload["filename"],
+                expected_stems=payload["expected_stems"],
+                search_locations=payload["search_locations"],
+                reason=(f"The RAW source search failed: {error}" if error else ""),
+            )
+            log.info(
+                "No source RAWs found for %s in %s",
+                payload["filename"],
+                [str(location[2]) for location in payload["search_locations"]],
+            )
+            return
         if error is not None:
             log.error(
                 "Restack focus metadata ordering failed; retaining filename order: %s",
@@ -19555,19 +19589,41 @@ class AppController(QObject):
         """Consecutive frames before *base_number*, newest (highest) first."""
         if extensions is None:
             extensions = RAW_EXTENSIONS
-        # Camera extensions are commonly uppercase. Windows path lookup hid that
-        # distinction, but Linux/WSL filesystems are case-sensitive.
-        files_by_name = {
-            candidate.name.casefold(): candidate
-            for candidate in raw_search_dir.iterdir()
-            if candidate.is_file()
-        }
-        found_raw_files: list[Path] = []
-        for raw_stem in self._expected_restack_raw_stems(
+        expected_stems = self._expected_restack_raw_stems(
             base_prefix,
             base_number,
             max_raw_search=max_raw_search,
-        ):
+        )
+        wanted_names = {
+            f"{raw_stem}{ext}".casefold()
+            for raw_stem in expected_stems
+            for ext in extensions
+        }
+        # Camera extensions are commonly uppercase. Windows path lookup hid that
+        # distinction, but Linux/WSL filesystems are case-sensitive. Filter by
+        # name before is_file(), so large directories cost at most one stat per
+        # relevant candidate rather than one stat per entry.
+        files_by_name: dict[str, Path] = {}
+        try:
+            for candidate in raw_search_dir.iterdir():
+                folded_name = candidate.name.casefold()
+                if folded_name not in wanted_names:
+                    continue
+                try:
+                    if candidate.is_file():
+                        files_by_name[folded_name] = candidate
+                except OSError as exc:
+                    log.debug("Could not stat Restack candidate %s: %s", candidate, exc)
+        except OSError as exc:
+            log.info(
+                "Could not enumerate RAW search directory %s: %s",
+                raw_search_dir,
+                exc,
+            )
+            return []
+
+        found_raw_files: list[Path] = []
+        for raw_stem in expected_stems:
             found_this_number = False
             for ext in sorted(extensions):
                 potential_raw = files_by_name.get(f"{raw_stem}{ext}".casefold())

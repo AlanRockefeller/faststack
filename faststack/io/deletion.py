@@ -340,6 +340,7 @@ def permanently_delete_image_files(
     )
     staged: list[tuple[Path, Path]] = []
     compensation: list[tuple[Path, Path]] = []
+    unlinked_staged: set[Path] = set()
 
     def _restore(staged_path: Path, original_path: Path) -> None:
         try:
@@ -365,6 +366,53 @@ def permanently_delete_image_files(
                 log.error(
                     "Could not restore %s to %s; recovery artifact retained",
                     staged_path,
+                    original_path,
+                    exc_info=True,
+                )
+        if not failures:
+            return
+        detail = "; ".join(f"{path}: {exc}" for path, exc in failures)
+        if any(isinstance(exc, SourceChangedError) for _path, exc in failures):
+            raise SourceChangedError(detail)
+        raise OSError(detail)
+
+    def _rollback_partial_unlinks() -> None:
+        """Restore every member and remove its now-redundant second copy."""
+        failures: list[tuple[Path, BaseException]] = []
+        for (staged_path, original_path), (recovery_path, recovery_original) in zip(
+            staged, compensation
+        ):
+            if recovery_original != original_path:
+                failures.append(
+                    (
+                        staged_path,
+                        OSError("permanent-delete recovery map is inconsistent"),
+                    )
+                )
+                continue
+            restore_path = (
+                recovery_path if staged_path in unlinked_staged else staged_path
+            )
+            redundant_path = (
+                staged_path if restore_path == recovery_path else recovery_path
+            )
+            try:
+                try:
+                    _restore(restore_path, original_path)
+                except FileNotFoundError:
+                    # An unlink wrapper may fail after removing the directory
+                    # entry. The complete recovery copy is still authoritative.
+                    if restore_path != staged_path:
+                        raise
+                    restore_path = recovery_path
+                    redundant_path = staged_path
+                    _restore(restore_path, original_path)
+                redundant_path.unlink(missing_ok=True)
+            except BaseException as exc:
+                failures.append((restore_path, exc))
+                log.error(
+                    "Could not fully roll back %s to %s; recovery artifact retained",
+                    restore_path,
                     original_path,
                     exc_info=True,
                 )
@@ -424,8 +472,9 @@ def permanently_delete_image_files(
         try:
             for staged_path, _original_path in staged:
                 _unlink(staged_path)
+                unlinked_staged.add(staged_path)
         except BaseException:
-            _restore_all(compensation)
+            _rollback_partial_unlinks()
             raise
 
         cleanup_failures = []

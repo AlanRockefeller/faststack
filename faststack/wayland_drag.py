@@ -125,25 +125,37 @@ def install_wayland_drag_monitor() -> WaylandDragOutcomeMonitor | None:
     if platform != "wayland":
         return None
 
-    forward_protocol = bool(os.environ.get("WAYLAND_DEBUG"))
-    os.environ["WAYLAND_DEBUG"] = "1"
+    previous_wayland_debug = os.environ.get("WAYLAND_DEBUG")
+    forward_protocol = bool(previous_wayland_debug)
     original_stderr = None
     read_fd = None
     write_fd = None
+    installed = False
     try:
+        os.environ["WAYLAND_DEBUG"] = "1"
         original_stderr = os.dup(2)
         read_fd, write_fd = os.pipe()
         os.dup2(write_fd, 2)
         os.close(write_fd)
         write_fd = None
-        return WaylandDragOutcomeMonitor(original_stderr, read_fd, forward_protocol)
+        monitor = WaylandDragOutcomeMonitor(original_stderr, read_fd, forward_protocol)
+        installed = True
+        return monitor
     except (OSError, RuntimeError):
         if original_stderr is not None:
-            os.dup2(original_stderr, 2)
-            os.close(original_stderr)
+            try:
+                os.dup2(original_stderr, 2)
+            finally:
+                os.close(original_stderr)
         if read_fd is not None:
             os.close(read_fd)
         if write_fd is not None:
             os.close(write_fd)
         log.warning("Wayland drag outcome monitor is unavailable", exc_info=True)
         return None
+    finally:
+        if not installed:
+            if previous_wayland_debug is None:
+                os.environ.pop("WAYLAND_DEBUG", None)
+            else:
+                os.environ["WAYLAND_DEBUG"] = previous_wayland_debug

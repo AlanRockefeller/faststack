@@ -50,21 +50,21 @@ FastStack checks GitHub Releases for newer versions when update checks are enabl
 
 ### Install from source
 
-Power users and Linux users can install from source. FastStack performs best on
-Python 3.12 due to PySide6 compatibility.
+Power users and Linux users can install from source. FastStack supports Python
+3.11 through 3.14; release builds are tested and packaged with Python 3.14.8.
 
 #### macOS
 
-1.  **Install Python 3.12 (via Homebrew):**
+1.  **Install Python 3.14 (via Homebrew):**
 
     ```bash
-    brew install python@3.12
+    brew install python@3.14
     ```
 
 2.  **Create and Activate a Virtual Environment:**
 
     ```bash
-    python3.12 -m venv venv
+    python3.14 -m venv venv
     source venv/bin/activate
     ```
 
@@ -75,8 +75,6 @@ Python 3.12 due to PySide6 compatibility.
     python -m pip install -U pip
     python -m pip install .
     ```
-
-    _Note: If you encounter issues with `opencv-python` or `PySide6` on newer Python versions (3.13+), please stick to Python 3.12._
 
 4.  **Run:**
     ```bash

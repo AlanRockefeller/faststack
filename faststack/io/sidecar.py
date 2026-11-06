@@ -1071,7 +1071,7 @@ class SidecarManager:
             self._latest_save_seq += 1
             seq = self._latest_save_seq
             payload = _sidecar_to_json(self.data)
-        self._dirty = True
+            self._dirty = True
         return seq, payload
 
     def write_prepared(self, seq: int, ours: dict) -> str:
@@ -1090,13 +1090,16 @@ class SidecarManager:
           caller should retry with ``save()``, which reports it.
         """
         with self._save_lock:
-            if seq != self._latest_save_seq:
-                return "superseded"
+            with self._state_lock:
+                if seq != self._latest_save_seq:
+                    return "superseded"
             if self._load_failed:
                 return "conflict"
             try:
                 if ours == self._baseline_payload and self._disk_matches_baseline():
-                    self._dirty = False
+                    with self._state_lock:
+                        if seq == self._latest_save_seq:
+                            self._dirty = False
                     self._last_save_error = None
                     return "unchanged"
                 with _sidecar_write_lock(self._write_lock_path):
@@ -1109,7 +1112,9 @@ class SidecarManager:
                 self._last_save_error = str(e)
                 log.error(f"Failed to write sidecar file {self.path}: {e}")
                 return "failed"
-            self._dirty = False
+            with self._state_lock:
+                if seq == self._latest_save_seq:
+                    self._dirty = False
             self._last_save_error = None
             log.debug(f"Saved sidecar file to {self.path} (background)")
             return "written"

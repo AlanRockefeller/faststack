@@ -221,6 +221,9 @@ ApplicationWindow {
         }
 
         if (root.controllerRef && !root.controllerRef.prepare_for_app_close()) {
+            // A failed save vetoes this close attempt. The recycle-bin choice
+            // only applied to that attempt; ask again on the next quit.
+            root.allowCloseWithRecycleBins = false
             close.accepted = false
             return
         }

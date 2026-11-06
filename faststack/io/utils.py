@@ -55,12 +55,23 @@ def fsync_directory(path: Path) -> None:
 def atomic_write_json(path: Path, payload: object) -> None:
     """Write JSON atomically and flush the file and directory to disk."""
     temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-    with temp_path.open("w") as f:
-        json.dump(payload, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    temp_path.replace(path)
-    fsync_directory(path.parent)
+    try:
+        with temp_path.open("w") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(path)
+        fsync_directory(path.parent)
+    except BaseException:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            log.warning(
+                "Could not remove failed atomic-write temporary file %s: %s",
+                temp_path,
+                cleanup_error,
+            )
+        raise
 
 
 def normalize_path_key(path: Union[Path, str]) -> str:

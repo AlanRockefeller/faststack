@@ -147,6 +147,13 @@ def build_chunks(jpeg, nchunks: int):
     if parsed is None:
         return None
     sof_h_off, w, h, hmax, vmax, dri, scan_start = parsed
+    raw = bytes(jpeg) if not isinstance(jpeg, bytes) else jpeg
+    if raw.find(b"\xff\xd9", scan_start) < 0:
+        # A growing/truncated file can contain enough restart markers to make
+        # every synthetic chunk decode successfully even though the source
+        # snapshot is incomplete. Whole-file decoding is responsible for
+        # reporting that condition and triggering the caller's reread.
+        return None
 
     mcu_w, mcu_h = hmax * 8, vmax * 8
     mcus_x = (w + mcu_w - 1) // mcu_w
@@ -180,7 +187,6 @@ def build_chunks(jpeg, nchunks: int):
 
     starts = range(0, mcu_rows, rows_per_chunk)
     header = bytes(jpeg[:scan_start])
-    raw = bytes(jpeg) if not isinstance(jpeg, bytes) else jpeg
     parts = []
     for r0 in starts:
         r1 = min(r0 + rows_per_chunk, mcu_rows)
