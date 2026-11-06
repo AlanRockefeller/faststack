@@ -67,12 +67,15 @@ def is_stack_layer(layer: Any) -> bool:
     return isinstance(layer, dict) and bool(layer.get(STACK_SOURCE_KEY))
 
 
-def stack_layers(edits: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """Visible stack layers, bottom to top."""
+def stack_layers(
+    edits: Mapping[str, Any], *, include_hidden: bool = False
+) -> List[Dict[str, Any]]:
+    """Stack layers bottom to top, normally limited to visible layers."""
     return [
         layer
         for layer in edits.get("local_layers") or ()
-        if is_stack_layer(layer) and layer.get("visible", True)
+        if is_stack_layer(layer)
+        and (include_hidden or layer.get("visible", True))
     ]
 
 

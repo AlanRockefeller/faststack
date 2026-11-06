@@ -595,7 +595,7 @@ class AppController(QObject):
         self._stack_inputs_token = 0
         self._stack_inputs_key: Optional[str] = None
         self._stack_input_paths: dict[str, Path] = {}
-        self._stack_source_loading: set[str] = set()
+        self._stack_source_loading: set[tuple[str, str]] = set()
         self._stackInputsReady.connect(self._on_stack_inputs_ready)
         self._stackSourceReady.connect(self._on_stack_source_ready)
         # Hover preview (the selected input, fully edited, shown inside the
@@ -2636,7 +2636,11 @@ class AppController(QObject):
             return True
 
         if is_main_window and event.type() == QEvent.Type.KeyPress:
-            if self.ui_state.isBrushMode and self._handle_brush_mode_key(event):
+            if (
+                self.ui_state.isBrushMode
+                and not self._is_grid_view_active
+                and self._handle_brush_mode_key(event)
+            ):
                 return True
             if event.key() == Qt.Key_Space and self._can_show_original_compare(event):
                 if not event.isAutoRepeat():
@@ -8983,6 +8987,8 @@ class AppController(QObject):
         if self._is_grid_view_active == active:
             return
 
+        if active and self.ui_state.isBrushMode:
+            self.exit_local_brush_mode()
         self._is_grid_view_active = active
 
         if active:
@@ -16728,7 +16734,7 @@ class AppController(QObject):
         editor._mask_assets.clear()
         editor._local_density_cache.clear()
         editor._stack_sources = {}
-        editor._stack_sources_path = None
+        editor._stack_sources_session_id = None
         if editor.current_edits.get("local_layers"):
             editor.set_local_layers([])
         self._reset_local_brush_session_state()
@@ -17544,17 +17550,23 @@ class AppController(QObject):
         """Load the inputs that the current image's stack layers paint."""
         if not self._stack_input_paths:
             return
-        for layer in stack_layers(self.image_editor.current_edits):
+        for layer in stack_layers(
+            self.image_editor.current_edits, include_hidden=True
+        ):
             self._request_stack_source(layer["source"])
 
     def _request_stack_source(self, name: str) -> None:
         """Decode and register stack input *name* in the background."""
         editor = self.image_editor
+        editor_session_id = editor.session_id
+        if editor_session_id is None:
+            return
+        loading_key = (editor_session_id, name)
         if (
             not name
             or name == STACK_OUTPUT_SOURCE
             or name in editor._stack_sources
-            or name in self._stack_source_loading
+            or loading_key in self._stack_source_loading
         ):
             return
         path = self._stack_input_paths.get(name)
@@ -17570,7 +17582,7 @@ class AppController(QObject):
             return
         token = self._stack_inputs_token
         editor_path = editor.current_filepath
-        self._stack_source_loading.add(name)
+        self._stack_source_loading.add(loading_key)
         self.update_status_message(
             f"Aligning {stack_input_label(name)} with the stack..."
         )
@@ -17585,6 +17597,7 @@ class AppController(QObject):
                     "token": token,
                     "name": name,
                     "editor_path": editor_path,
+                    "editor_session_id": editor_session_id,
                     "source": source,
                     "error": error,
                 }
@@ -17593,7 +17606,7 @@ class AppController(QObject):
         try:
             future = self._stack_paint_executor.submit(load_stack_source, path, output)
         except RuntimeError:
-            self._stack_source_loading.discard(name)
+            self._stack_source_loading.discard(loading_key)
             return
         future.add_done_callback(_done)
 
@@ -17602,7 +17615,9 @@ class AppController(QObject):
         if self._shutting_down or payload.get("token") != self._stack_inputs_token:
             return
         name = payload["name"]
-        self._stack_source_loading.discard(name)
+        editor_session_id = payload.get("editor_session_id")
+        if editor_session_id is not None:
+            self._stack_source_loading.discard((editor_session_id, name))
         label = stack_input_label(name)
         error = payload.get("error")
         if error is not None:
@@ -17610,10 +17625,17 @@ class AppController(QObject):
             self.update_status_message(f"Could not align {label}: {error}", 8000)
             return
         editor = self.image_editor
-        if editor.current_filepath != payload.get("editor_path"):
+        if (
+            editor.current_filepath != payload.get("editor_path")
+            or editor.session_id != editor_session_id
+            or editor._stack_sources_session_id != editor_session_id
+        ):
             return
         # Keep the inputs this photo's layers use plus the selected one.
-        keep = {layer["source"] for layer in stack_layers(editor.current_edits)}
+        keep = {
+            layer["source"]
+            for layer in stack_layers(editor.current_edits, include_hidden=True)
+        }
         keep.add(self.ui_state.stackInputName)
         sources = {k: v for k, v in editor._stack_sources.items() if k in keep}
         sources[name] = payload["source"]
@@ -17746,6 +17768,10 @@ class AppController(QObject):
             )
             self._stack_hover_sig = payload["sig"]
             self.ui_state.bump_stack_hover_generation()
+        elif decoded is None and current_sig == payload["sig"]:
+            # Do not retry an identical failed render forever. Any edit or
+            # source change produces a new signature and remains retryable.
+            self._stack_hover_sig = payload["sig"]
         if stack_mode and (
             self._stack_hover_pending or current_sig != self._stack_hover_sig
         ):

@@ -11,7 +11,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 - When in crop mode, you can now toggle the grid visibility.  Nice for lining things up / keeping edges equal.
 - New dodge & burn brush in the compact editor (Shift+D). The sliders turn orange and set what the brush does - any mix of exposure, brightness, contrast, whites, shadows, blacks, temp, tint, vibrance and color mix. Left-drag paints, right-drag or Alt-drag erases. Each stroke adds one coat, so painting over the same spot again makes the effect stronger. Changing the sliders after painting starts a new layer, so earlier strokes keep their look; click a layer to change its sliders later, hide it, or delete it. [ and ] change the brush size, Space+drag pans, Ctrl+Z undoes the last stroke, and M (or holding Ctrl) shows where you painted. Layers are saved with the edit, so you can come back and change them.
 - In the thumbnail grid, right-click an empty folder to delete it. Folders with no images but a few small leftover files (like faststack.json) can be deleted too - FastStack lists what is in them and asks first. Folders with images show no menu.
-- Dodge & burn: the compact editor has a "Dodge & Burn" button to turn the brush on and off, and a ? button that lists all the brush controls.
+- Dodge & burn: the compact editor has a "Burn" button to turn the brush on and off, and a ? button that lists all the brush controls.
 - Removed the background darkening tool (K). Dodge & burn does the same job: paint the background with a negative exposure or blacks recipe.
 
 ## 1.6.9 (2026-09-12)

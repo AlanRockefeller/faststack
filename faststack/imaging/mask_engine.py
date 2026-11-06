@@ -10,6 +10,7 @@ Provides:
 import dataclasses
 import logging
 import math
+import threading
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -334,8 +335,8 @@ class LayerDensityCache:
     one only the new strokes are composited — committing a stroke costs one
     stroke, not a re-rasterisation of the whole layer.
 
-    Not thread-safe: each instance belongs to a single rendering thread
-    (preview worker, export, GUI overlay).
+    Cache operations are protected because quick and refinement preview workers
+    can briefly overlap while a cancelled render unwinds.
     """
 
     _SIZES_PER_LAYER = 4
@@ -343,21 +344,25 @@ class LayerDensityCache:
     def __init__(self):
         # layer_id -> {(uid, shape, geometry): (strokes, density)}, LRU order
         self._entries: Dict[str, Dict[tuple, Tuple[tuple, Optional[LayerDensity]]]] = {}
+        self._lock = threading.Lock()
 
     def __bool__(self) -> bool:
-        return bool(self._entries)
+        with self._lock:
+            return bool(self._entries)
 
     def clear(self) -> None:
-        self._entries.clear()
+        with self._lock:
+            self._entries.clear()
 
     def get(
         self, layer_id: str, key: tuple
     ) -> Optional[Tuple[tuple, Optional[LayerDensity]]]:
-        sizes = self._entries.get(layer_id)
-        entry = sizes.pop(key, None) if sizes is not None else None
-        if entry is not None:
-            sizes[key] = entry  # most recently used last
-        return entry
+        with self._lock:
+            sizes = self._entries.get(layer_id)
+            entry = sizes.pop(key, None) if sizes is not None else None
+            if entry is not None:
+                sizes[key] = entry  # most recently used last
+            return entry
 
     def put(
         self,
@@ -366,16 +371,18 @@ class LayerDensityCache:
         strokes: tuple,
         value: Optional[LayerDensity],
     ) -> None:
-        sizes = self._entries.setdefault(layer_id, {})
-        sizes.pop(key, None)
-        sizes[key] = (strokes, value)
-        while len(sizes) > self._SIZES_PER_LAYER:
-            sizes.pop(next(iter(sizes)))
+        with self._lock:
+            sizes = self._entries.setdefault(layer_id, {})
+            sizes.pop(key, None)
+            sizes[key] = (strokes, value)
+            while len(sizes) > self._SIZES_PER_LAYER:
+                sizes.pop(next(iter(sizes)))
 
     def prune(self, keep_ids) -> None:
-        for layer_id in list(self._entries):
-            if layer_id not in keep_ids:
-                self._entries.pop(layer_id, None)
+        with self._lock:
+            for layer_id in list(self._entries):
+                if layer_id not in keep_ids:
+                    self._entries.pop(layer_id, None)
 
 
 def _extends(strokes: Sequence[MaskStroke], cached: tuple) -> bool:

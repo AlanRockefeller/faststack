@@ -1009,9 +1009,9 @@ class ImageEditor:
         self._local_density_cache = LayerDensityCache()
         # Stack paint: decoded + registered focus-stack inputs keyed by file
         # name (StackSource is immutable; the dict is only rebound/cleared on
-        # the GUI thread), and the image they were registered against.
+        # the GUI thread), and the load session they were registered against.
         self._stack_sources: Dict[str, StackSource] = {}
-        self._stack_sources_path: Optional[str] = None
+        self._stack_sources_session_id: Optional[str] = None
 
         # Rendering preferences pushed in from AppController config:
         # soft shoulder/toe on the levels ramp, and TPDF dither on 8-bit
@@ -1068,7 +1068,7 @@ class ImageEditor:
             self._mask_assets.clear()
             self._local_density_cache.clear()
             self._stack_sources = {}
-            self._stack_sources_path = None
+            self._stack_sources_session_id = None
 
     def set_source_exif(self, exif_bytes: Optional[bytes]):
         """Store EXIF bytes from the original source (e.g., paired JPEG).
@@ -1264,6 +1264,8 @@ class ImageEditor:
                 # Clear mask state from previous image
                 self._mask_assets.clear()
                 self._local_density_cache.clear()
+                self._stack_sources = {}
+                self._stack_sources_session_id = None
             log.error("Image file not found: %s", filepath)
             return False
 
@@ -1284,11 +1286,11 @@ class ImageEditor:
             # Clear mask state from previous image
             self._mask_assets.clear()
             self._local_density_cache.clear()
-            # Registered stack inputs stay valid across a reload of the same
-            # photo (e.g. after a save); another photo needs its own.
-            if self._stack_sources_path != str(load_filepath):
-                self._stack_sources = {}
-                self._stack_sources_path = str(load_filepath)
+            # Registrations are tied to the pixels in this load session. A
+            # same-path replacement can have different geometry, so every real
+            # reload gets a fresh set rather than reusing path-keyed sources.
+            self._stack_sources = {}
+            self._stack_sources_session_id = None
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
         _is_png = load_filepath.suffix.lower() == ".png"
@@ -1577,6 +1579,7 @@ class ImageEditor:
                     self.current_filepath = load_filepath
                     self.source_filepath = load_filepath
                     self.session_id = uuid.uuid4().hex
+                    self._stack_sources_session_id = self.session_id
                     self.original_image = loaded_original
                     self.float_image = loaded_float_image
                     self.float_preview = loaded_float_preview
@@ -1626,6 +1629,8 @@ class ImageEditor:
                 self._cached_detail_bands = None
                 self._mask_assets.clear()
                 self._local_density_cache.clear()
+                self._stack_sources = {}
+                self._stack_sources_session_id = None
             return False
 
     def _rotate_float_image(
