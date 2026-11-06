@@ -137,6 +137,13 @@ from faststack.imaging.mask_engine import (
     rasterize_layer_density,
 )
 from faststack.imaging.metadata import get_exif_data
+from faststack.imaging.stack_paint import (
+    STACK_OUTPUT_SOURCE,
+    is_stack_layer,
+    load_stack_source,
+    stack_input_label,
+    stack_layers,
+)
 from faststack.resources import (
     faststack_changelog_path,
     faststack_qml_dir,
@@ -485,6 +492,9 @@ class AppController(QObject):
     )  # Signal for async delete completion (result dict from worker)
     _exifBriefReady = Signal(object, str)  # (cache_key, brief) from background thread
     _restackOrderReady = Signal(object)  # Restack EXIF ordering result
+    _stackInputsReady = Signal(object)  # Stack paint: input JPG discovery result
+    _stackSourceReady = Signal(object)  # Stack paint: decoded + registered input
+    _stackHoverReady = Signal(object)  # Stack paint: hover preview render
     # (SidecarManager, outcome) from the background session-position write
     _sessionSidecarWriteFinished = Signal(object, str)
     _updateCheckFinished = Signal(object)  # Update check result from background thread
@@ -573,6 +583,29 @@ class AppController(QObject):
         )
         self._restack_order_token = 0
         self._restackOrderReady.connect(self._on_restack_order_ready)
+        # Stack paint: finding the in-camera stack's input JPGs and decoding /
+        # registering them. Token-deduplicated per image (_stack_inputs_token).
+        self._stack_paint_executor = create_daemon_threadpool_executor(
+            max_workers=1, thread_name_prefix="StackPaint"
+        )
+        self._stack_inputs_token = 0
+        self._stack_inputs_key: Optional[str] = None
+        self._stack_input_paths: dict[str, Path] = {}
+        self._stack_source_loading: set[str] = set()
+        self._stackInputsReady.connect(self._on_stack_inputs_ready)
+        self._stackSourceReady.connect(self._on_stack_source_ready)
+        # Hover preview (the selected input, fully edited, shown inside the
+        # brush circle): gate pattern + signature so it only re-renders when
+        # the edits or the selected input change.
+        self._stack_hover_sig: Optional[tuple] = None
+        self._stack_hover_inflight = False
+        self._stack_hover_pending = False
+        self._stack_hover_buffer: Optional[bytes] = None
+        self._stack_hover_timer = QTimer(self)
+        self._stack_hover_timer.setSingleShot(True)
+        self._stack_hover_timer.setInterval(120)
+        self._stack_hover_timer.timeout.connect(self._start_stack_hover_render)
+        self._stackHoverReady.connect(self._on_stack_hover_ready)
         self._editor_prewarm_executor = create_daemon_threadpool_executor(
             max_workers=1, thread_name_prefix="EditPrewarm"
         )
@@ -829,13 +862,17 @@ class AppController(QObject):
         # display-size report re-applies it against the real window.
         self.image_editor.preview_master_box = self._editor_preview_master_box()
         # Dodge & burn brush state; must exist before the first navigation
-        # because _reset_local_brush_on_navigation reads it. The recipe the
-        # next new layer gets survives navigation; the rest is per image.
+        # because _reset_local_brush_on_navigation reads it. All of it is
+        # per image: navigation leaves brush mode and resets the recipe.
         self._local_brush_recipe: dict[str, float] = {}
         self._local_active_layer_id: Optional[str] = None
         self._local_editing_layer_id: Optional[str] = None
         self._local_painting_layer_id: Optional[str] = None
-        self._local_stroke_history: list[str] = []
+        # Every layer the stroke in progress goes onto: one, except a stack
+        # paint erase, which restores the stack on all stack layers at once.
+        self._local_painting_layer_ids: tuple[str, ...] = ()
+        # One entry per stroke: a layer id, or a tuple of them (multi-layer).
+        self._local_stroke_history: list = []
         # GUI-thread raster cache for the mask overlay (the preview worker
         # has its own on the editor).
         self._local_overlay_cache = LayerDensityCache()
@@ -2515,6 +2552,7 @@ class AppController(QObject):
                     self._set_local_overlay_held(False)
                 if event.key() == Qt.Key_Space and self.ui_state.brushPanHeld:
                     self.ui_state.brushPanHeld = False
+                    self.stop_original_compare_preview()
                     return True
             if event.key() == Qt.Key_Space and not event.isAutoRepeat():
                 # Deliberately not limited to the main window. The compact
@@ -2688,8 +2726,11 @@ class AppController(QObject):
                 self._set_local_overlay_held(True)
             return False  # still a modifier for whatever comes next
         if key == Qt.Key_Space and not mods:
-            # Space+drag pans instead of showing the original.
+            # Space shows the original, as outside brush mode; Space+drag
+            # also pans instead of painting.
             self.ui_state.brushPanHeld = True
+            if not event.isAutoRepeat() and self._can_show_original_compare(event):
+                self.start_original_compare_preview()
             return True
         if key == Qt.Key_Escape:
             if self.ui_state.isHistogramVisible:
@@ -4272,6 +4313,10 @@ class AppController(QObject):
 
         self.ui_refresh_generation += 1
         self._metadata_cache_index = (-1, -1)  # Invalidate cache
+        # Stack paint availability follows the current image on every path
+        # that changes it (startup restore, rescans, deletes); a no-op when
+        # the image did not change.
+        self._refresh_stack_inputs()
 
         # Keep the editor preview reachable at the new generation so callers
         # that bump ui_refresh_generation for non-image reasons (batch toggle,
@@ -4751,7 +4796,7 @@ class AppController(QObject):
             if normalized_crop_box != (0, 0, 1000, 1000):
                 return True
 
-        for layer in effective_layers(edits):
+        for layer in (*effective_layers(edits), *stack_layers(edits)):
             mask_data = self.image_editor._mask_assets.get(layer["id"])
             if mask_data is not None and mask_data.has_strokes():
                 return True
@@ -6145,6 +6190,15 @@ class AppController(QObject):
                 developed_path=dev_path,
                 save_target_path=save_target_path,
             )
+            current_image_path = self._current_image_path()
+            if (
+                current_image_path is not None
+                and isinstance(export_snapshot, dict)
+                and stack_layers(export_snapshot.get("edits") or {})
+            ):
+                export_snapshot["stack_source_resolver"] = (
+                    self._stack_source_resolver_for(current_image_path)
+                )
         except RuntimeError as e:
             self._last_save_prepare_error = f"Failed to prepare save: {e}"
             log.warning(
@@ -8643,6 +8697,7 @@ class AppController(QObject):
         old_current_path = self._current_image_path()
         self.current_index = index  # Set index first so signals pick up correct image
         self._notify_thumbnail_current_path_changed(old_current_path)
+        self._refresh_stack_inputs()
         if direction in (-1, 1):
             self._last_navigation_direction = direction
 
@@ -14522,6 +14577,11 @@ class AppController(QObject):
             "index scan",
             wait=False,
         )
+        self._safe_shutdown_executor(
+            getattr(self, "_stack_paint_executor", None),
+            "stack paint",
+            wait=False,
+        )
         # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
         self._safe_shutdown_executor(
             self._save_executor, "save", wait=True, cancel_futures=False
@@ -16388,6 +16448,10 @@ class AppController(QObject):
 
     def _sync_editor_state_from_session(self):
         """Helper to push current editor session state (edits, crop) to UIState."""
+        # Covers directory switches and first loads that skip navigation;
+        # a no-op when the inputs for this image are already known.
+        self._refresh_stack_inputs()
+        self._ensure_stack_sources_for_edits()
         edits = self.image_editor.current_edits
         for key, value in edits.items():
             if hasattr(self.ui_state, key):
@@ -16631,6 +16695,7 @@ class AppController(QObject):
         self._local_active_layer_id = None
         self._local_editing_layer_id = None
         self._local_painting_layer_id = None
+        self._local_painting_layer_ids = ()
         self._local_stroke_history = []
         self._local_overlay_cache.clear()
 
@@ -16640,8 +16705,12 @@ class AppController(QObject):
         Called from _set_current_index() after the live session was flushed.
         Navigation while the editor is open does not reload the editor right
         away, so the old image's layers must not linger on the new one. Brush
-        mode itself and the brush recipe deliberately carry over.
+        mode is turned off and the brush recipe reset: a new photo that needs
+        dodge & burn will need a different recipe.
         """
+        if self.ui_state.isBrushMode:
+            self.exit_local_brush_mode()
+        self._local_brush_recipe = {}
         editor = self.image_editor
         if (
             self._local_active_layer_id is None
@@ -16654,6 +16723,8 @@ class AppController(QObject):
             return
         editor._mask_assets.clear()
         editor._local_density_cache.clear()
+        editor._stack_sources = {}
+        editor._stack_sources_path = None
         if editor.current_edits.get("local_layers"):
             editor.set_local_layers([])
         self._reset_local_brush_session_state()
@@ -16690,27 +16761,59 @@ class AppController(QObject):
                 self._reset_local_brush_session_state()
         return True
 
-    @Slot()
-    def toggle_local_brush_mode(self):
-        """Shift+D: enter or leave dodge & burn brush mode."""
-        if self.ui_state.isBrushMode:
-            self.exit_local_brush_mode()
-            return
+    def _enter_brush_mode(self, tool: str) -> bool:
+        """Enter brush mode with *tool* ("local" = dodge & burn, "stack")."""
         if self.ui_state.isCropping:
             self.update_status_message("Apply or cancel the crop before brushing")
-            return
+            return False
         if self._is_grid_view_active or not self.image_files:
-            return
+            return False
         if not self.ui_state.isEditorOpen or self.ui_state.isEditorExpanded:
             self.ui_state.isEditorExpanded = False
             self.ui_state.isEditorOpen = True
         if not self._prepare_local_brush_image_state():
-            return
+            return False
+        if self._local_painting_layer_id is not None:
+            self.finish_local_stroke()
+        self.ui_state.brushTool = tool
         self.ui_state.isBrushMode = True
         self._refresh_local_brush_ui()
-        self.update_status_message(
-            "Dodge & burn: set sliders, then paint. Right/Alt-drag erases."
-        )
+        self._update_local_overlay()
+        return True
+
+    @Slot()
+    def toggle_local_brush_mode(self):
+        """Shift+D: enter or leave dodge & burn brush mode."""
+        if self.ui_state.isBrushMode and self.ui_state.brushTool == "local":
+            self.exit_local_brush_mode()
+            return
+        if self._enter_brush_mode("local"):
+            self.update_status_message(
+                "Dodge & burn: set sliders, then paint. Right/Alt-drag erases."
+            )
+
+    @Slot()
+    def toggle_stack_brush_mode(self):
+        """Enter or leave stack paint (paint a stack input over the stack)."""
+        if self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
+            self.exit_local_brush_mode()
+            return
+        if not self._stack_input_paths:
+            self.update_status_message(
+                "Stack paint needs an in-camera stacked JPG with its input JPGs"
+            )
+            return
+        if not self._enter_brush_mode("stack"):
+            return
+        self._schedule_stack_hover()
+        name = self.ui_state.stackInputName
+        if name == STACK_OUTPUT_SOURCE or name in self.image_editor._stack_sources:
+            self.update_status_message(
+                f"Stack paint: paint to reveal {stack_input_label(name)}. "
+                "Right/Alt-drag restores the stack."
+            )
+        else:
+            self._request_stack_source(name)
 
     @Slot()
     def exit_local_brush_mode(self):
@@ -16718,6 +16821,7 @@ class AppController(QObject):
             self.finish_local_stroke()
         self.ui_state.brushPanHeld = False
         self.ui_state.localOverlayHeld = False
+        self._clear_stack_hover()
         if self.ui_state.isBrushMode:
             self.ui_state.isBrushMode = False
             self._update_local_overlay()
@@ -16760,6 +16864,8 @@ class AppController(QObject):
 
         An empty id also returns to the brush recipe.
         """
+        if is_stack_layer(self._local_layer(layer_id)):
+            return  # stack layers have no recipe to edit
         if not layer_id or layer_id == self._local_editing_layer_id:
             previous = self._local_layer(self._local_editing_layer_id)
             self._local_editing_layer_id = None
@@ -16789,12 +16895,25 @@ class AppController(QObject):
         layers = self._local_layers()
         if not any(layer["id"] == layer_id for layer in layers):
             return
-        if self._local_painting_layer_id == layer_id:
-            self._local_painting_layer_id = None
+        if layer_id in self._local_painting_layer_ids:
+            self._local_painting_layer_ids = tuple(
+                lid for lid in self._local_painting_layer_ids if lid != layer_id
+            )
+            self._local_painting_layer_id = (
+                self._local_painting_layer_ids[0]
+                if self._local_painting_layer_ids
+                else None
+            )
         self.image_editor._mask_assets.pop(layer_id, None)
-        self._local_stroke_history = [
-            lid for lid in self._local_stroke_history if lid != layer_id
-        ]
+        history = []
+        for entry in self._local_stroke_history:
+            if isinstance(entry, tuple):
+                entry = tuple(lid for lid in entry if lid != layer_id)
+                if entry:
+                    history.append(entry)
+            elif entry != layer_id:
+                history.append(entry)
+        self._local_stroke_history = history
         if self._local_editing_layer_id == layer_id:
             self._local_editing_layer_id = None
         if self._local_active_layer_id == layer_id:
@@ -16844,6 +16963,46 @@ class AppController(QObject):
         self._local_active_layer_id = layer_id
         return layer_id
 
+    def _stack_stroke_targets(self, erase: bool) -> list[str]:
+        """Stack layers the next stack paint stroke goes onto.
+
+        Painting goes onto the top stack layer when it shows the selected
+        input, otherwise onto a new layer on top (so it covers what is below).
+        Erasing restores the stack: it goes onto every visible stack layer.
+        """
+        assets = self.image_editor._mask_assets
+        layers = [layer for layer in self._local_layers() if is_stack_layer(layer)]
+        if erase:
+            ids = [
+                layer["id"]
+                for layer in layers
+                if layer.get("visible", True)
+                and assets.get(layer["id"]) is not None
+                and assets[layer["id"]].has_strokes()
+            ]
+            if not ids:
+                self.update_status_message("No stack paint to erase")
+            return ids
+        name = self.ui_state.stackInputName
+        if not name:
+            self.update_status_message("Choose a stack input to paint from")
+            return []
+        if name not in self.image_editor._stack_sources:
+            # Strokes are kept; the pixels appear once the input is aligned.
+            self._request_stack_source(name)
+        top = layers[-1] if layers else None
+        if top is not None and top["source"] == name and top.get("visible", True):
+            return [top["id"]]
+        layer_id = self._new_local_layer_id()
+        assets[layer_id] = MaskData()
+        self.image_editor.set_local_layers(
+            [
+                *self._local_layers(),
+                {"id": layer_id, "visible": True, "recipe": {}, "source": name},
+            ]
+        )
+        return [layer_id]
+
     @Slot(float, float, bool)
     def start_local_stroke(self, x_norm: float, y_norm: float, erase: bool):
         """Begin a stroke. Coords are normalised to the displayed image."""
@@ -16851,30 +17010,45 @@ class AppController(QObject):
             return
         if not self._prepare_local_brush_image_state():
             return
-        layer_id = self._local_stroke_target(bool(erase))
-        if layer_id is None:
+        if self.ui_state.brushTool == "stack":
+            layer_ids = self._stack_stroke_targets(bool(erase))
+        else:
+            layer_id = self._local_stroke_target(bool(erase))
+            layer_ids = [layer_id] if layer_id is not None else []
+        if not layer_ids:
             return
-        mask = self.image_editor._mask_assets.setdefault(layer_id, MaskData())
         point = inverse_transform(
             x_norm, y_norm, self.image_editor.current_edits, (1, 1)
         )
-        mask.live_stroke = MaskStroke(
+        stroke = MaskStroke(
             points=[point],
             radius=float(self.ui_state.brushRadius),
             hardness=float(self.ui_state.brushHardness),
             mode=STROKE_ERASE if erase else STROKE_PAINT,
         )
-        self._local_painting_layer_id = layer_id
+        for layer_id in layer_ids:
+            mask = self.image_editor._mask_assets.setdefault(layer_id, MaskData())
+            mask.live_stroke = stroke
+        self._local_painting_layer_id = layer_ids[0]
+        self._local_painting_layer_ids = tuple(layer_ids)
         self.image_editor.touch_local_masks()
         self._kick_preview_worker()
         self._update_local_overlay()
 
+    def _painting_masks(self) -> list[MaskData]:
+        assets = self.image_editor._mask_assets
+        return [
+            assets[lid]
+            for lid in self._local_painting_layer_ids
+            if assets.get(lid) is not None and assets[lid].live_stroke is not None
+        ]
+
     @Slot(float, float)
     def continue_local_stroke(self, x_norm: float, y_norm: float):
-        mask = self.image_editor._mask_assets.get(self._local_painting_layer_id or "")
-        live = mask.live_stroke if mask is not None else None
-        if live is None:
+        masks = self._painting_masks()
+        if not masks:
             return
+        live = masks[0].live_stroke
         point = inverse_transform(
             x_norm, y_norm, self.image_editor.current_edits, (1, 1)
         )
@@ -16882,22 +17056,32 @@ class AppController(QObject):
         if abs(point[0] - last[0]) + abs(point[1] - last[1]) < live.radius * 0.05:
             return
         # A new object each move: the render worker may hold the old one.
-        mask.live_stroke = dataclass_replace(live, points=[*live.points, point])
+        stroke = dataclass_replace(live, points=[*live.points, point])
+        for mask in masks:
+            mask.live_stroke = stroke
         self.image_editor.touch_local_masks()
         self._kick_preview_worker()
         self._update_local_overlay()
 
     @Slot()
     def finish_local_stroke(self):
-        layer_id = self._local_painting_layer_id
+        assets = self.image_editor._mask_assets
+        layer_ids = [
+            lid
+            for lid in self._local_painting_layer_ids
+            if assets.get(lid) is not None and assets[lid].live_stroke is not None
+        ]
         self._local_painting_layer_id = None
-        mask = self.image_editor._mask_assets.get(layer_id or "")
-        live = mask.live_stroke if mask is not None else None
-        if live is None:
+        self._local_painting_layer_ids = ()
+        if not layer_ids:
             return
-        mask.live_stroke = None
-        mask.add_stroke(live)
-        self._local_stroke_history.append(layer_id)
+        for layer_id in layer_ids:
+            mask = assets[layer_id]
+            mask.add_stroke(mask.live_stroke)
+            mask.live_stroke = None
+        self._local_stroke_history.append(
+            layer_ids[0] if len(layer_ids) == 1 else tuple(layer_ids)
+        )
         self.image_editor.touch_local_masks()
         self._after_local_edit("local brush stroke committed")
         self._update_local_overlay()
@@ -16911,9 +17095,14 @@ class AppController(QObject):
         """Ctrl+Z in brush mode: remove the most recent stroke."""
         assets = self.image_editor._mask_assets
         while self._local_stroke_history:
-            layer_id = self._local_stroke_history.pop()
-            mask = assets.get(layer_id)
-            if mask is not None and mask.has_strokes():
+            entry = self._local_stroke_history.pop()
+            ids = entry if isinstance(entry, tuple) else (entry,)
+            targets = [
+                lid
+                for lid in ids
+                if assets.get(lid) is not None and assets[lid].has_strokes()
+            ]
+            if targets:
                 break
         else:
             # Strokes restored from a saved edit have no history: fall back to
@@ -16929,12 +17118,16 @@ class AppController(QObject):
             if layer_id is None:
                 self.update_status_message("No brush strokes to undo")
                 return
-            mask = assets[layer_id]
-        mask.undo_last_stroke()
-        if not mask.has_strokes():
-            # An emptied layer is just clutter in the list.
+            targets = [layer_id]
+        emptied = []
+        for layer_id in targets:
+            assets[layer_id].undo_last_stroke()
+            if not assets[layer_id].has_strokes():
+                emptied.append(layer_id)
+        # An emptied layer is just clutter in the list.
+        for layer_id in emptied:
             self.delete_local_layer(layer_id)
-        else:
+        if len(emptied) < len(targets):
             self.image_editor.touch_local_masks()
             self._after_local_edit("local brush stroke undone")
             self._update_local_overlay()
@@ -16995,14 +17188,21 @@ class AppController(QObject):
         rows = []
         for layer in self._local_layers():
             mask = self.image_editor._mask_assets.get(layer["id"])
+            stack = is_stack_layer(layer)
             rows.append(
                 {
                     "id": layer["id"],
+                    "kind": "stack" if stack else "recipe",
+                    "source": layer.get("source", ""),
                     "name": f"Layer {layer['id'].removeprefix('L')}",
                     "visible": bool(layer.get("visible", True)),
-                    "summary": self._local_recipe_summary(layer["recipe"]),
+                    "summary": (
+                        stack_input_label(layer["source"])
+                        if stack
+                        else self._local_recipe_summary(layer["recipe"])
+                    ),
                     "strokes": len(mask.strokes) if mask is not None else 0,
-                    "active": layer["id"] == self._local_active_layer_id,
+                    "active": not stack and layer["id"] == self._local_active_layer_id,
                     "editing": editing is not None and layer["id"] == editing["id"],
                 }
             )
@@ -17054,33 +17254,51 @@ class AppController(QObject):
         if not ui.isBrushMode or not (ui.localOverlayVisible or ui.localOverlayHeld):
             self._clear_local_overlay()
             return
-        layer_id = self._local_editing_layer_id or self._local_active_layer_id
-        mask = self.image_editor._mask_assets.get(layer_id or "")
+        assets = self.image_editor._mask_assets
+        if ui.brushTool == "stack":
+            # Stack paint shows every visible stack layer (erase acts on all).
+            layer_ids = [
+                layer["id"] for layer in stack_layers(self.image_editor.current_edits)
+            ]
+        else:
+            layer_ids = [self._local_editing_layer_id or self._local_active_layer_id]
+        masks = [
+            (lid, assets[lid])
+            for lid in layer_ids
+            if lid and assets.get(lid) is not None
+        ]
         shape = self._local_overlay_shape()
-        if mask is None or shape is None:
+        if not masks or shape is None:
             self._clear_local_overlay()
             return
         try:
             from PySide6.QtGui import QImage
 
-            density = rasterize_layer_density(
-                layer_id,
-                mask,
-                shape,
-                self.image_editor.current_edits,
-                cache=self._local_overlay_cache,
-            )
             h, w = shape
             overlay = np.zeros((h, w, 4), dtype=np.uint8)
-            if density is not None:
-                # One coat shows at 35% opacity; further coats build up to 80%.
-                alpha = np.clip(density.arr * (0.35 * 255), 0, 0.8 * 255)
+            r, g, b = self._LOCAL_OVERLAY_RGB
+            for layer_id, mask in masks:
+                density = rasterize_layer_density(
+                    layer_id,
+                    mask,
+                    shape,
+                    self.image_editor.current_edits,
+                    cache=self._local_overlay_cache,
+                )
+                if density is None:
+                    continue
+                if ui.brushTool == "stack":
+                    # Stack paint is opaque after one coat (the composite
+                    # clips density at 1), so the overlay does not build up.
+                    alpha = np.clip(density.arr, 0.0, 1.0) * (0.45 * 255)
+                else:
+                    # One coat shows at 35% opacity; more coats build to 80%.
+                    alpha = np.clip(density.arr * (0.35 * 255), 0, 0.8 * 255)
                 region = overlay[density.y0 : density.y1, density.x0 : density.x1]
-                r, g, b = self._LOCAL_OVERLAY_RGB
                 region[..., 0] = b  # ARGB32 is BGRA in memory on little-endian
                 region[..., 1] = g
                 region[..., 2] = r
-                region[..., 3] = alpha.astype(np.uint8)
+                np.maximum(region[..., 3], alpha.astype(np.uint8), out=region[..., 3])
             buf = overlay.tobytes()
             # QImage wraps buf without copying; keep it alive with the image.
             self._local_overlay_buffer = buf
@@ -17090,6 +17308,355 @@ class AppController(QObject):
             ui.bump_local_overlay_generation()
         except Exception:
             log.exception("Failed to update dodge & burn overlay")
+
+    # ---- Stack paint inputs ----
+    #
+    # An in-camera focus stack ("<prefix><number> stacked.JPG") is preceded by
+    # its input frames, numbered just below it, saved as JPG (+RAW) in the
+    # stack-input directories that Restack searches, or next to the stack.
+    # The camera steps focus from near to far, so the highest-numbered frame
+    # is focused furthest back.
+
+    _STACKED_JPG_RE = re.compile(r"([A-Z]+)(\d+)\s+stacked\.jpe?g$", re.IGNORECASE)
+
+    def _find_stack_input_jpgs(self, image_path: Path) -> list[Path]:
+        """Input JPGs of an in-camera stacked JPG, near to far focus.
+
+        Pure filesystem work; safe to run on a worker thread.
+        """
+        match = self._STACKED_JPG_RE.search(image_path.name)
+        if not match:
+            return []
+        prefix, number = match.group(1), int(match.group(2))
+        search_dirs: list[Path] = []
+        main_dir = self._main_photo_directory()
+        if main_dir is not None:
+            try:
+                relative = image_path.parent.resolve().relative_to(main_dir)
+            except (OSError, ValueError):
+                relative = None
+            if relative is not None:
+                search_dirs.extend(
+                    base / relative
+                    for _label, base in self._configured_restack_raw_locations()
+                )
+        search_dirs.append(image_path.parent)
+        for directory in search_dirs:
+            try:
+                if not directory.is_dir():
+                    continue
+                found = self._find_restack_raws_in_dir(
+                    directory, prefix, number, extensions=JPG_EXTENSIONS
+                )
+            except OSError as exc:
+                log.debug("Stack input search failed in %s: %s", directory, exc)
+                continue
+            if found:
+                return list(reversed(found))
+        return []
+
+    def _stack_source_resolver_for(self, image_path: Path):
+        """Name -> input path lookup for the save worker (thread-safe)."""
+        known = (
+            dict(self._stack_input_paths)
+            if self._stack_inputs_key == self._key(image_path)
+            else {}
+        )
+
+        def resolve(name: str) -> Optional[Path]:
+            if name not in known:
+                known.update(
+                    {p.name: p for p in self._find_stack_input_jpgs(image_path)}
+                )
+            return known.get(name)
+
+        return resolve
+
+    def _refresh_stack_inputs(self) -> None:
+        """Find the current image's stack inputs in the background (once)."""
+        path = self._current_image_path()
+        try:
+            key = self._key(path) if path is not None else None
+        except (OSError, TypeError, ValueError):
+            key = None
+        if key == self._stack_inputs_key:
+            return
+        self._stack_inputs_token += 1
+        token = self._stack_inputs_token
+        self._stack_inputs_key = key
+        self._stack_input_paths = {}
+        self._stack_source_loading = set()
+        if self.ui_state is not None:
+            self.ui_state.stackInputs = []
+            self.ui_state.stackInputName = ""
+            if self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
+                self.exit_local_brush_mode()
+        if path is None or not self._STACKED_JPG_RE.search(path.name):
+            return
+
+        def _done(future: concurrent.futures.Future) -> None:
+            try:
+                result = future.result()
+            except Exception:  # pylint: disable=broad-exception-caught
+                log.exception("Stack input search failed for %s", path)
+                result = []
+            self._stackInputsReady.emit({"token": token, "paths": result})
+
+        try:
+            future = self._stack_paint_executor.submit(
+                self._find_stack_input_jpgs, path
+            )
+        except RuntimeError:
+            return  # shutting down
+        future.add_done_callback(_done)
+
+    @Slot(object)
+    def _on_stack_inputs_ready(self, payload) -> None:
+        if self._shutting_down or payload.get("token") != self._stack_inputs_token:
+            return
+        paths = payload.get("paths") or []
+        self._stack_input_paths = {p.name: p for p in paths}
+        count = len(paths)
+        rows = []
+        if paths:
+            # The stack itself, to paint back over frames painted below.
+            rows.append(
+                {"name": STACK_OUTPUT_SOURCE, "label": "S: Stack output", "short": "S"}
+            )
+        for i, p in enumerate(paths, start=1):
+            hint = " (far)" if i == count else (" (near)" if i == 1 else "")
+            rows.append(
+                {"name": p.name, "label": f"{i}: {p.stem}{hint}", "short": str(i)}
+            )
+        self.ui_state.stackInputs = rows
+        # Default to the frame focused furthest back.
+        self.ui_state.stackInputName = paths[-1].name if paths else ""
+        if paths:
+            log.debug("Stack inputs for current image: %s", [p.name for p in paths])
+        self._ensure_stack_sources_for_edits()
+
+    @Slot(str)
+    def set_stack_input(self, name: str) -> None:
+        """Dropdown: choose which stack input new stack strokes paint."""
+        if name not in self._stack_input_paths and not (
+            name == STACK_OUTPUT_SOURCE and self._stack_input_paths
+        ):
+            return
+        self.ui_state.stackInputName = name
+        if self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
+            self._request_stack_source(name)
+            self._schedule_stack_hover()
+
+    def _ensure_stack_sources_for_edits(self) -> None:
+        """Load the inputs that the current image's stack layers paint."""
+        if not self._stack_input_paths:
+            return
+        for layer in stack_layers(self.image_editor.current_edits):
+            self._request_stack_source(layer["source"])
+
+    def _request_stack_source(self, name: str) -> None:
+        """Decode and register stack input *name* in the background."""
+        editor = self.image_editor
+        if (
+            not name
+            or name == STACK_OUTPUT_SOURCE
+            or name in editor._stack_sources
+            or name in self._stack_source_loading
+        ):
+            return
+        path = self._stack_input_paths.get(name)
+        if path is None:
+            self.update_status_message(f"Stack input {name} was not found")
+            return
+        # Register against the full-resolution master when there is one:
+        # float buffers are only ever rebound, never written in place.
+        output = editor.float_image
+        if output is None:
+            output = editor.float_preview
+        if output is None:
+            return
+        token = self._stack_inputs_token
+        editor_path = editor.current_filepath
+        self._stack_source_loading.add(name)
+        self.update_status_message(
+            f"Aligning {stack_input_label(name)} with the stack..."
+        )
+
+        def _done(future: concurrent.futures.Future) -> None:
+            try:
+                source, error = future.result(), None
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                source, error = None, exc
+            self._stackSourceReady.emit(
+                {
+                    "token": token,
+                    "name": name,
+                    "editor_path": editor_path,
+                    "source": source,
+                    "error": error,
+                }
+            )
+
+        try:
+            future = self._stack_paint_executor.submit(load_stack_source, path, output)
+        except RuntimeError:
+            self._stack_source_loading.discard(name)
+            return
+        future.add_done_callback(_done)
+
+    @Slot(object)
+    def _on_stack_source_ready(self, payload) -> None:
+        if self._shutting_down or payload.get("token") != self._stack_inputs_token:
+            return
+        name = payload["name"]
+        self._stack_source_loading.discard(name)
+        label = stack_input_label(name)
+        error = payload.get("error")
+        if error is not None:
+            log.warning("Could not use stack input %s: %s", name, error)
+            self.update_status_message(f"Could not align {label}: {error}", 8000)
+            return
+        editor = self.image_editor
+        if editor.current_filepath != payload.get("editor_path"):
+            return
+        # Keep the inputs this photo's layers use plus the selected one.
+        keep = {layer["source"] for layer in stack_layers(editor.current_edits)}
+        keep.add(self.ui_state.stackInputName)
+        sources = {k: v for k, v in editor._stack_sources.items() if k in keep}
+        sources[name] = payload["source"]
+        # Rebind, never mutate: the render worker may be iterating the old dict.
+        editor._stack_sources = sources
+        editor.touch_local_masks()
+        self._kick_preview_worker()
+        if self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
+            self.update_status_message(
+                f"Stack paint: paint to reveal {label}. "
+                "Right/Alt-drag restores the stack."
+            )
+
+    def _clear_stack_hover(self) -> None:
+        self._stack_hover_timer.stop()
+        self._stack_hover_sig = None
+        self._stack_hover_pending = False
+        if self.ui_state._stack_hover_image is not None:
+            self.ui_state._stack_hover_image = None
+            self._stack_hover_buffer = None
+            self.ui_state.bump_stack_hover_generation(0)
+
+    def _schedule_stack_hover(self) -> None:
+        """Re-render the hover preview soon, if stack paint is active."""
+        if self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
+            self._stack_hover_timer.start()
+        else:
+            self._clear_stack_hover()
+
+    def _stack_hover_source(self, name: str):
+        """(ready, source) for the hover render; None = the stack output."""
+        if name == STACK_OUTPUT_SOURCE:
+            return True, None
+        source = self.image_editor._stack_sources.get(name)
+        return source is not None, source
+
+    def _stack_hover_signature(self, name: str, source) -> tuple:
+        """Everything the hover render depends on (stack strokes excluded)."""
+        editor = self.image_editor
+        edits = editor.current_edits
+        masks = editor._mask_assets
+        recipe_layers = []
+        for layer in effective_layers(edits):
+            mask = masks.get(layer["id"])
+            recipe_layers.append(
+                (
+                    repr(layer),
+                    (mask.uid, mask.revision, len(mask.strokes)) if mask else None,
+                )
+            )
+        return (
+            name,
+            id(source),
+            id(editor.float_preview),
+            id(editor.float_image),
+            repr(sorted((k, v) for k, v in edits.items() if k != "local_layers")),
+            tuple(recipe_layers),
+        )
+
+    def _start_stack_hover_render(self) -> None:
+        if self._shutting_down or not (
+            self.ui_state.isBrushMode and self.ui_state.brushTool == "stack"
+        ):
+            return
+        if self._stack_hover_inflight:
+            self._stack_hover_pending = True
+            return
+        name = self.ui_state.stackInputName
+        ready, source = self._stack_hover_source(name)
+        if not ready:
+            self._clear_stack_hover()  # rescheduled when the input is aligned
+            return
+        sig = self._stack_hover_signature(name, source)
+        if sig == self._stack_hover_sig:
+            return
+        editor = self.image_editor
+        self._stack_hover_inflight = True
+        self._stack_hover_pending = False
+
+        def _done(future: concurrent.futures.Future) -> None:
+            try:
+                decoded, error = future.result(), None
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                decoded, error = None, exc
+            self._stackHoverReady.emit(
+                {"sig": sig, "decoded": decoded, "error": error, "editor": editor}
+            )
+
+        try:
+            future = self._stack_paint_executor.submit(
+                editor.render_stack_hover_preview, source
+            )
+        except RuntimeError:
+            self._stack_hover_inflight = False
+            return
+        future.add_done_callback(_done)
+
+    @Slot(object)
+    def _on_stack_hover_ready(self, payload) -> None:
+        self._stack_hover_inflight = False
+        if self._shutting_down:
+            return
+        stack_mode = self.ui_state.isBrushMode and self.ui_state.brushTool == "stack"
+        if payload.get("error") is not None:
+            log.warning("Stack paint hover preview failed: %s", payload["error"])
+        decoded = payload.get("decoded")
+        current_sig = None
+        if stack_mode and payload.get("editor") is self.image_editor:
+            ready, source = self._stack_hover_source(self.ui_state.stackInputName)
+            if ready:
+                current_sig = self._stack_hover_signature(
+                    self.ui_state.stackInputName, source
+                )
+        if (
+            decoded is not None
+            and current_sig is not None
+            and current_sig == payload["sig"]
+        ):
+            from PySide6.QtGui import QImage
+
+            buf = bytes(decoded.buffer)
+            # QImage wraps buf without copying; keep it alive with the image.
+            self._stack_hover_buffer = buf
+            self.ui_state._stack_hover_image = QImage(
+                buf,
+                decoded.width,
+                decoded.height,
+                decoded.bytes_per_line,
+                decoded.format,
+            )
+            self._stack_hover_sig = payload["sig"]
+            self.ui_state.bump_stack_hover_generation()
+        if stack_mode and (
+            self._stack_hover_pending or current_sig != self._stack_hover_sig
+        ):
+            self._schedule_stack_hover()
 
     @Slot()
     def rotate_image_cw(self):
@@ -17628,6 +18195,8 @@ class AppController(QObject):
         """Kicks off a background preview render task."""
         if getattr(self, "_shutting_down", False):
             return
+        if self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
+            self._schedule_stack_hover()
 
         render_full_resolution = (
             self._should_render_live_preview_full_resolution()
@@ -18765,7 +19334,11 @@ class AppController(QObject):
         base_number: int,
         *,
         max_raw_search: int = 15,
+        extensions: Optional[set[str]] = None,
     ) -> list[Path]:
+        """Consecutive frames before *base_number*, newest (highest) first."""
+        if extensions is None:
+            extensions = RAW_EXTENSIONS
         # Camera extensions are commonly uppercase. Windows path lookup hid that
         # distinction, but Linux/WSL filesystems are case-sensitive.
         files_by_name = {
@@ -18780,7 +19353,7 @@ class AppController(QObject):
             max_raw_search=max_raw_search,
         ):
             found_this_number = False
-            for ext in sorted(RAW_EXTENSIONS):
+            for ext in sorted(extensions):
                 potential_raw = files_by_name.get(f"{raw_stem}{ext}".casefold())
                 if potential_raw is not None:
                     found_raw_files.append(potential_raw)

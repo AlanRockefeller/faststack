@@ -136,11 +136,30 @@ Window {
     // --- Color Palette (matches full editor) ---
     readonly property color backgroundColor: "#1e1e1e"
     readonly property color textColor: "white"
-    // Brush mode (dodge & burn) tints the sliders orange: they edit a local
-    // recipe instead of the global edit.
+    // Brush mode has two tools. Dodge & burn (recipeMode) tints the sliders
+    // orange: they edit a local recipe instead of the global edit. Stack
+    // paint (stackMode) paints a stack input frame; the sliders stay global.
     readonly property bool brushMode: compactEditor.uiStateRef ? compactEditor.uiStateRef.isBrushMode : false
-    readonly property color accentColor: compactEditor.brushMode ? "#f59e0b" : "#6366f1"
-    readonly property color accentColorHover: compactEditor.brushMode ? "#fbbf24" : "#818cf8"
+    readonly property bool stackMode: compactEditor.brushMode && !!compactEditor.uiStateRef && compactEditor.uiStateRef.brushTool === "stack"
+    readonly property bool recipeMode: compactEditor.brushMode && !compactEditor.stackMode
+    // Stack paint needs an in-camera stacked JPG whose input JPGs were found.
+    readonly property bool stackPaintAvailable: !!compactEditor.uiStateRef && compactEditor.uiStateRef.stackInputs.length > 0
+    readonly property int stackInputIndex: {
+        var inputs = compactEditor.uiStateRef ? compactEditor.uiStateRef.stackInputs : []
+        var name = compactEditor.uiStateRef ? compactEditor.uiStateRef.stackInputName : ""
+        for (var i = 0; i < inputs.length; ++i) {
+            if (inputs[i].name === name) return i
+        }
+        return -1
+    }
+    readonly property string stackInputLabel: compactEditor.stackInputIndex >= 0 ? compactEditor.uiStateRef.stackInputs[compactEditor.stackInputIndex].label : ""
+    readonly property color stackAccent: "#2dd4bf"
+    readonly property color stackAccentHover: "#5eead4"
+    readonly property color accentColor: compactEditor.recipeMode ? "#f59e0b" : "#6366f1"
+    readonly property color accentColorHover: compactEditor.recipeMode ? "#fbbf24" : "#818cf8"
+    // Accent of the brush panel (brush size, mask toggle, layer rows).
+    readonly property color panelAccent: compactEditor.stackMode ? compactEditor.stackAccent : compactEditor.accentColor
+    readonly property color panelAccentHover: compactEditor.stackMode ? compactEditor.stackAccentHover : compactEditor.accentColorHover
     readonly property color controlBg: "#10ffffff"
     readonly property color controlBorder: "#30ffffff"
     readonly property color separatorColor: "#20ffffff"
@@ -369,7 +388,7 @@ Window {
 
     function getBackendValue(key) {
         var _dependency = updatePulse;
-        if (compactEditor.brushMode) {
+        if (compactEditor.recipeMode) {
             var recipe = compactEditor.uiStateRef.localRecipe
             return (recipe && recipe[key] !== undefined) ? recipe[key] : 0.0
         }
@@ -377,10 +396,10 @@ Window {
         return 0.0;
     }
 
-    // Slider writes go to the global edit, or in brush mode to the local recipe.
+    // Slider writes go to the global edit, or in dodge & burn to the local recipe.
     function setEditValue(key, value) {
         if (!compactEditor.controllerRef) return
-        if (compactEditor.brushMode) compactEditor.controllerRef.set_local_recipe_param(key, value)
+        if (compactEditor.recipeMode) compactEditor.controllerRef.set_local_recipe_param(key, value)
         else compactEditor.controllerRef.set_edit_parameter(key, value)
     }
 
@@ -479,7 +498,30 @@ Window {
         }
     }
 
-    // Dodge & burn quick reference (the ? button in brush mode).
+    readonly property string stackHelpText:
+        "<b>Stack Paint</b><br>" +
+        "Paint one of the stack's input frames over the stacked photo, e.g. to bring back a clean background or remove stacking halos.<br><br>" +
+        "<b>Choosing the frame</b><br>" +
+        "• The dropdown next to <i>Stack</i> lists the input frames, near focus (1) to far focus. It starts on the frame focused furthest back.<br>" +
+        "• <i>S: Stack output</i> paints the stacked photo itself back over frames painted earlier.<br>" +
+        "• Each frame is aligned to the stack automatically (takes a second the first time).<br>" +
+        "• Painting from a different frame starts a new layer on top. Click a layer to pick its frame again.<br>" +
+        "• ◉ hides/shows a layer, × deletes it.<br><br>" +
+        "<b>Painting</b><br>" +
+        "• Hover: the brush circle previews the frame (with your edits) before you click<br>" +
+        "• Left-drag: paint the frame in<br>" +
+        "• Right-drag or Alt+drag: restore the stack (erases all stack layers there)<br>" +
+        "• Hardness: how soft the brush edge is<br><br>" +
+        "<b>Keys</b><br>" +
+        "• <b>[ ]</b> brush size &nbsp;·&nbsp; <b>Ctrl+Z</b>: undo last stroke<br>" +
+        "• hold <b>Space</b>: show original &nbsp;·&nbsp; <b>Space</b>+drag or middle-drag: pan &nbsp;·&nbsp; scroll: zoom<br>" +
+        "• <b>M</b>: toggle mask overlay &nbsp;·&nbsp; hold <b>Ctrl</b>: show it briefly<br>" +
+        "• <b>Esc</b>: leave stack paint<br><br>" +
+        "<b>Good to know</b><br>" +
+        "• The sliders keep editing the whole photo, painted frame included, and dodge &amp; burn layers apply on top.<br>" +
+        "• Layers are saved with the edit; reopening the photo re-aligns the frames."
+
+    // Brush quick reference (the ? button in brush mode).
     Popup {
         id: brushHelpPopup
         x: 8
@@ -499,7 +541,7 @@ Window {
         background: Rectangle {
             color: "#262626"
             radius: 6
-            border.color: compactEditor.accentColor
+            border.color: compactEditor.panelAccent
             border.width: 1
         }
 
@@ -516,8 +558,8 @@ Window {
                 textFormat: Text.StyledText
                 color: "#e8e6e3"
                 font.pixelSize: 11
-                linkColor: compactEditor.accentColorHover
-                text: "<b>Dodge &amp; Burn</b><br>" +
+                linkColor: compactEditor.panelAccentHover
+                text: compactEditor.stackMode ? compactEditor.stackHelpText : "<b>Dodge &amp; Burn</b><br>" +
                       "Paint any of the slider effects onto part of the photo.<br><br>" +
                       "<b>Choosing the effect</b><br>" +
                       "• With <i>New strokes</i> selected, the orange sliders set the recipe for the next stroke (e.g. Exposure −30 to burn, +30 to dodge; mix in any sliders).<br>" +
@@ -531,7 +573,7 @@ Window {
                       "• Hardness: how soft the brush edge is (inner ring on the cursor = full strength)<br><br>" +
                       "<b>Keys</b><br>" +
                       "• <b>[ ]</b> brush size<br>" +
-                      "• <b>Space</b>+drag: pan &nbsp;·&nbsp; scroll: zoom<br>" +
+                      "• hold <b>Space</b>: show original &nbsp;·&nbsp; <b>Space</b>+drag or middle-drag: pan &nbsp;·&nbsp; scroll: zoom<br>" +
                       "• <b>Ctrl+Z</b>: undo last stroke<br>" +
                       "• <b>M</b>: toggle mask overlay &nbsp;·&nbsp; hold <b>Ctrl</b>: show it briefly<br>" +
                       "• <b>Shift+D</b> or <b>Esc</b>: leave dodge &amp; burn<br><br>" +
@@ -589,39 +631,165 @@ Window {
             // --- Header ---
             RowLayout {
                 Layout.fillWidth: true
-                spacing: 6
+                spacing: 4
 
-                // Enters / leaves dodge & burn brush mode (same as Shift+D).
-                Button {
-                    id: brushModeBtn
-                    implicitHeight: 26
-                    Layout.preferredHeight: 26
-                    enabled: !compactEditor.cropActive
-                    padding: 0
-                    leftPadding: 8; rightPadding: 8
-                    flat: true
-                    ToolTip.visible: hovered
-                    ToolTip.delay: 500
-                    ToolTip.text: compactEditor.brushMode ? "Leave dodge & burn (Shift+D)" : "Dodge & burn brush (Shift+D)"
-                    onClicked: {
-                        if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_local_brush_mode()
-                        compactEditor.focusKeyboardHandler()
+                // Brush tools: dodge & burn ("Burn", Shift+D) and stack paint
+                // with its input-frame picker.
+                RowLayout {
+                    spacing: 2
+
+                    Button {
+                        id: brushModeBtn
+                        implicitHeight: 26
+                        Layout.preferredHeight: 26
+                        enabled: !compactEditor.cropActive
+                        padding: 0
+                        leftPadding: 6; rightPadding: 6
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.recipeMode ? "Leave dodge & burn (Shift+D)" : "Dodge & burn brush (Shift+D)"
+                        onClicked: {
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_local_brush_mode()
+                            compactEditor.focusKeyboardHandler()
+                        }
+                        contentItem: Text {
+                            text: "◐ Burn"
+                            font.pixelSize: 11
+                            font.weight: compactEditor.recipeMode ? Font.DemiBold : Font.Normal
+                            color: compactEditor.recipeMode ? "#1e1e1e"
+                                   : (brushModeBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor)
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: compactEditor.recipeMode ? compactEditor.accentColor
+                                   : (brushModeBtn.hovered ? "#30ffffff" : "transparent")
+                            border.color: compactEditor.recipeMode ? "transparent" : compactEditor.controlBorder
+                            border.width: 1
+                        }
                     }
-                    contentItem: Text {
-                        text: "◐ Dodge & Burn"
-                        font.pixelSize: 11
-                        font.weight: compactEditor.brushMode ? Font.DemiBold : Font.Normal
-                        color: compactEditor.brushMode ? "#1e1e1e"
-                               : (brushModeBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor)
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
+
+                    // Stack paint: grey unless this is an in-camera stacked JPG
+                    // whose input JPGs were found.
+                    Button {
+                        id: stackModeBtn
+                        implicitHeight: 26
+                        Layout.preferredHeight: 26
+                        enabled: !compactEditor.cropActive && compactEditor.stackPaintAvailable
+                        padding: 0
+                        leftPadding: 6; rightPadding: 6
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.stackMode ? "Leave stack paint" : "Stack paint: paint an input frame over the stack"
+                        onClicked: {
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_stack_brush_mode()
+                            compactEditor.focusKeyboardHandler()
+                        }
+                        contentItem: Text {
+                            text: "Stack"
+                            font.pixelSize: 11
+                            font.weight: compactEditor.stackMode ? Font.DemiBold : Font.Normal
+                            color: !stackModeBtn.enabled ? "#55524f"
+                                   : compactEditor.stackMode ? "#1e1e1e"
+                                   : (stackModeBtn.hovered ? compactEditor.stackAccentHover : compactEditor.textColor)
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: compactEditor.stackMode ? compactEditor.stackAccent
+                                   : (stackModeBtn.hovered ? "#30ffffff" : "transparent")
+                            border.color: compactEditor.stackMode ? "transparent"
+                                          : (stackModeBtn.enabled ? compactEditor.controlBorder : "#18ffffff")
+                            border.width: 1
+                        }
                     }
-                    background: Rectangle {
-                        radius: 4
-                        color: compactEditor.brushMode ? compactEditor.accentColor
-                               : (brushModeBtn.hovered ? "#30ffffff" : "transparent")
-                        border.color: compactEditor.brushMode ? "transparent" : compactEditor.controlBorder
-                        border.width: 1
+
+                    // Which input frame stack paint reveals (1 = nearest focus).
+                    ComboBox {
+                        id: stackInputCombo
+                        implicitWidth: 34; implicitHeight: 26
+                        Layout.minimumWidth: 34; Layout.preferredWidth: 34; Layout.maximumWidth: 34
+                        Layout.preferredHeight: 26
+                        enabled: !compactEditor.cropActive && compactEditor.stackPaintAvailable
+                        focusPolicy: Qt.NoFocus
+                        model: compactEditor.uiStateRef ? compactEditor.uiStateRef.stackInputs : []
+                        textRole: "label"
+                        currentIndex: compactEditor.stackInputIndex
+                        onActivated: function(index) {
+                            var inputs = compactEditor.uiStateRef ? compactEditor.uiStateRef.stackInputs : []
+                            if (compactEditor.controllerRef && index >= 0 && index < inputs.length)
+                                compactEditor.controllerRef.set_stack_input(inputs[index].name)
+                            currentIndex = Qt.binding(function() { return compactEditor.stackInputIndex })
+                            compactEditor.focusKeyboardHandler()
+                        }
+                        ToolTip.visible: hovered && !stackInputCombo.popup.visible
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.stackInputLabel !== ""
+                                      ? "Stack input to paint: " + compactEditor.stackInputLabel
+                                      : "Stack input to paint"
+                        contentItem: Text {
+                            leftPadding: 4
+                            text: stackInputCombo.currentIndex >= 0 && compactEditor.uiStateRef
+                                  ? compactEditor.uiStateRef.stackInputs[stackInputCombo.currentIndex].short
+                                  : "–"
+                            font.pixelSize: 10
+                            color: stackInputCombo.enabled ? compactEditor.textColor : "#55524f"
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        indicator: Text {
+                            x: stackInputCombo.width - width - 4
+                            y: (stackInputCombo.height - height) / 2
+                            text: "▾"
+                            font.pixelSize: 9
+                            color: stackInputCombo.enabled ? "#9a9795" : "#55524f"
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: stackInputCombo.hovered && stackInputCombo.enabled ? "#30ffffff" : "transparent"
+                            border.color: stackInputCombo.enabled ? compactEditor.controlBorder : "#18ffffff"
+                            border.width: 1
+                        }
+                        delegate: ItemDelegate {
+                            id: stackInputDelegate
+                            required property var modelData
+                            required property int index
+                            width: 176
+                            height: 22
+                            highlighted: stackInputCombo.highlightedIndex === stackInputDelegate.index
+                            contentItem: Text {
+                                text: stackInputDelegate.modelData.label
+                                font.pixelSize: 10
+                                color: stackInputDelegate.index === stackInputCombo.currentIndex ? compactEditor.stackAccentHover : "#e8e6e3"
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                color: stackInputDelegate.highlighted ? "#30ffffff" : "transparent"
+                            }
+                        }
+                        popup: Popup {
+                            y: stackInputCombo.height
+                            width: 180
+                            margins: 4
+                            padding: 2
+                            implicitHeight: contentItem.implicitHeight + 4
+                            contentItem: ListView {
+                                clip: true
+                                implicitHeight: Math.min(contentHeight, 360)
+                                model: stackInputCombo.popup.visible ? stackInputCombo.delegateModel : null
+                                currentIndex: stackInputCombo.highlightedIndex
+                                ScrollIndicator.vertical: ScrollIndicator { }
+                            }
+                            background: Rectangle {
+                                color: "#262626"
+                                radius: 4
+                                border.color: "#3a3a3a"
+                                border.width: 1
+                            }
+                        }
                     }
                 }
 
@@ -905,14 +1073,44 @@ Window {
                     spacing: 4
 
                     Text {
-                        text: "DODGE & BURN"
+                        text: compactEditor.stackMode ? "STACK PAINT" : "DODGE & BURN"
                         font.pixelSize: 9
                         font.weight: Font.DemiBold
                         font.letterSpacing: 1.0
-                        color: compactEditor.accentColorHover
+                        color: compactEditor.panelAccentHover
                     }
 
                     Item { Layout.fillWidth: true }
+
+                    // Show-mask toggle (same as M).
+                    CheckBox {
+                        id: brushMaskToggle
+                        text: "Mask"
+                        padding: 0
+                        checked: compactEditor.uiStateRef ? compactEditor.uiStateRef.localOverlayVisible : false
+                        onToggled: {
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_local_overlay()
+                            checked = Qt.binding(function() { return compactEditor.uiStateRef ? compactEditor.uiStateRef.localOverlayVisible : false })
+                        }
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: "Show mask overlay (M)"
+                        indicator: Rectangle {
+                            implicitWidth: 12; implicitHeight: 12
+                            x: 0; y: (brushMaskToggle.height - height) / 2
+                            radius: 2
+                            color: brushMaskToggle.checked ? compactEditor.panelAccent : "transparent"
+                            border.color: brushMaskToggle.checked ? compactEditor.panelAccent : "#6a6866"
+                            border.width: 1
+                        }
+                        contentItem: Text {
+                            text: brushMaskToggle.text
+                            leftPadding: 16
+                            font.pixelSize: 9
+                            color: brushMaskToggle.checked ? "#e8e6e3" : "#9a9795"
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
 
                     Button {
                         id: brushHelpBtn
@@ -923,7 +1121,7 @@ Window {
                         flat: true
                         ToolTip.visible: hovered
                         ToolTip.delay: 500
-                        ToolTip.text: "How dodge & burn works"
+                        ToolTip.text: compactEditor.stackMode ? "How stack paint works" : "How dodge & burn works"
                         onClicked: brushHelpPopup.opened ? brushHelpPopup.close() : brushHelpPopup.open()
                         contentItem: Text {
                             text: "?"
@@ -966,16 +1164,39 @@ Window {
                     }
                 }
 
+                // Stack paint: the input frame new strokes reveal.
+                Rectangle {
+                    visible: compactEditor.stackMode
+                    Layout.fillWidth: true
+                    implicitHeight: 22
+                    radius: 3
+                    color: "#332dd4bf"
+                    border.color: compactEditor.stackAccent
+                    border.width: 1
+
+                    Text {
+                        anchors.fill: parent
+                        anchors.leftMargin: 6
+                        anchors.rightMargin: 6
+                        verticalAlignment: Text.AlignVCenter
+                        text: "Painting from: " + compactEditor.stackInputLabel
+                        color: compactEditor.textColor
+                        font.pixelSize: 10
+                        elide: Text.ElideRight
+                    }
+                }
+
                 // The recipe the next new layer gets. Selected whenever no
                 // layer is being edited.
                 Rectangle {
                     id: newStrokesRow
+                    visible: !compactEditor.stackMode
                     readonly property bool selected: !compactEditor.uiStateRef || compactEditor.uiStateRef.localEditingLayerId === ""
                     Layout.fillWidth: true
                     implicitHeight: 22
                     radius: 3
                     color: newStrokesRow.selected ? "#33f59e0b" : "transparent"
-                    border.color: newStrokesRow.selected ? compactEditor.accentColor : "#30ffffff"
+                    border.color: newStrokesRow.selected ? compactEditor.panelAccent : "#30ffffff"
                     border.width: 1
 
                     Text {
@@ -1005,11 +1226,14 @@ Window {
                     delegate: Rectangle {
                         id: layerRow
                         required property var modelData
+                        readonly property bool isStack: layerRow.modelData.kind === "stack"
+                        // Each tool lists only its own layers.
+                        visible: layerRow.isStack === compactEditor.stackMode
                         Layout.fillWidth: true
                         implicitHeight: 22
                         radius: 3
                         color: layerRow.modelData.editing ? "#33f59e0b" : (layerMouse.containsMouse ? "#14ffffff" : "transparent")
-                        border.color: layerRow.modelData.editing ? compactEditor.accentColor
+                        border.color: layerRow.modelData.editing ? compactEditor.panelAccent
                                       : (layerRow.modelData.active ? "#60f59e0b" : "#30ffffff")
                         border.width: 1
 
@@ -1019,7 +1243,12 @@ Window {
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
-                                if (compactEditor.controllerRef) compactEditor.controllerRef.select_local_layer(layerRow.modelData.id)
+                                if (compactEditor.controllerRef) {
+                                    // A stack layer has no recipe: clicking it
+                                    // picks its frame for the next strokes.
+                                    if (layerRow.isStack) compactEditor.controllerRef.set_stack_input(layerRow.modelData.source)
+                                    else compactEditor.controllerRef.select_local_layer(layerRow.modelData.id)
+                                }
                                 compactEditor.focusKeyboardHandler()
                             }
                         }
@@ -1101,7 +1330,7 @@ Window {
                             Rectangle {
                                 width: brushSizeSlider.visualPosition * parent.width
                                 height: parent.height; radius: 2
-                                color: compactEditor.accentColor; opacity: 0.6
+                                color: compactEditor.panelAccent; opacity: 0.6
                             }
                         }
                         handle: Rectangle {
@@ -1109,7 +1338,7 @@ Window {
                             y: brushSizeSlider.topPadding + brushSizeSlider.availableHeight / 2 - height / 2
                             width: 10; height: 10; radius: 5
                             color: "#e8e6e3"
-                            border.color: brushSizeSlider.pressed ? compactEditor.accentColor : "#5a5755"
+                            border.color: brushSizeSlider.pressed ? compactEditor.panelAccent : "#5a5755"
                             border.width: 1
                         }
                         readonly property real minRadius: 0.002
@@ -1162,7 +1391,7 @@ Window {
                             Rectangle {
                                 width: brushHardnessSlider.visualPosition * parent.width
                                 height: parent.height; radius: 2
-                                color: compactEditor.accentColor; opacity: 0.6
+                                color: compactEditor.panelAccent; opacity: 0.6
                             }
                         }
                         handle: Rectangle {
@@ -1170,7 +1399,7 @@ Window {
                             y: brushHardnessSlider.topPadding + brushHardnessSlider.availableHeight / 2 - height / 2
                             width: 10; height: 10; radius: 5
                             color: "#e8e6e3"
-                            border.color: brushHardnessSlider.pressed ? compactEditor.accentColor : "#5a5755"
+                            border.color: brushHardnessSlider.pressed ? compactEditor.panelAccent : "#5a5755"
                             border.width: 1
                         }
                         Layout.fillWidth: true
@@ -1224,7 +1453,7 @@ Window {
 
                 Button {
                     id: autoLevelsBtn
-                    visible: !compactEditor.brushMode  // auto tools act on the global edit
+                    visible: !compactEditor.recipeMode  // auto tools act on the global edit
                     implicitWidth: 36; implicitHeight: 16
                     Layout.minimumWidth: 36; Layout.preferredWidth: 36; Layout.maximumWidth: 36
                     Layout.minimumHeight: 16; Layout.preferredHeight: 16; Layout.maximumHeight: 16
@@ -1283,7 +1512,7 @@ Window {
 
                 Button {
                     id: autoWbBtn
-                    visible: !compactEditor.brushMode  // auto tools act on the global edit
+                    visible: !compactEditor.recipeMode  // auto tools act on the global edit
                     implicitWidth: 36; implicitHeight: 16
                     Layout.minimumWidth: 36; Layout.preferredWidth: 36; Layout.maximumWidth: 36
                     Layout.minimumHeight: 16; Layout.preferredHeight: 16; Layout.maximumHeight: 16

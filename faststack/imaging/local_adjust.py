@@ -12,6 +12,8 @@ so two coats of Exposure +20 render exactly as Exposure +40 there.
 
 Layers live in the edit dict as ``edits["local_layers"]``: a list of plain
 JSON-safe dicts ``{"id": str, "visible": bool, "recipe": {key: float}}``.
+A layer with a ``"source"`` key is a stack layer instead (see
+``faststack.imaging.stack_paint``); it has no recipe.
 The list and its dicts are treated as immutable — the controller replaces
 them on every change — so shallow edit snapshots are safe to hand to the
 render and save workers.
@@ -105,23 +107,31 @@ def normalize_local_layers(value: Any) -> List[Dict[str, Any]]:
         if not layer_id or layer_id in seen:
             continue
         seen.add(layer_id)
-        layers.append(
-            {
-                "id": layer_id,
-                "visible": bool(item.get("visible", True)),
-                "recipe": normalize_recipe(item.get("recipe")),
-            }
-        )
+        layer = {
+            "id": layer_id,
+            "visible": bool(item.get("visible", True)),
+            "recipe": normalize_recipe(item.get("recipe")),
+        }
+        # Stack layers (faststack.imaging.stack_paint) paint a focus-stack
+        # input instead of a recipe.
+        source = item.get("source")
+        if isinstance(source, str) and source:
+            layer["source"] = source
+            layer["recipe"] = {}
+        layers.append(layer)
     return layers
 
 
 def effective_layers(edits: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Visible layers whose recipe moves at least one slider."""
+    """Visible recipe layers that move at least one slider (no stack layers)."""
     layers = edits.get("local_layers") or ()
     return [
         layer
         for layer in layers
-        if isinstance(layer, dict) and layer.get("visible", True) and layer.get("recipe")
+        if isinstance(layer, dict)
+        and layer.get("visible", True)
+        and layer.get("recipe")
+        and not layer.get("source")
     ]
 
 

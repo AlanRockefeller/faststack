@@ -273,6 +273,5 @@ class TestOverlayFallback(unittest.TestCase):
         self.assertEqual(transparent.format(), QImage.Format.Format_ARGB32)
 
 
-
 if __name__ == "__main__":
     unittest.main()

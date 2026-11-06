@@ -380,9 +380,7 @@ class LayerDensityCache:
 
 def _extends(strokes: Sequence[MaskStroke], cached: tuple) -> bool:
     """True when *strokes* starts with exactly the stroke objects in *cached*."""
-    return len(strokes) >= len(cached) and all(
-        a is b for a, b in zip(strokes, cached)
-    )
+    return len(strokes) >= len(cached) and all(a is b for a, b in zip(strokes, cached))
 
 
 def rasterize_layer_density(
@@ -404,15 +402,15 @@ def rasterize_layer_density(
     key = (mask_data.uid, tuple(shape), _geometry_key(edits))
 
     entry = cache.get(layer_id, key) if cache is not None else None
-    if entry is not None and len(entry[0]) == len(strokes) and _extends(
-        strokes, entry[0]
+    if (
+        entry is not None
+        and len(entry[0]) == len(strokes)
+        and _extends(strokes, entry[0])
     ):
         committed = entry[1]
     else:
         if entry is not None and _extends(strokes, entry[0]):
-            committed = _apply_strokes(
-                entry[1], strokes[len(entry[0]) :], edits, shape
-            )
+            committed = _apply_strokes(entry[1], strokes[len(entry[0]) :], edits, shape)
         else:
             committed = _apply_strokes(None, strokes, edits, shape)
         if cache is not None:

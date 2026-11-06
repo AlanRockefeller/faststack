@@ -47,6 +47,19 @@ from faststack.imaging.math_utils import (
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
+
+# Stack paint: focus-stack input pixels painted over the stacked output
+from faststack.imaging.stack_paint import (
+    STACK_OUTPUT_SOURCE,
+    StackAlignError,
+    StackSource,
+    composite_stack_layers,
+    is_stack_layer,
+    load_stack_source,
+    stack_identity,
+    stack_layers,
+    warp_source_to_base,
+)
 from faststack.models import DecodedImage
 from faststack.util.executors import create_daemon_threadpool_executor
 
@@ -897,6 +910,11 @@ class ImageEditor:
         # raster cache for them.
         self._mask_assets: Dict[str, MaskData] = {}
         self._local_density_cache = LayerDensityCache()
+        # Stack paint: decoded + registered focus-stack inputs keyed by file
+        # name (StackSource is immutable; the dict is only rebound/cleared on
+        # the GUI thread), and the image they were registered against.
+        self._stack_sources: Dict[str, StackSource] = {}
+        self._stack_sources_path: Optional[str] = None
 
         # Rendering preferences pushed in from AppController config:
         # soft shoulder/toe on the levels ramp, and TPDF dither on 8-bit
@@ -931,6 +949,7 @@ class ImageEditor:
                 and self._cached_u8_wb_lut is None
                 and not self._mask_assets
                 and not self._local_density_cache
+                and not self._stack_sources
             ):
                 return
             self.original_image = None
@@ -951,6 +970,8 @@ class ImageEditor:
             self._cached_u8_wb_lut = None
             self._mask_assets.clear()
             self._local_density_cache.clear()
+            self._stack_sources = {}
+            self._stack_sources_path = None
 
     def set_source_exif(self, exif_bytes: Optional[bytes]):
         """Store EXIF bytes from the original source (e.g., paired JPEG).
@@ -1166,6 +1187,11 @@ class ImageEditor:
             # Clear mask state from previous image
             self._mask_assets.clear()
             self._local_density_cache.clear()
+            # Registered stack inputs stay valid across a reload of the same
+            # photo (e.g. after a save); another photo needs its own.
+            if self._stack_sources_path != str(load_filepath):
+                self._stack_sources = {}
+                self._stack_sources_path = str(load_filepath)
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
         _is_png = load_filepath.suffix.lower() == ".png"
@@ -1575,6 +1601,7 @@ class ImageEditor:
         levels_soft_knee_override: Optional[bool] = None,
         mask_assets_override: Optional[Dict[str, "MaskData"]] = None,
         cache_override: Optional["LayerDensityCache"] = None,
+        stack_sources_override: Optional[Dict[str, StackSource]] = None,
         cache_context: Optional[dict] = None,
         update_highlight_state: bool = True,
         downscale_long_edge: Optional[int] = None,
@@ -1614,6 +1641,8 @@ class ImageEditor:
         ``mask_assets_override`` / ``cache_override`` supply the dodge & burn
         stroke masks and their raster cache (export snapshots); by default the
         live ``_mask_assets`` and the preview-thread cache are used.
+        ``stack_sources_override`` likewise supplies the registered stack
+        inputs for stack layers (default: the live ``_stack_sources``).
         """
         cv2 = _get_cv2()
         if edits is None:
@@ -1674,6 +1703,38 @@ class ImageEditor:
                 arr = arr.astype(np.float32) / 65535.0
             else:
                 arr = arr.astype(np.float32, copy=False)
+
+        # 0. Stack paint: blend painted focus-stack input pixels into the base
+        # image before any geometry, so they get exactly the same geometry,
+        # global and local edits as the rest of the photo. Returns a fresh
+        # array when it paints anything, so a shared input is never written.
+        stack_ident: Optional[tuple] = None
+        if stack_layers(edits):
+            stack_masks = (
+                mask_assets_override
+                if mask_assets_override is not None
+                else self._mask_assets
+            )
+            stack_sources = (
+                stack_sources_override
+                if stack_sources_override is not None
+                else self._stack_sources
+            )
+            arr, stack_painted = composite_stack_layers(
+                arr,
+                edits,
+                stack_masks,
+                stack_sources,
+                (
+                    cache_override
+                    if cache_override is not None
+                    else self._local_density_cache
+                ),
+            )
+            if stack_painted:
+                exact_u8 = False
+                stack_ident = stack_identity(edits, stack_masks, stack_sources)
+            _mark("stack_paint")
 
         # NOTE: For UI analysis, we want to capture the state AFTER White Balance and Exposure
         # but BEFORE Highlights/Shadows/ToneMapping, so the indicators reflect the
@@ -1861,7 +1922,9 @@ class ImageEditor:
             log.debug("_apply_edits for_export: skip_linear=%s", _skip_linear)
 
         if _skip_linear and not for_export:
-            upstream_hash, upstream_frozen = self._get_upstream_edits_hash(edits)
+            upstream_hash, upstream_frozen = self._get_upstream_edits_hash(
+                edits, stack_ident
+            )
             analysis_state = None
             with self._lock:
                 cached_dict = (
@@ -1973,7 +2036,9 @@ class ImageEditor:
 
             if should_analyze:
                 # Check cache for analysis state to avoid expensive re-computation on downstream edits
-                upstream_hash, upstream_frozen = self._get_upstream_edits_hash(edits)
+                upstream_hash, upstream_frozen = self._get_upstream_edits_hash(
+                    edits, stack_ident
+                )
 
                 cached_analysis = None
                 cached_analysis_shape = None
@@ -2108,6 +2173,10 @@ class ImageEditor:
                 if local is not None and local.linear_identity:
                     # Painted WB/exposure/shadows change the detail input.
                     detail_frozen = detail_frozen + (local.linear_identity,)
+                    detail_hash = hash(detail_frozen)
+                if stack_ident:
+                    # Painted stack-input pixels change the detail input.
+                    detail_frozen = detail_frozen + (("stack", stack_ident),)
                     detail_hash = hash(detail_frozen)
                 detail_scale_key = round(detail_render_scale, 8)
                 Y20_cached = Y3_cached = Y1_cached = None
@@ -3146,7 +3215,9 @@ class ImageEditor:
             "confidence": confidence,
         }
 
-    def _get_upstream_edits_hash(self, edits: Dict[str, Any]) -> tuple:
+    def _get_upstream_edits_hash(
+        self, edits: Dict[str, Any], stack_ident: Optional[tuple] = None
+    ) -> tuple:
         """Returns (hash, frozen_values) of edit parameters that affect the
         input to highlight recovery.
 
@@ -3181,6 +3252,8 @@ class ImageEditor:
         values.append(str(self.current_filepath))
         # Include float_image ID to catch reload-in-place or content changes (e.g. forced reload)
         values.append(self.current_mtime)
+        if stack_ident:
+            values.append(("stack", stack_ident))
         frozen = tuple(values)
         return (hash(frozen), frozen)
 
@@ -3371,8 +3444,12 @@ class ImageEditor:
         detail_source_scale: float = 1.0,
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
+        apply_overrides: Optional[Dict[str, Any]] = None,
     ) -> DecodedImage:
-        """Render edits against a float RGB array and package it for Qt display."""
+        """Render edits against a float RGB array and package it for Qt display.
+
+        ``apply_overrides`` adds keyword arguments to the ``_apply_edits`` call.
+        """
         cv2 = _get_cv2()
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
@@ -3386,6 +3463,7 @@ class ImageEditor:
             detail_source_scale=detail_source_scale,
             protect_input=protect_input,
             cancel_check=cancel_check,
+            **(apply_overrides or {}),
         )
         if cancel_check is not None and cancel_check():
             raise EditRenderCancelled
@@ -3439,6 +3517,69 @@ class ImageEditor:
             height=arr_u8.shape[0],
             bytes_per_line=arr_u8.strides[0],
             format=QImage.Format.Format_RGB888,
+        )
+
+    def render_stack_hover_preview(
+        self, source: Optional[StackSource], long_edge: int = 2560
+    ) -> Optional[DecodedImage]:
+        """Render the photo as if *source* were painted everywhere.
+
+        ``source=None`` means the stack output itself (the photo without any
+        stack layers).
+
+        Same geometry, global edits, dodge & burn layers and display colour
+        handling as the live preview, so the loupe can show it inside the
+        brush circle as a preview of what a stack paint stroke would do.
+        Safe on a worker thread: it uses private caches and snapshots.
+        """
+        with self._lock:
+            base = self.float_preview
+            if base is None:
+                base = self.float_image
+            edits = dict(self.current_edits)
+            masks = dict(self._mask_assets)
+            icc_bytes = (
+                self.original_image.info.get("icc_profile")
+                if self.original_image is not None
+                else None
+            )
+            full = self.float_image if self.float_image is not None else base
+        if base is None:
+            return None
+        edits["local_layers"] = [
+            layer
+            for layer in edits.get("local_layers") or ()
+            if not is_stack_layer(layer)
+        ]
+        # Sharper than the preview master when the full image allows: the
+        # loupe may be zoomed in on the brush.
+        fh, fw = full.shape[:2]
+        target = max(max(base.shape[:2]), min(long_edge, max(fh, fw)))
+        scale = target / max(fh, fw)
+        shape = (max(1, round(fh * scale)), max(1, round(fw * scale)))
+        if source is not None:
+            src_arr = warp_source_to_base(source, shape)
+        elif full.shape[:2] == shape:
+            src_arr = full
+        else:
+            src_arr = _get_cv2().resize(
+                full, (shape[1], shape[0]), interpolation=_get_cv2().INTER_AREA
+            )
+        return self._render_decoded_from_float(
+            src_arr,
+            edits=edits,
+            for_export=False,
+            apply_loupe_color=True,
+            icc_bytes=icc_bytes,
+            cache_context={},
+            detail_source_scale=min(shape[1] / fw, 1.0),
+            protect_input=True,
+            apply_overrides={
+                "mask_assets_override": masks,
+                "cache_override": LayerDensityCache(),
+                "stack_sources_override": {},
+                "update_highlight_state": False,
+            },
         )
 
     def get_full_resolution_preview_data(
@@ -4267,6 +4408,9 @@ class ImageEditor:
                 mask_copy.live_stroke = None
                 mask_assets_snapshot[key] = mask_copy
 
+            # --- Stack paint inputs (immutable objects; copy the dict) ---
+            stack_sources_snapshot = dict(self._stack_sources)
+
             # --- Paths ---
             filepath_snapshot = self.current_filepath
             source_filepath_snapshot = self.source_filepath or self.current_filepath
@@ -4304,6 +4448,10 @@ class ImageEditor:
             "write_developed_jpg": write_developed_jpg,
             "developed_path": developed_path,
             "mask_assets": mask_assets_snapshot,
+            "stack_sources": stack_sources_snapshot,
+            # Optional callable(name) -> Path the controller may add so the
+            # save worker can load stack inputs that were not loaded yet.
+            "stack_source_resolver": None,
         }
 
     def _dither_for_export(
@@ -4379,6 +4527,16 @@ class ImageEditor:
         if _debug:
             t0 = time.perf_counter()
 
+        # 0. Stack inputs a painted layer needs but the preview never loaded
+        # (e.g. a save right after reopening the photo) load here.
+        stack_sources = self._stack_sources_for_export(
+            edits_snapshot,
+            mask_override,
+            dict(snapshot.get("stack_sources") or {}),
+            snapshot.get("stack_source_resolver"),
+            source_arr,
+        )
+
         # 1. Apply edits to full resolution — uses only snapshot data
         # Use isolated snapshot context so background export doesn't pollute self._cached_*
         export_cache_context = {}
@@ -4389,6 +4547,7 @@ class ImageEditor:
             levels_soft_knee_override=levels_soft_knee,
             mask_assets_override=mask_override,
             cache_override=export_cache,
+            stack_sources_override=stack_sources,
             cache_context=export_cache_context,
             update_highlight_state=False,
             # The snapshot shares the live editor's float_image (see
@@ -4556,6 +4715,35 @@ class ImageEditor:
         finally:
             for tmp_output, _destination in temp_outputs:
                 tmp_output.unlink(missing_ok=True)
+
+    @staticmethod
+    def _stack_sources_for_export(
+        edits: Dict[str, Any],
+        masks: Dict[str, MaskData],
+        sources: Dict[str, StackSource],
+        resolver: Optional[Callable[[str], Optional[Path]]],
+        source_arr: np.ndarray,
+    ) -> Dict[str, StackSource]:
+        """Fill in stack inputs the export needs; runs on the save worker."""
+        for layer in stack_layers(edits):
+            name = layer["source"]
+            mask = masks.get(layer["id"])
+            if (
+                name == STACK_OUTPUT_SOURCE
+                or name in sources
+                or mask is None
+                or not mask.has_strokes()
+            ):
+                continue
+            path = resolver(name) if resolver is not None else None
+            if path is None:
+                log.warning("Stack input %s not found; saving without it", name)
+                continue
+            try:
+                sources[name] = load_stack_source(path, source_arr)
+            except (OSError, StackAlignError) as exc:
+                log.warning("Stack input %s skipped in save: %s", name, exc)
+        return sources
 
     def save_image(
         self,

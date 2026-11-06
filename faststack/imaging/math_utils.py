@@ -480,6 +480,4 @@ def _highlight_gain(p: np.ndarray, base: np.ndarray, amount, headroom: float):
 
     # Back to linear as a gain on brightness (p is its square root).
     v = p * p
-    return np.divide(
-        p_new * p_new, v, out=np.ones_like(v), where=v > np.float32(1e-8)
-    )
+    return np.divide(p_new * p_new, v, out=np.ones_like(v), where=v > np.float32(1e-8))

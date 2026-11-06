@@ -19,6 +19,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Drag & Drop:** Drag images to external applications. Press { and } to batch files to drag & drop multiple images.
 - **Image Editor:** Built-in editor with exposure, contrast, white balance, sharpness, and more (E key)
 - **Dodge & Burn:** Paint any compact-editor slider (exposure, contrast, shadows, white balance, vibrance, color mix…) onto part of the photo (Shift+D). Each stroke adds one coat, so overlapping strokes build up; strokes are kept as layers you can re-edit, hide, or delete.
+- **Stack Paint:** For in-camera focus stacks (`... stacked.JPG`), paint any of the stack's input JPGs - or the stack output itself - back over the stacked photo, e.g. to restore a clean background or fix stacking halos. Each input is aligned to the stack automatically, the brush circle previews what a click will paint, and global edits and dodge & burn apply to the painted pixels too.
 - **Quick Auto Adjust:** Press `l` for quick auto-levels, `L` for auto white balance + auto-levels together, `A` for auto white balance, `-`/`_` to keep adjusting the highlight/white side in 14-point steps, and `=`/`+` to adjust the shadow/black side in 7-point steps. These update the live in-memory edit session immediately and save once when you navigate away, start a drag, or explicitly save. Auto-levels treats its clip threshold as a budget (a few already-clipped specular pixels won't disable the stretch), brightens underexposed midtones toward a configurable target, and rolls off stretched highlights smoothly instead of hard-clipping them. Auto white balance analyzes only the cropped area, fades its correction when the scene lacks reliable neutrals, and damps magenta/green corrections so foliage isn't mistaken for a color cast. The midtone target, channel clip budget, highlight rolloff, export dithering, and tint correction strength are all adjustable in Settings.
 - **Photoshop / Gimp Integration:** Edit current image in Photoshop or Gimp (P key) - always uses RAW files when available.
 - **Image Filtering:** Filter images by filename
@@ -169,7 +170,7 @@ faststack "C:\path\to\photos"
 - `Left Arrow`: Previous Image
 - `Shift+Right Arrow`: Jump forward 10 images in loupe view
 - `Shift+Left Arrow`: Jump back 10 images in loupe view
-- `Shift+D`: Dodge & burn brush in the compact editor. Sliders set the brush recipe; left-drag paints, right/Alt-drag erases, `[`/`]` brush size, Space+drag pans, Ctrl+Z undoes a stroke, `M` (or hold Ctrl) shows the mask, Esc leaves brush mode
+- `Shift+D`: Dodge & burn brush in the compact editor. Sliders set the brush recipe; left-drag paints, right/Alt-drag erases, `[`/`]` brush size, Space+drag or middle-drag pans, Ctrl+Z undoes a stroke, `M` (or hold Ctrl) shows the mask, Esc leaves brush mode. The compact editor's "Stack" button (with its input dropdown) switches to stack paint, which uses the same brush keys; right/Alt-drag restores the stack there
 - `G`: Jump to Image Number
 - `I`: Show EXIF Data
 - `F11`: Toggle Fullscreen (Loupe View)

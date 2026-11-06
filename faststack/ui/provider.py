@@ -164,6 +164,14 @@ class ImageProvider(QQuickImageProvider):
         request_is_stale = False
         try:
             # Handle mask overlay requests
+            if id.startswith("stack_hover/"):
+                hover = getattr(
+                    self.app_controller.ui_state, "_stack_hover_image", None
+                )
+                if hover is not None and not hover.isNull():
+                    return hover.copy()
+                return self._transparent
+
             if id.startswith("mask_overlay/"):
                 overlay = getattr(
                     self.app_controller.ui_state, "_local_overlay_image", None
@@ -722,6 +730,10 @@ class UIState(QObject):
     local_editing_layer_id_changed = Signal(str)
     local_recipe_changed = Signal()
     local_brush_summary_changed = Signal(str)
+    brush_tool_changed = Signal(str)
+    stack_inputs_changed = Signal()
+    stack_input_name_changed = Signal(str)
+    stack_hover_generation_changed = Signal()
 
     # Debug Cache Signals
     debugCacheChanged = Signal(bool)
@@ -818,6 +830,15 @@ class UIState(QObject):
         self._local_editing_layer_id = ""
         self._local_recipe: dict = {}
         self._local_brush_summary = ""
+        # Which brush is active in brush mode: "local" (dodge & burn) or
+        # "stack" (paint a focus-stack input over the stacked photo).
+        self._brush_tool = "local"
+        self._stack_inputs: list = []  # [{"name", "label"}], near to far
+        self._stack_input_name = ""
+        # Stack paint hover preview (QImage); generation 0 = none available.
+        self._stack_hover_image = None
+        self._stack_hover_generation = 0
+        self._stack_hover_serial = 0
 
         # Debug Cache State
         self._debug_cache = False
@@ -2498,6 +2519,51 @@ class UIState(QObject):
         if self._local_brush_summary != new_value:
             self._local_brush_summary = new_value
             self.local_brush_summary_changed.emit(new_value)
+
+    @Property(str, notify=brush_tool_changed)
+    def brushTool(self) -> str:
+        return self._brush_tool
+
+    @brushTool.setter
+    def brushTool(self, new_value: str):
+        if self._brush_tool != new_value:
+            self._brush_tool = new_value
+            self.brush_tool_changed.emit(new_value)
+
+    @Property("QVariantList", notify=stack_inputs_changed)
+    def stackInputs(self) -> list:
+        """Input JPGs of the current in-camera stack, near to far focus."""
+        return self._stack_inputs
+
+    @stackInputs.setter
+    def stackInputs(self, new_value: list):
+        if self._stack_inputs != new_value:
+            self._stack_inputs = new_value
+            self.stack_inputs_changed.emit()
+
+    @Property(str, notify=stack_input_name_changed)
+    def stackInputName(self) -> str:
+        """File name of the stack input that stack paint strokes reveal."""
+        return self._stack_input_name
+
+    @stackInputName.setter
+    def stackInputName(self, new_value: str):
+        if self._stack_input_name != new_value:
+            self._stack_input_name = new_value
+            self.stack_input_name_changed.emit(new_value)
+
+    @Property(int, notify=stack_hover_generation_changed)
+    def stackHoverGeneration(self) -> int:
+        """Bumped per new stack paint hover preview; 0 when there is none."""
+        return self._stack_hover_generation
+
+    def bump_stack_hover_generation(self, value: "int | None" = None) -> None:
+        if value is None:
+            self._stack_hover_serial += 1
+            value = self._stack_hover_serial
+        if self._stack_hover_generation != value:
+            self._stack_hover_generation = value
+            self.stack_hover_generation_changed.emit()
 
     # --- Debug Cache Properties ---
 

@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 
 import QtQuick
+import QtQuick.Effects
 import QtQuick.Window
 
 // This file is intended to hold QML components like the main image view.
@@ -436,6 +437,59 @@ Item {
                     opacity: 1.0  // Opacity is baked into the ARGB32 image
                 }
 
+                // Stack paint hover preview: the selected input frame, fully
+                // edited, shown inside the brush circle so the user can see
+                // what a click would paint before painting.
+                Item {
+                    id: stackHoverPreview
+                    readonly property bool shown: !!loupeView.uiStateRef
+                                                  && loupeView.uiStateRef.isBrushMode
+                                                  && loupeView.uiStateRef.brushTool === "stack"
+                                                  && loupeView.uiStateRef.stackHoverGeneration > 0
+                                                  && !loupeView.uiStateRef.brushPanHeld
+                                                  && !loupeView.uiStateRef.originalCompareActive
+                                                  && mainMouseArea.brushCursorInside
+                                                  && !mainMouseArea.brushErasing
+                                                  && !mainMouseArea.middlePanning
+                    anchors.fill: parent
+                    z: 92
+                    visible: stackHoverPreview.shown
+
+                    Image {
+                        id: stackHoverImage
+                        anchors.fill: parent
+                        visible: false
+                        source: stackHoverPreview.shown
+                                ? "image://provider/stack_hover/" + loupeView.uiStateRef.stackHoverGeneration
+                                : ""
+                        fillMode: Image.Stretch
+                        cache: false
+                        smooth: true
+                    }
+
+                    Item {
+                        id: stackHoverMask
+                        anchors.fill: parent
+                        visible: false
+                        layer.enabled: true
+                        Rectangle {
+                            x: mainMouseArea.brushCursorX - brushCursor.radius
+                            y: mainMouseArea.brushCursorY - brushCursor.radius
+                            width: brushCursor.radius * 2
+                            height: width
+                            radius: width / 2
+                            color: "white"
+                        }
+                    }
+
+                    MultiEffect {
+                        anchors.fill: parent
+                        source: stackHoverImage
+                        maskEnabled: true
+                        maskSource: stackHoverMask
+                    }
+                }
+
                 // Brush outline. Lives in mainImage coordinates so it scales
                 // with zoom; the inner ring marks where the falloff starts.
                 Item {
@@ -450,6 +504,7 @@ Item {
                     readonly property real lineWidth: 1.25 / Math.max(0.01, imageRotator.zoomScale)
                     visible: !!loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode
                              && !loupeView.uiStateRef.brushPanHeld && mainMouseArea.brushCursorInside
+                             && !mainMouseArea.middlePanning
                     x: mainMouseArea.brushCursorX
                     y: mainMouseArea.brushCursorY
 
@@ -939,10 +994,11 @@ Item {
         MouseArea {
             id: mainMouseArea
             anchors.fill: parent
-            acceptedButtons: Qt.LeftButton | Qt.RightButton
+            acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
             hoverEnabled: true
             cursorShape: {
                 if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode && !loupeView.uiStateRef.isCropping) {
+                    if (mainMouseArea.middlePanning) return Qt.ClosedHandCursor
                     if (loupeView.uiStateRef.brushPanHeld) return mainMouseArea.pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
                     return Qt.CrossCursor
                 }
@@ -953,12 +1009,17 @@ Item {
         // Dodge & burn painting state; the cursor position is in mainImage
         // coordinates.
         property bool isBrushPainting: false
+        property bool brushErasing: false
+        // Brush mode: middle-drag pans (as Space+drag does).
+        property bool middlePanning: false
         property real brushCursorX: 0
         property real brushCursorY: 0
         property bool brushCursorInside: false
         onContainsMouseChanged: if (!containsMouse) brushCursorInside = false
         // A grab stolen mid-stroke (window switch, popup) still commits it.
         onCanceled: {
+            middlePanning = false
+            brushErasing = false
             if (isBrushPainting) {
                 isBrushPainting = false
                 if (loupeView.controllerRef) loupeView.controllerRef.finish_local_stroke()
@@ -1209,6 +1270,18 @@ Item {
         }
 
         onPressed: function(mouse) {
+            // The middle button only pans, and only in brush mode; elsewhere
+            // it keeps passing through as before.
+            if (mouse.button === Qt.MiddleButton) {
+                if (!loupeView.uiStateRef || !loupeView.uiStateRef.isBrushMode || loupeView.uiStateRef.isCropping) {
+                    mouse.accepted = false
+                    return
+                }
+                lastX = mouse.x
+                lastY = mouse.y
+                middlePanning = true
+                return
+            }
             lastX = mouse.x
             lastY = mouse.y
             startX = mouse.x
@@ -1236,6 +1309,7 @@ Item {
                 var erase = mouse.button === Qt.RightButton || (mouse.modifiers & Qt.AltModifier)
                 loupeView.controllerRef.start_local_stroke(imgCoords.x, imgCoords.y, !!erase)
                 isBrushPainting = true
+                brushErasing = !!erase
                 return
             }
 
@@ -1373,6 +1447,14 @@ Item {
             if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode)
                 updateBrushCursor(mouse.x, mouse.y)
 
+            if (middlePanning) {
+                panTransform.x += (mouse.x - lastX)
+                panTransform.y += (mouse.y - lastY)
+                lastX = mouse.x
+                lastY = mouse.y
+                return
+            }
+
             // Dodge & burn painting drag
             if (isBrushPainting && loupeView.controllerRef) {
                 var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
@@ -1489,7 +1571,12 @@ Item {
         }
         
         onReleased: function(mouse) {
+            if (mouse.button === Qt.MiddleButton) {
+                middlePanning = false
+                return
+            }
             // Dodge & burn stroke release
+            brushErasing = false
             if (isBrushPainting) {
                 isBrushPainting = false
                 if (loupeView.controllerRef) loupeView.controllerRef.finish_local_stroke()
