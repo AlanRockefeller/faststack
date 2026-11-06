@@ -1,21 +1,21 @@
 # faststack/imaging/mask_engine.py
-"""Mask rasterisation, refinement, and coordinate transforms.
+"""Stroke rasterisation and coordinate transforms for local adjustments.
 
-Layer 2 of the mask subsystem.  Provides:
-- forward_transform / inverse_transform  – pure coordinate helpers
-- rasterize_strokes   – draw normalised strokes onto a pixel grid
-- resolve_mask        – full pipeline: strokes → confidence → feather → clamp
-- MaskRasterCache     – disposable, resolution-keyed cache for raster products
+Provides:
+- forward_transform / inverse_transform – pure coordinate helpers
+- rasterize_layer_density – strokes → per-pixel coat density for one layer
+- LayerDensityCache       – disposable, resolution-keyed raster cache
 """
 
-import hashlib
+import dataclasses
 import logging
 import math
-from typing import Any, Dict, Optional, Tuple
+import threading
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-from faststack.imaging.mask import DarkenSettings, MaskData
+from faststack.imaging.mask import STROKE_ERASE, MaskData, MaskStroke
 from faststack.imaging.optional_deps import get_cv2
 
 log = logging.getLogger(__name__)
@@ -24,17 +24,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Coordinate transforms
 # ---------------------------------------------------------------------------
-
-
-def _geometry_hash(edits: Dict[str, Any]) -> int:
-    """Hash of the geometry edits that affect mask alignment."""
-    return hash(
-        (
-            edits.get("rotation", 0),
-            round(float(edits.get("straighten_angle", 0.0)), 3),
-            tuple(edits.get("crop_box") or ()),
-        )
-    )
 
 
 def forward_transform(
@@ -160,438 +149,285 @@ def inverse_transform(
 # ---------------------------------------------------------------------------
 
 
-def _interpolate_points(points: list, max_gap: float) -> list:
-    """Insert intermediate points so no two consecutive points are more than
-    *max_gap* pixels apart.  Prevents dotted strokes from fast mouse movement."""
-    if len(points) <= 1:
-        return points
-    result = [points[0]]
-    for i in range(1, len(points)):
-        x0, y0 = result[-1]
-        x1, y1 = points[i]
-        dx, dy = x1 - x0, y1 - y0
-        dist = math.sqrt(dx * dx + dy * dy)
-        if dist > max_gap:
-            n = int(math.ceil(dist / max_gap))
-            for j in range(1, n):
-                t = j / n
-                result.append((x0 + dx * t, y0 + dy * t))
-        result.append((x1, y1))
-    return result
+@dataclasses.dataclass
+class LayerDensity:
+    """Coat density of one layer inside its bounding box.
+
+    ``arr`` is float32 ``(y1 - y0, x1 - x0)``; pixels outside the box have
+    density 0.  One paint stroke deposits up to 1.0, so overlapping strokes
+    build up without limit.
+    """
+
+    y0: int
+    y1: int
+    x0: int
+    x1: int
+    arr: np.ndarray
 
 
-def _draw_stroke_numpy(
-    canvas: np.ndarray,
-    points: list,
+def _base_diagonal_px(edits: Dict[str, Any], shape: Tuple[int, int]) -> float:
+    """Diagonal of the uncropped oriented image, in *shape*'s pixels."""
+    th, tw = shape
+    crop_box = edits.get("crop_box")
+    cw = ch = 1.0
+    if crop_box is not None and len(crop_box) == 4:
+        cw = (crop_box[2] - crop_box[0]) / 1000
+        ch = (crop_box[3] - crop_box[1]) / 1000
+        if cw <= 0 or ch <= 0:
+            cw = ch = 1.0
+    return math.hypot(tw / cw, th / ch)
+
+
+def _stroke_pixel_points(
+    stroke: MaskStroke, edits: Dict[str, Any], shape: Tuple[int, int]
+) -> np.ndarray:
+    pts = [forward_transform(x, y, edits, shape) for x, y in stroke.points]
+    return np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+
+
+def _stroke_coverage(
+    pixel_points: np.ndarray,
     radius_px: float,
-) -> None:
-    """Draw a stroke onto *canvas* (H, W) using numpy distance computation."""
-    h, w = canvas.shape
-    if radius_px < 0.5:
-        radius_px = 0.5
+    hardness: float,
+    shape: Tuple[int, int],
+) -> Optional[Tuple[int, int, int, int, np.ndarray]]:
+    """Soft single-coat coverage of one stroke, cropped to its bounding box.
 
-    # Interpolate to prevent gaps from fast mouse movement
-    filled = _interpolate_points(points, max_gap=max(1.0, radius_px * 0.5))
+    Returns ``(y0, y1, x0, x1, coverage)`` or None when the stroke misses the
+    image.  Coverage is 1.0 within ``radius * hardness`` of the stroke path
+    and falls smoothly to 0 at ``radius``.  Using the distance to the whole
+    path (rather than summing dabs) is what makes a stroke a single coat.
+    """
+    h, w = shape
+    if pixel_points.size == 0:
+        return None
+    radius_px = max(0.75, float(radius_px))
+    pad = radius_px + 2.0
+    min_x, min_y = pixel_points.min(axis=0)
+    max_x, max_y = pixel_points.max(axis=0)
+    x0 = max(0, int(math.floor(min_x - pad)))
+    y0 = max(0, int(math.floor(min_y - pad)))
+    x1 = min(w, int(math.ceil(max_x + pad)) + 1)
+    y1 = min(h, int(math.ceil(max_y + pad)) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return None
 
+    # The distance canvas extends past the image edge by the brush radius so
+    # a stroke whose path runs just outside the frame still paints inside it.
+    # Limit it to the output box plus that radius: after a tight crop, stored
+    # path points can otherwise be many crop widths outside the image.
+    ipad = int(math.ceil(pad))
+    cx0 = int(math.floor(max(x0 - ipad, min_x - pad)))
+    cy0 = int(math.floor(max(y0 - ipad, min_y - pad)))
+    cx1 = int(math.ceil(min(x1 + ipad, max_x + pad))) + 1
+    cy1 = int(math.ceil(min(y1 + ipad, max_y + pad))) + 1
+    local = pixel_points - (cx0, cy0)
+
+    cv2 = get_cv2()
+    if cv2 is not None:
+        canvas = np.full((cy1 - cy0, cx1 - cx0), 255, dtype=np.uint8)
+        ipts = np.round(local).astype(np.int32)
+        if len(ipts) == 1:
+            px, py = ipts[0]
+            if 0 <= py < canvas.shape[0] and 0 <= px < canvas.shape[1]:
+                canvas[py, px] = 0
+        else:
+            cv2.polylines(canvas, [ipts.reshape(-1, 1, 2)], False, 0, 1)
+        dist = cv2.distanceTransform(canvas, cv2.DIST_L2, 5)
+    else:
+        dist = _path_distance_numpy(local, (cy1 - cy0, cx1 - cx0), pad)
+
+    dist = dist[y0 - cy0 : y1 - cy0, x0 - cx0 : x1 - cx0]
+    inner = radius_px * min(1.0, max(0.0, hardness))
+    soft = max(radius_px - inner, 1.0)
+    t = np.clip((radius_px - dist) / soft, 0.0, 1.0)
+    coverage = t * t * (3.0 - 2.0 * t)
+    return y0, y1, x0, x1, coverage.astype(np.float32, copy=False)
+
+
+def _path_distance_numpy(
+    points: np.ndarray, shape: Tuple[int, int], max_dist: float
+) -> np.ndarray:
+    """Distance to the nearest point of a densely interpolated path (no cv2)."""
+    h, w = shape
+    dist = np.full((h, w), max_dist + 1.0, dtype=np.float32)
+    filled = [tuple(points[0])]
+    for x1, y1 in points[1:]:
+        x0, y0 = filled[-1]
+        n = max(1, int(math.ceil(math.hypot(x1 - x0, y1 - y0))))
+        for j in range(1, n + 1):
+            filled.append((x0 + (x1 - x0) * j / n, y0 + (y1 - y0) * j / n))
+    r = int(math.ceil(max_dist)) + 1
     for px, py in filled:
-        # Bounding box for this circle
-        x0 = max(0, int(px - radius_px - 1))
-        x1 = min(w, int(px + radius_px + 2))
-        y0 = max(0, int(py - radius_px - 1))
-        y1 = min(h, int(py + radius_px + 2))
-        if x1 <= x0 or y1 <= y0:
+        bx0, bx1 = max(0, int(px) - r), min(w, int(px) + r + 1)
+        by0, by1 = max(0, int(py) - r), min(h, int(py) + r + 1)
+        if bx1 <= bx0 or by1 <= by0:
             continue
-
-        yy, xx = np.ogrid[y0:y1, x0:x1]
-        dist_sq = (xx - px) ** 2 + (yy - py) ** 2
-        inside = dist_sq <= radius_px**2
-        canvas[y0:y1, x0:x1] = np.maximum(
-            canvas[y0:y1, x0:x1], inside.astype(np.float32)
-        )
+        yy, xx = np.ogrid[by0:by1, bx0:bx1]
+        d = np.sqrt((xx - px) ** 2 + (yy - py) ** 2).astype(np.float32)
+        np.minimum(dist[by0:by1, bx0:bx1], d, out=dist[by0:by1, bx0:bx1])
+    return dist
 
 
-def _draw_stroke_cv2(
-    canvas: np.ndarray,
-    points: list,
-    radius_px: float,
-) -> None:
-    """Draw a stroke onto *canvas* using cv2.circle (faster)."""
-    cv2 = get_cv2()
-    if cv2 is None:
-        return
-    r = max(1, int(round(radius_px)))
-
-    # Interpolate to prevent gaps from fast mouse movement
-    filled = _interpolate_points(points, max_gap=max(1.0, r * 0.5))
-
-    for px, py in filled:
-        cv2.circle(canvas, (int(round(px)), int(round(py))), r, 1.0, -1)
-
-
-def rasterize_strokes(
-    mask_data: MaskData,
-    shape: Tuple[int, int],
+def _apply_strokes(
+    base: Optional[LayerDensity],
+    strokes: Sequence[MaskStroke],
     edits: Dict[str, Any],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Rasterise all strokes to float32 (H, W) maps.
-
-    Returns ``(add_map, protect_map)`` each in [0, 1].  ``add_map`` marks
-    background hints; ``protect_map`` marks subject protection.
-
-    Strokes are in oriented-base-image normalised coords and are
-    forward-transformed to *shape* accounting for current geometry edits.
-    """
-    cv2 = get_cv2()
-    h, w = shape
-    add_map = np.zeros((h, w), dtype=np.float32)
-    protect_map = np.zeros((h, w), dtype=np.float32)
-
-    draw_fn = _draw_stroke_cv2 if cv2 is not None else _draw_stroke_numpy
-
-    for stroke in mask_data.strokes:
-        # Transform stroke points to pixel coords in target array
-        pixel_points = []
-        for xn, yn in stroke.points:
-            px, py = forward_transform(xn, yn, edits, shape)
-            pixel_points.append((px, py))
-
-        # Radius in pixels (normalised radius × image diagonal for consistency)
-        diag = math.sqrt(w * w + h * h)
-        radius_px = stroke.radius * diag
-
-        target = add_map if stroke.stroke_type == "add" else protect_map
-        draw_fn(target, pixel_points, radius_px)
-
-    # Clamp
-    np.clip(add_map, 0.0, 1.0, out=add_map)
-    np.clip(protect_map, 0.0, 1.0, out=protect_map)
-    return add_map, protect_map
-
-
-# ---------------------------------------------------------------------------
-# Gaussian blur helper
-# ---------------------------------------------------------------------------
-
-
-def _gaussian_blur(arr: np.ndarray, sigma: float) -> np.ndarray:
-    """Gaussian blur a 2-D float32 array."""
-    if sigma < 0.5:
-        return arr
-    cv2 = get_cv2()
-    if cv2 is not None:
-        ksize = int(math.ceil(sigma * 6)) | 1  # odd kernel
-        return cv2.GaussianBlur(arr, (ksize, ksize), sigma)
-
-    # Numpy-only fallback: separable 1-D convolution
-    radius = int(math.ceil(sigma * 3))
-    x = np.arange(-radius, radius + 1, dtype=np.float32)
-    kernel = np.exp(-0.5 * (x / sigma) ** 2)
-    kernel /= kernel.sum()
-    # Pad + convolve rows then columns
-
-    out = arr.copy()
-    for row in range(out.shape[0]):
-        out[row, :] = np.convolve(out[row, :], kernel, mode="same")
-    for col in range(out.shape[1]):
-        out[:, col] = np.convolve(out[:, col], kernel, mode="same")
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Confidence map builders
-# ---------------------------------------------------------------------------
-
-
-def _dark_prior(image_arr: np.ndarray, dark_range: float) -> np.ndarray:
-    """Higher confidence for darker pixels."""
-    luma = image_arr @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-    # smoothstep: 1 below lo, 0 above hi
-    lo = dark_range * 0.3
-    hi = max(lo + 0.01, dark_range * 0.7)
-    t = np.clip((luma - lo) / (hi - lo), 0.0, 1.0)
-    return 1.0 - t  # dark pixels → 1.0
-
-
-def _neutral_prior(image_arr: np.ndarray, sensitivity: float) -> np.ndarray:
-    """Higher confidence for low-chroma (neutral / grey) pixels."""
-    cmax = image_arr.max(axis=2)
-    cmin = image_arr.min(axis=2)
-    chroma = cmax - cmin
-    lo = 0.05
-    hi = max(lo + 0.01, 0.15 * max(0.1, sensitivity))
-    t = np.clip((chroma - lo) / (hi - lo), 0.0, 1.0)
-    return 1.0 - t  # neutral → 1.0
-
-
-def _border_prior(
-    shape: Tuple[int, int], border_width_frac: float = 0.05
-) -> np.ndarray:
-    """Distance-from-border prior — pixels near edges get higher confidence."""
-    h, w = shape
-    bw = max(1, int(min(h, w) * border_width_frac))
-    prior = np.zeros((h, w), dtype=np.float32)
-    prior[:bw, :] = 1.0
-    prior[-bw:, :] = 1.0
-    prior[:, :bw] = 1.0
-    prior[:, -bw:] = 1.0
-    return prior
-
-
-def _edge_magnitude(image_arr: np.ndarray) -> np.ndarray:
-    """Gradient magnitude for edge stopping."""
-    cv2 = get_cv2()
-    luma = image_arr @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-    if cv2 is not None:
-        gx = cv2.Sobel(luma, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(luma, cv2.CV_32F, 0, 1, ksize=3)
-        mag = np.sqrt(gx**2 + gy**2)
-    else:
-        # Simple numpy gradient
-        gy, gx = np.gradient(luma)
-        mag = np.sqrt(gx**2 + gy**2)
-    # Normalise to [0, 1]
-    m = mag.max()
-    if m > 1e-6:
-        mag /= m
-    return mag
-
-
-# ---------------------------------------------------------------------------
-# Image-content in-process cache key for cache keying
-# ---------------------------------------------------------------------------
-
-
-def _image_content_key(image_arr: np.ndarray) -> int:
-    """Robust in-process cache key for resolved-mask cache invalidation.
-
-    Priors (dark, neutral, edge) depend on image content, so the cache must
-    be invalidated when edits change the image (exposure, WB, levels, etc.).
-
-    Content-derived priors can change at any pixel, so sampling cannot safely
-    identify the rendered stage. BLAKE2 scans the contiguous buffer without
-    allocating when the renderer already produced C-order output.
-    """
-    contiguous = np.ascontiguousarray(image_arr)
-    raw = memoryview(contiguous).cast("B")
-    digest = hashlib.blake2b(raw, digest_size=8).digest()
-    return int.from_bytes(digest, "little")
-
-
-# ---------------------------------------------------------------------------
-# Mask resolution pipeline
-# ---------------------------------------------------------------------------
-
-
-def resolve_mask(
-    mask_data: MaskData,
-    settings: DarkenSettings,
-    image_arr: np.ndarray,
     shape: Tuple[int, int],
-    edits: Dict[str, Any],
-    cache: Optional["MaskRasterCache"] = None,
-    image_key: Any = None,
-) -> np.ndarray:
-    """Full mask resolution: strokes → confidence → feather → soft mask.
-
-    Returns float32 (H, W) in [0, 1] where 1.0 = full background effect.
-
-    *image_arr* is the current sRGB float32 (H, W, 3) image used for
-    edge-aware analysis.  *shape* must match ``image_arr.shape[:2]``.
-    """
-    geo_hash = _geometry_hash(edits)
-    params_key = settings.params_tuple()
-    # ImageEditor supplies a generation/revision identity for interactive and
-    # export renders. Standalone callers without trustworthy provenance retain
-    # the full-content fallback for correctness.
-    img_key = image_key if image_key is not None else _image_content_key(image_arr)
-
-    if cache is not None:
-        cached = cache.get_resolved(
-            mask_data.revision, shape, geo_hash, params_key, img_key
+) -> Optional[LayerDensity]:
+    """Composite *strokes* in order onto *base* (never mutated)."""
+    diag = _base_diagonal_px(edits, shape)
+    covered = []
+    for stroke in strokes:
+        cov = _stroke_coverage(
+            _stroke_pixel_points(stroke, edits, shape),
+            stroke.radius * diag,
+            stroke.hardness,
+            shape,
         )
-        if cached is not None:
-            return cached
+        if cov is not None:
+            covered.append((stroke, cov))
+    if not covered:
+        return base
 
-    # --- Rasterise strokes (may hit stroke cache) ---
-    if cache is not None:
-        stroke_maps = cache.get_strokes(mask_data.revision, shape, geo_hash)
-    else:
-        stroke_maps = None
+    boxes = [c[1][:4] for c in covered if c[0].mode != STROKE_ERASE]
+    if base is not None:
+        boxes.append((base.y0, base.y1, base.x0, base.x1))
+    if not boxes:
+        return base  # only erasing, and nothing to erase
+    y0 = min(b[0] for b in boxes)
+    y1 = max(b[1] for b in boxes)
+    x0 = min(b[2] for b in boxes)
+    x1 = max(b[3] for b in boxes)
 
-    if stroke_maps is None:
-        add_map, protect_map = rasterize_strokes(mask_data, shape, edits)
-        if cache is not None:
-            cache.put_strokes(
-                mask_data.revision, shape, geo_hash, (add_map, protect_map)
-            )
-    else:
-        add_map, protect_map = stroke_maps
+    out = np.zeros((y1 - y0, x1 - x0), dtype=np.float32)
+    if base is not None:
+        out[base.y0 - y0 : base.y1 - y0, base.x0 - x0 : base.x1 - x0] = base.arr
 
-    # --- Build auto priors based on mode ---
-    mode = settings.mode
-    auto_prior = np.zeros(shape, dtype=np.float32)
-
-    # Pre-compute edges if needed by either auto priors or final edge protection.
-    edges = None
-    if (
-        mode != "paint_only" and settings.auto_from_edges > 0.01
-    ) or settings.edge_protection > 0.01:
-        edges = _edge_magnitude(image_arr)
-
-    if mode != "paint_only":
-        # Dark prior
-        dp = _dark_prior(image_arr, settings.dark_range)
-
-        if mode == "border_auto":
-            # Border connectivity: combine border seed with dark prior
-            bp = _border_prior(shape)
-            bp_blurred = _gaussian_blur(bp, sigma=min(shape) * 0.05)
-            auto_prior = dp * 0.5 + bp_blurred * 0.5
-        elif mode == "strong_subject":
-            # Strong subject protection — use dark prior but weight protect more
-            auto_prior = dp * 0.3
+    for stroke, (sy0, sy1, sx0, sx1, cov) in covered:
+        # Clip the stroke box to the layer box (erase strokes may extend past).
+        cy0, cy1 = max(sy0, y0), min(sy1, y1)
+        cx0, cx1 = max(sx0, x0), min(sx1, x1)
+        if cy1 <= cy0 or cx1 <= cx0:
+            continue
+        c = cov[cy0 - sy0 : cy1 - sy0, cx0 - sx0 : cx1 - sx0]
+        region = out[cy0 - y0 : cy1 - y0, cx0 - x0 : cx1 - x0]
+        if stroke.mode == STROKE_ERASE:
+            region *= 1.0 - c
         else:
-            # "assisted" — balanced
-            auto_prior = dp * 0.4
-
-        # Neutrality prior blended in
-        if settings.neutrality_sensitivity > 0.01:
-            np_arr = _neutral_prior(image_arr, settings.neutrality_sensitivity)
-            auto_prior = (
-                auto_prior * 0.6 + np_arr * 0.4 * settings.neutrality_sensitivity
-            )
-
-        # Edge-aware prior: areas between strong edges are likely uniform
-        # background, so use inverted edge magnitude as a positive signal.
-        if settings.auto_from_edges > 0.01:
-            # edges is already computed above
-            # Blur the edge map so the "between edges" regions fill in
-            edge_blurred = _gaussian_blur(edges, sigma=min(shape) * 0.02)
-            # Invert: low-edge (smooth) regions get high confidence
-            edge_prior = 1.0 - edge_blurred
-            w = settings.auto_from_edges
-            auto_prior = auto_prior * (1.0 - w) + edge_prior * w
-
-    # --- Combine signals ---
-    # Background confidence = user strokes + auto prior where user hasn't painted
-    raw_bg = np.clip(add_map + auto_prior * (1.0 - add_map), 0.0, 1.0)
-
-    # Subject protection
-    sp_weight = settings.subject_protection
-    if mode == "strong_subject":
-        sp_weight = min(1.0, sp_weight + 0.3)
-
-    raw_bg = raw_bg * (1.0 - protect_map * sp_weight)
-
-    # --- Edge stopping ---
-    if settings.edge_protection > 0.01:
-        # edges is already computed above
-        # Reduce mask confidence at strong edges
-        edge_brake = 1.0 - edges * settings.edge_protection
-        raw_bg = raw_bg * np.clip(edge_brake, 0.0, 1.0)
-
-    # --- Feather / blur ---
-    feather_sigma = settings.feather * min(shape) * 0.03
-    if feather_sigma > 0.5:
-        raw_bg = _gaussian_blur(raw_bg, feather_sigma)
-
-    # --- Expand / contract ---
-    ec = settings.expand_contract
-    cv2 = get_cv2() if abs(ec) > 0.01 else None
-    if cv2 is not None:
-        ksize = max(3, int(abs(ec) * min(shape) * 0.02)) | 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-        if ec > 0:
-            raw_bg = cv2.dilate(raw_bg, kernel)
-        else:
-            raw_bg = cv2.erode(raw_bg, kernel)
-
-    # --- Final clamp ---
-    result = np.clip(raw_bg, 0.0, 1.0)
-
-    if cache is not None:
-        cache.put_resolved(
-            mask_data.revision, shape, geo_hash, params_key, img_key, result
-        )
-
-    return result
+            region += c
+    return LayerDensity(y0, y1, x0, x1, out)
 
 
-# ---------------------------------------------------------------------------
-# Disposable raster cache
-# ---------------------------------------------------------------------------
+def _geometry_key(edits: Dict[str, Any]) -> tuple:
+    return (
+        edits.get("rotation", 0),
+        round(float(edits.get("straighten_angle", 0.0)), 4),
+        tuple(edits.get("crop_box") or ()),
+    )
 
 
-class MaskRasterCache:
-    """Resolution-keyed cache for disposable raster products.
+class LayerDensityCache:
+    """Committed-stroke densities per layer and render size.
 
-    Keeps one stroke-map entry and one resolved-mask entry at a time.
-    Preview and export resolutions have different shapes, so they
-    naturally miss and recompute — no stale cross-contamination.
+    Live previews alternate between a few render sizes (drag tier, quick
+    master, display-resolution refinement), so each layer keeps a small LRU
+    of sizes rather than one entry that every size change would evict.
+
+    Entries remember the exact stroke objects they were built from. Strokes
+    are immutable once committed and the list only ever grows by appending
+    (or is replaced on undo/clear), so when the current list extends a cached
+    one only the new strokes are composited — committing a stroke costs one
+    stroke, not a re-rasterisation of the whole layer.
+
+    Cache operations are protected because quick and refinement preview workers
+    can briefly overlap while a cancelled render unwinds.
     """
+
+    _SIZES_PER_LAYER = 4
 
     def __init__(self):
-        self._stroke_key: Optional[tuple] = None
-        self._stroke_maps: Optional[Tuple[np.ndarray, np.ndarray]] = None
-
-        self._resolved_key: Optional[tuple] = None
-        self._resolved_mask: Optional[np.ndarray] = None
+        # layer_id -> {(uid, shape, geometry): (strokes, density)}, LRU order
+        self._entries: Dict[str, Dict[tuple, Tuple[tuple, Optional[LayerDensity]]]] = {}
+        self._lock = threading.Lock()
 
     def __bool__(self) -> bool:
-        return self._stroke_maps is not None or self._resolved_mask is not None
+        with self._lock:
+            return bool(self._entries)
 
     def clear(self) -> None:
-        self._stroke_key = None
-        self._stroke_maps = None
-        self._resolved_key = None
-        self._resolved_mask = None
+        with self._lock:
+            self._entries.clear()
 
-    # stroke maps
+    def get(
+        self, layer_id: str, key: tuple
+    ) -> Optional[Tuple[tuple, Optional[LayerDensity]]]:
+        with self._lock:
+            sizes = self._entries.get(layer_id)
+            entry = sizes.pop(key, None) if sizes is not None else None
+            if entry is not None:
+                sizes[key] = entry  # most recently used last
+            return entry
 
-    def get_strokes(
+    def put(
         self,
-        revision: int,
-        shape: Tuple[int, int],
-        geo_hash: int,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        key = (revision, shape, geo_hash)
-        if self._stroke_key == key:
-            return self._stroke_maps
-        return None
-
-    def put_strokes(
-        self,
-        revision: int,
-        shape: Tuple[int, int],
-        geo_hash: int,
-        maps: Tuple[np.ndarray, np.ndarray],
+        layer_id: str,
+        key: tuple,
+        strokes: tuple,
+        value: Optional[LayerDensity],
     ) -> None:
-        self._stroke_key = (revision, shape, geo_hash)
-        self._stroke_maps = maps
+        with self._lock:
+            sizes = self._entries.setdefault(layer_id, {})
+            sizes.pop(key, None)
+            sizes[key] = (strokes, value)
+            while len(sizes) > self._SIZES_PER_LAYER:
+                sizes.pop(next(iter(sizes)))
 
-    # resolved mask
+    def prune(self, keep_ids) -> None:
+        with self._lock:
+            for layer_id in list(self._entries):
+                if layer_id not in keep_ids:
+                    self._entries.pop(layer_id, None)
 
-    def get_resolved(
-        self,
-        revision: int,
-        shape: Tuple[int, int],
-        geo_hash: int,
-        params_key: tuple,
-        img_key: Any,
-    ) -> Optional[np.ndarray]:
-        key = (revision, shape, geo_hash, params_key, img_key)
-        if self._resolved_key == key:
-            return self._resolved_mask
-        return None
 
-    def put_resolved(
-        self,
-        revision: int,
-        shape: Tuple[int, int],
-        geo_hash: int,
-        params_key: tuple,
-        img_key: Any,
-        mask: np.ndarray,
-    ) -> None:
-        self._resolved_key = (revision, shape, geo_hash, params_key, img_key)
-        self._resolved_mask = mask
+def _extends(strokes: Sequence[MaskStroke], cached: tuple) -> bool:
+    """True when *strokes* starts with exactly the stroke objects in *cached*."""
+    return len(strokes) >= len(cached) and all(a is b for a, b in zip(strokes, cached))
+
+
+def rasterize_layer_density(
+    layer_id: str,
+    mask_data: MaskData,
+    shape: Tuple[int, int],
+    edits: Dict[str, Any],
+    cache: Optional[LayerDensityCache] = None,
+    include_live: bool = True,
+) -> Optional[LayerDensity]:
+    """Coat density of one layer at *shape*, or None if nothing is painted.
+
+    Committed strokes are cached (incrementally, see LayerDensityCache); the
+    in-progress ``live_stroke`` is composited on top fresh each call.
+    """
+    # Read each reference once: the GUI thread rebinds them, never mutates.
+    strokes = tuple(mask_data.strokes)
+    live = mask_data.live_stroke if include_live else None
+    key = (mask_data.uid, tuple(shape), _geometry_key(edits))
+
+    entry = cache.get(layer_id, key) if cache is not None else None
+    if (
+        entry is not None
+        and len(entry[0]) == len(strokes)
+        and _extends(strokes, entry[0])
+    ):
+        committed = entry[1]
+    else:
+        if entry is not None and _extends(strokes, entry[0]):
+            committed = _apply_strokes(entry[1], strokes[len(entry[0]) :], edits, shape)
+        else:
+            committed = _apply_strokes(None, strokes, edits, shape)
+        if cache is not None:
+            cache.put(layer_id, key, strokes, committed)
+
+    if live is None or not live.points:
+        return committed
+    return _apply_strokes(committed, [live], edits, shape)

@@ -1,9 +1,12 @@
-"""Tests for highlight recovery system.
+"""Tests for the Highlights slider (edge-aware local tone mapping).
 
-Tests the new brightness-based highlight recovery that:
-- Preserves hue/chroma via brightness rescaling
-- Uses adaptive parameters based on headroom and clipping
-- Handles both 16-bit (headroom) and 8-bit (JPEG) sources
+The operator splits brightness into an edge-preserving base and the detail
+riding on it, compresses only the base, and applies the result as a single
+gain per pixel:
+- Preserves hue/chroma (one gain for all three channels)
+- Leaves regions below the pivot untouched
+- Darkens bright regions while keeping the texture inside them
+- Pulls exposure headroom back under display white
 """
 
 import os
@@ -14,14 +17,6 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-# Mock cv2 if not available (for test environments)
-try:
-    import cv2
-except ImportError:
-    from unittest import mock
-
-    sys.modules["cv2"] = mock.MagicMock()
-
 import time
 
 import numpy as np
@@ -29,35 +24,35 @@ import numpy as np
 from faststack.imaging.math_utils import (
     _analyze_highlight_state,
     _apply_headroom_shoulder,
-    _highlight_boost_linear,
-    _highlight_recover_linear,
+    apply_highlight_tone,
+    compute_highlight_base,
 )
 
 
+def _highlights(rgb: np.ndarray, amount) -> np.ndarray:
+    p, base, headroom = compute_highlight_base(rgb)
+    return apply_highlight_tone(rgb, amount, base, headroom, p=p)
+
+
 def test_monotonicity():
-    """Gradient 0→2.0 should be non-decreasing after recovery."""
-    # Create gradient with headroom
-    gradient = np.linspace(0, 2.0, 100).reshape(10, 10)
-    rgb = np.stack([gradient, gradient * 0.5, gradient * 0.3], axis=2).astype(
-        np.float32
-    )
+    """A smooth ramp 0→2.0 should stay non-decreasing after recovery."""
+    ramp = np.linspace(0, 2.0, 200, dtype=np.float32)
+    gradient = np.tile(ramp, (16, 1))
+    rgb = np.stack([gradient, gradient * 0.5, gradient * 0.3], axis=2)
 
-    recovered = _highlight_recover_linear(rgb, amount=1.0, pivot=0.5)
+    recovered = _highlights(rgb, -1.0)
 
-    # Check max-channel brightness is non-decreasing
-    brightness = recovered.max(axis=2).flatten()
+    brightness = recovered[8, :, 0]
     diffs = np.diff(brightness)
-    eps = 1e-7
-
-    assert np.all(diffs >= -eps), f"Monotonicity violated: min diff = {diffs.min()}"
-    print("test_monotonicity passed")
+    assert np.all(diffs >= -1e-6), f"Monotonicity violated: min diff = {diffs.min()}"
+    # Headroom is brought back toward display white.
+    assert brightness[-1] < 1.2, f"Headroom not compressed: {brightness[-1]}"
 
 
 def test_no_nan_inf():
     """Random input including edge cases should produce finite output."""
     np.random.seed(42)
 
-    # Include zeros, ones, headroom, and extreme values
     test_cases = [
         np.random.rand(50, 50, 3).astype(np.float32),  # Normal
         np.zeros((10, 10, 3), dtype=np.float32),  # All zeros
@@ -69,70 +64,42 @@ def test_no_nan_inf():
     ]
 
     for i, arr in enumerate(test_cases):
-        recovered = _highlight_recover_linear(arr, amount=1.0, pivot=0.5)
-        assert np.isfinite(recovered).all(), f"NaN/inf in test case {i}"
-
-        boosted = _highlight_boost_linear(arr, amount=1.0, pivot=0.5)
-        assert np.isfinite(boosted).all(), f"NaN/inf in boost test case {i}"
-
-    print("test_no_nan_inf passed")
+        for amount in (-1.0, 1.0):
+            out = _highlights(arr, amount)
+            assert np.isfinite(out).all(), f"NaN/inf in case {i}, amount {amount}"
 
 
 def test_hue_preservation():
-    """Saturated highlight ramp should preserve RGB ratios (hue)."""
-    # Create saturated red gradient with headroom
-    brightness = np.linspace(0.1, 2.0, 50).reshape(5, 10)
-    rgb = np.stack([brightness, brightness * 0.2, brightness * 0.2], axis=2).astype(
-        np.float32
-    )
+    """Saturated highlights keep their RGB ratios (hue)."""
+    ramp = np.linspace(0.1, 2.0, 100, dtype=np.float32)
+    brightness = np.tile(ramp, (10, 1))
+    rgb = np.stack([brightness, brightness * 0.2, brightness * 0.2], axis=2)
 
-    recovered = _highlight_recover_linear(
-        rgb, amount=0.8, pivot=0.5, chroma_rolloff=0.0
-    )
+    recovered = _highlights(rgb, -0.8)
 
-    # Check R:G:B ratios where brightness > 0.01
-    orig_brightness = rgb.max(axis=2)
-    mask = orig_brightness > 0.01
-
-    if np.any(mask):
-        # Normalize to get ratio
-        orig_norm = rgb[mask] / (orig_brightness[mask, None] + 1e-7)
-        rec_brightness = recovered.max(axis=2)
-        rec_norm = recovered[mask] / (rec_brightness[mask, None] + 1e-7)
-
-        # Ratios should be within 5%
-        ratio_diff = np.abs(orig_norm - rec_norm).max()
-        assert ratio_diff < 0.05, f"Hue shift too large: {ratio_diff}"
-
-    print("test_hue_preservation passed")
+    orig_ratio = rgb[..., 1] / rgb[..., 0]
+    rec_ratio = recovered[..., 1] / np.maximum(recovered[..., 0], 1e-12)
+    assert np.abs(orig_ratio - rec_ratio).max() < 1e-4
 
 
 def test_mask_isolation():
-    """Pixels with max-channel below pivot should barely change."""
-    # Create image with values below and above pivot
-    low = np.ones((10, 10, 3), dtype=np.float32) * 0.3  # Below pivot 0.5
+    """Regions below the pivot are untouched."""
+    low = np.ones((10, 10, 3), dtype=np.float32) * 0.15  # p ≈ 0.39 < pivot
 
-    recovered = _highlight_recover_linear(low, amount=1.0, pivot=0.5)
-
-    # Changes should be minimal
-    diff = np.abs(recovered - low).max()
-    assert diff < 1e-4, f"Below-pivot pixels changed by {diff}"
-
-    print("test_mask_isolation passed")
+    for amount in (-1.0, -0.5, 0.5, 1.0):
+        out = _highlights(low, amount)
+        diff = np.abs(out - low).max()
+        assert diff < 1e-6, f"Below-pivot pixels changed by {diff} at {amount}"
 
 
 def test_plateau_stability():
     """Clipped [1,1,1] region should stay uniform after recovery (no ringing)."""
-    # Uniform white plateau
     plateau = np.ones((20, 20, 3), dtype=np.float32)
 
-    recovered = _highlight_recover_linear(plateau, amount=1.0, pivot=0.5)
+    recovered = _highlights(plateau, -1.0)
 
-    # All pixels should be the same (uniform)
-    std = recovered.std()
-    assert std < 1e-6, f"Plateau became non-uniform: std = {std}"
-
-    print("test_plateau_stability passed")
+    assert recovered.std() < 1e-6, f"Plateau non-uniform: std = {recovered.std()}"
+    assert recovered.mean() < 0.9, "Plateau should be darkened"
 
 
 def test_headroom_shoulder():
@@ -152,8 +119,6 @@ def test_headroom_shoulder():
     # Should be monotonic
     assert np.all(np.diff(out) >= 0), "Shoulder is not monotonic"
 
-    print("test_headroom_shoulder passed")
-
 
 def test_analyze_highlight_state():
     """Highlight state analysis should detect headroom and clipping."""
@@ -170,8 +135,6 @@ def test_analyze_highlight_state():
     assert (
         state["headroom_pct"] < 0.01
     ), f"Should not detect headroom: {state['headroom_pct']}"
-
-    print("test_analyze_highlight_state passed")
 
 
 def test_source_clipping_detection():
@@ -191,94 +154,54 @@ def test_source_clipping_detection():
     state_with_u8 = _analyze_highlight_state(rgb_linear, srgb_u8=srgb_u8)
     assert state_with_u8["source_clipped_pct"] == 1.0
 
-    print("test_source_clipping_detection passed")
-
 
 def test_benchmark():
     """1920x1080 should be processed in reasonable time (vectorized)."""
     arr = np.random.rand(1080, 1920, 3).astype(np.float32)
 
-    # Warm up
-    _highlight_recover_linear(arr, amount=0.5, pivot=0.5)
+    _highlights(arr, -0.5)  # Warm up
 
-    # Benchmark
     start = time.perf_counter()
     for _ in range(3):
-        _highlight_recover_linear(arr, amount=0.5, pivot=0.5)
+        _highlights(arr, -0.5)
     elapsed = (time.perf_counter() - start) / 3
 
-    print(f"test_benchmark: 1920x1080 recovery in {elapsed * 1000:.1f}ms")
+    print(f"test_benchmark: 1920x1080 highlights in {elapsed * 1000:.1f}ms")
     # Informational only - no hard assertion for CI stability
 
 
 def test_amount_zero_identity():
-    """amount=0 should return input unchanged (identity transform)."""
+    """amount=0 returns the input unchanged, scalar or per-pixel map."""
     arr = np.random.rand(20, 20, 3).astype(np.float32) * 1.5  # Include headroom
 
-    recovered = _highlight_recover_linear(arr.copy(), amount=0.0, pivot=0.5)
-
-    # Should be extremely close to identity
-    diff = np.abs(recovered - arr).max()
-    assert diff < 1e-6, f"amount=0 should be identity, but max diff = {diff}"
-
-    print("test_amount_zero_identity passed")
+    assert np.array_equal(_highlights(arr, 0.0), arr)
+    zero_map = np.zeros(arr.shape[:2], dtype=np.float32)
+    assert np.abs(_highlights(arr, zero_map) - arr).max() < 1e-6
 
 
-def test_pivot_behavior():
-    """Values <= pivot should remain unchanged regardless of amount."""
-    np.random.seed(123)
-    low_values = np.random.rand(15, 15, 3).astype(np.float32) * 0.4  # All below 0.5
+def test_detail_preserved():
+    """Recovery darkens a bright textured region without flattening its texture."""
+    rng = np.random.default_rng(7)
+    p = np.clip(0.9 + rng.normal(0.0, 0.02, (128, 128)), 0, None).astype(np.float32)
+    v = p * p
+    rgb = np.stack([v, v, v], axis=2)
 
-    for amount in [0.0, 0.5, 1.0]:
-        recovered = _highlight_recover_linear(
-            low_values.copy(), amount=amount, pivot=0.5
-        )
-        diff = np.abs(recovered - low_values).max()
-        assert (
-            diff < 1e-5
-        ), f"Values below pivot changed with amount={amount}: max_diff={diff}"
+    out = _highlights(rgb, -1.0)
 
-    print("test_pivot_behavior passed")
+    p_out = np.sqrt(out[..., 0])
+    assert p_out.mean() < p.mean() - 0.05, "Bright region should get darker"
+    assert p_out.std() >= p.std(), "Texture amplitude must not shrink"
 
 
 def test_increasing_amount_increases_compression():
     """Higher amount should result in more compression of highlights."""
-    # Create bright image with headroom
     bright = np.ones((10, 10, 3), dtype=np.float32) * 1.5
 
-    recovered_low = _highlight_recover_linear(bright, amount=0.3, pivot=0.5)
-    recovered_high = _highlight_recover_linear(bright, amount=0.9, pivot=0.5)
+    recovered_low = _highlights(bright, -0.3)
+    recovered_high = _highlights(bright, -0.9)
 
-    # Higher amount should compress more (result closer to 1.0)
     avg_low = recovered_low.mean()
     avg_high = recovered_high.mean()
-
-    # avg_high should be lower (more compressed toward 1.0) than avg_low
     assert (
         avg_high <= avg_low
     ), f"Higher amount should compress more: avg_low={avg_low:.4f}, avg_high={avg_high:.4f}"
-
-    print("test_increasing_amount_increases_compression passed")
-
-
-if __name__ == "__main__":
-    try:
-        test_monotonicity()
-        test_no_nan_inf()
-        test_hue_preservation()
-        test_mask_isolation()
-        test_plateau_stability()
-        test_headroom_shoulder()
-        test_analyze_highlight_state()
-        test_source_clipping_detection()
-        test_amount_zero_identity()
-        test_pivot_behavior()
-        test_increasing_amount_increases_compression()
-        test_benchmark()
-        print("\nALL TESTS PASSED")
-    except Exception as e:
-        print(f"\nTEST FAILED: {e}")
-        import traceback
-
-        traceback.print_exc()
-        exit(1)

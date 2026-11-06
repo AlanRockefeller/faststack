@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 
 import QtQuick
+import QtQuick.Effects
 import QtQuick.Window
 
 // This file is intended to hold QML components like the main image view.
@@ -16,6 +17,15 @@ Item {
     property var controllerRef: null
     property bool isDarkTheme: true
     property int footerHeight: 60
+    // Until the user touches the Grid switch, preserve the legacy behavior:
+    // hidden for ordinary cropping and visible while rotating. A boolean
+    // override makes the grid independently toggleable for this crop session.
+    property var cropGridOverride: null
+    readonly property bool cropGridVisible: uiStateRef
+                                            && uiStateRef.isCropping
+                                            && (cropGridOverride === null
+                                                ? mainMouseArea.isRotating
+                                                : Boolean(cropGridOverride))
 
     // Expose zoom state to parent (Main.qml title bar)
     readonly property real currentZoomScale: imageRotator.zoomScale
@@ -128,6 +138,7 @@ Item {
                 // Capture the session's visual source when crop mode turns on,
                 // then keep it stable until crop mode exits.
                 loupeView.freezeCropImageSource()
+                loupeView.cropGridOverride = null
                 aspectRatioWindow.dismissed = false
             } else {
                 if (mainMouseArea) {
@@ -137,6 +148,7 @@ Item {
                     mainMouseArea.resetCropRotation()
                 }
                 if (loupeView.uiStateRef) loupeView.uiStateRef.isCropRotating = false
+                loupeView.cropGridOverride = null
                 loupeView.releaseCropImageSource()
             }
         }
@@ -407,18 +419,115 @@ Item {
                     angle: mainMouseArea.cropRotation
                 }
                 
-                // Darken mask overlay - anchored to mainImage, rotates/scales with it
+                // Dodge & burn mask overlay - anchored to mainImage, rotates/scales with it
                 Image {
-                    id: darkenOverlay
+                    id: localMaskOverlay
+                    readonly property bool shown: !!loupeView.uiStateRef
+                                                  && loupeView.uiStateRef.isBrushMode
+                                                  && (loupeView.uiStateRef.localOverlayVisible || loupeView.uiStateRef.localOverlayHeld)
+                                                  && !loupeView.uiStateRef.originalCompareActive
                     anchors.fill: parent
                     z: 90
-                    visible: loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible && !loupeView.uiStateRef.originalCompareActive
-                    source: (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && loupeView.uiStateRef.darkenOverlayVisible && !loupeView.uiStateRef.originalCompareActive)
-                            ? "image://provider/mask_overlay/" + loupeView.uiStateRef.darkenOverlayGeneration
+                    visible: localMaskOverlay.shown
+                    source: localMaskOverlay.shown
+                            ? "image://provider/mask_overlay/" + loupeView.uiStateRef.localOverlayGeneration
                             : ""
                     fillMode: Image.Stretch
                     cache: false
                     opacity: 1.0  // Opacity is baked into the ARGB32 image
+                }
+
+                // Stack paint hover preview: the selected input frame, fully
+                // edited, shown inside the brush circle so the user can see
+                // what a click would paint before painting.
+                Item {
+                    id: stackHoverPreview
+                    readonly property bool shown: !!loupeView.uiStateRef
+                                                  && loupeView.uiStateRef.isBrushMode
+                                                  && loupeView.uiStateRef.brushTool === "stack"
+                                                  && loupeView.uiStateRef.stackHoverGeneration > 0
+                                                  && !loupeView.uiStateRef.brushPanHeld
+                                                  && !loupeView.uiStateRef.originalCompareActive
+                                                  && mainMouseArea.brushCursorInside
+                                                  && !mainMouseArea.brushErasing
+                                                  && !mainMouseArea.middlePanning
+                    anchors.fill: parent
+                    z: 92
+                    visible: stackHoverPreview.shown
+
+                    Image {
+                        id: stackHoverImage
+                        anchors.fill: parent
+                        visible: false
+                        source: stackHoverPreview.shown
+                                ? "image://provider/stack_hover/" + loupeView.uiStateRef.stackHoverGeneration
+                                : ""
+                        fillMode: Image.Stretch
+                        cache: false
+                        smooth: true
+                    }
+
+                    Item {
+                        id: stackHoverMask
+                        anchors.fill: parent
+                        visible: false
+                        layer.enabled: true
+                        Rectangle {
+                            x: mainMouseArea.brushCursorX - brushCursor.radius
+                            y: mainMouseArea.brushCursorY - brushCursor.radius
+                            width: brushCursor.radius * 2
+                            height: width
+                            radius: width / 2
+                            color: "white"
+                        }
+                    }
+
+                    MultiEffect {
+                        anchors.fill: parent
+                        source: stackHoverImage
+                        maskEnabled: true
+                        maskSource: stackHoverMask
+                    }
+                }
+
+                // Brush outline. Lives in mainImage coordinates so it scales
+                // with zoom; the inner ring marks where the falloff starts.
+                Item {
+                    id: brushCursor
+                    z: 95
+                    readonly property var cropScale: loupeView.uiStateRef ? loupeView.uiStateRef.brushCropScale : [1, 1]
+                    readonly property real radius: loupeView.uiStateRef
+                        ? loupeView.uiStateRef.brushRadius * Math.sqrt(
+                              Math.pow(mainImage.width / Math.max(0.001, brushCursor.cropScale[0]), 2)
+                              + Math.pow(mainImage.height / Math.max(0.001, brushCursor.cropScale[1]), 2))
+                        : 0
+                    readonly property real lineWidth: 1.25 / Math.max(0.01, imageRotator.zoomScale)
+                    visible: !!loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode
+                             && !loupeView.uiStateRef.brushPanHeld && mainMouseArea.brushCursorInside
+                             && !mainMouseArea.middlePanning
+                    x: mainMouseArea.brushCursorX
+                    y: mainMouseArea.brushCursorY
+
+                    Rectangle {
+                        x: -brushCursor.radius; y: -brushCursor.radius
+                        width: brushCursor.radius * 2; height: width; radius: width / 2
+                        color: "transparent"
+                        border.color: "#c0000000"; border.width: brushCursor.lineWidth * 3
+                    }
+                    Rectangle {
+                        x: -brushCursor.radius; y: -brushCursor.radius
+                        width: brushCursor.radius * 2; height: width; radius: width / 2
+                        color: "transparent"
+                        border.color: "white"; border.width: brushCursor.lineWidth
+                    }
+                    Rectangle {
+                        readonly property real r: brushCursor.radius * (loupeView.uiStateRef ? loupeView.uiStateRef.brushHardness : 0.5)
+                        visible: r > brushCursor.lineWidth * 3
+                        x: -r; y: -r
+                        width: r * 2; height: width; radius: width / 2
+                        color: "transparent"
+                        border.color: "#90ffffff"; border.width: brushCursor.lineWidth
+                    }
                 }
 
                 source: loupeView.displayedImageSource
@@ -836,43 +945,43 @@ Item {
             }
         }
 
-        // Alignment grid for rotate mode. Lives in the viewport (NOT inside
+        // Crop alignment grid. Lives in the viewport (NOT inside
         // imageRotator/mainImage) so the lines stay screen-horizontal and
         // screen-vertical while the image rotates underneath them.
         Item {
-            id: rotateAlignGrid
+            id: cropAlignGrid
             anchors.fill: parent
             z: 10
-            visible: loupeView.uiStateRef && loupeView.uiStateRef.isCropping && mainMouseArea.isRotating
+            visible: loupeView.cropGridVisible
             property real gridSpacing: 56
             property color lineColor: "#59ffffff"
             property color centerLineColor: "#b3ffffff"
 
             Repeater {
-                id: rotateGridVLines
-                model: rotateAlignGrid.visible ? 2 * Math.ceil(rotateAlignGrid.width / (2 * rotateAlignGrid.gridSpacing)) + 1 : 0
+                id: cropGridVLines
+                model: cropAlignGrid.visible ? 2 * Math.ceil(cropAlignGrid.width / (2 * cropAlignGrid.gridSpacing)) + 1 : 0
                 Rectangle {
                     required property int index
-                    property int centerIndex: (rotateGridVLines.count - 1) / 2
-                    x: rotateAlignGrid.width / 2 + (index - centerIndex) * rotateAlignGrid.gridSpacing - width / 2
+                    property int centerIndex: (cropGridVLines.count - 1) / 2
+                    x: cropAlignGrid.width / 2 + (index - centerIndex) * cropAlignGrid.gridSpacing - width / 2
                     y: 0
                     width: 1
-                    height: rotateAlignGrid.height
-                    color: index === centerIndex ? rotateAlignGrid.centerLineColor : rotateAlignGrid.lineColor
+                    height: cropAlignGrid.height
+                    color: index === centerIndex ? cropAlignGrid.centerLineColor : cropAlignGrid.lineColor
                 }
             }
 
             Repeater {
-                id: rotateGridHLines
-                model: rotateAlignGrid.visible ? 2 * Math.ceil(rotateAlignGrid.height / (2 * rotateAlignGrid.gridSpacing)) + 1 : 0
+                id: cropGridHLines
+                model: cropAlignGrid.visible ? 2 * Math.ceil(cropAlignGrid.height / (2 * cropAlignGrid.gridSpacing)) + 1 : 0
                 Rectangle {
                     required property int index
-                    property int centerIndex: (rotateGridHLines.count - 1) / 2
+                    property int centerIndex: (cropGridHLines.count - 1) / 2
                     x: 0
-                    y: rotateAlignGrid.height / 2 + (index - centerIndex) * rotateAlignGrid.gridSpacing - height / 2
-                    width: rotateAlignGrid.width
+                    y: cropAlignGrid.height / 2 + (index - centerIndex) * cropAlignGrid.gridSpacing - height / 2
+                    width: cropAlignGrid.width
                     height: 1
-                    color: index === centerIndex ? rotateAlignGrid.centerLineColor : rotateAlignGrid.lineColor
+                    color: index === centerIndex ? cropAlignGrid.centerLineColor : cropAlignGrid.lineColor
                 }
             }
         }
@@ -885,16 +994,44 @@ Item {
         MouseArea {
             id: mainMouseArea
             anchors.fill: parent
-            acceptedButtons: Qt.LeftButton | Qt.RightButton
+            acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
             hoverEnabled: true
             cursorShape: {
-                if (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening) return Qt.CrossCursor
+                if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode && !loupeView.uiStateRef.isCropping) {
+                    if (mainMouseArea.middlePanning) return Qt.ClosedHandCursor
+                    if (loupeView.uiStateRef.brushPanHeld) return mainMouseArea.pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+                    return Qt.CrossCursor
+                }
                 if (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping) return Qt.ArrowCursor
                 return Qt.CrossCursor
             }
 
-        // Darken painting state
-        property bool isDarkenPainting: false
+        // Dodge & burn painting state; the cursor position is in mainImage
+        // coordinates.
+        property bool isBrushPainting: false
+        property bool brushErasing: false
+        // Brush mode: middle-drag pans (as Space+drag does).
+        property bool middlePanning: false
+        property real brushCursorX: 0
+        property real brushCursorY: 0
+        property bool brushCursorInside: false
+        onContainsMouseChanged: if (!containsMouse) brushCursorInside = false
+        // A grab stolen mid-stroke (window switch, popup) still commits it.
+        onCanceled: {
+            middlePanning = false
+            brushErasing = false
+            if (isBrushPainting) {
+                isBrushPainting = false
+                if (loupeView.controllerRef) loupeView.controllerRef.finish_local_stroke()
+            }
+        }
+
+        function updateBrushCursor(mx, my) {
+            var p = mainImage.mapFromItem(mainMouseArea, mx, my)
+            brushCursorX = p.x
+            brushCursorY = p.y
+            brushCursorInside = true
+        }
         
         // Drag-to-pan with drag-and-drop when dragging outside window
         property real lastX: 0
@@ -938,7 +1075,7 @@ Item {
         PinchHandler {
             id: loupePinchHandler
             target: null
-            enabled: !mainMouseArea.isCropDragging && !mainMouseArea.isDarkenPainting
+            enabled: !mainMouseArea.isCropDragging && !mainMouseArea.isBrushPainting
 
             property real startZoomScale: 1
             property real startImagePointX: 0
@@ -1133,6 +1270,18 @@ Item {
         }
 
         onPressed: function(mouse) {
+            // The middle button only pans, and only in brush mode; elsewhere
+            // it keeps passing through as before.
+            if (mouse.button === Qt.MiddleButton) {
+                if (!loupeView.uiStateRef || !loupeView.uiStateRef.isBrushMode || loupeView.uiStateRef.isCropping) {
+                    mouse.accepted = false
+                    return
+                }
+                lastX = mouse.x
+                lastY = mouse.y
+                middlePanning = true
+                return
+            }
             lastX = mouse.x
             lastY = mouse.y
             startX = mouse.x
@@ -1147,17 +1296,20 @@ Item {
                 endCropInteraction()
             }
 
-            // Darken painting mode
-            if (loupeView.uiStateRef && loupeView.uiStateRef.isDarkening && !loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
+            // Dodge & burn: left paints, right or Alt+left erases, and
+            // Space+left pans (handled by the normal pan path below).
+            if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode && !loupeView.uiStateRef.isCropping && loupeView.controllerRef) {
+                updateBrushCursor(mouse.x, mouse.y)
+                if (loupeView.uiStateRef.brushPanHeld) return
                 var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
-                var sx = Math.max(0, Math.min(1, imgCoords.x))
-                var sy = Math.max(0, Math.min(1, imgCoords.y))
-                if (imgCoords.x < 0 || imgCoords.x > 1 || imgCoords.y < 0 || imgCoords.y > 1) {
-                    return  // click outside image bounds
+                // Points just outside the frame still paint up to its edge.
+                if (imgCoords.x < -0.05 || imgCoords.x > 1.05 || imgCoords.y < -0.05 || imgCoords.y > 1.05) {
+                    return
                 }
-                var strokeType = (mouse.button === Qt.RightButton) ? "protect" : "add"
-                loupeView.controllerRef.start_darken_stroke(sx, sy, strokeType)
-                isDarkenPainting = true
+                var erase = mouse.button === Qt.RightButton || (mouse.modifiers & Qt.AltModifier)
+                loupeView.controllerRef.start_local_stroke(imgCoords.x, imgCoords.y, !!erase)
+                isBrushPainting = true
+                brushErasing = !!erase
                 return
             }
 
@@ -1292,12 +1444,27 @@ Item {
             return { x: p.x / w, y: p.y / h }
         }
         onPositionChanged: function(mouse) {
-            // Darken painting drag — clamp to image bounds
-            if (isDarkenPainting && loupeView.controllerRef) {
+            if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode)
+                updateBrushCursor(mouse.x, mouse.y)
+
+            if (middlePanning) {
+                panTransform.x += (mouse.x - lastX)
+                panTransform.y += (mouse.y - lastY)
+                lastX = mouse.x
+                lastY = mouse.y
+                return
+            }
+
+            // Dodge & burn painting drag
+            if (isBrushPainting && loupeView.controllerRef) {
                 var imgCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
-                var cx = Math.max(0, Math.min(1, imgCoords.x))
-                var cy = Math.max(0, Math.min(1, imgCoords.y))
-                loupeView.controllerRef.continue_darken_stroke(cx, cy)
+                loupeView.controllerRef.continue_local_stroke(imgCoords.x, imgCoords.y)
+                return
+            }
+            // In brush mode a plain drag must not fall through to panning or
+            // drag-and-drop; only Space+drag pans.
+            if (pressed && loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode
+                    && !loupeView.uiStateRef.brushPanHeld && !loupeView.uiStateRef.isCropping) {
                 return
             }
 
@@ -1404,10 +1571,15 @@ Item {
         }
         
         onReleased: function(mouse) {
-            // Darken painting release
-            if (isDarkenPainting) {
-                isDarkenPainting = false
-                if (loupeView.controllerRef) loupeView.controllerRef.finish_darken_stroke()
+            if (mouse.button === Qt.MiddleButton) {
+                middlePanning = false
+                return
+            }
+            // Dodge & burn stroke release
+            brushErasing = false
+            if (isBrushPainting) {
+                isBrushPainting = false
+                if (loupeView.controllerRef) loupeView.controllerRef.finish_local_stroke()
                 return
             }
 
@@ -1914,31 +2086,100 @@ Item {
                     }
                 }
             }
-            
-                Rectangle {
-                    width: parent.width
-                    height: 30
-                    color: mainMouseArea.isRotating ? "#555555" : "transparent"
-                    radius: 3
-                    
-                    Text {
-                        anchors.left: parent.left
-                        anchors.leftMargin: 10
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "Rotate"
-                        color: aspectRatioWindow.isDark ? "white" : "black"
-                        font.pixelSize: 11
-                        font.bold: mainMouseArea.isRotating
-                    }
-                    
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            mainMouseArea.isRotating = !mainMouseArea.isRotating
-                            mainMouseArea.cropDragMode = "none"
-                        }
+
+            Rectangle {
+                id: gridToggleRow
+                width: parent.width
+                height: 30
+                radius: 3
+                activeFocusOnTab: true
+                color: gridToggleMouse.containsMouse || activeFocus
+                       ? (aspectRatioWindow.isDark ? "#484848" : "#dddddd")
+                       : "transparent"
+
+                function toggleGrid() {
+                    loupeView.cropGridOverride = !loupeView.cropGridVisible
+                }
+
+                Accessible.name: "Crop alignment grid"
+                Accessible.role: Accessible.CheckBox
+                Accessible.checked: loupeView.cropGridVisible
+                Accessible.onPressAction: gridToggleRow.toggleGrid()
+
+                Keys.onPressed: (event) => {
+                    if (event.key === Qt.Key_Enter
+                            || event.key === Qt.Key_Return
+                            || event.key === Qt.Key_Space) {
+                        gridToggleRow.toggleGrid()
+                        event.accepted = true
                     }
                 }
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Grid"
+                    color: aspectRatioWindow.isDark ? "white" : "black"
+                    font.pixelSize: 11
+                }
+
+                Rectangle {
+                    id: gridToggleTrack
+                    anchors.right: parent.right
+                    anchors.rightMargin: 6
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 30
+                    height: 16
+                    radius: height / 2
+                    color: loupeView.cropGridVisible ? "#6366f1"
+                                                      : (aspectRatioWindow.isDark ? "#666666" : "#aaaaaa")
+
+                    Rectangle {
+                        width: 12
+                        height: 12
+                        radius: width / 2
+                        y: 2
+                        x: loupeView.cropGridVisible ? parent.width - width - 2 : 2
+                        color: "white"
+                    }
+                }
+
+                MouseArea {
+                    id: gridToggleMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    onClicked: {
+                        gridToggleRow.forceActiveFocus()
+                        gridToggleRow.toggleGrid()
+                    }
+                }
+            }
+
+            Rectangle {
+                width: parent.width
+                height: 30
+                color: mainMouseArea.isRotating ? "#555555" : "transparent"
+                radius: 3
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Rotate"
+                    color: aspectRatioWindow.isDark ? "white" : "black"
+                    font.pixelSize: 11
+                    font.bold: mainMouseArea.isRotating
+                }
+                    
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        mainMouseArea.isRotating = !mainMouseArea.isRotating
+                        mainMouseArea.cropDragMode = "none"
+                    }
+                }
+            }
         }
     }
 

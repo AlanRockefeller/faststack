@@ -19,25 +19,48 @@ from PIL import ExifTags, Image, ImageFilter, ImageOps
 
 from faststack.imaging.jpeg import TURBO_AVAILABLE, decode_jpeg_rgb
 
-# Mask subsystem (lazy imports avoided — lightweight dataclasses)
+# Local adjustment layers (dodge & burn)
+from faststack.imaging.local_adjust import (
+    LOCAL_GAIN_KEYS,
+    LOCAL_LINEAR_KEYS,
+    LOCAL_SRGB_KEYS,
+    apply_local_shadows,
+    apply_local_srgb_block,
+    build_local_adjustments,
+    effective_layers,
+    layers_use_keys,
+    local_linear_gain_ratio,
+)
 from faststack.imaging.mask import MaskData
-from faststack.imaging.mask_engine import MaskRasterCache
+from faststack.imaging.mask_engine import LayerDensityCache
 from faststack.imaging.math_utils import (
     _analyze_highlight_state,
     _apply_headroom_shoulder,
-    _highlight_boost_linear,
-    _highlight_recover_linear,
-    _lerp,
     _linear_to_srgb,
     _linear_to_srgb_fast,
     _smoothstep01,
     _srgb_to_linear,
     _srgb_to_linear_fast,
     _srgb_u8_exact_to_linear,
+    apply_highlight_tone,
+    compute_highlight_base,
 )
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
-from faststack.models import DecodedImage, ResolvedDarkenMask
+
+# Stack paint: focus-stack input pixels painted over the stacked output
+from faststack.imaging.stack_paint import (
+    STACK_OUTPUT_SOURCE,
+    StackAlignError,
+    StackSource,
+    composite_stack_layers,
+    is_stack_layer,
+    load_stack_source,
+    stack_identity,
+    stack_layers,
+    warp_source_to_base,
+)
+from faststack.models import DecodedImage
 from faststack.util.executors import create_daemon_threadpool_executor
 
 try:
@@ -190,6 +213,36 @@ def _rec601_gray(arr: np.ndarray) -> np.ndarray:
     if cv2 is not None and arr.flags["C_CONTIGUOUS"]:
         return cv2.transform(arr, _REC601_LUMA.reshape(1, 3)).reshape(arr.shape[:2])
     return arr @ _REC601_LUMA
+
+
+def _hsv_hue_degrees(arr: np.ndarray) -> np.ndarray:
+    """HSV hue in degrees [0, 360) of an (H, W, 3) float RGB array."""
+    cv2 = _get_cv2()
+    if cv2 is not None:
+        # Clip first: arr can hold out-of-[0,1] values here (headroom from
+        # earlier contrast/brightness overshoot), where HSV hue is
+        # ill-defined. np.clip also returns a C-contiguous copy, so no
+        # separate contiguity check is needed for cv2.cvtColor.
+        return cv2.cvtColor(
+            np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False),
+            cv2.COLOR_RGB2HSV,
+        )[:, :, 0]
+    hue_source = np.clip(arr, 0.0, 1.0)
+    cmax = hue_source.max(axis=2)
+    cmin = hue_source.min(axis=2)
+    delta = cmax - cmin
+    safe = delta > 1e-6
+    r, g, b = hue_source[:, :, 0], hue_source[:, :, 1], hue_source[:, :, 2]
+    hue = np.zeros_like(cmax)
+    # Standard HSV hue (degrees), guarding the achromatic case.
+    rmax = safe & (cmax == r)
+    gmax = safe & (cmax == g) & ~rmax
+    bmax = safe & (cmax == b) & ~rmax & ~gmax
+    with np.errstate(invalid="ignore", divide="ignore"):
+        hue[rmax] = (60.0 * ((g - b)[rmax] / delta[rmax]) + 360.0) % 360.0
+        hue[gmax] = 60.0 * ((b - r)[gmax] / delta[gmax]) + 120.0
+        hue[bmax] = 60.0 * ((r - g)[bmax] / delta[bmax]) + 240.0
+    return hue
 
 
 def _apply_basic_srgb_adjustments(
@@ -532,39 +585,6 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
         return None
 
 
-# ----------------------------
-# sRGB ↔ Linear Conversion Helpers
-# ----------------------------
-
-
-# Constants for Highlight Recovery
-
-# Highlight Compression Curve
-HEADROOM_COMPRESSION_STEEPNESS = 2.0
-
-# Adaptive Parameters (tuned by image content analysis)
-# Pivot: Linear-light brightness where recovery starts to take hold. The effect
-# tapers in smoothly (smoothstep) from zero at the pivot to full at display
-# white, so a low pivot widens the affected band across all bright pixels
-# (Photoshop-style) while still leaving midtones near the pivot essentially
-# untouched. linear 0.30/0.50 ≈ sRGB 0.58/0.74.
-ADAPTIVE_PIVOT_MIN = 0.30
-ADAPTIVE_PIVOT_MAX = 0.50
-
-# K Factor: Steepness of the over-white compression shoulder
-ADAPTIVE_K_BASE = 8.0
-ADAPTIVE_K_SCALING = 4.0
-ADAPTIVE_K_HEADROOM_BASE = 8.0
-ADAPTIVE_K_HEADROOM_SCALING = 4.0
-
-# Chroma Rolloff: Desaturation in extreme highlights
-ADAPTIVE_ROLLOFF_MIN = 0.02
-ADAPTIVE_ROLLOFF_MAX = 0.12
-
-# Analysis Safety
-HEADROOM_MAX_BRIGHTNESS_PERCENTILE = 99.5
-
-
 def _gaussian_blur_float(arr: np.ndarray, radius: float) -> np.ndarray:
     """Apply Gaussian Blur to a float32 array using OpenCV.
 
@@ -730,6 +750,103 @@ def _rotated_content_point(
     )
 
 
+def geometry_affine(
+    edits: Dict[str, Any], base_shape: Tuple[int, int]
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """Exact pixel geometry of ``_apply_edits`` steps 1-3 as an affine map.
+
+    Returns ``(A, (out_h, out_w))`` where the 3x3 matrix ``A`` maps
+    continuous pixel coordinates (pixel centres at ``i + 0.5``) of an
+    oriented base image of *base_shape* to those of the post-geometry
+    (rotated, straightened, cropped) image of size ``(out_h, out_w)``.
+    Built from the same helpers as the renderer, so unlike the stroke
+    model in ``mask_engine`` it is exact for straighten and its autocrop.
+    Keep in step with the geometry block of ``_apply_edits``.
+    """
+    h, w = int(base_shape[0]), int(base_shape[1])
+    a = np.eye(3)
+
+    def then(m: np.ndarray) -> None:
+        nonlocal a
+        a = m @ a
+
+    k = (int(edits.get("rotation", 0) or 0) // 90) % 4
+    if k == 1:  # np.rot90 once (CCW): (x, y) -> (y, W - x)
+        then(np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, w], [0.0, 0.0, 1.0]]))
+        w, h = h, w
+    elif k == 2:
+        then(np.array([[-1.0, 0.0, w], [0.0, -1.0, h], [0.0, 0.0, 1.0]]))
+    elif k == 3:  # (x, y) -> (H - y, x)
+        then(np.array([[0.0, -1.0, h], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]))
+        w, h = h, w
+
+    straighten = float(edits.get("straighten_angle", 0.0) or 0.0)
+    crop_vals: Optional[tuple] = None
+    crop_edit = edits.get("crop_box")
+    if crop_edit:
+        try:
+            if len(crop_edit) == 4:
+                crop_vals = tuple(float(v) for v in crop_edit)
+        except (TypeError, ValueError):
+            crop_vals = None
+        if crop_vals == (0.0, 0.0, 1000.0, 1000.0):
+            crop_vals = None
+
+    orig_w, orig_h = w, h
+    if abs(straighten) > 0.001:
+        angle = -straighten  # _apply_edits rotates by -straighten_angle
+        if abs(angle) >= 0.01:  # _rotate_float_image no-op threshold
+            new_w, new_h = _expanded_canvas_size(w, h, angle)
+            rad = math.radians(angle)
+            cos_a, sin_a = math.cos(rad), math.sin(rad)
+            cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+            # cv2.getRotationMatrix2D(center, angle, 1) in index coords.
+            rot = np.array(
+                [
+                    [cos_a, sin_a, (1 - cos_a) * cx - sin_a * cy + (new_w - w) / 2.0],
+                    [-sin_a, cos_a, sin_a * cx + (1 - cos_a) * cy + (new_h - h) / 2.0],
+                    [0.0, 0.0, 1.0],
+                ]
+            )
+            to_idx = np.array([[1.0, 0, -0.5], [0, 1.0, -0.5], [0, 0, 1.0]])
+            from_idx = np.array([[1.0, 0, 0.5], [0, 1.0, 0.5], [0, 0, 1.0]])
+            then(from_idx @ rot @ to_idx)
+            w, h = new_w, new_h
+        if crop_vals is None:
+            cw, ch = _rotated_rect_with_max_area(
+                orig_w, orig_h, math.radians(straighten)
+            )
+            left, top, right, bottom = _autocrop_canvas_rect(cw, ch, w, h, straighten)
+            then(np.array([[1.0, 0, -left], [0, 1.0, -top], [0, 0, 1.0]]))
+            w, h = right - left, bottom - top
+
+    if crop_vals is not None:
+        if abs(straighten) > 0.001:
+            left, top, right, bottom = _crop_box_canvas_rect(
+                crop_vals, orig_w, orig_h, straighten, w, h
+            )
+        else:
+            left = max(0, int(round(crop_vals[0] * w / 1000)))
+            top = max(0, int(round(crop_vals[1] * h / 1000)))
+            right = min(w, int(round(crop_vals[2] * w / 1000)))
+            bottom = min(h, int(round(crop_vals[3] * h / 1000)))
+        if right > left and bottom > top:
+            then(np.array([[1.0, 0, -left], [0, 1.0, -top], [0, 0, 1.0]]))
+            w, h = right - left, bottom - top
+
+    return a, (h, w)
+
+
+def geometry_normalized_affine(
+    edits: Dict[str, Any], base_shape: Tuple[int, int]
+) -> np.ndarray:
+    """``geometry_affine`` between normalised [0, 1] coordinates: oriented
+    base image -> displayed (post-geometry) image."""
+    a, (out_h, out_w) = geometry_affine(edits, base_shape)
+    bh, bw = base_shape
+    return np.diag([1.0 / out_w, 1.0 / out_h, 1.0]) @ a @ np.diag([bw, bh, 1.0])
+
+
 def _autocrop_canvas_rect(
     cw: int, ch: int, canvas_w: int, canvas_h: int, straighten_angle: float
 ) -> tuple[int, int, int, int]:
@@ -866,13 +983,9 @@ class ImageEditor:
         # Timestamp of the currently loaded file (for cache invalidation)
         self.current_mtime: float = 0.0
 
-        # Caching for expensive percentile calculation in highlight recovery.
-        # Stores: {'hash': int, 'frozen': tuple, 'max_brightness': float}. Keyed
-        # on _get_upstream_edits_hash() rather than _edits_rev, because the
-        # input to highlight recovery only depends on geometry/WB/exposure
-        # (plus file/mtime), not on the highlights slider itself — moving
-        # just that slider must not invalidate this cache.
-        self._cached_max_brightness_state: Optional[Dict[str, Any]] = None
+        # Clipping/headroom telemetry for the editor's indicators, keyed on
+        # _get_upstream_edits_hash() (geometry/WB/exposure plus file/mtime) so
+        # moving tone sliders does not recompute it.
         self._cached_highlight_analysis: Optional[Dict[str, Any]] = None
 
         # Cache for luma detail bands (pyramid blur decomposition)
@@ -889,9 +1002,16 @@ class ImageEditor:
         )
         self._cached_u8_wb_lut: Optional[Tuple[Tuple[float, float], List[int]]] = None
 
-        # Mask subsystem — generic mask assets keyed by tool id
+        # Dodge & burn: stroke masks keyed by local layer id (the recipes
+        # live in current_edits["local_layers"]) and the preview thread's
+        # raster cache for them.
         self._mask_assets: Dict[str, MaskData] = {}
-        self._mask_raster_cache = MaskRasterCache()
+        self._local_density_cache = LayerDensityCache()
+        # Stack paint: decoded + registered focus-stack inputs keyed by file
+        # name (StackSource is immutable; the dict is only rebound/cleared on
+        # the GUI thread), and the load session they were registered against.
+        self._stack_sources: Dict[str, StackSource] = {}
+        self._stack_sources_session_id: Optional[str] = None
 
         # Rendering preferences pushed in from AppController config:
         # soft shoulder/toe on the levels ramp, and TPDF dither on 8-bit
@@ -922,11 +1042,11 @@ class ImageEditor:
                 and self._last_highlight_state is None
                 and self._cached_highlight_analysis is None
                 and self._cached_detail_bands is None
-                and self._cached_max_brightness_state is None
                 and self._cached_u8_lut is None
                 and self._cached_u8_wb_lut is None
                 and not self._mask_assets
-                and not self._mask_raster_cache
+                and not self._local_density_cache
+                and not self._stack_sources
             ):
                 return
             self.original_image = None
@@ -943,11 +1063,12 @@ class ImageEditor:
             self._last_highlight_state = None  # Explicit reset
             self._cached_highlight_analysis = None
             self._cached_detail_bands = None
-            self._cached_max_brightness_state = None
             self._cached_u8_lut = None
             self._cached_u8_wb_lut = None
             self._mask_assets.clear()
-            self._mask_raster_cache.clear()
+            self._local_density_cache.clear()
+            self._stack_sources = {}
+            self._stack_sources_session_id = None
 
     def set_source_exif(self, exif_bytes: Optional[bytes]):
         """Store EXIF bytes from the original source (e.g., paired JPEG).
@@ -958,9 +1079,11 @@ class ImageEditor:
         self._source_exif_bytes = exif_bytes
 
     def reset_edits(self):
-        """Reset edits to initial values and bump revision."""
+        """Reset edits (including dodge & burn layers) and bump revision."""
         with self._lock:
             self.current_edits = self._initial_edits()
+            self._mask_assets.clear()
+            self._local_density_cache.clear()
             self._edits_rev += 1
 
     def _initial_edits(self) -> Dict[str, Any]:
@@ -984,7 +1107,8 @@ class ImageEditor:
             "clarity": 0.0,
             "texture": 0.0,
             "straighten_angle": 0.0,
-            "darken_settings": None,  # DarkenSettings or None
+            # Dodge & burn layers; see faststack.imaging.local_adjust.
+            "local_layers": [],
             # Per-hue saturation bank (color mix); see _COLOR_MIX_BANDS.
             **{key: 0.0 for key in _COLOR_MIX_KEYS},
         }
@@ -993,87 +1117,6 @@ class ImageEditor:
     def tone_curve_version(edits: Dict[str, Any]) -> int:
         """Resolve a recipe consistently for preview, export and migration."""
         return _resolve_tone_curve_version(edits.get("tone_curve_version", 1))
-
-    @staticmethod
-    def _freeze_mask_identity_value(value: Any) -> Any:
-        """Freeze small edit-state values without scanning rendered pixels."""
-        if isinstance(value, dict):
-            return tuple(
-                sorted(
-                    (
-                        ImageEditor._freeze_mask_identity_value(key),
-                        ImageEditor._freeze_mask_identity_value(item),
-                    )
-                    for key, item in value.items()
-                )
-            )
-        if isinstance(value, (list, tuple)):
-            return tuple(
-                ImageEditor._freeze_mask_identity_value(item) for item in value
-            )
-        if isinstance(value, np.ndarray):
-            # Edit state should not contain pixel buffers. If a future tool adds
-            # one, its immutable object identity is still safer on the hot path
-            # than silently reintroducing an O(image-size) scan.
-            return ("array", id(value), value.shape, value.dtype.str)
-        if isinstance(value, float):
-            return round(value, 9)
-        return value
-
-    def _mask_render_identity(
-        self,
-        source: Any,
-        edits: Dict[str, Any],
-        *,
-        for_export: bool,
-        levels_soft_knee: bool,
-        downscale_long_edge: Optional[int],
-        detail_source_scale: float,
-        stage_stamps: tuple,
-    ) -> tuple:
-        """Identity of the immutable source and all pre-mask render inputs.
-
-        The resolved-mask cache must invalidate whenever the pre-darken image
-        could differ, and stay stable otherwise. Everything that can move those
-        pixels is enumerated here:
-
-        * the decoded source — ``session_id`` changes on every load and
-          ``_preview_master_generation`` on every preview-master rebuild, so a
-          recycled ``id()`` cannot alias a different buffer; ``current_mtime``
-          covers reload-in-place.
-        * every edit except ``darken_settings`` and ``vignette``, which are the
-          only pipeline stages at or after the darken step (19.5 and 20).
-          Rotation, straighten and crop are ordinary edit keys, so geometry —
-          the one group of content-*moving* rather than content-scaling
-          operations before the mask — is covered here too.
-        * the render parameters that change pixels without changing edits:
-          ``for_export`` (selects the export clipping/skip-linear branch),
-          ``levels_soft_knee``, ``downscale_long_edge`` and
-          ``detail_source_scale``.
-        * ``stage_stamps`` — see ``_render_cache_stamps``. Two renders with
-          identical edits can still differ where an upstream cache handed back
-          an approximate stage, so the stamps of any *reused* stage are part of
-          the identity.
-
-        Shape is not included because ``resolve_mask`` already keys on it.
-        """
-        upstream_edits = tuple(
-            (key, self._freeze_mask_identity_value(value))
-            for key, value in sorted(edits.items())
-            if key not in {"darken_settings", "vignette"}
-        )
-        return (
-            self.session_id,
-            id(source),
-            self._preview_master_generation,
-            self.current_mtime,
-            bool(for_export),
-            bool(levels_soft_knee),
-            downscale_long_edge,
-            round(float(detail_source_scale), 9),
-            stage_stamps,
-            upstream_edits,
-        )
 
     @staticmethod
     def _rotate_point_90_normalized(
@@ -1152,6 +1195,7 @@ class ImageEditor:
             and abs(_get_f("clarity")) <= 0.001
             and abs(_get_f("texture")) <= 0.001
             and abs(_get_f("sharpness")) <= 0.001
+            and not layers_use_keys(edits, LOCAL_LINEAR_KEYS)
         )
 
     @staticmethod
@@ -1165,6 +1209,7 @@ class ImageEditor:
         - No vignette (uses in-place ``arr *=``).
         - No geometry ops — rotation, straighten, crop create views/slices; later
           in-place ops on those views would mutate the backing array.
+        - No dodge & burn layers (their region is pasted back in place).
 
         All remaining sRGB-space ops (brightness, contrast, saturation, vibrance,
         levels) use reassignment (``arr = arr * factor``), which is safe.
@@ -1176,16 +1221,13 @@ class ImageEditor:
             except (ValueError, TypeError):
                 return 1.0  # Safe default: treat as "active" to skip optimization
 
-        darken = edits.get("darken_settings")
-        darken_active = darken is not None and getattr(darken, "enabled", False)
-
         return (
             ImageEditor._edits_skip_linear(edits)
             and abs(_get_f("vignette")) <= 0.001
             and edits.get("rotation", 0) == 0
             and abs(_get_f("straighten_angle")) <= 0.001
             and not edits.get("crop_box")
-            and not darken_active
+            and not effective_layers(edits)
         )
 
     def load_image(
@@ -1221,7 +1263,9 @@ class ImageEditor:
                 self._cached_rev = -1
                 # Clear mask state from previous image
                 self._mask_assets.clear()
-                self._mask_raster_cache.clear()
+                self._local_density_cache.clear()
+                self._stack_sources = {}
+                self._stack_sources_session_id = None
             log.error("Image file not found: %s", filepath)
             return False
 
@@ -1241,7 +1285,12 @@ class ImageEditor:
             self._source_exif_bytes = source_exif
             # Clear mask state from previous image
             self._mask_assets.clear()
-            self._mask_raster_cache.clear()
+            self._local_density_cache.clear()
+            # Registrations are tied to the pixels in this load session. A
+            # same-path replacement can have different geometry, so every real
+            # reload gets a fresh set rather than reusing path-keyed sources.
+            self._stack_sources = {}
+            self._stack_sources_session_id = None
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
         _is_png = load_filepath.suffix.lower() == ".png"
@@ -1530,6 +1579,7 @@ class ImageEditor:
                     self.current_filepath = load_filepath
                     self.source_filepath = load_filepath
                     self.session_id = uuid.uuid4().hex
+                    self._stack_sources_session_id = self.session_id
                     self.original_image = loaded_original
                     self.float_image = loaded_float_image
                     self.float_preview = loaded_float_preview
@@ -1575,11 +1625,12 @@ class ImageEditor:
                 self._edits_rev += 1
                 self._cached_preview = None
                 self._cached_rev = -1
-                self._cached_max_brightness_state = None
                 self._cached_highlight_analysis = None
                 self._cached_detail_bands = None
                 self._mask_assets.clear()
-                self._mask_raster_cache.clear()
+                self._local_density_cache.clear()
+                self._stack_sources = {}
+                self._stack_sources_session_id = None
             return False
 
     def _rotate_float_image(
@@ -1651,15 +1702,14 @@ class ImageEditor:
         for_export: bool = False,
         levels_soft_knee_override: Optional[bool] = None,
         mask_assets_override: Optional[Dict[str, "MaskData"]] = None,
-        cache_override: Optional["MaskRasterCache"] = None,
+        cache_override: Optional["LayerDensityCache"] = None,
+        stack_sources_override: Optional[Dict[str, StackSource]] = None,
         cache_context: Optional[dict] = None,
         update_highlight_state: bool = True,
         downscale_long_edge: Optional[int] = None,
         detail_source_scale: float = 1.0,
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
-        stop_before_darken: bool = False,
-        render_state_out: Optional[Dict[str, Any]] = None,
         source_exact_u8: bool = False,
     ) -> np.ndarray:
         """Applies all current edits to the provided float32 numpy array.
@@ -1690,14 +1740,11 @@ class ImageEditor:
         sampled between expensive stages so idle refinement can yield when a
         newer edit revision arrives. Export callers never pass it.
 
-        ``stop_before_darken`` returns the authoritative content-analysis stage
-        used by the background-darkening mask. Overlay generation uses this
-        exact boundary so it cannot derive priors from a different edit stage.
-
-        ``render_state_out`` receives this render's ``mask_render_identity``.
-        Callers that stop before the darken step and resolve the mask
-        themselves need it, because the identity depends on which upstream
-        stages this particular render reused rather than recomputed.
+        ``mask_assets_override`` / ``cache_override`` supply the dodge & burn
+        stroke masks and their raster cache (export snapshots); by default the
+        live ``_mask_assets`` and the preview-thread cache are used.
+        ``stack_sources_override`` likewise supplies the registered stack
+        inputs for stack layers (default: the live ``_stack_sources``).
         """
         cv2 = _get_cv2()
         if edits is None:
@@ -1758,6 +1805,38 @@ class ImageEditor:
                 arr = arr.astype(np.float32) / 65535.0
             else:
                 arr = arr.astype(np.float32, copy=False)
+
+        # 0. Stack paint: blend painted focus-stack input pixels into the base
+        # image before any geometry, so they get exactly the same geometry,
+        # global and local edits as the rest of the photo. Returns a fresh
+        # array when it paints anything, so a shared input is never written.
+        stack_ident: Optional[tuple] = None
+        if stack_layers(edits):
+            stack_masks = (
+                mask_assets_override
+                if mask_assets_override is not None
+                else self._mask_assets
+            )
+            stack_sources = (
+                stack_sources_override
+                if stack_sources_override is not None
+                else self._stack_sources
+            )
+            arr, stack_painted = composite_stack_layers(
+                arr,
+                edits,
+                stack_masks,
+                stack_sources,
+                (
+                    cache_override
+                    if cache_override is not None
+                    else self._local_density_cache
+                ),
+            )
+            if stack_painted:
+                exact_u8 = False
+                stack_ident = stack_identity(edits, stack_masks, stack_sources)
+            _mark("stack_paint")
 
         # NOTE: For UI analysis, we want to capture the state AFTER White Balance and Exposure
         # but BEFORE Highlights/Shadows/ToneMapping, so the indicators reflect the
@@ -1891,6 +1970,27 @@ class ImageEditor:
         _mark("downscale")
         _check_cancelled()
 
+        # Dodge & burn: per-pixel recipe deltas at this render's resolution.
+        # Each stage below renders globally first; stages a layer touches are
+        # then re-rendered over the painted bounding box with per-pixel values.
+        local = None
+        if effective_layers(edits):
+            local = build_local_adjustments(
+                edits,
+                (
+                    mask_assets_override
+                    if mask_assets_override is not None
+                    else self._mask_assets
+                ),
+                arr.shape[:2],
+                (
+                    cache_override
+                    if cache_override is not None
+                    else self._local_density_cache
+                ),
+            )
+            _mark("local_masks")
+
         _skip_linear = self._edits_skip_linear(edits)
 
         # Detach from a shared input buffer before any tonal op can touch it.
@@ -1920,17 +2020,13 @@ class ImageEditor:
         # computes from a 4x-strided view below. (_skip_linear is computed
         # above, before the protect_input check.)
 
-        # Stamps of any *reused* (and therefore possibly approximate) upstream
-        # stage, for _mask_render_identity(). None means "computed exactly from
-        # source + edits", which needs no identity of its own.
-        highlight_stage_stamp: Optional[tuple] = None
-        detail_stage_stamp: Optional[tuple] = None
-
         if for_export:
             log.debug("_apply_edits for_export: skip_linear=%s", _skip_linear)
 
         if _skip_linear and not for_export:
-            upstream_hash, upstream_frozen = self._get_upstream_edits_hash(edits)
+            upstream_hash, upstream_frozen = self._get_upstream_edits_hash(
+                edits, stack_ident
+            )
             analysis_state = None
             with self._lock:
                 cached_dict = (
@@ -1981,16 +2077,11 @@ class ImageEditor:
             _check_cancelled()
 
         if not _skip_linear:
-            # Capture strided view for analysis ONLY if needed
-            # We need analysis if:
-            # 1. We are in preview (not for_export) -> To show UI indicators.
-            # 2. OR if we have highlights/shadows active -> To drive adaptive params.
-
+            # The clipping/headroom analysis only feeds the editor's UI
+            # indicators, so exports skip it.
             highlights = float(edits.get("highlights", 0.0))
             shadows = float(edits.get("shadows", 0.0))
-            should_analyze = (not for_export) or (
-                abs(highlights) > 0.001 or abs(shadows) > 0.001
-            )
+            should_analyze = not for_export
 
             arr_stride = None
             srgb_u8_stride = None
@@ -2047,7 +2138,9 @@ class ImageEditor:
 
             if should_analyze:
                 # Check cache for analysis state to avoid expensive re-computation on downstream edits
-                upstream_hash, upstream_frozen = self._get_upstream_edits_hash(edits)
+                upstream_hash, upstream_frozen = self._get_upstream_edits_hash(
+                    edits, stack_ident
+                )
 
                 cached_analysis = None
                 cached_analysis_shape = None
@@ -2092,28 +2185,56 @@ class ImageEditor:
                         else:
                             self._cached_highlight_analysis = entry
 
-                # The state is measured from a 4x-strided view, and its cache
-                # key does not include resolution — so a hit across two render
-                # tiers hands back numbers this buffer would not have produced.
-                # It reaches pixels only through the highlights branch below.
-                if abs(highlights) > 0.001:
-                    highlight_stage_stamp = cached_analysis_shape
-
             if not for_export and update_highlight_state:
                 with self._lock:
                     self._last_highlight_state = analysis_state
 
-            # 8. Highlights/Shadows - Using linear light and brightness-based processing
-            if abs(highlights) > 0.001 or abs(shadows) > 0.001:
-                arr = self._apply_highlights_shadows(
-                    arr,
-                    highlights,
-                    shadows,
-                    srgb_u8_stride=srgb_u8_stride,  # Pass if we need to recompute analysis
-                    analysis_state=analysis_state,
-                    edits=edits,
-                    cache_context=cache_context,
-                )
+            # 6-7 (local). WB and exposure are pure gains, so painted pixels
+            # just take the ratio to the global gain. Applied after the
+            # highlight analysis so its cache stays valid across strokes.
+            if local is not None and local.has_any(LOCAL_GAIN_KEYS):
+                ratio = local_linear_gain_ratio(edits, local)
+                if ratio is not None:
+                    arr[local.roi] *= ratio
+
+            # 8. Shadows, then Highlights (edge-aware local tone mapping).
+            #
+            # Both depend on each pixel's own brightness, so painted layers
+            # re-render their region per pixel: keep the ROI's input from
+            # before the first stage the layers touch.
+            local_shadows = local is not None and "shadows" in local.maps
+            local_highlights = local is not None and "highlights" in local.maps
+            local_tone_in = arr[local.roi].copy() if local_shadows else None
+
+            arr = self._apply_shadows_linear(arr, shadows)
+            if local_highlights and local_tone_in is None:
+                local_tone_in = arr[local.roi].copy()
+
+            highlights_active = abs(highlights) > 0.001 or local_highlights
+            if highlights_active:
+                # The base layer is solved over the whole frame, so a painted
+                # region sees the same regions (and no seam at its edge).
+                hl_p, hl_base, hl_headroom = compute_highlight_base(arr)
+                if abs(highlights) > 0.001:
+                    arr = apply_highlight_tone(
+                        arr, highlights, hl_base, hl_headroom, p=hl_p
+                    )
+                del hl_p
+
+            if local_tone_in is not None:
+                region = local_tone_in
+                if local_shadows:
+                    region = apply_local_shadows(
+                        region, local.value("shadows", shadows)
+                    )
+                if highlights_active:
+                    region = apply_highlight_tone(
+                        region,
+                        local.value("highlights", highlights),
+                        hl_base[local.roi],
+                        hl_headroom,
+                    )
+                arr[local.roi] = region
 
             _mark("linear_tone")
             _check_cancelled()
@@ -2151,6 +2272,14 @@ class ImageEditor:
 
                 # Check cache for detail bands (hash + frozen tuple verification)
                 detail_hash, detail_frozen = self._get_detail_upstream_hash(edits)
+                if local is not None and local.linear_identity:
+                    # Painted WB/exposure/shadows change the detail input.
+                    detail_frozen = detail_frozen + (local.linear_identity,)
+                    detail_hash = hash(detail_frozen)
+                if stack_ident:
+                    # Painted stack-input pixels change the detail input.
+                    detail_frozen = detail_frozen + (("stack", stack_ident),)
+                    detail_hash = hash(detail_frozen)
                 detail_scale_key = round(detail_render_scale, 8)
                 Y20_cached = Y3_cached = Y1_cached = None
                 cache_hit = False
@@ -2295,23 +2424,6 @@ class ImageEditor:
                             self._cached_detail_bands = new_cache
                         cached_band_ids = new_cache["band_ids"]
 
-                # A band this render used is its stored array rescaled from the
-                # gain it was blurred at to the current one, so its identity
-                # plus the current exposure (already in the key) pins its value
-                # exactly. A freshly blurred band and a reused band that was
-                # blurred under the same conditions therefore agree, while a
-                # band carried across an exposure or highlights/shadows change
-                # — where the rescale is only an approximation — does not.
-                detail_stage_stamp = tuple(
-                    (name, cached_band_ids.get(name))
-                    for name, needed in (
-                        ("Y20", need_Y20),
-                        ("Y3", need_Y3),
-                        ("Y1", need_Y1),
-                    )
-                    if needed
-                )
-
                 # Build hierarchical pyramid bands (non-overlapping frequency ranges)
                 detail = np.zeros_like(Y)
 
@@ -2374,6 +2486,14 @@ class ImageEditor:
         # NOTE: All operations below must be non-mutating (use reassignment) when
         # _skip_linear=True and for_export=True to avoid corrupting self.float_image.
         # Vignette is excluded from the no-copy path because it uses in-place math.
+
+        # 14-19 (local). Keep the painted region's input; the whole sRGB block
+        # is re-rendered for it with per-pixel values after step 19.
+        local_srgb_in = (
+            arr[local.roi].copy()
+            if local is not None and local.has_any(LOCAL_SRGB_KEYS)
+            else None
+        )
 
         # 14-17. Common scalar sRGB adjustments. Export processes independent
         # row bands on a small scoped daemon pool; the save worker waits for
@@ -2453,28 +2573,7 @@ class ImageEditor:
             for key, (_name, center) in zip(_COLOR_MIX_KEYS, _COLOR_MIX_BANDS)
         ]
         if any(abs(v) > 0.001 for _c, v in color_mix_vals):
-            if cv2 is not None:
-                # Clip first: arr can hold out-of-[0,1] values here (headroom from
-                # earlier contrast/brightness overshoot), where HSV hue is
-                # ill-defined. np.clip also returns a C-contiguous copy, so no
-                # separate contiguity check is needed for cv2.cvtColor.
-                hue = cv2.cvtColor(np.clip(arr, 0.0, 1.0), cv2.COLOR_RGB2HSV)[:, :, 0]
-            else:
-                hue_source = np.clip(arr, 0.0, 1.0)
-                cmax = hue_source.max(axis=2)
-                cmin = hue_source.min(axis=2)
-                delta = cmax - cmin
-                safe = delta > 1e-6
-                r, g, b = hue_source[:, :, 0], hue_source[:, :, 1], hue_source[:, :, 2]
-                hue = np.zeros_like(cmax)
-                # Standard HSV hue (degrees), guarding the achromatic case.
-                rmax = safe & (cmax == r)
-                gmax = safe & (cmax == g) & ~rmax
-                bmax = safe & (cmax == b) & ~rmax & ~gmax
-                with np.errstate(invalid="ignore", divide="ignore"):
-                    hue[rmax] = (60.0 * ((g - b)[rmax] / delta[rmax]) + 360.0) % 360.0
-                    hue[gmax] = 60.0 * ((b - r)[gmax] / delta[gmax]) + 120.0
-                    hue[bmax] = 60.0 * ((r - g)[bmax] / delta[bmax]) + 240.0
+            hue = _hsv_hue_degrees(arr)
 
             factor = np.zeros(arr.shape[:2], dtype=np.float32)
             for center, value in color_mix_vals:
@@ -2506,72 +2605,16 @@ class ImageEditor:
 
         _check_cancelled()
 
-        # 19.5. Background Darkening (masked, after levels, before vignette)
-        mask_render_identity = self._mask_render_identity(
-            img_arr,
-            edits,
-            for_export=for_export,
-            levels_soft_knee=use_levels_soft_knee,
-            downscale_long_edge=downscale_long_edge,
-            detail_source_scale=detail_source_scale,
-            stage_stamps=(highlight_stage_stamp, detail_stage_stamp),
-        )
-        if render_state_out is not None:
-            render_state_out["mask_render_identity"] = mask_render_identity
-
-        if stop_before_darken:
-            return arr
-
-        darken = edits.get("darken_settings")
-        if darken is not None and getattr(darken, "enabled", False):
-            # Use override assets/cache if provided (export snapshot), else live state
-            _assets = (
-                mask_assets_override
-                if mask_assets_override is not None
-                else self._mask_assets
+        if local_srgb_in is not None:
+            region = apply_local_srgb_block(
+                local_srgb_in,
+                edits,
+                local,
+                levels_soft_knee=use_levels_soft_knee,
             )
-            _cache = (
-                cache_override
-                if cache_override is not None
-                else self._mask_raster_cache
-            )
-            mask_data = _assets.get(darken.mask_id)
-            if mask_data is not None and mask_data.has_strokes():
-                from faststack.imaging.mask_engine import resolve_mask
-                from faststack.imaging.masked_ops import apply_masked_darken
-
-                resolved = resolve_mask(
-                    mask_data,
-                    darken,
-                    arr,
-                    arr.shape[:2],
-                    edits,
-                    cache=_cache,
-                    image_key=mask_render_identity,
-                )
-                if render_state_out is not None:
-                    # Hand the overlay the mask this render actually applied,
-                    # rather than making it re-render the pre-darken stage to
-                    # resolve an equivalent one. Published read-only: the array
-                    # is shared with MaskRasterCache and, once emitted, with the
-                    # GUI thread. See models.ResolvedDarkenMask.
-                    try:
-                        resolved.flags.writeable = False
-                    except ValueError:  # pragma: no cover - non-owning array
-                        pass
-                    render_state_out["resolved_darken_mask"] = ResolvedDarkenMask(
-                        mask=resolved,
-                        width=resolved.shape[1],
-                        height=resolved.shape[0],
-                        mask_id=darken.mask_id,
-                        mask_revision=mask_data.revision,
-                    )
-                arr = apply_masked_darken(
-                    arr,
-                    resolved,
-                    darken_amount=darken.darken_amount,
-                    edge_protection=darken.edge_protection,
-                )
+            if np.may_share_memory(arr, img_arr):
+                arr = arr.copy()  # never write into a shared input buffer
+            arr[local.roi] = region
 
         _check_cancelled()
 
@@ -3274,7 +3317,9 @@ class ImageEditor:
             "confidence": confidence,
         }
 
-    def _get_upstream_edits_hash(self, edits: Dict[str, Any]) -> tuple:
+    def _get_upstream_edits_hash(
+        self, edits: Dict[str, Any], stack_ident: Optional[tuple] = None
+    ) -> tuple:
         """Returns (hash, frozen_values) of edit parameters that affect the
         input to highlight recovery.
 
@@ -3309,6 +3354,8 @@ class ImageEditor:
         values.append(str(self.current_filepath))
         # Include float_image ID to catch reload-in-place or content changes (e.g. forced reload)
         values.append(self.current_mtime)
+        if stack_ident:
+            values.append(("stack", stack_ident))
         frozen = tuple(values)
         return (hash(frozen), frozen)
 
@@ -3484,9 +3531,6 @@ class ImageEditor:
             height=target_h,
             bytes_per_line=resized.strides[0],
             format=decoded.format,
-            # Display resizing does not re-resolve the mask; it stays at the
-            # tier that produced it and QML scales the overlay to fit.
-            darken_mask=decoded.darken_mask,
         )
 
     def _render_decoded_from_float(
@@ -3502,13 +3546,16 @@ class ImageEditor:
         detail_source_scale: float = 1.0,
         protect_input: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
+        apply_overrides: Optional[Dict[str, Any]] = None,
     ) -> DecodedImage:
-        """Render edits against a float RGB array and package it for Qt display."""
+        """Render edits against a float RGB array and package it for Qt display.
+
+        ``apply_overrides`` adds keyword arguments to the ``_apply_edits`` call.
+        """
         cv2 = _get_cv2()
         _debug = log.isEnabledFor(logging.DEBUG)
         if _debug:
             t0 = time.perf_counter()
-        render_state: Dict[str, Any] = {}
         arr = self._apply_edits(
             base,
             edits=edits,
@@ -3518,7 +3565,7 @@ class ImageEditor:
             detail_source_scale=detail_source_scale,
             protect_input=protect_input,
             cancel_check=cancel_check,
-            render_state_out=render_state,
+            **(apply_overrides or {}),
         )
         if cancel_check is not None and cancel_check():
             raise EditRenderCancelled
@@ -3572,8 +3619,69 @@ class ImageEditor:
             height=arr_u8.shape[0],
             bytes_per_line=arr_u8.strides[0],
             format=QImage.Format.Format_RGB888,
-            # Pixels and the mask applied to them travel together from here on.
-            darken_mask=render_state.get("resolved_darken_mask"),
+        )
+
+    def render_stack_hover_preview(
+        self, source: Optional[StackSource], long_edge: int = 2560
+    ) -> Optional[DecodedImage]:
+        """Render the photo as if *source* were painted everywhere.
+
+        ``source=None`` means the stack output itself (the photo without any
+        stack layers).
+
+        Same geometry, global edits, dodge & burn layers and display colour
+        handling as the live preview, so the loupe can show it inside the
+        brush circle as a preview of what a stack paint stroke would do.
+        Safe on a worker thread: it uses private caches and snapshots.
+        """
+        with self._lock:
+            base = self.float_preview
+            if base is None:
+                base = self.float_image
+            edits = dict(self.current_edits)
+            masks = dict(self._mask_assets)
+            icc_bytes = (
+                self.original_image.info.get("icc_profile")
+                if self.original_image is not None
+                else None
+            )
+            full = self.float_image if self.float_image is not None else base
+        if base is None:
+            return None
+        edits["local_layers"] = [
+            layer
+            for layer in edits.get("local_layers") or ()
+            if not is_stack_layer(layer)
+        ]
+        # Sharper than the preview master when the full image allows: the
+        # loupe may be zoomed in on the brush.
+        fh, fw = full.shape[:2]
+        target = max(max(base.shape[:2]), min(long_edge, max(fh, fw)))
+        scale = target / max(fh, fw)
+        shape = (max(1, round(fh * scale)), max(1, round(fw * scale)))
+        if source is not None:
+            src_arr = warp_source_to_base(source, shape)
+        elif full.shape[:2] == shape:
+            src_arr = full
+        else:
+            src_arr = _get_cv2().resize(
+                full, (shape[1], shape[0]), interpolation=_get_cv2().INTER_AREA
+            )
+        return self._render_decoded_from_float(
+            src_arr,
+            edits=edits,
+            for_export=False,
+            apply_loupe_color=True,
+            icc_bytes=icc_bytes,
+            cache_context={},
+            detail_source_scale=min(shape[1] / fw, 1.0),
+            protect_input=True,
+            apply_overrides={
+                "mask_assets_override": masks,
+                "cache_override": LayerDensityCache(),
+                "stack_sources_override": {},
+                "update_highlight_state": False,
+            },
         )
 
     def get_full_resolution_preview_data(
@@ -3777,10 +3885,33 @@ class ImageEditor:
         """Apply current edits and return the data as a DecodedImage."""
         return self.get_preview_data_cached()
 
+    def geometry_base_shape(self) -> Optional[Tuple[int, int]]:
+        """Full-resolution oriented base shape for ``geometry_affine``."""
+        with self._lock:
+            for arr in (self.float_image, self.float_preview):
+                if arr is not None:
+                    return arr.shape[:2]
+        return None
+
     def get_edit_value(self, key: str, default: Any = None) -> Any:
         """Thread-safe retrieval of an edit parameter."""
         with self._lock:
             return self.current_edits.get(key, default)
+
+    def set_local_layers(self, layers: List[Dict[str, Any]]) -> None:
+        """Replace the dodge & burn layer list.
+
+        The list and its dicts are never mutated after this call (callers
+        build new ones), so shallow edit snapshots stay consistent.
+        """
+        with self._lock:
+            self.current_edits["local_layers"] = layers
+            self._edits_rev += 1
+
+    def touch_local_masks(self) -> None:
+        """Invalidate renders after a stroke change in ``_mask_assets``."""
+        with self._lock:
+            self._edits_rev += 1
 
     def set_edit_param(self, key: str, value: Any) -> bool:
         """Update a single edit parameter."""
@@ -3847,208 +3978,42 @@ class ImageEditor:
                 return True
             return False
 
+    @staticmethod
+    def _apply_shadows_linear(arr: np.ndarray, shadows: float) -> np.ndarray:
+        """Shadows slider in linear light: gain below mid-gray luminance."""
+        if abs(shadows) <= 0.001:
+            return arr
+        lum = arr[:, :, 0] * 0.2126 + arr[:, :, 1] * 0.7152 + arr[:, :, 2] * 0.0722
+        lum = np.clip(lum, 1e-10, None)
+        shadow_mask = _smoothstep01(1.0 - lum / 0.18)  # 0.18 = linear mid-gray
+        shadow_factor = 1.0 + (shadows * 0.5) * shadow_mask
+        return arr * np.expand_dims(shadow_factor, axis=2)
+
     def _apply_highlights_shadows(
         self,
         linear: np.ndarray,
         highlights: float,
         shadows: float,
-        *,
-        srgb_u8_stride: Optional[np.ndarray] = None,
-        analysis_state: Optional[Dict[str, float]] = None,
-        edits: Optional[Dict[str, Any]] = None,
-        cache_context: Optional[dict] = None,
     ) -> np.ndarray:
-        """Apply highlights and shadows adjustments using brightness-based processing in linear light.
+        """Apply Shadows, then Highlights, to a linear-light RGB array.
 
-        Highlights slider semantics:
-        - Negative (e.g., -100): Compress bright regions, recover detail if headroom exists.
-          Uses brightness-based rescaling to preserve hue/chroma.
-        - Positive (e.g., +100): Lift highlights (brighten bright areas).
-
-        For JPEG (no headroom): Applies perceptual rolloff + optional desaturation
-        (artistic fallback) to simulate recovery of micro-contrast.
+        Highlights is an edge-aware local tone operator (see
+        ``math_utils.compute_highlight_base``): negative values darken bright
+        regions while keeping -- and mildly boosting -- the texture inside
+        them; positive values brighten them.
 
         Args:
-            linear: Float32 RGB array (H, W, 3) in linear light, may have values > 1.0
+            linear: Float32 RGB array (H, W, 3) in linear light, may exceed 1.0
             highlights: -1.0 to 1.0, negative recovers highlights, positive boosts
             shadows: -1.0 to 1.0, positive lifts shadows, negative crushes
-            srgb_u8_stride: Optional uint8 sRGB array (strided) for accurate JPEG clipping detection
-                     (should be the image BEFORE linearization)
-            analysis_state: Optional pre-computed analysis state to avoid re-work.
 
         Returns:
             Adjusted float32 RGB array (linear)
         """
-        arr = linear
-
-        # Analyze highlight state if needed
-        # If caller passed analysis_state, usage that.
-        state = analysis_state
-        if state is None:
-            # Re-compute locally if not provided
-            # We assume srgb_u8_stride is ALREADY STRIDED if passed
-            arr_stride = arr[::4, ::4, :]
-            # If srgb_u8_stride was passed, use it directly (it's already small).
-            # If it wasn't passed, we can't easily recreate the source state here without the original source buffer.
-            # But the caller (_apply_edits) usually provides it.
-            state = _analyze_highlight_state(arr_stride, srgb_u8=srgb_u8_stride)
-
-        # Ensure we have edits dict to check upstream hash
-        if edits is None:
-            # Fallback to current_edits if not provided (cached preview path passes it)
-            # But access under lock to be safe from modifications
-            with self._lock:
-                edits = self.current_edits.copy()
-
-        # We DO NOT update self._last_highlight_state here to avoid race/staleness during export.
-        # The preview path in _apply_edits handles the UI state update.
-
-        # --- Shadows Adjustment (unchanged approach) ---
-        if abs(shadows) > 0.001:
-            # Compute luminance for shadow mask
-            lum = arr[:, :, 0] * 0.2126 + arr[:, :, 1] * 0.7152 + arr[:, :, 2] * 0.0722
-            lum = np.clip(lum, 1e-10, None)
-
-            pivot = 0.18  # Mid-gray in linear
-            shadow_mask = _smoothstep01(1.0 - lum / pivot)
-
-            shadow_adj = shadows * 0.5
-            shadow_factor = 1.0 + shadow_adj * shadow_mask
-            shadow_factor = np.expand_dims(shadow_factor, axis=2)
-            arr = arr * shadow_factor
-
-        # --- Highlights Adjustment (new brightness-based approach) ---
+        arr = self._apply_shadows_linear(linear, shadows)
         if abs(highlights) > 0.001:
-            headroom_pct = state["headroom_pct"]
-
-            # Use specific keys from new analysis logic
-            # source_clipped_pct: True JPEG flat-top clipping
-            # current_nearwhite_pct: Current brightness distribution near 1.0
-            clipped_pct = state.get("source_clipped_pct", state.get("clipped_pct", 0.0))
-            near_white_pct = state.get(
-                "current_nearwhite_pct", state.get("near_white_pct", 0.0)
-            )
-
-            if highlights < 0:
-                # Negative: compress/recover highlights
-                amount = -highlights  # 0 to 1
-
-                # Adaptive parameters based on headroom and clipping
-                # More clipping (source) → later pivot (only affect very top end)
-                pivot = _lerp(ADAPTIVE_PIVOT_MIN, ADAPTIVE_PIVOT_MAX, clipped_pct)
-
-                # k increases with near_white_pct (recoverable micro-contrast)
-                # BUT also increase k when headroom exists for stronger compression
-                k = ADAPTIVE_K_BASE + ADAPTIVE_K_SCALING * near_white_pct
-                if headroom_pct > 0.01:
-                    k = max(
-                        k,
-                        ADAPTIVE_K_HEADROOM_BASE
-                        + ADAPTIVE_K_HEADROOM_SCALING * headroom_pct,
-                    )  # Stronger k for headroom
-
-                # More clipping → more chroma rolloff
-                chroma_rolloff = _lerp(
-                    ADAPTIVE_ROLLOFF_MIN, ADAPTIVE_ROLLOFF_MAX, clipped_pct
-                )
-
-                # Headroom ceiling: preserve some tonal separation above 1.0
-                # Robustify: use percentile to ignore hot pixels, clamped to valid range
-                if headroom_pct > 0.01:
-                    # Check cache for max_brightness
-                    # Compute hash of upstream params
-                    current_hash, current_frozen = self._get_upstream_edits_hash(edits)
-
-                    max_brightness = 1.0
-                    hit = False
-                    with self._lock:
-                        cached = (
-                            cache_context.get("max_brightness_state")
-                            if cache_context is not None
-                            else self._cached_max_brightness_state
-                        )
-                        if (
-                            cached
-                            and cached.get("hash") == current_hash
-                            and cached.get("frozen") == current_frozen
-                        ):
-                            max_brightness = cached["value"]
-                            hit = True
-
-                    if not hit:
-                        # Use 99.5th percentile of max-channel brightness to avoid hot pixels
-                        max_rgb = arr.max(axis=2)
-                        if max_rgb.size > 0:
-                            # Optimize: Use much coarser stride and np.partition for speed
-                            # We only need an estimate for headroom, so we don't need high precision
-                            # Stride ::10 reduces data by 100x vs full, 6x faster than ::4
-                            view = max_rgb[::10, ::10]
-                            if view.size > 0:
-                                # np.partition is O(N) vs np.percentile O(N log N)
-                                # We want 99.5th percentile roughly.
-                                # Index for 99.5% = size * 0.995 => size - (size * 0.005)
-                                k_index = int(view.size * 0.995)
-                                # Clamp to valid range
-                                k_index = min(max(0, k_index), view.size - 1)
-
-                                partitioned = np.partition(view.flatten(), k_index)
-                                max_brightness = float(partitioned[k_index])
-                            else:
-                                max_brightness = 1.0
-                        else:
-                            max_brightness = 1.0
-
-                        with self._lock:
-                            entry = {
-                                "hash": current_hash,
-                                "frozen": current_frozen,
-                                "value": max_brightness,
-                            }
-                            if cache_context is not None:
-                                cache_context["max_brightness_state"] = entry
-                            else:
-                                self._cached_max_brightness_state = entry
-
-                    # Clamp to avoid crazy values from single hot pixels or artifacts
-                    max_brightness = min(max_brightness, 100.0)
-
-                    if max_brightness > 1.0:
-                        # Preserve some headroom detail, reduced by amount
-                        headroom_ceiling = 1.0 + (max_brightness - 1.0) * 0.3 * (
-                            1.0 - amount * 0.7
-                        )
-                        pivot = min(pivot, 0.5 + 0.25 * (1.0 - headroom_pct))
-                    else:
-                        headroom_ceiling = 1.0
-                else:
-                    headroom_ceiling = 1.0
-
-                # JPEG fallback: when near_white is high but clipping is low,
-                # nudge pivot earlier to expose micro-contrast (Photoshop-like feel)
-                if headroom_pct < 0.01:
-                    if near_white_pct > 0.05 and clipped_pct < 0.05:
-                        # Lots of recoverable near-white, not much flat clipping:
-                        # nudge the pivot earlier so the broad highlight band is
-                        # engaged, floored low enough to keep covering ordinary
-                        # bright pixels rather than just the clipped top end.
-                        pivot = max(0.28, pivot - 0.12 * near_white_pct)
-                    if clipped_pct > 0.02:
-                        # Increase chroma rolloff for flat-clipped JPEGs
-                        chroma_rolloff = max(chroma_rolloff, 0.14)
-
-                arr = _highlight_recover_linear(
-                    arr,
-                    amount,
-                    pivot=pivot,
-                    k=k,
-                    chroma_rolloff=chroma_rolloff,
-                    headroom_ceiling=headroom_ceiling,
-                )
-            else:
-                # Positive: boost highlights (hue-preserving)
-                amount = highlights  # 0 to 1
-                arr = _highlight_boost_linear(arr, amount, pivot=0.5)
-
+            p, base, headroom = compute_highlight_base(arr)
+            arr = apply_highlight_tone(arr, highlights, base, headroom, p=p)
         return arr
 
     def set_crop_box(self, crop_box: Tuple[int, int, int, int]):
@@ -4542,33 +4507,19 @@ class ImageEditor:
             # --- Edits (shallow dict copy) ---
             edits_snapshot = self.current_edits.copy()
 
-            # --- Deep-snapshot mutable darken state ---
-            # Always deepcopy DarkenSettings when present so the background
-            # thread never reads the live object (which the main thread can
-            # mutate, e.g. enabling/disabling or changing params).
-            ds = edits_snapshot.get("darken_settings")
-            if ds is not None:
-                edits_snapshot["darken_settings"] = copy.deepcopy(ds)
-                if getattr(ds, "enabled", False):
-                    live_mask = self._mask_assets.get(ds.mask_id)
-                    mask_snapshot = (
-                        copy.deepcopy(live_mask) if live_mask is not None else None
-                    )
-                    export_cache = MaskRasterCache()
-                else:
-                    # Darken disabled — record the absence explicitly so
-                    # save_from_snapshot does not fall back to live assets.
-                    mask_snapshot = None
-                    export_cache = None
-            else:
-                mask_snapshot = None
-                export_cache = None
+            # --- Dodge & burn stroke masks ---
+            # Deep copies, minus any half-painted stroke, so the save worker
+            # never reads MaskData the GUI thread is still painting into.
+            mask_assets_snapshot = {}
+            for key, mask in self._mask_assets.items():
+                if mask is None:
+                    continue
+                mask_copy = copy.deepcopy(mask)
+                mask_copy.live_stroke = None
+                mask_assets_snapshot[key] = mask_copy
 
-            mask_assets_snapshot = {
-                key: copy.deepcopy(mask)
-                for key, mask in self._mask_assets.items()
-                if mask is not None
-            }
+            # --- Stack paint inputs (immutable objects; copy the dict) ---
+            stack_sources_snapshot = dict(self._stack_sources)
 
             # --- Paths ---
             filepath_snapshot = self.current_filepath
@@ -4581,16 +4532,10 @@ class ImageEditor:
             levels_soft_knee = bool(self.levels_soft_knee)
             export_dither = bool(self.export_dither)
 
-        # Build mask override dict.  When darken is present but disabled (or
-        # has no mask), provide an empty dict so _apply_edits uses it instead
-        # of falling back to the live self._mask_assets.
-        ds_snap = edits_snapshot.get("darken_settings")
-        if ds_snap is not None:
-            mask_override = (
-                {ds_snap.mask_id: mask_snapshot} if mask_snapshot is not None else {}
-            )
-        else:
-            mask_override = None
+        # Always an explicit dict, so the export never falls back to the live
+        # self._mask_assets; a fresh raster cache keeps it off the preview's.
+        mask_override = mask_assets_snapshot
+        export_cache = LayerDensityCache()
 
         original_path = save_target_path if save_target_path else filepath_snapshot
 
@@ -4613,6 +4558,10 @@ class ImageEditor:
             "write_developed_jpg": write_developed_jpg,
             "developed_path": developed_path,
             "mask_assets": mask_assets_snapshot,
+            "stack_sources": stack_sources_snapshot,
+            # Optional callable(name) -> Path the controller may add so the
+            # save worker can load stack inputs that were not loaded yet.
+            "stack_source_resolver": None,
         }
 
     def _dither_for_export(
@@ -4688,6 +4637,16 @@ class ImageEditor:
         if _debug:
             t0 = time.perf_counter()
 
+        # 0. Stack inputs a painted layer needs but the preview never loaded
+        # (e.g. a save right after reopening the photo) load here.
+        stack_sources = self._stack_sources_for_export(
+            edits_snapshot,
+            mask_override,
+            dict(snapshot.get("stack_sources") or {}),
+            snapshot.get("stack_source_resolver"),
+            source_arr,
+        )
+
         # 1. Apply edits to full resolution — uses only snapshot data
         # Use isolated snapshot context so background export doesn't pollute self._cached_*
         export_cache_context = {}
@@ -4698,6 +4657,7 @@ class ImageEditor:
             levels_soft_knee_override=levels_soft_knee,
             mask_assets_override=mask_override,
             cache_override=export_cache,
+            stack_sources_override=stack_sources,
             cache_context=export_cache_context,
             update_highlight_state=False,
             # The snapshot shares the live editor's float_image (see
@@ -4865,6 +4825,35 @@ class ImageEditor:
         finally:
             for tmp_output, _destination in temp_outputs:
                 tmp_output.unlink(missing_ok=True)
+
+    @staticmethod
+    def _stack_sources_for_export(
+        edits: Dict[str, Any],
+        masks: Dict[str, MaskData],
+        sources: Dict[str, StackSource],
+        resolver: Optional[Callable[[str], Optional[Path]]],
+        source_arr: np.ndarray,
+    ) -> Dict[str, StackSource]:
+        """Fill in stack inputs the export needs; runs on the save worker."""
+        for layer in stack_layers(edits):
+            name = layer["source"]
+            mask = masks.get(layer["id"])
+            if (
+                name == STACK_OUTPUT_SOURCE
+                or name in sources
+                or mask is None
+                or not mask.has_strokes()
+            ):
+                continue
+            path = resolver(name) if resolver is not None else None
+            if path is None:
+                log.warning("Stack input %s not found; saving without it", name)
+                continue
+            try:
+                sources[name] = load_stack_source(path, source_arr)
+            except (OSError, StackAlignError) as exc:
+                log.warning("Stack input %s skipped in save: %s", name, exc)
+        return sources
 
     def save_image(
         self,

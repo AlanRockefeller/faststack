@@ -102,37 +102,6 @@ class Sidecar:
 
 
 @dataclasses.dataclass
-class ResolvedDarkenMask:
-    """The background-darkening mask one render actually applied.
-
-    Published by ``ImageEditor._apply_edits`` at pipeline step 19.5 and carried
-    on the ``DecodedImage`` produced by that same pass, so the overlay and the
-    pixels underneath it are one atomic result: a frame can never be shown with
-    a mask resolved by a different render.
-
-    **Ownership.** ``mask`` is the array ``resolve_mask`` allocated (a fresh
-    ``np.clip`` output) and handed to ``MaskRasterCache``. The cache only ever
-    rebinds that slot, never writes through it, and ``apply_masked_darken``
-    reads it without mutating. It is published read-only
-    (``flags.writeable = False``) so the invariant fails loudly instead of
-    silently corrupting a displayed overlay, which lets the worker share it
-    with the GUI thread with no copy.
-
-    ``width``/``height`` are the mask's own dimensions — the render tier that
-    produced it, which is the drag tier during a slider drag and the display
-    tier after refinement. They need not match a ``DecodedImage`` that was
-    later resized for display.
-    """
-
-    mask: Any  # np.ndarray float32 (H, W) in [0, 1]; typed loosely to keep
-    # numpy off models.py's import path.
-    width: int
-    height: int
-    mask_id: str
-    mask_revision: int
-
-
-@dataclasses.dataclass
 class DecodedImage:
     """A decoded image buffer ready for display."""
 
@@ -155,20 +124,12 @@ class DecodedImage:
     decode_trace: Optional[Dict[str, Any]] = None
     is_placeholder: bool = False
     placeholder_reason: Optional[str] = None
-    # The darkening mask resolved by the render that produced `buffer`, when
-    # background darkening was active. Lets the overlay be built without a
-    # second pre-darken render. See ResolvedDarkenMask.
-    darken_mask: Optional[ResolvedDarkenMask] = None
 
     def __sizeof__(self) -> int:
         """Returns the retained size of this frame in bytes.
 
-        Includes the published darkening mask, which is a float32 plane 4/3 the
-        size of the RGB888 buffer. Production cache budgeting goes through
+        Production cache budgeting goes through
         ``faststack.imaging.cache.get_decoded_image_size`` rather than this
         method; the two are kept in agreement so neither can under-report.
         """
-        mask = getattr(self.darken_mask, "mask", None)
-        nbytes = getattr(mask, "nbytes", None)
-        mask_bytes = nbytes if isinstance(nbytes, int) and nbytes > 0 else 0
-        return self.buffer.nbytes + mask_bytes
+        return self.buffer.nbytes

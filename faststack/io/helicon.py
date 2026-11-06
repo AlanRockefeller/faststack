@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple
 
 from faststack.config import config
 from faststack.io.arguments import parse_external_arguments
+from faststack.io.child_process import inherited_output_kwargs
 from faststack.io.executable_validator import validate_executable_path
 
 log = logging.getLogger(__name__)
@@ -159,9 +160,8 @@ def launch_focus_stacker(
                 cwd=str(working_directory),
                 shell=False,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
                 close_fds=True,
+                **inherited_output_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             log.exception("Failed to launch OpenFocus: %s", exc)
@@ -209,9 +209,8 @@ def launch_focus_stacker(
             args,
             shell=False,  # CRITICAL: Never use shell=True with user input
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
             close_fds=True,  # Close unused file descriptors
+            **inherited_output_kwargs(),
         )
         return True, FocusStackerLaunch(process=process, manifest_path=tmp_path)
     except (OSError, subprocess.SubprocessError) as e:

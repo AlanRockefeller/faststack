@@ -58,6 +58,10 @@ Item {
     property int thumbnailSize: 160
     property int textHeight: 24
     property color textColor: tile.isDarkTheme ? "white" : "black"
+
+    // Emitted on right-click of a (non-parent) folder tile; coordinates are
+    // in tile space so the owner can map them for a context menu.
+    signal folderContextMenuRequested(string folderPath, real mouseX, real mouseY)
     property color selectedColor: "#4CAF50"
     property color currentColor: "#FFD700"  // Gold for current image
     property color hoverColor: tile.isDarkTheme ? "#404040" : "#e0e0e0"
@@ -639,6 +643,12 @@ Item {
 
         onClicked: function(mouse) {
             if (tile.tileIsFolder) {
+                if (mouse.button === Qt.RightButton) {
+                    // Right-click: context menu (never on the ".." entry)
+                    if (!tile.tileIsParentFolder)
+                        tile.folderContextMenuRequested(tile.tileFilePath, mouse.x, mouse.y)
+                    return
+                }
                 // Navigate into folder (or parent)
                 if (tile.uiStateRef) tile.uiStateRef.gridNavigateTo(tile.tileFilePath)
             } else {

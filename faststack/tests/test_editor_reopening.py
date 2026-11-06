@@ -116,7 +116,7 @@ class TestEditorReopening(unittest.TestCase):
 
     def test_reuse_returns_REUSED_not_True(self):
         """The reuse path must return _REUSED (truthy, but ``is True`` is False)
-        so _prepare_darken_image_state can distinguish reuse from reload."""
+        so _prepare_local_brush_image_state can distinguish reuse from reload."""
         target = Path("test.jpg")
         self.controller.image_editor.current_filepath = target
         self.controller.image_editor.current_mtime = 123.4
@@ -131,12 +131,12 @@ class TestEditorReopening(unittest.TestCase):
                 # Must be truthy (success)…
                 self.assertTrue(res)
                 # …but not exactly True (so ``is True`` check in
-                # _prepare_darken_image_state correctly skips darken reset)
+                # _prepare_local_brush_image_state correctly skips the reset)
                 self.assertIsNot(res, True)
                 self.assertEqual(res, AppController._REUSED)
 
-    def test_prepare_darken_skips_reset_on_reuse(self):
-        """_prepare_darken_image_state must NOT call _reset_darken_on_navigation
+    def test_prepare_brush_skips_reset_on_reuse(self):
+        """_prepare_local_brush_image_state must NOT call _reset_local_brush_session_state
         when load_image_for_editing returns _REUSED."""
         self.controller.image_editor.current_filepath = None  # Force a load
         self.controller.image_editor.float_image = None  # Force needs_load=True
@@ -148,35 +148,35 @@ class TestEditorReopening(unittest.TestCase):
             return_value=AppController._REUSED,
         ):
             with patch.object(
-                self.controller, "_reset_darken_on_navigation"
+                self.controller, "_reset_local_brush_session_state"
             ) as mock_reset:
-                result = self.controller._prepare_darken_image_state()
+                result = self.controller._prepare_local_brush_image_state()
                 self.assertTrue(result)
                 mock_reset.assert_not_called()
 
-    def test_prepare_darken_resets_on_real_reload(self):
-        """_prepare_darken_image_state MUST call _reset_darken_on_navigation
+    def test_prepare_brush_resets_on_real_reload(self):
+        """_prepare_local_brush_image_state MUST call _reset_local_brush_session_state
         when load_image_for_editing returns True (real reload)."""
         self.controller.image_editor.current_filepath = None
         self.controller.image_editor.float_image = None
 
         with patch.object(self.controller, "load_image_for_editing", return_value=True):
             with patch.object(
-                self.controller, "_reset_darken_on_navigation"
+                self.controller, "_reset_local_brush_session_state"
             ) as mock_reset:
-                result = self.controller._prepare_darken_image_state()
+                result = self.controller._prepare_local_brush_image_state()
                 self.assertTrue(result)
                 mock_reset.assert_called_once()
 
-    def test_prepare_darken_aborts_on_failure(self):
-        """_prepare_darken_image_state must return False when load fails."""
+    def test_prepare_brush_aborts_on_failure(self):
+        """_prepare_local_brush_image_state must return False when load fails."""
         self.controller.image_editor.current_filepath = None
         self.controller.image_editor.float_image = None
 
         with patch.object(
             self.controller, "load_image_for_editing", return_value=False
         ):
-            result = self.controller._prepare_darken_image_state()
+            result = self.controller._prepare_local_brush_image_state()
             self.assertFalse(result)
 
     def test_save_closes_ui_immediately_but_keeps_memory(self):

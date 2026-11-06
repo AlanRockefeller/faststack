@@ -164,9 +164,17 @@ class ImageProvider(QQuickImageProvider):
         request_is_stale = False
         try:
             # Handle mask overlay requests
+            if id.startswith("stack_hover/"):
+                hover = getattr(
+                    self.app_controller.ui_state, "_stack_hover_image", None
+                )
+                if hover is not None and not hover.isNull():
+                    return hover.copy()
+                return self._transparent
+
             if id.startswith("mask_overlay/"):
                 overlay = getattr(
-                    self.app_controller.ui_state, "_darken_overlay_image", None
+                    self.app_controller.ui_state, "_local_overlay_image", None
                 )
                 if overlay is not None and not overlay.isNull():
                     return overlay.copy()
@@ -709,20 +717,23 @@ class UIState(QObject):
     color_sat_purple_changed = Signal(float)
     color_sat_magenta_changed = Signal(float)
 
-    # Background Darkening Signals
-    is_darkening_changed = Signal(bool)
-    darken_overlay_generation_changed = Signal()
-    darken_overlay_visible_changed = Signal(bool)
-    darken_amount_changed = Signal(float)
-    darken_edge_protection_changed = Signal(float)
-    darken_subject_protection_changed = Signal(float)
-    darken_feather_changed = Signal(float)
-    darken_dark_range_changed = Signal(float)
-    darken_neutrality_changed = Signal(float)
-    darken_expand_contract_changed = Signal(float)
-    darken_auto_edges_changed = Signal(float)
-    darken_mode_changed = Signal(str)
-    darken_brush_radius_changed = Signal(float)
+    # Dodge & Burn Brush Signals
+    is_brush_mode_changed = Signal(bool)
+    brush_radius_changed = Signal(float)
+    brush_hardness_changed = Signal(float)
+    brush_crop_scale_changed = Signal()
+    brush_pan_held_changed = Signal(bool)
+    local_overlay_visible_changed = Signal(bool)
+    local_overlay_held_changed = Signal(bool)
+    local_overlay_generation_changed = Signal()
+    local_layers_changed = Signal()
+    local_editing_layer_id_changed = Signal(str)
+    local_recipe_changed = Signal()
+    local_brush_summary_changed = Signal(str)
+    brush_tool_changed = Signal(str)
+    stack_inputs_changed = Signal()
+    stack_input_name_changed = Signal(str)
+    stack_hover_generation_changed = Signal()
 
     # Debug Cache Signals
     debugCacheChanged = Signal(bool)
@@ -805,21 +816,29 @@ class UIState(QObject):
         self._color_sat_purple = 0.0
         self._color_sat_magenta = 0.0
 
-        # Background Darkening State
-        self._is_darkening = False
-        self._darken_overlay_visible = True
-        self._darken_overlay_generation = 0
-        self._darken_overlay_image = None  # QImage for mask overlay
-        self._darken_amount = 0.5
-        self._darken_edge_protection = 0.5
-        self._darken_subject_protection = 0.5
-        self._darken_feather = 0.5
-        self._darken_dark_range = 0.5
-        self._darken_neutrality = 0.5
-        self._darken_expand_contract = 0.0
-        self._darken_auto_edges = 0.0
-        self._darken_mode = "assisted"
-        self._darken_brush_radius = 0.03
+        # Dodge & Burn Brush State
+        self._is_brush_mode = False
+        self._brush_radius = 0.03
+        self._brush_hardness = 0.5
+        self._brush_crop_scale = [1.0, 1.0]
+        self._brush_pan_held = False
+        self._local_overlay_visible = False
+        self._local_overlay_held = False
+        self._local_overlay_generation = 0
+        self._local_overlay_image = None  # QImage for the mask overlay
+        self._local_layers: list = []
+        self._local_editing_layer_id = ""
+        self._local_recipe: dict = {}
+        self._local_brush_summary = ""
+        # Which brush is active in brush mode: "local" (dodge & burn) or
+        # "stack" (paint a focus-stack input over the stacked photo).
+        self._brush_tool = "local"
+        self._stack_inputs: list = []  # [{"name", "label"}], near to far
+        self._stack_input_name = ""
+        # Stack paint hover preview (QImage); generation 0 = none available.
+        self._stack_hover_image = None
+        self._stack_hover_generation = 0
+        self._stack_hover_serial = 0
 
         # Debug Cache State
         self._debug_cache = False
@@ -1933,19 +1952,6 @@ class UIState(QObject):
         self.cropRotation = 0.0
         self.currentCropBox = (0, 0, 1000, 1000)
         self.currentAspectRatioIndex = 0
-        # Darken tool — use property setters so QML bindings update
-        self.isDarkening = False
-        self.darkenOverlayVisible = True
-        self.darkenAmount = 0.5
-        self.darkenEdgeProtection = 0.5
-        self.darkenSubjectProtection = 0.5
-        self.darkenFeather = 0.5
-        self.darkenDarkRange = 0.5
-        self.darkenNeutrality = 0.5
-        self.darkenExpandContract = 0.0
-        self.darkenAutoEdges = 0.0
-        self.darkenMode = "assisted"
-        self.darkenBrushRadius = 0.03
 
     @Property("QVariantMap", notify=histogram_data_changed)
     def histogramData(self) -> dict:
@@ -2391,131 +2397,173 @@ class UIState(QObject):
             self._texture = new_value
             self.texture_changed.emit(new_value)
 
-    # --- Background Darkening Properties ---
+    # --- Dodge & Burn Brush Properties ---
 
-    @Property(bool, notify=is_darkening_changed)
-    def isDarkening(self) -> bool:
-        return self._is_darkening
+    @Property(bool, notify=is_brush_mode_changed)
+    def isBrushMode(self) -> bool:
+        return self._is_brush_mode
 
-    @isDarkening.setter
-    def isDarkening(self, new_value: bool):
-        if self._is_darkening != new_value:
-            self._is_darkening = new_value
-            self.is_darkening_changed.emit(new_value)
+    @isBrushMode.setter
+    def isBrushMode(self, new_value: bool):
+        if self._is_brush_mode != new_value:
+            self._is_brush_mode = new_value
+            self.is_brush_mode_changed.emit(new_value)
 
-    @Property(bool, notify=darken_overlay_visible_changed)
-    def darkenOverlayVisible(self) -> bool:
-        return self._darken_overlay_visible
+    @Property(float, notify=brush_radius_changed)
+    def brushRadius(self) -> float:
+        """Brush radius as a fraction of the uncropped image diagonal."""
+        return self._brush_radius
 
-    @darkenOverlayVisible.setter
-    def darkenOverlayVisible(self, new_value: bool):
-        if self._darken_overlay_visible != new_value:
-            self._darken_overlay_visible = new_value
-            self.darken_overlay_visible_changed.emit(new_value)
+    @brushRadius.setter
+    def brushRadius(self, new_value: float):
+        if self._brush_radius != new_value:
+            self._brush_radius = new_value
+            self.brush_radius_changed.emit(new_value)
 
-    @Property(int, notify=darken_overlay_generation_changed)
-    def darkenOverlayGeneration(self) -> int:
-        return self._darken_overlay_generation
+    @Property(float, notify=brush_hardness_changed)
+    def brushHardness(self) -> float:
+        return self._brush_hardness
 
-    @Property(float, notify=darken_amount_changed)
-    def darkenAmount(self) -> float:
-        return self._darken_amount
+    @brushHardness.setter
+    def brushHardness(self, new_value: float):
+        if self._brush_hardness != new_value:
+            self._brush_hardness = new_value
+            self.brush_hardness_changed.emit(new_value)
 
-    @darkenAmount.setter
-    def darkenAmount(self, new_value: float):
-        if self._darken_amount != new_value:
-            self._darken_amount = new_value
-            self.darken_amount_changed.emit(new_value)
+    @Property("QVariantList", notify=brush_crop_scale_changed)
+    def brushCropScale(self) -> list:
+        """[width, height] of the crop as fractions of the uncropped image."""
+        return self._brush_crop_scale
 
-    @Property(float, notify=darken_edge_protection_changed)
-    def darkenEdgeProtection(self) -> float:
-        return self._darken_edge_protection
+    @brushCropScale.setter
+    def brushCropScale(self, new_value: list):
+        if self._brush_crop_scale != new_value:
+            self._brush_crop_scale = new_value
+            self.brush_crop_scale_changed.emit()
 
-    @darkenEdgeProtection.setter
-    def darkenEdgeProtection(self, new_value: float):
-        if self._darken_edge_protection != new_value:
-            self._darken_edge_protection = new_value
-            self.darken_edge_protection_changed.emit(new_value)
+    @Property(bool, notify=brush_pan_held_changed)
+    def brushPanHeld(self) -> bool:
+        return self._brush_pan_held
 
-    @Property(float, notify=darken_subject_protection_changed)
-    def darkenSubjectProtection(self) -> float:
-        return self._darken_subject_protection
+    @brushPanHeld.setter
+    def brushPanHeld(self, new_value: bool):
+        if self._brush_pan_held != new_value:
+            self._brush_pan_held = new_value
+            self.brush_pan_held_changed.emit(new_value)
 
-    @darkenSubjectProtection.setter
-    def darkenSubjectProtection(self, new_value: float):
-        if self._darken_subject_protection != new_value:
-            self._darken_subject_protection = new_value
-            self.darken_subject_protection_changed.emit(new_value)
+    @Property(bool, notify=local_overlay_visible_changed)
+    def localOverlayVisible(self) -> bool:
+        return self._local_overlay_visible
 
-    @Property(float, notify=darken_feather_changed)
-    def darkenFeather(self) -> float:
-        return self._darken_feather
+    @localOverlayVisible.setter
+    def localOverlayVisible(self, new_value: bool):
+        if self._local_overlay_visible != new_value:
+            self._local_overlay_visible = new_value
+            self.local_overlay_visible_changed.emit(new_value)
 
-    @darkenFeather.setter
-    def darkenFeather(self, new_value: float):
-        if self._darken_feather != new_value:
-            self._darken_feather = new_value
-            self.darken_feather_changed.emit(new_value)
+    @Property(bool, notify=local_overlay_held_changed)
+    def localOverlayHeld(self) -> bool:
+        return self._local_overlay_held
 
-    @Property(float, notify=darken_dark_range_changed)
-    def darkenDarkRange(self) -> float:
-        return self._darken_dark_range
+    @localOverlayHeld.setter
+    def localOverlayHeld(self, new_value: bool):
+        if self._local_overlay_held != new_value:
+            self._local_overlay_held = new_value
+            self.local_overlay_held_changed.emit(new_value)
 
-    @darkenDarkRange.setter
-    def darkenDarkRange(self, new_value: float):
-        if self._darken_dark_range != new_value:
-            self._darken_dark_range = new_value
-            self.darken_dark_range_changed.emit(new_value)
+    @Property(int, notify=local_overlay_generation_changed)
+    def localOverlayGeneration(self) -> int:
+        return self._local_overlay_generation
 
-    @Property(float, notify=darken_neutrality_changed)
-    def darkenNeutrality(self) -> float:
-        return self._darken_neutrality
+    def bump_local_overlay_generation(self) -> None:
+        self._local_overlay_generation += 1
+        self.local_overlay_generation_changed.emit()
 
-    @darkenNeutrality.setter
-    def darkenNeutrality(self, new_value: float):
-        if self._darken_neutrality != new_value:
-            self._darken_neutrality = new_value
-            self.darken_neutrality_changed.emit(new_value)
+    @Property("QVariantList", notify=local_layers_changed)
+    def localLayers(self) -> list:
+        return self._local_layers
 
-    @Property(float, notify=darken_expand_contract_changed)
-    def darkenExpandContract(self) -> float:
-        return self._darken_expand_contract
+    @localLayers.setter
+    def localLayers(self, new_value: list):
+        if self._local_layers != new_value:
+            self._local_layers = new_value
+            self.local_layers_changed.emit()
 
-    @darkenExpandContract.setter
-    def darkenExpandContract(self, new_value: float):
-        if self._darken_expand_contract != new_value:
-            self._darken_expand_contract = new_value
-            self.darken_expand_contract_changed.emit(new_value)
+    @Property(str, notify=local_editing_layer_id_changed)
+    def localEditingLayerId(self) -> str:
+        return self._local_editing_layer_id
 
-    @Property(float, notify=darken_auto_edges_changed)
-    def darkenAutoEdges(self) -> float:
-        return self._darken_auto_edges
+    @localEditingLayerId.setter
+    def localEditingLayerId(self, new_value: str):
+        if self._local_editing_layer_id != new_value:
+            self._local_editing_layer_id = new_value
+            self.local_editing_layer_id_changed.emit(new_value)
 
-    @darkenAutoEdges.setter
-    def darkenAutoEdges(self, new_value: float):
-        if self._darken_auto_edges != new_value:
-            self._darken_auto_edges = new_value
-            self.darken_auto_edges_changed.emit(new_value)
+    @Property("QVariantMap", notify=local_recipe_changed)
+    def localRecipe(self) -> dict:
+        """Recipe the compact sliders show in brush mode (edit units)."""
+        return self._local_recipe
 
-    @Property(str, notify=darken_mode_changed)
-    def darkenMode(self) -> str:
-        return self._darken_mode
+    @localRecipe.setter
+    def localRecipe(self, new_value: dict):
+        if self._local_recipe != new_value:
+            self._local_recipe = new_value
+            self.local_recipe_changed.emit()
 
-    @darkenMode.setter
-    def darkenMode(self, new_value: str):
-        if self._darken_mode != new_value:
-            self._darken_mode = new_value
-            self.darken_mode_changed.emit(new_value)
+    @Property(str, notify=local_brush_summary_changed)
+    def localBrushSummary(self) -> str:
+        return self._local_brush_summary
 
-    @Property(float, notify=darken_brush_radius_changed)
-    def darkenBrushRadius(self) -> float:
-        return self._darken_brush_radius
+    @localBrushSummary.setter
+    def localBrushSummary(self, new_value: str):
+        if self._local_brush_summary != new_value:
+            self._local_brush_summary = new_value
+            self.local_brush_summary_changed.emit(new_value)
 
-    @darkenBrushRadius.setter
-    def darkenBrushRadius(self, new_value: float):
-        if self._darken_brush_radius != new_value:
-            self._darken_brush_radius = new_value
-            self.darken_brush_radius_changed.emit(new_value)
+    @Property(str, notify=brush_tool_changed)
+    def brushTool(self) -> str:
+        return self._brush_tool
+
+    @brushTool.setter
+    def brushTool(self, new_value: str):
+        if self._brush_tool != new_value:
+            self._brush_tool = new_value
+            self.brush_tool_changed.emit(new_value)
+
+    @Property("QVariantList", notify=stack_inputs_changed)
+    def stackInputs(self) -> list:
+        """Input JPGs of the current in-camera stack, near to far focus."""
+        return self._stack_inputs
+
+    @stackInputs.setter
+    def stackInputs(self, new_value: list):
+        if self._stack_inputs != new_value:
+            self._stack_inputs = new_value
+            self.stack_inputs_changed.emit()
+
+    @Property(str, notify=stack_input_name_changed)
+    def stackInputName(self) -> str:
+        """File name of the stack input that stack paint strokes reveal."""
+        return self._stack_input_name
+
+    @stackInputName.setter
+    def stackInputName(self, new_value: str):
+        if self._stack_input_name != new_value:
+            self._stack_input_name = new_value
+            self.stack_input_name_changed.emit(new_value)
+
+    @Property(int, notify=stack_hover_generation_changed)
+    def stackHoverGeneration(self) -> int:
+        """Bumped per new stack paint hover preview; 0 when there is none."""
+        return self._stack_hover_generation
+
+    def bump_stack_hover_generation(self, value: "int | None" = None) -> None:
+        if value is None:
+            self._stack_hover_serial += 1
+            value = self._stack_hover_serial
+        if self._stack_hover_generation != value:
+            self._stack_hover_generation = value
+            self.stack_hover_generation_changed.emit()
 
     # --- Debug Cache Properties ---
 
@@ -2671,6 +2719,19 @@ class UIState(QObject):
         """Navigate to a folder in grid view."""
         if hasattr(self.app_controller, "grid_navigate_to"):
             self.app_controller.grid_navigate_to(path)
+
+    @Slot(str, result="QVariantMap")
+    def gridInspectFolderForDelete(self, path: str) -> dict:
+        """Check whether a grid folder is empty enough to offer deletion."""
+        if hasattr(self.app_controller, "grid_inspect_folder_for_delete"):
+            return self.app_controller.grid_inspect_folder_for_delete(path)
+        return {"deletable": False}
+
+    @Slot(str, "QVariantList")
+    def gridDeleteFolder(self, path: str, expectedItems: list):
+        """Delete an empty / almost-empty folder shown in the grid."""
+        if hasattr(self.app_controller, "grid_delete_folder"):
+            self.app_controller.grid_delete_folder(path, list(expectedItems or []))
 
     @Slot()
     def gridClearSelection(self):

@@ -1534,21 +1534,6 @@ ApplicationWindow {
         }
     }
 
-    // Background Darkening Tool (K) — independent of the editor sidebar
-    Shortcut {
-        sequence: "K"
-        context: Qt.ApplicationShortcut
-        enabled: root.uiStateRef ? !root.uiStateRef.isDialogOpen && !root.uiStateRef.isCropping : false
-        onActivated: {
-            if (!root.uiStateRef || !root.controllerRef) return
-            if (root.uiStateRef.isDarkening) {
-                root.controllerRef.toggle_darken_mode()
-            } else {
-                root.controllerRef.open_darken_tool()
-            }
-        }
-    }
-
     // Grid View Toggle (T for Thumbnails)
     Shortcut {
         sequence: "T"
@@ -2230,6 +2215,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;Space: Toggle selection on current image<br>" +
                           "&nbsp;&nbsp;Click: Open image in single view<br>" +
                           "&nbsp;&nbsp;Right-click / Ctrl+Click: Toggle selection<br>" +
+                          "&nbsp;&nbsp;Right-click empty folder: Delete empty folder<br>" +
                           "&nbsp;&nbsp;Shift+Click: Select range<br>" +
                           "&nbsp;&nbsp;B: Add selected images to batch<br>" +
                           "&nbsp;&nbsp;Delete/Backspace: Delete selected or cursor image<br>" +
@@ -2285,7 +2271,11 @@ ApplicationWindow {
                           "&nbsp;&nbsp;_: Raise current auto-adjust whites (live)<br>" +
                           "&nbsp;&nbsp;+: Raise current auto-adjust shadows/blacks (live)<br>" +
                           "&nbsp;&nbsp;=: Deepen current auto-adjust shadows/background (live)<br>" +
-                          "&nbsp;&nbsp;K: Background Darkening Tool<br>" +
+                          "&nbsp;&nbsp;Shift+D: Dodge &amp; burn brush (in the compact editor)<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Sliders set the brush recipe; left-drag paints, right/Alt-drag erases<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Each stroke adds one coat; overlapping strokes build up<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;[ / ]: Brush size&nbsp;&nbsp;Space+drag: Pan&nbsp;&nbsp;Ctrl+Z: Undo stroke<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;M: Toggle mask overlay&nbsp;&nbsp;Hold Ctrl: Show overlay&nbsp;&nbsp;Esc: Leave brush<br>" +
                           "&nbsp;&nbsp;O (or right-click): Toggle crop mode<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;1/2/3/4: Set aspect ratio (1:1, 4:3, 3:2, 16:9)<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;Enter: Apply crop to live session<br>" +
@@ -2461,14 +2451,6 @@ ApplicationWindow {
                 mainViewLoader.forceActiveFocus()
             }
         }
-    }
-
-    Loader {
-        id: darkenToolLoader
-        property bool loadedOnce: false
-        active: loadedOnce || (root.uiStateRef && root.uiStateRef.isDarkening)
-        source: "DarkenToolPanel.qml"
-        onLoaded: Qt.callLater(function() { darkenToolLoader.loadedOnce = true })
     }
 
     function show_jump_to_image_dialog() {

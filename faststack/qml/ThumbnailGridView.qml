@@ -24,6 +24,168 @@ Item {
     property string trackedDirectory: gridViewRoot.uiStateRef ? gridViewRoot.uiStateRef.gridDirectory : ""
     property bool pendingDirectoryRestore: false
 
+    property var controllerRef: typeof controller !== "undefined" ? controller : null
+    property color popupBackgroundColor: gridViewRoot.isDarkTheme ? "#2b2b2b" : "#f5f5f5"
+    property color popupBorderColor: gridViewRoot.isDarkTheme ? "#666666" : "#cccccc"
+    property color popupTextColor: gridViewRoot.isDarkTheme ? "white" : "black"
+    property color popupHoverColor: gridViewRoot.isDarkTheme ? "#444444" : "#dddddd"
+    // Inspection result for the folder the context menu was opened on.
+    property var folderMenuInfo: null
+
+    function openFolderContextMenu(folderPath, x, y) {
+        if (!gridViewRoot.uiStateRef) return
+        var info = gridViewRoot.uiStateRef.gridInspectFolderForDelete(folderPath)
+        // The menu only has "delete", so show nothing for non-empty folders.
+        if (!info || !info.deletable) return
+        gridViewRoot.folderMenuInfo = info
+        folderContextMenu.popup(gridViewRoot, x, y)
+    }
+
+    function folderNameFromPath(path) {
+        var parts = String(path).split(/[\\/]/)
+        while (parts.length > 1 && parts[parts.length - 1] === "") parts.pop()
+        return parts[parts.length - 1]
+    }
+
+    function requestFolderDelete() {
+        var info = gridViewRoot.folderMenuInfo
+        if (!info || !gridViewRoot.uiStateRef) return
+        if (info.empty) {
+            gridViewRoot.uiStateRef.gridDeleteFolder(info.path, [])
+        } else {
+            folderDeleteConfirmDialog.open()
+        }
+    }
+
+    Menu {
+        id: folderContextMenu
+        implicitWidth: 240
+
+        onOpened: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_opened("qml-folder-context-menu")
+        onClosed: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_closed("qml-folder-context-menu")
+        Component.onDestruction: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_closed("qml-folder-context-menu")
+
+        background: Rectangle {
+            implicitWidth: 240
+            implicitHeight: folderMenuColumn.implicitHeight
+            color: gridViewRoot.popupBackgroundColor
+            border.color: gridViewRoot.popupBorderColor
+            radius: 4
+        }
+
+        contentItem: Column {
+            id: folderMenuColumn
+
+            MenuActionItem {
+                width: 240
+                text: gridViewRoot.folderMenuInfo && !gridViewRoot.folderMenuInfo.empty
+                    ? "Delete almost-empty folder..."
+                    : "Delete empty folder"
+                hoverFillColor: gridViewRoot.popupHoverColor
+                defaultTextColor: gridViewRoot.popupTextColor
+                onClicked: {
+                    folderContextMenu.close()
+                    gridViewRoot.requestFolderDelete()
+                }
+            }
+
+            // Preview of what is inside an almost-empty folder.
+            Text {
+                visible: gridViewRoot.folderMenuInfo !== null && !gridViewRoot.folderMenuInfo.empty
+                width: 240
+                leftPadding: 10
+                rightPadding: 10
+                bottomPadding: 8
+                color: gridViewRoot.popupTextColor
+                opacity: 0.75
+                font.pixelSize: 11
+                elide: Text.ElideMiddle
+                maximumLineCount: 12
+                text: {
+                    var info = gridViewRoot.folderMenuInfo
+                    if (!info || info.empty || !info.items) return ""
+                    var maxShown = 10
+                    var shown = info.items.slice(0, maxShown)
+                    var lines = ["Contains (" + info.sizeText + "):"]
+                    for (var i = 0; i < shown.length; i++) lines.push("  " + shown[i])
+                    if (info.items.length > maxShown)
+                        lines.push("  ...and " + (info.items.length - maxShown) + " more")
+                    return lines.join("\n")
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: folderDeleteConfirmDialog
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        focus: true
+        closePolicy: Popup.CloseOnEscape
+        width: Math.min(520, gridViewRoot.width - 40)
+        title: "Delete almost-empty folder?"
+        standardButtons: Dialog.Yes | Dialog.Cancel
+
+        onOpened: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_opened("qml-folder-delete-confirm")
+        onClosed: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_closed("qml-folder-delete-confirm")
+        Component.onDestruction: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_closed("qml-folder-delete-confirm")
+
+        onAccepted: {
+            var info = gridViewRoot.folderMenuInfo
+            if (info && gridViewRoot.uiStateRef)
+                gridViewRoot.uiStateRef.gridDeleteFolder(info.path, info.items)
+        }
+
+        background: Rectangle {
+            color: gridViewRoot.popupBackgroundColor
+            border.color: gridViewRoot.popupBorderColor
+            radius: 4
+        }
+
+        contentItem: Column {
+            spacing: 8
+
+            Text {
+                width: folderDeleteConfirmDialog.availableWidth
+                wrapMode: Text.WordWrap
+                color: gridViewRoot.popupTextColor
+                text: {
+                    var info = gridViewRoot.folderMenuInfo
+                    if (!info) return ""
+                    var n = info.items ? info.items.length : 0
+                    return "\"" + gridViewRoot.folderNameFromPath(info.path) + "\" has no images, but it is not "
+                        + "completely empty. It contains " + n + " item" + (n === 1 ? "" : "s")
+                        + " (" + info.sizeText + "):"
+                }
+            }
+
+            ScrollView {
+                width: folderDeleteConfirmDialog.availableWidth
+                height: Math.min(200, folderItemsText.implicitHeight + 8)
+                clip: true
+
+                Text {
+                    id: folderItemsText
+                    width: folderDeleteConfirmDialog.availableWidth - 16
+                    leftPadding: 12
+                    color: gridViewRoot.popupTextColor
+                    font.family: "monospace"
+                    wrapMode: Text.WrapAnywhere
+                    text: gridViewRoot.folderMenuInfo && gridViewRoot.folderMenuInfo.items
+                        ? gridViewRoot.folderMenuInfo.items.join("\n") : ""
+                }
+            }
+
+            Text {
+                width: folderDeleteConfirmDialog.availableWidth
+                wrapMode: Text.WordWrap
+                color: gridViewRoot.popupTextColor
+                text: "Delete the folder and everything in it?"
+            }
+        }
+    }
+
     function clampIndex(index) {
         // For an empty model, keep 0 as a safe default index instead of using -1.
         if (thumbnailGrid.count <= 0) return 0
@@ -130,6 +292,11 @@ Item {
             isDarkTheme: gridViewRoot.isDarkTheme
 
             tileHasCursor: index === thumbnailGrid.currentIndex
+
+            onFolderContextMenuRequested: function(folderPath, mouseX, mouseY) {
+                var pos = mapToItem(gridViewRoot, mouseX, mouseY)
+                gridViewRoot.openFolderContextMenu(folderPath, pos.x, pos.y)
+            }
         }
 
         // Scroll bar

@@ -136,8 +136,30 @@ Window {
     // --- Color Palette (matches full editor) ---
     readonly property color backgroundColor: "#1e1e1e"
     readonly property color textColor: "white"
-    readonly property color accentColor: "#6366f1"
-    readonly property color accentColorHover: "#818cf8"
+    // Brush mode has two tools. Dodge & burn (recipeMode) tints the sliders
+    // orange: they edit a local recipe instead of the global edit. Stack
+    // paint (stackMode) paints a stack input frame; the sliders stay global.
+    readonly property bool brushMode: compactEditor.uiStateRef ? compactEditor.uiStateRef.isBrushMode : false
+    readonly property bool stackMode: compactEditor.brushMode && !!compactEditor.uiStateRef && compactEditor.uiStateRef.brushTool === "stack"
+    readonly property bool recipeMode: compactEditor.brushMode && !compactEditor.stackMode
+    // Stack paint needs an in-camera stacked JPG whose input JPGs were found.
+    readonly property bool stackPaintAvailable: !!compactEditor.uiStateRef && compactEditor.uiStateRef.stackInputs.length > 0
+    readonly property int stackInputIndex: {
+        var inputs = compactEditor.uiStateRef ? compactEditor.uiStateRef.stackInputs : []
+        var name = compactEditor.uiStateRef ? compactEditor.uiStateRef.stackInputName : ""
+        for (var i = 0; i < inputs.length; ++i) {
+            if (inputs[i].name === name) return i
+        }
+        return -1
+    }
+    readonly property string stackInputLabel: compactEditor.stackInputIndex >= 0 ? compactEditor.uiStateRef.stackInputs[compactEditor.stackInputIndex].label : ""
+    readonly property color stackAccent: "#2dd4bf"
+    readonly property color stackAccentHover: "#5eead4"
+    readonly property color accentColor: compactEditor.recipeMode ? "#f59e0b" : "#6366f1"
+    readonly property color accentColorHover: compactEditor.recipeMode ? "#fbbf24" : "#818cf8"
+    // Accent of the brush panel (brush size, mask toggle, layer rows).
+    readonly property color panelAccent: compactEditor.stackMode ? compactEditor.stackAccent : compactEditor.accentColor
+    readonly property color panelAccentHover: compactEditor.stackMode ? compactEditor.stackAccentHover : compactEditor.accentColorHover
     readonly property color controlBg: "#10ffffff"
     readonly property color controlBorder: "#30ffffff"
     readonly property color separatorColor: "#20ffffff"
@@ -151,10 +173,17 @@ Window {
     // Whether the per-hue COLOR MIX section is expanded (collapsed by default).
     property bool colorMixExpanded: false
     readonly property bool cropActive: compactEditor.uiStateRef ? compactEditor.uiStateRef.isCropping : false
-    // Plain Left/Right belong to this window (they move the slider
-    // highlight), so the controller's arrow-navigation event filter lets them
-    // through to QML instead of turning them into image navigation.
-    readonly property bool handlesPlainArrowKeys: true
+    // Let the controller own plain Left/Right so presses and holds navigate
+    // images with the same cadence as they do in the loupe window.
+    readonly property bool plainArrowNavigationEnabled: visible
+                                                        && controllerRef
+                                                        && uiStateRef
+                                                        && !cropActive
+                                                        && !discardDialog.opened
+    onPlainArrowNavigationEnabledChanged: {
+        if (!plainArrowNavigationEnabled && compactEditor.controllerRef)
+            compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
+    }
     property int lastLoadedIndex: -1
     property bool lastLoadWasFull: false
     property bool forceNextPreviewLoad: false
@@ -162,9 +191,8 @@ Window {
 
     // Key of the slider that the Up/Down arrow keys will adjust. The matching
     // row is highlighted so the user can see which control is targeted.
-    // Left/Right move the highlight; clicking a slider's label (or value) also
-    // retargets. Defaults to the first slider so the arrow keys work
-    // immediately when the editor opens.
+    // Clicking a slider's label (or value) retargets it. Defaults to the first
+    // slider so Up/Down work immediately when the editor opens.
     property string highlightedSliderKey: "exposure"
     property bool keyboardHandlerReady: false
 
@@ -184,31 +212,8 @@ Window {
         // then convert back to edit space the way the sliders do.
         var sliderVal = compactEditor.getBackendValue(key) / scale * 100
         sliderVal = Math.max(-100, Math.min(100, sliderVal + delta))
-        compactEditor.controllerRef.set_edit_parameter(key, sliderVal / 100 * scale)
+        compactEditor.setEditValue(key, sliderVal / 100 * scale)
         compactEditor.updatePulse++  // refreshes sliders + histogram
-    }
-
-    // Slider keys in on-screen order (collapsed COLOR MIX rows excluded), so
-    // Left/Right walk the highlight through exactly what the user can see.
-    function visibleSliderKeys() {
-        var models = [lightModel, colorModel]
-        if (compactEditor.colorMixExpanded) models.push(colorMixModel)
-        var keys = []
-        for (var m = 0; m < models.length; ++m) {
-            for (var i = 0; i < models[m].count; ++i) keys.push(models[m].get(i).key)
-        }
-        return keys
-    }
-
-    // Move the highlight `step` rows (wrapping at either end).
-    function moveSliderHighlight(step) {
-        if (compactEditor.cropActive) return
-        var keys = compactEditor.visibleSliderKeys()
-        if (keys.length === 0) return
-        var idx = keys.indexOf(compactEditor.highlightedSliderKey)
-        if (idx < 0) idx = step > 0 ? -1 : 0
-        idx = (idx + step + keys.length) % keys.length
-        compactEditor.highlightedSliderKey = keys[idx]
     }
 
     // Scroll the editor so `item` (a slider row) is fully visible.
@@ -249,8 +254,12 @@ Window {
         if (key === Qt.Key_Left || key === Qt.Key_Right) {
             var step = key === Qt.Key_Right ? 1 : -1
             if (modifiers === Qt.NoModifier) {
-                // Plain Left/Right: move the slider highlight.
-                compactEditor.moveSliderHighlight(step)
+                // Normally the controller's event filter handles physical
+                // plain arrows. Keep this fallback for synthetic QML events.
+                if (compactEditor.uiStateRef) {
+                    if (step > 0) compactEditor.uiStateRef.nextImage()
+                    else compactEditor.uiStateRef.prevImage()
+                }
                 return true
             }
             if (modifiers === Qt.ControlModifier) {
@@ -364,6 +373,7 @@ Window {
             if (compactEditor.controllerRef) {
                 compactEditor.controllerRef.release_auxiliary_navigation_hold(compactEditor)
                 compactEditor.controllerRef.set_editor_slider_drag_active(false)
+                compactEditor.controllerRef.exit_local_brush_mode()
             }
             compactEditor.saveWindowPlacement(true)
             deferredLoadTimer.stop()
@@ -378,8 +388,19 @@ Window {
 
     function getBackendValue(key) {
         var _dependency = updatePulse;
+        if (compactEditor.recipeMode) {
+            var recipe = compactEditor.uiStateRef.localRecipe
+            return (recipe && recipe[key] !== undefined) ? recipe[key] : 0.0
+        }
         if (compactEditor.uiStateRef && key in compactEditor.uiStateRef) return compactEditor.uiStateRef[key];
         return 0.0;
+    }
+
+    // Slider writes go to the global edit, or in dodge & burn to the local recipe.
+    function setEditValue(key, value) {
+        if (!compactEditor.controllerRef) return
+        if (compactEditor.recipeMode) compactEditor.controllerRef.set_local_recipe_param(key, value)
+        else compactEditor.controllerRef.set_edit_parameter(key, value)
     }
 
     function sliderEditScale(key) {
@@ -410,8 +431,9 @@ Window {
 
     // Keyboard handling for the compact editor window.
     //
-    // Arrow keys (see handleArrowKey): Left / Right move the slider highlight,
-    // Up / Down adjust the highlighted slider, Ctrl+Left / Right switch images,
+    // Arrow keys (see handleArrowKey): Left / Right switch images using the
+    // controller's loupe-navigation hold behavior, Up / Down adjust the
+    // highlighted slider, Ctrl+Left / Right also switch images, and
     // Shift+Left / Right keep the main window's jump-by-10 binding.
     //
     // This focus scope handles the remaining compact-editor keys:
@@ -451,7 +473,11 @@ Window {
             if (compactEditor.handleArrowKey(event.key, event.modifiers)) {
                 event.accepted = true
             } else if (event.key === Qt.Key_Escape) {
-                compactEditor.requestClose()
+                if (compactEditor.brushMode) {
+                    if (compactEditor.controllerRef) compactEditor.controllerRef.exit_local_brush_mode()
+                } else {
+                    compactEditor.requestClose()
+                }
                 event.accepted = true
             } else if (event.key === Qt.Key_E && !(event.modifiers & Qt.ControlModifier)) {
                 compactEditor.requestClose()
@@ -468,6 +494,93 @@ Window {
                 if (compactEditor.controllerRef)
                     compactEditor.controllerRef.handle_key_from_compact_editor(event.key, event.modifiers, event.text)
                 event.accepted = true
+            }
+        }
+    }
+
+    readonly property string stackHelpText:
+        "<b>Stack Paint</b><br>" +
+        "Paint one of the stack's input frames over the stacked photo, e.g. to bring back a clean background or remove stacking halos.<br><br>" +
+        "<b>Choosing the frame</b><br>" +
+        "• The dropdown next to <i>Stack</i> lists the input frames, near focus (1) to far focus. It starts on the frame focused furthest back.<br>" +
+        "• <i>S: Stack output</i> paints the stacked photo itself back over frames painted earlier.<br>" +
+        "• Each frame is aligned to the stack automatically (takes a second the first time).<br>" +
+        "• Painting from a different frame starts a new layer on top. Click a layer to pick its frame again.<br>" +
+        "• ◉ hides/shows a layer, × deletes it.<br><br>" +
+        "<b>Painting</b><br>" +
+        "• Hover: the brush circle previews the frame (with your edits) before you click<br>" +
+        "• Left-drag: paint the frame in<br>" +
+        "• Right-drag or Alt+drag: restore the stack (erases all stack layers there)<br>" +
+        "• Hardness: how soft the brush edge is<br><br>" +
+        "<b>Keys</b><br>" +
+        "• <b>[ ]</b> brush size &nbsp;·&nbsp; <b>Ctrl+Z</b>: undo last stroke<br>" +
+        "• hold <b>Space</b>: show original &nbsp;·&nbsp; <b>Space</b>+drag or middle-drag: pan &nbsp;·&nbsp; scroll: zoom<br>" +
+        "• <b>M</b>: toggle mask overlay &nbsp;·&nbsp; hold <b>Ctrl</b>: show it briefly<br>" +
+        "• <b>Esc</b>: leave stack paint<br><br>" +
+        "<b>Good to know</b><br>" +
+        "• The sliders keep editing the whole photo, painted frame included, and dodge &amp; burn layers apply on top.<br>" +
+        "• Layers are saved with the edit; reopening the photo re-aligns the frames."
+
+    // Brush quick reference (the ? button in brush mode).
+    Popup {
+        id: brushHelpPopup
+        x: 8
+        y: 40
+        width: compactEditor.width - 16
+        height: Math.min(compactEditor.height - 56, brushHelpText.implicitHeight + 24)
+        padding: 12
+        modal: false
+        focus: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        onClosed: compactEditor.focusKeyboardHandler()
+        // Leaving brush mode (Done, Esc, Shift+D) takes the help with it.
+        Connections {
+            target: compactEditor
+            function onBrushModeChanged() { if (!compactEditor.brushMode) brushHelpPopup.close() }
+        }
+        background: Rectangle {
+            color: "#262626"
+            radius: 6
+            border.color: compactEditor.panelAccent
+            border.width: 1
+        }
+
+        Flickable {
+            anchors.fill: parent
+            contentHeight: brushHelpText.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            Text {
+                id: brushHelpText
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.StyledText
+                color: "#e8e6e3"
+                font.pixelSize: 11
+                linkColor: compactEditor.panelAccentHover
+                text: compactEditor.stackMode ? compactEditor.stackHelpText : "<b>Dodge &amp; Burn</b><br>" +
+                      "Paint any of the slider effects onto part of the photo.<br><br>" +
+                      "<b>Choosing the effect</b><br>" +
+                      "• With <i>New strokes</i> selected, the orange sliders set the recipe for the next stroke (e.g. Exposure −30 to burn, +30 to dodge; mix in any sliders).<br>" +
+                      "• If you change the sliders after painting, the next stroke starts a new layer, so earlier strokes keep their look.<br>" +
+                      "• Click a layer to change its sliders after painting; all of its strokes update. Click it again (or <i>New strokes</i>) to go back.<br>" +
+                      "• ◉ hides/shows a layer, × deletes it.<br><br>" +
+                      "<b>Painting</b><br>" +
+                      "• Left-drag: paint one coat<br>" +
+                      "• Paint over the same spot again to build it up (2 coats = twice the recipe)<br>" +
+                      "• Right-drag or Alt+drag: erase from the selected / last-painted layer<br>" +
+                      "• Hardness: how soft the brush edge is (inner ring on the cursor = full strength)<br><br>" +
+                      "<b>Keys</b><br>" +
+                      "• <b>[ ]</b> brush size<br>" +
+                      "• hold <b>Space</b>: show original &nbsp;·&nbsp; <b>Space</b>+drag or middle-drag: pan &nbsp;·&nbsp; scroll: zoom<br>" +
+                      "• <b>Ctrl+Z</b>: undo last stroke<br>" +
+                      "• <b>M</b>: toggle mask overlay &nbsp;·&nbsp; hold <b>Ctrl</b>: show it briefly<br>" +
+                      "• <b>Shift+D</b> or <b>Esc</b>: leave dodge &amp; burn<br><br>" +
+                      "<b>Good to know</b><br>" +
+                      "• Reset clears the global sliders and all layers.<br>" +
+                      "• Layers are saved with the edit; come back to the photo to change them.<br>" +
+                      "• Strokes follow crop and rotation."
             }
         }
     }
@@ -518,7 +631,167 @@ Window {
             // --- Header ---
             RowLayout {
                 Layout.fillWidth: true
-                spacing: 6
+                spacing: 4
+
+                // Brush tools: dodge & burn ("Burn", Shift+D) and stack paint
+                // with its input-frame picker.
+                RowLayout {
+                    spacing: 2
+
+                    Button {
+                        id: brushModeBtn
+                        implicitHeight: 26
+                        Layout.preferredHeight: 26
+                        enabled: !compactEditor.cropActive
+                        padding: 0
+                        leftPadding: 6; rightPadding: 6
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.recipeMode ? "Leave dodge & burn (Shift+D)" : "Dodge & burn brush (Shift+D)"
+                        onClicked: {
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_local_brush_mode()
+                            compactEditor.focusKeyboardHandler()
+                        }
+                        contentItem: Text {
+                            text: "◐ Burn"
+                            font.pixelSize: 11
+                            font.weight: compactEditor.recipeMode ? Font.DemiBold : Font.Normal
+                            color: compactEditor.recipeMode ? "#1e1e1e"
+                                   : (brushModeBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor)
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: compactEditor.recipeMode ? compactEditor.accentColor
+                                   : (brushModeBtn.hovered ? "#30ffffff" : "transparent")
+                            border.color: compactEditor.recipeMode ? "transparent" : compactEditor.controlBorder
+                            border.width: 1
+                        }
+                    }
+
+                    // Stack paint: grey unless this is an in-camera stacked JPG
+                    // whose input JPGs were found.
+                    Button {
+                        id: stackModeBtn
+                        implicitHeight: 26
+                        Layout.preferredHeight: 26
+                        enabled: !compactEditor.cropActive && compactEditor.stackPaintAvailable
+                        padding: 0
+                        leftPadding: 6; rightPadding: 6
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.stackMode ? "Leave stack paint" : "Stack paint: paint an input frame over the stack"
+                        onClicked: {
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_stack_brush_mode()
+                            compactEditor.focusKeyboardHandler()
+                        }
+                        contentItem: Text {
+                            text: "Stack"
+                            font.pixelSize: 11
+                            font.weight: compactEditor.stackMode ? Font.DemiBold : Font.Normal
+                            color: !stackModeBtn.enabled ? "#55524f"
+                                   : compactEditor.stackMode ? "#1e1e1e"
+                                   : (stackModeBtn.hovered ? compactEditor.stackAccentHover : compactEditor.textColor)
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: compactEditor.stackMode ? compactEditor.stackAccent
+                                   : (stackModeBtn.hovered ? "#30ffffff" : "transparent")
+                            border.color: compactEditor.stackMode ? "transparent"
+                                          : (stackModeBtn.enabled ? compactEditor.controlBorder : "#18ffffff")
+                            border.width: 1
+                        }
+                    }
+
+                    // Which input frame stack paint reveals (1 = nearest focus).
+                    ComboBox {
+                        id: stackInputCombo
+                        implicitWidth: 34; implicitHeight: 26
+                        Layout.minimumWidth: 34; Layout.preferredWidth: 34; Layout.maximumWidth: 34
+                        Layout.preferredHeight: 26
+                        enabled: !compactEditor.cropActive && compactEditor.stackPaintAvailable
+                        focusPolicy: Qt.NoFocus
+                        model: compactEditor.uiStateRef ? compactEditor.uiStateRef.stackInputs : []
+                        textRole: "label"
+                        currentIndex: compactEditor.stackInputIndex
+                        onActivated: function(index) {
+                            var inputs = compactEditor.uiStateRef ? compactEditor.uiStateRef.stackInputs : []
+                            if (compactEditor.controllerRef && index >= 0 && index < inputs.length)
+                                compactEditor.controllerRef.set_stack_input(inputs[index].name)
+                            currentIndex = Qt.binding(function() { return compactEditor.stackInputIndex })
+                            compactEditor.focusKeyboardHandler()
+                        }
+                        ToolTip.visible: hovered && !stackInputCombo.popup.visible
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.stackInputLabel !== ""
+                                      ? "Stack input to paint: " + compactEditor.stackInputLabel
+                                      : "Stack input to paint"
+                        contentItem: Text {
+                            leftPadding: 4
+                            text: stackInputCombo.currentIndex >= 0 && compactEditor.uiStateRef
+                                  ? compactEditor.uiStateRef.stackInputs[stackInputCombo.currentIndex].short
+                                  : "–"
+                            font.pixelSize: 10
+                            color: stackInputCombo.enabled ? compactEditor.textColor : "#55524f"
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        indicator: Text {
+                            x: stackInputCombo.width - width - 4
+                            y: (stackInputCombo.height - height) / 2
+                            text: "▾"
+                            font.pixelSize: 9
+                            color: stackInputCombo.enabled ? "#9a9795" : "#55524f"
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: stackInputCombo.hovered && stackInputCombo.enabled ? "#30ffffff" : "transparent"
+                            border.color: stackInputCombo.enabled ? compactEditor.controlBorder : "#18ffffff"
+                            border.width: 1
+                        }
+                        delegate: ItemDelegate {
+                            id: stackInputDelegate
+                            required property var modelData
+                            required property int index
+                            width: 176
+                            height: 22
+                            highlighted: stackInputCombo.highlightedIndex === stackInputDelegate.index
+                            contentItem: Text {
+                                text: stackInputDelegate.modelData.label
+                                font.pixelSize: 10
+                                color: stackInputDelegate.index === stackInputCombo.currentIndex ? compactEditor.stackAccentHover : "#e8e6e3"
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                color: stackInputDelegate.highlighted ? "#30ffffff" : "transparent"
+                            }
+                        }
+                        popup: Popup {
+                            y: stackInputCombo.height
+                            width: 180
+                            margins: 4
+                            padding: 2
+                            implicitHeight: contentItem.implicitHeight + 4
+                            contentItem: ListView {
+                                clip: true
+                                implicitHeight: Math.min(contentHeight, 360)
+                                model: stackInputCombo.popup.visible ? stackInputCombo.delegateModel : null
+                                currentIndex: stackInputCombo.highlightedIndex
+                                ScrollIndicator.vertical: ScrollIndicator { }
+                            }
+                            background: Rectangle {
+                                color: "#262626"
+                                radius: 4
+                                border.color: "#3a3a3a"
+                                border.width: 1
+                            }
+                        }
+                    }
+                }
 
                 Item { Layout.fillWidth: true }
 
@@ -786,6 +1059,382 @@ Window {
 
             Rectangle { Layout.fillWidth: true; height: 1; color: compactEditor.separatorColor; Layout.topMargin: 2 }
 
+            // --- DODGE & BURN (brush mode, Shift+D) ---
+            // While this is shown, the LIGHT / COLOR sliders edit a local
+            // recipe: the selected layer's, or the one new strokes get.
+            ColumnLayout {
+                id: brushPanel
+                visible: compactEditor.brushMode
+                Layout.fillWidth: true
+                spacing: 4
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    Text {
+                        text: compactEditor.stackMode ? "STACK PAINT" : "DODGE & BURN"
+                        font.pixelSize: 9
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 1.0
+                        color: compactEditor.panelAccentHover
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    // Show-mask toggle (same as M).
+                    CheckBox {
+                        id: brushMaskToggle
+                        text: "Mask"
+                        padding: 0
+                        checked: compactEditor.uiStateRef ? compactEditor.uiStateRef.localOverlayVisible : false
+                        onToggled: {
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_local_overlay()
+                            checked = Qt.binding(function() { return compactEditor.uiStateRef ? compactEditor.uiStateRef.localOverlayVisible : false })
+                        }
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: "Show mask overlay (M)"
+                        indicator: Rectangle {
+                            implicitWidth: 12; implicitHeight: 12
+                            x: 0; y: (brushMaskToggle.height - height) / 2
+                            radius: 2
+                            color: brushMaskToggle.checked ? compactEditor.panelAccent : "transparent"
+                            border.color: brushMaskToggle.checked ? compactEditor.panelAccent : "#6a6866"
+                            border.width: 1
+                        }
+                        contentItem: Text {
+                            text: brushMaskToggle.text
+                            leftPadding: 16
+                            font.pixelSize: 9
+                            color: brushMaskToggle.checked ? "#e8e6e3" : "#9a9795"
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+
+                    Button {
+                        id: brushHelpBtn
+                        implicitWidth: 18; implicitHeight: 18
+                        Layout.minimumWidth: 18; Layout.preferredWidth: 18; Layout.maximumWidth: 18
+                        Layout.minimumHeight: 18; Layout.preferredHeight: 18; Layout.maximumHeight: 18
+                        padding: 0
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.stackMode ? "How stack paint works" : "How dodge & burn works"
+                        onClicked: brushHelpPopup.opened ? brushHelpPopup.close() : brushHelpPopup.open()
+                        contentItem: Text {
+                            text: "?"
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
+                            color: brushHelpBtn.hovered || brushHelpPopup.opened ? "#e8e6e3" : "#9a9795"
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 9
+                            color: brushHelpBtn.hovered || brushHelpPopup.opened ? "#30ffffff" : "#18ffffff"
+                            border.color: "#3a3a3a"; border.width: 1
+                        }
+                    }
+
+                    Button {
+                        id: brushDoneBtn
+                        implicitWidth: 40; implicitHeight: 18
+                        Layout.minimumWidth: 40; Layout.preferredWidth: 40; Layout.maximumWidth: 40
+                        Layout.minimumHeight: 18; Layout.preferredHeight: 18; Layout.maximumHeight: 18
+                        padding: 0
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: "Leave brush mode (Shift+D / Esc)"
+                        onClicked: if (compactEditor.controllerRef) compactEditor.controllerRef.exit_local_brush_mode()
+                        contentItem: Text {
+                            text: "Done"
+                            font.pixelSize: 9
+                            color: brushDoneBtn.hovered ? "#e8e6e3" : "#9a9795"
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 2
+                            color: brushDoneBtn.hovered ? "#30ffffff" : "#18ffffff"
+                            border.color: "#3a3a3a"; border.width: 1
+                        }
+                    }
+                }
+
+                // Stack paint: the input frame new strokes reveal.
+                Rectangle {
+                    visible: compactEditor.stackMode
+                    Layout.fillWidth: true
+                    implicitHeight: 22
+                    radius: 3
+                    color: "#332dd4bf"
+                    border.color: compactEditor.stackAccent
+                    border.width: 1
+
+                    Text {
+                        anchors.fill: parent
+                        anchors.leftMargin: 6
+                        anchors.rightMargin: 6
+                        verticalAlignment: Text.AlignVCenter
+                        text: "Painting from: " + compactEditor.stackInputLabel
+                        color: compactEditor.textColor
+                        font.pixelSize: 10
+                        elide: Text.ElideRight
+                    }
+                }
+
+                // The recipe the next new layer gets. Selected whenever no
+                // layer is being edited.
+                Rectangle {
+                    id: newStrokesRow
+                    visible: !compactEditor.stackMode
+                    readonly property bool selected: !compactEditor.uiStateRef || compactEditor.uiStateRef.localEditingLayerId === ""
+                    Layout.fillWidth: true
+                    implicitHeight: 22
+                    radius: 3
+                    color: newStrokesRow.selected ? "#33f59e0b" : "transparent"
+                    border.color: newStrokesRow.selected ? compactEditor.panelAccent : "#30ffffff"
+                    border.width: 1
+
+                    Text {
+                        anchors.fill: parent
+                        anchors.leftMargin: 6
+                        anchors.rightMargin: 6
+                        verticalAlignment: Text.AlignVCenter
+                        text: "New strokes: " + (compactEditor.uiStateRef ? compactEditor.uiStateRef.localBrushSummary : "")
+                        color: compactEditor.textColor
+                        font.pixelSize: 10
+                        elide: Text.ElideRight
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.select_local_layer("")
+                            compactEditor.focusKeyboardHandler()
+                        }
+                    }
+                }
+
+                Repeater {
+                    model: compactEditor.uiStateRef ? compactEditor.uiStateRef.localLayers : []
+
+                    delegate: Rectangle {
+                        id: layerRow
+                        required property var modelData
+                        readonly property bool isStack: layerRow.modelData.kind === "stack"
+                        // Each tool lists only its own layers.
+                        visible: layerRow.isStack === compactEditor.stackMode
+                        Layout.fillWidth: true
+                        implicitHeight: 22
+                        radius: 3
+                        color: layerRow.modelData.editing ? "#33f59e0b" : (layerMouse.containsMouse ? "#14ffffff" : "transparent")
+                        border.color: layerRow.modelData.editing ? compactEditor.panelAccent
+                                      : (layerRow.modelData.active ? "#60f59e0b" : "#30ffffff")
+                        border.width: 1
+
+                        MouseArea {
+                            id: layerMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (compactEditor.controllerRef) {
+                                    // A stack layer has no recipe: clicking it
+                                    // picks its frame for the next strokes.
+                                    if (layerRow.isStack) compactEditor.controllerRef.set_stack_input(layerRow.modelData.source)
+                                    else compactEditor.controllerRef.select_local_layer(layerRow.modelData.id)
+                                }
+                                compactEditor.focusKeyboardHandler()
+                            }
+                        }
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 2
+                            anchors.rightMargin: 2
+                            spacing: 4
+
+                            Text {
+                                Layout.preferredWidth: 18
+                                horizontalAlignment: Text.AlignHCenter
+                                text: layerRow.modelData.visible ? "◉" : "○"
+                                color: layerRow.modelData.visible ? "#e8e6e3" : compactEditor.mutedText
+                                font.pixelSize: 11
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: if (compactEditor.controllerRef) compactEditor.controllerRef.set_local_layer_visible(layerRow.modelData.id, !layerRow.modelData.visible)
+                                }
+                            }
+
+                            Text {
+                                text: layerRow.modelData.name
+                                color: layerRow.modelData.visible ? compactEditor.textColor : compactEditor.mutedText
+                                font.pixelSize: 10
+                                font.weight: Font.DemiBold
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: layerRow.modelData.summary
+                                color: "#9a9795"
+                                font.pixelSize: 9
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                Layout.preferredWidth: 16
+                                horizontalAlignment: Text.AlignHCenter
+                                text: "×"
+                                color: deleteMouse.containsMouse ? "#ff8080" : "#9a9795"
+                                font.pixelSize: 13
+                                MouseArea {
+                                    id: deleteMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: if (compactEditor.controllerRef) compactEditor.controllerRef.delete_local_layer(layerRow.modelData.id)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Brush size (log scale: 0.2% .. 25% of the image diagonal)
+                // and hardness.
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    Text {
+                        Layout.preferredWidth: 70
+                        text: "Size  [ ]"
+                        color: compactEditor.textColor
+                        font.pixelSize: 11
+                    }
+
+                    Slider {
+                        id: brushSizeSlider
+                        Layout.preferredHeight: 20
+                        background: Rectangle {
+                            x: brushSizeSlider.leftPadding
+                            y: brushSizeSlider.topPadding + brushSizeSlider.availableHeight / 2 - height / 2
+                            width: brushSizeSlider.availableWidth
+                            height: 4; radius: 2
+                            color: "#2e2e2e"; border.color: "#383838"; border.width: 1
+                            Rectangle {
+                                width: brushSizeSlider.visualPosition * parent.width
+                                height: parent.height; radius: 2
+                                color: compactEditor.panelAccent; opacity: 0.6
+                            }
+                        }
+                        handle: Rectangle {
+                            x: brushSizeSlider.leftPadding + brushSizeSlider.visualPosition * (brushSizeSlider.availableWidth - width)
+                            y: brushSizeSlider.topPadding + brushSizeSlider.availableHeight / 2 - height / 2
+                            width: 10; height: 10; radius: 5
+                            color: "#e8e6e3"
+                            border.color: brushSizeSlider.pressed ? compactEditor.panelAccent : "#5a5755"
+                            border.width: 1
+                        }
+                        readonly property real minRadius: 0.002
+                        readonly property real maxRadius: 0.25
+                        Layout.fillWidth: true
+                        focusPolicy: Qt.NoFocus
+                        from: 0; to: 100
+                        function radiusFromValue(v) { return minRadius * Math.pow(maxRadius / minRadius, v / 100) }
+                        Binding {
+                            target: brushSizeSlider
+                            property: "value"
+                            when: !brushSizeSlider.pressed
+                            value: compactEditor.uiStateRef
+                                   ? 100 * Math.log(compactEditor.uiStateRef.brushRadius / brushSizeSlider.minRadius) / Math.log(brushSizeSlider.maxRadius / brushSizeSlider.minRadius)
+                                   : 50
+                        }
+                        onMoved: if (compactEditor.controllerRef) compactEditor.controllerRef.set_brush_radius(radiusFromValue(value))
+                    }
+
+                    Text {
+                        Layout.preferredWidth: 32
+                        horizontalAlignment: Text.AlignRight
+                        text: compactEditor.uiStateRef ? (compactEditor.uiStateRef.brushRadius * 100).toFixed(1) : ""
+                        font.family: "IBM Plex Mono"
+                        font.pixelSize: 10
+                        color: "#e8e6e3"
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    Text {
+                        Layout.preferredWidth: 70
+                        text: "Hardness"
+                        color: compactEditor.textColor
+                        font.pixelSize: 11
+                    }
+
+                    Slider {
+                        id: brushHardnessSlider
+                        Layout.preferredHeight: 20
+                        background: Rectangle {
+                            x: brushHardnessSlider.leftPadding
+                            y: brushHardnessSlider.topPadding + brushHardnessSlider.availableHeight / 2 - height / 2
+                            width: brushHardnessSlider.availableWidth
+                            height: 4; radius: 2
+                            color: "#2e2e2e"; border.color: "#383838"; border.width: 1
+                            Rectangle {
+                                width: brushHardnessSlider.visualPosition * parent.width
+                                height: parent.height; radius: 2
+                                color: compactEditor.panelAccent; opacity: 0.6
+                            }
+                        }
+                        handle: Rectangle {
+                            x: brushHardnessSlider.leftPadding + brushHardnessSlider.visualPosition * (brushHardnessSlider.availableWidth - width)
+                            y: brushHardnessSlider.topPadding + brushHardnessSlider.availableHeight / 2 - height / 2
+                            width: 10; height: 10; radius: 5
+                            color: "#e8e6e3"
+                            border.color: brushHardnessSlider.pressed ? compactEditor.panelAccent : "#5a5755"
+                            border.width: 1
+                        }
+                        Layout.fillWidth: true
+                        focusPolicy: Qt.NoFocus
+                        from: 0; to: 100
+                        Binding {
+                            target: brushHardnessSlider
+                            property: "value"
+                            when: !brushHardnessSlider.pressed
+                            value: compactEditor.uiStateRef ? compactEditor.uiStateRef.brushHardness * 100 : 50
+                        }
+                        onMoved: if (compactEditor.controllerRef) compactEditor.controllerRef.set_brush_hardness(value / 100)
+                    }
+
+                    Text {
+                        Layout.preferredWidth: 32
+                        horizontalAlignment: Text.AlignRight
+                        text: compactEditor.uiStateRef ? Math.round(compactEditor.uiStateRef.brushHardness * 100) : ""
+                        font.family: "IBM Plex Mono"
+                        font.pixelSize: 10
+                        color: "#e8e6e3"
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    text: "Drag to paint, right-drag to erase. Press ? for all controls."
+                    color: compactEditor.mutedText
+                    font.pixelSize: 9
+                }
+
+                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: compactEditor.separatorColor; Layout.topMargin: 2 }
+            }
+
             // --- LIGHT Section ---
             RowLayout {
                 Layout.fillWidth: true
@@ -804,6 +1453,7 @@ Window {
 
                 Button {
                     id: autoLevelsBtn
+                    visible: !compactEditor.recipeMode  // auto tools act on the global edit
                     implicitWidth: 36; implicitHeight: 16
                     Layout.minimumWidth: 36; Layout.preferredWidth: 36; Layout.maximumWidth: 36
                     Layout.minimumHeight: 16; Layout.preferredHeight: 16; Layout.maximumHeight: 16
@@ -835,6 +1485,7 @@ Window {
                 ListElement { name: "Exposure"; key: "exposure"; min: -100; max: 100 }
                 ListElement { name: "Brightness"; key: "brightness"; min: -100; max: 100 }
                 ListElement { name: "Contrast"; key: "contrast"; min: -100; max: 100 }
+                ListElement { name: "Highlights"; key: "highlights"; min: -100; max: 100 }
                 ListElement { name: "Whites"; key: "whites"; min: -100; max: 100 }
                 ListElement { name: "Shadows"; key: "shadows"; min: -100; max: 100 }
                 ListElement { name: "Blacks"; key: "blacks"; min: -100; max: 100 }
@@ -861,6 +1512,7 @@ Window {
 
                 Button {
                     id: autoWbBtn
+                    visible: !compactEditor.recipeMode  // auto tools act on the global edit
                     implicitWidth: 36; implicitHeight: 16
                     Layout.minimumWidth: 36; Layout.preferredWidth: 36; Layout.maximumWidth: 36
                     Layout.minimumHeight: 16; Layout.preferredHeight: 16; Layout.maximumHeight: 16
@@ -1098,7 +1750,7 @@ Window {
                     repeat: true
                     onTriggered: {
                         if (Math.abs(slider._pendingValue - slider._lastSentValue) > 0.001) {
-                            if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(slider._pendingValue))
+                            compactEditor.setEditValue(sliderRow.key, slider.editValueFromSliderValue(slider._pendingValue))
                             slider._lastSentValue = slider._pendingValue
                         }
                     }
@@ -1125,7 +1777,7 @@ Window {
                     compactEditor.highlightedSliderKey = sliderRow.key
                     slider.isResetting = true
                     sendTimer.stop()
-                    if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
+                    compactEditor.setEditValue(sliderRow.key, 0.0)
                     slider.value = 0.0
                     _pendingValue = 0.0
                     slider._lastSentValue = 0.0
@@ -1147,9 +1799,9 @@ Window {
                     } else {
                         sendTimer.stop()
                         if (slider.isResetting) {
-                            if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
+                            compactEditor.setEditValue(sliderRow.key, 0.0)
                         } else {
-                            if (compactEditor.controllerRef) compactEditor.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
+                            compactEditor.setEditValue(sliderRow.key, slider.editValueFromSliderValue(value))
                         }
                         if (compactEditor.controllerRef) compactEditor.controllerRef.update_histogram()
                         if (compactEditor.controllerRef) compactEditor.controllerRef.set_editor_slider_drag_active(false)
