@@ -1323,6 +1323,10 @@ Item {
                 }
 
                 if (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping) {
+                    // The source was frozen before crop activation so source
+                    // changes could not race the interaction. If activation is
+                    // rejected, do not leak that source into a later crop.
+                    loupeView.releaseCropImageSource()
                     endCropInteraction()
                     return
                 }
@@ -2107,9 +2111,7 @@ Item {
                 Accessible.onPressAction: gridToggleRow.toggleGrid()
 
                 Keys.onPressed: (event) => {
-                    if (event.key === Qt.Key_Enter
-                            || event.key === Qt.Key_Return
-                            || event.key === Qt.Key_Space) {
+                    if (event.key === Qt.Key_Space) {
                         gridToggleRow.toggleGrid()
                         event.accepted = true
                     }
@@ -2150,8 +2152,10 @@ Item {
                     anchors.fill: parent
                     hoverEnabled: true
                     onClicked: {
-                        gridToggleRow.forceActiveFocus()
                         gridToggleRow.toggleGrid()
+                        // Enter/Return applies the crop. A pointer click must
+                        // not leave the grid switch owning those keys.
+                        loupeView.forceActiveFocus()
                     }
                 }
             }

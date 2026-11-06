@@ -39,6 +39,17 @@ function Write-Utf8File {
     [System.IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)
 }
 
+function Join-ValidatedTsvRow {
+    param([object[]]$Fields)
+
+    $line = [string]::Join("`t", [string[]]$Fields)
+    $columnCount = [regex]::Matches($line, "`t").Count + 1
+    if ($columnCount -ne $Fields.Count) {
+        throw "TSV row has $columnCount columns; expected $($Fields.Count)."
+    }
+    return $line
+}
+
 function Add-Utf8File {
     param([string]$Path, [string]$Text)
     [System.IO.File]::AppendAllText($Path, $Text, $Utf8NoBom)
@@ -1070,7 +1081,11 @@ function Write-TraceReports {
     [void]$report.AppendLine('## Cold versus warm')
     [void]$report.AppendLine("Metric`tCold`tWarm")
     foreach ($metric in $metrics) {
-        [void]$report.AppendLine(('{0}`t{1}`t{2}' -f $metric, $cold.$metric, $warm.$metric))
+        [void]$report.AppendLine((Join-ValidatedTsvRow -Fields @(
+            $metric
+            $cold.$metric
+            $warm.$metric
+        )))
     }
 
     foreach ($stats in @($cold, $warm)) {
@@ -1082,7 +1097,10 @@ function Write-TraceReports {
         else {
             [void]$report.AppendLine("Count`tCombination")
             foreach ($group in ($stats.RepeatedCombos | Select-Object -First 100)) {
-                [void]$report.AppendLine(('{0}`t{1}' -f $group.Count, $group.Name))
+                [void]$report.AppendLine((Join-ValidatedTsvRow -Fields @(
+                    $group.Count
+                    $group.Name
+                )))
             }
         }
 
@@ -1094,7 +1112,10 @@ function Write-TraceReports {
         else {
             [void]$report.AppendLine("Count`tReason")
             foreach ($group in $stats.RejectReasons) {
-                [void]$report.AppendLine(('{0}`t{1}' -f $group.Count, $group.Name))
+                [void]$report.AppendLine((Join-ValidatedTsvRow -Fields @(
+                    $group.Count
+                    $group.Name
+                )))
             }
         }
 
@@ -1124,19 +1145,19 @@ function Write-TraceReports {
         foreach ($row in $stats.WorkerRows) {
             $safePath = ([string]$row.Path) -replace "`t", ' '
             $safeRaw = ([string]$row.Raw) -replace "`t", ' '
-            [void]$tsv.AppendLine(('{0}`t{1}`t{2}`t{3}`t{4}`t{5}`t{6}`t{7}`t{8}`t{9}`t{10}' -f
-                $label,
-                $row.Task,
-                $row.Seq,
-                $row.Role,
-                $row.Quality,
-                $row.DisplayGeneration,
-                $safePath,
-                $row.QueueMs,
-                $row.DecodeMs,
-                $row.TotalMs,
+            [void]$tsv.AppendLine((Join-ValidatedTsvRow -Fields @(
+                $label
+                $row.Task
+                $row.Seq
+                $row.Role
+                $row.Quality
+                $row.DisplayGeneration
+                $safePath
+                $row.QueueMs
+                $row.DecodeMs
+                $row.TotalMs
                 $safeRaw
-            ))
+            )))
         }
     }
     Write-Utf8File -Path $EventsTsvPath -Text $tsv.ToString()

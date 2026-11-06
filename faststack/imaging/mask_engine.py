@@ -31,12 +31,17 @@ def forward_transform(
     y_norm: float,
     edits: Dict[str, Any],
     target_shape: Tuple[int, int],
+    point_transform: Optional[np.ndarray] = None,
 ) -> Tuple[float, float]:
     """Map oriented-base-image [0,1] coords → pixel coords in the
     post-geometry (post-straighten, post-crop) rasterisation array.
 
     *target_shape* is ``(H, W)`` of the array being rasterised into.
     """
+    if point_transform is not None:
+        x, y, _ = point_transform @ np.array([x_norm, y_norm, 1.0])
+        return float(x), float(y)
+
     straighten = float(edits.get("straighten_angle", 0.0))
     crop_box = edits.get("crop_box")
     has_crop = (
@@ -90,6 +95,7 @@ def inverse_transform(
     y_disp: float,
     edits: Dict[str, Any],
     display_shape: Tuple[int, int],
+    normalized_transform: Optional[np.ndarray] = None,
 ) -> Tuple[float, float]:
     """Map display / QML normalised [0,1] coords → oriented-base-image [0,1].
 
@@ -99,6 +105,10 @@ def inverse_transform(
     ``x_disp`` and ``y_disp`` are assumed already normalised to [0,1]
     relative to the displayed (post-crop, post-straighten) image.
     """
+    if normalized_transform is not None:
+        x, y, _ = np.linalg.inv(normalized_transform) @ np.array([x_disp, y_disp, 1.0])
+        return float(x), float(y)
+
     straighten = float(edits.get("straighten_angle", 0.0))
     crop_box = edits.get("crop_box")
     has_crop = (
@@ -165,8 +175,22 @@ class LayerDensity:
     arr: np.ndarray
 
 
-def _base_diagonal_px(edits: Dict[str, Any], shape: Tuple[int, int]) -> float:
+def _base_diagonal_px(
+    edits: Dict[str, Any],
+    shape: Tuple[int, int],
+    base_shape: Optional[Tuple[int, int]] = None,
+    point_transform: Optional[np.ndarray] = None,
+) -> float:
     """Diagonal of the uncropped oriented image, in *shape*'s pixels."""
+    if base_shape is not None and point_transform is not None:
+        bh, bw = base_shape
+        base_to_target = point_transform[:2, :2] @ np.diag(
+            [1.0 / max(bw, 1), 1.0 / max(bh, 1)]
+        )
+        scale_x = float(np.linalg.norm(base_to_target[:, 0]))
+        scale_y = float(np.linalg.norm(base_to_target[:, 1]))
+        return math.hypot(bw, bh) * (scale_x + scale_y) * 0.5
+
     th, tw = shape
     crop_box = edits.get("crop_box")
     cw = ch = 1.0
@@ -179,9 +203,14 @@ def _base_diagonal_px(edits: Dict[str, Any], shape: Tuple[int, int]) -> float:
 
 
 def _stroke_pixel_points(
-    stroke: MaskStroke, edits: Dict[str, Any], shape: Tuple[int, int]
+    stroke: MaskStroke,
+    edits: Dict[str, Any],
+    shape: Tuple[int, int],
+    point_transform: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    pts = [forward_transform(x, y, edits, shape) for x, y in stroke.points]
+    pts = [
+        forward_transform(x, y, edits, shape, point_transform) for x, y in stroke.points
+    ]
     return np.asarray(pts, dtype=np.float64).reshape(-1, 2)
 
 
@@ -274,13 +303,15 @@ def _apply_strokes(
     strokes: Sequence[MaskStroke],
     edits: Dict[str, Any],
     shape: Tuple[int, int],
+    base_shape: Optional[Tuple[int, int]] = None,
+    point_transform: Optional[np.ndarray] = None,
 ) -> Optional[LayerDensity]:
     """Composite *strokes* in order onto *base* (never mutated)."""
-    diag = _base_diagonal_px(edits, shape)
+    diag = _base_diagonal_px(edits, shape, base_shape, point_transform)
     covered = []
     for stroke in strokes:
         cov = _stroke_coverage(
-            _stroke_pixel_points(stroke, edits, shape),
+            _stroke_pixel_points(stroke, edits, shape, point_transform),
             stroke.radius * diag,
             stroke.hardness,
             shape,
@@ -319,11 +350,22 @@ def _apply_strokes(
     return LayerDensity(y0, y1, x0, x1, out)
 
 
-def _geometry_key(edits: Dict[str, Any]) -> tuple:
-    return (
+def _geometry_key(
+    edits: Dict[str, Any],
+    base_shape: Optional[Tuple[int, int]] = None,
+    point_transform: Optional[np.ndarray] = None,
+) -> tuple:
+    key = (
         edits.get("rotation", 0),
         round(float(edits.get("straighten_angle", 0.0)), 4),
         tuple(edits.get("crop_box") or ()),
+    )
+    if point_transform is None:
+        return key
+    return (
+        *key,
+        tuple(base_shape or ()),
+        tuple(np.round(point_transform, 8).ravel()),
     )
 
 
@@ -402,6 +444,8 @@ def rasterize_layer_density(
     edits: Dict[str, Any],
     cache: Optional[LayerDensityCache] = None,
     include_live: bool = True,
+    base_shape: Optional[Tuple[int, int]] = None,
+    point_transform: Optional[np.ndarray] = None,
 ) -> Optional[LayerDensity]:
     """Coat density of one layer at *shape*, or None if nothing is painted.
 
@@ -411,7 +455,11 @@ def rasterize_layer_density(
     # Read each reference once: the GUI thread rebinds them, never mutates.
     strokes = tuple(mask_data.strokes)
     live = mask_data.live_stroke if include_live else None
-    key = (mask_data.uid, tuple(shape), _geometry_key(edits))
+    key = (
+        mask_data.uid,
+        tuple(shape),
+        _geometry_key(edits, base_shape, point_transform),
+    )
 
     entry = cache.get(layer_id, key) if cache is not None else None
     if (
@@ -422,12 +470,21 @@ def rasterize_layer_density(
         committed = entry[1]
     else:
         if entry is not None and _extends(strokes, entry[0]):
-            committed = _apply_strokes(entry[1], strokes[len(entry[0]) :], edits, shape)
+            committed = _apply_strokes(
+                entry[1],
+                strokes[len(entry[0]) :],
+                edits,
+                shape,
+                base_shape,
+                point_transform,
+            )
         else:
-            committed = _apply_strokes(None, strokes, edits, shape)
+            committed = _apply_strokes(
+                None, strokes, edits, shape, base_shape, point_transform
+            )
         if cache is not None:
             cache.put(layer_id, key, strokes, committed)
 
     if live is None or not live.points:
         return committed
-    return _apply_strokes(committed, [live], edits, shape)
+    return _apply_strokes(committed, [live], edits, shape, base_shape, point_transform)

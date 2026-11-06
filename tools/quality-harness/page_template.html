@@ -700,6 +700,7 @@ $("swX").addEventListener("click",function(){show("X");});
 $("pick1").addEventListener("click",function(){setPick("1");});
 $("pick2").addEventListener("click",function(){setPick("2");});
 $("pickSame").addEventListener("click",function(){setPick("same");});
+$("pickDiffer").addEventListener("click",function(){setPick("differ");});
 function commitNote(){
   var v=$("trialNote").value.trim();
   if(v&&lastRow){

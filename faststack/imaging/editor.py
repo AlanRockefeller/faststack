@@ -969,6 +969,7 @@ class ImageEditor:
         self._edits_rev = 0
         self._cached_rev = -1
         self._cached_preview = None
+        self._render_cache_generation = 0
 
         # Bit depth of the loaded image (8 or 16)
         self.bit_depth: int = 8
@@ -1805,6 +1806,7 @@ class ImageEditor:
                 arr = arr.astype(np.float32) / 65535.0
             else:
                 arr = arr.astype(np.float32, copy=False)
+        mask_base_shape = arr.shape[:2]
 
         # 0. Stack paint: blend painted focus-stack input pixels into the base
         # image before any geometry, so they get exactly the same geometry,
@@ -1975,6 +1977,9 @@ class ImageEditor:
         # then re-rendered over the painted bounding box with per-pixel values.
         local = None
         if effective_layers(edits):
+            mask_point_transform = np.diag(
+                [arr.shape[1], arr.shape[0], 1.0]
+            ) @ geometry_normalized_affine(edits, mask_base_shape)
             local = build_local_adjustments(
                 edits,
                 (
@@ -1988,6 +1993,8 @@ class ImageEditor:
                     if cache_override is not None
                     else self._local_density_cache
                 ),
+                base_shape=mask_base_shape,
+                point_transform=mask_point_transform,
             )
             _mark("local_masks")
 
@@ -3459,6 +3466,7 @@ class ImageEditor:
                     else None
                 )
                 rev = self._edits_rev
+                cache_generation = self._render_cache_generation
 
         if cached is not None:
             return self._resize_decoded_for_display(cached, output_size)
@@ -3486,6 +3494,7 @@ class ImageEditor:
                 edits_override is None
                 and downscale_long_edge is None
                 and self._edits_rev == rev
+                and self._render_cache_generation == cache_generation
             ):
                 self._cached_preview = decoded
                 self._cached_rev = rev
@@ -3912,6 +3921,13 @@ class ImageEditor:
         """Invalidate renders after a stroke change in ``_mask_assets``."""
         with self._lock:
             self._edits_rev += 1
+
+    def invalidate_render_cache(self) -> None:
+        """Discard rendered pixels without recording a user edit."""
+        with self._lock:
+            self._render_cache_generation += 1
+            self._cached_preview = None
+            self._cached_rev = -1
 
     def set_edit_param(self, key: str, value: Any) -> bool:
         """Update a single edit parameter."""
@@ -4847,12 +4863,16 @@ class ImageEditor:
                 continue
             path = resolver(name) if resolver is not None else None
             if path is None:
-                log.warning("Stack input %s not found; saving without it", name)
-                continue
+                raise RuntimeError(
+                    f"Stack input {name} is unavailable; the painted layer was not saved"
+                )
             try:
                 sources[name] = load_stack_source(path, source_arr)
             except (OSError, StackAlignError) as exc:
-                log.warning("Stack input %s skipped in save: %s", name, exc)
+                raise RuntimeError(
+                    f"Stack input {name} could not be rendered; "
+                    "the painted layer was not saved"
+                ) from exc
         return sources
 
     def save_image(

@@ -330,6 +330,8 @@ class LiveEditSessionState:
     session_id: Optional[str]
     persisted_revision: int
     submitted_revision: int
+    persisted_has_meaningful_edits: bool = False
+    submitted_has_meaningful_edits: bool = False
 
 
 @dataclass
@@ -477,6 +479,21 @@ class AppController(QObject):
     _thumbnailReadySignal = Signal(str)
 
     MAX_FAILED_RESTORATIONS_TO_LOG = 10
+
+    @Slot(float, float, result="QVariantMap")
+    def available_screen_geometry(self, x: float, y: float) -> dict[str, int]:
+        """Return one screen's usable geometry for a virtual-desktop point."""
+        point = QPoint(round(x), round(y))
+        screen = QGuiApplication.screenAt(point) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return {}
+        geometry = screen.availableGeometry()
+        return {
+            "x": geometry.x(),
+            "y": geometry.y(),
+            "width": geometry.width(),
+            "height": geometry.height(),
+        }
 
     @staticmethod
     def _key(p: Optional[Path]) -> Optional[str]:
@@ -4725,7 +4742,12 @@ class AppController(QObject):
             return False
         return self._current_live_session_has_meaningful_edits()
 
-    def _ensure_live_edit_session_state(self, *, force_reset: bool = False) -> None:
+    def _ensure_live_edit_session_state(
+        self,
+        *,
+        force_reset: bool = False,
+        restored_has_meaningful_edits: bool = False,
+    ) -> None:
         """Bind dirty-session tracking to the currently loaded editor session."""
         info = self._get_current_preview_session_provenance()
         if info is None:
@@ -4746,6 +4768,8 @@ class AppController(QObject):
                 session_id=session_id,
                 persisted_revision=revision,
                 submitted_revision=revision,
+                persisted_has_meaningful_edits=restored_has_meaningful_edits,
+                submitted_has_meaningful_edits=restored_has_meaningful_edits,
             )
 
     def _clear_live_edit_session_state(self) -> None:
@@ -5399,14 +5423,21 @@ class AppController(QObject):
             return False
         if revision <= max(state.persisted_revision, state.submitted_revision):
             return False
-        return self._current_live_session_has_meaningful_edits()
+        baseline_has_edits = (
+            state.submitted_has_meaningful_edits
+            if state.submitted_revision >= state.persisted_revision
+            else state.persisted_has_meaningful_edits
+        )
+        return self._current_live_session_has_meaningful_edits() or baseline_has_edits
 
     @Slot(result=bool)
     def has_unsaved_edits(self) -> bool:
         """QML-callable: True when the editor has unsaved meaningful edits."""
         return self._is_current_live_edit_session_dirty()
 
-    def _mark_current_live_edit_session_submitted(self, revision: int) -> None:
+    def _mark_current_live_edit_session_submitted(
+        self, revision: int, has_meaningful_edits: bool
+    ) -> None:
         """Record that a save request has been queued for the current session revision."""
         state = self._live_edit_session_state
         info = self._get_current_preview_session_provenance()
@@ -5415,9 +5446,13 @@ class AppController(QObject):
 
         active_path_key, session_id, _ = info
         if state.active_path_key == active_path_key and state.session_id == session_id:
-            state.submitted_revision = max(state.submitted_revision, revision)
+            if revision >= state.submitted_revision:
+                state.submitted_revision = revision
+                state.submitted_has_meaningful_edits = has_meaningful_edits
 
-    def _mark_current_live_edit_session_persisted(self, revision: int) -> None:
+    def _mark_current_live_edit_session_persisted(
+        self, revision: int, has_meaningful_edits: bool
+    ) -> None:
         """Record that the current session revision has been written to disk."""
         state = self._live_edit_session_state
         info = self._get_current_preview_session_provenance()
@@ -5426,11 +5461,14 @@ class AppController(QObject):
 
         active_path_key, session_id, _ = info
         if state.active_path_key == active_path_key and state.session_id == session_id:
-            state.persisted_revision = max(state.persisted_revision, revision)
-            state.submitted_revision = max(
-                state.submitted_revision,
-                state.persisted_revision,
-            )
+            if revision >= state.persisted_revision:
+                state.persisted_revision = revision
+                state.persisted_has_meaningful_edits = has_meaningful_edits
+            if state.persisted_revision > state.submitted_revision:
+                state.submitted_revision = state.persisted_revision
+                state.submitted_has_meaningful_edits = (
+                    state.persisted_has_meaningful_edits
+                )
 
     def _mark_current_live_edit_session_clean(self) -> None:
         """Treat the current revision as clean without writing a file."""
@@ -5445,6 +5483,8 @@ class AppController(QObject):
         if state is not None:
             state.persisted_revision = revision
             state.submitted_revision = revision
+            state.persisted_has_meaningful_edits = False
+            state.submitted_has_meaningful_edits = False
 
     def _retire_pending_saves_for_photoshop(
         self,
@@ -5565,6 +5605,7 @@ class AppController(QObject):
             and revision >= state.submitted_revision
         ):
             state.submitted_revision = state.persisted_revision
+            state.submitted_has_meaningful_edits = state.persisted_has_meaningful_edits
 
     def _note_latest_save_token(
         self,
@@ -5767,8 +5808,13 @@ class AppController(QObject):
             preview_only=True,
         ):
             self._bind_loaded_editor_output_path(active_path)
-            self._restore_pending_edit_state_for_loaded_path(active_path)
-            self._ensure_live_edit_session_state(force_reset=True)
+            restored = self._restore_pending_edit_state_for_loaded_path(active_path)
+            self._ensure_live_edit_session_state(
+                force_reset=True,
+                restored_has_meaningful_edits=(
+                    restored and self._current_live_session_has_meaningful_edits()
+                ),
+            )
             self._prewarm_editor_float_image()
             return active_path
 
@@ -6166,7 +6212,16 @@ class AppController(QObject):
 
         _, _, save_revision = session_info
         live_state = self._live_edit_session_state
-        if not self._current_live_session_has_meaningful_edits():
+        has_meaningful_edits = self._current_live_session_has_meaningful_edits()
+        baseline_has_meaningful_edits = bool(
+            live_state
+            and (
+                live_state.submitted_has_meaningful_edits
+                if live_state.submitted_revision >= live_state.persisted_revision
+                else live_state.persisted_has_meaningful_edits
+            )
+        )
+        if not has_meaningful_edits and not baseline_has_meaningful_edits:
             self._mark_current_live_edit_session_clean()
             return None
         if live_state is not None and save_revision <= live_state.submitted_revision:
@@ -6245,6 +6300,7 @@ class AppController(QObject):
                 "save_action_type": "save_edit",
                 "save_image_key": save_image_key,
                 "save_revision": save_revision,
+                "save_has_meaningful_edits": has_meaningful_edits,
                 "save_request_id": uuid.uuid4().hex,
                 "session_token": session_token,
                 "edit_source_path": str(
@@ -6316,7 +6372,10 @@ class AppController(QObject):
         # release it, and a duplicate completion callback releases a token the
         # governor has already forgotten.
         context["prefetch_constraint_token"] = self._enter_prefetch_constraint("save")
-        self._mark_current_live_edit_session_submitted(context["save_revision"])
+        self._mark_current_live_edit_session_submitted(
+            context["save_revision"],
+            bool(context.get("save_has_meaningful_edits", True)),
+        )
         self.ui_state.isSaving = True
         if saving_status:
             self.ui_state.statusMessage = saving_status
@@ -6447,7 +6506,10 @@ class AppController(QObject):
         # Same per-execution token as the async path; _on_save_finished below
         # releases it from the result dict regardless of outcome.
         context["prefetch_constraint_token"] = self._enter_prefetch_constraint("save")
-        self._mark_current_live_edit_session_submitted(context["save_revision"])
+        self._mark_current_live_edit_session_submitted(
+            context["save_revision"],
+            bool(context.get("save_has_meaningful_edits", True)),
+        )
         self.ui_state.isSaving = True
         if saving_status:
             self.update_status_message(saving_status)
@@ -6718,7 +6780,10 @@ class AppController(QObject):
             # time and are immune to editor/navigation changes during the save.
             editor_was_open = save_result.get("editor_was_open", False)
             if still_on_same_session and save_revision is not None:
-                self._mark_current_live_edit_session_persisted(int(save_revision))
+                self._mark_current_live_edit_session_persisted(
+                    int(save_revision),
+                    bool(save_result.get("save_has_meaningful_edits", True)),
+                )
 
             if still_on_same_session:
                 # 1. Editor Cleanup (only if revision is unchanged)
@@ -6761,6 +6826,9 @@ class AppController(QObject):
                     metadata_path,
                     completed_edit_state_request_id=save_result.get("save_request_id"),
                     saved_edit_state=saved_edit_state,
+                    clear_saved_edit_state=not bool(
+                        save_result.get("save_has_meaningful_edits", True)
+                    ),
                 )
                 save_directory_key = save_result.get("save_directory_key")
                 current_directory_key = self._key(self.image_dir)
@@ -14639,6 +14707,9 @@ class AppController(QObject):
                         Path(meta_path_str),
                         completed_edit_state_request_id=ctx.get("save_request_id"),
                         saved_edit_state=saved_edit_state,
+                        clear_saved_edit_state=not bool(
+                            ctx.get("save_has_meaningful_edits", True)
+                        ),
                     )
                     self._forget_pending_edit_save_request(
                         ctx.get("save_image_key"), ctx.get("save_request_id")
@@ -15320,6 +15391,7 @@ class AppController(QObject):
         *,
         completed_edit_state_request_id: Optional[str] = None,
         saved_edit_state: Optional[dict[str, Any]] = None,
+        clear_saved_edit_state: bool = False,
     ) -> Optional[dict]:
         """Mark an image as edited and return the pre-save metadata snapshot."""
         old_meta = self._capture_metadata_snapshot(sidecar, image_path)
@@ -15344,7 +15416,19 @@ class AppController(QObject):
                     completed_edit_state_request_id,
                 )
             else:
-                new_meta["edit_state"] = saved_edit_state
+                new_meta["edit_state"] = (
+                    None if clear_saved_edit_state else saved_edit_state
+                )
+        elif clear_saved_edit_state:
+            current_edit_state = new_meta.get("edit_state")
+            if not (
+                isinstance(current_edit_state, dict)
+                and current_edit_state.get("status") == "pending_save"
+                and completed_edit_state_request_id is not None
+                and current_edit_state.get("request_id")
+                != completed_edit_state_request_id
+            ):
+                new_meta["edit_state"] = None
         if not sidecar.update_metadata(image_path, new_meta):
             log.error(
                 "Image pixels were saved but edited metadata remains pending for %s",
@@ -16438,8 +16522,13 @@ class AppController(QObject):
                     clear_editor=False,
                 )
                 self._bind_loaded_editor_output_path(active_path)
-                self._restore_pending_edit_state_for_loaded_path(active_path)
-                self._ensure_live_edit_session_state(force_reset=True)
+                restored = self._restore_pending_edit_state_for_loaded_path(active_path)
+                self._ensure_live_edit_session_state(
+                    force_reset=True,
+                    restored_has_meaningful_edits=(
+                        restored and self._current_live_session_has_meaningful_edits()
+                    ),
+                )
                 # Notify UIState to update bindings
                 # We do this via signals or by calling the update function on UIState if available
                 # But UIState listens to editor signals?
@@ -17052,28 +17141,31 @@ class AppController(QObject):
         self._update_local_overlay()
 
     def _stack_geometry(self):
-        """(base_shape, A, out_shape) for exact stack paint geometry, or None."""
+        """(base_shape, A, out_shape) for exact brush geometry, or None."""
         base_shape = self.image_editor.geometry_base_shape()
-        if base_shape is None:
+        if (
+            not isinstance(base_shape, (tuple, list))
+            or len(base_shape) != 2
+            or any(not isinstance(v, (int, np.integer)) or v <= 0 for v in base_shape)
+        ):
             return None
+        base_shape = (int(base_shape[0]), int(base_shape[1]))
         a, out_shape = geometry_affine(self.image_editor.current_edits, base_shape)
         return base_shape, a, out_shape
 
     def _brush_point(self, x_norm: float, y_norm: float) -> tuple[float, float]:
         """Displayed-image [0,1] coords -> oriented base image [0,1] coords.
 
-        Stack paint composites real pixels through the renderer's exact
-        geometry, so it needs the exact inverse (the mask_engine model is
-        approximate under straighten). Dodge & burn keeps the model it
-        renders with, so its strokes stay under the cursor too.
+        Both brush renderers use the renderer's exact geometry affine, so
+        capture strokes through that affine's exact inverse too.
         """
         edits = self.image_editor.current_edits
-        if self.ui_state.brushTool == "stack":
-            base_shape = self.image_editor.geometry_base_shape()
-            if base_shape is not None:
-                inv = np.linalg.inv(geometry_normalized_affine(edits, base_shape))
-                u, v, _ = inv @ np.array([x_norm, y_norm, 1.0])
-                return float(u), float(v)
+        geometry = self._stack_geometry()
+        if geometry is not None:
+            base_shape, _affine, _out_shape = geometry
+            inv = np.linalg.inv(geometry_normalized_affine(edits, base_shape))
+            u, v, _ = inv @ np.array([x_norm, y_norm, 1.0])
+            return float(u), float(v)
         return inverse_transform(x_norm, y_norm, edits, (1, 1))
 
     def _painting_masks(self) -> list[MaskData]:
@@ -17256,7 +17348,7 @@ class AppController(QObject):
         if crop_box is not None and len(crop_box) == 4:
             cw = max(1e-3, (crop_box[2] - crop_box[0]) / 1000)
             ch = max(1e-3, (crop_box[3] - crop_box[1]) / 1000)
-        geometry = self._stack_geometry() if ui.brushTool == "stack" else None
+        geometry = self._stack_geometry()
         if geometry is not None:
             # Exact displayed fraction of the (rotated) base image, including
             # the straighten autocrop, so the ring matches the painted size.
@@ -17267,19 +17359,10 @@ class AppController(QObject):
         ui.brushCropScale = [cw, ch]
 
     def _local_overlay_shape(self) -> Optional[Tuple[int, int]]:
-        source = self.image_editor.float_preview
-        if source is None:
-            source = self.image_editor.float_image
-        if source is None:
+        geometry = self._stack_geometry()
+        if geometry is None:
             return None
-        h, w = source.shape[:2]
-        edits = self.image_editor.current_edits
-        if (int(edits.get("rotation", 0)) // 90) % 2:
-            h, w = w, h
-        crop_box = edits.get("crop_box")
-        if crop_box is not None and len(crop_box) == 4:
-            w *= max(1e-3, (crop_box[2] - crop_box[0]) / 1000)
-            h *= max(1e-3, (crop_box[3] - crop_box[1]) / 1000)
+        _base_shape, _affine, (h, w) = geometry
         scale = self._LOCAL_OVERLAY_LONG_EDGE / max(h, w, 1)
         return max(1, round(h * scale)), max(1, round(w * scale))
 
@@ -17389,6 +17472,12 @@ class AppController(QObject):
             h, w = shape
             overlay = np.zeros((h, w, 4), dtype=np.uint8)
             r, g, b = self._LOCAL_OVERLAY_RGB
+            base_shape = self.image_editor.geometry_base_shape()
+            point_transform = None
+            if base_shape is not None:
+                point_transform = np.diag([w, h, 1.0]) @ geometry_normalized_affine(
+                    self.image_editor.current_edits, base_shape
+                )
             for layer_id, mask in masks:
                 density = rasterize_layer_density(
                     layer_id,
@@ -17396,6 +17485,8 @@ class AppController(QObject):
                     shape,
                     self.image_editor.current_edits,
                     cache=self._local_overlay_cache,
+                    base_shape=base_shape,
+                    point_transform=point_transform,
                 )
                 if density is None:
                     continue
@@ -17647,7 +17738,7 @@ class AppController(QObject):
         sources[name] = payload["source"]
         # Rebind, never mutate: the render worker may be iterating the old dict.
         editor._stack_sources = sources
-        editor.touch_local_masks()
+        editor.invalidate_render_cache()
         self._kick_preview_worker()
         if self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
             self.update_status_message(

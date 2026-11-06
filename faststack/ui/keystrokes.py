@@ -95,7 +95,10 @@ class Keybinder:
         modifiers = event.modifiers()
         log.debug(f"Key pressed: {key} ({text!r}) with modifiers {modifiers}")
 
-        if text == "|" and modifiers == Qt.ShiftModifier:
+        # Match the character produced by the active keyboard layout. AltGr is
+        # represented as Ctrl+Alt on common layouts, so exact modifier matching
+        # rejects a valid | even though that is the documented shortcut.
+        if text == "|":
             self._call("clear_all_batches")
             return True
 

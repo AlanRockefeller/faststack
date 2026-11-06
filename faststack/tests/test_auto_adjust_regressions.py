@@ -155,6 +155,9 @@ class _Controller:
     def deepen_auto_adjust_blacks(self):
         self.calls.append("deepen_auto_adjust_blacks")
 
+    def clear_all_batches(self):
+        self.calls.append("clear_all_batches")
+
 
 def test_clear_active_auto_adjust_state_clears_editor_even_if_editor_ui_is_open():
     clear_active_auto_adjust_state = _extract_app_method(
@@ -353,3 +356,20 @@ def test_shift_minus_character_still_triggers_highlight_adjust():
 
     assert handled is True
     assert controller.calls == ["reduce_auto_adjust_highlights"]
+
+
+def test_altgr_pipe_character_clears_batches():
+    keybinder_cls = _load_keybinder_class()
+    controller = _Controller()
+    keybinder = keybinder_cls(controller)
+
+    handled = keybinder.handle_key_press(
+        _Event(
+            _Qt.Key_Backslash,
+            "|",
+            _Qt.ControlModifier | _Qt.AltModifier,
+        )
+    )
+
+    assert handled is True
+    assert controller.calls == ["clear_all_batches"]
