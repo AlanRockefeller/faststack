@@ -332,8 +332,8 @@ def _resize_2d(arr: np.ndarray, size: tuple, *, shrink: bool) -> np.ndarray:
     from PIL import Image
 
     resample = Image.Resampling.BOX if shrink else Image.Resampling.BILINEAR
-    img = Image.fromarray(np.ascontiguousarray(arr, dtype=np.float32), mode="F")
-    return np.asarray(img.resize(size, resample=resample), dtype=np.float32)
+    img = Image.fromarray(np.ascontiguousarray(arr, dtype=np.float32))
+    return np.array(img.resize(size, resample=resample), dtype=np.float32, copy=True)
 
 
 def compute_highlight_base(rgb_linear: np.ndarray) -> tuple:

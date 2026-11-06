@@ -214,10 +214,13 @@ def _stroke_coverage(
 
     # The distance canvas extends past the image edge by the brush radius so
     # a stroke whose path runs just outside the frame still paints inside it.
-    cx0 = int(math.floor(min(x0, min_x - pad)))
-    cy0 = int(math.floor(min(y0, min_y - pad)))
-    cx1 = int(math.ceil(max(x1, max_x + pad))) + 1
-    cy1 = int(math.ceil(max(y1, max_y + pad))) + 1
+    # Limit it to the output box plus that radius: after a tight crop, stored
+    # path points can otherwise be many crop widths outside the image.
+    ipad = int(math.ceil(pad))
+    cx0 = int(math.floor(max(x0 - ipad, min_x - pad)))
+    cy0 = int(math.floor(max(y0 - ipad, min_y - pad)))
+    cx1 = int(math.ceil(min(x1 + ipad, max_x + pad))) + 1
+    cy1 = int(math.ceil(min(y1 + ipad, max_y + pad))) + 1
     local = pixel_points - (cx0, cy0)
 
     cv2 = get_cv2()
@@ -225,7 +228,9 @@ def _stroke_coverage(
         canvas = np.full((cy1 - cy0, cx1 - cx0), 255, dtype=np.uint8)
         ipts = np.round(local).astype(np.int32)
         if len(ipts) == 1:
-            canvas[ipts[0, 1], ipts[0, 0]] = 0
+            px, py = ipts[0]
+            if 0 <= py < canvas.shape[0] and 0 <= px < canvas.shape[1]:
+                canvas[py, px] = 0
         else:
             cv2.polylines(canvas, [ipts.reshape(-1, 1, 2)], False, 0, 1)
         dist = cv2.distanceTransform(canvas, cv2.DIST_L2, 5)

@@ -9036,24 +9036,32 @@ class AppController(QObject):
         # Notify UI state via signal
         self.ui_state.isGridViewActiveChanged.emit(active)
 
+    def _grid_child_folder_for_delete(self, path: str) -> Optional[Path]:
+        """Resolve *path* when it is a direct child of the grid directory."""
+        model = self._thumbnail_model
+        if model is None:
+            return None
+        try:
+            folder_path = Path(path).resolve()
+            current_directory = Path(model.current_directory).resolve()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if folder_path.parent != current_directory:
+            return None
+        return folder_path
+
     def grid_inspect_folder_for_delete(self, path: str) -> dict:
         """Report whether a grid folder is empty / almost empty (no images)."""
-        folder_path = Path(path)
-        if (
-            self._thumbnail_model
-            and folder_path.parent != self._thumbnail_model.current_directory
-        ):
+        folder_path = self._grid_child_folder_for_delete(path)
+        if folder_path is None:
             # Only child folders of the grid's directory (never "..").
             return {"deletable": False, "reason": "not a child folder"}
         return inspect_folder_for_delete(folder_path).to_qml()
 
     def grid_delete_folder(self, path: str, expected_items: list) -> None:
         """Delete a folder previously reported deletable by the inspector."""
-        folder_path = Path(path)
-        if (
-            self._thumbnail_model
-            and folder_path.parent != self._thumbnail_model.current_directory
-        ):
+        folder_path = self._grid_child_folder_for_delete(path)
+        if folder_path is None:
             log.warning("Refusing to delete non-child folder %s", path)
             return
         error = delete_inspected_folder(
@@ -17550,9 +17558,7 @@ class AppController(QObject):
         """Load the inputs that the current image's stack layers paint."""
         if not self._stack_input_paths:
             return
-        for layer in stack_layers(
-            self.image_editor.current_edits, include_hidden=True
-        ):
+        for layer in stack_layers(self.image_editor.current_edits, include_hidden=True):
             self._request_stack_source(layer["source"])
 
     def _request_stack_source(self, name: str) -> None:

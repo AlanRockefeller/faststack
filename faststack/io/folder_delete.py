@@ -7,7 +7,6 @@ reported as "almost empty" so the UI can list what is there and ask first.
 
 import logging
 import os
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
@@ -128,10 +127,16 @@ def delete_inspected_folder(path: Path, expected_items: List[str]) -> str:
     if sorted(expected_items) != current.items:
         return "Folder contents changed; not deleted"
     try:
-        if current.empty:
-            os.rmdir(path)
-        else:
-            shutil.rmtree(path)
+        # Remove only the entries that were inspected. If anything appears
+        # after the check, one of the rmdir calls fails instead of recursively
+        # deleting the unexpected content.
+        for rel in reversed(current.items):
+            target = path / rel.rstrip("/")
+            if rel.endswith("/"):
+                os.rmdir(target)
+            else:
+                os.unlink(target)
+        os.rmdir(path)
     except OSError as exc:
         log.warning("Failed to delete folder %s: %s", path, exc)
         return f"Could not delete folder: {exc}"

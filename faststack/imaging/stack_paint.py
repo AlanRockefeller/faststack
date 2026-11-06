@@ -74,8 +74,7 @@ def stack_layers(
     return [
         layer
         for layer in edits.get("local_layers") or ()
-        if is_stack_layer(layer)
-        and (include_hidden or layer.get("visible", True))
+        if is_stack_layer(layer) and (include_hidden or layer.get("visible", True))
     ]
 
 
