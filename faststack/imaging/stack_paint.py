@@ -47,7 +47,7 @@ _MIN_INLIERS = 25
 _MIN_LEVEL_LONG_EDGE = 384
 
 # Geometry-neutral edits: stack masks are rasterised in base image space.
-_BASE_SPACE_EDITS: Dict[str, Any] = {
+BASE_SPACE_EDITS: Dict[str, Any] = {
     "rotation": 0,
     "straighten_angle": 0.0,
     "crop_box": None,
@@ -399,7 +399,7 @@ def composite_stack_layers(
         if mask is None or (source is None and not is_output):
             continue
         density = rasterize_layer_density(
-            layer["id"], mask, (h, w), _BASE_SPACE_EDITS, cache=cache
+            layer["id"], mask, (h, w), BASE_SPACE_EDITS, cache=cache
         )
         if density is None:
             continue

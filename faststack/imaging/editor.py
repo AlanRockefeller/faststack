@@ -750,6 +750,103 @@ def _rotated_content_point(
     )
 
 
+def geometry_affine(
+    edits: Dict[str, Any], base_shape: Tuple[int, int]
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """Exact pixel geometry of ``_apply_edits`` steps 1-3 as an affine map.
+
+    Returns ``(A, (out_h, out_w))`` where the 3x3 matrix ``A`` maps
+    continuous pixel coordinates (pixel centres at ``i + 0.5``) of an
+    oriented base image of *base_shape* to those of the post-geometry
+    (rotated, straightened, cropped) image of size ``(out_h, out_w)``.
+    Built from the same helpers as the renderer, so unlike the stroke
+    model in ``mask_engine`` it is exact for straighten and its autocrop.
+    Keep in step with the geometry block of ``_apply_edits``.
+    """
+    h, w = int(base_shape[0]), int(base_shape[1])
+    a = np.eye(3)
+
+    def then(m: np.ndarray) -> None:
+        nonlocal a
+        a = m @ a
+
+    k = (int(edits.get("rotation", 0) or 0) // 90) % 4
+    if k == 1:  # np.rot90 once (CCW): (x, y) -> (y, W - x)
+        then(np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, w], [0.0, 0.0, 1.0]]))
+        w, h = h, w
+    elif k == 2:
+        then(np.array([[-1.0, 0.0, w], [0.0, -1.0, h], [0.0, 0.0, 1.0]]))
+    elif k == 3:  # (x, y) -> (H - y, x)
+        then(np.array([[0.0, -1.0, h], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]))
+        w, h = h, w
+
+    straighten = float(edits.get("straighten_angle", 0.0) or 0.0)
+    crop_vals: Optional[tuple] = None
+    crop_edit = edits.get("crop_box")
+    if crop_edit:
+        try:
+            if len(crop_edit) == 4:
+                crop_vals = tuple(float(v) for v in crop_edit)
+        except (TypeError, ValueError):
+            crop_vals = None
+        if crop_vals == (0.0, 0.0, 1000.0, 1000.0):
+            crop_vals = None
+
+    orig_w, orig_h = w, h
+    if abs(straighten) > 0.001:
+        angle = -straighten  # _apply_edits rotates by -straighten_angle
+        if abs(angle) >= 0.01:  # _rotate_float_image no-op threshold
+            new_w, new_h = _expanded_canvas_size(w, h, angle)
+            rad = math.radians(angle)
+            cos_a, sin_a = math.cos(rad), math.sin(rad)
+            cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+            # cv2.getRotationMatrix2D(center, angle, 1) in index coords.
+            rot = np.array(
+                [
+                    [cos_a, sin_a, (1 - cos_a) * cx - sin_a * cy + (new_w - w) / 2.0],
+                    [-sin_a, cos_a, sin_a * cx + (1 - cos_a) * cy + (new_h - h) / 2.0],
+                    [0.0, 0.0, 1.0],
+                ]
+            )
+            to_idx = np.array([[1.0, 0, -0.5], [0, 1.0, -0.5], [0, 0, 1.0]])
+            from_idx = np.array([[1.0, 0, 0.5], [0, 1.0, 0.5], [0, 0, 1.0]])
+            then(from_idx @ rot @ to_idx)
+            w, h = new_w, new_h
+        if crop_vals is None:
+            cw, ch = _rotated_rect_with_max_area(
+                orig_w, orig_h, math.radians(straighten)
+            )
+            left, top, right, bottom = _autocrop_canvas_rect(cw, ch, w, h, straighten)
+            then(np.array([[1.0, 0, -left], [0, 1.0, -top], [0, 0, 1.0]]))
+            w, h = right - left, bottom - top
+
+    if crop_vals is not None:
+        if abs(straighten) > 0.001:
+            left, top, right, bottom = _crop_box_canvas_rect(
+                crop_vals, orig_w, orig_h, straighten, w, h
+            )
+        else:
+            left = max(0, int(round(crop_vals[0] * w / 1000)))
+            top = max(0, int(round(crop_vals[1] * h / 1000)))
+            right = min(w, int(round(crop_vals[2] * w / 1000)))
+            bottom = min(h, int(round(crop_vals[3] * h / 1000)))
+        if right > left and bottom > top:
+            then(np.array([[1.0, 0, -left], [0, 1.0, -top], [0, 0, 1.0]]))
+            w, h = right - left, bottom - top
+
+    return a, (h, w)
+
+
+def geometry_normalized_affine(
+    edits: Dict[str, Any], base_shape: Tuple[int, int]
+) -> np.ndarray:
+    """``geometry_affine`` between normalised [0, 1] coordinates: oriented
+    base image -> displayed (post-geometry) image."""
+    a, (out_h, out_w) = geometry_affine(edits, base_shape)
+    bh, bw = base_shape
+    return np.diag([1.0 / out_w, 1.0 / out_h, 1.0]) @ a @ np.diag([bw, bh, 1.0])
+
+
 def _autocrop_canvas_rect(
     cw: int, ch: int, canvas_w: int, canvas_h: int, straighten_angle: float
 ) -> tuple[int, int, int, int]:
@@ -3782,6 +3879,14 @@ class ImageEditor:
     def get_preview_data(self) -> Optional[DecodedImage]:
         """Apply current edits and return the data as a DecodedImage."""
         return self.get_preview_data_cached()
+
+    def geometry_base_shape(self) -> Optional[Tuple[int, int]]:
+        """Full-resolution oriented base shape for ``geometry_affine``."""
+        with self._lock:
+            for arr in (self.float_image, self.float_preview):
+                if arr is not None:
+                    return arr.shape[:2]
+        return None
 
     def get_edit_value(self, key: str, default: Any = None) -> Any:
         """Thread-safe retrieval of an edit parameter."""

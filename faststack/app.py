@@ -123,6 +123,8 @@ from faststack.imaging.editor import (
     ImageEditor,
     _safe_replace,
     fit_scale_in_box,
+    geometry_affine,
+    geometry_normalized_affine,
 )
 from faststack.imaging.local_adjust import (
     LOCAL_ADJUST_KEYS,
@@ -137,7 +139,9 @@ from faststack.imaging.mask_engine import (
     rasterize_layer_density,
 )
 from faststack.imaging.metadata import get_exif_data
+from faststack.imaging.optional_deps import get_cv2
 from faststack.imaging.stack_paint import (
+    BASE_SPACE_EDITS,
     STACK_OUTPUT_SOURCE,
     is_stack_layer,
     load_stack_source,
@@ -17017,9 +17021,7 @@ class AppController(QObject):
             layer_ids = [layer_id] if layer_id is not None else []
         if not layer_ids:
             return
-        point = inverse_transform(
-            x_norm, y_norm, self.image_editor.current_edits, (1, 1)
-        )
+        point = self._brush_point(x_norm, y_norm)
         stroke = MaskStroke(
             points=[point],
             radius=float(self.ui_state.brushRadius),
@@ -17035,6 +17037,31 @@ class AppController(QObject):
         self._kick_preview_worker()
         self._update_local_overlay()
 
+    def _stack_geometry(self):
+        """(base_shape, A, out_shape) for exact stack paint geometry, or None."""
+        base_shape = self.image_editor.geometry_base_shape()
+        if base_shape is None:
+            return None
+        a, out_shape = geometry_affine(self.image_editor.current_edits, base_shape)
+        return base_shape, a, out_shape
+
+    def _brush_point(self, x_norm: float, y_norm: float) -> tuple[float, float]:
+        """Displayed-image [0,1] coords -> oriented base image [0,1] coords.
+
+        Stack paint composites real pixels through the renderer's exact
+        geometry, so it needs the exact inverse (the mask_engine model is
+        approximate under straighten). Dodge & burn keeps the model it
+        renders with, so its strokes stay under the cursor too.
+        """
+        edits = self.image_editor.current_edits
+        if self.ui_state.brushTool == "stack":
+            base_shape = self.image_editor.geometry_base_shape()
+            if base_shape is not None:
+                inv = np.linalg.inv(geometry_normalized_affine(edits, base_shape))
+                u, v, _ = inv @ np.array([x_norm, y_norm, 1.0])
+                return float(u), float(v)
+        return inverse_transform(x_norm, y_norm, edits, (1, 1))
+
     def _painting_masks(self) -> list[MaskData]:
         assets = self.image_editor._mask_assets
         return [
@@ -17049,9 +17076,7 @@ class AppController(QObject):
         if not masks:
             return
         live = masks[0].live_stroke
-        point = inverse_transform(
-            x_norm, y_norm, self.image_editor.current_edits, (1, 1)
-        )
+        point = self._brush_point(x_norm, y_norm)
         last = live.points[-1]
         if abs(point[0] - last[0]) + abs(point[1] - last[1]) < live.radius * 0.05:
             return
@@ -17217,6 +17242,14 @@ class AppController(QObject):
         if crop_box is not None and len(crop_box) == 4:
             cw = max(1e-3, (crop_box[2] - crop_box[0]) / 1000)
             ch = max(1e-3, (crop_box[3] - crop_box[1]) / 1000)
+        geometry = self._stack_geometry() if ui.brushTool == "stack" else None
+        if geometry is not None:
+            # Exact displayed fraction of the (rotated) base image, including
+            # the straighten autocrop, so the ring matches the painted size.
+            (bh, bw), _a, (oh, ow) = geometry
+            if (int(self.image_editor.current_edits.get("rotation", 0)) // 90) % 2:
+                bh, bw = bw, bh
+            cw, ch = max(1e-3, ow / bw), max(1e-3, oh / bh)
         ui.brushCropScale = [cw, ch]
 
     def _local_overlay_shape(self) -> Optional[Tuple[int, int]]:
@@ -17235,6 +17268,74 @@ class AppController(QObject):
             h *= max(1e-3, (crop_box[3] - crop_box[1]) / 1000)
         scale = self._LOCAL_OVERLAY_LONG_EDGE / max(h, w, 1)
         return max(1, round(h * scale)), max(1, round(w * scale))
+
+    def _update_stack_overlay(self) -> None:
+        """Mask overlay for stack paint: every visible stack layer, flat.
+
+        Rasterised in base image space and warped through the renderer's
+        exact geometry, so it lines up with the painted pixels. Stack paint
+        is opaque after one coat, so the overlay does not build up.
+        """
+        ui = self.ui_state
+        assets = self.image_editor._mask_assets
+        masks = [
+            (layer["id"], assets[layer["id"]])
+            for layer in stack_layers(self.image_editor.current_edits)
+            if assets.get(layer["id"]) is not None
+        ]
+        geometry = self._stack_geometry()
+        cv2 = get_cv2()
+        if not masks or geometry is None or cv2 is None:
+            self._clear_local_overlay()
+            return
+        try:
+            from PySide6.QtGui import QImage
+
+            (bh, bw), a, (out_h, out_w) = geometry
+            scale = self._LOCAL_OVERLAY_LONG_EDGE / max(out_h, out_w, 1)
+            oh, ow = max(1, round(out_h * scale)), max(1, round(out_w * scale))
+            # Base raster at about the overlay's pixel density.
+            bs = min(1.0, scale)
+            rh, rw = max(1, round(bh * bs)), max(1, round(bw * bs))
+            density = np.zeros((rh, rw), np.float32)
+            for layer_id, mask in masks:
+                d = rasterize_layer_density(
+                    layer_id,
+                    mask,
+                    (rh, rw),
+                    BASE_SPACE_EDITS,
+                    cache=self._local_overlay_cache,
+                )
+                if d is not None:
+                    region = density[d.y0 : d.y1, d.x0 : d.x1]
+                    np.maximum(region, np.minimum(d.arr, 1.0), out=region)
+            # raster px -> base px -> displayed px -> overlay px, index coords.
+            m = (
+                np.array([[1.0, 0, -0.5], [0, 1.0, -0.5], [0, 0, 1.0]])
+                @ np.diag([ow / out_w, oh / out_h, 1.0])
+                @ a
+                @ np.diag([bw / rw, bh / rh, 1.0])
+                @ np.array([[1.0, 0, 0.5], [0, 1.0, 0.5], [0, 0, 1.0]])
+            )
+            warped = cv2.warpAffine(
+                density, m[:2], (ow, oh), flags=cv2.INTER_LINEAR, borderValue=0
+            )
+            overlay = np.zeros((oh, ow, 4), dtype=np.uint8)
+            r, g, b = self._LOCAL_OVERLAY_RGB
+            overlay[..., 0] = b  # ARGB32 is BGRA in memory on little-endian
+            overlay[..., 1] = g
+            overlay[..., 2] = r
+            alpha = np.clip(warped, 0.0, 1.0) * (0.45 * 255)
+            overlay[..., 3] = alpha.astype(np.uint8)
+            buf = overlay.tobytes()
+            # QImage wraps buf without copying; keep it alive with the image.
+            self._local_overlay_buffer = buf
+            ui._local_overlay_image = QImage(
+                buf, ow, oh, ow * 4, QImage.Format.Format_ARGB32
+            )
+            ui.bump_local_overlay_generation()
+        except Exception:
+            log.exception("Failed to update stack paint overlay")
 
     def _clear_local_overlay(self) -> None:
         if self.ui_state._local_overlay_image is None:
@@ -17256,12 +17357,9 @@ class AppController(QObject):
             return
         assets = self.image_editor._mask_assets
         if ui.brushTool == "stack":
-            # Stack paint shows every visible stack layer (erase acts on all).
-            layer_ids = [
-                layer["id"] for layer in stack_layers(self.image_editor.current_edits)
-            ]
-        else:
-            layer_ids = [self._local_editing_layer_id or self._local_active_layer_id]
+            self._update_stack_overlay()
+            return
+        layer_ids = [self._local_editing_layer_id or self._local_active_layer_id]
         masks = [
             (lid, assets[lid])
             for lid in layer_ids
@@ -17287,13 +17385,8 @@ class AppController(QObject):
                 )
                 if density is None:
                     continue
-                if ui.brushTool == "stack":
-                    # Stack paint is opaque after one coat (the composite
-                    # clips density at 1), so the overlay does not build up.
-                    alpha = np.clip(density.arr, 0.0, 1.0) * (0.45 * 255)
-                else:
-                    # One coat shows at 35% opacity; more coats build to 80%.
-                    alpha = np.clip(density.arr * (0.35 * 255), 0, 0.8 * 255)
+                # One coat shows at 35% opacity; more coats build to 80%.
+                alpha = np.clip(density.arr * (0.35 * 255), 0, 0.8 * 255)
                 region = overlay[density.y0 : density.y1, density.x0 : density.x1]
                 region[..., 0] = b  # ARGB32 is BGRA in memory on little-endian
                 region[..., 1] = g
