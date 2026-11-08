@@ -1,8 +1,27 @@
 """Core data types and enumerations for FastStack."""
 
 import dataclasses
+import hashlib
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+def filesystem_source_identity(stat_result: os.stat_result) -> str:
+    """Return a cheap stable token for the filesystem object behind an image.
+
+    This deliberately avoids content hashing. A same-size in-place rewrite
+    that preserves every cheap timestamp/file-id field (possible on Windows)
+    cannot be detected by this scheme and still requires manual refresh.
+    """
+    fields = (
+        getattr(stat_result, "st_mtime_ns", 0),
+        getattr(stat_result, "st_size", 0),
+        getattr(stat_result, "st_ino", 0),
+        getattr(stat_result, "st_ctime_ns", 0),
+    )
+    payload = ":".join(str(value or 0) for value in fields).encode("ascii")
+    return hashlib.blake2s(payload, digest_size=8).hexdigest()
 
 
 @dataclasses.dataclass
@@ -18,6 +37,11 @@ class ImageFile:
     sort_name_cf: Optional[str] = None
     has_backups: bool = False
     has_developed: bool = False
+    # Stat details captured by the folder scan so the thumbnail grid does not
+    # stat every image again on the UI thread. None means "unknown, stat it".
+    # The controller clears both when it rewrites the file itself.
+    mtime_ns: Optional[int] = None
+    source_identity: Optional[str] = None
 
     @property
     def raw_path(self) -> Optional[Path]:

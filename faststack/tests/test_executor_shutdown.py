@@ -20,7 +20,9 @@ def test_shutdown_drains_queue_by_default():
 
     def task(val):
         started_event.set()
-        time.sleep(0.1)
+        if val == "head":
+            # Keep the worker busy while the rest is queued and shutdown starts.
+            time.sleep(0.05)
         results.append(val)
         return val
 
@@ -57,26 +59,33 @@ def test_shutdown_can_cancel_queued():
 
     results = []
     started_event = threading.Event()
+    release_head = threading.Event()
 
     def task(val):
         started_event.set()
-        time.sleep(0.1)
+        if val == "head":
+            # Hold the worker until the queued tasks have been cancelled, so a
+            # scheduling delay cannot let one of them start first.
+            release_head.wait(timeout=5.0)
         results.append(val)
         return val
 
     # Occupy the worker
     f1 = executor.submit(task, "head")
-    started_event.wait(timeout=1.0)
+    assert started_event.wait(timeout=1.0)
 
     # Queue some items
     f2 = executor.submit(task, "queued1")
     f3 = executor.submit(task, "queued2")
 
-    # Shutdown WITH cancelling futures
-    executor.shutdown(wait=True, cancel_futures=True)
+    # Cancel the queue while the head task is still blocked, then let it
+    # finish and wait for the workers to exit.
+    executor.shutdown(wait=False, cancel_futures=True)
+    release_head.set()
+    executor.shutdown(wait=True)
 
     # f1 should finish (it was running)
-    assert f1.result() == "head"
+    assert f1.result(timeout=5.0) == "head"
     assert "head" in results
 
     # f2 and f3 should be cancelled

@@ -117,16 +117,129 @@ def symlinks_restorable() -> bool:
     return os.link in os.supports_follow_symlinks
 
 
+RESTORE_LINK = "link"
+RESTORE_EXCLUSIVE_COPY = "copy"
+
+
+def _exclusive_copy_restore(source: Path, target: Path) -> None:
+    """Copy *source* to *target*, failing if *target* already exists.
+
+    The no-replace fallback for filesystems without hard links (FAT32/exFAT
+    camera cards and USB drives). ``O_CREAT | O_EXCL`` is an atomic
+    exclusive create everywhere, so a file that appeared at the authorized
+    pathname is never overwritten -- the same guarantee the hard link gives.
+    Unlike a link the bytes are copied, so the content becomes visible
+    progressively; a failed copy removes only the file this call created.
+    """
+    if source.is_symlink():
+        raise NotImplementedError(
+            f"Cannot restore {target.name} as a symlink by copying."
+        )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(target, flags, 0o666)
+    try:
+        created = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        # O_EXCL guarantees this call created the file an instant ago, so it
+        # is safe to remove without the identity check used below.
+        try:
+            os.unlink(target)
+        except OSError:
+            log.warning("Could not remove partial restore %s", target)
+        raise
+    try:
+        with os.fdopen(fd, "wb") as dst:
+            fd = -1  # Owned by the file object now.
+            with open(source, "rb") as src:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        shutil.copystat(source, target)
+    except BaseException:
+        if fd != -1:
+            os.close(fd)
+        _unlink_if_same_file(target, created)
+        raise
+
+
+def _unlink_if_same_file(path: Path, expected: os.stat_result) -> None:
+    """Remove *path* only while it is still the file *expected* describes.
+
+    O_EXCL guarantees the create, not a later unlink: another writer could
+    have replaced the partial copy in the meantime, and its file must stay.
+    """
+    try:
+        current = os.lstat(path)
+    except OSError:
+        return  # Already gone.
+    if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+        log.warning(
+            "Not removing partial restore %s: another file now has that name",
+            path,
+        )
+        return
+    try:
+        path.unlink()
+    except OSError:
+        log.warning("Could not remove partial restore %s", path)
+
+
+def restore_without_replace(source: Path, target: Path) -> None:
+    """Move *source* back to *target* without ever overwriting *target*.
+
+    Tries an atomic hard link first and falls back to an exclusive-create copy
+    on filesystems without hard links. Raises FileExistsError (leaving
+    *source* in place) when a file appeared at *target* in the meantime.
+    """
+    try:
+        _atomic_no_replace_link(source, target)
+    except FileExistsError:
+        raise
+    except (OSError, NotImplementedError):
+        _exclusive_copy_restore(source, target)
+    source.unlink()
+
+
+def _require_space_for_copy_rollback(
+    transaction_dir: Path, candidates: list[tuple[Path, FileIdentity]]
+) -> None:
+    """Refuse to stage when a copy-based rollback could run out of space.
+
+    Without hard links both the recovery copies and a rollback are byte
+    copies. If a recovery copy fails with ENOSPC, rolling the already-staged
+    members back needs space as well; with none left they would be stranded
+    in the hidden transaction directory under their staging names. Checked
+    before the first file moves so the transaction fails cleanly instead.
+    """
+    sizes = [identity.size or 0 for _path, identity in candidates]
+    required = sum(sizes) + max(sizes, default=0)
+    try:
+        free = shutil.disk_usage(transaction_dir).free
+    except OSError:
+        return  # Unknown capacity; behave as before.
+    if free < required:
+        raise OSError(
+            "Permanent deletion refused: this drive cannot hard link and has "
+            f"{free / 1e6:.0f} MB free, less than the {required / 1e6:.0f} MB "
+            "needed to keep the deletion recoverable. Free some space and try "
+            "again."
+        )
+
+
 def _verify_rollback_capability(
     transaction_dir: Path, destinations: list[Path]
-) -> None:
-    """Raise OSError unless staged files can be rolled back atomically.
+) -> dict[Path, str]:
+    """Choose, and prove, a no-replace restore method for each destination.
 
-    Filesystems such as exFAT do not support hard links, so the restore path
-    used by a failed transaction has to be proven *before* the first source
-    file is moved. The probe links out of the transaction directory into each
-    destination directory, exercising the same call the rollback would make.
+    The restore path used by a failed transaction has to be proven *before*
+    the first source file is moved. A hard link (``RESTORE_LINK``) is
+    preferred: it restores the very same filesystem object. Filesystems such
+    as FAT32/exFAT do not support hard links, so there the exclusive-create
+    copy (``RESTORE_EXCLUSIVE_COPY``) is probed instead. Raises OSError only
+    when neither works.
     """
+    methods: dict[Path, str] = {}
     for directory in destinations:
         handle, probe_name = tempfile.mkstemp(
             prefix=".faststack-linkprobe-", dir=transaction_dir
@@ -134,28 +247,38 @@ def _verify_rollback_capability(
         os.close(handle)
         probe_source = Path(probe_name)
         probe_target = directory / f".faststack-linkprobe-{uuid.uuid4().hex}"
-        linked = False
+        created = False
         try:
             try:
                 _atomic_no_replace_link(probe_source, probe_target)
-                linked = True
-            except NotImplementedError as exc:
+                created = True
+                methods[directory] = RESTORE_LINK
+                continue
+            except (NotImplementedError, OSError) as exc:
+                link_error = exc
+            try:
+                _exclusive_copy_restore(probe_source, probe_target)
+                created = True
+                methods[directory] = RESTORE_EXCLUSIVE_COPY
+                log.info(
+                    "Hard links unavailable in %s (%s); rollback will use an "
+                    "exclusive-create copy",
+                    directory,
+                    link_error,
+                )
+            except (NotImplementedError, OSError) as exc:
                 raise OSError(
-                    f"Permanent deletion refused: {directory} does not support the "
-                    "atomic no-replace restore required to roll the deletion back."
-                ) from exc
-            except OSError as exc:
-                raise OSError(
-                    f"Permanent deletion refused: {directory} does not support the "
-                    "atomic no-replace restore required to roll the deletion back "
-                    f"({exc})."
+                    f"Permanent deletion refused: {directory} does not support "
+                    "a no-replace restore to roll the deletion back "
+                    f"({link_error}; {exc})."
                 ) from exc
         finally:
-            for probe in ((probe_target,) if linked else ()) + (probe_source,):
+            for probe in ((probe_target,) if created else ()) + (probe_source,):
                 try:
                     probe.unlink()
                 except OSError:
                     log.warning("Could not remove rollback probe %s", probe)
+    return methods
 
 
 def ensure_recycle_bin_dir(recycle_bin_dir: Path) -> bool:
@@ -340,13 +463,21 @@ def permanently_delete_image_files(
     )
     staged: list[tuple[Path, Path]] = []
     compensation: list[tuple[Path, Path]] = []
+    unlinked_staged: set[Path] = set()
+    restore_methods: dict[Path, str] = {}
 
     def _restore(staged_path: Path, original_path: Path) -> None:
         try:
-            # A hard link is an atomic no-replace restore: unlike os.replace,
-            # it fails if another file appeared at the authorized pathname.
-            # Its availability was proven before the first file was staged.
-            _atomic_no_replace_link(staged_path, original_path)
+            # Both methods are atomic no-replace restores: unlike os.replace,
+            # they fail if another file appeared at the authorized pathname.
+            # The method was proven before the first file was staged.
+            if (
+                restore_methods.get(original_path.parent, RESTORE_LINK)
+                == RESTORE_EXCLUSIVE_COPY
+            ):
+                _exclusive_copy_restore(staged_path, original_path)
+            else:
+                _atomic_no_replace_link(staged_path, original_path)
         except FileExistsError as exc:
             raise SourceChangedError(
                 f"Cannot restore {original_path.name}: a replacement appeared. "
@@ -375,13 +506,74 @@ def permanently_delete_image_files(
             raise SourceChangedError(detail)
         raise OSError(detail)
 
+    def _rollback_partial_unlinks() -> None:
+        """Restore every member and remove its now-redundant second copy."""
+        failures: list[tuple[Path, BaseException]] = []
+        for (staged_path, original_path), (recovery_path, recovery_original) in zip(
+            staged, compensation
+        ):
+            if recovery_original != original_path:
+                failures.append(
+                    (
+                        staged_path,
+                        OSError("permanent-delete recovery map is inconsistent"),
+                    )
+                )
+                continue
+            restore_path = (
+                recovery_path if staged_path in unlinked_staged else staged_path
+            )
+            redundant_path = (
+                staged_path if restore_path == recovery_path else recovery_path
+            )
+            try:
+                try:
+                    _restore(restore_path, original_path)
+                except FileNotFoundError:
+                    # An unlink wrapper may fail after removing the directory
+                    # entry. The complete recovery copy is still authoritative.
+                    if restore_path != staged_path:
+                        raise
+                    restore_path = recovery_path
+                    redundant_path = staged_path
+                    _restore(restore_path, original_path)
+                redundant_path.unlink(missing_ok=True)
+            except BaseException as exc:
+                failures.append((restore_path, exc))
+                log.error(
+                    "Could not fully roll back %s to %s; recovery artifact retained",
+                    restore_path,
+                    original_path,
+                    exc_info=True,
+                )
+        if not failures:
+            return
+        detail = "; ".join(f"{path}: {exc}" for path, exc in failures)
+        if any(isinstance(exc, SourceChangedError) for _path, exc in failures):
+            raise SourceChangedError(detail)
+        raise OSError(detail)
+
     try:
         # Never stage a source file before the rollback path is proven usable.
         destinations: list[Path] = []
         for path, _identity in candidates:
             if path.parent not in destinations:
                 destinations.append(path.parent)
-        _verify_rollback_capability(transaction_dir, destinations)
+        restore_methods.update(
+            _verify_rollback_capability(transaction_dir, destinations)
+        )
+        if RESTORE_EXCLUSIVE_COPY in restore_methods.values():
+            _require_space_for_copy_rollback(transaction_dir, candidates)
+        for path, _identity in candidates:
+            if (
+                restore_methods.get(path.parent) == RESTORE_EXCLUSIVE_COPY
+                and path.is_symlink()
+            ):
+                raise OSError(
+                    f"Permanent deletion refused: {path.name} is a symlink and "
+                    "this filesystem cannot restore it as one if the deletion "
+                    "has to be rolled back."
+                )
         if not symlinks_restorable():
             # A symlinked source can be staged, but not restored as a symlink
             # (see _atomic_no_replace_link). Refuse before the first move
@@ -424,8 +616,9 @@ def permanently_delete_image_files(
         try:
             for staged_path, _original_path in staged:
                 _unlink(staged_path)
+                unlinked_staged.add(staged_path)
         except BaseException:
-            _restore_all(compensation)
+            _rollback_partial_unlinks()
             raise
 
         cleanup_failures = []

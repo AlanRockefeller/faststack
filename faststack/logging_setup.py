@@ -56,8 +56,31 @@ def _can_create_dir(path: Path) -> bool:
     return _is_writable_dir(parent)
 
 
+_app_data_dir: Path | None = None
+
+
 def get_app_data_dir() -> Path:
-    """Return a writable application data directory, with fallbacks."""
+    """Return a writable application data directory, with fallbacks.
+
+    The choice is made once per process. Every caller (config, session
+    records, logs) must agree on one directory, and the writability probe
+    creates and deletes a temp file, which must not run on every call --
+    the session registry asks for this directory after each navigation.
+    """
+    global _app_data_dir
+    if _app_data_dir is None:
+        _app_data_dir = _choose_app_data_dir()
+    return _app_data_dir
+
+
+def reset_app_data_dir_cache() -> None:
+    """Forget the cached app-data directory (for tests that change HOME/APPDATA)."""
+    global _app_data_dir
+    _app_data_dir = None
+
+
+def _choose_app_data_dir() -> Path:
+    """Pick the first writable (or creatable) app-data candidate, else a temp dir."""
     candidates = []
 
     app_data = os.getenv("APPDATA")
@@ -139,13 +162,16 @@ def setup_logging(debug: bool = False, *, diagnostic: bool = False) -> Path | No
     root_logger.setLevel(logging.DEBUG if debug else logging.WARNING)
     root_logger.handlers.clear()
 
-    app_logger = logging.getLogger("faststack.app")
-    if debug:
-        app_logger.setLevel(logging.DEBUG)
-    elif diagnostic:
-        app_logger.setLevel(logging.INFO)
-    else:
-        app_logger.setLevel(logging.NOTSET)
+    # faststack.controller holds the AppController mixins that were split out
+    # of faststack.app; they keep the same verbosity.
+    for logger_name in ("faststack.app", "faststack.controller"):
+        app_logger = logging.getLogger(logger_name)
+        if debug:
+            app_logger.setLevel(logging.DEBUG)
+        elif diagnostic:
+            app_logger.setLevel(logging.INFO)
+        else:
+            app_logger.setLevel(logging.NOTSET)
 
     # A base --debugcache run keeps the root logger at WARNING, but scan timing
     # is a concise startup diagnostic rather than general INFO noise. Admit the

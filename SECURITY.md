@@ -2,14 +2,14 @@
 
 ## Supported Versions
 
-FastStack currently provides security updates for version **1.6.3 and earlier**.
+FastStack provides security updates for the **latest release** only. Fixes ship
+as a new release rather than as patches to older versions.
 
 | Version | Supported |
 | ------- | --------- |
-| 1.6.3 and earlier | :white_check_mark: |
+| Latest release (1.7.x) | :white_check_mark: |
 | Unreleased development branches | :white_check_mark: |
-
-When a future release is published, this table may be updated to describe which release lines continue to receive security fixes.
+| Older releases | :x: (upgrade to the latest release) |
 
 ## Reporting a Vulnerability
 

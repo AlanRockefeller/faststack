@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faststack"
-version = "1.6.9"
+version = "1.7.0"
 authors = [
     { name = "Alan Rockefeller" },
 ]
@@ -13,6 +13,10 @@ readme = "README.md"
 requires-python = ">=3.11,<3.15"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: MacOS",
@@ -23,7 +27,7 @@ dependencies = [
     "PyTurboJPEG>=1.8,<2.0",
     "numpy>=2.0,<3.0",
     "cachetools>=5.0,<6.0",
-    "watchdog>=4.0,<5.0",
+    "watchdog>=4.0.2,<5.0",  # 4.0.2: FSEvents schedule() accepts event_filter
     "Pillow>=12.3.0,<13.0",
     "packaging>=24.0,<26.0",
     # OpenCV 4.10+ might be required for NumPy 2.0 binary compatibility

@@ -7,6 +7,7 @@ import threading
 import time
 from numbers import Real
 from pathlib import Path
+from typing import Any, NamedTuple, Optional
 
 from PySide6.QtCore import Property, QObject, Qt, Signal, Slot
 from PySide6.QtGui import QImage
@@ -27,6 +28,116 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 
+class LoupePreviewSelection(NamedTuple):
+    """Which rendered buffer, if any, the loupe serves instead of a decode."""
+
+    kind: Optional[str]  # "editor-preview", "original-compare-preview" or None
+    image_data: Any
+    expected_path: Any
+    has_active_auto_adjust: bool
+    has_current_live_preview: bool
+
+
+def select_loupe_preview_buffer(
+    controller, index: int, generation: Optional[int]
+) -> LoupePreviewSelection:
+    """Decide whether ``index`` is served from a rendered preview buffer.
+
+    This is the one place that policy lives: ImageProvider.requestImage serves
+    the returned buffer, and the controller's non-blocking loupe source treats
+    a selection as "ready without decoding", so the two cannot disagree.
+    """
+    # The editor-rendered preview is also accepted while an auto-adjust
+    # session is live (rapid '-' / '=' before the debounced save) so the loupe
+    # tracks each keypress, and while the live edit session holds meaningful
+    # edits (e.g. a crop applied outside the editor).
+    has_active_auto_adjust = (
+        getattr(controller, "_active_auto_adjust_state", None) is not None
+    )
+    has_current_live_preview = False
+    live_preview_check = getattr(
+        controller, "_has_current_live_preview_for_index", None
+    )
+    if callable(live_preview_check):
+        try:
+            has_current_live_preview = bool(live_preview_check(index))
+        except Exception:
+            has_current_live_preview = False
+
+    # A buffer's stored session key must match the current preview provenance
+    # so a preview from an old/replaced editor session is never served.
+    provenance = None
+    get_provenance = getattr(
+        controller, "_get_current_preview_session_provenance", None
+    )
+    if callable(get_provenance):
+        try:
+            provenance = get_provenance()
+        except Exception:
+            provenance = None
+    session_key = (provenance[0], provenance[1]) if provenance is not None else None
+    compare_key = tuple(provenance) if provenance is not None else None
+    is_current = index == controller.current_index
+
+    # Comparing against the original deliberately has no isZoomed check: the
+    # user asked for the pre-edit image, so the low-res original is right even
+    # while zoomed in.
+    if (
+        getattr(controller, "_original_compare_active", False)
+        and is_current
+        and compare_key is not None
+        and controller._original_compare_preview is not None
+        and controller._original_compare_index == index
+        and getattr(controller, "_original_compare_session_key", None) == compare_key
+        and (
+            generation is None
+            or getattr(controller, "_original_compare_gen", None) == generation
+        )
+    ):
+        return LoupePreviewSelection(
+            "original-compare-preview",
+            controller._original_compare_preview,
+            compare_key[0],
+            has_active_auto_adjust,
+            has_current_live_preview,
+        )
+
+    has_valid_preview_buffer = (
+        session_key is not None
+        and controller._last_rendered_preview is not None
+        and controller._last_rendered_preview_index == index
+        and getattr(controller, "_last_rendered_preview_session_key", None)
+        == session_key
+        and (
+            generation is None
+            or getattr(controller, "_last_rendered_preview_gen", None) == generation
+        )
+    )
+    # A committed live preview is sufficient on its own; with the editor open
+    # or an auto-adjust session active the editor preview is accepted too.
+    # Zoomed in, the full-resolution decode wins over the low-res preview.
+    if (
+        (
+            controller.ui_state.isEditorOpen
+            or has_active_auto_adjust
+            or has_current_live_preview
+        )
+        and is_current
+        and not controller.ui_state.isZoomed
+        and has_valid_preview_buffer
+    ):
+        return LoupePreviewSelection(
+            "editor-preview",
+            controller._last_rendered_preview,
+            session_key[0],
+            has_active_auto_adjust,
+            has_current_live_preview,
+        )
+    return LoupePreviewSelection(
+        None, None, None, has_active_auto_adjust, has_current_live_preview
+    )
+
+
 class ImageProvider(QQuickImageProvider):
     def __init__(self, app_controller):
         super().__init__(QQuickImageProvider.ImageType.Image)
@@ -36,10 +147,16 @@ class ImageProvider(QQuickImageProvider):
         # Transparent 1x1 fallback for mask overlays (prevents grey-screen bug)
         self._transparent = QImage(1, 1, QImage.Format.Format_ARGB32)
         self._transparent.fill(Qt.GlobalColor.transparent)
-        # Keepalive queue to prevent GC of buffers currently in use by QImage
-        # Increased to 128 to prevent crashes during rapid scrolling/thrashing where
-        # QML might hold onto textures slightly longer than the Python GC expects.
-        self._keepalive = collections.deque(maxlen=128)
+        # Keepalive queue to prevent GC of buffers currently in use by QImage.
+        # A QImage built on a numpy buffer does not own the pixels, and QML can
+        # hold the texture upload slightly longer than the Python GC expects,
+        # so recently served buffers stay referenced here. The queue is bounded
+        # by bytes as well as count: the old fixed 128 entries pinned up to
+        # several GB of full-resolution frames outside the decode cache's
+        # budget. A floor of entries is always kept so the in-flight frames of
+        # a fast held-key burst can never be released early.
+        self._keepalive: collections.deque = collections.deque()
+        self._keepalive_bytes = 0
         # Lock to protect keepalive deque from concurrent access by QML rendering threads
         self._keepalive_lock = threading.Lock()
         # Pre-built sRGB color space, reused across requests instead of
@@ -50,6 +167,41 @@ class ImageProvider(QQuickImageProvider):
 
     def _fallback_image(self) -> QImage:
         return self.placeholder.copy()
+
+    # Keepalive bounds. 16 frames always survive (more than any burst of
+    # pending texture uploads); beyond that the queue is trimmed to 128
+    # entries or 256 MB, whichever is hit first.
+    _KEEPALIVE_MIN_ENTRIES = 16
+    _KEEPALIVE_MAX_ENTRIES = 128
+    _KEEPALIVE_MAX_BYTES = 256 * 1024 * 1024
+
+    @staticmethod
+    def _buffer_nbytes(buffer) -> int:
+        """Size of a served pixel buffer in bytes (0 when it cannot be measured)."""
+        nbytes = getattr(buffer, "nbytes", None)
+        if isinstance(nbytes, int):
+            return nbytes
+        try:
+            return memoryview(buffer).nbytes
+        except (TypeError, ValueError):
+            return 0
+
+    def _retain_buffer(self, buffer) -> None:
+        """Keep ``buffer`` alive until enough newer frames have been served."""
+        if buffer is None:
+            return
+        nbytes = self._buffer_nbytes(buffer)
+        with self._keepalive_lock:
+            if self._keepalive and self._keepalive[-1][0] is buffer:
+                return
+            self._keepalive.append((buffer, nbytes))
+            self._keepalive_bytes += nbytes
+            while len(self._keepalive) > self._KEEPALIVE_MIN_ENTRIES and (
+                len(self._keepalive) > self._KEEPALIVE_MAX_ENTRIES
+                or self._keepalive_bytes > self._KEEPALIVE_MAX_BYTES
+            ):
+                _old, old_bytes = self._keepalive.popleft()
+                self._keepalive_bytes -= old_bytes
 
     def _log_provider_fallback(
         self,
@@ -284,127 +436,18 @@ class ImageProvider(QQuickImageProvider):
                     )
                     return self._fallback_image()
 
-            # If editor is open, use the background-rendered preview buffer
-            # BUT only if the requested index matches the currently edited index!
-            # AND the generation matches (to avoid stale frames during rotation/param changes)
-            # FIX: If zoomed in, force full-res image instead of low-res preview
-
-            # Also accept the editor-rendered preview when an auto-adjust
-            # session is live (rapid '-' / '=' before the debounced save),
-            # so the main loupe visibly tracks each keypress.
-            has_active_auto_adjust = (
-                getattr(self.app_controller, "_active_auto_adjust_state", None)
-                is not None
-            )
-            # Also accept the editor-rendered preview when the live edit
-            # session holds meaningful edits (e.g. a crop applied outside the
-            # editor), so the main loupe reflects those edits immediately.
-            has_current_live_preview = False
-            live_preview_check = getattr(
-                self.app_controller, "_has_current_live_preview_for_index", None
-            )
-            if callable(live_preview_check):
-                try:
-                    has_current_live_preview = bool(live_preview_check(index))
-                except Exception:
-                    has_current_live_preview = False
-            # Whether there is a usable rendered preview buffer for this index.
-            # The stored session key must match the current live edit session so
-            # a preview from an old/replaced editor session can never be served.
-            # This is independent of the meaningful-edits requirement, so a valid
-            # editor-open preview displays without satisfying the stricter
-            # _has_current_live_preview_for_index() check a second time.
-            current_preview_provenance = None
-            get_preview_provenance = getattr(
-                self.app_controller,
-                "_get_current_preview_session_provenance",
-                None,
-            )
-            if callable(get_preview_provenance):
-                try:
-                    current_preview_provenance = get_preview_provenance()
-                except Exception:
-                    current_preview_provenance = None
-
-            current_preview_session_key = (
-                (
-                    current_preview_provenance[0],
-                    current_preview_provenance[1],
-                )
-                if current_preview_provenance is not None
-                else None
-            )
-            current_compare_session_key = (
-                tuple(current_preview_provenance)
-                if current_preview_provenance is not None
-                else None
-            )
-
-            has_valid_preview_buffer = (
-                current_preview_session_key is not None
-                and self.app_controller._last_rendered_preview is not None
-                and self.app_controller._last_rendered_preview_index == index
-                and getattr(
-                    self.app_controller, "_last_rendered_preview_session_key", None
-                )
-                == current_preview_session_key
-                and (
-                    gen is None
-                    or getattr(self.app_controller, "_last_rendered_preview_gen", None)
-                    == gen
-                )
-            )
-
-            # A committed live preview (session-key match) is sufficient on its
-            # own. When the editor is open or an auto-adjust session is active we
-            # also accept the editor-rendered preview, provided a valid buffer
-            # exists for the current index.
-            use_editor_preview = (
-                (
-                    self.app_controller.ui_state.isEditorOpen
-                    or has_active_auto_adjust
-                    or has_current_live_preview
-                )
-                and index == self.app_controller.current_index
-                and not self.app_controller.ui_state.isZoomed
-                and has_valid_preview_buffer
-            )
-
-            # Unlike use_editor_preview above, this intentionally has no
-            # isZoomed check: while comparing against the original, showing
-            # the low-res original preview is semantically correct even when
-            # zoomed in, since the user is explicitly asking to see the
-            # pre-edit image rather than a zoomed detail of the edited one.
-            use_original_compare_preview = (
-                getattr(self.app_controller, "_original_compare_active", False)
-                and index == self.app_controller.current_index
-                and current_compare_session_key is not None
-                and self.app_controller._original_compare_preview is not None
-                and self.app_controller._original_compare_index == index
-                and getattr(
-                    self.app_controller,
-                    "_original_compare_session_key",
-                    None,
-                )
-                == current_compare_session_key
-                and (
-                    gen is None
-                    or getattr(self.app_controller, "_original_compare_gen", None)
-                    == gen
-                )
-            )
+            selection = select_loupe_preview_buffer(self.app_controller, index, gen)
+            has_active_auto_adjust = selection.has_active_auto_adjust
+            has_current_live_preview = selection.has_current_live_preview
+            use_original_compare_preview = selection.kind == "original-compare-preview"
 
             if _trace:
                 _t_get = time.perf_counter()
 
-            if use_original_compare_preview:
-                image_data = self.app_controller._original_compare_preview
-                buffer_expected_path = current_compare_session_key[0]
-                provenance_kind = "original-compare-preview"
-            elif use_editor_preview:
-                image_data = self.app_controller._last_rendered_preview
-                buffer_expected_path = current_preview_session_key[0]
-                provenance_kind = "editor-preview"
+            if selection.kind is not None:
+                image_data = selection.image_data
+                buffer_expected_path = selection.expected_path
+                provenance_kind = selection.kind
             elif stale_cached_image_data is not None:
                 # Stale request with a cache hit found above: use it directly
                 # rather than triggering a (possibly blocking) decode.
@@ -513,9 +556,7 @@ class ImageProvider(QQuickImageProvider):
                 else:
                     # SAFETY: Keep a reference to the underlying buffer to prevent garbage collection
                     # while Qt holds the QImage. QImage created from bytes does NOT own the data.
-                    # Lock protects against concurrent access from QML rendering threads.
-                    with self._keepalive_lock:
-                        self._keepalive.append(image_data.buffer)
+                    self._retain_buffer(image_data.buffer)
 
                 # Set sRGB color space for proper color management (if available)
                 # Skip this when using ICC mode - pixels are already in monitor space
@@ -660,6 +701,9 @@ class UIState(QObject):
     currentDirectoryChanged = Signal()  # Signal when working directory changes
     stackDirectorySwitchChanged = Signal()
     settingsDialogRequested = Signal()  # Ask QML to open the Settings dialog
+    # (message, can_save): ask before handing an image with unsaved FastStack
+    # edits to the external image editor.
+    imageEditorUnsavedPromptRequested = Signal(str, bool)
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelBlackThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
@@ -739,6 +783,7 @@ class UIState(QObject):
     debugCacheChanged = Signal(bool)
     cacheStatsChanged = Signal(str)
     isDecodingChanged = Signal(bool)
+    isLoupeImagePendingChanged = Signal(bool)
     debugModeChanged = Signal(bool)  # General debug mode signal
     debugThumbTimingChanged = Signal(bool)  # Thumbnail pipeline timing
     isDialogOpenChanged = Signal(bool)  # New signal for dialog state
@@ -844,6 +889,7 @@ class UIState(QObject):
         self._debug_cache = False
         self._cache_stats = ""
         self._is_decoding = False
+        self._is_loupe_image_pending = False
         self._is_dialog_open = False
         self._is_saving = False  # Save operation in progress
         self._debug_thumb_timing = False
@@ -987,17 +1033,23 @@ class UIState(QObject):
         # yields a distinct URL (guaranteeing a reload + a fresh present ack).
         seq = getattr(self.app_controller, "_current_nav_seq", 0)
         generation = self.app_controller.ui_refresh_generation
-        note_requested = getattr(
-            self.app_controller,
-            "_note_nav_source_requested",
-            None,
-        )
-        if callable(note_requested):
-            note_requested(seq, generation)
-        return (
-            f"image://provider/{self.app_controller.current_index}"
-            f"/{generation}/{seq}"
-        )
+        index = self.app_controller.current_index
+        target = f"image://provider/{index}/{generation}/{seq}"
+        # The loupe Image loads synchronously on the GUI thread; the
+        # controller keeps the shown source until the target is decoded.
+        resolve = getattr(self.app_controller, "_resolve_loupe_image_source", None)
+        source = resolve(target, index, seq) if callable(resolve) else target
+        if not isinstance(source, str):
+            source = target
+        if source == target:
+            note_requested = getattr(
+                self.app_controller,
+                "_note_nav_source_requested",
+                None,
+            )
+            if callable(note_requested):
+                note_requested(seq, generation)
+        return source
 
     @Property(int, notify=currentImageSourceChanged)
     def currentNavSeq(self):
@@ -2587,6 +2639,18 @@ class UIState(QObject):
             self._cache_stats = value
             self.cacheStatsChanged.emit(value)
 
+    @Property(bool, notify=isLoupeImagePendingChanged)
+    def isLoupeImagePending(self) -> bool:
+        """The loupe shows the previous image while the current one decodes."""
+        return self._is_loupe_image_pending
+
+    @isLoupeImagePending.setter
+    def isLoupeImagePending(self, value: bool):
+        value = bool(value)
+        if self._is_loupe_image_pending != value:
+            self._is_loupe_image_pending = value
+            self.isLoupeImagePendingChanged.emit(value)
+
     @Property(bool, notify=isDecodingChanged)
     def isDecoding(self) -> bool:
         return self._is_decoding
@@ -2882,10 +2946,13 @@ class UIState(QObject):
             for i in reversed(indices):
                 entry = model.get_entry(i)
                 if entry and not entry.is_folder:
+                    # source_identity must match the visible tile id or the
+                    # prefetched cache entry is never consumed.
                     prefetcher.submit(
                         entry.path,
                         entry.mtime_ns,
                         size=size,
+                        source_identity=entry.source_identity,
                         priority=priority,
                     )
 

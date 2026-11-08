@@ -25,6 +25,7 @@ ApplicationWindow {
     property var savedWindowGeometry: ({})
     property bool windowGeometryReady: false
     property bool suppressWindowGeometrySave: false
+    property bool histogramOverlaidMode: true
 
     Settings {
         id: mainWindowSettings
@@ -42,15 +43,26 @@ ApplicationWindow {
         property bool savedMaximized: false
     }
 
+    // One live owner for both histogram views. Separate Settings objects that
+    // target the same key do not receive each other's changes.
+    Settings {
+        category: "histogram"
+        property alias overlaidMode: root.histogramOverlaidMode
+    }
+
     function enterFullScreenLoupe() {
         if (!root.uiStateRef || root.uiStateRef.isGridViewActive) return
 
+        // Record the derived state, not the raw visibility: a frameless
+        // maximized window reports FullScreen on Windows (see isMaximized),
+        // and restoring from that value would un-maximize it.
         savedWindowGeometry = {
             x: root.x,
             y: root.y,
             width: root.width,
             height: root.height,
-            visibility: root.visibility
+            maximized: root.isMaximized,
+            windowed: root.visibility === Window.Windowed
         }
 
         fullScreenLoupe = true
@@ -63,11 +75,11 @@ ApplicationWindow {
         root.suppressWindowGeometrySave = true
         fullScreenLoupe = false
 
-        if (savedWindowGeometry.visibility === Window.Maximized) {
+        if (savedWindowGeometry.maximized) {
             root.showMaximized()
         } else {
             root.showNormal()
-            if (savedWindowGeometry.visibility === Window.Windowed) {
+            if (savedWindowGeometry.windowed) {
                 root.x = savedWindowGeometry.x
                 root.y = savedWindowGeometry.y
                 root.width = savedWindowGeometry.width
@@ -99,9 +111,10 @@ ApplicationWindow {
         // (falling back to the current screen). Using root.screen alone would
         // pull a window restored onto a secondary monitor back to the primary,
         // because root.screen is the primary until the window is mapped.
-        var screen = WP.screenContaining(Application.screens, root.x, root.y)
-                     || root.screen
-        WP.clampToScreen(root, screen, {
+        var geometry = root.controllerRef
+                     ? root.controllerRef.available_screen_geometry(root.x, root.y)
+                     : null
+        WP.clampToScreen(root, geometry, {
             minWidth: root.minimumWidth,
             minHeight: root.minimumHeight
         })
@@ -126,9 +139,15 @@ ApplicationWindow {
             // First run: center on the active screen rather than pinning the
             // window to (0, 0). Retry after showing in case no screen was
             // available yet.
-            var centered = WP.centerOnScreen(root, root.screen)
+            var geometry = root.controllerRef
+                         ? root.controllerRef.available_screen_geometry(root.x, root.y)
+                         : null
+            var centered = WP.centerOnScreen(root, geometry)
             root.visible = true
-            if (!centered) WP.centerOnScreen(root, root.screen)
+            if (!centered && root.controllerRef) {
+                geometry = root.controllerRef.available_screen_geometry(root.x, root.y)
+                WP.centerOnScreen(root, geometry)
+            }
             root.clampWindowToVisibleScreen(true)
             // Persist the initial centered placement so the next launch
             // restores it instead of treating geometry as unsaved.
@@ -206,7 +225,13 @@ ApplicationWindow {
         }
 
         if (root.controllerRef && !root.controllerRef.prepare_for_app_close()) {
+            // A failed save vetoes this close attempt. The recycle-bin choice
+            // only applied to that attempt; ask again on the next quit.
+            root.allowCloseWithRecycleBins = false
             close.accepted = false
+            // Offer a way out so a persistent save failure cannot trap the
+            // user in the app.
+            root.openDialogSafely(unsavedCloseDialog)
             return
         }
 
@@ -1549,6 +1574,12 @@ ApplicationWindow {
         function onSettingsDialogRequested() {
             root.openSettingsDialog()
         }
+        function onImageEditorUnsavedPromptRequested(message, canSave) {
+            imageEditorUnsavedDialog.message = message
+            imageEditorUnsavedDialog.canSave = canSave
+            imageEditorUnsavedDialog.choice = "cancel"
+            root.openDialogSafely(imageEditorUnsavedDialog)
+        }
     }
 
     // Handle View Switching and Prefetch Gating
@@ -1629,6 +1660,34 @@ ApplicationWindow {
                             event.accepted = true
                         }
                     }
+                }
+            }
+
+            // The loupe keeps the previous image on screen while the current
+            // one decodes; after a short delay, say so. Fast decodes never
+            // show it.
+            BusyIndicator {
+                id: loupePendingIndicator
+                readonly property bool pending: !!root.uiStateRef && root.uiStateRef.isLoupeImagePending
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: 12
+                width: 28
+                height: 28
+                z: 10
+                running: visible
+                visible: pending && loupePendingDelay.elapsed
+                onPendingChanged: {
+                    loupePendingDelay.elapsed = false
+                    if (pending) loupePendingDelay.restart()
+                    else loupePendingDelay.stop()
+                }
+
+                Timer {
+                    id: loupePendingDelay
+                    property bool elapsed: false
+                    interval: 250
+                    onTriggered: elapsed = true
                 }
             }
         }
@@ -2204,6 +2263,7 @@ ApplicationWindow {
                           "<b>Navigation:</b><br>" +
                           "&nbsp;&nbsp;Right Arrow: Next Image<br>" +
                           "&nbsp;&nbsp;Left Arrow: Previous Image<br>" +
+                          "&nbsp;&nbsp;Shift+Left / Right: Jump 10 images<br>" +
                           "&nbsp;&nbsp;G: Jump to Image Number<br>" +
                           "&nbsp;&nbsp;Alt+U: Jump to Last Uploaded<br>" +
                           "&nbsp;&nbsp;I: Show EXIF Data<br>" +
@@ -2245,7 +2305,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;{: Begin new batch<br>" +
                           "&nbsp;&nbsp;B: Toggle current image in/out of batch<br>" +
                           "&nbsp;&nbsp;}: End current batch<br>" +
-                          "&nbsp;&nbsp;\\: Clear all batches<br><br>" +
+                          "&nbsp;&nbsp;|: Clear all batches<br><br>" +
                           "<b>Flag Toggles:</b><br>" +
                           "&nbsp;&nbsp;D: Toggle todo flag<br>" +
                           "&nbsp;&nbsp;F: Toggle favorite flag<br>" +
@@ -2254,7 +2314,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
                           "<b>File Management:</b><br>" +
                           "&nbsp;&nbsp;Delete/Backspace: Move current image to recycle bin<br>" +
-                          "&nbsp;&nbsp;Ctrl+Z: Undo last saved action<br><br>" +
+                          "&nbsp;&nbsp;Ctrl+Z: Undo (discards unsaved live edits first, then the last saved action or clear)<br><br>" +
                           "<b>Image Editing:</b><br>" +
                           "&nbsp;&nbsp;E: Toggle Image Editor<br>" +
                           "&nbsp;&nbsp;Ctrl+S (in editor): Save current live edits<br>" +
@@ -2277,12 +2337,13 @@ ApplicationWindow {
                           "&nbsp;&nbsp;&nbsp;&nbsp;[ / ]: Brush size&nbsp;&nbsp;Space+drag: Pan&nbsp;&nbsp;Ctrl+Z: Undo stroke<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;M: Toggle mask overlay&nbsp;&nbsp;Hold Ctrl: Show overlay&nbsp;&nbsp;Esc: Leave brush<br>" +
                           "&nbsp;&nbsp;O (or right-click): Toggle crop mode<br>" +
-                          "&nbsp;&nbsp;&nbsp;&nbsp;1/2/3/4: Set aspect ratio (1:1, 4:3, 3:2, 16:9)<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Aspect Ratio panel: pick a ratio, toggle the grid, or Rotate<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;Enter: Apply crop to live session<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;Esc: Cancel crop<br><br>" +
                           "<b>Other Actions:</b><br>" +
                           "&nbsp;&nbsp;Enter: Launch Focus Stacker<br>" +
                           "&nbsp;&nbsp;P: Edit in image editor (Photoshop/GIMP)<br>" +
+                          "&nbsp;&nbsp;R: Open the paired RAW in RawTherapee<br>" +
                           "&nbsp;&nbsp;H: Toggle histogram window<br>" +
                           "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
                           "&nbsp;&nbsp;Esc: Close dialog/editor, switch to grid view, or exit fullscreen"
@@ -2406,6 +2467,7 @@ ApplicationWindow {
 
     HistogramWindow {
         id: histogramWindow
+        histogramModeOwner: root
         windowBackgroundColor: root.currentBackgroundColor
         primaryTextColor: root.currentTextColor
         gridLineColor: root.isDarkTheme ? "#454545" : "#dcdcdc"
@@ -2440,6 +2502,7 @@ ApplicationWindow {
         onLoaded: {
             item.backgroundColor = Qt.binding(function() { return root.currentBackgroundColor })
             item.textColor = Qt.binding(function() { return root.currentTextColor })
+            item.histogramModeOwner = root
             Qt.callLater(function() { imageEditorLoader.loadedOnce = true })
         }
     }
@@ -2629,6 +2692,102 @@ ApplicationWindow {
             color: "black"
         }
     }
+
+    Dialog {
+        id: unsavedCloseDialog
+        title: "Edits Not Saved"
+        modal: true
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        width: Math.min(420, parent.width * 0.9)
+        standardButtons: Dialog.Yes | Dialog.No
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-unsaved-close")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-unsaved-close")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-unsaved-close")
+
+        Label {
+            width: parent.width
+            text: "Your current edits could not be saved (see the status bar).\n\nQuit anyway and discard them?"
+            wrapMode: Text.WordWrap
+        }
+
+        onAccepted: {
+            if (root.controllerRef) root.controllerRef.discard_unsaved_edits_for_close()
+            Qt.callLater(root.close)
+        }
+    }
+
+    Dialog {
+        id: imageEditorUnsavedDialog
+        title: "Unsaved FastStack Edits"
+        modal: true
+        closePolicy: Popup.CloseOnEscape
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        width: Math.min(480, parent.width * 0.9)
+        standardButtons: Dialog.NoButton
+
+        property string message: ""
+        property bool canSave: false
+        // Set by the buttons; Escape or closing any other way cancels.
+        property string choice: "cancel"
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-image-editor-unsaved")
+        onClosed: {
+            if (root.controllerRef) {
+                root.controllerRef.dialog_closed("qml-image-editor-unsaved")
+                root.controllerRef.resolve_image_editor_unsaved_prompt(imageEditorUnsavedDialog.choice)
+            }
+            imageEditorUnsavedDialog.choice = "cancel"
+        }
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-image-editor-unsaved")
+
+        ColumnLayout {
+            width: parent.width
+            spacing: 16
+
+            Label {
+                Layout.fillWidth: true
+                text: imageEditorUnsavedDialog.message
+                wrapMode: Text.WordWrap
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Item { Layout.fillWidth: true }
+
+                Button {
+                    text: "Cancel"
+                    onClicked: {
+                        imageEditorUnsavedDialog.choice = "cancel"
+                        imageEditorUnsavedDialog.close()
+                    }
+                }
+
+                Button {
+                    text: "Discard Edits"
+                    onClicked: {
+                        imageEditorUnsavedDialog.choice = "discard"
+                        imageEditorUnsavedDialog.close()
+                    }
+                }
+
+                Button {
+                    text: "Save First"
+                    highlighted: true
+                    visible: imageEditorUnsavedDialog.canSave
+                    onClicked: {
+                        imageEditorUnsavedDialog.choice = "save"
+                        imageEditorUnsavedDialog.close()
+                    }
+                }
+            }
+        }
+    }
+
     Dialog {
         id: recycleBinCleanupDialog
         title: recycleBinCleanupDialog.cleanupTitle

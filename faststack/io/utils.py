@@ -1,5 +1,7 @@
 """Utilities for filesystem operations, path normalization, and hashing."""
 
+import errno
+import functools
 import hashlib
 import json
 import logging
@@ -52,15 +54,76 @@ def fsync_directory(path: Path) -> None:
                 pass
 
 
+# fsync errnos that mean "this filesystem cannot sync", not "the data was
+# lost": some network/FUSE filesystems reject fsync outright.
+_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, "EINVAL", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "ENOSYS", None),
+    )
+    if code is not None
+)
+
+
+def fsync_file(path: Path, *, strict: bool = False) -> None:
+    """Flush an already-written file's data to stable storage.
+
+    Used before an atomic ``os.replace`` so a power loss or card pull cannot
+    leave the destination name pointing at a truncated file. A filesystem
+    that does not support fsync is tolerated (logged). Any other failure --
+    a real write-back error such as EIO or ENOSPC -- is raised when
+    ``strict`` is set, so the caller does not commit data that never reached
+    the disk; otherwise it is logged and ignored.
+    """
+    # Windows' FlushFileBuffers needs a handle opened with write access.
+    flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags)
+        os.fsync(fd)
+    except OSError as e:
+        if strict and e.errno not in _FSYNC_UNSUPPORTED_ERRNOS:
+            raise
+        # In strict mode the caller is about to commit without durability;
+        # say so where the user can see it.
+        log.log(
+            logging.WARNING if strict else logging.DEBUG,
+            "Failed to fsync file %s: %s",
+            path,
+            e,
+        )
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def atomic_write_json(path: Path, payload: object) -> None:
     """Write JSON atomically and flush the file and directory to disk."""
     temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-    with temp_path.open("w") as f:
-        json.dump(payload, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    temp_path.replace(path)
-    fsync_directory(path.parent)
+    try:
+        with temp_path.open("w") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(path)
+        fsync_directory(path.parent)
+    except BaseException:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            log.warning(
+                "Could not remove failed atomic-write temporary file %s: %s",
+                temp_path,
+                cleanup_error,
+            )
+        raise
 
 
 def normalize_path_key(path: Union[Path, str]) -> str:
@@ -80,15 +143,29 @@ def normalize_path_key(path: Union[Path, str]) -> str:
     return os.path.normcase(os.path.abspath(p_str)).replace("\\", "/")
 
 
+def _hash_path_uncached(path_str: str) -> str:
+    # normalize_path_key handles the canonicalization pure-string wise
+    norm_path = normalize_path_key(path_str)
+
+    # MD5 is used for ID generation, not security.
+    # It must map the same path to the same ID across app restarts.
+    return hashlib.md5(norm_path.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+
+
+# The thumbnail grid asks for every visible row's hash on each repaint, so
+# repeat lookups are served from memory. Bounded so a long session browsing
+# many folders cannot grow it without limit.
+_hash_path_cached = functools.lru_cache(maxsize=65536)(_hash_path_uncached)
+
+
 def compute_path_hash(path: Union[Path, str]) -> str:
     """Compute a fast, stable hash of the path for UI/Thumbnail IDs.
 
     Uses MD5 of the normalized path string.
     CRITICAL: Does NOT access the filesystem (no .resolve() calls).
     """
-    # normalize_path_key handles the canonicalization pure-string wise
-    norm_path = normalize_path_key(path)
-
-    # MD5 is used for ID generation, not security.
-    # It must map the same path to the same ID across app restarts.
-    return hashlib.md5(norm_path.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+    path_str = os.fspath(path)
+    if os.path.isabs(path_str):
+        return _hash_path_cached(path_str)
+    # A relative path's normalized form depends on the working directory.
+    return _hash_path_uncached(path_str)

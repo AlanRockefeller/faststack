@@ -60,6 +60,8 @@ from faststack.imaging.stack_paint import (
     stack_layers,
     warp_source_to_base,
 )
+from faststack.io.indexer import JPG_EXTENSIONS
+from faststack.io.utils import fsync_directory, fsync_file
 from faststack.models import DecodedImage
 from faststack.util.executors import create_daemon_threadpool_executor
 
@@ -386,10 +388,20 @@ def _normalized_wb_gains(by: float, mg: float) -> Tuple[float, float, float]:
 
 
 def _safe_replace(tmp_path: Path, target_path: Path) -> None:
-    """Atomically replace target with tmp, retrying on Windows file-lock errors."""
+    """Durably and atomically replace target with tmp.
+
+    The temporary file's data is flushed before the rename and the parent
+    directory afterwards, so a crash or power loss leaves either the old or the
+    new file under ``target_path`` rather than a truncated one. Retries on
+    Windows file-lock errors.
+    """
+    # Strict: a write-back error must fail the save rather than replace the
+    # original with data that never reached the disk.
+    fsync_file(tmp_path, strict=True)
     for attempt in range(_REPLACE_MAX_RETRIES):
         try:
             os.replace(str(tmp_path), str(target_path))
+            fsync_directory(Path(target_path).parent)
             return
         except OSError:
             if attempt < _REPLACE_MAX_RETRIES - 1:
@@ -562,26 +574,43 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
 
     # Extract base name without any existing -backup suffix
     stem = original_path.stem
-    # Remove any existing -backup, -backup2, -backup-1, etc. (handles both old and new formats)
-    base_stem = re.sub(r"-backup(-?\d+)?$", "", stem)
+    # Remove any existing -backup, -backup2, -backup-1, etc. (handles both old
+    # and new formats, and -BACKUP from case-insensitive filesystems).
+    base_stem = re.sub(r"-backup(-?\d+)?$", "", stem, flags=re.IGNORECASE)
 
-    # Try filename-backup.jpg first
-    backup_path = original_path.parent / f"{base_stem}-backup{original_path.suffix}"
-
-    # If that exists, try filename-backup2.jpg, filename-backup3.jpg, etc.
-    i = 2
-    while backup_path.exists():
+    # Try filename-backup.jpg first, then filename-backup2.jpg, -backup3, ...
+    # The name is claimed with an exclusive create so a concurrent writer (or
+    # a file appearing between the check and the copy) is never overwritten.
+    i = 1
+    while True:
+        suffix = "" if i == 1 else str(i)
         backup_path = (
-            original_path.parent / f"{base_stem}-backup{i}{original_path.suffix}"
+            original_path.parent / f"{base_stem}-backup{suffix}{original_path.suffix}"
         )
         i += 1
+        try:
+            dst = open(backup_path, "xb")
+        except FileExistsError:
+            continue
+        except OSError as e:
+            log.exception("Failed to create backup: %s", e)
+            return None
+        break
 
     try:
-        # Perform the backup
-        shutil.copy2(original_path, backup_path)
+        with dst, open(original_path, "rb") as src:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        shutil.copystat(original_path, backup_path)
+        fsync_directory(backup_path.parent)
         return backup_path
     except OSError as e:
         log.exception("Failed to create backup: %s", e)
+        try:
+            backup_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
 
 
@@ -969,6 +998,7 @@ class ImageEditor:
         self._edits_rev = 0
         self._cached_rev = -1
         self._cached_preview = None
+        self._render_cache_generation = 0
 
         # Bit depth of the loaded image (8 or 16)
         self.bit_depth: int = 8
@@ -1294,7 +1324,7 @@ class ImageEditor:
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
         _is_png = load_filepath.suffix.lower() == ".png"
-        _is_jpeg = load_filepath.suffix.lower() in (".jpg", ".jpeg")
+        _is_jpeg = load_filepath.suffix.lower() in JPG_EXTENSIONS
 
         try:
             # --- JPEG fast path: decode pixels with TurboJPEG ---
@@ -1350,6 +1380,13 @@ class ImageEditor:
                     )
                     float_image_orientation_applied = True
                 loaded_original = Image.fromarray(jpeg_arr)
+                if float_image_orientation_applied and jpeg_meta_info.get("exif"):
+                    # The pixels are already upright; reset the tag like
+                    # ImageOps.exif_transpose does on the Pillow path so the
+                    # image's EXIF never claims a rotation it no longer needs.
+                    cleaned_exif = sanitize_exif_orientation(jpeg_meta_info["exif"])
+                    if cleaned_exif is not None:
+                        jpeg_meta_info["exif"] = cleaned_exif
                 if jpeg_meta_info:
                     # Carry EXIF/ICC over so getexif() and info["icc_profile"]
                     # behave exactly like a Pillow-decoded image.
@@ -1414,6 +1451,13 @@ class ImageEditor:
                         # But consistently OpenCV uses BGR layout for 3-channel images.
                         # Let's verify by assuming BGR and swapping.
                         arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                    elif len(arr.shape) == 3 and arr.shape[2] == 4:
+                        # 16-bit RGBA TIFF/PNG: keep the 16-bit color and drop
+                        # alpha, as the 8-bit Pillow path's convert("RGB") does,
+                        # instead of falling back and losing the bit depth.
+                        arr = np.ascontiguousarray(
+                            cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
+                        )
                     else:
                         # Invalid channel count, fall back to Pillow
                         cv_img_valid = False
@@ -1589,6 +1633,11 @@ class ImageEditor:
                     self._edits_rev += 1
                     self._cached_preview = None
                     self._cached_rev = -1
+                    # Pixel-derived caches are keyed on path + mtime, and a
+                    # save restores the original mtime, so a same-path reload
+                    # with new pixels would otherwise reuse stale blurs.
+                    self._cached_detail_bands = None
+                    self._cached_highlight_analysis = None
                     break
 
             # Preview pixels are derived after EXIF orientation was applied, so
@@ -1805,6 +1854,7 @@ class ImageEditor:
                 arr = arr.astype(np.float32) / 65535.0
             else:
                 arr = arr.astype(np.float32, copy=False)
+        mask_base_shape = arr.shape[:2]
 
         # 0. Stack paint: blend painted focus-stack input pixels into the base
         # image before any geometry, so they get exactly the same geometry,
@@ -1975,6 +2025,9 @@ class ImageEditor:
         # then re-rendered over the painted bounding box with per-pixel values.
         local = None
         if effective_layers(edits):
+            mask_point_transform = np.diag(
+                [arr.shape[1], arr.shape[0], 1.0]
+            ) @ geometry_normalized_affine(edits, mask_base_shape)
             local = build_local_adjustments(
                 edits,
                 (
@@ -1988,6 +2041,8 @@ class ImageEditor:
                     if cache_override is not None
                     else self._local_density_cache
                 ),
+                base_shape=mask_base_shape,
+                point_transform=mask_point_transform,
             )
             _mark("local_masks")
 
@@ -3459,6 +3514,7 @@ class ImageEditor:
                     else None
                 )
                 rev = self._edits_rev
+                cache_generation = self._render_cache_generation
 
         if cached is not None:
             return self._resize_decoded_for_display(cached, output_size)
@@ -3486,6 +3542,7 @@ class ImageEditor:
                 edits_override is None
                 and downscale_long_edge is None
                 and self._edits_rev == rev
+                and self._render_cache_generation == cache_generation
             ):
                 self._cached_preview = decoded
                 self._cached_rev = rev
@@ -3913,6 +3970,13 @@ class ImageEditor:
         with self._lock:
             self._edits_rev += 1
 
+    def invalidate_render_cache(self) -> None:
+        """Discard rendered pixels without recording a user edit."""
+        with self._lock:
+            self._render_cache_generation += 1
+            self._cached_preview = None
+            self._cached_rev = -1
+
     def set_edit_param(self, key: str, value: Any) -> bool:
         """Update a single edit parameter."""
         with self._lock:
@@ -3957,7 +4021,12 @@ class ImageEditor:
                     log.warning("Invalid value for rotation %r: %s", value, e)
                     return False
 
-            if key in self.current_edits and key != "crop_box":
+            if key == "crop_box":
+                # The crop box has its own normalization (a full-frame box
+                # becomes None); route it there instead of silently ignoring.
+                return self.set_crop_box(value)
+
+            if key in self.current_edits:
                 # Check for floating point equality to prevent cache thrashing
                 new_val = value
                 current_val = self.current_edits.get(key)
@@ -4847,12 +4916,16 @@ class ImageEditor:
                 continue
             path = resolver(name) if resolver is not None else None
             if path is None:
-                log.warning("Stack input %s not found; saving without it", name)
-                continue
+                raise RuntimeError(
+                    f"Stack input {name} is unavailable; the painted layer was not saved"
+                )
             try:
                 sources[name] = load_stack_source(path, source_arr)
             except (OSError, StackAlignError) as exc:
-                log.warning("Stack input %s skipped in save: %s", name, exc)
+                raise RuntimeError(
+                    f"Stack input {name} could not be rendered; "
+                    "the painted layer was not saved"
+                ) from exc
         return sources
 
     def save_image(
@@ -4894,10 +4967,6 @@ class ImageEditor:
         except OSError:
             original_stat = None
 
-        backup_path = create_backup_file(original_path)
-        if backup_path is None:
-            raise RuntimeError(f"Unable to create backup for {original_path}")
-
         exif_bytes = self._get_sanitized_exif_bytes()
         icc_bytes = (
             self.original_image.info.get("icc_profile")
@@ -4928,6 +4997,11 @@ class ImageEditor:
                     fallback_kwargs["icc_profile"] = icc_bytes
                 img_u8.save(tmp_path, **fallback_kwargs)
             _validate_temp_output(tmp_path)
+            # Back up only once the new encode exists, so a failed encode does
+            # not leave a spurious -backup file behind.
+            backup_path = create_backup_file(original_path)
+            if backup_path is None:
+                raise RuntimeError(f"Unable to create backup for {original_path}")
             _safe_replace(tmp_path, original_path)
         finally:
             try:
@@ -5026,7 +5100,9 @@ class ImageEditor:
             if self.levels_soft_knee:
                 lut = _apply_levels_soft_clip(lut)
             lut = np.clip(lut, 0.0, 1.0)
-            lut_rgb = (lut * 255.0).astype(np.uint8).tolist() * 3  # 768 entries
+            # Round like the WB fast path and the float path do; truncation
+            # made this path up to one level darker than the others.
+            lut_rgb = np.rint(lut * 255.0).astype(np.uint8).tolist() * 3  # 768 entries
             with self._lock:
                 self._cached_u8_lut = (cache_key, lut_rgb)
 

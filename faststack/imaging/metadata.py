@@ -509,10 +509,18 @@ def get_exif_data(path: Union[str, Path]) -> Dict[str, Any]:
             else:
                 val = float(exposure_time)
 
-            if val < 1:
-                summary["Shutter Speed"] = f"1/{int(1 / val)}s"
+            reciprocal = 1 / val if val > 0 else 0
+            denominator = round(reciprocal)
+            if (
+                val < 1
+                and denominator >= 2
+                and abs(reciprocal - denominator) <= 0.02 * reciprocal
+            ):
+                # A true 1/N exposure (1/200, 1/3). int(1/val) used to turn
+                # e.g. 0.625s into "1/1s".
+                summary["Shutter Speed"] = f"1/{denominator}s"
             else:
-                summary["Shutter Speed"] = f"{val}s"
+                summary["Shutter Speed"] = f"{val:g}s"
         except Exception:
             summary["Shutter Speed"] = clean_exif_value(exposure_time)
 

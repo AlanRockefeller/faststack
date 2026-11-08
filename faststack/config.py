@@ -660,8 +660,8 @@ DEFAULT_CONFIG = {
         "args": "",
     },
     "raw": {
-        "source_dir": "C:\\Users\\alanr\\pictures\\olympus.stack.input.photos",
-        "secondary_source_dir": "H:\\olympus.stack.input.photos",
+        "source_dir": "",
+        "secondary_source_dir": "",
         "additional_source_dirs": "",
         "mirror_base": "",
     },
@@ -685,7 +685,7 @@ class AppConfig:
         self.config = configparser.ConfigParser(interpolation=None)
         self._changed_options: set[tuple[str, str]] = set()
         self._removed_options: set[tuple[str, str]] = set()
-        self._load_failed = False
+        self._invalid_value_warned: set[tuple[str, str]] = set()
         self.load()
 
     def load(self):
@@ -711,7 +711,6 @@ class AppConfig:
                 )
                 self.config = configparser.ConfigParser(interpolation=None)
                 self.config.read_dict(DEFAULT_CONFIG)
-                self._load_failed = True
                 for section, keys in DEFAULT_CONFIG.items():
                     for key in keys:
                         self._changed_options.add((section, key))
@@ -817,6 +816,15 @@ class AppConfig:
 
         return changed
 
+    def _snapshot_in_memory_config(self) -> configparser.ConfigParser:
+        """Copy every section/key currently loaded into a fresh parser."""
+        snapshot = configparser.ConfigParser(interpolation=None)
+        for section in self.config.sections():
+            snapshot.add_section(section)
+            for key, value in self.config.items(section, raw=True):
+                snapshot.set(section, key, value)
+        return snapshot
+
     def _read_latest_config(self) -> configparser.ConfigParser | None:
         if not self.config_path.exists():
             return configparser.ConfigParser(interpolation=None)
@@ -859,7 +867,10 @@ class AppConfig:
                         )
                         shutil.copy2(self.config_path, backup)
                         log.warning("Preserved unreadable config as %s", backup)
-                    latest = configparser.ConfigParser(interpolation=None)
+                    # Rebuild from the settings this process is running with,
+                    # not from an empty parser: otherwise only the keys changed
+                    # this session would survive, both on disk and in memory.
+                    latest = self._snapshot_in_memory_config()
 
                 for section, key in self._removed_options:
                     if latest.has_section(section):
@@ -874,7 +885,6 @@ class AppConfig:
             self.config = latest
             self._changed_options.clear()
             self._removed_options.clear()
-            self._load_failed = False
             log.info("Saved config to %s", self.config_path)
             return True
         except (OSError, configparser.Error) as e:
@@ -897,7 +907,7 @@ class AppConfig:
 
     def getint(self, section, key, fallback=None):
         """Return a config value as an integer."""
-        return self.config.getint(section, key, fallback=fallback)
+        return self._get_typed("int", int, section, key, fallback)
 
     @overload
     def getfloat(self, section, key, fallback: None = None) -> float | None: ...
@@ -906,7 +916,7 @@ class AppConfig:
 
     def getfloat(self, section, key, fallback=None):
         """Return a config value as a float."""
-        return self.config.getfloat(section, key, fallback=fallback)
+        return self._get_typed("float", float, section, key, fallback)
 
     @overload
     def getboolean(self, section, key, fallback: None = None) -> bool | None: ...
@@ -915,7 +925,49 @@ class AppConfig:
 
     def getboolean(self, section, key, fallback=None):
         """Return a config value as a boolean."""
-        return self.config.getboolean(section, key, fallback=fallback)
+        return self._get_typed("boolean", self._parse_boolean, section, key, fallback)
+
+    @staticmethod
+    def _parse_boolean(value: str) -> bool:
+        lowered = str(value).strip().lower()
+        if lowered not in configparser.ConfigParser.BOOLEAN_STATES:
+            raise ValueError(f"Not a boolean: {value}")
+        return configparser.ConfigParser.BOOLEAN_STATES[lowered]
+
+    def _get_typed(self, kind, convert, section, key, fallback):
+        """Read a typed value, tolerating a malformed hand-edited entry.
+
+        configparser only applies ``fallback`` when the option is missing; an
+        unparseable value raises ValueError. A typo in faststack.ini must not
+        stop the app from starting, so fall back to the caller's default (or
+        the built-in default) and warn once per option instead.
+        """
+        getter = getattr(self.config, f"get{kind}")
+        try:
+            return getter(section, key, fallback=fallback)
+        except ValueError:
+            pass
+        value = fallback
+        if value is None:
+            default_raw = DEFAULT_CONFIG.get(section, {}).get(key)
+            if default_raw is not None:
+                try:
+                    value = convert(default_raw)
+                except ValueError:
+                    value = None
+        warn_key = (section, key)
+        if warn_key not in self._invalid_value_warned:
+            self._invalid_value_warned.add(warn_key)
+            log.warning(
+                "Invalid %s value %r for [%s] %s in %s; using %r",
+                kind,
+                self.config.get(section, key, fallback=None),
+                section,
+                key,
+                self.config_path,
+                value,
+            )
+        return value
 
     def set(self, section, key, value):
         """Set a config value, creating the section if needed."""

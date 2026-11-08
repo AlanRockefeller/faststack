@@ -12,6 +12,9 @@ from typing import Any, Callable, Optional
 
 log = logging.getLogger(__name__)
 
+# Upper bound on an idle PriorityExecutor worker's sleep between queue checks.
+_IDLE_WAIT_SECONDS = 5.0
+
 
 class DaemonThreadPoolExecutor:
     """A minimal thread pool whose workers are genuinely abandonable.
@@ -304,6 +307,19 @@ class PriorityExecutor:
                 # only guarantees a missed wake-up can never wedge a worker.
                 self._admission.wait(0.25)
 
+    def _wait_for_admission_change(self, timeout: float) -> None:
+        """Park a constrained worker without reserving a slot.
+
+        The capacity check and the wait happen under one lock hold, so a
+        release or limit change between a failed admission and this call is
+        observed instead of missed. Releases, limit increases and shutdown all
+        notify ``_admission``; the timeout only bounds a missed wake-up.
+        """
+        with self._admission:
+            if self._stop_event.is_set() or self._admitted < self._concurrency_limit:
+                return
+            self._admission.wait(timeout)
+
     def _release_admission(self, *, was_running: bool) -> None:
         with self._admission:
             self._admitted = max(0, self._admitted - 1)
@@ -365,6 +381,10 @@ class PriorityExecutor:
         with self._queue.not_empty:
             if self._queue.queue:
                 return True
+            # Checked under the same lock shutdown() notifies with, so a stop
+            # request can never slip in between this check and the wait.
+            if self._stop_event.is_set():
+                return False
             self._queue.not_empty.wait(timeout)
             return bool(self._queue.queue)
 
@@ -376,13 +396,19 @@ class PriorityExecutor:
             if self._stop_event.is_set() and self._queue.empty():
                 break
 
-            if not self._wait_for_work(0.1):
+            # put() and shutdown() both notify not_empty, so the timeout only
+            # bounds a missed wake-up; a short poll here would wake every idle
+            # worker of every pool many times a second.
+            if not self._wait_for_work(_IDLE_WAIT_SECONDS):
                 # Nothing to run: stay unadmitted so a constraint entered while
                 # idle takes effect immediately for the next submission.
                 continue
 
             if not self._acquire_admission(blocking=False):
-                # Constrained: re-check the stop/drain condition and wait again.
+                # Constrained: park until capacity, the limit, or shutdown
+                # changes instead of re-polling the non-empty queue (which
+                # would spin at full CPU), then re-check the drain condition.
+                self._wait_for_admission_change(0.25)
                 continue
 
             try:

@@ -1502,13 +1502,6 @@ class Prefetcher:
         # Cooperative cancellation flag for shutdown
         self._stop_event = threading.Event()
 
-        # The display-size gate already prevents premature work. Warm the full
-        # configured window while the user is idle instead of waiting until the
-        # held-key burst has already begun.
-        self._initial_radius = self.prefetch_radius
-        self._navigation_count = 0  # Track how many times user has navigated
-        self._radius_expanded = True
-
         # Directional prefetching
         self._last_navigation_direction: int = 1  # 1 = forward, -1 = backward
 
@@ -1552,6 +1545,10 @@ class Prefetcher:
 
     def set_image_files(self, image_files: List[ImageFile]):
         with self._futures_lock:
+            # The controller can mutate its list in place (insert, then pass
+            # the same list back), which identity/length checks alone cannot
+            # see; always drop the path index here.
+            self._path_index_cache = None
             if self.image_files == image_files:
                 return
             old = self.image_files
@@ -1754,24 +1751,10 @@ class Prefetcher:
         if direction is not None:
             self._last_navigation_direction = direction
 
-        # Track navigation to expand radius after user starts moving
-        if is_navigation and not self._radius_expanded:
-            self._navigation_count += 1
-            if self._navigation_count >= 2:
-                self._radius_expanded = True
-                log.info(
-                    "Expanding prefetch radius from %d to %d after user navigation",
-                    self._initial_radius,
-                    self.prefetch_radius,
-                )
-
-        # Use a smaller radius initially to reduce cache thrash before display
-        # size is stable, but never exceed a user-configured smaller radius.
-        effective_radius = (
-            min(self._initial_radius, self.prefetch_radius)
-            if not self._radius_expanded
-            else self.prefetch_radius
-        )
+        # The whole configured window is warmed from the first navigation on;
+        # the display-size gate already prevents premature work. Callers may
+        # still cap the radius for a cheap first pass (e.g. after a zoom).
+        effective_radius = self.prefetch_radius
         if radius_limit is not None:
             effective_radius = min(effective_radius, max(0, radius_limit))
         display_width, display_height, display_generation = self.get_display_info()
@@ -1781,8 +1764,7 @@ class Prefetcher:
 
         if self.debug:
             log.info(
-                "Prefetch radius: initial=%d, configured=%d, effective=%d",
-                self._initial_radius,
+                "Prefetch radius: configured=%d, effective=%d",
                 self.prefetch_radius,
                 effective_radius,
             )
@@ -2927,11 +2909,43 @@ class Prefetcher:
                     self.future_quality.pop(idx, None)
                     self._demand_indices.discard(idx)
                     self._navigation_cancel_indices.discard(idx)
-            for i, image_file in enumerate(self.image_files):
-                if Path(image_file.path).as_posix() == path_str:
-                    for scheduled in self._scheduled.values():
-                        scheduled.discard(i)
-                    break
+            for i in self._indices_for_path_locked(path_str):
+                for scheduled in self._scheduled.values():
+                    scheduled.discard(i)
+
+    def _indices_for_path_locked(self, path_str: str) -> List[int]:
+        """Indices of ``self.image_files`` whose posix path equals ``path_str``.
+
+        Caller holds ``_futures_lock``. The lookup table is rebuilt lazily
+        whenever ``image_files`` is replaced, so per-eviction callers stay O(1)
+        instead of scanning (and building a Path for) every image in the folder.
+        """
+        image_files = self.image_files
+        cached = getattr(self, "_path_index_cache", None)
+        if (
+            cached is None
+            or cached[0] is not image_files
+            or cached[1] != len(image_files)
+        ):
+            table: Dict[str, List[int]] = {}
+            for i, image_file in enumerate(image_files):
+                table.setdefault(Path(image_file.path).as_posix(), []).append(i)
+            cached = (image_files, len(image_files), table)
+            self._path_index_cache = cached
+        indices = cached[2].get(path_str, [])
+        # Cheap guard against an in-place change not yet reported through
+        # set_image_files: verify the hits and rebuild once if any is stale.
+        if any(
+            i >= len(image_files) or Path(image_files[i].path).as_posix() != path_str
+            for i in indices
+        ):
+            self._path_index_cache = None
+            return [
+                i
+                for i, image_file in enumerate(image_files)
+                if Path(image_file.path).as_posix() == path_str
+            ]
+        return indices
 
     def unschedule_path(self, path) -> None:
         """Allow a path to be prefetched again after its cache entry was evicted.
@@ -2952,10 +2966,9 @@ class Prefetcher:
         """
         path_str = Path(path).as_posix()
         with self._futures_lock:
-            for i, image_file in enumerate(self.image_files):
-                if Path(image_file.path).as_posix() == path_str:
-                    for scheduled in self._scheduled.values():
-                        scheduled.discard(i)
+            for i in self._indices_for_path_locked(path_str):
+                for scheduled in self._scheduled.values():
+                    scheduled.discard(i)
 
     def cancel_pending_cover_tasks(self) -> None:
         """Cancel queued cover-quality work without invalidating the generation."""

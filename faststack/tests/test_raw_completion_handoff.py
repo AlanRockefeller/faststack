@@ -1,5 +1,6 @@
 """Regression coverage for FS-P11-001's Qt completion handoff."""
 
+import contextlib
 import os
 import subprocess
 import threading
@@ -100,18 +101,24 @@ def _config_value(executable):
     return get
 
 
+@contextlib.contextmanager
 def _rawtherapee_exists(executable):
-    """Pretend only the configured RawTherapee executable exists.
+    """Pretend only the configured RawTherapee executable exists and is valid.
 
     Patching os.path.exists wholesale also fakes Path.exists() on Python
-    3.14+, which hides missing-output checks in the worker.
+    3.14+, which hides missing-output checks in the worker. The executable
+    validator is stubbed too: the fake path is not a real executable.
     """
     real_exists = os.path.exists
     target = str(executable)
-    return patch(
-        "faststack.app.os.path.exists",
-        side_effect=lambda path: path == target or real_exists(path),
-    )
+    with (
+        patch(
+            "faststack.app.os.path.exists",
+            side_effect=lambda path: path == target or real_exists(path),
+        ),
+        patch("faststack.app.validate_executable_path", return_value=(True, None)),
+    ):
+        yield
 
 
 def _write_worker_output(cmd, contents=b"tiff"):

@@ -1,6 +1,5 @@
 """ThumbnailModel for QML GridView with file/folder entries."""
 
-import hashlib
 import logging
 import os
 import time
@@ -21,6 +20,7 @@ from PySide6.QtCore import (
 
 from faststack.io.indexer import DirectoryScanError, find_images
 from faststack.io.utils import compute_path_hash, normalize_path_key
+from faststack.models import filesystem_source_identity
 from faststack.thumbnail_view.folder_stats import (
     FolderStats,
     count_images_in_folder,
@@ -30,21 +30,9 @@ from faststack.thumbnail_view.folder_stats import (
 log = logging.getLogger(__name__)
 
 
-def filesystem_source_identity(stat_result: os.stat_result) -> str:
-    """Return a cheap stable token for the filesystem object behind an image.
-
-    This deliberately avoids content hashing. A same-size in-place rewrite
-    that preserves every cheap timestamp/file-id field (possible on Windows)
-    cannot be detected by this scheme and still requires manual refresh.
-    """
-    fields = (
-        getattr(stat_result, "st_mtime_ns", 0),
-        getattr(stat_result, "st_size", 0),
-        getattr(stat_result, "st_ino", 0),
-        getattr(stat_result, "st_ctime_ns", 0),
-    )
-    payload = ":".join(str(value or 0) for value in fields).encode("ascii")
-    return hashlib.blake2s(payload, digest_size=8).hexdigest()
+# Re-exported: the identity lives next to ImageFile so the folder scan can
+# compute it once per file (see models.filesystem_source_identity).
+__all__ = ["filesystem_source_identity"]
 
 
 def _empty_folder_stats_payload() -> dict:
@@ -379,7 +367,9 @@ class ThumbnailModel(QAbstractListModel):
         # Scan for folders
         folders: List[ThumbnailEntry] = []
         try:
-            for entry in os.scandir(self._current_directory):
+            with os.scandir(self._current_directory) as dir_entries:
+                scanned = list(dir_entries)
+            for entry in scanned:
                 if entry.is_dir() and not entry.name.startswith("."):
                     folder_path = Path(entry.path)
                     try:
@@ -634,61 +624,61 @@ class ThumbnailModel(QAbstractListModel):
             else None
         )
 
+        # Scan folders, filter and stat images BEFORE resetting the model so
+        # attached views never sit on an empty model while disk I/O runs.
+        t0 = time.perf_counter()
+        prospective_entries = self._scan_folder_entries()
+        t1 = time.perf_counter()
+
+        # Apply active filename filter if set
+        if self._active_filter:
+            needle = self._active_filter.lower()
+            images = [img for img in images if needle in img.path.stem.lower()]
+
+        # Build metadata map lazily, after filename filter, so we
+        # don't do sidecar lookups for images that got filtered out.
+        if metadata_map is None and metadata_map_fn is not None:
+            metadata_map = metadata_map_fn(images)
+
+        # Apply active flag filters (AND logic)
+        if self._active_filter_flags:
+            flags = self._active_filter_flags
+            filtered = []
+            # When metadata_map is provided (even empty) treat it as
+            # authoritative — don't fall through to per-image sidecar
+            # lookups, and key lookups by str(img.path) so we don't
+            # re-resolve a stable key the bulk-map builder already paid for.
+            map_authoritative = metadata_map is not None
+            for img in images:
+                try:
+                    if map_authoritative:
+                        meta = metadata_map.get(str(img.path), {})
+                    elif self._get_metadata:
+                        meta = self._get_metadata(img.path)
+                    else:
+                        continue
+
+                    if not isinstance(meta, dict):
+                        log.debug("Metadata for %s is not a dict: %r", img.path, meta)
+                        continue
+
+                    if all(meta.get(flag, False) for flag in flags):
+                        filtered.append(img)
+                except Exception as e:
+                    log.debug("Error filtering image %s: %s", img.path, e)
+                    # Skip images with metadata errors
+            images = filtered
+
+        prospective_entries.extend(self._build_image_entries(images, metadata_map))
+        t2 = time.perf_counter()
+
         self.beginResetModel()
         try:
-            self._entries.clear()
+            self._entries = prospective_entries
             self._id_to_row.clear()
             self._path_to_row.clear()
             self._selected_indices.clear()
             self._last_selected_index = None
-
-            t0 = time.perf_counter()
-            self._add_folders_to_entries()
-            t1 = time.perf_counter()
-
-            # Apply active filename filter if set
-            if self._active_filter:
-                needle = self._active_filter.lower()
-                images = [img for img in images if needle in img.path.stem.lower()]
-
-            # Build metadata map lazily, after filename filter, so we
-            # don't do sidecar lookups for images that got filtered out.
-            if metadata_map is None and metadata_map_fn is not None:
-                metadata_map = metadata_map_fn(images)
-
-            # Apply active flag filters (AND logic)
-            if self._active_filter_flags:
-                flags = self._active_filter_flags
-                filtered = []
-                # When metadata_map is provided (even empty) treat it as
-                # authoritative — don't fall through to per-image sidecar
-                # lookups, and key lookups by str(img.path) so we don't
-                # re-resolve a stable key the bulk-map builder already paid for.
-                map_authoritative = metadata_map is not None
-                for img in images:
-                    try:
-                        if map_authoritative:
-                            meta = metadata_map.get(str(img.path), {})
-                        elif self._get_metadata:
-                            meta = self._get_metadata(img.path)
-                        else:
-                            continue
-
-                        if not isinstance(meta, dict):
-                            log.debug(
-                                "Metadata for %s is not a dict: %r", img.path, meta
-                            )
-                            continue
-
-                        if all(meta.get(flag, False) for flag in flags):
-                            filtered.append(img)
-                    except Exception as e:
-                        log.debug("Error filtering image %s: %s", img.path, e)
-                        # Skip images with metadata errors
-                images = filtered
-
-            self._add_images_to_entries(images, metadata_map)
-            t2 = time.perf_counter()
             self._rebuild_id_mapping()
             self._selected_indices = {
                 self._path_to_row[path]
@@ -730,13 +720,20 @@ class ThumbnailModel(QAbstractListModel):
         # and keyed by str(img.path).
         map_authoritative = metadata_map is not None
         for img in images:
-            try:
-                stat_info = img.path.stat()
-                mtime_ns = stat_info.st_mtime_ns
-                source_identity = filesystem_source_identity(stat_info)
-            except OSError:
-                mtime_ns = int(getattr(img, "timestamp", 0) * 1e9)
-                source_identity = "0"
+            # Prefer the stat captured when the folder was scanned; statting
+            # every image again here ran on the UI thread for each refresh.
+            # Files FastStack rewrote have these cleared by the controller
+            # (_forget_image_file_stat), so they are statted afresh.
+            mtime_ns = getattr(img, "mtime_ns", None)
+            source_identity = getattr(img, "source_identity", None)
+            if mtime_ns is None or source_identity is None:
+                try:
+                    stat_info = img.path.stat()
+                    mtime_ns = stat_info.st_mtime_ns
+                    source_identity = filesystem_source_identity(stat_info)
+                except OSError:
+                    mtime_ns = int(getattr(img, "timestamp", 0) * 1e9)
+                    source_identity = "0"
 
             # Get metadata
             is_stacked = False

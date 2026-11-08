@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Window
 import QtQuick.Layouts 1.15
-import QtCore
 
 Window {
     id: histogramWindow
@@ -12,6 +11,10 @@ Window {
     minimumHeight: 50
     property var uiStateRef: typeof uiState !== "undefined" ? uiState : null
     property var controllerRef: typeof controller !== "undefined" ? controller : null
+    property var histogramModeOwner: null
+    readonly property bool overlaidMode: histogramModeOwner
+                                         ? histogramModeOwner.histogramOverlaidMode
+                                         : true
     readonly property bool plainArrowNavigationEnabled: visible
                                                         && controllerRef
                                                         && uiStateRef
@@ -28,12 +31,6 @@ Window {
         if (histogramWindow.controllerRef)
             histogramWindow.controllerRef.unregister_auxiliary_navigation_window(histogramWindow)
     }
-    Settings {
-        id: histSettings
-        category: "histogram"
-        property bool overlaidMode: true
-    }
-
     visible: histogramWindow.uiStateRef ? histogramWindow.uiStateRef.isHistogramVisible : false
 
     FocusScope {
@@ -108,8 +105,11 @@ Window {
 
         HistogramModeToggle {
             Layout.fillWidth: true
-            overlaidMode: histSettings.overlaidMode
-            onModeRequested: (overlaid) => histSettings.overlaidMode = overlaid
+            overlaidMode: histogramWindow.overlaidMode
+            onModeRequested: (overlaid) => {
+                if (histogramWindow.histogramModeOwner)
+                    histogramWindow.histogramModeOwner.histogramOverlaidMode = overlaid
+            }
         }
 
         // Histogram display (overlaid or 3-channel)
@@ -119,7 +119,7 @@ Window {
 
             OverlaidHistogram {
                 anchors.fill: parent
-                visible: histSettings.overlaidMode
+                visible: histogramWindow.overlaidMode
                 rData: histogramWindow.rHistogramData
                 gData: histogramWindow.gHistogramData
                 bData: histogramWindow.bHistogramData
@@ -134,7 +134,7 @@ Window {
 
             RowLayout {
                 anchors.fill: parent
-                visible: !histSettings.overlaidMode
+                visible: !histogramWindow.overlaidMode
                 spacing: histogramWindow.width > 200 ? 15 : 2
 
                 SingleChannelHistogram {

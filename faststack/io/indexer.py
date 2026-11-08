@@ -12,7 +12,7 @@ from faststack.io.variants import (
     norm_path,
     parse_variant_stem,
 )
-from faststack.models import ImageFile
+from faststack.models import ImageFile, filesystem_source_identity
 
 log = logging.getLogger(__name__)
 
@@ -104,7 +104,13 @@ def _build_image_list(
             raw_pair = _find_raw_pair(p, stat, raws.get(p.stem.casefold(), []))
             if raw_pair:
                 used_raws.add(raw_pair)
-            img = ImageFile(path=p, raw_pair=raw_pair, timestamp=stat.st_mtime)
+            img = ImageFile(
+                path=p,
+                raw_pair=raw_pair,
+                timestamp=stat.st_mtime,
+                mtime_ns=stat.st_mtime_ns,
+                source_identity=filesystem_source_identity(stat),
+            )
             image_entries.append((image_sort_key(img), img))
 
     for p, stat, base_stem in developed_candidates:
@@ -121,6 +127,8 @@ def _build_image_list(
             raw_pair=None,
             timestamp=effective_ts,
             sort_name_cf=effective_name,
+            mtime_ns=stat.st_mtime_ns,
+            source_identity=filesystem_source_identity(stat),
         )
         image_entries.append((image_sort_key(img), img))
 
@@ -128,7 +136,11 @@ def _build_image_list(
         for raw_path, raw_stat in raw_list:
             if raw_path not in used_raws:
                 img = ImageFile(
-                    path=raw_path, raw_pair=raw_path, timestamp=raw_stat.st_mtime
+                    path=raw_path,
+                    raw_pair=raw_path,
+                    timestamp=raw_stat.st_mtime,
+                    mtime_ns=raw_stat.st_mtime_ns,
+                    source_identity=filesystem_source_identity(raw_stat),
                 )
                 image_entries.append((image_sort_key(img), img))
 

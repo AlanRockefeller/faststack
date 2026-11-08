@@ -89,33 +89,64 @@ class Keybinder:
             f"Keybinder: neither main_window nor controller has '{method_name}'"
         )
 
+    # Modifiers that select a binding. Keypad and layout-group flags only say
+    # where a key came from, so they never change which action runs.
+    _BINDING_MODIFIERS = (
+        Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier
+    )
+    _COMMAND_MODIFIERS = Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
+
+    # Bound by the character the active layout produced, whatever modifiers
+    # it took to type it: AltGr arrives as Ctrl+Alt on Windows, so [ ] { } |
+    # on many European layouts would otherwise never match.
+    _CHARACTER_MAP = {
+        "|": "clear_all_batches",
+        "[": "begin_new_stack",
+        "]": "end_current_stack",
+        "{": "begin_new_batch",
+        "}": "end_current_batch",
+    }
+
+    @staticmethod
+    def _is_letter_key(key) -> bool:
+        return Qt.Key_A <= key <= Qt.Key_Z
+
+    def _modifier_binding(self, key, modifiers):
+        for (mapped_key, mapped_modifier), method_name in self.modifier_key_map.items():
+            if key == mapped_key and modifiers == mapped_modifier:
+                return method_name
+        return None
+
     def handle_key_press(self, event):
         key = event.key()
         text = event.text()
-        modifiers = event.modifiers()
+        modifiers = event.modifiers() & self._BINDING_MODIFIERS
         log.debug(f"Key pressed: {key} ({text!r}) with modifiers {modifiers}")
 
-        if text == "|" and modifiers == Qt.ShiftModifier:
-            self._call("clear_all_batches")
+        method_name = self._CHARACTER_MAP.get(text)
+        if method_name:
+            self._call(method_name)
             return True
 
-        # Check for modifier + key combinations
-        for (mapped_key, mapped_modifier), method_name in self.modifier_key_map.items():
-            # Check if required modifier is present in event modifiers
-            if key == mapped_key and (modifiers & mapped_modifier) == mapped_modifier:
-                log.debug(
-                    f"Matched modifier key: {key} + {mapped_modifier} -> {method_name}"
-                )
+        # Modifier combinations match exactly, so Ctrl+Shift+C is not Ctrl+C
+        # and a future binding cannot be shadowed by a shorter one. Shift is
+        # how some layouts type digits and symbols (AZERTY sends Ctrl+1 as
+        # Ctrl+Shift+&), so a non-letter key is retried without it.
+        candidates = [modifiers]
+        if modifiers & Qt.ShiftModifier and not self._is_letter_key(key):
+            candidates.append(modifiers & ~Qt.ShiftModifier)
+        for candidate in candidates:
+            method_name = self._modifier_binding(key, candidate)
+            if method_name:
+                log.debug(f"Matched modifier key: {key} + {candidate} -> {method_name}")
                 self._call(method_name)
                 return True
 
-        blocked_auto_adjust_modifiers = modifiers & (
-            Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
-        )
+        command_modifiers = modifiers & self._COMMAND_MODIFIERS
 
         # Check for single key presses
         if key == Qt.Key_L:
-            if not blocked_auto_adjust_modifiers:
+            if not command_modifiers:
                 self._call(
                     "quick_auto_adjust"
                     if modifiers & Qt.ShiftModifier
@@ -124,49 +155,43 @@ class Keybinder:
                 return True
             return False
 
-        if not blocked_auto_adjust_modifiers:
-            if text == "-":
-                self._call("reduce_auto_adjust_highlights")
-                return True
-            if text == "_":
-                self._call("raise_auto_adjust_whites")
-                return True
-            if text == "+":
-                self._call("raise_auto_adjust_blacks")
-                return True
-            if text == "=":
-                self._call("deepen_auto_adjust_blacks")
-                return True
-            if key == Qt.Key_Minus and modifiers == Qt.NoModifier:
-                self._call("reduce_auto_adjust_highlights")
-                return True
-            if key == Qt.Key_Underscore:
-                self._call("raise_auto_adjust_whites")
-                return True
-            if key == Qt.Key_Plus:
-                self._call("raise_auto_adjust_blacks")
-                return True
-            if key == Qt.Key_Equal and modifiers == Qt.NoModifier:
-                self._call("deepen_auto_adjust_blacks")
-                return True
+        if command_modifiers:
+            # Unbound Ctrl/Alt/Meta chords (Ctrl+P, Alt+D, ...) no longer fall
+            # through to the plain-key action.
+            return False
+
+        if text == "-":
+            self._call("reduce_auto_adjust_highlights")
+            return True
+        if text == "_":
+            self._call("raise_auto_adjust_whites")
+            return True
+        if text == "+":
+            self._call("raise_auto_adjust_blacks")
+            return True
+        if text == "=":
+            self._call("deepen_auto_adjust_blacks")
+            return True
+        if key == Qt.Key_Minus and modifiers == Qt.NoModifier:
+            self._call("reduce_auto_adjust_highlights")
+            return True
+        if key == Qt.Key_Underscore:
+            self._call("raise_auto_adjust_whites")
+            return True
+        if key == Qt.Key_Plus:
+            self._call("raise_auto_adjust_blacks")
+            return True
+        if key == Qt.Key_Equal and modifiers == Qt.NoModifier:
+            self._call("deepen_auto_adjust_blacks")
+            return True
 
         method_name = self.key_map.get(key)
         if method_name:
+            # Letter bindings are plain keys: Shift+letter is left unbound.
+            # Symbol keys such as { } _ + need Shift to be typed at all.
+            if self._is_letter_key(key) and modifiers & Qt.ShiftModifier:
+                return False
             self._call(method_name)
-            return True
-
-        # extra safety for layouts where bracket keycodes are odd
-        if text == "[":
-            self._call("begin_new_stack")
-            return True
-        if text == "]":
-            self._call("end_current_stack")
-            return True
-        if text == "{":
-            self._call("begin_new_batch")
-            return True
-        if text == "}":
-            self._call("end_current_batch")
             return True
 
         return False

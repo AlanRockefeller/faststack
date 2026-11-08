@@ -69,9 +69,11 @@ Window {
         // Clamp against the monitor the coordinates fall on (not just the
         // current screen), so a window saved on a secondary monitor is not
         // dragged back to the primary before it has been mapped.
-        var screen = WP.screenContaining(Application.screens, compactEditor.x, compactEditor.y)
-                     || compactEditor.screen
-        WP.clampToScreen(compactEditor, screen, {
+        var geometry = compactEditor.controllerRef
+                     ? compactEditor.controllerRef.available_screen_geometry(
+                           compactEditor.x, compactEditor.y)
+                     : null
+        WP.clampToScreen(compactEditor, geometry, {
             minWidth: compactEditor.minimumWidth,
             maxWidth: compactEditor.maximumWidth,
             minHeight: compactEditor.minimumHeight

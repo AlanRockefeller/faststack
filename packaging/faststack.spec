@@ -32,11 +32,21 @@ def existing_binary(
     return None
 
 
+def required_data_file(path: str | os.PathLike[str]) -> str:
+    candidate = Path(path)
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Required bundle resource not found: {candidate}")
+    return str(candidate)
+
+
 datas = [
     (str(ROOT / "faststack" / "qml"), "faststack/qml"),
     # Bundle the README next to the package so Help > View Readme works in
     # the frozen macOS/Windows builds (see resources.faststack_readme_path).
-    (str(ROOT / "README.md"), "faststack"),
+    (required_data_file(ROOT / "README.md"), "faststack"),
+    # Help > View Changelog uses the same local-first lookup and must keep
+    # working in offline frozen builds.
+    (required_data_file(ROOT / "ChangeLog.md"), "faststack"),
 ]
 # Ship faststack's own dist-info so importlib.metadata.version("faststack")
 # resolves inside the frozen build. Without it the updater cannot tell which
@@ -92,7 +102,8 @@ for candidate in (
 # FastStack's ENTIRE Qt surface is:
 #   Python : QtCore, QtGui, QtWidgets, QtQml, QtQuick
 #   QML    : QtQuick, QtQuick.Controls, QtQuick.Layouts,
-#            QtQuick.Controls.Material, QtQuick.Window, QtCore
+#            QtQuick.Controls.Material, QtQuick.Window, QtCore,
+#            QtQuick.Effects (MultiEffect, kept via qt6quickeffects below)
 # Nothing below is reachable from that set, yet PyInstaller collects it all
 # through PySide6's dependency graph. Measured on the shipped 1.6.8 Windows
 # build: ~125 MB of a 240 MB download, of which QtWebEngine alone is 86.8 MB

@@ -1,5 +1,6 @@
 """Tests for ThumbnailPrefetcher and ThumbnailCache."""
 
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -391,11 +392,23 @@ class TestThumbnailDecode:
         )
 
         try:
+            # Wait for the done callback itself to return (the decode should
+            # fail and neither cache nor call back). Its _inflight pop happens
+            # before the cache/notify effects, so that is not enough to wait on.
+            callback_done = threading.Event()
+            original_on_done = prefetcher._on_decode_done
+
+            def on_done_and_signal(*args, **kwargs):
+                try:
+                    return original_on_done(*args, **kwargs)
+                finally:
+                    callback_done.set()
+
+            prefetcher._on_decode_done = on_done_and_signal
             mtime_ns = img_path.stat().st_mtime_ns
             prefetcher.submit(img_path, mtime_ns)
-
-            # Give it a moment to attempt decode; it should fail and not cache/callback
-            time.sleep(0.3)
+            assert callback_done.wait(timeout=5.0)
+            assert not prefetcher._inflight
             if qt_app is not None:
                 try:
                     qt_app.processEvents()

@@ -15,6 +15,42 @@ _CANCELLED = re.compile(rb"wl_data_source#(\d+)\.cancelled\(\)")
 # Data-transfer traffic worth keeping for --debug drag diagnostics.
 _DND_TRACE = re.compile(rb"wl_data_(source|device|offer)|zwp_primary_selection")
 _DND_TRACE_LIMIT = 400
+_MAX_PENDING_LINE = 1 << 20
+
+# Process-wide record of what install_wayland_drag_monitor() changed, so the
+# child-process helpers can undo it for every program FastStack launches: a
+# child must neither inherit WAYLAND_DEBUG (a Wayland client would then log its
+# whole protocol into our pipe) nor write to fd 2 (the pipe), which would make
+# inherited_output_kwargs() treat the console as a pipe and discard its output.
+_monitor_installed = False
+_previous_wayland_debug: str | None = None
+_original_stderr_fd: int | None = None
+
+
+def monitor_installed() -> bool:
+    """Whether the drag monitor has taken over this process's stderr."""
+    return _monitor_installed
+
+
+def original_stderr_fd() -> int | None:
+    """The real stderr descriptor saved by the monitor, or None when unredirected."""
+    return _original_stderr_fd if _monitor_installed else None
+
+
+def child_environment() -> dict[str, str]:
+    """Return an environment for child processes without the monitor's debug flag.
+
+    ``WAYLAND_DEBUG`` is restored to whatever the user had set before FastStack
+    started (usually nothing), so launched editors, stackers and respawned
+    FastStack instances run at normal speed and keep their own stderr.
+    """
+    env = dict(os.environ)
+    if _monitor_installed:
+        if _previous_wayland_debug is None:
+            env.pop("WAYLAND_DEBUG", None)
+        else:
+            env["WAYLAND_DEBUG"] = _previous_wayland_debug
+    return env
 
 
 class WaylandDragOutcomeMonitor:
@@ -93,18 +129,35 @@ class WaylandDragOutcomeMonitor:
                 self._outcome_ready.set()
 
     def _read_stderr(self) -> None:
+        # This thread is the only reader of the process's stderr pipe: if it
+        # ever died, the pipe would fill and every later stderr write in the
+        # process would block. So nothing in the loop may escape it.
         pending = b""
-        while chunk := os.read(self._read_fd, 65536):
+        while True:
+            try:
+                chunk = os.read(self._read_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
             pending += chunk
             *lines, pending = pending.split(b"\n")
             for line in lines:
                 complete_line = line + b"\n"
-                if _WAYLAND_LINE.match(line):
-                    self._record(line)
-                    if self._forward_protocol:
+                try:
+                    if _WAYLAND_LINE.match(line):
+                        self._record(line)
+                        if self._forward_protocol:
+                            self._forward(complete_line)
+                    else:
                         self._forward(complete_line)
-                else:
+                except Exception:  # noqa: BLE001 - keep draining the pipe
                     self._forward(complete_line)
+            if len(pending) > _MAX_PENDING_LINE:
+                # Pathological newline-free output: pass it through rather
+                # than buffering it without bound.
+                self._forward(pending)
+                pending = b""
         if pending:
             self._forward(pending)
 
@@ -125,25 +178,41 @@ def install_wayland_drag_monitor() -> WaylandDragOutcomeMonitor | None:
     if platform != "wayland":
         return None
 
-    forward_protocol = bool(os.environ.get("WAYLAND_DEBUG"))
-    os.environ["WAYLAND_DEBUG"] = "1"
+    global _monitor_installed, _previous_wayland_debug, _original_stderr_fd
+    previous_wayland_debug = os.environ.get("WAYLAND_DEBUG")
+    forward_protocol = bool(previous_wayland_debug)
     original_stderr = None
     read_fd = None
     write_fd = None
+    installed = False
     try:
+        os.environ["WAYLAND_DEBUG"] = "1"
         original_stderr = os.dup(2)
         read_fd, write_fd = os.pipe()
         os.dup2(write_fd, 2)
         os.close(write_fd)
         write_fd = None
-        return WaylandDragOutcomeMonitor(original_stderr, read_fd, forward_protocol)
+        monitor = WaylandDragOutcomeMonitor(original_stderr, read_fd, forward_protocol)
+        installed = True
+        _monitor_installed = True
+        _previous_wayland_debug = previous_wayland_debug
+        _original_stderr_fd = original_stderr
+        return monitor
     except (OSError, RuntimeError):
         if original_stderr is not None:
-            os.dup2(original_stderr, 2)
-            os.close(original_stderr)
+            try:
+                os.dup2(original_stderr, 2)
+            finally:
+                os.close(original_stderr)
         if read_fd is not None:
             os.close(read_fd)
         if write_fd is not None:
             os.close(write_fd)
         log.warning("Wayland drag outcome monitor is unavailable", exc_info=True)
         return None
+    finally:
+        if not installed:
+            if previous_wayland_debug is None:
+                os.environ.pop("WAYLAND_DEBUG", None)
+            else:
+                os.environ["WAYLAND_DEBUG"] = previous_wayland_debug

@@ -548,7 +548,8 @@ Window {
                     contentWidth: availableWidth
                     // Keep the scrollbar visible so it is obvious the page scrolls.
                     ScrollBar.vertical.policy: contentHeight > availableHeight ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
-                    rightPadding: effectiveScrollBarWidth + 8
+                    // effectiveScrollBarWidth is Qt 6.6+; compute it so Qt 6.5 still works.
+                    rightPadding: (ScrollBar.vertical && ScrollBar.vertical.visible ? ScrollBar.vertical.width : 0) + 8
 
                     ColumnLayout {
                         width: parent.width
@@ -1142,7 +1143,8 @@ Window {
                     contentWidth: availableWidth
                     // Keep the scrollbar visible so it is obvious the page scrolls.
                     ScrollBar.vertical.policy: contentHeight > availableHeight ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
-                    rightPadding: effectiveScrollBarWidth + 8
+                    // effectiveScrollBarWidth is Qt 6.6+; compute it so Qt 6.5 still works.
+                    rightPadding: (ScrollBar.vertical && ScrollBar.vertical.visible ? ScrollBar.vertical.width : 0) + 8
 
                     ColumnLayout {
                         width: parent.width

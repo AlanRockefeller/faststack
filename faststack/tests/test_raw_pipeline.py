@@ -63,6 +63,9 @@ def _stub_develop_guards(app):
     app._raw_development_operations = {}
 
 
+# The configured executable in these tests is a fake path, so the executable
+# validator (which checks the real filesystem) is stubbed for the whole class.
+@patch("faststack.app.validate_executable_path", new=lambda *a, **k: (True, None))
 class TestRawPipeline(unittest.TestCase):
     @patch("faststack.app.os.path.exists")
     @patch("faststack.app.subprocess.Popen")
@@ -103,6 +106,9 @@ class TestRawPipeline(unittest.TestCase):
         # Bind the real _develop_raw_backend method to our mock
         app._develop_raw_backend = AppController._develop_raw_backend.__get__(
             app, AppController
+        )
+        app._configured_rawtherapee_executable = (
+            AppController._configured_rawtherapee_executable.__get__(app, AppController)
         )
 
         # Create 0-byte zombie file BEFORE calling develop
@@ -159,6 +165,9 @@ class TestRawPipeline(unittest.TestCase):
         app._develop_raw_backend = AppController._develop_raw_backend.__get__(
             app, AppController
         )
+        app._configured_rawtherapee_executable = (
+            AppController._configured_rawtherapee_executable.__get__(app, AppController)
+        )
 
         app._develop_raw_backend()
 
@@ -205,6 +214,9 @@ class TestRawPipeline(unittest.TestCase):
         _stub_develop_guards(app)
         app._develop_raw_backend = AppController._develop_raw_backend.__get__(
             app, AppController
+        )
+        app._configured_rawtherapee_executable = (
+            AppController._configured_rawtherapee_executable.__get__(app, AppController)
         )
 
         app._develop_raw_backend()

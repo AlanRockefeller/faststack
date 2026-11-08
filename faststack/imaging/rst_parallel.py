@@ -15,6 +15,7 @@ the IDCT changes -- only which thread runs which MCU rows.
 from __future__ import annotations
 
 import logging
+import mmap
 import os
 import struct
 import threading
@@ -22,6 +23,7 @@ from typing import Optional
 
 import numpy as np
 
+from faststack.imaging.turbo import capture_thread_warnings, forward_thread_warnings
 from faststack.util.executors import PriorityExecutor, create_priority_executor
 
 log = logging.getLogger(__name__)
@@ -147,6 +149,15 @@ def build_chunks(jpeg, nchunks: int):
     if parsed is None:
         return None
     sof_h_off, w, h, hmax, vmax, dri, scan_start = parsed
+    # Slice the caller's buffer directly instead of copying the whole file
+    # with bytes(): ``jpeg`` is normally an mmap of the full JPEG, and the
+    # copy doubled the memory traffic of every split decode. mmap and bytes
+    # slice to bytes; any other buffer is wrapped in a memoryview, whose
+    # slices concatenate with bytes below.
+    if isinstance(jpeg, (bytes, bytearray, mmap.mmap)):
+        raw = jpeg
+    else:
+        raw = memoryview(jpeg)
 
     mcu_w, mcu_h = hmax * 8, vmax * 8
     mcus_x = (w + mcu_w - 1) // mcu_w
@@ -169,6 +180,13 @@ def build_chunks(jpeg, nchunks: int):
     buf = np.frombuffer(jpeg, dtype=np.uint8)[scan_start:]
     ff = np.flatnonzero(buf[:-1] == 0xFF)
     nxt = buf[ff + 1]
+    if not np.any(nxt == 0xD9):
+        # No EOI marker after the scan start. A growing/truncated file can
+        # contain enough restart markers to make every synthetic chunk decode
+        # successfully even though the source snapshot is incomplete.
+        # Whole-file decoding is responsible for reporting that condition and
+        # triggering the caller's reread.
+        return None
     rst = ff[(nxt >= 0xD0) & (nxt <= 0xD7)] + scan_start
 
     needed = ((mcu_rows - 1) // rows_per_chunk) * rows_per_chunk * iv_per_row
@@ -180,7 +198,6 @@ def build_chunks(jpeg, nchunks: int):
 
     starts = range(0, mcu_rows, rows_per_chunk)
     header = bytes(jpeg[:scan_start])
-    raw = bytes(jpeg) if not isinstance(jpeg, bytes) else jpeg
     parts = []
     for r0 in starts:
         r1 = min(r0 + rows_per_chunk, mcu_rows)
@@ -222,18 +239,26 @@ def decode_parallel(
     num, den = scaling_factor if scaling_factor else (1, 1)
 
     def work(part):
-        return decoder.decode(
-            part,
-            scaling_factor=scaling_factor,
-            pixel_format=pixel_format,
-            flags=flags,
-        )
+        # Chunk decodes run on pool threads; capture their decoder warnings
+        # here and hand them back so the caller's truncation check sees them.
+        with capture_thread_warnings() as caught:
+            out = decoder.decode(
+                part,
+                scaling_factor=scaling_factor,
+                pixel_format=pixel_format,
+                flags=flags,
+            )
+        return out, caught
 
     pool = _get_pool()
     # The caller blocks on these futures from its own thread -- never from a
     # worker of this pool -- so waiting here cannot starve the pool.
     futures = [pool.submit(work, part, priority=priority) for part in parts]
-    outs = [future.result() for future in futures]
+    outs = []
+    for future in futures:
+        out, caught = future.result()
+        forward_thread_warnings(caught)
+        outs.append(out)
     out_h = -(-h * num // den)
     merged = np.concatenate(outs, axis=0)
     return merged[:out_h] if merged.shape[0] > out_h else merged

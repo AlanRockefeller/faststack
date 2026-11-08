@@ -177,6 +177,8 @@ def build_local_adjustments(
     mask_assets: Dict[str, MaskData],
     shape: Tuple[int, int],
     cache: Optional[LayerDensityCache] = None,
+    base_shape: Optional[Tuple[int, int]] = None,
+    point_transform: Optional[np.ndarray] = None,
 ) -> Optional[LocalAdjustments]:
     """Rasterise every effective layer at *shape* into recipe delta maps."""
     layers = effective_layers(edits)
@@ -191,7 +193,13 @@ def build_local_adjustments(
         if mask_data is None:
             continue
         density = rasterize_layer_density(
-            layer["id"], mask_data, shape, edits, cache=cache
+            layer["id"],
+            mask_data,
+            shape,
+            edits,
+            cache=cache,
+            base_shape=base_shape,
+            point_transform=point_transform,
         )
         if density is not None:
             painted.append((layer, mask_data, density))

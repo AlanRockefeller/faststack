@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,8 @@ from faststack.io.indexer import JPG_EXTENSIONS, RAW_EXTENSIONS
 
 log = logging.getLogger(__name__)
 
+_STOP_JOIN_TIMEOUT_SECONDS = 5.0
+
 # Matches FastStack backup filenames: name-backup.jpg, name-backup2.jpg, etc.
 _BACKUP_RE = re.compile(r"-backup\d*\.jpe?g$")
 _TEMP_IMAGE_RE = re.compile(
@@ -30,6 +33,10 @@ _TEMP_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _WATCHED_IMAGE_EXTENSIONS = frozenset(JPG_EXTENSIONS | RAW_EXTENSIONS)
+# Files whose appearance or disappearance changes what the UI shows: images,
+# plus the TIFF outputs of RAW development (`<stem>-working.tif`), which drive
+# the Develop RAW / Load RAW button state.
+_RELEVANT_FILE_EXTENSIONS = _WATCHED_IMAGE_EXTENSIONS | {".tif", ".tiff"}
 
 # Only the event types ImageDirectoryEventHandler reacts to. On inotify this
 # also narrows the kernel subscription, so FastStack's own reads (every
@@ -56,15 +63,37 @@ def _is_ignored_path(path: str) -> bool:
         or p.endswith("faststack.json")
         or p.endswith("faststack.json.lock")
         or ".__faststack_tmp__" in p
+        or "__faststack_rollback__" in p
+        or "__faststack_restore__" in p
         or _TEMP_IMAGE_RE.search(p) is not None
         or _BACKUP_RE.search(p) is not None
-        or "image recycle bin" in p.split("/")
+        or any(
+            part == "image recycle bin" or part.startswith(".faststack-delete-")
+            for part in p.split("/")
+        )
     )
+
+
+def _discard_event(_path: str) -> None:
+    """Callback for an abandoned observer: its events are no longer wanted."""
 
 
 def _is_watched_image_path(path: str) -> bool:
     """Return True when a file can contribute pixels to FastStack's image list."""
     return Path(path).suffix.lower() in _WATCHED_IMAGE_EXTENSIONS
+
+
+def _is_relevant_path(path: str, is_directory: bool) -> bool:
+    """Return True when a create/delete/move at ``path`` can change the view.
+
+    Directories matter to the thumbnail grid (folder tiles); files matter only
+    when they are images or RAW-development TIFFs. Stray sidecars, lock files,
+    text notes and the like used to trigger a full folder rescan on every
+    creation or deletion.
+    """
+    if _is_ignored_path(path):
+        return False
+    return is_directory or Path(path).suffix.lower() in _RELEVANT_FILE_EXTENSIONS
 
 
 class ImageDirectoryEventHandler(FileSystemEventHandler):
@@ -79,13 +108,13 @@ class ImageDirectoryEventHandler(FileSystemEventHandler):
         self.callback = callback
 
     def on_created(self, event):
-        if _is_ignored_path(event.src_path):
+        if not _is_relevant_path(event.src_path, event.is_directory):
             return
         log.info("Detected file creation: %s. Requesting refresh.", event.src_path)
         self.callback(event.src_path)
 
     def on_deleted(self, event):
-        if _is_ignored_path(event.src_path):
+        if not _is_relevant_path(event.src_path, event.is_directory):
             return
         log.info("Detected file deletion: %s. Requesting refresh.", event.src_path)
         self.callback(event.src_path)
@@ -94,8 +123,8 @@ class ImageDirectoryEventHandler(FileSystemEventHandler):
         # Treat the endpoints independently. Applications commonly save by moving
         # an ignored temporary file over the real image; the destination still
         # needs to invalidate its cached pixels.
-        src_relevant = not _is_ignored_path(event.src_path)
-        dest_relevant = not _is_ignored_path(event.dest_path)
+        src_relevant = _is_relevant_path(event.src_path, event.is_directory)
+        dest_relevant = _is_relevant_path(event.dest_path, event.is_directory)
         if not (src_relevant or dest_relevant):
             # e.g. our own sidecar write: faststack.<uuid>.tmp -> faststack.json
             return
@@ -190,13 +219,44 @@ class Watcher:
         except Exception:
             log.debug("stop()/join() failed on partial observer", exc_info=True)
 
-    def stop(self):
-        """Stops watching the directory."""
-        if self.observer and self.observer.is_alive():
-            self.observer.stop()
-            self.observer.join()
-            log.info("Stopped watching directory.")
+    def stop(self) -> bool:
+        """Stop watching. Returns False when the observer had to be abandoned."""
+        observer = self.observer
+        stopped = True
+        if observer and observer.is_alive():
+            # Bounded: stop() runs on the UI thread (e.g. around sidecar
+            # writes). watchdog's observer.stop() itself joins its emitter
+            # threads without a timeout, so the whole stop-and-join runs on a
+            # helper thread; an observer stuck on a hung network share is
+            # abandoned (watchdog's threads are daemons) instead of freezing
+            # the app.
+            def _stop_observer() -> None:
+                try:
+                    observer.stop()
+                    observer.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+                except Exception:  # noqa: BLE001 - best-effort shutdown
+                    log.debug("Watcher stop raised", exc_info=True)
+
+            stopper = threading.Thread(
+                target=_stop_observer, name="watcher-stop", daemon=True
+            )
+            stopper.start()
+            stopper.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+            if stopper.is_alive() or observer.is_alive():
+                log.warning(
+                    "Directory watcher did not stop within %.0fs; abandoning it",
+                    _STOP_JOIN_TIMEOUT_SECONDS,
+                )
+                # The stuck observer may still deliver events for the old
+                # directory. Cut it off from the shared callback, and give
+                # any later start() a handler of its own.
+                self.event_handler.callback = _discard_event
+                self.event_handler = ImageDirectoryEventHandler(self.callback)
+                stopped = False
+            else:
+                log.info("Stopped watching directory.")
             self.observer = None  # Clear instance after stopping
+        return stopped
 
     def is_alive(self) -> bool:
         """Checks if the watcher thread is alive."""

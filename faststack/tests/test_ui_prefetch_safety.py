@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from faststack.ui.provider import UIState
@@ -31,12 +32,15 @@ class TestUIPrefetchSafety(unittest.TestCase):
         self.model.rowCount.return_value = 5000
         self.model.thumbnail_size = 256
 
+        # Plain objects: building hundreds of MagicMock entries per call
+        # dominated this file's runtime.
         def get_entry_mock(i):
-            entry = MagicMock()
-            entry.path = Path(f"image_{i}.jpg")
-            entry.mtime_ns = 123456789
-            entry.is_folder = False
-            return entry
+            return SimpleNamespace(
+                path=Path(f"image_{i}.jpg"),
+                mtime_ns=123456789,
+                source_identity="0",
+                is_folder=False,
+            )
 
         self.model.get_entry.side_effect = get_entry_mock
 
