@@ -39,15 +39,21 @@ _ROUTER_MARK = "_faststack_thread_warning_router"
 TRUNCATION_WARNING_TEXT = "Premature end of JPEG file"
 
 
-def _has_truncation_filter() -> bool:
-    for action, message, _category, _module, _lineno in warnings.filters:
-        if (
-            action == "always"
-            and message is not None
-            and message.pattern == TRUNCATION_WARNING_TEXT
-        ):
-            return True
-    return False
+def _truncation_filter_is_first() -> bool:
+    """True while our "always" filter is the first filter consulted.
+
+    Python applies the first matching filter, so a later
+    ``simplefilter("ignore", UserWarning)`` anywhere in the process would
+    swallow the truncation warning if it sat in front of ours.
+    """
+    if not warnings.filters:
+        return False
+    action, message, _category, _module, _lineno = warnings.filters[0]
+    return (
+        action == "always"
+        and message is not None
+        and message.pattern == TRUNCATION_WARNING_TEXT
+    )
 
 
 def _install_warning_router() -> None:
@@ -57,7 +63,10 @@ def _install_warning_router() -> None:
     ``catch_warnings`` blocks elsewhere (including test harnesses) restore the
     previous global state on exit and drop the router with it.
     """
-    if getattr(warnings.showwarning, _ROUTER_MARK, False) and _has_truncation_filter():
+    if (
+        getattr(warnings.showwarning, _ROUTER_MARK, False)
+        and _truncation_filter_is_first()
+    ):
         return
     with _router_lock:
         previous = warnings.showwarning
@@ -72,7 +81,10 @@ def _install_warning_router() -> None:
 
             setattr(_router, _ROUTER_MARK, True)
             warnings.showwarning = _router
-        if not _has_truncation_filter():
+        if not _truncation_filter_is_first():
+            # filterwarnings() drops an identical earlier entry and inserts at
+            # the front, so this both installs the filter and restores its
+            # precedence over anything added since.
             warnings.filterwarnings("always", message=TRUNCATION_WARNING_TEXT)
 
 

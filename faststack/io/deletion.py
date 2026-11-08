@@ -137,6 +137,7 @@ def _exclusive_copy_restore(source: Path, target: Path) -> None:
         )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     fd = os.open(target, flags, 0o666)
+    created = os.fstat(fd)
     try:
         with os.fdopen(fd, "wb") as dst:
             fd = -1  # Owned by the file object now.
@@ -148,11 +149,30 @@ def _exclusive_copy_restore(source: Path, target: Path) -> None:
     except BaseException:
         if fd != -1:
             os.close(fd)
-        try:
-            target.unlink()
-        except OSError:
-            log.warning("Could not remove partial restore %s", target)
+        _unlink_if_same_file(target, created)
         raise
+
+
+def _unlink_if_same_file(path: Path, expected: os.stat_result) -> None:
+    """Remove *path* only while it is still the file *expected* describes.
+
+    O_EXCL guarantees the create, not a later unlink: another writer could
+    have replaced the partial copy in the meantime, and its file must stay.
+    """
+    try:
+        current = os.lstat(path)
+    except OSError:
+        return  # Already gone.
+    if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+        log.warning(
+            "Not removing partial restore %s: another file now has that name",
+            path,
+        )
+        return
+    try:
+        path.unlink()
+    except OSError:
+        log.warning("Could not remove partial restore %s", path)
 
 
 def restore_without_replace(source: Path, target: Path) -> None:
@@ -169,6 +189,32 @@ def restore_without_replace(source: Path, target: Path) -> None:
     except (OSError, NotImplementedError):
         _exclusive_copy_restore(source, target)
     source.unlink()
+
+
+def _require_space_for_copy_rollback(
+    transaction_dir: Path, candidates: list[tuple[Path, FileIdentity]]
+) -> None:
+    """Refuse to stage when a copy-based rollback could run out of space.
+
+    Without hard links both the recovery copies and a rollback are byte
+    copies. If a recovery copy fails with ENOSPC, rolling the already-staged
+    members back needs space as well; with none left they would be stranded
+    in the hidden transaction directory under their staging names. Checked
+    before the first file moves so the transaction fails cleanly instead.
+    """
+    sizes = [identity.size or 0 for _path, identity in candidates]
+    required = sum(sizes) + max(sizes, default=0)
+    try:
+        free = shutil.disk_usage(transaction_dir).free
+    except OSError:
+        return  # Unknown capacity; behave as before.
+    if free < required:
+        raise OSError(
+            "Permanent deletion refused: this drive cannot hard link and has "
+            f"{free / 1e6:.0f} MB free, less than the {required / 1e6:.0f} MB "
+            "needed to keep the deletion recoverable. Free some space and try "
+            "again."
+        )
 
 
 def _verify_rollback_capability(
@@ -506,6 +552,8 @@ def permanently_delete_image_files(
         restore_methods.update(
             _verify_rollback_capability(transaction_dir, destinations)
         )
+        if RESTORE_EXCLUSIVE_COPY in restore_methods.values():
+            _require_space_for_copy_rollback(transaction_dir, candidates)
         for path, _identity in candidates:
             if (
                 restore_methods.get(path.parent) == RESTORE_EXCLUSIVE_COPY

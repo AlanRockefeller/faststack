@@ -88,7 +88,14 @@ def fsync_file(path: Path, *, strict: bool = False) -> None:
     except OSError as e:
         if strict and e.errno not in _FSYNC_UNSUPPORTED_ERRNOS:
             raise
-        log.debug("Failed to fsync file %s: %s", path, e)
+        # In strict mode the caller is about to commit without durability;
+        # say so where the user can see it.
+        log.log(
+            logging.WARNING if strict else logging.DEBUG,
+            "Failed to fsync file %s: %s",
+            path,
+            e,
+        )
     finally:
         if fd is not None:
             try:

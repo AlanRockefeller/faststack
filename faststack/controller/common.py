@@ -8,9 +8,19 @@ log = logging.getLogger(__name__)
 
 
 def app_debug_mode() -> bool:
-    """The --debug flag. main() sets it on faststack.app at startup."""
-    app_module = sys.modules.get("faststack.app")
-    return bool(getattr(app_module, "_debug_mode", False))
+    """The --debug flag, read from wherever main() set it.
+
+    main() assigns the module global ``_debug_mode``. Under ``faststack`` /
+    ``python -m faststack`` that module is ``faststack.app``; under
+    ``python -m faststack.app`` (how respawned windows start) it runs as
+    ``__main__`` instead, so both are checked. Tests patch
+    ``faststack.app._debug_mode`` directly.
+    """
+    for module_name in ("faststack.app", "__main__"):
+        module = sys.modules.get(module_name)
+        if module is not None and getattr(module, "_debug_mode", False):
+            return True
+    return False
 
 
 def _worker_unaccounted_ms(stats: dict) -> Optional[float]:

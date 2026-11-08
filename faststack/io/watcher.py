@@ -70,6 +70,10 @@ def _is_ignored_path(path: str) -> bool:
     )
 
 
+def _discard_event(_path: str) -> None:
+    """Callback for an abandoned observer: its events are no longer wanted."""
+
+
 def _is_watched_image_path(path: str) -> bool:
     """Return True when a file can contribute pixels to FastStack's image list."""
     return Path(path).suffix.lower() in _WATCHED_IMAGE_EXTENSIONS
@@ -198,9 +202,10 @@ class Watcher:
         except Exception:
             log.debug("stop()/join() failed on partial observer", exc_info=True)
 
-    def stop(self):
-        """Stops watching the directory."""
+    def stop(self) -> bool:
+        """Stop watching. Returns False when the observer had to be abandoned."""
         observer = self.observer
+        stopped = True
         if observer and observer.is_alive():
             # Bounded: stop() runs on the UI thread (e.g. around sidecar
             # writes). watchdog's observer.stop() itself joins its emitter
@@ -225,9 +230,16 @@ class Watcher:
                     "Directory watcher did not stop within %.0fs; abandoning it",
                     _STOP_JOIN_TIMEOUT_SECONDS,
                 )
+                # The stuck observer may still deliver events for the old
+                # directory. Cut it off from the shared callback, and give
+                # any later start() a handler of its own.
+                self.event_handler.callback = _discard_event
+                self.event_handler = ImageDirectoryEventHandler(self.callback)
+                stopped = False
             else:
                 log.info("Stopped watching directory.")
             self.observer = None  # Clear instance after stopping
+        return stopped
 
     def is_alive(self) -> bool:
         """Checks if the watcher thread is alive."""

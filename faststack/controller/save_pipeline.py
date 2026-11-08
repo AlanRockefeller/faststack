@@ -281,7 +281,9 @@ class SavePipelineMixin:
 
     @staticmethod
     def _float_source_to_pil(source_arr: np.ndarray) -> Image.Image:
-        arr_u8 = (np.clip(source_arr, 0.0, 1.0) * 255).astype(np.uint8)
+        # Round: this rebuilds original_image from the float master, so it
+        # must be the exact inverse of the /255.0 conversion, not a truncation.
+        arr_u8 = np.rint(np.clip(source_arr, 0.0, 1.0) * 255.0).astype(np.uint8)
         return Image.fromarray(arr_u8, mode="RGB")
 
     def _restore_source_buffer_from_pending_request(
@@ -565,11 +567,15 @@ class SavePipelineMixin:
         session_token: Any,
         status_message: Optional[str],
     ) -> bool:
-        """Decline a save when another request for the same target is already active."""
+        """Decline a save when another request for the same target is already active.
+
+        A declined request is not recorded as the target's latest save token:
+        nothing was queued for it, so the in-flight save must keep its retry
+        and failure reporting.
+        """
         if not self._save_target_is_in_flight(target):
             return False
 
-        self._note_latest_save_token(target=target, session_token=session_token)
         log.info(
             "Skipping save request for %s; another save is already in flight", target
         )
@@ -799,9 +805,6 @@ class SavePipelineMixin:
             self.update_status_message(self._last_save_prepare_error, timeout=5000)
             return None
 
-        self._note_latest_save_token(
-            target=effective_target, session_token=session_token
-        )
         save_metadata_path = (
             self.image_files[self.current_index].path
             if 0 <= self.current_index < len(self.image_files)
@@ -881,6 +884,8 @@ class SavePipelineMixin:
         ):
             return False
 
+        # Accepted: from here on this is the newest save for the target.
+        self._note_latest_save_token(target=target, session_token=session_token)
         self._suppress_watcher_paths(target)
         self._open_save_tracking_for_request(request)
         # One governor token per accepted save execution, carried on the
@@ -1004,6 +1009,8 @@ class SavePipelineMixin:
         ):
             if saving_status is None and target:
                 self._pending_save_recovery[target] = request
+                # Deferred, not dropped: it supersedes the in-flight save.
+                self._note_latest_save_token(target=target, session_token=session_token)
                 # This deferred request IS the newest revision for the target,
                 # so it must be published with the same ordering guarantees as
                 # a normally accepted async save. Without this, the persisted
@@ -1022,6 +1029,7 @@ class SavePipelineMixin:
                 )
             return False
 
+        self._note_latest_save_token(target=target, session_token=session_token)
         self._suppress_watcher_paths(target)
         self._open_save_tracking_for_request(request)
         # Same per-execution token as the async path; _on_save_finished below
