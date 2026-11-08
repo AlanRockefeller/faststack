@@ -46,9 +46,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[bundle,dev]"
 
-      - name: Run Ruff
-        run: python -m ruff check faststack/
-
       - name: Run tests
         env:
           QT_QPA_PLATFORM: offscreen

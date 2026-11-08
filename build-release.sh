@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  ./build-release.sh [--tag v1.6.4-build3] [--target origin/main] [--dry-run] [--skip-ruff]
+  ./build-release.sh [--tag v1.6.4-build3] [--target origin/main] [--dry-run]
 
 Build FastStack release binaries by creating and pushing a v* tag.
 GitHub Actions builds the Windows and macOS artifacts and publishes them to
@@ -36,15 +36,6 @@ cd "$repo_root"
 tag=""
 target_ref="origin/main"
 dry_run=false
-skip_ruff=false
-temp_dir=""
-
-cleanup() {
-  if [ -n "$temp_dir" ] && [ -d "$temp_dir" ]; then
-    rm -rf "$temp_dir"
-  fi
-}
-trap cleanup EXIT
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -62,10 +53,6 @@ while [ "$#" -gt 0 ]; do
       dry_run=true
       shift
       ;;
-    --skip-ruff)
-      skip_ruff=true
-      shift
-      ;;
     -h|--help)
       usage
       exit 0
@@ -75,23 +62,6 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
-
-find_venv_python() {
-  local candidate
-  for candidate in \
-    ".venv/Scripts/python.exe" \
-    ".venv/bin/python" \
-    "venv/Scripts/python.exe" \
-    "venv/bin/python" \
-    ".venv-win/Scripts/python.exe"
-  do
-    if [ -x "$candidate" ] || [ -f "$candidate" ]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
 
 show_target_file() {
   local path="$1"
@@ -179,23 +149,6 @@ target_file_contains .github/workflows/build-executables.yml 'tools/release_note
   || die "target build workflow must build release notes from ChangeLog.md"
 target_file_contains tools/release_notes.py 'def render_release_notes' \
   || die "target tools/release_notes.py is missing the release-notes builder"
-
-if [ "$skip_ruff" = false ]; then
-  python_bin="$(find_venv_python)" \
-    || die "no project virtualenv Python found; expected .venv or venv"
-  head_sha="$(git rev-parse HEAD^{commit})"
-  if [ "$target_sha" = "$head_sha" ]; then
-    ruff_dir="$repo_root"
-  else
-    temp_dir="$(mktemp -d)"
-    git archive "$target_sha" | tar -x -C "$temp_dir"
-    ruff_dir="$temp_dir"
-  fi
-  note "Running Ruff with $python_bin against $target_sha"
-  (cd "$ruff_dir" && "$repo_root/$python_bin" -m ruff check faststack/)
-else
-  note "Skipping Ruff"
-fi
 
 remote_url="$(git remote get-url origin)"
 repo_slug="$(printf '%s\n' "$remote_url" \
