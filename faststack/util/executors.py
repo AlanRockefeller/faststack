@@ -304,6 +304,19 @@ class PriorityExecutor:
                 # only guarantees a missed wake-up can never wedge a worker.
                 self._admission.wait(0.25)
 
+    def _wait_for_admission_change(self, timeout: float) -> None:
+        """Park a constrained worker without reserving a slot.
+
+        The capacity check and the wait happen under one lock hold, so a
+        release or limit change between a failed admission and this call is
+        observed instead of missed. Releases, limit increases and shutdown all
+        notify ``_admission``; the timeout only bounds a missed wake-up.
+        """
+        with self._admission:
+            if self._stop_event.is_set() or self._admitted < self._concurrency_limit:
+                return
+            self._admission.wait(timeout)
+
     def _release_admission(self, *, was_running: bool) -> None:
         with self._admission:
             self._admitted = max(0, self._admitted - 1)
@@ -382,7 +395,10 @@ class PriorityExecutor:
                 continue
 
             if not self._acquire_admission(blocking=False):
-                # Constrained: re-check the stop/drain condition and wait again.
+                # Constrained: park until capacity, the limit, or shutdown
+                # changes instead of re-polling the non-empty queue (which
+                # would spin at full CPU), then re-check the drain condition.
+                self._wait_for_admission_change(0.25)
                 continue
 
             try:

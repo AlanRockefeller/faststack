@@ -117,16 +117,57 @@ def symlinks_restorable() -> bool:
     return os.link in os.supports_follow_symlinks
 
 
+RESTORE_LINK = "link"
+RESTORE_EXCLUSIVE_COPY = "copy"
+
+
+def _exclusive_copy_restore(source: Path, target: Path) -> None:
+    """Copy *source* to *target*, failing if *target* already exists.
+
+    The no-replace fallback for filesystems without hard links (FAT32/exFAT
+    camera cards and USB drives). ``O_CREAT | O_EXCL`` is an atomic
+    exclusive create everywhere, so a file that appeared at the authorized
+    pathname is never overwritten -- the same guarantee the hard link gives.
+    Unlike a link the bytes are copied, so the content becomes visible
+    progressively; a failed copy removes only the file this call created.
+    """
+    if source.is_symlink():
+        raise NotImplementedError(
+            f"Cannot restore {target.name} as a symlink by copying."
+        )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(target, flags, 0o666)
+    try:
+        with os.fdopen(fd, "wb") as dst:
+            fd = -1  # Owned by the file object now.
+            with open(source, "rb") as src:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        shutil.copystat(source, target)
+    except BaseException:
+        if fd != -1:
+            os.close(fd)
+        try:
+            target.unlink()
+        except OSError:
+            log.warning("Could not remove partial restore %s", target)
+        raise
+
+
 def _verify_rollback_capability(
     transaction_dir: Path, destinations: list[Path]
-) -> None:
-    """Raise OSError unless staged files can be rolled back atomically.
+) -> dict[Path, str]:
+    """Choose, and prove, a no-replace restore method for each destination.
 
-    Filesystems such as exFAT do not support hard links, so the restore path
-    used by a failed transaction has to be proven *before* the first source
-    file is moved. The probe links out of the transaction directory into each
-    destination directory, exercising the same call the rollback would make.
+    The restore path used by a failed transaction has to be proven *before*
+    the first source file is moved. A hard link (``RESTORE_LINK``) is
+    preferred: it restores the very same filesystem object. Filesystems such
+    as FAT32/exFAT do not support hard links, so there the exclusive-create
+    copy (``RESTORE_EXCLUSIVE_COPY``) is probed instead. Raises OSError only
+    when neither works.
     """
+    methods: dict[Path, str] = {}
     for directory in destinations:
         handle, probe_name = tempfile.mkstemp(
             prefix=".faststack-linkprobe-", dir=transaction_dir
@@ -134,28 +175,38 @@ def _verify_rollback_capability(
         os.close(handle)
         probe_source = Path(probe_name)
         probe_target = directory / f".faststack-linkprobe-{uuid.uuid4().hex}"
-        linked = False
+        created = False
         try:
             try:
                 _atomic_no_replace_link(probe_source, probe_target)
-                linked = True
-            except NotImplementedError as exc:
+                created = True
+                methods[directory] = RESTORE_LINK
+                continue
+            except (NotImplementedError, OSError) as exc:
+                link_error = exc
+            try:
+                _exclusive_copy_restore(probe_source, probe_target)
+                created = True
+                methods[directory] = RESTORE_EXCLUSIVE_COPY
+                log.info(
+                    "Hard links unavailable in %s (%s); rollback will use an "
+                    "exclusive-create copy",
+                    directory,
+                    link_error,
+                )
+            except (NotImplementedError, OSError) as exc:
                 raise OSError(
-                    f"Permanent deletion refused: {directory} does not support the "
-                    "atomic no-replace restore required to roll the deletion back."
-                ) from exc
-            except OSError as exc:
-                raise OSError(
-                    f"Permanent deletion refused: {directory} does not support the "
-                    "atomic no-replace restore required to roll the deletion back "
-                    f"({exc})."
+                    f"Permanent deletion refused: {directory} does not support "
+                    "a no-replace restore to roll the deletion back "
+                    f"({link_error}; {exc})."
                 ) from exc
         finally:
-            for probe in ((probe_target,) if linked else ()) + (probe_source,):
+            for probe in ((probe_target,) if created else ()) + (probe_source,):
                 try:
                     probe.unlink()
                 except OSError:
                     log.warning("Could not remove rollback probe %s", probe)
+    return methods
 
 
 def ensure_recycle_bin_dir(recycle_bin_dir: Path) -> bool:
@@ -341,13 +392,20 @@ def permanently_delete_image_files(
     staged: list[tuple[Path, Path]] = []
     compensation: list[tuple[Path, Path]] = []
     unlinked_staged: set[Path] = set()
+    restore_methods: dict[Path, str] = {}
 
     def _restore(staged_path: Path, original_path: Path) -> None:
         try:
-            # A hard link is an atomic no-replace restore: unlike os.replace,
-            # it fails if another file appeared at the authorized pathname.
-            # Its availability was proven before the first file was staged.
-            _atomic_no_replace_link(staged_path, original_path)
+            # Both methods are atomic no-replace restores: unlike os.replace,
+            # they fail if another file appeared at the authorized pathname.
+            # The method was proven before the first file was staged.
+            if (
+                restore_methods.get(original_path.parent, RESTORE_LINK)
+                == RESTORE_EXCLUSIVE_COPY
+            ):
+                _exclusive_copy_restore(staged_path, original_path)
+            else:
+                _atomic_no_replace_link(staged_path, original_path)
         except FileExistsError as exc:
             raise SourceChangedError(
                 f"Cannot restore {original_path.name}: a replacement appeared. "
@@ -429,7 +487,19 @@ def permanently_delete_image_files(
         for path, _identity in candidates:
             if path.parent not in destinations:
                 destinations.append(path.parent)
-        _verify_rollback_capability(transaction_dir, destinations)
+        restore_methods.update(
+            _verify_rollback_capability(transaction_dir, destinations)
+        )
+        for path, _identity in candidates:
+            if (
+                restore_methods.get(path.parent) == RESTORE_EXCLUSIVE_COPY
+                and path.is_symlink()
+            ):
+                raise OSError(
+                    f"Permanent deletion refused: {path.name} is a symlink and "
+                    "this filesystem cannot restore it as one if the deletion "
+                    "has to be rolled back."
+                )
         if not symlinks_restorable():
             # A symlinked source can be staged, but not restored as a symlink
             # (see _atomic_no_replace_link). Refuse before the first move

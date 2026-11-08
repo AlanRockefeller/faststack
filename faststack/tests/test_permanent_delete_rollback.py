@@ -53,8 +53,10 @@ def _require_symlinks(tmp_path: Path) -> None:
     ids=["oserror", "notimplemented"],
 )
 class TestRollbackCapabilityPreflight:
-    def test_refuses_delete_when_hard_links_unavailable(self, tmp_path, failure):
-        """A filesystem without hard links must not lose the original file."""
+    """Without hard links (FAT32/exFAT), rollback uses an exclusive-create copy."""
+
+    def test_deletes_when_hard_links_unavailable(self, tmp_path, failure):
+        """Camera cards and USB drives must still support permanent deletion."""
         jpg = tmp_path / "img.jpg"
         jpg.write_text("jpg-bytes")
         img = MockImageFile(jpg, None)
@@ -64,31 +66,60 @@ class TestRollbackCapabilityPreflight:
         ):
             result = permanently_delete_image_files(img)
 
-        assert result is False
-        assert jpg.exists()
-        assert jpg.read_text() == "jpg-bytes"
+        assert result is True
+        assert not jpg.exists()
         assert _transaction_dirs(tmp_path) == []
         assert _probe_leftovers(tmp_path) == []
 
-    def test_no_source_is_staged_when_rollback_unavailable(self, tmp_path, failure):
-        """The preflight must run before the first os.replace of a source."""
+    def test_copy_rollback_restores_every_member(self, tmp_path, failure):
+        """A staging failure without hard links restores the authorized bytes."""
         jpg = tmp_path / "img.jpg"
         raw = tmp_path / "img.orf"
         jpg.write_text("jpg-bytes")
         raw.write_text("raw-bytes")
         img = MockImageFile(jpg, raw)
 
+        real_replace = os.replace
+        calls = []
+
+        def fake_replace(src, dst):
+            calls.append(Path(src))
+            if len(calls) == 2:
+                raise OSError(errno.EIO, "simulated staging failure")
+            real_replace(src, dst)
+
         with patch(
             "faststack.io.deletion._atomic_no_replace_link", side_effect=failure
         ):
-            with patch("faststack.io.deletion.os.replace") as mock_replace:
+            with patch("faststack.io.deletion.os.replace", side_effect=fake_replace):
                 result = permanently_delete_image_files(img)
+
+        assert result is False
+        assert jpg.read_text() == "jpg-bytes"
+        assert raw.read_text() == "raw-bytes"
+        assert _transaction_dirs(tmp_path) == []
+
+    def test_refuses_when_no_restore_method_works(self, tmp_path, failure):
+        """With neither restore method available, nothing is staged."""
+        jpg = tmp_path / "img.jpg"
+        jpg.write_text("jpg-bytes")
+        img = MockImageFile(jpg, None)
+
+        with patch(
+            "faststack.io.deletion._atomic_no_replace_link", side_effect=failure
+        ):
+            with patch(
+                "faststack.io.deletion._exclusive_copy_restore",
+                side_effect=OSError(errno.EPERM, "read-only"),
+            ):
+                with patch("faststack.io.deletion.os.replace") as mock_replace:
+                    result = permanently_delete_image_files(img)
 
         assert result is False
         assert mock_replace.call_count == 0
         assert jpg.read_text() == "jpg-bytes"
-        assert raw.read_text() == "raw-bytes"
         assert _transaction_dirs(tmp_path) == []
+        assert _probe_leftovers(tmp_path) == []
 
 
 class TestRollbackOnSupportedFilesystem:

@@ -2882,10 +2882,13 @@ class UIState(QObject):
             for i in reversed(indices):
                 entry = model.get_entry(i)
                 if entry and not entry.is_folder:
+                    # source_identity must match the visible tile id or the
+                    # prefetched cache entry is never consumed.
                     prefetcher.submit(
                         entry.path,
                         entry.mtime_ns,
                         size=size,
+                        source_identity=entry.source_identity,
                         priority=priority,
                     )
 

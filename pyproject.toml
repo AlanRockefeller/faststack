@@ -27,7 +27,7 @@ dependencies = [
     "PyTurboJPEG>=1.8,<2.0",
     "numpy>=2.0,<3.0",
     "cachetools>=5.0,<6.0",
-    "watchdog>=4.0,<5.0",
+    "watchdog>=4.0.2,<5.0",  # 4.0.2: FSEvents schedule() accepts event_filter
     "Pillow>=12.3.0,<13.0",
     "packaging>=24.0,<26.0",
     # OpenCV 4.10+ might be required for NumPy 2.0 binary compatibility

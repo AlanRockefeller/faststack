@@ -739,6 +739,9 @@ class AppController(QObject):
         # Deferred-init state: set to safe defaults, populated later by their methods
         self._saves_in_flight: Dict[str, int] = {}
         self._saving_keys: Dict[str, int] = {}
+        # Per-request save-tracking ownership: id(request) -> entry. Released
+        # exactly once, by _on_save_finished or by shutdown reconciliation.
+        self._open_save_tracking: Dict[int, dict[str, Any]] = {}
         self._batch_indices_cache: set = set()
         self._batch_indices_cache_key: Optional[tuple] = None
         self.recycle_bin_dir: Optional[Path] = None
@@ -3245,6 +3248,37 @@ class AppController(QObject):
         # waiting its turn in the same job.
         return not current.exists or current == entry["identity"]
 
+    def _invalidate_inflight_index_scans(self) -> None:
+        """Discard any background scan snapshot taken before an in-memory
+        image-list mutation (delete/recycle/restore).
+
+        A walk captured before the mutation would otherwise publish afterwards
+        and resurrect (or re-hide) rows. Bumping the epoch makes the stale
+        completion take the discard path, and requesting a rescan there
+        replaces it with a snapshot of the post-mutation directory.
+        """
+        self._index_scan_epoch += 1
+        if self._index_scan_inflight:
+            self._index_rescan_needed = True
+
+    def _drop_pending_delete_images(self, images):
+        """Remove scan rows for files an in-flight delete job still owns."""
+        if not self._pending_delete_identities:
+            return images
+        now = time.monotonic()
+        kept = []
+        with self._suppressed_paths_lock:
+            for image in images:
+                try:
+                    key = self._key(image.path)
+                except (OSError, TypeError, ValueError):
+                    kept.append(image)
+                    continue
+                if key and self._is_pending_delete_path(key, image.path, now):
+                    continue
+                kept.append(image)
+        return kept
+
     @Slot()
     def _start_watcher_debounce_timer(self) -> None:
         """Non-overloaded slot to restart the watcher debounce timer.
@@ -3416,6 +3450,9 @@ class AppController(QObject):
             return
 
         images, variant_map = result
+        # A walk that overlapped a delete job can still list files the worker
+        # has not moved yet; they were already removed from the UI.
+        images = self._drop_pending_delete_images(images)
 
         with self._watcher_changed_lock:
             changed_paths = self._watcher_changed_paths
@@ -3452,10 +3489,62 @@ class AppController(QObject):
         for path in photoshop_overwrites:
             log.info("Detected completed image editor overwrite: %s", path)
 
+        # Stack ranges are indices into image_files; capture their identities
+        # before the swap so an inserted/removed earlier row cannot shift them
+        # onto different images (launching the wrong files).
+        pre_scan_stack_paths = self._resolve_ranges_to_paths(self.stacks)
+        pre_scan_stack_start = (
+            self.image_files[self.stack_start_index].path
+            if self.stack_start_index is not None
+            and 0 <= self.stack_start_index < len(self.image_files)
+            else None
+        )
+        pre_scan_stack_end = (
+            self.image_files[self.stack_end_index].path
+            if self.stack_end_index is not None
+            and 0 <= self.stack_end_index < len(self.image_files)
+            else None
+        )
+
         self._all_images = images
         self._variant_map = variant_map
         self._apply_filter_to_cached_list(notify=False)
         stack_ranges_changed = False
+        if self._filter_enabled and self._filter_identity_snapshot is not None:
+            # Filtered view: the snapshot holds the full semantic groups
+            # (including hidden members) and is kept current by every visible
+            # stack edit. Re-project it, exactly as apply_filter() does.
+            previous_stacks = self.stacks
+            snapshot = self._filter_identity_snapshot
+            self.stacks = self._rebuild_ranges_from_paths(snapshot["stack_groups"])
+            self.stack_start_index = (
+                self._path_to_index.get(self._key(snapshot["stack_start"]))
+                if snapshot["stack_start"]
+                else None
+            )
+            self.stack_end_index = (
+                self._path_to_index.get(self._key(snapshot["stack_end"]))
+                if snapshot["stack_end"]
+                else None
+            )
+            stack_ranges_changed = self.stacks != previous_stacks
+        elif not self.sidecar.data.stack_paths:
+            # No persisted identities (legacy sidecar): remap by path.
+            previous_stacks = self.stacks
+            # Distinct stacks may be adjacent, so do not merge them.
+            self.stacks = self._rebuild_ranges_from_paths(pre_scan_stack_paths)
+            stack_ranges_changed = self.stacks != previous_stacks
+        if not self._filter_enabled:
+            self.stack_start_index = (
+                self._path_to_index.get(self._key(pre_scan_stack_start))
+                if pre_scan_stack_start
+                else None
+            )
+            self.stack_end_index = (
+                self._path_to_index.get(self._key(pre_scan_stack_end))
+                if pre_scan_stack_end
+                else None
+            )
         if not self._filter_enabled and self.sidecar.data.stack_paths:
             previous_stacks = self.stacks
             with self.sidecar._state_lock:
@@ -5101,6 +5190,7 @@ class AppController(QObject):
         state["status"] = "saved"
         state["source_path"] = str(source_path or backup_path or saved_path)
         state["saved_at"] = datetime.now().isoformat(timespec="seconds")
+        state["target_fingerprint"] = self._edit_target_fingerprint(saved_path)
         if not self._edit_state_has_replayable_source(state, saved_path):
             log.debug(
                 "Not storing saved edit state for %s; source is not replayable",
@@ -5136,6 +5226,7 @@ class AppController(QObject):
             "source_path": str(source_path),
             "target_path": str(saved_path),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "target_fingerprint": self._edit_target_fingerprint(saved_path),
             "edits": self._serialize_editor_edits(edits),
             "masks": self._serialize_mask_assets(masks),
             "auto_adjust": self._serialize_current_auto_adjust_state(),
@@ -5147,6 +5238,44 @@ class AppController(QObject):
             )
             return None
         return state
+
+    @staticmethod
+    def _edit_target_fingerprint(path: Optional[Path]) -> Optional[list[int]]:
+        """[size, mtime_ns] of the file a saved edit state produced.
+
+        Captured after the save finished (saves restore the original mtime
+        inside the write, so this is the final value). An external editor
+        overwriting the target changes it. ctime/inode are deliberately left
+        out so copying or moving the folder does not invalidate the state.
+        """
+        if path is None:
+            return None
+        try:
+            st = os.stat(path)
+        except (OSError, TypeError, ValueError):
+            return None
+        return [int(st.st_size), int(st.st_mtime_ns)]
+
+    def _saved_edit_state_matches_target(
+        self, edit_state: dict[str, Any], target_path: Path
+    ) -> bool:
+        """False when the target changed since FastStack saved this state.
+
+        Replaying a stale "saved" state would reload the old source plus the
+        old edits and let the next FastStack save overwrite a newer external
+        result (Photoshop, GIMP, ...). States written before fingerprints
+        existed cannot be verified and are accepted as before.
+        """
+        if edit_state.get("status") != "saved":
+            return True
+        expected = edit_state.get("target_fingerprint")
+        if expected is None:
+            return True
+        current = self._edit_target_fingerprint(target_path)
+        try:
+            return current is not None and list(expected) == current
+        except TypeError:
+            return False
 
     def _edit_state_has_replayable_source(
         self, edit_state: dict[str, Any], target_fallback: Optional[Path]
@@ -5354,6 +5483,13 @@ class AppController(QObject):
         if not self._edit_state_has_replayable_source(edit_state, active_path):
             log.info(
                 "Ignoring edit state with non-replayable source for %s",
+                active_path,
+            )
+            return None
+        if not self._saved_edit_state_matches_target(edit_state, active_path):
+            log.info(
+                "Ignoring saved edit state for %s: the file changed after "
+                "FastStack saved it (external editor?)",
                 active_path,
             )
             return None
@@ -5670,6 +5806,52 @@ class AppController(QObject):
             self._saving_keys[save_image_key] = (
                 self._saving_keys.get(save_image_key, 0) + 1
             )
+
+    def _open_save_tracking_for_request(self, request: dict[str, Any]) -> None:
+        """Count *request* as in flight; paired with the release below."""
+        context = request.get("context", {})
+        target = context.get("target")
+        save_image_key = context.get("save_image_key")
+        self._increment_save_tracking(target=target, save_image_key=save_image_key)
+        self._open_save_tracking[id(request)] = {
+            "request": request,  # keeps id(request) unique while open
+            "target": target,
+            "save_image_key": save_image_key,
+            "future": None,
+        }
+
+    def _release_save_tracking_for_request(self, request: Optional[dict]) -> bool:
+        """Release *request*'s in-flight counters exactly once."""
+        if request is None:
+            return False
+        entry = self._open_save_tracking.get(id(request))
+        if entry is None or entry["request"] is not request:
+            return False
+        del self._open_save_tracking[id(request)]
+        self._decrement_save_tracking(
+            target=entry["target"], save_image_key=entry["save_image_key"]
+        )
+        return True
+
+    def _reconcile_save_tracking_for_shutdown(self) -> None:
+        """Release tracking for saves that finished while Qt delivery was stopped.
+
+        Runs after the save executor drained. Their _saveFinished completions
+        are queued behind the shutdown (or dropped by its guard), so without
+        this the counters stay populated and the exit watchdog would never
+        fire for a later hung shutdown step. A save whose future is somehow
+        not settled keeps its tracking (and keeps the watchdog waiting).
+        """
+        for entry in list(self._open_save_tracking.values()):
+            future = entry.get("future")
+            if future is not None and not future.done():
+                log.error(
+                    "Save for %s has not settled after executor shutdown; "
+                    "keeping it tracked",
+                    entry.get("target"),
+                )
+                continue
+            self._release_save_tracking_for_request(entry["request"])
 
     def _decrement_save_tracking(
         self,
@@ -6365,7 +6547,6 @@ class AppController(QObject):
         context = request["context"]
         export_snapshot = request["snapshot"]
         target = context.get("target")
-        save_image_key = context.get("save_image_key")
         session_token = context.get("session_token")
 
         if self._reject_save_while_target_busy(
@@ -6376,7 +6557,7 @@ class AppController(QObject):
             return False
 
         self._suppress_watcher_paths(target)
-        self._increment_save_tracking(target=target, save_image_key=save_image_key)
+        self._open_save_tracking_for_request(request)
         # One governor token per accepted save execution, carried on the
         # context so it travels into the result dict. Encoding and file I/O
         # compete with speculative decoding for the same cores, and overlapping
@@ -6444,13 +6625,16 @@ class AppController(QObject):
             self._leave_prefetch_constraint(
                 context.pop("prefetch_constraint_token", None)
             )
-            self._decrement_save_tracking(target=target, save_image_key=save_image_key)
+            self._release_save_tracking_for_request(request)
             if not self._saves_in_flight:
                 self.ui_state.isSaving = False
             self._mark_current_live_edit_session_save_failed(context["save_revision"])
             self.update_status_message(f"Failed to start background save: {e}")
             return False
 
+        tracking = self._open_save_tracking.get(id(request))
+        if tracking is not None:
+            tracking["future"] = future
         self._remember_pending_edit_save_request(request)
         self._write_pending_edit_state_for_request(request)
 
@@ -6482,7 +6666,6 @@ class AppController(QObject):
         context = request["context"]
         export_snapshot = request["snapshot"]
         target = context.get("target")
-        save_image_key = context.get("save_image_key")
         session_token = context.get("session_token")
 
         if self._reject_save_while_target_busy(
@@ -6515,7 +6698,7 @@ class AppController(QObject):
             return False
 
         self._suppress_watcher_paths(target)
-        self._increment_save_tracking(target=target, save_image_key=save_image_key)
+        self._open_save_tracking_for_request(request)
         # Same per-execution token as the async path; _on_save_finished below
         # releases it from the result dict regardless of outcome.
         context["prefetch_constraint_token"] = self._enter_prefetch_constraint("save")
@@ -6663,15 +6846,26 @@ class AppController(QObject):
         # token belongs to THIS save execution only, so a duplicate or stale
         # completion cannot restore capacity another in-flight save still needs.
         self._leave_prefetch_constraint(save_result.get("prefetch_constraint_token"))
+        # Tracking is also released before the shutdown guard (idempotently,
+        # per request): a completion delivered during shutdown must not leave
+        # _saves_in_flight populated, or the exit watchdog waits forever.
+        tracked_request = save_result.get("request")
+        if tracked_request is not None:
+            self._release_save_tracking_for_request(tracked_request)
+        else:
+            # Request-less result (legacy/synthetic): release by target/key.
+            self._decrement_save_tracking(
+                target=save_result.get("target"),
+                save_image_key=save_result.get("save_image_key"),
+            )
         # Guard against callbacks during/after shutdown
         if self._shutting_down:
             return
 
-        # Remove completed target from in-flight set, then clear the saving
-        # indicator only when no exports remain in progress.
+        # The in-flight set was updated above; clear the saving indicator
+        # only when no exports remain in progress.
         target = save_result.get("target")
         save_key = save_result.get("save_image_key")
-        self._decrement_save_tracking(target=target, save_image_key=save_key)
         if not self._saves_in_flight:
             self.ui_state.isSaving = False
 
@@ -9900,6 +10094,7 @@ class AppController(QObject):
         except RuntimeError:
             pass  # executor shut down, ignore
 
+    @Slot(object, str)
     def _on_exif_brief_ready(self, exif_key: tuple[str, str], brief: str):
         """Slot called on main thread when background EXIF read completes."""
         if getattr(self, "_shutting_down", False) or not self.ui_state:
@@ -10817,6 +11012,10 @@ class AppController(QObject):
 
         Returns:
             True if the focus stacker was successfully launched, otherwise False.
+            This reports the launch only: once the external process is running
+            the stack must not be offered for retry (that would duplicate the
+            work), so a stacked-metadata save failure is reported and left
+            dirty for a later save instead of turning into a False here.
         """
         log.info("Launching focus stacker with %d files.", len(files))
         unique_files = list(dict.fromkeys(files))
@@ -10836,7 +11035,9 @@ class AppController(QObject):
                         meta.stacked_date = today
                         break
             if not self._persist_sidecar():
-                return False
+                # _persist_sidecar() already surfaced the error and kept the
+                # in-memory flags dirty for the next save.
+                log.warning("Focus stacker launched but stacked metadata was not saved")
             self._metadata_cache_index = (-1, -1)  # Invalidate cache
 
         return success
@@ -13040,6 +13241,7 @@ class AppController(QObject):
             "cancelled": did_cancel,
         }
 
+    @Slot(object)
     def _on_delete_finished(
         self, result_dict: dict, *, allow_during_shutdown: bool = False
     ) -> None:
@@ -13059,6 +13261,9 @@ class AppController(QObject):
 
         if job:
             self._release_pending_delete_paths(job.job_id, job.work_items)
+            # A scan that ran during the worker's I/O may list files it has
+            # since moved; once suppression is released nothing filters them.
+            self._invalidate_inflight_index_scans()
             pending_history_index = next(
                 (
                     index
@@ -13734,6 +13939,7 @@ class AppController(QObject):
         for idx in sorted_indices:
             if 0 <= idx < len(self.image_files):
                 del self.image_files[idx]
+        self._invalidate_inflight_index_scans()
 
         # Reposition current_index immediately (fast, in-memory only)
         validated_sorted = sorted(i for i in sorted_indices if 0 <= i < original_count)
@@ -14245,7 +14451,10 @@ class AppController(QObject):
                 self.image_editor.reset_edits()
             if hasattr(self.ui_state, "reset_editor_state"):
                 self.ui_state.reset_editor_state()
-            self._clear_live_edit_session_state()
+            # The editor session stays loaded, so re-baseline instead of
+            # dropping tracking: with no state, later slider edits would never
+            # read as dirty and navigation would silently discard them.
+            self._mark_current_live_edit_session_clean()
             with self._preview_lock:
                 self._clear_last_rendered_preview_locked()
             # Nothing changed on disk; just force a fresh decode of the
@@ -14293,6 +14502,7 @@ class AppController(QObject):
                 for idx, img in sorted(removed_items, key=lambda x: x[0]):
                     insert_idx = min(idx, len(self.image_files))
                     self.image_files.insert(insert_idx, img)
+                self._invalidate_inflight_index_scans()
 
                 self._rebuild_path_to_index()
                 # Keep showing the user's current image until the worker has
@@ -14694,6 +14904,7 @@ class AppController(QObject):
         self._safe_shutdown_executor(
             self._save_executor, "save", wait=True, cancel_futures=False
         )
+        self._reconcile_save_tracking_for_shutdown()
         self._safe_shutdown_executor(
             self._delete_executor, "delete", wait=True, cancel_futures=False
         )
@@ -14889,9 +15100,26 @@ class AppController(QObject):
                     Path(path) for path in (jpg_src, raw_src) if path is not None
                 )
 
+        # The recycled file was the only thing that tied an original-path
+        # entry to the deleted image. If a file now occupies that path (a
+        # replacement copied in, a re-export, a restore by other means), the
+        # entry describes the occupant -- its edits and flags -- and must
+        # survive emptying the bin.
+        def path_reoccupied(path: Path) -> bool:
+            try:
+                return os.path.lexists(path)
+            except (OSError, ValueError):
+                return True  # Unknown: keep metadata rather than risk loss.
+
         metadata_changed = False
         with self.sidecar._state_lock:
             for path in original_paths:
+                if path_reoccupied(path):
+                    log.debug(
+                        "Keeping metadata for %s: path is occupied by another file",
+                        path,
+                    )
+                    continue
                 key = self.sidecar.metadata_key_for_path(path)
                 if self.sidecar.data.entries.pop(key, None) is not None:
                     metadata_changed = True
@@ -18751,12 +18979,12 @@ class AppController(QObject):
             with self._preview_lock:
                 self._preview_inflight = False
 
-    @Slot(object)
     def _emit_preview_accepted_side_effects(self):
         self.ui_state.currentImageSourceChanged.emit()
         self.ui_state.highlightStateChanged.emit()
         self.update_histogram()
 
+    @Slot(object)
     def _apply_preview_result(self, payload):
         if getattr(self, "_shutting_down", False):
             return
@@ -20176,19 +20404,45 @@ class AppController(QObject):
                 filepath, cached_preview=None, preview_only=True
             )
 
-        # Save current_index, temporarily set to target index for auto_levels()
+        # Save current_index, temporarily set to target index for auto_levels().
+        # The viewer's variant override (developed/backup) belongs to the image
+        # on screen, not to the batch targets: leaving it set would load the
+        # viewed variant for every item and (for backups) save it over each
+        # target. Clear it per item so source and target come from `index`.
         saved_index = self.current_index
+        saved_override_path = self.view_override_path
+        saved_override_kind = self.view_override_kind
         self.current_index = index
+        self.view_override_path = None
+        self.view_override_kind = None
 
         try:
+            try:
+                expected_source = self.get_active_edit_path(index)
+            except (IndexError, OSError, TypeError, ValueError):
+                return False
+
             self._last_auto_levels_msg = ""
             applied = self.auto_levels()
 
             if not applied:
                 return False
 
+            loaded_path = self.image_editor.current_filepath
+            if not loaded_path or normalize_path_key(loaded_path) != normalize_path_key(
+                expected_source
+            ):
+                log.warning(
+                    "batch auto levels: editor loaded %s, expected %s; skipping",
+                    loaded_path,
+                    expected_source,
+                )
+                return False
+
             try:
-                save_target_path = self._get_save_target_path_for_current_view()
+                # Overrides are cleared, so this saves in place to the batch
+                # item's own edit source.
+                save_target_path = None
                 save_result = self.image_editor.save_image_uint8_levels(
                     save_target_path=save_target_path
                 )
@@ -20241,6 +20495,8 @@ class AppController(QObject):
             return False
         finally:
             self.current_index = saved_index
+            self.view_override_path = saved_override_path
+            self.view_override_kind = saved_override_kind
 
     # --- Batch Auto Levels ---
 
