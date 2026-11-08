@@ -394,8 +394,13 @@ class TestThumbnailDecode:
             mtime_ns = img_path.stat().st_mtime_ns
             prefetcher.submit(img_path, mtime_ns)
 
-            # Give it a moment to attempt decode; it should fail and not cache/callback
-            time.sleep(0.3)
+            # Wait for the decode attempt to settle (it should fail and
+            # neither cache nor call back) instead of a fixed sleep.
+            deadline = time.monotonic() + 5.0
+            while prefetcher._inflight and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert not prefetcher._inflight
+            time.sleep(0.02)  # let the done-callback finish after its pop
             if qt_app is not None:
                 try:
                     qt_app.processEvents()

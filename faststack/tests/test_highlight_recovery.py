@@ -20,6 +20,7 @@ sys.path.insert(
 import time
 
 import numpy as np
+import pytest
 
 from faststack.imaging.math_utils import (
     _analyze_highlight_state,
@@ -155,6 +156,10 @@ def test_source_clipping_detection():
     assert state_with_u8["source_clipped_pct"] == 1.0
 
 
+@pytest.mark.skipif(
+    not os.environ.get("FASTSTACK_BENCH"),
+    reason="informational benchmark; set FASTSTACK_BENCH=1 to run",
+)
 def test_benchmark():
     """1920x1080 should be processed in reasonable time (vectorized)."""
     arr = np.random.rand(1080, 1920, 3).astype(np.float32)

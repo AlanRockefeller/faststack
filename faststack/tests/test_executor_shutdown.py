@@ -20,7 +20,9 @@ def test_shutdown_drains_queue_by_default():
 
     def task(val):
         started_event.set()
-        time.sleep(0.1)
+        if val == "head":
+            # Keep the worker busy while the rest is queued and shutdown starts.
+            time.sleep(0.05)
         results.append(val)
         return val
 
@@ -60,7 +62,9 @@ def test_shutdown_can_cancel_queued():
 
     def task(val):
         started_event.set()
-        time.sleep(0.1)
+        if val == "head":
+            # Keep the worker busy while the rest is queued and shutdown starts.
+            time.sleep(0.05)
         results.append(val)
         return val
 
