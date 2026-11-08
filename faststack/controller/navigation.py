@@ -1834,3 +1834,15 @@ class NavigationMixin:
                 self._paced_present_ready = False
             self._navigation_gate_watchdog_timer.stop()
             self._resume_paced_navigation()
+            return
+        # _set_current_index may mint a fresh sequence for the target: in
+        # debug-cache mode a source refresh during the pending decode
+        # re-targets the navigation records at the displayed image, so the
+        # target is seeded again when it becomes current. QML captures that
+        # final sequence for the new source, and the gate must carry the same
+        # value or the target's Ready event can never release it and held
+        # navigation stalls until the watchdog fires.
+        with self._nav_trace_lock:
+            gate = self._paced_present_gate
+            if gate is not None and gate.get("seq") != self._current_nav_seq:
+                gate["seq"] = self._current_nav_seq

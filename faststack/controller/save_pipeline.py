@@ -1100,7 +1100,20 @@ class SavePipelineMixin:
         seed_quality = getattr(decoded, "quality", "cover")
         if seed_quality not in {"fast", "cover"}:
             seed_quality = "cover"
-        self.image_cache[build_cache_key(path, display_gen, seed_quality)] = decoded
+        seed_key = build_cache_key(path, display_gen, seed_quality)
+        self.image_cache[seed_key] = decoded
+        if seed_key not in self.image_cache:
+            # The cache declined the seed (it is larger than the whole budget,
+            # or the path is tombstoned). The entry under this key is gone, but
+            # the other quality may still hold the pre-edit decode; drop every
+            # entry for the path so nothing superseded can be served. A fresh
+            # decode shows the same unsaved file until the save lands, which is
+            # the normal no-seed behaviour.
+            self.image_cache.pop_path(path)
+            log.debug(
+                "Live-preview seed for %s was not cached; cleared stale entries",
+                path.name,
+            )
 
     def _flush_current_live_edit_session_for_navigation(self) -> bool:
         """Queue a background save for the current dirty session before switching images."""

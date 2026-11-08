@@ -33,6 +33,10 @@ _TEMP_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _WATCHED_IMAGE_EXTENSIONS = frozenset(JPG_EXTENSIONS | RAW_EXTENSIONS)
+# Files whose appearance or disappearance changes what the UI shows: images,
+# plus the TIFF outputs of RAW development (`<stem>-working.tif`), which drive
+# the Develop RAW / Load RAW button state.
+_RELEVANT_FILE_EXTENSIONS = _WATCHED_IMAGE_EXTENSIONS | {".tif", ".tiff"}
 
 # Only the event types ImageDirectoryEventHandler reacts to. On inotify this
 # also narrows the kernel subscription, so FastStack's own reads (every
@@ -83,12 +87,13 @@ def _is_relevant_path(path: str, is_directory: bool) -> bool:
     """Return True when a create/delete/move at ``path`` can change the view.
 
     Directories matter to the thumbnail grid (folder tiles); files matter only
-    when they are images. Stray sidecars, lock files, text notes and the like
-    used to trigger a full folder rescan on every creation or deletion.
+    when they are images or RAW-development TIFFs. Stray sidecars, lock files,
+    text notes and the like used to trigger a full folder rescan on every
+    creation or deletion.
     """
     if _is_ignored_path(path):
         return False
-    return is_directory or _is_watched_image_path(path)
+    return is_directory or Path(path).suffix.lower() in _RELEVANT_FILE_EXTENSIONS
 
 
 class ImageDirectoryEventHandler(FileSystemEventHandler):

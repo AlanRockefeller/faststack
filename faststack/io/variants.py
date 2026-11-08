@@ -97,6 +97,7 @@ class VariantMap(dict):
     """
 
     def __init__(self, *args, **kwargs):
+        """Build like a dict; the path index is created on first lookup."""
         super().__init__(*args, **kwargs)
         self._path_index: Optional[Dict[str, str]] = None
 

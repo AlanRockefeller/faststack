@@ -177,6 +177,7 @@ class ImageProvider(QQuickImageProvider):
 
     @staticmethod
     def _buffer_nbytes(buffer) -> int:
+        """Size of a served pixel buffer in bytes (0 when it cannot be measured)."""
         nbytes = getattr(buffer, "nbytes", None)
         if isinstance(nbytes, int):
             return nbytes

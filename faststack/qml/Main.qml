@@ -2314,7 +2314,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
                           "<b>File Management:</b><br>" +
                           "&nbsp;&nbsp;Delete/Backspace: Move current image to recycle bin<br>" +
-                          "&nbsp;&nbsp;Ctrl+Z: Undo last saved action or clear<br><br>" +
+                          "&nbsp;&nbsp;Ctrl+Z: Undo (discards unsaved live edits first, then the last saved action or clear)<br><br>" +
                           "<b>Image Editing:</b><br>" +
                           "&nbsp;&nbsp;E: Toggle Image Editor<br>" +
                           "&nbsp;&nbsp;Ctrl+S (in editor): Save current live edits<br>" +

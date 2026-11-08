@@ -155,6 +155,31 @@ class ByteLRUCache(LRUCache):
         }
 
     def __setitem__(self, key, value):  # pylint: disable=signature-differs
+        # cachetools raises ValueError for a single value larger than the
+        # whole budget (a huge image with a small configured cache). Not
+        # caching it is the correct outcome; crashing the decode is not.
+        try:
+            value_size = self.getsizeof(value)
+        except Exception:  # pylint: disable=broad-exception-caught
+            value_size = 0
+        if value_size > self.maxsize:
+            log.warning(
+                "Not caching %s: %.1f MB exceeds the %.1f MB cache budget",
+                key,
+                value_size / 1024**2,
+                self.maxsize / 1024**2,
+            )
+            # The caller meant to replace whatever this key held. Leaving the
+            # old entry behind would serve superseded pixels: a live-preview
+            # seed that does not fit would let navigation show the pre-edit
+            # decode while its save is still in flight. __delitem__ fires the
+            # eviction callback outside the lock like every other removal.
+            try:
+                del self[key]
+            except KeyError:
+                pass
+            return
+
         pending_callbacks = []
         with self._lock:
             # Check tombstones - prevent caching if key starts with a tombstoned prefix
@@ -175,22 +200,6 @@ class ByteLRUCache(LRUCache):
                     if key_str.startswith(prefix):
                         log.debug("Refusing to cache tombstoned key: %s", key)
                         return
-
-            # cachetools raises ValueError for a single value larger than the
-            # whole budget (a huge image with a small configured cache). Not
-            # caching it is the correct outcome; crashing the decode is not.
-            try:
-                value_size = self.getsizeof(value)
-            except Exception:  # pylint: disable=broad-exception-caught
-                value_size = 0
-            if value_size > self.maxsize:
-                log.warning(
-                    "Not caching %s: %.1f MB exceeds the %.1f MB cache budget",
-                    key,
-                    value_size / 1024**2,
-                    self.maxsize / 1024**2,
-                )
-                return
 
             # Check if this is a replacement to handle its callback if __delitem__ isn't called.
             _MISSING = object()  # pylint: disable=invalid-name

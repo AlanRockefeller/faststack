@@ -21,7 +21,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Dodge & Burn:** Paint any compact-editor slider (exposure, contrast, shadows, white balance, vibrance, color mix…) onto part of the photo (Shift+D). Each stroke adds one coat, so overlapping strokes build up; strokes are kept as layers you can re-edit, hide, or delete.
 - **Stack Paint:** For in-camera focus stacks (`... stacked.JPG`), paint any of the stack's input JPGs - or the stack output itself - back over the stacked photo, e.g. to restore a clean background or fix stacking halos. Each input is aligned to the stack automatically, the brush circle previews what a click will paint, and global edits and dodge & burn apply to the painted pixels too.
 - **Quick Auto Adjust:** Press `l` for quick auto-levels, `L` for auto white balance + auto-levels together, `A` for auto white balance, `-`/`_` to keep adjusting the highlight/white side in 14-point steps, and `=`/`+` to adjust the shadow/black side in 7-point steps. These update the live in-memory edit session immediately and save once when you navigate away, start a drag, or explicitly save. Auto-levels treats its clip threshold as a budget (a few already-clipped specular pixels won't disable the stretch), brightens underexposed midtones toward a configurable target, and rolls off stretched highlights smoothly instead of hard-clipping them. Auto white balance analyzes only the cropped area, fades its correction when the scene lacks reliable neutrals, and damps magenta/green corrections so foliage isn't mistaken for a color cast. The midtone target, channel clip budget, highlight rolloff, export dithering, and tint correction strength are all adjustable in Settings.
-- **Photoshop / Gimp Integration:** Edit current image in Photoshop or Gimp (P key) - always uses RAW files when available.
+- **Photoshop / GIMP Integration:** Edit the current image in Photoshop or GIMP (P key). Photoshop gets the RAW file when one exists; GIMP gets the JPG.
 - **Image Filtering:** Filter images by filename
 - **Theme Support:** Toggle between light and dark themes
 - **Delete & Undo:** Move images to recycle bin (Delete/Backspace) with undo support (Ctrl+Z)
@@ -190,11 +190,11 @@ faststack "C:\path\to\photos"
 - `Ctrl+E`: Toggle edited flag
 - `Ctrl+S`: Toggle stacked flag
 - `Enter`: Launch Helicon Focus with selected RAWs
-- `P`: Edit in Photoshop or Gimp (uses RAW file when available; asks first if FastStack edits are unsaved)
+- `P`: Edit in Photoshop or GIMP. Photoshop receives the paired RAW file when one exists (otherwise the JPG); GIMP always receives the JPG, since it cannot open RAW files directly. Asks first if FastStack edits are unsaved
 - `R`: Open the paired RAW file in RawTherapee (uses the RawTherapee path from Settings, or `rawtherapee` on your PATH)
 - `O` (or Right-Click): Toggle crop mode (Enter to apply crop to the live session, Esc to cancel)
 - `Delete` / `Backspace`: Move image to recycle bin
-- `Ctrl+Z`: Undo last saved action (delete, saved edit, or clearing stacks/batches)
+- `Ctrl+Z`: Undo. If the current image has unsaved live edits (quick auto adjust, crop, editor sliders), the first press discards those; otherwise it undoes the last saved action (delete, saved edit, or clearing stacks/batches)
 - `A`: Quick auto white balance (live session; saved on navigation, drag, or Ctrl+S)
 - `Ctrl+Shift+B`: Quick auto white balance (alternate)
 - `l`: Quick auto levels + vibrance (live session; saved on navigation, drag, or Ctrl+S)
@@ -299,7 +299,9 @@ editor with unsaved edits prompts you to discard or keep them.
 
 ### Undo and caveats
 
-- `Ctrl+Z` undoes the last saved edit, restoring the image from its `-backup`.
+- `Ctrl+Z` first discards any unsaved live edits on the current image; press it
+  again to undo the last saved edit, which restores the image from its
+  `-backup` copy.
 - Because the editor operates on the visual JPG, edits stack on top of the
   current file; for the most flexibility do your heavy adjustments before
   exporting elsewhere.

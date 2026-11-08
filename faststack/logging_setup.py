@@ -80,6 +80,7 @@ def reset_app_data_dir_cache() -> None:
 
 
 def _choose_app_data_dir() -> Path:
+    """Pick the first writable (or creatable) app-data candidate, else a temp dir."""
     candidates = []
 
     app_data = os.getenv("APPDATA")
