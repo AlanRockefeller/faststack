@@ -1570,6 +1570,12 @@ ApplicationWindow {
         function onSettingsDialogRequested() {
             root.openSettingsDialog()
         }
+        function onImageEditorUnsavedPromptRequested(message, canSave) {
+            imageEditorUnsavedDialog.message = message
+            imageEditorUnsavedDialog.canSave = canSave
+            imageEditorUnsavedDialog.choice = "cancel"
+            root.openDialogSafely(imageEditorUnsavedDialog)
+        }
     }
 
     // Handle View Switching and Prefetch Gating
@@ -1650,6 +1656,34 @@ ApplicationWindow {
                             event.accepted = true
                         }
                     }
+                }
+            }
+
+            // The loupe keeps the previous image on screen while the current
+            // one decodes; after a short delay, say so. Fast decodes never
+            // show it.
+            BusyIndicator {
+                id: loupePendingIndicator
+                readonly property bool pending: !!root.uiStateRef && root.uiStateRef.isLoupeImagePending
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: 12
+                width: 28
+                height: 28
+                z: 10
+                running: visible
+                visible: pending && loupePendingDelay.elapsed
+                onPendingChanged: {
+                    loupePendingDelay.elapsed = false
+                    if (pending) loupePendingDelay.restart()
+                    else loupePendingDelay.stop()
+                }
+
+                Timer {
+                    id: loupePendingDelay
+                    property bool elapsed: false
+                    interval: 250
+                    onTriggered: elapsed = true
                 }
             }
         }
@@ -2275,7 +2309,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;Ctrl+S: Toggle stacked flag<br><br>" +
                           "<b>File Management:</b><br>" +
                           "&nbsp;&nbsp;Delete/Backspace: Move current image to recycle bin<br>" +
-                          "&nbsp;&nbsp;Ctrl+Z: Undo last saved action<br><br>" +
+                          "&nbsp;&nbsp;Ctrl+Z: Undo last saved action or clear<br><br>" +
                           "<b>Image Editing:</b><br>" +
                           "&nbsp;&nbsp;E: Toggle Image Editor<br>" +
                           "&nbsp;&nbsp;Ctrl+S (in editor): Save current live edits<br>" +
@@ -2675,6 +2709,76 @@ ApplicationWindow {
         onAccepted: {
             if (root.controllerRef) root.controllerRef.discard_unsaved_edits_for_close()
             Qt.callLater(root.close)
+        }
+    }
+
+    Dialog {
+        id: imageEditorUnsavedDialog
+        title: "Unsaved FastStack Edits"
+        modal: true
+        closePolicy: Popup.CloseOnEscape
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        width: Math.min(480, parent.width * 0.9)
+        standardButtons: Dialog.NoButton
+
+        property string message: ""
+        property bool canSave: false
+        // Set by the buttons; Escape or closing any other way cancels.
+        property string choice: "cancel"
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-image-editor-unsaved")
+        onClosed: {
+            if (root.controllerRef) {
+                root.controllerRef.dialog_closed("qml-image-editor-unsaved")
+                root.controllerRef.resolve_image_editor_unsaved_prompt(imageEditorUnsavedDialog.choice)
+            }
+            imageEditorUnsavedDialog.choice = "cancel"
+        }
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-image-editor-unsaved")
+
+        ColumnLayout {
+            width: parent.width
+            spacing: 16
+
+            Label {
+                Layout.fillWidth: true
+                text: imageEditorUnsavedDialog.message
+                wrapMode: Text.WordWrap
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Item { Layout.fillWidth: true }
+
+                Button {
+                    text: "Cancel"
+                    onClicked: {
+                        imageEditorUnsavedDialog.choice = "cancel"
+                        imageEditorUnsavedDialog.close()
+                    }
+                }
+
+                Button {
+                    text: "Discard Edits"
+                    onClicked: {
+                        imageEditorUnsavedDialog.choice = "discard"
+                        imageEditorUnsavedDialog.close()
+                    }
+                }
+
+                Button {
+                    text: "Save First"
+                    highlighted: true
+                    visible: imageEditorUnsavedDialog.canSave
+                    onClicked: {
+                        imageEditorUnsavedDialog.choice = "save"
+                        imageEditorUnsavedDialog.close()
+                    }
+                }
+            }
         }
     }
 

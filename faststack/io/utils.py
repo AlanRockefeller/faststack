@@ -1,6 +1,7 @@
 """Utilities for filesystem operations, path normalization, and hashing."""
 
 import errno
+import functools
 import hashlib
 import json
 import logging
@@ -135,15 +136,29 @@ def normalize_path_key(path: Union[Path, str]) -> str:
     return os.path.normcase(os.path.abspath(p_str)).replace("\\", "/")
 
 
+def _hash_path_uncached(path_str: str) -> str:
+    # normalize_path_key handles the canonicalization pure-string wise
+    norm_path = normalize_path_key(path_str)
+
+    # MD5 is used for ID generation, not security.
+    # It must map the same path to the same ID across app restarts.
+    return hashlib.md5(norm_path.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+
+
+# The thumbnail grid asks for every visible row's hash on each repaint, so
+# repeat lookups are served from memory. Bounded so a long session browsing
+# many folders cannot grow it without limit.
+_hash_path_cached = functools.lru_cache(maxsize=65536)(_hash_path_uncached)
+
+
 def compute_path_hash(path: Union[Path, str]) -> str:
     """Compute a fast, stable hash of the path for UI/Thumbnail IDs.
 
     Uses MD5 of the normalized path string.
     CRITICAL: Does NOT access the filesystem (no .resolve() calls).
     """
-    # normalize_path_key handles the canonicalization pure-string wise
-    norm_path = normalize_path_key(path)
-
-    # MD5 is used for ID generation, not security.
-    # It must map the same path to the same ID across app restarts.
-    return hashlib.md5(norm_path.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+    path_str = os.fspath(path)
+    if os.path.isabs(path_str):
+        return _hash_path_cached(path_str)
+    # A relative path's normalized form depends on the working directory.
+    return _hash_path_uncached(path_str)

@@ -139,13 +139,16 @@ def setup_logging(debug: bool = False, *, diagnostic: bool = False) -> Path | No
     root_logger.setLevel(logging.DEBUG if debug else logging.WARNING)
     root_logger.handlers.clear()
 
-    app_logger = logging.getLogger("faststack.app")
-    if debug:
-        app_logger.setLevel(logging.DEBUG)
-    elif diagnostic:
-        app_logger.setLevel(logging.INFO)
-    else:
-        app_logger.setLevel(logging.NOTSET)
+    # faststack.controller holds the AppController mixins that were split out
+    # of faststack.app; they keep the same verbosity.
+    for logger_name in ("faststack.app", "faststack.controller"):
+        app_logger = logging.getLogger(logger_name)
+        if debug:
+            app_logger.setLevel(logging.DEBUG)
+        elif diagnostic:
+            app_logger.setLevel(logging.INFO)
+        else:
+            app_logger.setLevel(logging.NOTSET)
 
     # A base --debugcache run keeps the root logger at WARNING, but scan timing
     # is a concise startup diagnostic rather than general INFO noise. Admit the

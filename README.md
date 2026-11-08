@@ -179,18 +179,18 @@ faststack "C:\path\to\photos"
 - `D`: Toggle todo flag - shows up red on the sparkline so you can see if you have flagged images to work on later
 - `[`: Begin new stack group
 - `]`: End current stack group
-- `C`: Clear all stacks
+- `C`: Clear all stacks (Ctrl+Z restores them)
 - `{`: Begin new drag & drop batch
 - `}`: End current drag & drop batch
-- `|` (Shift+`\`): Clear drag & drop batch
+- `|` (Shift+`\`): Clear drag & drop batch (Ctrl+Z restores it)
 - `U`: Toggle uploaded flag
 - `Ctrl+E`: Toggle edited flag
 - `Ctrl+S`: Toggle stacked flag
 - `Enter`: Launch Helicon Focus with selected RAWs
-- `P`: Edit in Photoshop or Gimp (uses RAW file when available)
+- `P`: Edit in Photoshop or Gimp (uses RAW file when available; asks first if FastStack edits are unsaved)
 - `O` (or Right-Click): Toggle crop mode (Enter to apply crop to the live session, Esc to cancel)
 - `Delete` / `Backspace`: Move image to recycle bin
-- `Ctrl+Z`: Undo last saved action (delete or saved edit)
+- `Ctrl+Z`: Undo last saved action (delete, saved edit, or clearing stacks/batches)
 - `A`: Quick auto white balance (live session; saved on navigation, drag, or Ctrl+S)
 - `Ctrl+Shift+B`: Quick auto white balance (alternate)
 - `l`: Quick auto levels + vibrance (live session; saved on navigation, drag, or Ctrl+S)
