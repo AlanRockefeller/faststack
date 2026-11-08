@@ -394,7 +394,9 @@ def _safe_replace(tmp_path: Path, target_path: Path) -> None:
     new file under ``target_path`` rather than a truncated one. Retries on
     Windows file-lock errors.
     """
-    fsync_file(tmp_path)
+    # Strict: a write-back error must fail the save rather than replace the
+    # original with data that never reached the disk.
+    fsync_file(tmp_path, strict=True)
     for attempt in range(_REPLACE_MAX_RETRIES):
         try:
             os.replace(str(tmp_path), str(target_path))

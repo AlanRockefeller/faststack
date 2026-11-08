@@ -946,10 +946,9 @@ class AppConfig:
                     value = convert(default_raw)
                 except ValueError:
                     value = None
-        warned = self.__dict__.setdefault("_invalid_value_warned", set())
         warn_key = (section, key)
-        if warn_key not in warned:
-            warned.add(warn_key)
+        if warn_key not in self._invalid_value_warned:
+            self._invalid_value_warned.add(warn_key)
             log.warning(
                 "Invalid %s value %r for [%s] %s in %s; using %r",
                 kind,

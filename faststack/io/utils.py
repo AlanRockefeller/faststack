@@ -1,5 +1,6 @@
 """Utilities for filesystem operations, path normalization, and hashing."""
 
+import errno
 import hashlib
 import json
 import logging
@@ -52,12 +53,29 @@ def fsync_directory(path: Path) -> None:
                 pass
 
 
-def fsync_file(path: Path) -> None:
-    """Best-effort flush of an already-written file's data to stable storage.
+# fsync errnos that mean "this filesystem cannot sync", not "the data was
+# lost": some network/FUSE filesystems reject fsync outright.
+_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, "EINVAL", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "ENOSYS", None),
+    )
+    if code is not None
+)
+
+
+def fsync_file(path: Path, *, strict: bool = False) -> None:
+    """Flush an already-written file's data to stable storage.
 
     Used before an atomic ``os.replace`` so a power loss or card pull cannot
-    leave the destination name pointing at a truncated file. Failures are
-    logged and ignored: some network/FUSE filesystems reject fsync.
+    leave the destination name pointing at a truncated file. A filesystem
+    that does not support fsync is tolerated (logged). Any other failure --
+    a real write-back error such as EIO or ENOSPC -- is raised when
+    ``strict`` is set, so the caller does not commit data that never reached
+    the disk; otherwise it is logged and ignored.
     """
     # Windows' FlushFileBuffers needs a handle opened with write access.
     flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
@@ -67,6 +85,8 @@ def fsync_file(path: Path) -> None:
         fd = os.open(path, flags)
         os.fsync(fd)
     except OSError as e:
+        if strict and e.errno not in _FSYNC_UNSUPPORTED_ERRNOS:
+            raise
         log.debug("Failed to fsync file %s: %s", path, e)
     finally:
         if fd is not None:

@@ -1552,6 +1552,10 @@ class Prefetcher:
 
     def set_image_files(self, image_files: List[ImageFile]):
         with self._futures_lock:
+            # The controller can mutate its list in place (insert, then pass
+            # the same list back), which identity/length checks alone cannot
+            # see; always drop the path index here.
+            self._path_index_cache = None
             if self.image_files == image_files:
                 return
             old = self.image_files
@@ -2927,7 +2931,7 @@ class Prefetcher:
                     self.future_quality.pop(idx, None)
                     self._demand_indices.discard(idx)
                     self._navigation_cancel_indices.discard(idx)
-            for i in self._indices_for_path_locked(path_str)[:1]:
+            for i in self._indices_for_path_locked(path_str):
                 for scheduled in self._scheduled.values():
                     scheduled.discard(i)
 
@@ -2950,7 +2954,20 @@ class Prefetcher:
                 table.setdefault(Path(image_file.path).as_posix(), []).append(i)
             cached = (image_files, len(image_files), table)
             self._path_index_cache = cached
-        return cached[2].get(path_str, [])
+        indices = cached[2].get(path_str, [])
+        # Cheap guard against an in-place change not yet reported through
+        # set_image_files: verify the hits and rebuild once if any is stale.
+        if any(
+            i >= len(image_files) or Path(image_files[i].path).as_posix() != path_str
+            for i in indices
+        ):
+            self._path_index_cache = None
+            return [
+                i
+                for i, image_file in enumerate(image_files)
+                if Path(image_file.path).as_posix() == path_str
+            ]
+        return indices
 
     def unschedule_path(self, path) -> None:
         """Allow a path to be prefetched again after its cache entry was evicted.

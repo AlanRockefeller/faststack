@@ -6809,9 +6809,16 @@ class AppController(QObject):
         """Flush the live session before allowing the main window to close."""
         if self._shutting_down:
             return True
-        if getattr(self, "_close_discard_confirmed", False):
+        confirmed_token = getattr(self, "_close_discard_token", None)
+        self._close_discard_token = None  # One quit attempt only.
+        if (
+            confirmed_token is not None
+            and confirmed_token == self._close_discard_state()
+        ):
             # The user already chose to quit without the edits that could not
-            # be saved; do not retry (and veto) the same failing save again.
+            # be saved, and nothing was edited since; do not retry (and veto)
+            # the same failing save again. Any later edit changes the state,
+            # so it is saved (or prompts again) rather than silently dropped.
             self._shutdown_flush_prepared = True
             return True
 
@@ -6845,7 +6852,21 @@ class AppController(QObject):
             self.discard_edit_parameters()
         except Exception:
             log.exception("Failed to reset edits while discarding for close")
-        self._close_discard_confirmed = True
+        self._close_discard_token = self._close_discard_state()
+
+    def _close_discard_state(self) -> tuple:
+        """Identify the exact edit state a discard-and-quit choice applies to."""
+        editor = self.image_editor
+        current_path = (
+            self._key(self.image_files[self.current_index].path)
+            if 0 <= self.current_index < len(self.image_files)
+            else None
+        )
+        return (
+            current_path,
+            getattr(editor, "session_id", None) if editor else None,
+            getattr(editor, "_edits_rev", None) if editor else None,
+        )
 
     @Slot()
     def save_edited_image(self):

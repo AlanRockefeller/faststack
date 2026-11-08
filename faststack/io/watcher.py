@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -199,14 +200,27 @@ class Watcher:
 
     def stop(self):
         """Stops watching the directory."""
-        if self.observer and self.observer.is_alive():
-            self.observer.stop()
+        observer = self.observer
+        if observer and observer.is_alive():
             # Bounded: stop() runs on the UI thread (e.g. around sidecar
-            # writes), and an observer stuck on a hung network share must not
-            # freeze the app. watchdog's threads are daemons, so an observer
-            # that misses the deadline is simply abandoned.
-            self.observer.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
-            if self.observer.is_alive():
+            # writes). watchdog's observer.stop() itself joins its emitter
+            # threads without a timeout, so the whole stop-and-join runs on a
+            # helper thread; an observer stuck on a hung network share is
+            # abandoned (watchdog's threads are daemons) instead of freezing
+            # the app.
+            def _stop_observer() -> None:
+                try:
+                    observer.stop()
+                    observer.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+                except Exception:  # noqa: BLE001 - best-effort shutdown
+                    log.debug("Watcher stop raised", exc_info=True)
+
+            stopper = threading.Thread(
+                target=_stop_observer, name="watcher-stop", daemon=True
+            )
+            stopper.start()
+            stopper.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+            if stopper.is_alive() or observer.is_alive():
                 log.warning(
                     "Directory watcher did not stop within %.0fs; abandoning it",
                     _STOP_JOIN_TIMEOUT_SECONDS,
