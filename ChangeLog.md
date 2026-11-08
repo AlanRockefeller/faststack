@@ -4,7 +4,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 
 ## 1.7.0 (2026-11-06)
 
-- Added Python 3.14 support. Release builds are now tested and packaged with Python 3.14.8.
+- Added Python 3.14 support. Release builds are now tested and packaged with Python 3.14.10.
 - New stack paint brush for in-camera focus stacks (the "... stacked.JPG" files Olympus / OM cameras make). Press "Stack" in the compact editor and paint one of the photos the stack was made from back over the stacked result - handy for bringing back a clean background, or fixing halos and smeared spots the camera's stacking left behind. The little dropdown next to the button picks which photo to paint from: 1 is the one focused closest, and it starts on the one focused furthest back. "S: Stack output" paints the stacked photo itself back over anything you painted before. FastStack lines each photo up with the stack automatically (the camera crops and enlarges them a little differently each time), so the painted parts fit in without seams. While you hover, the brush circle shows exactly what a click would paint. Any slider changes you make apply to the painted parts too, and dodge & burn works on top. Right-drag or Alt-drag puts the stack back. The button is grey when the photo is not an in-camera stack or its input JPGs can't be found - FastStack looks in the same stack input folders Restack uses, and next to the stacked photo.
 - The "Dodge & Burn" button is now just "Burn" to make room for "Stack".
 - In both brushes you can now pan by dragging with the middle mouse button, as well as with Space+drag.
@@ -14,6 +14,19 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 - In the thumbnail grid, right-click an empty folder to delete it. Folders with no images but a few small leftover files (like faststack.json) can be deleted too - FastStack lists what is in them and asks first. Folders with images show no menu.
 - Dodge & burn: the compact editor has a "Burn" button to turn the brush on and off, and a ? button that lists all the brush controls.
 - Removed the background darkening tool (K). Dodge & burn does the same job: paint the background with a negative exposure or blacks recipe.
+- Zooming in and back out is much cheaper. FastStack used to throw away every image it had decoded around you each time the zoom state changed, so after a zoom round trip the next arrow presses had to wait for new decodes. The fit-to-window images are now kept while you are zoomed in and reused when you zoom back out.
+- Faster grid refreshes, filters and sorting on big folders, especially on network drives. Every image without an entry in faststack.json was being checked against the disk four times on each pass; those checks now run only when an old-style entry actually needs them.
+- Lower memory use: the small safety buffer of recently shown images is now limited by size instead of a fixed count, which could pin several GB of full-resolution frames on a 4K screen.
+- Changing "Optimize For" in Settings now re-decodes the images around you right away, instead of only the current one, and images still being decoded with the old setting can no longer slip into the cache.
+- Develop RAW accepts a RawTherapee path with quotes or ~ in it, and validates the executable the same way the Edit (P) launcher does instead of running whatever the setting points at.
+- Undo fixes: if a delete had already finished, Ctrl+Z could skip over the previous undo step (a cleared stack or batch) instead of undoing it; and undoing a saved edit now waits when that image is still being saved, rather than racing the save.
+- The editor's Clarity, Texture and Sharpness no longer reuse blurs from the previous version of a photo after you save and reopen it.
+- Windows: pressing F11 to leave full screen now returns a maximized window to maximized instead of a smaller window.
+- Linux (Wayland): programs FastStack launches (GIMP, RawTherapee, Helicon Focus, a reopened FastStack window) no longer inherit the drag-and-drop protocol logging FastStack uses internally, and their console output is no longer swallowed.
+- Thumbnail grid and sort: switching folders now saves the position and pending flags of the folder you are leaving first; files other than images (notes, lock files) created or deleted in the folder no longer trigger a rescan; and the grid no longer re-reads every file's details on the UI thread on each refresh.
+- If faststack.ini becomes unreadable, saving a setting now rewrites all of your settings instead of just the ones changed in that session.
+- Restack Source RAWs works for stacked photos named ".jpeg" as well as ".jpg", and the editor treats ".jpe" files as JPEGs.
+- The Key Bindings help and README no longer list number-key aspect ratio shortcuts that did not exist; aspect ratios are chosen in the panel at the top left of crop mode.
 
 ## 1.6.9 (2026-09-12)
 

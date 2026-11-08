@@ -53,12 +53,16 @@ ApplicationWindow {
     function enterFullScreenLoupe() {
         if (!root.uiStateRef || root.uiStateRef.isGridViewActive) return
 
+        // Record the derived state, not the raw visibility: a frameless
+        // maximized window reports FullScreen on Windows (see isMaximized),
+        // and restoring from that value would un-maximize it.
         savedWindowGeometry = {
             x: root.x,
             y: root.y,
             width: root.width,
             height: root.height,
-            visibility: root.visibility
+            maximized: root.isMaximized,
+            windowed: root.visibility === Window.Windowed
         }
 
         fullScreenLoupe = true
@@ -71,11 +75,11 @@ ApplicationWindow {
         root.suppressWindowGeometrySave = true
         fullScreenLoupe = false
 
-        if (savedWindowGeometry.visibility === Window.Maximized) {
+        if (savedWindowGeometry.maximized) {
             root.showMaximized()
         } else {
             root.showNormal()
-            if (savedWindowGeometry.visibility === Window.Windowed) {
+            if (savedWindowGeometry.windowed) {
                 root.x = savedWindowGeometry.x
                 root.y = savedWindowGeometry.y
                 root.width = savedWindowGeometry.width
@@ -2259,6 +2263,7 @@ ApplicationWindow {
                           "<b>Navigation:</b><br>" +
                           "&nbsp;&nbsp;Right Arrow: Next Image<br>" +
                           "&nbsp;&nbsp;Left Arrow: Previous Image<br>" +
+                          "&nbsp;&nbsp;Shift+Left / Right: Jump 10 images<br>" +
                           "&nbsp;&nbsp;G: Jump to Image Number<br>" +
                           "&nbsp;&nbsp;Alt+U: Jump to Last Uploaded<br>" +
                           "&nbsp;&nbsp;I: Show EXIF Data<br>" +
@@ -2332,12 +2337,13 @@ ApplicationWindow {
                           "&nbsp;&nbsp;&nbsp;&nbsp;[ / ]: Brush size&nbsp;&nbsp;Space+drag: Pan&nbsp;&nbsp;Ctrl+Z: Undo stroke<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;M: Toggle mask overlay&nbsp;&nbsp;Hold Ctrl: Show overlay&nbsp;&nbsp;Esc: Leave brush<br>" +
                           "&nbsp;&nbsp;O (or right-click): Toggle crop mode<br>" +
-                          "&nbsp;&nbsp;&nbsp;&nbsp;1/2/3/4: Set aspect ratio (1:1, 4:3, 3:2, 16:9)<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;Aspect Ratio panel: pick a ratio, toggle the grid, or Rotate<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;Enter: Apply crop to live session<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;Esc: Cancel crop<br><br>" +
                           "<b>Other Actions:</b><br>" +
                           "&nbsp;&nbsp;Enter: Launch Focus Stacker<br>" +
                           "&nbsp;&nbsp;P: Edit in image editor (Photoshop/GIMP)<br>" +
+                          "&nbsp;&nbsp;R: Open the paired RAW in RawTherapee<br>" +
                           "&nbsp;&nbsp;H: Toggle histogram window<br>" +
                           "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
                           "&nbsp;&nbsp;Esc: Close dialog/editor, switch to grid view, or exit fullscreen"

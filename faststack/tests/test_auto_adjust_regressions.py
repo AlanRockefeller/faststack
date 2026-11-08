@@ -185,6 +185,7 @@ def test_undo_flushes_pending_auto_adjust_save_before_reporting_nothing_to_undo(
         undo_history=[],
         update_status_message=Mock(),
         _parse_edit_undo_data=lambda data: data,
+        _block_if_saving=lambda *paths: False,
         _restore_backup_safe=lambda saved_path, backup_path: True,
         _clear_active_auto_adjust_state=Mock(),
         _restore_metadata_snapshot=Mock(),

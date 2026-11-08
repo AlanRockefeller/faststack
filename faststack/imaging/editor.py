@@ -60,6 +60,7 @@ from faststack.imaging.stack_paint import (
     stack_layers,
     warp_source_to_base,
 )
+from faststack.io.indexer import JPG_EXTENSIONS
 from faststack.io.utils import fsync_directory, fsync_file
 from faststack.models import DecodedImage
 from faststack.util.executors import create_daemon_threadpool_executor
@@ -1323,7 +1324,7 @@ class ImageEditor:
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
         _is_png = load_filepath.suffix.lower() == ".png"
-        _is_jpeg = load_filepath.suffix.lower() in (".jpg", ".jpeg")
+        _is_jpeg = load_filepath.suffix.lower() in JPG_EXTENSIONS
 
         try:
             # --- JPEG fast path: decode pixels with TurboJPEG ---
@@ -1632,6 +1633,11 @@ class ImageEditor:
                     self._edits_rev += 1
                     self._cached_preview = None
                     self._cached_rev = -1
+                    # Pixel-derived caches are keyed on path + mtime, and a
+                    # save restores the original mtime, so a same-path reload
+                    # with new pixels would otherwise reuse stale blurs.
+                    self._cached_detail_bands = None
+                    self._cached_highlight_analysis = None
                     break
 
             # Preview pixels are derived after EXIF orientation was applied, so
@@ -4015,7 +4021,12 @@ class ImageEditor:
                     log.warning("Invalid value for rotation %r: %s", value, e)
                     return False
 
-            if key in self.current_edits and key != "crop_box":
+            if key == "crop_box":
+                # The crop box has its own normalization (a full-frame box
+                # becomes None); route it there instead of silently ignoring.
+                return self.set_crop_box(value)
+
+            if key in self.current_edits:
                 # Check for floating point equality to prevent cache thrashing
                 new_val = value
                 current_val = self.current_edits.get(key)
@@ -5089,7 +5100,9 @@ class ImageEditor:
             if self.levels_soft_knee:
                 lut = _apply_levels_soft_clip(lut)
             lut = np.clip(lut, 0.0, 1.0)
-            lut_rgb = (lut * 255.0).astype(np.uint8).tolist() * 3  # 768 entries
+            # Round like the WB fast path and the float path do; truncation
+            # made this path up to one level darker than the others.
+            lut_rgb = np.rint(lut * 255.0).astype(np.uint8).tolist() * 3  # 768 entries
             with self._lock:
                 self._cached_u8_lut = (cache_key, lut_rgb)
 

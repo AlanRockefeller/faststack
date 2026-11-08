@@ -1339,7 +1339,17 @@ class SavePipelineMixin:
                     attempts,
                     error_msg,
                 )
-                self._submit_save_request_async(request)
+                if not self._submit_save_request_async(request):
+                    # Another save for this file is still in flight, so the
+                    # retry could not be queued. Keep the snapshot for the
+                    # shutdown flush instead of silently dropping it.
+                    if target:
+                        self._pending_save_recovery[target] = request
+                    log.error(
+                        "Retry of the background save for %s could not be "
+                        "submitted; queued for shutdown flush",
+                        target,
+                    )
                 return
             if isinstance(request, dict) and target and not still_on_same_session:
                 self._pending_save_recovery[target] = request

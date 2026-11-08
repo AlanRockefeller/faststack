@@ -17,6 +17,41 @@ _DND_TRACE = re.compile(rb"wl_data_(source|device|offer)|zwp_primary_selection")
 _DND_TRACE_LIMIT = 400
 _MAX_PENDING_LINE = 1 << 20
 
+# Process-wide record of what install_wayland_drag_monitor() changed, so the
+# child-process helpers can undo it for every program FastStack launches: a
+# child must neither inherit WAYLAND_DEBUG (a Wayland client would then log its
+# whole protocol into our pipe) nor write to fd 2 (the pipe), which would make
+# inherited_output_kwargs() treat the console as a pipe and discard its output.
+_monitor_installed = False
+_previous_wayland_debug: str | None = None
+_original_stderr_fd: int | None = None
+
+
+def monitor_installed() -> bool:
+    """Whether the drag monitor has taken over this process's stderr."""
+    return _monitor_installed
+
+
+def original_stderr_fd() -> int | None:
+    """The real stderr descriptor saved by the monitor, or None when unredirected."""
+    return _original_stderr_fd if _monitor_installed else None
+
+
+def child_environment() -> dict[str, str]:
+    """Return an environment for child processes without the monitor's debug flag.
+
+    ``WAYLAND_DEBUG`` is restored to whatever the user had set before FastStack
+    started (usually nothing), so launched editors, stackers and respawned
+    FastStack instances run at normal speed and keep their own stderr.
+    """
+    env = dict(os.environ)
+    if _monitor_installed:
+        if _previous_wayland_debug is None:
+            env.pop("WAYLAND_DEBUG", None)
+        else:
+            env["WAYLAND_DEBUG"] = _previous_wayland_debug
+    return env
+
 
 class WaylandDragOutcomeMonitor:
     """Track protocol completion for the active drag while forwarding stderr."""
@@ -143,6 +178,7 @@ def install_wayland_drag_monitor() -> WaylandDragOutcomeMonitor | None:
     if platform != "wayland":
         return None
 
+    global _monitor_installed, _previous_wayland_debug, _original_stderr_fd
     previous_wayland_debug = os.environ.get("WAYLAND_DEBUG")
     forward_protocol = bool(previous_wayland_debug)
     original_stderr = None
@@ -158,6 +194,9 @@ def install_wayland_drag_monitor() -> WaylandDragOutcomeMonitor | None:
         write_fd = None
         monitor = WaylandDragOutcomeMonitor(original_stderr, read_fd, forward_protocol)
         installed = True
+        _monitor_installed = True
+        _previous_wayland_debug = previous_wayland_debug
+        _original_stderr_fd = original_stderr
         return monitor
     except (OSError, RuntimeError):
         if original_stderr is not None:

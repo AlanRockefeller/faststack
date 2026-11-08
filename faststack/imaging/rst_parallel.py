@@ -15,6 +15,7 @@ the IDCT changes -- only which thread runs which MCU rows.
 from __future__ import annotations
 
 import logging
+import mmap
 import os
 import struct
 import threading
@@ -148,13 +149,15 @@ def build_chunks(jpeg, nchunks: int):
     if parsed is None:
         return None
     sof_h_off, w, h, hmax, vmax, dri, scan_start = parsed
-    raw = bytes(jpeg) if not isinstance(jpeg, bytes) else jpeg
-    if raw.find(b"\xff\xd9", scan_start) < 0:
-        # A growing/truncated file can contain enough restart markers to make
-        # every synthetic chunk decode successfully even though the source
-        # snapshot is incomplete. Whole-file decoding is responsible for
-        # reporting that condition and triggering the caller's reread.
-        return None
+    # Slice the caller's buffer directly instead of copying the whole file
+    # with bytes(): ``jpeg`` is normally an mmap of the full JPEG, and the
+    # copy doubled the memory traffic of every split decode. mmap and bytes
+    # slice to bytes; any other buffer is wrapped in a memoryview, whose
+    # slices concatenate with bytes below.
+    if isinstance(jpeg, (bytes, bytearray, mmap.mmap)):
+        raw = jpeg
+    else:
+        raw = memoryview(jpeg)
 
     mcu_w, mcu_h = hmax * 8, vmax * 8
     mcus_x = (w + mcu_w - 1) // mcu_w
@@ -177,6 +180,13 @@ def build_chunks(jpeg, nchunks: int):
     buf = np.frombuffer(jpeg, dtype=np.uint8)[scan_start:]
     ff = np.flatnonzero(buf[:-1] == 0xFF)
     nxt = buf[ff + 1]
+    if not np.any(nxt == 0xD9):
+        # No EOI marker after the scan start. A growing/truncated file can
+        # contain enough restart markers to make every synthetic chunk decode
+        # successfully even though the source snapshot is incomplete.
+        # Whole-file decoding is responsible for reporting that condition and
+        # triggering the caller's reread.
+        return None
     rst = ff[(nxt >= 0xD0) & (nxt <= 0xD7)] + scan_start
 
     needed = ((mcu_rows - 1) // rows_per_chunk) * rows_per_chunk * iv_per_row

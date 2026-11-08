@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from faststack.config import DEFAULT_CONFIG, config, detect_image_editor_path
 from faststack.io.arguments import parse_external_arguments
-from faststack.io.child_process import inherited_output_kwargs, reap_in_background
+from faststack.io.child_process import child_popen_kwargs, reap_in_background
 from faststack.io.executable_validator import validate_executable_path
 from faststack.io.indexer import RAW_EXTENSIONS
 
@@ -481,7 +481,7 @@ class ImageEditorHandoffMixin:
                 shell=False,  # CRITICAL: Never use shell=True with user input
                 stdin=subprocess.DEVNULL,
                 close_fds=True,  # Close unused file descriptors
-                **inherited_output_kwargs(),
+                **child_popen_kwargs(),
             )
             reap_in_background(process, Path(photoshop_exe).name)
 

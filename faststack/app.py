@@ -32,7 +32,14 @@ import threading
 import subprocess
 from faststack.ui.provider import ImageProvider, UIState
 import PySide6
-from PySide6.QtGui import QCursor, QDesktopServices, QDrag, QGuiApplication, QPixmap
+from PySide6.QtGui import (
+    QCursor,
+    QDesktopServices,
+    QDrag,
+    QGuiApplication,
+    QImageReader,
+    QPixmap,
+)
 from PySide6.QtCore import (
     QUrl,
     QTimer,
@@ -72,7 +79,11 @@ from faststack.models import (
     DecodedImage,
     EntryMetadata,
 )
-from faststack.io.child_process import inherited_output_kwargs, reap_in_background
+from faststack.io.child_process import (
+    child_environment,
+    child_popen_kwargs,
+    reap_in_background,
+)
 from faststack.io.folder_delete import (
     delete_inspected_folder,
     inspect_folder_for_delete,
@@ -830,6 +841,12 @@ class AppController(
         self.display_width = 0
         self.display_height = 0
         self.display_generation = 0
+        # Generations are allocated from this monotonic counter so a value is
+        # never handed out twice, even though display_generation itself can
+        # return to an earlier value when a zoom toggle is reversed (see
+        # set_zoomed). (unzoomed, zoomed) generations of the current zoom pair.
+        self._display_generation_counter = 0
+        self._zoom_generation_pair: Optional[tuple[int, int]] = None
         self._display_lock = threading.Lock()
         self._is_decoding = False
         self._quality_decode_token = 0
@@ -1955,10 +1972,18 @@ class AppController(
                 return 0, 0, self.display_generation
             return self.display_width, self.display_height, self.display_generation
 
+    def _allocate_display_generation_locked(self) -> int:
+        """Switch to a never-used display generation. Caller holds _display_lock."""
+        self._display_generation_counter = (
+            max(self._display_generation_counter, self.display_generation) + 1
+        )
+        self.display_generation = self._display_generation_counter
+        return self.display_generation
+
     def _bump_display_generation(self):
-        """Increment display_generation under _display_lock."""
+        """Move to a fresh display_generation under _display_lock."""
         with self._display_lock:
-            self.display_generation += 1
+            self._allocate_display_generation_locked()
 
     def _cache_decode_quality(self, cache_key: str) -> Optional[str]:
         """Return cached display quality for ``cache_key`` without changing key format."""
@@ -2282,6 +2307,27 @@ class AppController(
             self._decode_invalidation_epochs[epoch_key] = (now, fingerprint)
         self.image_cache.pop_path(p)
         self.prefetcher.invalidate_path(p)
+        self._forget_image_file_stat(p)
+
+    def _forget_image_file_stat(self, path: Path) -> None:
+        """Drop the indexer's cached stat for a file whose contents changed.
+
+        The thumbnail grid reuses the stat captured when the folder was
+        scanned instead of re-statting every image on the UI thread, so a
+        file FastStack itself rewrote must be re-statted on the next refresh.
+        """
+        path_to_index = getattr(self, "_path_to_index", None)
+        if not path_to_index:
+            return
+        try:
+            index = path_to_index.get(self._key(path))
+        except (OSError, TypeError, ValueError):
+            return
+        if index is None or not (0 <= index < len(self.image_files)):
+            return
+        image_file = self.image_files[index]
+        image_file.mtime_ns = None
+        image_file.source_identity = None
 
     def _mark_optimistic_decode_seed_epoch(self, path: Path) -> None:
         """Record that the decode cache currently contains optimistic pixels."""
@@ -2330,7 +2376,7 @@ class AppController(
             self.display_height = height
             self.display_ready = True
             if changed:
-                self.display_generation += 1
+                self._allocate_display_generation_locked()
         return changed, first_report
 
     def _handle_resize(self):
@@ -2376,14 +2422,36 @@ class AppController(
             if _debug_mode:
                 log.info("AppController.set_zoomed: %s -> %s", self.is_zoomed, zoomed)
             self.is_zoomed = zoomed
-            self.display_generation += 1  # Invalidates old entries via cache key
+            # Zoomed (full-resolution) and fit-to-window frames live under
+            # different display generations, but neither invalidates the
+            # other. Reversing a zoom toggle restores the generation that
+            # state used before, so every frame decoded for it is reachable
+            # again and a zoom in/out round trip no longer re-decodes the
+            # whole prefetch window. Only a real change (resize, color mode)
+            # allocates a fresh generation, which also retires the pair.
+            current = self.display_generation
+            pair = self._zoom_generation_pair
+            if zoomed:
+                if pair is not None and pair[0] == current:
+                    self.display_generation = pair[1]
+                else:
+                    self._zoom_generation_pair = (
+                        current,
+                        self._allocate_display_generation_locked(),
+                    )
+            elif pair is not None and pair[1] == current:
+                self.display_generation = pair[0]
+            else:
+                self._allocate_display_generation_locked()
+                self._zoom_generation_pair = None
         self.is_zoomed_changed.emit(zoomed)
         log.info("Zoom state changed to: %s", zoomed)
 
-        # Cancel stale prefetch tasks and restart at the new resolution,
-        # mirroring what _handle_resize() does.
+        # Stop work queued for the previous zoom state and restart at the new
+        # resolution. The decode cache is left alone: frames for the other
+        # state stay under their own generation and the byte budget evicts
+        # them if memory gets tight.
         self.prefetcher.cancel_all()
-        self.image_cache.clear()
         if self._loupe_decode_allowed():
             self.prefetcher.submit_task(
                 self.current_index,
@@ -8503,16 +8571,11 @@ class AppController(
 
     @Slot(float)
     def set_awb_strength(self, value):
+        # The strength is read when auto white balance is next applied; it
+        # does not change how already-decoded frames are displayed, so there
+        # is nothing to invalidate here.
         config.set("awb", "strength", value)
         config.save()
-
-        # Refresh if AWB was recently applied
-        if self.get_color_mode() in ["saturation", "icc"]:
-            self.image_cache.clear()
-            self.prefetcher.cancel_all()
-            self._bump_display_generation()
-            self.prefetcher.update_prefetch(self.current_index)
-            self.sync_ui_state()
 
     @Slot(float)
     @Slot(float, float)
@@ -8689,15 +8752,20 @@ class AppController(
         config.set("core", "optimize_for", optimize_for)
         config.save()
 
-        # If the setting changed, clear cache and redraw current image
+        # The setting changes how every frame is decoded, so invalidate the
+        # way set_color_mode does: a fresh display generation stops in-flight
+        # decodes made with the old setting from landing under live keys, and
+        # the prefetch window is rebuilt instead of just redrawing one image.
         if old_value != optimize_for:
             log.info(
                 f"Optimize for changed from {old_value} to {optimize_for}, clearing cache and redrawing"
             )
             self.image_cache.clear()
-            # Force redraw of current image
-            if self.current_index >= 0 and self.current_index < len(self.image_files):
-                self.ui_state.currentImageSourceChanged.emit()
+            self.prefetcher.cancel_all()
+            self._bump_display_generation()
+            if 0 <= self.current_index < len(self.image_files):
+                self.prefetcher.update_prefetch(self.current_index)
+                self.sync_ui_state()
 
     @Slot(result=float)
     def get_auto_level_clipping_threshold(self):
@@ -8850,6 +8918,25 @@ class AppController(
         finally:
             self.dialog_closed(token)
 
+    def _flush_directory_state_before_switch(self) -> None:
+        """Persist the outgoing folder's sidecar and session position."""
+        old_dir = getattr(self, "image_dir", None)
+        old_sidecar = getattr(self, "sidecar", None)
+        if old_sidecar is not None and getattr(old_sidecar, "dirty", False):
+            try:
+                old_sidecar.save()
+            except Exception:
+                log.exception("Could not flush the sidecar before leaving %s", old_dir)
+        timer = getattr(self, "_session_save_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+            try:
+                self._persist_session_state()
+            except Exception:
+                log.exception(
+                    "Could not persist the position before leaving %s", old_dir
+                )
+
     def _switch_to_directory(
         self, folder_path: Path, update_base_directory: bool = True
     ):
@@ -8888,6 +8975,12 @@ class AppController(
             return False
 
         self._begin_direct_image_transition("directory switched")
+
+        # Flush the folder being left before its sidecar manager is replaced:
+        # retry a durable write that failed earlier, and persist the position
+        # the 1s session debounce has not written yet (the timer would
+        # otherwise fire after the switch and record the new folder instead).
+        self._flush_directory_state_before_switch()
 
         # Stop the old watcher
         if self.watcher:
@@ -11015,15 +11108,16 @@ class AppController(
                     "Undo cancelled pending delete job %d (%d items)", job_id, count
                 )
             else:
-                # Job already completed — find the corresponding "delete" entries
-                # in undo_history and undo the last one
+                # Job already completed: its files are in the recycle bin and
+                # the real most-recent action is the next history entry. Run
+                # the full dispatch on it rather than falling through, which
+                # only handled "delete" and edit entries and silently dropped
+                # a clear_stacks/clear_batches entry popped this way.
                 self.update_status_message("Delete already completed, undoing...")
-                # Fall through to try popping the next entry
-                if self.undo_history:
-                    action_type, action_data, timestamp = self.undo_history.pop()
-                else:
+                if not self.undo_history:
                     self.update_status_message("Nothing to undo.")
                     return
+                return self.undo_delete()
 
         if action_type == "delete":
             try:
@@ -11145,6 +11239,12 @@ class AppController(
                 ) = self._parse_edit_undo_data(action_data)
             except ValueError as e:
                 self.update_status_message(f"Undo failed: {e}")
+                return
+
+            if self._block_if_saving(saved_path):
+                # A save for this file is still in flight; swapping the backup
+                # in now would race the writer. Keep the entry for a retry.
+                self.undo_history.append((action_type, action_data, timestamp))
                 return
 
             try:
@@ -11724,8 +11824,7 @@ class AppController(
             self.update_status_message("No RAW file exists for the current image.")
             return
 
-        configured = config.get("rawtherapee", "exe") or ""
-        executable = os.path.expanduser(os.path.expandvars(configured.strip('" ')))
+        executable = self._configured_rawtherapee_executable()
         # Development uses the CLI binary; interactive editing needs its GUI sibling.
         if executable:
             path = Path(executable)
@@ -11748,7 +11847,7 @@ class AppController(
                 shell=False,
                 stdin=subprocess.DEVNULL,
                 close_fds=True,
-                **inherited_output_kwargs(),
+                **child_popen_kwargs(),
             )
             reap_in_background(process, Path(executable).name)
             self.update_status_message(f"Opened {raw_path.name} in RawTherapee.")
@@ -12053,6 +12152,34 @@ class AppController(
                 return True
         return False
 
+    _DRAG_PREVIEW_EDGE = 128
+
+    def _drag_preview_pixmap(self, path: Path) -> Optional[QPixmap]:
+        """Build the small drag icon without decoding the whole file.
+
+        QImageReader with a scaled size lets the JPEG decoder work at a
+        reduced DCT scale, so this stays cheap on the UI thread even for
+        very large files.
+        """
+        edge = self._DRAG_PREVIEW_EDGE
+        try:
+            reader = QImageReader(str(path))
+            reader.setAutoTransform(True)
+            size = reader.size()
+            if size.isValid() and not size.isEmpty():
+                size.scale(edge, edge, Qt.KeepAspectRatio)
+                reader.setScaledSize(size)
+            image = reader.read()
+        except (RuntimeError, OSError):
+            return None
+        if image.isNull():
+            return None
+        if image.width() > edge or image.height() > edge:
+            image = image.scaled(
+                edge, edge, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        return QPixmap.fromImage(image)
+
     @Slot()
     def start_drag_current_image(self):
         if not self.image_files or self.current_index >= len(self.image_files):
@@ -12233,13 +12360,11 @@ class AppController(
         drag.setMimeData(mime_data)
 
         # --- thumbnail / drag preview ---
-        pix = QPixmap(str(file_paths[0]))
-        if not pix.isNull():
-            # scale it down so it's not huge
-            scaled = pix.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            drag.setPixmap(scaled)
+        pix = self._drag_preview_pixmap(file_paths[0])
+        if pix is not None and not pix.isNull():
+            drag.setPixmap(pix)
             # hotspot = center of image
-            drag.setHotSpot(QPoint(scaled.width() // 2, scaled.height() // 2))
+            drag.setHotSpot(QPoint(pix.width() // 2, pix.height() // 2))
 
         log.info(
             "Starting drag for %d file(s) on platform %r with formats %s: %s",
@@ -12507,6 +12632,11 @@ class AppController(
                     exc_info=True,
                 )
 
+    def _configured_rawtherapee_executable(self) -> str:
+        """Return the configured RawTherapee path, unquoted and expanded."""
+        configured = str(config.get("rawtherapee", "exe") or "")
+        return os.path.expanduser(os.path.expandvars(configured.strip('" ')))
+
     def _develop_raw_backend(self):
         """Internal: Triggers the actual RawTherapee process."""
         if not self.image_files:
@@ -12535,14 +12665,21 @@ class AppController(
             f".{tif_path.stem}_{uuid.uuid4().hex[:8]}{tif_path.suffix}"
         )
 
-        # Resolve RawTherapee Executable
-        from faststack.config import config
-
-        rt_exe = config.get("rawtherapee", "exe")
+        # Resolve and validate the RawTherapee executable the same way the
+        # interactive launcher does (expansion, unquoting, validation).
+        rt_exe = self._configured_rawtherapee_executable()
         if not rt_exe or not os.path.exists(rt_exe):
             self._mark_raw_development_finished(develop_key)
             self.update_status_message("RawTherapee not found. Check settings.")
             log.error("RawTherapee executable not configured or missing: %s", rt_exe)
+            return False
+        valid, error = validate_executable_path(
+            rt_exe, app_type="rawtherapee", allow_custom_paths=True
+        )
+        if not valid:
+            self._mark_raw_development_finished(develop_key)
+            self.update_status_message(f"RawTherapee validation failed: {error}")
+            log.error("RawTherapee executable rejected: %s", error)
             return False
         self.update_status_message("Developing RAW... please wait.")
         log.info("Starting RAW development: %s -> %s", raw_path, tif_path)
@@ -12586,6 +12723,7 @@ class AppController(
                     "stdout": subprocess.PIPE,
                     "stderr": subprocess.PIPE,
                     "text": True,
+                    "env": child_environment(),
                 }
                 if sys.platform == "win32":
                     popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -15788,13 +15926,17 @@ class AppController(
         current_image_path = self.image_files[self.current_index].path
         filename = current_image_path.name
 
-        # Ensure it's a stacked JPG
-        if not filename.lower().endswith(" stacked.jpg"):
+        # Ensure it's a stacked JPG (".jpg" or ".jpeg", any case), using the
+        # same pattern the stack-paint detection does.
+        suffix = current_image_path.suffix.lower()
+        if suffix not in JPG_EXTENSIONS or not filename.lower().endswith(
+            f" stacked{suffix}"
+        ):
             self.update_status_message("Current image is not a stacked JPG.")
             return
 
         # Extract base name and number, e.g., "PB210633" from "20251121-PB210633 stacked.JPG"
-        match = re.search(r"([A-Z]+)(\d+)\s+stacked\.JPG", filename, re.IGNORECASE)
+        match = self._STACKED_JPG_RE.search(filename)
         if not match:
             self.update_status_message("Could not parse stacked JPG filename format.")
             log.error("Could not parse stacked JPG filename: %s", filename)

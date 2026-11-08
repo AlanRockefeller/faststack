@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from faststack.io.child_process import child_environment
 from faststack.io.executable_validator import validate_executable_path
 
 log = logging.getLogger(__name__)
@@ -159,6 +160,7 @@ def _read_focus_with_exiftool(paths: list[Path]) -> list[FocusPosition]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=child_environment(),
         )
         try:
             stdout, stderr = process.communicate(timeout=15)

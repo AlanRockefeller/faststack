@@ -1502,13 +1502,6 @@ class Prefetcher:
         # Cooperative cancellation flag for shutdown
         self._stop_event = threading.Event()
 
-        # The display-size gate already prevents premature work. Warm the full
-        # configured window while the user is idle instead of waiting until the
-        # held-key burst has already begun.
-        self._initial_radius = self.prefetch_radius
-        self._navigation_count = 0  # Track how many times user has navigated
-        self._radius_expanded = True
-
         # Directional prefetching
         self._last_navigation_direction: int = 1  # 1 = forward, -1 = backward
 
@@ -1758,24 +1751,10 @@ class Prefetcher:
         if direction is not None:
             self._last_navigation_direction = direction
 
-        # Track navigation to expand radius after user starts moving
-        if is_navigation and not self._radius_expanded:
-            self._navigation_count += 1
-            if self._navigation_count >= 2:
-                self._radius_expanded = True
-                log.info(
-                    "Expanding prefetch radius from %d to %d after user navigation",
-                    self._initial_radius,
-                    self.prefetch_radius,
-                )
-
-        # Use a smaller radius initially to reduce cache thrash before display
-        # size is stable, but never exceed a user-configured smaller radius.
-        effective_radius = (
-            min(self._initial_radius, self.prefetch_radius)
-            if not self._radius_expanded
-            else self.prefetch_radius
-        )
+        # The whole configured window is warmed from the first navigation on;
+        # the display-size gate already prevents premature work. Callers may
+        # still cap the radius for a cheap first pass (e.g. after a zoom).
+        effective_radius = self.prefetch_radius
         if radius_limit is not None:
             effective_radius = min(effective_radius, max(0, radius_limit))
         display_width, display_height, display_generation = self.get_display_info()
@@ -1785,8 +1764,7 @@ class Prefetcher:
 
         if self.debug:
             log.info(
-                "Prefetch radius: initial=%d, configured=%d, effective=%d",
-                self._initial_radius,
+                "Prefetch radius: configured=%d, effective=%d",
                 self.prefetch_radius,
                 effective_radius,
             )

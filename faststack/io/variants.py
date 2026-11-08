@@ -87,6 +87,62 @@ def parse_variant_stem(stem: str) -> Tuple[str, bool, Optional[int]]:
     return group_key, is_developed, backup_number
 
 
+class VariantMap(dict):
+    """``{group_key: VariantGroup}`` with a lazily built file-path index.
+
+    ``get_group_key_for_path`` runs on every navigation step (EXIF source
+    path, variant badges), so a linear scan over every file in the folder is
+    replaced by one dictionary lookup. Any mutation drops the index; it is
+    rebuilt on the next lookup.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._path_index: Optional[Dict[str, str]] = None
+
+    def path_index(self) -> Dict[str, str]:
+        """Normalized file path -> group key, built on first use."""
+        index = self._path_index
+        if index is None:
+            index = {}
+            for key, group in self.items():
+                for info in group.all_files:
+                    index.setdefault(norm_path(info.path), key)
+            self._path_index = index
+        return index
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._path_index = None
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self._path_index = None
+
+    def pop(self, *args):
+        result = super().pop(*args)
+        self._path_index = None
+        return result
+
+    def popitem(self):
+        result = super().popitem()
+        self._path_index = None
+        return result
+
+    def setdefault(self, key, default=None):
+        result = super().setdefault(key, default)
+        self._path_index = None
+        return result
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self._path_index = None
+
+    def clear(self):
+        super().clear()
+        self._path_index = None
+
+
 def build_variant_map(
     all_jpg_paths: List[Path],
 ) -> Dict[str, VariantGroup]:
@@ -96,13 +152,14 @@ def build_variant_map(
         all_jpg_paths: All JPG paths in the directory (including backups).
 
     Returns:
-        Dict keyed by group_key.casefold() -> VariantGroup with selection rules applied.
+        VariantMap keyed by group_key.casefold() -> VariantGroup with selection
+        rules applied (a dict with a path index for fast reverse lookups).
     """
     # 1. Parse all files by extensionless logical stem first. Most folders have
     # one ordinary image per stem and retain the historical extension-agnostic
     # grouping. If multiple ordinary JPEGs differ only by extension, however,
     # they are distinct physical images and each extension gets its own group.
-    groups: Dict[str, VariantGroup] = {}
+    groups: Dict[str, VariantGroup] = VariantMap()
     stem_buckets: Dict[str, List[VariantInfo]] = {}
 
     # Sort paths to ensure deterministic behavior for group_key casing
@@ -217,9 +274,14 @@ def get_group_key_for_path(
 ) -> Optional[str]:
     """Look up the casefolded group key for a file path."""
     target = norm_path(path)
-    for key, group in variant_map.items():
-        if any(norm_path(info.path) == target for info in group.all_files):
+    if isinstance(variant_map, VariantMap):
+        key = variant_map.path_index().get(target)
+        if key is not None and key in variant_map:
             return key
+    else:
+        for key, group in variant_map.items():
+            if any(norm_path(info.path) == target for info in group.all_files):
+                return key
 
     group_key, _, _ = parse_variant_stem(path.stem)
     key_cf = group_key.casefold()

@@ -147,10 +147,16 @@ class ImageProvider(QQuickImageProvider):
         # Transparent 1x1 fallback for mask overlays (prevents grey-screen bug)
         self._transparent = QImage(1, 1, QImage.Format.Format_ARGB32)
         self._transparent.fill(Qt.GlobalColor.transparent)
-        # Keepalive queue to prevent GC of buffers currently in use by QImage
-        # Increased to 128 to prevent crashes during rapid scrolling/thrashing where
-        # QML might hold onto textures slightly longer than the Python GC expects.
-        self._keepalive = collections.deque(maxlen=128)
+        # Keepalive queue to prevent GC of buffers currently in use by QImage.
+        # A QImage built on a numpy buffer does not own the pixels, and QML can
+        # hold the texture upload slightly longer than the Python GC expects,
+        # so recently served buffers stay referenced here. The queue is bounded
+        # by bytes as well as count: the old fixed 128 entries pinned up to
+        # several GB of full-resolution frames outside the decode cache's
+        # budget. A floor of entries is always kept so the in-flight frames of
+        # a fast held-key burst can never be released early.
+        self._keepalive: collections.deque = collections.deque()
+        self._keepalive_bytes = 0
         # Lock to protect keepalive deque from concurrent access by QML rendering threads
         self._keepalive_lock = threading.Lock()
         # Pre-built sRGB color space, reused across requests instead of
@@ -161,6 +167,40 @@ class ImageProvider(QQuickImageProvider):
 
     def _fallback_image(self) -> QImage:
         return self.placeholder.copy()
+
+    # Keepalive bounds. 16 frames always survive (more than any burst of
+    # pending texture uploads); beyond that the queue is trimmed to 128
+    # entries or 256 MB, whichever is hit first.
+    _KEEPALIVE_MIN_ENTRIES = 16
+    _KEEPALIVE_MAX_ENTRIES = 128
+    _KEEPALIVE_MAX_BYTES = 256 * 1024 * 1024
+
+    @staticmethod
+    def _buffer_nbytes(buffer) -> int:
+        nbytes = getattr(buffer, "nbytes", None)
+        if isinstance(nbytes, int):
+            return nbytes
+        try:
+            return memoryview(buffer).nbytes
+        except (TypeError, ValueError):
+            return 0
+
+    def _retain_buffer(self, buffer) -> None:
+        """Keep ``buffer`` alive until enough newer frames have been served."""
+        if buffer is None:
+            return
+        nbytes = self._buffer_nbytes(buffer)
+        with self._keepalive_lock:
+            if self._keepalive and self._keepalive[-1][0] is buffer:
+                return
+            self._keepalive.append((buffer, nbytes))
+            self._keepalive_bytes += nbytes
+            while len(self._keepalive) > self._KEEPALIVE_MIN_ENTRIES and (
+                len(self._keepalive) > self._KEEPALIVE_MAX_ENTRIES
+                or self._keepalive_bytes > self._KEEPALIVE_MAX_BYTES
+            ):
+                _old, old_bytes = self._keepalive.popleft()
+                self._keepalive_bytes -= old_bytes
 
     def _log_provider_fallback(
         self,
@@ -515,9 +555,7 @@ class ImageProvider(QQuickImageProvider):
                 else:
                     # SAFETY: Keep a reference to the underlying buffer to prevent garbage collection
                     # while Qt holds the QImage. QImage created from bytes does NOT own the data.
-                    # Lock protects against concurrent access from QML rendering threads.
-                    with self._keepalive_lock:
-                        self._keepalive.append(image_data.buffer)
+                    self._retain_buffer(image_data.buffer)
 
                 # Set sRGB color space for proper color management (if available)
                 # Skip this when using ICC mode - pixels are already in monitor space

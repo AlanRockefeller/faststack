@@ -137,7 +137,17 @@ def _exclusive_copy_restore(source: Path, target: Path) -> None:
         )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     fd = os.open(target, flags, 0o666)
-    created = os.fstat(fd)
+    try:
+        created = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        # O_EXCL guarantees this call created the file an instant ago, so it
+        # is safe to remove without the identity check used below.
+        try:
+            os.unlink(target)
+        except OSError:
+            log.warning("Could not remove partial restore %s", target)
+        raise
     try:
         with os.fdopen(fd, "wb") as dst:
             fd = -1  # Owned by the file object now.

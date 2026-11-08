@@ -162,7 +162,10 @@ def _scan_folder_files(folder_path: Path) -> Tuple[int, int, list]:
     except OSError:
         pass
 
-    # Sort JPG files alphabetically (matches find_images default sort)
+    # Sort JPG files alphabetically. The loupe's default order is by file
+    # timestamp first (see indexer.image_sort_key); for camera-named files the
+    # two orders agree, and the sparkline only needs a coarse 40-bucket
+    # progression, so this avoids a stat() per file in every subfolder.
     jpg_files.sort(key=str.lower)
     return jpg_count, raw_count, jpg_files
 

@@ -686,7 +686,6 @@ class AppConfig:
         self._changed_options: set[tuple[str, str]] = set()
         self._removed_options: set[tuple[str, str]] = set()
         self._invalid_value_warned: set[tuple[str, str]] = set()
-        self._load_failed = False
         self.load()
 
     def load(self):
@@ -712,7 +711,6 @@ class AppConfig:
                 )
                 self.config = configparser.ConfigParser(interpolation=None)
                 self.config.read_dict(DEFAULT_CONFIG)
-                self._load_failed = True
                 for section, keys in DEFAULT_CONFIG.items():
                     for key in keys:
                         self._changed_options.add((section, key))
@@ -818,6 +816,15 @@ class AppConfig:
 
         return changed
 
+    def _snapshot_in_memory_config(self) -> configparser.ConfigParser:
+        """Copy every section/key currently loaded into a fresh parser."""
+        snapshot = configparser.ConfigParser(interpolation=None)
+        for section in self.config.sections():
+            snapshot.add_section(section)
+            for key, value in self.config.items(section, raw=True):
+                snapshot.set(section, key, value)
+        return snapshot
+
     def _read_latest_config(self) -> configparser.ConfigParser | None:
         if not self.config_path.exists():
             return configparser.ConfigParser(interpolation=None)
@@ -860,7 +867,10 @@ class AppConfig:
                         )
                         shutil.copy2(self.config_path, backup)
                         log.warning("Preserved unreadable config as %s", backup)
-                    latest = configparser.ConfigParser(interpolation=None)
+                    # Rebuild from the settings this process is running with,
+                    # not from an empty parser: otherwise only the keys changed
+                    # this session would survive, both on disk and in memory.
+                    latest = self._snapshot_in_memory_config()
 
                 for section, key in self._removed_options:
                     if latest.has_section(section):
@@ -875,7 +885,6 @@ class AppConfig:
             self.config = latest
             self._changed_options.clear()
             self._removed_options.clear()
-            self._load_failed = False
             log.info("Saved config to %s", self.config_path)
             return True
         except (OSError, configparser.Error) as e:

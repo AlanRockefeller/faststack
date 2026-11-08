@@ -1,6 +1,5 @@
 """ThumbnailModel for QML GridView with file/folder entries."""
 
-import hashlib
 import logging
 import os
 import time
@@ -21,6 +20,7 @@ from PySide6.QtCore import (
 
 from faststack.io.indexer import DirectoryScanError, find_images
 from faststack.io.utils import compute_path_hash, normalize_path_key
+from faststack.models import filesystem_source_identity
 from faststack.thumbnail_view.folder_stats import (
     FolderStats,
     count_images_in_folder,
@@ -30,21 +30,9 @@ from faststack.thumbnail_view.folder_stats import (
 log = logging.getLogger(__name__)
 
 
-def filesystem_source_identity(stat_result: os.stat_result) -> str:
-    """Return a cheap stable token for the filesystem object behind an image.
-
-    This deliberately avoids content hashing. A same-size in-place rewrite
-    that preserves every cheap timestamp/file-id field (possible on Windows)
-    cannot be detected by this scheme and still requires manual refresh.
-    """
-    fields = (
-        getattr(stat_result, "st_mtime_ns", 0),
-        getattr(stat_result, "st_size", 0),
-        getattr(stat_result, "st_ino", 0),
-        getattr(stat_result, "st_ctime_ns", 0),
-    )
-    payload = ":".join(str(value or 0) for value in fields).encode("ascii")
-    return hashlib.blake2s(payload, digest_size=8).hexdigest()
+# Re-exported: the identity lives next to ImageFile so the folder scan can
+# compute it once per file (see models.filesystem_source_identity).
+__all__ = ["filesystem_source_identity"]
 
 
 def _empty_folder_stats_payload() -> dict:
@@ -732,13 +720,20 @@ class ThumbnailModel(QAbstractListModel):
         # and keyed by str(img.path).
         map_authoritative = metadata_map is not None
         for img in images:
-            try:
-                stat_info = img.path.stat()
-                mtime_ns = stat_info.st_mtime_ns
-                source_identity = filesystem_source_identity(stat_info)
-            except OSError:
-                mtime_ns = int(getattr(img, "timestamp", 0) * 1e9)
-                source_identity = "0"
+            # Prefer the stat captured when the folder was scanned; statting
+            # every image again here ran on the UI thread for each refresh.
+            # Files FastStack rewrote have these cleared by the controller
+            # (_forget_image_file_stat), so they are statted afresh.
+            mtime_ns = getattr(img, "mtime_ns", None)
+            source_identity = getattr(img, "source_identity", None)
+            if mtime_ns is None or source_identity is None:
+                try:
+                    stat_info = img.path.stat()
+                    mtime_ns = stat_info.st_mtime_ns
+                    source_identity = filesystem_source_identity(stat_info)
+                except OSError:
+                    mtime_ns = int(getattr(img, "timestamp", 0) * 1e9)
+                    source_identity = "0"
 
             # Get metadata
             is_stacked = False

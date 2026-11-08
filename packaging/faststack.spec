@@ -102,7 +102,8 @@ for candidate in (
 # FastStack's ENTIRE Qt surface is:
 #   Python : QtCore, QtGui, QtWidgets, QtQml, QtQuick
 #   QML    : QtQuick, QtQuick.Controls, QtQuick.Layouts,
-#            QtQuick.Controls.Material, QtQuick.Window, QtCore
+#            QtQuick.Controls.Material, QtQuick.Window, QtCore,
+#            QtQuick.Effects (MultiEffect, kept via qt6quickeffects below)
 # Nothing below is reachable from that set, yet PyInstaller collects it all
 # through PySide6's dependency graph. Measured on the shipped 1.6.8 Windows
 # build: ~125 MB of a 240 MB download, of which QtWebEngine alone is 86.8 MB

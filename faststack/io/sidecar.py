@@ -858,7 +858,7 @@ class SidecarManager:
         """
         # Stable keys are authoritative and require no legacy filesystem
         # ambiguity probes. Build the broader fallback list only after a miss.
-        stable_key, candidate_keys = self._lookup_keys(
+        stable_key, candidate_keys, _probe_keys = self._lookup_keys(
             image_ref, include_legacy_stems=False
         )
         if not stable_key:
@@ -870,7 +870,11 @@ class SidecarManager:
             ambiguous_legacy_keys = set(self.data.ambiguous_legacy_keys)
             meta = self.data.entries.get(stable_key)
             if meta is None:
-                _stable_key, candidate_keys = self._lookup_keys(image_ref)
+                _stable_key, candidate_keys, probe_keys = self._lookup_keys(image_ref)
+                # The sibling-JPEG probe costs several stat() calls, so it runs
+                # only when a legacy stem key actually holds an entry -- not for
+                # every untracked image on every grid refresh or filter pass.
+                stem_ambiguous: Optional[bool] = None
                 for candidate_key in candidate_keys:
                     if candidate_key == stable_key:
                         continue
@@ -879,6 +883,15 @@ class SidecarManager:
                     candidate_meta = self.data.entries.get(candidate_key)
                     if candidate_meta is None:
                         continue
+                    if candidate_key in probe_keys:
+                        if stem_ambiguous is None:
+                            probe_path = self._lookup_path(image_ref)
+                            stem_ambiguous = (
+                                probe_path is not None
+                                and self._jpeg_stem_is_ambiguous(probe_path)
+                            )
+                        if stem_ambiguous:
+                            continue
                     meta = candidate_meta
                     if stable_key not in self.data.entries:
                         self.data.entries[stable_key] = candidate_meta
@@ -944,41 +957,61 @@ class SidecarManager:
         self._stable_key_cache[cache_key] = result
         return result
 
+    @staticmethod
+    def _lookup_path(image_ref: Union[str, Path]) -> Optional[Path]:
+        """Return the filesystem path behind a lookup reference, if it is one.
+
+        Only strings with explicit path separators count as paths. Dotted
+        strings (even with image extensions like "photo.CR2") are exact keys;
+        migration of legacy filename keys is handled by the
+        _stable_key_from_key scan in get_metadata.
+        """
+        if isinstance(image_ref, Path):
+            return image_ref if image_ref.name else None
+        value = str(image_ref)
+        if value and (os.path.sep in value or "/" in value or "\\" in value):
+            return Path(value)
+        return None
+
     def _lookup_keys(
         self,
         image_ref: Union[str, Path],
         *,
         include_legacy_stems: bool = True,
-    ) -> tuple[str, list[str]]:
-        """Return (stable_key, migration_candidate_keys) for a metadata lookup."""
+    ) -> tuple[str, list[str], frozenset[str]]:
+        """Return (stable_key, candidate_keys, probe_keys) for a metadata lookup.
+
+        ``candidate_keys`` are the keys a migration lookup should try after a
+        stable-key miss. ``probe_keys`` is the subset older releases derived
+        from a JPEG's stem (extensionless and RAW-suffixed names). Those are
+        only trustworthy when no sibling JPEG shares the stem, so a caller that
+        finds a probe key in the sidecar must confirm with
+        ``_jpeg_stem_is_ambiguous()`` before trusting the entry. The probe is
+        deferred to the caller because it stats the directory several times
+        per image, which must not happen for every lookup miss.
+        """
         if isinstance(image_ref, Path):
             if not image_ref.name:
-                return "", []
-            stable_key = self.metadata_key_for_path(image_ref)
-            full_name_key = self._metadata_filename_key(image_ref)
-            legacy_keys = [full_name_key]
-            if include_legacy_stems and not self._jpeg_stem_is_ambiguous(image_ref):
-                legacy_keys.extend(self._legacy_stem_keys(image_ref, stable_key))
-            return stable_key, legacy_keys
+                return "", [], frozenset()
+            path = image_ref
+        else:
+            path = self._lookup_path(image_ref)
+            if path is None:
+                value = str(image_ref)
+                if not value:
+                    return "", [], frozenset()
+                return value, [value], frozenset()
 
-        value = str(image_ref)
-        if not value:
-            return "", []
-
-        # Only treat string as a path if it contains explicit path separators.
-        # Dotted strings (even with image extensions like "photo.CR2") are
-        # treated as exact keys — migration of legacy filename keys is handled
-        # by the _stable_key_from_key scan in get_metadata.
-        if os.path.sep in value or "/" in value or "\\" in value:
-            path = Path(value)
-            stable_key = self.metadata_key_for_path(path)
-            full_name_key = self._metadata_filename_key(path)
-            legacy_keys = [full_name_key]
-            if include_legacy_stems and not self._jpeg_stem_is_ambiguous(path):
-                legacy_keys.extend(self._legacy_stem_keys(path, stable_key))
-            return stable_key, legacy_keys
-
-        return value, [value]
+        stable_key = self.metadata_key_for_path(path)
+        full_name_key = self._metadata_filename_key(path)
+        candidate_keys = [full_name_key]
+        probe_keys: frozenset[str] = frozenset()
+        if include_legacy_stems:
+            stem_keys = self._legacy_stem_keys(path, stable_key)
+            candidate_keys.extend(stem_keys)
+            if path.suffix.lower() in JPG_EXTENSIONS:
+                probe_keys = frozenset(stem_keys)
+        return stable_key, candidate_keys, probe_keys
 
     def _legacy_stem_keys(self, path: Path, stable_key: str) -> list[str]:
         """Return unambiguous extensionless/RAW keys used by older releases."""

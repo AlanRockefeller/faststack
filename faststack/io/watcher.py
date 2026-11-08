@@ -79,6 +79,18 @@ def _is_watched_image_path(path: str) -> bool:
     return Path(path).suffix.lower() in _WATCHED_IMAGE_EXTENSIONS
 
 
+def _is_relevant_path(path: str, is_directory: bool) -> bool:
+    """Return True when a create/delete/move at ``path`` can change the view.
+
+    Directories matter to the thumbnail grid (folder tiles); files matter only
+    when they are images. Stray sidecars, lock files, text notes and the like
+    used to trigger a full folder rescan on every creation or deletion.
+    """
+    if _is_ignored_path(path):
+        return False
+    return is_directory or _is_watched_image_path(path)
+
+
 class ImageDirectoryEventHandler(FileSystemEventHandler):
     """Handles filesystem events for the image directory.
 
@@ -91,13 +103,13 @@ class ImageDirectoryEventHandler(FileSystemEventHandler):
         self.callback = callback
 
     def on_created(self, event):
-        if _is_ignored_path(event.src_path):
+        if not _is_relevant_path(event.src_path, event.is_directory):
             return
         log.info("Detected file creation: %s. Requesting refresh.", event.src_path)
         self.callback(event.src_path)
 
     def on_deleted(self, event):
-        if _is_ignored_path(event.src_path):
+        if not _is_relevant_path(event.src_path, event.is_directory):
             return
         log.info("Detected file deletion: %s. Requesting refresh.", event.src_path)
         self.callback(event.src_path)
@@ -106,8 +118,8 @@ class ImageDirectoryEventHandler(FileSystemEventHandler):
         # Treat the endpoints independently. Applications commonly save by moving
         # an ignored temporary file over the real image; the destination still
         # needs to invalidate its cached pixels.
-        src_relevant = not _is_ignored_path(event.src_path)
-        dest_relevant = not _is_ignored_path(event.dest_path)
+        src_relevant = _is_relevant_path(event.src_path, event.is_directory)
+        dest_relevant = _is_relevant_path(event.dest_path, event.is_directory)
         if not (src_relevant or dest_relevant):
             # e.g. our own sidecar write: faststack.<uuid>.tmp -> faststack.json
             return

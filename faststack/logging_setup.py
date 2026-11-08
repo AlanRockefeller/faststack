@@ -56,8 +56,30 @@ def _can_create_dir(path: Path) -> bool:
     return _is_writable_dir(parent)
 
 
+_app_data_dir: Path | None = None
+
+
 def get_app_data_dir() -> Path:
-    """Return a writable application data directory, with fallbacks."""
+    """Return a writable application data directory, with fallbacks.
+
+    The choice is made once per process. Every caller (config, session
+    records, logs) must agree on one directory, and the writability probe
+    creates and deletes a temp file, which must not run on every call --
+    the session registry asks for this directory after each navigation.
+    """
+    global _app_data_dir
+    if _app_data_dir is None:
+        _app_data_dir = _choose_app_data_dir()
+    return _app_data_dir
+
+
+def reset_app_data_dir_cache() -> None:
+    """Forget the cached app-data directory (for tests that change HOME/APPDATA)."""
+    global _app_data_dir
+    _app_data_dir = None
+
+
+def _choose_app_data_dir() -> Path:
     candidates = []
 
     app_data = os.getenv("APPDATA")
