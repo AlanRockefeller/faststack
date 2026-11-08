@@ -22,6 +22,7 @@ from typing import Optional
 
 import numpy as np
 
+from faststack.imaging.turbo import capture_thread_warnings, forward_thread_warnings
 from faststack.util.executors import PriorityExecutor, create_priority_executor
 
 log = logging.getLogger(__name__)
@@ -228,18 +229,26 @@ def decode_parallel(
     num, den = scaling_factor if scaling_factor else (1, 1)
 
     def work(part):
-        return decoder.decode(
-            part,
-            scaling_factor=scaling_factor,
-            pixel_format=pixel_format,
-            flags=flags,
-        )
+        # Chunk decodes run on pool threads; capture their decoder warnings
+        # here and hand them back so the caller's truncation check sees them.
+        with capture_thread_warnings() as caught:
+            out = decoder.decode(
+                part,
+                scaling_factor=scaling_factor,
+                pixel_format=pixel_format,
+                flags=flags,
+            )
+        return out, caught
 
     pool = _get_pool()
     # The caller blocks on these futures from its own thread -- never from a
     # worker of this pool -- so waiting here cannot starve the pool.
     futures = [pool.submit(work, part, priority=priority) for part in parts]
-    outs = [future.result() for future in futures]
+    outs = []
+    for future in futures:
+        out, caught = future.result()
+        forward_thread_warnings(caught)
+        outs.append(out)
     out_h = -(-h * num // den)
     merged = np.concatenate(outs, axis=0)
     return merged[:out_h] if merged.shape[0] > out_h else merged

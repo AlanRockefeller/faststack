@@ -2,7 +2,6 @@
 
 import logging
 import time
-import warnings
 from io import BytesIO
 from typing import Any, Literal, Optional, Tuple
 
@@ -11,7 +10,12 @@ from PIL import Image
 
 from faststack.imaging import rst_parallel
 from faststack.imaging.optional_deps import get_cv2
-from faststack.imaging.turbo import TJPF_RGB, create_turbojpeg
+from faststack.imaging.turbo import (
+    TJPF_RGB,
+    TRUNCATION_WARNING_TEXT,
+    capture_thread_warnings,
+    create_turbojpeg,
+)
 
 log = logging.getLogger(__name__)
 
@@ -40,8 +44,10 @@ def _decode_with_retry(
     warning-tainted result into an authoritative image.
     """
     dec = decoder or JPEG_DECODER
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    # Per-thread capture: concurrent decode threads must neither lose their
+    # own truncation warning nor see another thread's (catch_warnings is
+    # process-global and unsafe here).
+    with capture_thread_warnings() as caught:
         result = None
         if use_rst_parallel:
             try:
@@ -62,7 +68,7 @@ def _decode_with_retry(
             caught.clear()
             result = dec.decode(jpeg_bytes, **decode_kwargs)
 
-    if any("Premature end of JPEG file" in str(w.message) for w in caught):
+    if any(TRUNCATION_WARNING_TEXT in message for message in caught):
         raise IncompleteJPEGError(
             f"TurboJPEG reported an incomplete JPEG snapshot for "
             f"{source_path or '<unknown>'}"

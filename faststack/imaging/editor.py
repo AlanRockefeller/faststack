@@ -60,6 +60,7 @@ from faststack.imaging.stack_paint import (
     stack_layers,
     warp_source_to_base,
 )
+from faststack.io.utils import fsync_directory, fsync_file
 from faststack.models import DecodedImage
 from faststack.util.executors import create_daemon_threadpool_executor
 
@@ -386,10 +387,18 @@ def _normalized_wb_gains(by: float, mg: float) -> Tuple[float, float, float]:
 
 
 def _safe_replace(tmp_path: Path, target_path: Path) -> None:
-    """Atomically replace target with tmp, retrying on Windows file-lock errors."""
+    """Durably and atomically replace target with tmp.
+
+    The temporary file's data is flushed before the rename and the parent
+    directory afterwards, so a crash or power loss leaves either the old or the
+    new file under ``target_path`` rather than a truncated one. Retries on
+    Windows file-lock errors.
+    """
+    fsync_file(tmp_path)
     for attempt in range(_REPLACE_MAX_RETRIES):
         try:
             os.replace(str(tmp_path), str(target_path))
+            fsync_directory(Path(target_path).parent)
             return
         except OSError:
             if attempt < _REPLACE_MAX_RETRIES - 1:
@@ -562,26 +571,43 @@ def create_backup_file(original_path: Path) -> Optional[Path]:
 
     # Extract base name without any existing -backup suffix
     stem = original_path.stem
-    # Remove any existing -backup, -backup2, -backup-1, etc. (handles both old and new formats)
-    base_stem = re.sub(r"-backup(-?\d+)?$", "", stem)
+    # Remove any existing -backup, -backup2, -backup-1, etc. (handles both old
+    # and new formats, and -BACKUP from case-insensitive filesystems).
+    base_stem = re.sub(r"-backup(-?\d+)?$", "", stem, flags=re.IGNORECASE)
 
-    # Try filename-backup.jpg first
-    backup_path = original_path.parent / f"{base_stem}-backup{original_path.suffix}"
-
-    # If that exists, try filename-backup2.jpg, filename-backup3.jpg, etc.
-    i = 2
-    while backup_path.exists():
+    # Try filename-backup.jpg first, then filename-backup2.jpg, -backup3, ...
+    # The name is claimed with an exclusive create so a concurrent writer (or
+    # a file appearing between the check and the copy) is never overwritten.
+    i = 1
+    while True:
+        suffix = "" if i == 1 else str(i)
         backup_path = (
-            original_path.parent / f"{base_stem}-backup{i}{original_path.suffix}"
+            original_path.parent / f"{base_stem}-backup{suffix}{original_path.suffix}"
         )
         i += 1
+        try:
+            dst = open(backup_path, "xb")
+        except FileExistsError:
+            continue
+        except OSError as e:
+            log.exception("Failed to create backup: %s", e)
+            return None
+        break
 
     try:
-        # Perform the backup
-        shutil.copy2(original_path, backup_path)
+        with dst, open(original_path, "rb") as src:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        shutil.copystat(original_path, backup_path)
+        fsync_directory(backup_path.parent)
         return backup_path
     except OSError as e:
         log.exception("Failed to create backup: %s", e)
+        try:
+            backup_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
 
 
@@ -1351,6 +1377,13 @@ class ImageEditor:
                     )
                     float_image_orientation_applied = True
                 loaded_original = Image.fromarray(jpeg_arr)
+                if float_image_orientation_applied and jpeg_meta_info.get("exif"):
+                    # The pixels are already upright; reset the tag like
+                    # ImageOps.exif_transpose does on the Pillow path so the
+                    # image's EXIF never claims a rotation it no longer needs.
+                    cleaned_exif = sanitize_exif_orientation(jpeg_meta_info["exif"])
+                    if cleaned_exif is not None:
+                        jpeg_meta_info["exif"] = cleaned_exif
                 if jpeg_meta_info:
                     # Carry EXIF/ICC over so getexif() and info["icc_profile"]
                     # behave exactly like a Pillow-decoded image.
@@ -1415,6 +1448,13 @@ class ImageEditor:
                         # But consistently OpenCV uses BGR layout for 3-channel images.
                         # Let's verify by assuming BGR and swapping.
                         arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                    elif len(arr.shape) == 3 and arr.shape[2] == 4:
+                        # 16-bit RGBA TIFF/PNG: keep the 16-bit color and drop
+                        # alpha, as the 8-bit Pillow path's convert("RGB") does,
+                        # instead of falling back and losing the bit depth.
+                        arr = np.ascontiguousarray(
+                            cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
+                        )
                     else:
                         # Invalid channel count, fall back to Pillow
                         cv_img_valid = False
@@ -4914,10 +4954,6 @@ class ImageEditor:
         except OSError:
             original_stat = None
 
-        backup_path = create_backup_file(original_path)
-        if backup_path is None:
-            raise RuntimeError(f"Unable to create backup for {original_path}")
-
         exif_bytes = self._get_sanitized_exif_bytes()
         icc_bytes = (
             self.original_image.info.get("icc_profile")
@@ -4948,6 +4984,11 @@ class ImageEditor:
                     fallback_kwargs["icc_profile"] = icc_bytes
                 img_u8.save(tmp_path, **fallback_kwargs)
             _validate_temp_output(tmp_path)
+            # Back up only once the new encode exists, so a failed encode does
+            # not leave a spurious -backup file behind.
+            backup_path = create_backup_file(original_path)
+            if backup_path is None:
+                raise RuntimeError(f"Unable to create backup for {original_path}")
             _safe_replace(tmp_path, original_path)
         finally:
             try:

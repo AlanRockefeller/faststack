@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,8 +43,11 @@ class FolderStats:
 # - json_mtime_ns: changes when faststack.json is modified (flags, metadata)
 # - folder_mtime_ns: changes when files are added/removed/renamed in folder
 # - folder_mtime_ns: changes when files are added/removed/renamed in folder
-_stats_cache: Dict[Tuple[Path, int, int], Optional[FolderStats]] = {}
+_stats_cache: Dict[Tuple[str, int, int], Optional[FolderStats]] = {}
 MAX_CACHE_SIZE = 1000
+# Folder stats are read from the UI thread and from thumbnail workers; the
+# FIFO trim iterates the dict, which must not race another thread's insert.
+_cache_lock = threading.Lock()
 
 
 def _check_cache_size(cache_dict):
@@ -94,17 +98,20 @@ def read_folder_stats(folder_path: Path) -> Optional[FolderStats]:
         folder_mtime_ns = 0  # Fallback if stat fails
 
     # Check cache using both mtime values for invalidation
-    cache_key = (folder_path.resolve(), json_mtime_ns, folder_mtime_ns)
-    if cache_key in _stats_cache:
-        return _stats_cache[cache_key]
+    # abspath, not resolve(): this runs per folder tile while scrolling, and
+    # resolve() costs a syscall per path component (slow on network shares).
+    cache_key = (os.path.abspath(folder_path), json_mtime_ns, folder_mtime_ns)
+    with _cache_lock:
+        if cache_key in _stats_cache:
+            return _stats_cache[cache_key]
 
     # Parse the JSON file
     stats = _parse_faststack_json(json_path)
 
     # Cache the result (even if None)
-    # Cache the result (even if None)
-    _check_cache_size(_stats_cache)
-    _stats_cache[cache_key] = stats
+    with _cache_lock:
+        _check_cache_size(_stats_cache)
+        _stats_cache[cache_key] = stats
 
     return stats
 
@@ -140,7 +147,9 @@ def _scan_folder_files(folder_path: Path) -> Tuple[int, int, list]:
     raw_count = 0
     jpg_files = []
     try:
-        for entry in os.scandir(folder_path):
+        with os.scandir(folder_path) as entries:
+            scanned = list(entries)
+        for entry in scanned:
             if entry.is_file():
                 # FASTER: os.path.splitext is string-based, avoids Path object creation
                 _, suffix = os.path.splitext(entry.name)
@@ -318,8 +327,8 @@ def _compute_folder_coverage(
 
 def clear_stats_cache():
     """Clear the folder stats cache."""
-    global _stats_cache
-    _stats_cache.clear()
+    with _cache_lock:
+        _stats_cache.clear()
     log.debug("Cleared folder stats cache")
 
 
@@ -343,16 +352,19 @@ def count_images_in_folder(folder_path: Path) -> Optional[FolderStats]:
         return None
 
     # Use a different cache key prefix to avoid collision with faststack.json cache
-    cache_key = (folder_path.resolve(), mtime_ns)
+    cache_key = (os.path.abspath(folder_path), mtime_ns)
     # Check if we have this in a separate "raw count" cache
-    if cache_key in _raw_count_cache:
-        return _raw_count_cache[cache_key]
+    with _cache_lock:
+        if cache_key in _raw_count_cache:
+            return _raw_count_cache[cache_key]
 
     # Count image files using shared scan function
     jpg_count, raw_count, _ = _scan_folder_files(folder_path)
     total_count = jpg_count + raw_count
     if total_count == 0:
-        _raw_count_cache[cache_key] = None
+        with _cache_lock:
+            _check_cache_size(_raw_count_cache)
+            _raw_count_cache[cache_key] = None
         return None
 
     stats = FolderStats(
@@ -363,13 +375,14 @@ def count_images_in_folder(folder_path: Path) -> Optional[FolderStats]:
         jpg_count=jpg_count,
         raw_count=raw_count,
     )
-    _check_cache_size(_raw_count_cache)
-    _raw_count_cache[cache_key] = stats
+    with _cache_lock:
+        _check_cache_size(_raw_count_cache)
+        _raw_count_cache[cache_key] = stats
     return stats
 
 
 # Separate cache for raw file counts (folders without faststack.json)
-_raw_count_cache: Dict[Tuple[Path, int], Optional[FolderStats]] = {}
+_raw_count_cache: Dict[Tuple[str, int], Optional[FolderStats]] = {}
 
 
 def get_file_counts_by_extension(folder_path: Path) -> Dict[str, int]:
@@ -388,7 +401,9 @@ def get_file_counts_by_extension(folder_path: Path) -> Dict[str, int]:
     """
     counts: Counter[str] = Counter()
     try:
-        for entry in os.scandir(folder_path):
+        with os.scandir(folder_path) as entries:
+            scanned = list(entries)
+        for entry in scanned:
             if entry.is_file():
                 name = entry.name
                 # Skip faststack.json
@@ -413,6 +428,6 @@ def get_file_counts_by_extension(folder_path: Path) -> Dict[str, int]:
 
 def clear_raw_count_cache():
     """Clear the raw file count cache."""
-    global _raw_count_cache
-    _raw_count_cache.clear()
+    with _cache_lock:
+        _raw_count_cache.clear()
     log.debug("Cleared raw count cache")

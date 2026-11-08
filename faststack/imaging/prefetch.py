@@ -2927,11 +2927,30 @@ class Prefetcher:
                     self.future_quality.pop(idx, None)
                     self._demand_indices.discard(idx)
                     self._navigation_cancel_indices.discard(idx)
-            for i, image_file in enumerate(self.image_files):
-                if Path(image_file.path).as_posix() == path_str:
-                    for scheduled in self._scheduled.values():
-                        scheduled.discard(i)
-                    break
+            for i in self._indices_for_path_locked(path_str)[:1]:
+                for scheduled in self._scheduled.values():
+                    scheduled.discard(i)
+
+    def _indices_for_path_locked(self, path_str: str) -> List[int]:
+        """Indices of ``self.image_files`` whose posix path equals ``path_str``.
+
+        Caller holds ``_futures_lock``. The lookup table is rebuilt lazily
+        whenever ``image_files`` is replaced, so per-eviction callers stay O(1)
+        instead of scanning (and building a Path for) every image in the folder.
+        """
+        image_files = self.image_files
+        cached = getattr(self, "_path_index_cache", None)
+        if (
+            cached is None
+            or cached[0] is not image_files
+            or cached[1] != len(image_files)
+        ):
+            table: Dict[str, List[int]] = {}
+            for i, image_file in enumerate(image_files):
+                table.setdefault(Path(image_file.path).as_posix(), []).append(i)
+            cached = (image_files, len(image_files), table)
+            self._path_index_cache = cached
+        return cached[2].get(path_str, [])
 
     def unschedule_path(self, path) -> None:
         """Allow a path to be prefetched again after its cache entry was evicted.
@@ -2952,10 +2971,9 @@ class Prefetcher:
         """
         path_str = Path(path).as_posix()
         with self._futures_lock:
-            for i, image_file in enumerate(self.image_files):
-                if Path(image_file.path).as_posix() == path_str:
-                    for scheduled in self._scheduled.values():
-                        scheduled.discard(i)
+            for i in self._indices_for_path_locked(path_str):
+                for scheduled in self._scheduled.values():
+                    scheduled.discard(i)
 
     def cancel_pending_cover_tasks(self) -> None:
         """Cancel queued cover-quality work without invalidating the generation."""

@@ -185,6 +185,7 @@ from faststack.io.deletion import (
     confirm_permanent_delete,
     confirm_batch_permanent_delete,
     permanently_delete_image_files,
+    restore_without_replace,
     validate_file_identity,
 )
 from faststack.deletion_types import (
@@ -6808,6 +6809,11 @@ class AppController(QObject):
         """Flush the live session before allowing the main window to close."""
         if self._shutting_down:
             return True
+        if getattr(self, "_close_discard_confirmed", False):
+            # The user already chose to quit without the edits that could not
+            # be saved; do not retry (and veto) the same failing save again.
+            self._shutdown_flush_prepared = True
+            return True
 
         self._shutdown_flush_prepared = False
         request = self._prepare_current_session_save_request(
@@ -6825,6 +6831,21 @@ class AppController(QObject):
             self._shutdown_flush_prepared = True
             return True
         return False
+
+    @Slot()
+    def discard_unsaved_edits_for_close(self) -> None:
+        """Let the main window close after the final save failed.
+
+        prepare_for_app_close() vetoes a close whose save fails (read-only
+        folder, full disk, active crop). Without this escape a persistent
+        failure would make the app impossible to quit normally.
+        """
+        log.warning("User chose to quit and discard edits that could not be saved")
+        try:
+            self.discard_edit_parameters()
+        except Exception:
+            log.exception("Failed to reset edits while discarding for close")
+        self._close_discard_confirmed = True
 
     @Slot()
     def save_edited_image(self):
@@ -13146,10 +13167,21 @@ class AppController(QObject):
                         # The JPG was already moved. Restore it only if its
                         # original pathname is still empty; never overwrite a
                         # replacement that appeared during the operation.
-                        if recycled_jpg and not jpg_path.exists():
+                        if recycled_jpg:
                             try:
-                                os.replace(str(recycled_jpg), str(jpg_path))
-                            except OSError:
+                                # No-replace restore: exists()+os.replace could
+                                # overwrite a file that appeared in between.
+                                restore_without_replace(
+                                    Path(recycled_jpg), Path(jpg_path)
+                                )
+                            except FileExistsError:
+                                log.warning(
+                                    "Not restoring %s: a replacement appeared; "
+                                    "the original remains at %s",
+                                    jpg_path,
+                                    recycled_jpg,
+                                )
+                            except (OSError, NotImplementedError):
                                 log.exception(
                                     "Could not restore JPG after RAW identity changed"
                                 )
@@ -13548,15 +13580,6 @@ class AppController(QObject):
                 self._pending_delete_jobs[job.job_id] = job
                 self._register_pending_delete_paths(job.job_id, job.work_items)
 
-                # Define callback to bridge back to main thread
-                def _on_perm_done(future):
-                    try:
-                        res = future.result()
-                        # Emit on main thread via signal
-                        self._deleteFinished.emit(res)
-                    except Exception as e:
-                        log.error("Perm delete worker exception: %s", e)
-
                 work_by_key = {
                     self._key(item.jpg_path): item for item in job.work_items
                 }
@@ -13564,6 +13587,29 @@ class AppController(QObject):
                     (idx, img, work_by_key.get(self._key(img.path)))
                     for idx, img in perm_candidates
                 ]
+                perm_job_id = job.job_id
+
+                # Define callback to bridge back to main thread
+                def _on_perm_done(future):
+                    try:
+                        res = future.result()
+                    except BaseException as e:
+                        log.error("Perm delete worker exception: %s", e)
+                        # Report every candidate as failed so the completion
+                        # handler rolls back and releases the pending job and
+                        # its watcher suppression instead of leaving it stuck.
+                        res = {
+                            "job_id": perm_job_id,
+                            "_perm_result": True,
+                            "perm_success": [],
+                            "perm_fail": [
+                                (idx, img) for idx, img, _work in permanent_items
+                            ],
+                            "perm_changed": [],
+                        }
+                    # Emit on main thread via signal
+                    self._deleteFinished.emit(res)
+
                 fut = self._delete_executor.submit(
                     self._run_critical_user_data_operation,
                     "permanent delete",
@@ -15353,7 +15399,9 @@ class AppController(QObject):
         # Handle backup images: strip -backup, -backup2, -backup-1, etc. to find original RAW
         original_stem = jpg_path.stem
         # Remove -backup with optional digits or -backup-digits (handles both formats)
-        original_stem = re.sub(r"-backup(-?\d+)?$", "", original_stem)
+        original_stem = re.sub(
+            r"-backup(-?\d+)?$", "", original_stem, flags=re.IGNORECASE
+        )
 
         # Look for RAW file with the original stem
         raw_path = None
@@ -15361,11 +15409,16 @@ class AppController(QObject):
             # Use the paired RAW if it exists
             raw_path = image_file.raw_pair
         else:
-            # Search for RAW file manually by original stem
+            # Search for RAW file manually by original stem. Cameras usually
+            # write upper-case extensions (.ORF, .CR2), which a case-sensitive
+            # filesystem will not match against the lower-case table.
             for ext in RAW_EXTENSIONS:
-                potential_raw = jpg_path.parent / f"{original_stem}{ext}"
-                if potential_raw.exists():
-                    raw_path = potential_raw
+                for candidate_ext in dict.fromkeys((ext, ext.upper())):
+                    potential_raw = jpg_path.parent / f"{original_stem}{candidate_ext}"
+                    if potential_raw.exists():
+                        raw_path = potential_raw
+                        break
+                if raw_path is not None:
                     break
 
         if raw_path and raw_path.exists():
@@ -21653,8 +21706,10 @@ def main(
         # (or it no longer exists) and no recovery prompt was declined.
         if not image_dir_str:
             default_dir = config.get("core", "default_directory")
-            if default_dir:
-                default_dir_path = Path(default_dir).expanduser()
+            if default_dir and default_dir.strip():
+                # Same parsing as the other configured directories: strips
+                # quotes, expands %VARS%/~, maps Windows drives under WSL.
+                default_dir_path = resolve_configured_path(default_dir)
                 if default_dir_path.is_dir():
                     image_dir_str = str(default_dir_path.resolve())
                 else:
@@ -21905,10 +21960,17 @@ def main(
         watchdog["timer"] = killer
         killer.start()
 
-        # After 4s, dump stacks to stderr so we can see what's hung just before the kill.
-        faulthandler.dump_traceback_later(4.0, repeat=False)
-
         try:
+            # After 4s, dump stacks to stderr so we can see what's hung just
+            # before the kill. Windowed (console=False) builds have no stderr,
+            # and faulthandler raises in that case; never let diagnostics
+            # prevent the real shutdown work below.
+            if sys.stderr is not None:
+                try:
+                    faulthandler.dump_traceback_later(4.0, repeat=False)
+                except (RuntimeError, ValueError, OSError) as e:
+                    log.debug("faulthandler dump unavailable: %s", e)
+
             # Stop Qt timers on main thread
             try:
                 timer.stop()

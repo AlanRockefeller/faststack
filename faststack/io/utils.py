@@ -52,6 +52,30 @@ def fsync_directory(path: Path) -> None:
                 pass
 
 
+def fsync_file(path: Path) -> None:
+    """Best-effort flush of an already-written file's data to stable storage.
+
+    Used before an atomic ``os.replace`` so a power loss or card pull cannot
+    leave the destination name pointing at a truncated file. Failures are
+    logged and ignored: some network/FUSE filesystems reject fsync.
+    """
+    # Windows' FlushFileBuffers needs a handle opened with write access.
+    flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags)
+        os.fsync(fd)
+    except OSError as e:
+        log.debug("Failed to fsync file %s: %s", path, e)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def atomic_write_json(path: Path, payload: object) -> None:
     """Write JSON atomically and flush the file and directory to disk."""
     temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")

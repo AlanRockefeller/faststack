@@ -176,6 +176,22 @@ class ByteLRUCache(LRUCache):
                         log.debug("Refusing to cache tombstoned key: %s", key)
                         return
 
+            # cachetools raises ValueError for a single value larger than the
+            # whole budget (a huge image with a small configured cache). Not
+            # caching it is the correct outcome; crashing the decode is not.
+            try:
+                value_size = self.getsizeof(value)
+            except Exception:  # pylint: disable=broad-exception-caught
+                value_size = 0
+            if value_size > self.maxsize:
+                log.warning(
+                    "Not caching %s: %.1f MB exceeds the %.1f MB cache budget",
+                    key,
+                    value_size / 1024**2,
+                    self.maxsize / 1024**2,
+                )
+                return
+
             # Check if this is a replacement to handle its callback if __delitem__ isn't called.
             _MISSING = object()  # pylint: disable=invalid-name
             old_value = _MISSING

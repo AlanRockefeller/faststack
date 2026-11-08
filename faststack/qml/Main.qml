@@ -225,6 +225,9 @@ ApplicationWindow {
             // only applied to that attempt; ask again on the next quit.
             root.allowCloseWithRecycleBins = false
             close.accepted = false
+            // Offer a way out so a persistent save failure cannot trap the
+            // user in the app.
+            root.openDialogSafely(unsavedCloseDialog)
             return
         }
 
@@ -2649,6 +2652,32 @@ ApplicationWindow {
             color: "black"
         }
     }
+
+    Dialog {
+        id: unsavedCloseDialog
+        title: "Edits Not Saved"
+        modal: true
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        width: Math.min(420, parent.width * 0.9)
+        standardButtons: Dialog.Yes | Dialog.No
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-unsaved-close")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-unsaved-close")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-unsaved-close")
+
+        Label {
+            width: parent.width
+            text: "Your current edits could not be saved (see the status bar).\n\nQuit anyway and discard them?"
+            wrapMode: Text.WordWrap
+        }
+
+        onAccepted: {
+            if (root.controllerRef) root.controllerRef.discard_unsaved_edits_for_close()
+            Qt.callLater(root.close)
+        }
+    }
+
     Dialog {
         id: recycleBinCleanupDialog
         title: recycleBinCleanupDialog.cleanupTitle

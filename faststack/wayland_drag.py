@@ -15,6 +15,7 @@ _CANCELLED = re.compile(rb"wl_data_source#(\d+)\.cancelled\(\)")
 # Data-transfer traffic worth keeping for --debug drag diagnostics.
 _DND_TRACE = re.compile(rb"wl_data_(source|device|offer)|zwp_primary_selection")
 _DND_TRACE_LIMIT = 400
+_MAX_PENDING_LINE = 1 << 20
 
 
 class WaylandDragOutcomeMonitor:
@@ -93,18 +94,35 @@ class WaylandDragOutcomeMonitor:
                 self._outcome_ready.set()
 
     def _read_stderr(self) -> None:
+        # This thread is the only reader of the process's stderr pipe: if it
+        # ever died, the pipe would fill and every later stderr write in the
+        # process would block. So nothing in the loop may escape it.
         pending = b""
-        while chunk := os.read(self._read_fd, 65536):
+        while True:
+            try:
+                chunk = os.read(self._read_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
             pending += chunk
             *lines, pending = pending.split(b"\n")
             for line in lines:
                 complete_line = line + b"\n"
-                if _WAYLAND_LINE.match(line):
-                    self._record(line)
-                    if self._forward_protocol:
+                try:
+                    if _WAYLAND_LINE.match(line):
+                        self._record(line)
+                        if self._forward_protocol:
+                            self._forward(complete_line)
+                    else:
                         self._forward(complete_line)
-                else:
+                except Exception:  # noqa: BLE001 - keep draining the pipe
                     self._forward(complete_line)
+            if len(pending) > _MAX_PENDING_LINE:
+                # Pathological newline-free output: pass it through rather
+                # than buffering it without bound.
+                self._forward(pending)
+                pending = b""
         if pending:
             self._forward(pending)
 

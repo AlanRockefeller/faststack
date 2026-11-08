@@ -379,7 +379,9 @@ class ThumbnailModel(QAbstractListModel):
         # Scan for folders
         folders: List[ThumbnailEntry] = []
         try:
-            for entry in os.scandir(self._current_directory):
+            with os.scandir(self._current_directory) as dir_entries:
+                scanned = list(dir_entries)
+            for entry in scanned:
                 if entry.is_dir() and not entry.name.startswith("."):
                     folder_path = Path(entry.path)
                     try:
@@ -634,61 +636,61 @@ class ThumbnailModel(QAbstractListModel):
             else None
         )
 
+        # Scan folders, filter and stat images BEFORE resetting the model so
+        # attached views never sit on an empty model while disk I/O runs.
+        t0 = time.perf_counter()
+        prospective_entries = self._scan_folder_entries()
+        t1 = time.perf_counter()
+
+        # Apply active filename filter if set
+        if self._active_filter:
+            needle = self._active_filter.lower()
+            images = [img for img in images if needle in img.path.stem.lower()]
+
+        # Build metadata map lazily, after filename filter, so we
+        # don't do sidecar lookups for images that got filtered out.
+        if metadata_map is None and metadata_map_fn is not None:
+            metadata_map = metadata_map_fn(images)
+
+        # Apply active flag filters (AND logic)
+        if self._active_filter_flags:
+            flags = self._active_filter_flags
+            filtered = []
+            # When metadata_map is provided (even empty) treat it as
+            # authoritative — don't fall through to per-image sidecar
+            # lookups, and key lookups by str(img.path) so we don't
+            # re-resolve a stable key the bulk-map builder already paid for.
+            map_authoritative = metadata_map is not None
+            for img in images:
+                try:
+                    if map_authoritative:
+                        meta = metadata_map.get(str(img.path), {})
+                    elif self._get_metadata:
+                        meta = self._get_metadata(img.path)
+                    else:
+                        continue
+
+                    if not isinstance(meta, dict):
+                        log.debug("Metadata for %s is not a dict: %r", img.path, meta)
+                        continue
+
+                    if all(meta.get(flag, False) for flag in flags):
+                        filtered.append(img)
+                except Exception as e:
+                    log.debug("Error filtering image %s: %s", img.path, e)
+                    # Skip images with metadata errors
+            images = filtered
+
+        prospective_entries.extend(self._build_image_entries(images, metadata_map))
+        t2 = time.perf_counter()
+
         self.beginResetModel()
         try:
-            self._entries.clear()
+            self._entries = prospective_entries
             self._id_to_row.clear()
             self._path_to_row.clear()
             self._selected_indices.clear()
             self._last_selected_index = None
-
-            t0 = time.perf_counter()
-            self._add_folders_to_entries()
-            t1 = time.perf_counter()
-
-            # Apply active filename filter if set
-            if self._active_filter:
-                needle = self._active_filter.lower()
-                images = [img for img in images if needle in img.path.stem.lower()]
-
-            # Build metadata map lazily, after filename filter, so we
-            # don't do sidecar lookups for images that got filtered out.
-            if metadata_map is None and metadata_map_fn is not None:
-                metadata_map = metadata_map_fn(images)
-
-            # Apply active flag filters (AND logic)
-            if self._active_filter_flags:
-                flags = self._active_filter_flags
-                filtered = []
-                # When metadata_map is provided (even empty) treat it as
-                # authoritative — don't fall through to per-image sidecar
-                # lookups, and key lookups by str(img.path) so we don't
-                # re-resolve a stable key the bulk-map builder already paid for.
-                map_authoritative = metadata_map is not None
-                for img in images:
-                    try:
-                        if map_authoritative:
-                            meta = metadata_map.get(str(img.path), {})
-                        elif self._get_metadata:
-                            meta = self._get_metadata(img.path)
-                        else:
-                            continue
-
-                        if not isinstance(meta, dict):
-                            log.debug(
-                                "Metadata for %s is not a dict: %r", img.path, meta
-                            )
-                            continue
-
-                        if all(meta.get(flag, False) for flag in flags):
-                            filtered.append(img)
-                    except Exception as e:
-                        log.debug("Error filtering image %s: %s", img.path, e)
-                        # Skip images with metadata errors
-                images = filtered
-
-            self._add_images_to_entries(images, metadata_map)
-            t2 = time.perf_counter()
             self._rebuild_id_mapping()
             self._selected_indices = {
                 self._path_to_row[path]

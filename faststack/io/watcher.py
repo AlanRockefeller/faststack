@@ -23,6 +23,8 @@ from faststack.io.indexer import JPG_EXTENSIONS, RAW_EXTENSIONS
 
 log = logging.getLogger(__name__)
 
+_STOP_JOIN_TIMEOUT_SECONDS = 5.0
+
 # Matches FastStack backup filenames: name-backup.jpg, name-backup2.jpg, etc.
 _BACKUP_RE = re.compile(r"-backup\d*\.jpe?g$")
 _TEMP_IMAGE_RE = re.compile(
@@ -56,9 +58,14 @@ def _is_ignored_path(path: str) -> bool:
         or p.endswith("faststack.json")
         or p.endswith("faststack.json.lock")
         or ".__faststack_tmp__" in p
+        or "__faststack_rollback__" in p
+        or "__faststack_restore__" in p
         or _TEMP_IMAGE_RE.search(p) is not None
         or _BACKUP_RE.search(p) is not None
-        or "image recycle bin" in p.split("/")
+        or any(
+            part == "image recycle bin" or part.startswith(".faststack-delete-")
+            for part in p.split("/")
+        )
     )
 
 
@@ -194,8 +201,18 @@ class Watcher:
         """Stops watching the directory."""
         if self.observer and self.observer.is_alive():
             self.observer.stop()
-            self.observer.join()
-            log.info("Stopped watching directory.")
+            # Bounded: stop() runs on the UI thread (e.g. around sidecar
+            # writes), and an observer stuck on a hung network share must not
+            # freeze the app. watchdog's threads are daemons, so an observer
+            # that misses the deadline is simply abandoned.
+            self.observer.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+            if self.observer.is_alive():
+                log.warning(
+                    "Directory watcher did not stop within %.0fs; abandoning it",
+                    _STOP_JOIN_TIMEOUT_SECONDS,
+                )
+            else:
+                log.info("Stopped watching directory.")
             self.observer = None  # Clear instance after stopping
 
     def is_alive(self) -> bool:

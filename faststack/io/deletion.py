@@ -155,6 +155,22 @@ def _exclusive_copy_restore(source: Path, target: Path) -> None:
         raise
 
 
+def restore_without_replace(source: Path, target: Path) -> None:
+    """Move *source* back to *target* without ever overwriting *target*.
+
+    Tries an atomic hard link first and falls back to an exclusive-create copy
+    on filesystems without hard links. Raises FileExistsError (leaving
+    *source* in place) when a file appeared at *target* in the meantime.
+    """
+    try:
+        _atomic_no_replace_link(source, target)
+    except FileExistsError:
+        raise
+    except (OSError, NotImplementedError):
+        _exclusive_copy_restore(source, target)
+    source.unlink()
+
+
 def _verify_rollback_capability(
     transaction_dir: Path, destinations: list[Path]
 ) -> dict[Path, str]:

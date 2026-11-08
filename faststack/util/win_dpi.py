@@ -106,6 +106,10 @@ class DpiWatchdog(QObject):
         stuck = _stuck_screens(app.screens(), dpi_by_device)
         if not stuck:
             self._failed_attempts = 0
+            if self._reported and not self._timer.isActive():
+                # A later screen change fixed it; resume normal polling.
+                self._reported = False
+                self._timer.start()
             return
 
         for screen, dpi in stuck:
@@ -129,6 +133,10 @@ class DpiWatchdog(QObject):
         self._failed_attempts += 1
         if self._failed_attempts >= _MAX_QUIET_ATTEMPTS and not self._reported:
             self._reported = True
+            # Repairs are not working and the user has been told to restart:
+            # stop posting WM_DISPLAYCHANGE (and logging) every interval.
+            # Screen-change signals still trigger a check.
+            self._timer.stop()
             self.repairFailed.emit()
 
 

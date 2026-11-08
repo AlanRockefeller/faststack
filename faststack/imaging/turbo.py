@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
+import warnings
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple
@@ -17,6 +20,91 @@ try:
 except ImportError:  # pragma: no cover - exercised via create_turbojpeg
     TurboJPEG = None
     TJPF_RGB = None
+
+# --- Per-thread decoder warning capture -------------------------------------
+#
+# PyTurboJPEG reports recoverable libjpeg problems (notably "Premature end of
+# JPEG file" for a truncated snapshot) through ``warnings.warn``.
+# ``warnings.catch_warnings`` swaps process-global state and is not safe while
+# several decode threads run at once: a thread can lose its recorder mid-decode
+# or receive another thread's warning. Instead, one permanent showwarning
+# router delivers each warning to the sink of the thread that emitted it.
+
+_capture_state = threading.local()
+_router_lock = threading.Lock()
+_ROUTER_MARK = "_faststack_thread_warning_router"
+# Without an "always" filter the default action shows a given message once per
+# call site, so a second truncated file would go unreported. Scoped to the one
+# message FastStack acts on so other warning policies are left untouched.
+TRUNCATION_WARNING_TEXT = "Premature end of JPEG file"
+
+
+def _has_truncation_filter() -> bool:
+    for action, message, _category, _module, _lineno in warnings.filters:
+        if (
+            action == "always"
+            and message is not None
+            and message.pattern == TRUNCATION_WARNING_TEXT
+        ):
+            return True
+    return False
+
+
+def _install_warning_router() -> None:
+    """Install (or re-install) the per-thread router and its filter.
+
+    Cheap when already installed. Re-checked on every capture because
+    ``catch_warnings`` blocks elsewhere (including test harnesses) restore the
+    previous global state on exit and drop the router with it.
+    """
+    if getattr(warnings.showwarning, _ROUTER_MARK, False) and _has_truncation_filter():
+        return
+    with _router_lock:
+        previous = warnings.showwarning
+        if not getattr(previous, _ROUTER_MARK, False):
+
+            def _router(message, category, filename, lineno, file=None, line=None):
+                sink = getattr(_capture_state, "sink", None)
+                if sink is not None:
+                    sink.append(str(message))
+                    return
+                previous(message, category, filename, lineno, file, line)
+
+            setattr(_router, _ROUTER_MARK, True)
+            warnings.showwarning = _router
+        if not _has_truncation_filter():
+            warnings.filterwarnings("always", message=TRUNCATION_WARNING_TEXT)
+
+
+@contextmanager
+def capture_thread_warnings():
+    """Collect the messages of warnings emitted on the current thread only."""
+    _install_warning_router()
+    previous_sink = getattr(_capture_state, "sink", None)
+    sink: list[str] = []
+    _capture_state.sink = sink
+    try:
+        yield sink
+    finally:
+        _capture_state.sink = previous_sink
+        if previous_sink is not None:
+            previous_sink.extend(sink)
+
+
+def forward_thread_warnings(messages: list[str]) -> None:
+    """Hand warnings captured on a helper thread to the current thread's sink.
+
+    Used by split decodes, whose chunk workers run on pool threads while the
+    caller waits inside its own :func:`capture_thread_warnings` block.
+    """
+    if not messages:
+        return
+    sink = getattr(_capture_state, "sink", None)
+    if sink is not None:
+        sink.extend(messages)
+        return
+    for message in messages:
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
 
 
 def _candidate_library_paths() -> list[Optional[str]]:

@@ -88,7 +88,12 @@ def _sidecar_from_json(data: dict) -> Sidecar:
         ambiguous_legacy_keys = []
     return Sidecar(
         version=data.get("version", 2),
-        last_index=data.get("last_index", 0),
+        last_index=(
+            data.get("last_index")
+            if isinstance(data.get("last_index"), int)
+            and not isinstance(data.get("last_index"), bool)
+            else 0
+        ),
         last_path=(
             data.get("last_path") if isinstance(data.get("last_path"), str) else None
         ),

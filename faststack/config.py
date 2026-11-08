@@ -660,8 +660,8 @@ DEFAULT_CONFIG = {
         "args": "",
     },
     "raw": {
-        "source_dir": "C:\\Users\\alanr\\pictures\\olympus.stack.input.photos",
-        "secondary_source_dir": "H:\\olympus.stack.input.photos",
+        "source_dir": "",
+        "secondary_source_dir": "",
         "additional_source_dirs": "",
         "mirror_base": "",
     },
@@ -685,6 +685,7 @@ class AppConfig:
         self.config = configparser.ConfigParser(interpolation=None)
         self._changed_options: set[tuple[str, str]] = set()
         self._removed_options: set[tuple[str, str]] = set()
+        self._invalid_value_warned: set[tuple[str, str]] = set()
         self._load_failed = False
         self.load()
 
@@ -897,7 +898,7 @@ class AppConfig:
 
     def getint(self, section, key, fallback=None):
         """Return a config value as an integer."""
-        return self.config.getint(section, key, fallback=fallback)
+        return self._get_typed("int", int, section, key, fallback)
 
     @overload
     def getfloat(self, section, key, fallback: None = None) -> float | None: ...
@@ -906,7 +907,7 @@ class AppConfig:
 
     def getfloat(self, section, key, fallback=None):
         """Return a config value as a float."""
-        return self.config.getfloat(section, key, fallback=fallback)
+        return self._get_typed("float", float, section, key, fallback)
 
     @overload
     def getboolean(self, section, key, fallback: None = None) -> bool | None: ...
@@ -915,7 +916,50 @@ class AppConfig:
 
     def getboolean(self, section, key, fallback=None):
         """Return a config value as a boolean."""
-        return self.config.getboolean(section, key, fallback=fallback)
+        return self._get_typed("boolean", self._parse_boolean, section, key, fallback)
+
+    @staticmethod
+    def _parse_boolean(value: str) -> bool:
+        lowered = str(value).strip().lower()
+        if lowered not in configparser.ConfigParser.BOOLEAN_STATES:
+            raise ValueError(f"Not a boolean: {value}")
+        return configparser.ConfigParser.BOOLEAN_STATES[lowered]
+
+    def _get_typed(self, kind, convert, section, key, fallback):
+        """Read a typed value, tolerating a malformed hand-edited entry.
+
+        configparser only applies ``fallback`` when the option is missing; an
+        unparseable value raises ValueError. A typo in faststack.ini must not
+        stop the app from starting, so fall back to the caller's default (or
+        the built-in default) and warn once per option instead.
+        """
+        getter = getattr(self.config, f"get{kind}")
+        try:
+            return getter(section, key, fallback=fallback)
+        except ValueError:
+            pass
+        value = fallback
+        if value is None:
+            default_raw = DEFAULT_CONFIG.get(section, {}).get(key)
+            if default_raw is not None:
+                try:
+                    value = convert(default_raw)
+                except ValueError:
+                    value = None
+        warned = self.__dict__.setdefault("_invalid_value_warned", set())
+        warn_key = (section, key)
+        if warn_key not in warned:
+            warned.add(warn_key)
+            log.warning(
+                "Invalid %s value %r for [%s] %s in %s; using %r",
+                kind,
+                self.config.get(section, key, fallback=None),
+                section,
+                key,
+                self.config_path,
+                value,
+            )
+        return value
 
     def set(self, section, key, value):
         """Set a config value, creating the section if needed."""

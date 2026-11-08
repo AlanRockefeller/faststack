@@ -20,6 +20,7 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from faststack.io.child_process import reap_in_background
 from faststack.io.utils import atomic_write_json
 from faststack.logging_setup import get_app_data_dir
 
@@ -437,10 +438,14 @@ def respawn_for_directory(
         args.extend(["--restore-path", image_path])
     if index is not None:
         args.extend(["--restore-index", str(index)])
-    args.append(directory)
+    # "--" ends option parsing so a directory name starting with "-" is never
+    # read as a flag.
+    args.extend(["--", directory])
     try:
-        subprocess.Popen(args, shell=False)
+        process = subprocess.Popen(args, shell=False)
     except OSError as e:
         log.warning("Failed to respawn FastStack for %s: %s", directory, e)
         return False
+    # Wait on a daemon thread so the child never lingers as a zombie.
+    reap_in_background(process, "FastStack")
     return True
