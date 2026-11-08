@@ -11,7 +11,15 @@ from faststack import wayland_drag
 
 log = logging.getLogger(__name__)
 
-_DISCARD_OUTPUT = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+
+def _stream_fd(stream) -> int | None:
+    """Return the descriptor behind a standard stream, or None when unusable."""
+    if stream is None or getattr(stream, "closed", False):
+        return None
+    try:
+        return stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
 
 
 def _console_stderr_fd() -> int | None:
@@ -24,36 +32,44 @@ def _console_stderr_fd() -> int | None:
     saved = wayland_drag.original_stderr_fd()
     if saved is not None:
         return saved
-    stream = sys.stderr
-    if stream is None or getattr(stream, "closed", False):
-        return None
+    return _stream_fd(sys.stderr)
+
+
+def _is_console_like(fd: int | None) -> bool:
+    """True for a terminal or regular file a child may keep open indefinitely.
+
+    Pipes and sockets are excluded: a long-lived editor inheriting a launcher
+    wrapper's capture pipe would keep that wrapper waiting for EOF after
+    FastStack itself has exited.
+    """
+    if fd is None:
+        return False
     try:
-        return stream.fileno()
-    except (AttributeError, OSError, ValueError):
-        return None
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        return False
+    return not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode))
 
 
 def inherited_output_kwargs() -> dict:
     """Popen kwargs that send a child's stdout/stderr to FastStack's console.
 
     A console or regular-file redirection captures tool output alongside
-    FastStack's own log. Pipe-backed output is discarded so a long-lived
-    editor cannot keep a launcher wrapper's capture pipe open after FastStack
-    exits. Windowed builds have no usable stderr and are discarded too.
+    FastStack's own log. Each stream is checked on its own: pipe-backed or
+    unavailable output is discarded (windowed builds have no usable console).
+    When the Wayland drag monitor has taken over fd 2, the child gets the
+    saved real stderr instead of the monitor's pipe.
     """
-    fd = _console_stderr_fd()
-    if fd is None:
-        return dict(_DISCARD_OUTPUT)
-    try:
-        mode = os.fstat(fd).st_mode
-    except OSError:
-        return dict(_DISCARD_OUTPUT)
-    if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
-        return dict(_DISCARD_OUTPUT)
-    if wayland_drag.original_stderr_fd() is not None:
-        # fd 2 is the drag monitor's pipe; hand the child the real stderr.
-        return {"stdout": None, "stderr": fd}
-    return {"stdout": None, "stderr": None}
+    stdout = None if _is_console_like(_stream_fd(sys.stdout)) else subprocess.DEVNULL
+
+    stderr_fd = _console_stderr_fd()
+    if not _is_console_like(stderr_fd):
+        stderr = subprocess.DEVNULL
+    elif wayland_drag.original_stderr_fd() is not None:
+        stderr = stderr_fd
+    else:
+        stderr = None
+    return {"stdout": stdout, "stderr": stderr}
 
 
 def child_environment() -> dict[str, str]:

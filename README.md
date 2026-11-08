@@ -225,7 +225,7 @@ are with uploads, edits, stacks, todos and batches in that folder.
 - `B`: Add the selected images to the batch
 - `Delete` / `Backspace`: Move the selected images (or the cursor image) to the recycle bin
 - `Esc`: Clear the selection, or return to single-image view
-- Right-click an empty (or almost empty) folder to delete it; FastStack lists what is inside and asks first
+- Right-click a folder with no images to delete it. A completely empty folder is removed as soon as you choose **Delete empty folder**; a folder that still holds a few small leftover files (a `faststack.json`, for example) shows what is inside and asks before deleting. Folders that contain images show no menu
 
 ## Image Editor
 
@@ -299,9 +299,11 @@ editor with unsaved edits prompts you to discard or keep them.
 
 ### Undo and caveats
 
-- `Ctrl+Z` first discards any unsaved live edits on the current image; press it
-  again to undo the last saved edit, which restores the image from its
-  `-backup` copy.
+- `Ctrl+Z` first discards any unsaved live edits on the current image. Press it
+  again to undo the most recent saved action: a saved edit (the image is
+  restored from its `-backup` copy), a deletion (restored from the recycle
+  bin), or a cleared stack or batch. The status bar says so when there is
+  nothing left to undo.
 - Because the editor operates on the visual JPG, edits stack on top of the
   current file; for the most flexibility do your heavy adjustments before
   exporting elsewhere.
