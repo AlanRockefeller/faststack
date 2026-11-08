@@ -3534,6 +3534,13 @@ class AppController(QObject):
             # Distinct stacks may be adjacent, so do not merge them.
             self.stacks = self._rebuild_ranges_from_paths(pre_scan_stack_paths)
             stack_ranges_changed = self.stacks != previous_stacks
+            if stack_ranges_changed and not self._filter_enabled:
+                # Persist the remapped numeric ranges, or the next load would
+                # restore the stale indices. Deliberately no stack_paths here:
+                # identity restoration rejects adjacent distinct groups.
+                with self.sidecar._state_lock:
+                    self.sidecar.data.stacks = [s[:] for s in self.stacks]
+                self._persist_sidecar()
         if not self._filter_enabled:
             self.stack_start_index = (
                 self._path_to_index.get(self._key(pre_scan_stack_start))

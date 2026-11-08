@@ -51,7 +51,7 @@ FastStack checks GitHub Releases for newer versions when update checks are enabl
 ### Install from source
 
 Power users and Linux users can install from source. FastStack supports Python
-3.11 through 3.14; release builds are tested and packaged with Python 3.14.8.
+3.11 through 3.14; release builds are tested and packaged with Python 3.14.10.
 
 #### macOS
 
