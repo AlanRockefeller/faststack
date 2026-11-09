@@ -1,6 +1,8 @@
 # faststack/tests/conftest.py
+import atexit
 import faulthandler
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -16,6 +18,12 @@ _TEST_APP_DATA = tempfile.mkdtemp(prefix="faststack-test-appdata-")
 os.makedirs(os.path.join(_TEST_APP_DATA, "faststack"), exist_ok=True)
 os.environ["APPDATA"] = _TEST_APP_DATA
 os.environ.pop("LOCALAPPDATA", None)
+# Remove the directory when the interpreter exits; otherwise every run leaves
+# one behind in the system temp folder. atexit callbacks run after the
+# non-daemon save/delete executor threads have been joined, so a late
+# session-record or sidecar write cannot recreate the tree. Best effort: a
+# daemon thread racing the removal only costs a leftover directory.
+atexit.register(shutil.rmtree, _TEST_APP_DATA, ignore_errors=True)
 
 
 def _dump_usr2(signum, frame):
