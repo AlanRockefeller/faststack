@@ -20,7 +20,13 @@ SIDECAR_FILENAME = "faststack.json"
 
 @dataclass
 class FolderStats:
-    """Statistics parsed from a folder's faststack.json file."""
+    """Statistics parsed from a folder's faststack.json file.
+
+    The four counts and ``batch_count`` cover entries whose image is still in
+    the folder. An entry outlives its file when the file is deleted, moved or
+    renamed outside FastStack; counting those made a folder tile claim
+    uploads and edits for photos that were no longer there.
+    """
 
     total_images: int
     stacked_count: int
@@ -60,7 +66,9 @@ _cache_lock = threading.Lock()
 # child costs the two stat() calls that validate its entry. Entries are keyed
 # by folder path and checked against the same two mtimes as _stats_cache.
 _PERSISTED_FILENAME = "folder_stats_cache.json"
-_PERSISTED_VERSION = 1
+# Bump when the meaning of a stored value changes, so results computed the
+# old way are recomputed. 2: counts exclude entries whose file is gone.
+_PERSISTED_VERSION = 2
 _PERSIST_DELAY_SECONDS = 2.0
 # abspath -> {"json": mtime_ns, "dir": mtime_ns, "stats": dict or None}.
 # None until first use; guarded by _cache_lock.
@@ -283,17 +291,34 @@ def _scan_folder_files(folder_path: Path) -> Tuple[int, int, list]:
         Tuple of (jpg_count, raw_count, jpg_filenames_sorted)
         jpg_filenames_sorted is a list of JPG filenames sorted alphabetically.
     """
+    jpg_count, raw_count, jpg_files, _names, _stems = _scan_folder_names(folder_path)
+    return jpg_count, raw_count, jpg_files
+
+
+def _scan_folder_names(
+    folder_path: Path,
+) -> Tuple[int, int, list, set, set]:
+    """``_scan_folder_files`` plus every file's lowercased name and stem.
+
+    The two sets are what a sidecar entry key is checked against: FastStack
+    keys a JPG by its file name and anything else (a RAW on its own, an entry
+    from an old release) by its stem.
+    """
     jpg_count = 0
     raw_count = 0
     jpg_files = []
+    names: set = set()
+    stems: set = set()
     try:
         with os.scandir(folder_path) as entries:
             scanned = list(entries)
         for entry in scanned:
             if entry.is_file():
                 # FASTER: os.path.splitext is string-based, avoids Path object creation
-                _, suffix = os.path.splitext(entry.name)
+                stem, suffix = os.path.splitext(entry.name)
                 suffix = suffix.lower()
+                names.add(entry.name.lower())
+                stems.add(stem.lower())
                 if suffix in JPG_EXTENSIONS:
                     jpg_count += 1
                     jpg_files.append(entry.name)
@@ -307,7 +332,19 @@ def _scan_folder_files(folder_path: Path) -> Tuple[int, int, list]:
     # two orders agree, and the sparkline only needs a coarse 40-bucket
     # progression, so this avoids a stat() per file in every subfolder.
     jpg_files.sort(key=str.lower)
-    return jpg_count, raw_count, jpg_files
+    return jpg_count, raw_count, jpg_files, names, stems
+
+
+def _entry_file_present(key, names: set, stems: set) -> bool:
+    """Whether the image a sidecar entry belongs to is in the folder."""
+    if not isinstance(key, str):
+        return False
+    if "/" in key:
+        # A file outside this folder's own listing (a subfolder or an
+        # absolute path): not looked up here, so it keeps being counted.
+        return True
+    lowered = key.lower()
+    return lowered in names or lowered in stems
 
 
 def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
@@ -336,14 +373,21 @@ def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
         log.debug("Invalid entries format in %s", json_path)
         return None
 
-    # Count statistics from entries
-    total_images = len(entries)
+    # Single-pass scan: count file types AND collect JPG filenames for sparkline
+    folder_path = json_path.parent
+    jpg_count, raw_count, jpg_files, names, stems = _scan_folder_names(folder_path)
+
+    # Count statistics from the entries whose image is still in the folder
+    total_images = 0
     stacked_count = 0
     uploaded_count = 0
     edited_count = 0
     batch_count = 0
 
-    for stem, meta in entries.items():
+    for key, meta in entries.items():
+        if not _entry_file_present(key, names, stems):
+            continue
+        total_images += 1
         if not isinstance(meta, dict):
             continue
 
@@ -355,10 +399,6 @@ def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
             edited_count += 1
         if meta.get("batch", False):
             batch_count += 1
-
-    # Single-pass scan: count file types AND collect JPG filenames for sparkline
-    folder_path = json_path.parent
-    jpg_count, raw_count, jpg_files = _scan_folder_files(folder_path)
 
     # Compute coverage buckets for sparkline (using pre-collected JPG list)
     coverage_buckets, batch_coverage_buckets = _compute_folder_coverage(
