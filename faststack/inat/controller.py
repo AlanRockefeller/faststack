@@ -32,6 +32,7 @@ from faststack.inat.grouping import (
     Location,
     ObservationGroup,
     PhotoRecord,
+    haversine_m,
     initial_grouping,
     merge_groups,
     move_photo,
@@ -54,6 +55,7 @@ from faststack.inat.mycomap_vision import (
 from faststack.inat.mycomap_vision import describe_error as describe_vision_error
 from faststack.inat.photo_facts import read_photo_facts
 from faststack.inat.tiles import TileCache, TileFetcher
+from faststack.inat.tuning import HISTORY_FILE, GroupingHistory, pairs_from_groups
 from faststack.logging_setup import get_app_data_dir
 from faststack.util.executors import create_daemon_threadpool_executor
 
@@ -215,6 +217,7 @@ class INatUploadController(QObject):
     usageTextChanged = Signal()
     settingsChanged = Signal()
     uploadProgressChanged = Signal()
+    thresholdsChanged = Signal()
     uploadFinished = Signal(list, bool)  # paths that went up, all cards done
     showMessage = Signal(str)
 
@@ -243,6 +246,14 @@ class INatUploadController(QObject):
         )
         self._http = HttpClient(self._user_agent)
         self._executor = create_daemon_threadpool_executor(2, "inat-upload")
+        self._history = GroupingHistory(get_app_data_dir() / HISTORY_FILE)
+        self._vision_cache: dict[frozenset, VisionResult] = {}
+        self._time_gap_s = float(self.timeGapMinutes * 60)
+        self._distance_m = float(self.distanceMeters)
+        self._thresholds_source = "default"
+        self._thresholds_note = ""
+        self._folder = ""
+        self._manual_edits = False
         self._tile_cache: Optional[TileCache] = None
         self._tile_fetcher: Optional[TileFetcher] = None
         self._tile_lock = threading.Lock()
@@ -552,27 +563,127 @@ class INatUploadController(QObject):
             return False
         self._photos = records
         self._uploaded_paths = []
+        self._vision_cache = {}
+        self._manual_edits = False
         self._cancel_upload.clear()
+        self._folder = str(records[0].path.parent)
+        suggestion = self._history.suggest(
+            self._folder,
+            float(self.timeGapMinutes * 60),
+            float(self.distanceMeters),
+        )
+        self._time_gap_s = suggestion.time_gap_s
+        self._distance_m = suggestion.distance_m
+        self._thresholds_source = suggestion.source
+        if suggestion.source == "folder":
+            self._thresholds_note = (
+                "sliders restored from your last upload of this folder"
+            )
+        elif suggestion.source == "learned":
+            self._thresholds_note = (
+                f"sliders learned from {suggestion.batches} past uploads"
+            )
+        else:
+            self._thresholds_note = "sliders at the settings defaults"
+        self.thresholdsChanged.emit()
+        self._regroup(announce=True)
+        self.refreshUsage()
+        return True
+
+    def _regroup(self, announce: bool = False) -> None:
         groups = initial_grouping(
-            records,
-            time_gap_s=self.timeGapMinutes * 60,
-            distance_m=float(self.distanceMeters),
+            self._photos,
+            time_gap_s=self._time_gap_s,
+            distance_m=self._distance_m,
         )
         cards = [self._new_card(g) for g in groups]
         self._model.reset(cards)
-        self._set_status(
-            f"{len(records)} photo(s) grouped into {len(cards)} observation(s)."
-        )
+        if announce:
+            self._set_status(
+                f"{len(self._photos)} photo(s) grouped into {len(cards)} observation(s)."
+            )
         self.cardsChanged.emit()
-        self.refreshUsage()
-        return True
+
+    @Property(float, notify=thresholdsChanged)
+    def timeGapSeconds(self) -> float:  # noqa: N802
+        return self._time_gap_s
+
+    @Property(float, notify=thresholdsChanged)
+    def distanceMetersLive(self) -> float:  # noqa: N802
+        return self._distance_m
+
+    @Property(str, notify=thresholdsChanged)
+    def thresholdsNote(self) -> str:  # noqa: N802
+        return self._thresholds_note
+
+    @Property(bool, notify=cardsChanged)
+    def canRegroup(self) -> bool:  # noqa: N802
+        return bool(self._photos) and not any(
+            c.status in (STATUS_UPLOADING, STATUS_UPLOADED) for c in self._model.cards
+        )
+
+    @Property(bool, notify=cardsChanged)
+    def hasManualEdits(self) -> bool:  # noqa: N802
+        return self._manual_edits
+
+    @Slot(float, float)
+    def setThresholds(self, time_gap_s: float, distance_m: float) -> None:  # noqa: N802
+        """The sliders moved: regroup from scratch with the new thresholds.
+
+        Manual edits (split / merge / drag) are discarded; Vision answers are
+        kept for any card whose photo set is unchanged.
+        """
+        if not self.canRegroup:
+            return
+        time_gap_s = max(1.0, float(time_gap_s))
+        distance_m = max(1.0, float(distance_m))
+        if time_gap_s == self._time_gap_s and distance_m == self._distance_m:
+            return
+        self._time_gap_s = time_gap_s
+        self._distance_m = distance_m
+        self._thresholds_source = "manual"
+        self._thresholds_note = "sliders set by hand"
+        self._manual_edits = False
+        self.thresholdsChanged.emit()
+        self._regroup()
+        self._set_status(
+            f"Regrouped into {len(self._model.cards)} observation(s) "
+            f"({_fmt_seconds(time_gap_s)} / {_fmt_meters(distance_m)})."
+        )
 
     def _new_card(self, group: ObservationGroup) -> Card:
         card = Card(
             id=self._next_card_id, group=group, geoprivacy=self.defaultGeoprivacy
         )
         self._next_card_id += 1
+        self._apply_cached_vision(card)
         return card
+
+    @staticmethod
+    def _photo_set(card: Card) -> frozenset:
+        return frozenset(p.key for p in card.group.photos)
+
+    def _apply_cached_vision(self, card: Card) -> None:
+        """Reuse an earlier Vision answer when the card's photo set is the same."""
+        result = self._vision_cache.get(self._photo_set(card))
+        if result is None:
+            return
+        card.vision = result
+        card.status = STATUS_IDENTIFIED
+        card.status_text = self._vision_status_text(result)
+        if result.suggested_name:
+            card.chosen_name = result.suggested_name
+            card.chosen_rank = result.suggested_rank
+            self._lookup_taxon(card)
+
+    @staticmethod
+    def _vision_status_text(result: VisionResult) -> str:
+        if result.answer_name:
+            pct = int((result.answer_confidence or 0) * 100)
+            return f"Vision: {result.answer_name} ({pct}% at {result.answer_rank})"
+        if result.suggested_name:
+            return f"Vision's best guess: {result.suggested_name} (not confident)"
+        return "Vision had no suggestion."
 
     # ------------------------------------------------------------------
     # Card values for the model
@@ -677,6 +788,7 @@ class INatUploadController(QObject):
         if card.status in (STATUS_IDENTIFIED, STATUS_IDENTIFYING, STATUS_ERROR):
             card.status = STATUS_PENDING
             card.status_text = ""
+        self._apply_cached_vision(card)
 
     # ------------------------------------------------------------------
     # Grouping edits
@@ -697,6 +809,7 @@ class INatUploadController(QObject):
             c.manual_location = card.manual_location
             new_cards.append(c)
         self._model.replace(card, new_cards)
+        self._manual_edits = True
         self._set_status(f"Split into {len(new_cards)} observations.")
         self.cardsChanged.emit()
 
@@ -725,6 +838,7 @@ class INatUploadController(QObject):
         self._model.replace(first, [merged])
         for c in chosen[1:]:
             self._model.remove(c)
+        self._manual_edits = True
         self._set_status(f"Merged {len(chosen)} cards.")
         self.cardsChanged.emit()
 
@@ -761,6 +875,7 @@ class INatUploadController(QObject):
         if target is not None:
             self._touch(target)
         self._model.reset(new_cards)
+        self._manual_edits = True
         self.cardsChanged.emit()
 
     @Slot(int, float, float)
@@ -929,15 +1044,9 @@ class INatUploadController(QObject):
             self._model.refresh(card, "status", "statusText")
             return
         card.vision = result
+        self._vision_cache[self._photo_set(card)] = result
         card.status = STATUS_IDENTIFIED
-        if result.answer_name:
-            card.status_text = f"Vision: {result.answer_name} ({int((result.answer_confidence or 0) * 100)}% at {result.answer_rank})"
-        elif result.suggested_name:
-            card.status_text = (
-                f"Vision's best guess: {result.suggested_name} (not confident)"
-            )
-        else:
-            card.status_text = "Vision had no suggestion."
+        card.status_text = self._vision_status_text(result)
         if result.usage:
             used = result.usage.get("used")
             limit = result.usage.get("limit")
@@ -1019,6 +1128,7 @@ class INatUploadController(QObject):
         self._cancel_upload.clear()
         self._begin_job()
         self.cardsChanged.emit()
+        self._record_grouping()
 
         def work():
             client = INatClient(token, self._http)
@@ -1063,6 +1173,22 @@ class INatUploadController(QObject):
             self._uploadRunFinished.emit()
 
         self._executor.submit(work)
+
+    def _record_grouping(self) -> None:
+        """The grouping the user is uploading is the ground truth to learn from."""
+        try:
+            groups = [c.group.photos for c in self._model.cards]
+            pairs = pairs_from_groups(groups, haversine_m)
+            self._history.record(
+                self._folder,
+                self._time_gap_s,
+                self._distance_m,
+                pairs,
+                photos=len(self._photos),
+                observations=len(groups),
+            )
+        except Exception:
+            log.debug("Could not record grouping history", exc_info=True)
 
     @Slot()
     def cancelUpload(self) -> None:  # noqa: N802
@@ -1126,3 +1252,17 @@ class INatUploadController(QObject):
     def _set_status(self, text: str) -> None:
         self._status_text = text
         self.statusTextChanged.emit()
+
+
+def _fmt_seconds(seconds: float) -> str:
+    if seconds < 90:
+        return f"{int(round(seconds))} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def _fmt_meters(meters: float) -> str:
+    if meters < 1000:
+        return f"{int(round(meters))} m"
+    return f"{meters / 1000:.1f} km"

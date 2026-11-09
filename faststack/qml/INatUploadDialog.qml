@@ -173,6 +173,100 @@ Window {
             }
         }
 
+        // Grouping sliders: regroup live by time gap and GPS distance.
+        Rectangle {
+            Layout.fillWidth: true
+            implicitHeight: sliderRow.implicitHeight + 16
+            radius: 8
+            color: dialog.cardColor
+            border.color: dialog.cardBorder
+
+            // Log-scale mapping so the useful range (seconds to hours, metres
+            // to kilometres) fits one slider.
+            function toValue(pos, lo, hi) { return lo * Math.pow(hi / lo, pos) }
+            function toPos(value, lo, hi) { return Math.log(Math.max(lo, Math.min(hi, value)) / lo) / Math.log(hi / lo) }
+            function fmtSeconds(s) { return s < 90 ? Math.round(s) + " s" : (s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h") }
+            function fmtMeters(m) { return m < 1000 ? Math.round(m) + " m" : (m / 1000).toFixed(1) + " km" }
+            id: sliderBox
+            readonly property real timeLo: 15
+            readonly property real timeHi: 6 * 3600
+            readonly property real distLo: 2
+            readonly property real distHi: 5000
+            property bool syncing: false
+
+            // Debounced push to the controller so dragging doesn't regroup per pixel.
+            Timer {
+                id: regroupTimer
+                interval: 120
+                onTriggered: {
+                    if (!dialog.uploader) return
+                    dialog.uploader.setThresholds(sliderBox.toValue(timeSlider.value, sliderBox.timeLo, sliderBox.timeHi),
+                                                  sliderBox.toValue(distSlider.value, sliderBox.distLo, sliderBox.distHi))
+                }
+            }
+            function syncFromController() {
+                if (!dialog.uploader) return
+                syncing = true
+                timeSlider.value = toPos(dialog.uploader.timeGapSeconds, timeLo, timeHi)
+                distSlider.value = toPos(dialog.uploader.distanceMetersLive, distLo, distHi)
+                syncing = false
+            }
+            Connections {
+                target: dialog.uploader
+                function onThresholdsChanged() { sliderBox.syncFromController() }
+            }
+            Component.onCompleted: syncFromController()
+
+            RowLayout {
+                id: sliderRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.margins: 12
+                spacing: 14
+
+                Text { text: "New observation after"; color: dialog.mutedText; font.pixelSize: 12 }
+                Slider {
+                    id: timeSlider
+                    Layout.preferredWidth: 220
+                    from: 0; to: 1
+                    enabled: dialog.uploader && dialog.uploader.canRegroup && !dialog.uploader.busy
+                    onMoved: regroupTimer.restart()
+                    ToolTip.visible: pressed
+                    ToolTip.text: sliderBox.fmtSeconds(sliderBox.toValue(value, sliderBox.timeLo, sliderBox.timeHi))
+                }
+                Text {
+                    text: sliderBox.fmtSeconds(sliderBox.toValue(timeSlider.value, sliderBox.timeLo, sliderBox.timeHi))
+                    color: dialog.textColor; font.pixelSize: 13; font.bold: true
+                    Layout.preferredWidth: 56
+                }
+                Text { text: "or a move of"; color: dialog.mutedText; font.pixelSize: 12 }
+                Slider {
+                    id: distSlider
+                    Layout.preferredWidth: 220
+                    from: 0; to: 1
+                    enabled: timeSlider.enabled
+                    onMoved: regroupTimer.restart()
+                    ToolTip.visible: pressed
+                    ToolTip.text: sliderBox.fmtMeters(sliderBox.toValue(value, sliderBox.distLo, sliderBox.distHi))
+                }
+                Text {
+                    text: sliderBox.fmtMeters(sliderBox.toValue(distSlider.value, sliderBox.distLo, sliderBox.distHi))
+                    color: dialog.textColor; font.pixelSize: 13; font.bold: true
+                    Layout.preferredWidth: 56
+                }
+                Item { Layout.fillWidth: true }
+                Text {
+                    text: dialog.uploader ? dialog.uploader.thresholdsNote
+                          + (dialog.uploader.hasManualEdits ? " · moving a slider discards your manual splits/merges" : "")
+                          : ""
+                    color: "#777777"; font.pixelSize: 11
+                    elide: Text.ElideRight
+                    Layout.maximumWidth: 420
+                }
+            }
+        }
+
         // Cards
         ScrollView {
             id: scroller
@@ -426,7 +520,7 @@ Window {
             }
 
             Rectangle { Layout.fillWidth: true; height: 1; color: dialog.cardBorder }
-            Text { text: "Grouping"; color: dialog.textColor; font.bold: true }
+            Text { text: "Grouping defaults (the sliders start here until FastStack has learned from your uploads)"; color: dialog.textColor; font.bold: true; font.pixelSize: 12 }
             GridLayout {
                 columns: 4
                 columnSpacing: 8
