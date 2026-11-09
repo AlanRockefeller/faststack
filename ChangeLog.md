@@ -2,6 +2,10 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## Unreleased
+
+- New Actions > iNaturalist upload. Takes the photos in the current batch (or the current image when nothing is batched), groups them into observations by capture time and GPS distance, and shows one large card per observation with all its photos. Each card can be identified with MycoMap Vision (vision.mycomap.org): the top name is filled in, and every species, genus and family Vision lists is shown as a clickable chip with its confidence, so you can pick a different one or type your own. Grouped too aggressively? Choose how many observations are really in a card from the little dropdown and press Split - FastStack re-partitions those photos by time and location into that many. Photos out of order? Drag any photo onto another card, or onto the strip at the bottom to make it its own observation; tick two cards and press Merge to combine them. The location is the average of the EXIF GPS fixes in the card (a warning appears when they disagree by more than a camera's GPS error, since that usually means the grouping is wrong), and cards without GPS can be placed by clicking on an OpenStreetMap map. Map tiles are cached on disk in a folder you choose, sized from free disk space unless you set a limit; tiles you look at often are kept longest. Photos are shrunk to 1024 px for Vision and 2048 px for iNaturalist with their EXIF kept. Uploaded photos are marked uploaded like a finished drag-and-drop. Your 24-hour iNaturalist API token and MycoMap Vision key go in the dialog's settings and are kept in the OS keyring.
+
 ## 1.7.0 (2026-11-06)
 
 - Added Python 3.14 support. Release builds are now tested and packaged with Python 3.14.10.

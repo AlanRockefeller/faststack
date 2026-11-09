@@ -108,6 +108,8 @@ from faststack.io.helicon import (
 )
 from faststack.io.focus_order import order_focus_stack_inputs
 from faststack.io.arguments import parse_external_arguments
+from faststack.inat.controller import INatUploadController
+from faststack.inat.providers import CardPhotoProvider, TileImageProvider
 from faststack.io.executable_validator import validate_executable_path
 from faststack.io.utils import normalize_path_key, resolve_configured_path
 from faststack.imaging.cache import (
@@ -11411,6 +11413,12 @@ class AppController(
         log.info("Shutting down background resources.")
 
         self._shutting_down = True  # gate async callbacks during shutdown_nonqt too
+        inat_upload = getattr(self, "_inat_upload", None)
+        if inat_upload is not None:
+            try:
+                inat_upload.shutdown()
+            except Exception:
+                log.debug("iNat upload shutdown failed", exc_info=True)
         self._exif_pending_path = None  # optional but consistent with shutdown_qt
         self._cancel_raw_development_operations()
 
@@ -12476,6 +12484,94 @@ class AppController(
                 os.access(path, os.R_OK),
                 url.toString(),
             )
+
+    # --- iNaturalist upload (Actions menu) ---------------------------------
+
+    def _batch_export_paths(self) -> tuple[list[Path], list[Path]]:
+        """(files to send, their catalogue paths), batch files or the current image.
+
+        Same selection as drag-and-drop: every photo in every defined batch,
+        else the current image, preferring the developed JPG in RAW mode.
+        """
+        if not self.image_files:
+            return [], []
+        indices: set[int] = set()
+        for start, end in self.batches:
+            for idx in range(start, end + 1):
+                if 0 <= idx < len(self.image_files):
+                    indices.add(idx)
+        if not indices and 0 <= self.current_index < len(self.image_files):
+            indices.add(self.current_index)
+        send: list[Path] = []
+        catalogue: list[Path] = []
+        in_raw_mode = getattr(self, "current_edit_source_mode", "jpeg") == "raw"
+        for idx in sorted(indices):
+            img = self.image_files[idx]
+            if not img.path.exists():
+                continue
+            is_developed_artifact = img.path.stem.lower().endswith("-developed")
+            if (in_raw_mode or is_developed_artifact) and img.developed_jpg_path.exists():
+                send.append(img.developed_jpg_path)
+            else:
+                send.append(img.path)
+            catalogue.append(img.path)
+        return send, catalogue
+
+    @Slot(result=bool)
+    def open_inat_upload(self) -> bool:
+        """Prepare the iNaturalist upload dialog for the current batch."""
+        inat_upload = getattr(self, "_inat_upload", None)
+        if inat_upload is None:
+            self.update_status_message("iNaturalist upload is not available.")
+            return False
+        send, catalogue = self._batch_export_paths()
+        if not send:
+            self.update_status_message("No photos in the batch to upload.")
+            return False
+        current_path = (
+            self.image_files[self.current_index].path
+            if 0 <= self.current_index < len(self.image_files)
+            else None
+        )
+        if current_path in catalogue and self._is_current_live_edit_session_dirty():
+            if self._block_if_saving(current_path):
+                return False
+            if not self._flush_current_live_edit_session_for_drag():
+                return False
+        for path in send:
+            if self._block_if_saving(path):
+                return False
+        self._inat_upload_catalogue = {str(s): c for s, c in zip(send, catalogue)}
+        if not inat_upload.open([str(p) for p in send]):
+            self.update_status_message("Could not read any of the batch photos.")
+            return False
+        return True
+
+    def _on_inat_upload_finished(self, uploaded_paths, all_done: bool) -> None:
+        """Mark the photos uploaded in the sidecar, like an accepted drag.
+
+        Batches are cleared only once every card went up, so a partial run
+        leaves the failed photos batched for another try.
+        """
+        lookup = getattr(self, "_inat_upload_catalogue", {}) or {}
+        catalogue_paths = []
+        for raw in uploaded_paths:
+            path = lookup.get(str(raw), Path(str(raw)))
+            catalogue_paths.append(Path(path))
+        if not catalogue_paths:
+            return
+        if all_done:
+            self._mark_drag_uploaded(catalogue_paths, "inaturalist upload")
+        else:
+            today = datetime.now().strftime("%Y-%m-%d")
+            for path in catalogue_paths:
+                meta = self.sidecar.get_metadata(path)
+                meta.uploaded = True
+                meta.uploaded_date = today
+            self._persist_sidecar()
+        self.update_status_message(
+            f"Uploaded {len(catalogue_paths)} photo(s) to iNaturalist", 5000
+        )
 
     def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
         """Mark dragged files uploaded and clear batches after an accepted drop."""
@@ -18146,11 +18242,24 @@ def main(
     # Register thumbnail provider for grid view
     engine.addImageProvider("thumbnail", controller._thumbnail_provider)
 
+    # Actions -> iNaturalist upload: its controller, card thumbnails and the
+    # OpenStreetMap tile provider for the location picker.
+    inat_upload = INatUploadController(
+        config,
+        parent=controller,
+        user_agent=f"FastStack/{get_current_version()} (+https://github.com/AlanRockefeller/faststack)",
+    )
+    controller._inat_upload = inat_upload
+    inat_upload.uploadFinished.connect(controller._on_inat_upload_finished)
+    engine.addImageProvider("inatphoto", CardPhotoProvider(inat_upload.photo_path))
+    engine.addImageProvider("osmtile", TileImageProvider(inat_upload.tile_fetcher))
+
     # Expose controller and UI state to QML
     context = engine.rootContext()
     context.setContextProperty("uiState", controller.ui_state)
     context.setContextProperty("controller", controller)
     context.setContextProperty("thumbnailModel", controller._thumbnail_model)
+    context.setContextProperty("inatUpload", inat_upload)
 
     if debug_requested:
         log.info(

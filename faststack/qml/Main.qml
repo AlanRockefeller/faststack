@@ -1067,6 +1067,18 @@ ApplicationWindow {
             }
             MenuActionItem {
                 width: 220
+                text: "iNaturalist upload"
+                enabled: root.uiStateRef ? root.uiStateRef.imageCount > 0 : false
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                disabledTextColor: root.isDarkTheme ? "#666666" : "#999999"
+                onClicked: {
+                    actionsMenu.close()
+                    root.openINatUploadDialog()
+                }
+            }
+            MenuActionItem {
+                width: 220
                 text: "Clear Stacks"
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
@@ -2439,6 +2451,35 @@ ApplicationWindow {
                 root.openDialogSafely(item)
                 openWhenLoaded = false
             }
+        }
+    }
+
+    // Actions -> iNaturalist upload. Loaded on first use; the controller
+    // collects the batch (or the current image) before the window opens.
+    Loader {
+        id: inatUploadLoader
+        property bool loadedOnce: false
+        property bool openWhenLoaded: false
+        active: loadedOnce
+        source: "INatUploadDialog.qml"
+        onLoaded: {
+            if (openWhenLoaded) {
+                item.show()
+                item.raise()
+                openWhenLoaded = false
+            }
+        }
+    }
+
+    function openINatUploadDialog() {
+        if (!root.controllerRef || !root.controllerRef.open_inat_upload())
+            return
+        inatUploadLoader.openWhenLoaded = true
+        inatUploadLoader.loadedOnce = true
+        if (inatUploadLoader.item && inatUploadLoader.openWhenLoaded) {
+            inatUploadLoader.item.show()
+            inatUploadLoader.item.raise()
+            inatUploadLoader.openWhenLoaded = false
         }
     }
 
