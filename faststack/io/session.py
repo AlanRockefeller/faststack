@@ -442,8 +442,11 @@ def respawn_for_directory(
     # read as a flag.
     args.extend(["--", directory])
     try:
-        # Console output and a clean environment: the child must not inherit
-        # the Wayland drag monitor's WAYLAND_DEBUG or its stderr pipe.
+        # A peer window, not a tool: it shares this console directly (its log
+        # lines are already FastStack-formatted) and usually outlives the
+        # window that spawned it, so its output is not relayed through this
+        # process. The clean environment keeps the Wayland drag monitor's
+        # WAYLAND_DEBUG and stderr pipe out of the child.
         process = subprocess.Popen(args, shell=False, **child_popen_kwargs())
     except OSError as e:
         log.warning("Failed to respawn FastStack for %s: %s", directory, e)

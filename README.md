@@ -416,7 +416,10 @@ change; **Cancel** (or `Esc`) discards them.
 
 - `faststack.ini` holds the settings: `%APPDATA%\faststack\` on Windows,
   `~/.faststack/` on Linux and macOS. Logs go to a `logs` folder next to it
-  when FastStack runs without a console.
+  when FastStack runs without a console. Whatever the programs FastStack
+  launches print (OpenFocus or Helicon Focus, your image editor, RawTherapee,
+  ExifTool) is included, each line prefixed with the program's name, such as
+  `[OpenFocus] ...`.
 - `faststack.json` in each image folder (the *sidecar*) records flags
   (uploaded, edited, favorite, todo...), stacks, batches, sort mode and the
   last viewed image. Several FastStack windows can share one folder safely.

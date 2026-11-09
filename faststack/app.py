@@ -81,8 +81,8 @@ from faststack.models import (
 )
 from faststack.io.child_process import (
     child_environment,
-    child_popen_kwargs,
-    reap_in_background,
+    launch_with_relayed_output,
+    log_tool_output,
 )
 from faststack.io.folder_delete import (
     delete_inspected_folder,
@@ -11842,14 +11842,14 @@ class AppController(
             self.update_status_message(f"RawTherapee validation failed: {error}")
             return
         try:
-            process = subprocess.Popen(
+            # Never a shell. RawTherapee's output is relayed as "[RawTherapee]"
+            # lines and the editor keeps running if FastStack is closed first.
+            launch_with_relayed_output(
                 [executable, str(raw_path.resolve())],
-                shell=False,
+                name="RawTherapee",
                 stdin=subprocess.DEVNULL,
                 close_fds=True,
-                **child_popen_kwargs(),
             )
-            reap_in_background(process, Path(executable).name)
             self.update_status_message(f"Opened {raw_path.name} in RawTherapee.")
         except OSError as exc:
             log.exception("Failed to launch RawTherapee")
@@ -12744,6 +12744,11 @@ class AppController(
                     operation.cancel_requested = True
                     self._stop_raw_process(process)
                     raise
+                # Show what the CLI printed, with its name in front, like the
+                # tools FastStack does not wait for.
+                tool_name = Path(rt_exe).stem or "rawtherapee-cli"
+                log_tool_output(tool_name, stdout)
+                log_tool_output(tool_name, stderr)
 
                 if process.returncode == 0:
                     with self._raw_develop_lock:

@@ -227,4 +227,8 @@ def setup_logging(debug: bool = False, *, diagnostic: bool = False) -> Path | No
     # watchdog logs every raw inotify event at DEBUG ("in-event ..."), which
     # buried --debug output; FastStack's own watcher logs what it acts on.
     logging.getLogger("watchdog").setLevel(logging.INFO if debug else logging.WARNING)
+    # Lines relayed from external tools (faststack/io/child_process.py) stand
+    # in for what those tools used to write straight to the console, so they
+    # are shown at every verbosity, not only in --debug runs.
+    logging.getLogger("faststack.external").setLevel(logging.INFO)
     return log_file
