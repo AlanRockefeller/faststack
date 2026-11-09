@@ -4037,14 +4037,16 @@ class AppController(
             return True
         return self._persist_sidecar()
 
-    def _queue_sidecar_write(self) -> None:
+    def _queue_sidecar_write(self, manager: Optional[SidecarManager] = None) -> None:
         """Write the folder sidecar on the session-write worker.
 
         For metadata changes made in the middle of an interaction (a slider
-        drag, an auto-adjust keystroke), where a synchronous write would hold
-        the GUI thread for a serialise, a write and two fsyncs.
+        drag, an auto-adjust keystroke, a save finishing while the user is
+        already on the next image), where a synchronous write would hold the
+        GUI thread for a serialise, a write and two fsyncs.
         """
-        manager = self.sidecar
+        if manager is None:
+            manager = self.sidecar
         try:
             prepared = manager.prepare_background_write()
         except Exception as e:
@@ -12306,8 +12308,17 @@ class AppController(
         completed_edit_state_request_id: Optional[str] = None,
         saved_edit_state: Optional[dict[str, Any]] = None,
         clear_saved_edit_state: bool = False,
+        background: bool = False,
     ) -> Optional[dict]:
-        """Mark an image as edited and return the pre-save metadata snapshot."""
+        """Mark an image as edited and return the pre-save metadata snapshot.
+
+        ``background`` writes the sidecar on the session-write worker instead
+        of on the calling (GUI) thread. A write that fails there is retried
+        synchronously and reported. A crash before it lands leaves the saved
+        image without its edited flag, and its edit state as the start of the
+        save left it: still marked pending_save, or absent when no pending
+        state was written.
+        """
         old_meta = self._capture_metadata_snapshot(sidecar, image_path)
         new_meta = dict(old_meta or {})
         new_meta["edited"] = True
@@ -12343,7 +12354,12 @@ class AppController(
                 != completed_edit_state_request_id
             ):
                 new_meta["edit_state"] = None
-        if not sidecar.update_metadata(image_path, new_meta):
+        # Only the current folder's sidecar goes to the worker: it is the one
+        # the shutdown path saves, so a write still queued at exit is covered.
+        if background and sidecar is self.sidecar and not self._shutting_down:
+            sidecar.update_metadata(image_path, new_meta, save=False)
+            self._queue_sidecar_write(sidecar)
+        elif not sidecar.update_metadata(image_path, new_meta):
             log.error(
                 "Image pixels were saved but edited metadata remains pending for %s",
                 image_path,

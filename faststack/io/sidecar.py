@@ -1263,8 +1263,14 @@ class SidecarManager:
             self.data.last_index = index
             self.data.last_path = last_path
 
-    def update_metadata(self, image_ref: Union[str, Path], updates: dict) -> bool:
-        """Update multiple metadata fields for an image and save if changed."""
+    def update_metadata(
+        self, image_ref: Union[str, Path], updates: dict, *, save: bool = True
+    ) -> bool:
+        """Update multiple metadata fields for an image and save if changed.
+
+        ``save=False`` changes the in-memory entry only; the caller then owns
+        the write (see ``prepare_background_write``).
+        """
         meta = self.get_metadata(image_ref, create=True)
         changed = False
         for key, value in updates.items():
@@ -1275,6 +1281,6 @@ class SidecarManager:
             else:
                 log.warning(f"Unknown metadata key: {key}")
 
-        if changed:
+        if changed and save:
             return self.save()
         return True

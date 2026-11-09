@@ -1451,6 +1451,9 @@ class SavePipelineMixin:
                     clear_saved_edit_state=not bool(
                         save_result.get("save_has_meaningful_edits", True)
                     ),
+                    # This runs on the GUI thread, usually a moment after the
+                    # user has moved on to the next image.
+                    background=True,
                 )
                 save_directory_key = save_result.get("save_directory_key")
                 current_directory_key = self._key(self.image_dir)
