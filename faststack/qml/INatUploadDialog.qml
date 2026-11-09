@@ -623,7 +623,7 @@ Window {
             id: cardDrop
             anchors.fill: parent
             keys: ["inat-photo"]
-            enabled: card.status !== "uploading" && card.status !== "uploaded"
+            enabled: !card.model.locked
             onDropped: function(drop) {
                 dialog.uploader.movePhoto(dragGhost.photoKey, card.cardId)
                 drop.accept()
@@ -644,7 +644,7 @@ Window {
                 spacing: 10
                 CheckBox {
                     checked: card.model.selected
-                    enabled: card.status !== "uploading" && card.status !== "uploaded"
+                    enabled: !card.model.locked
                     onToggled: dialog.uploader.toggleSelected(card.cardId)
                     ToolTip.visible: hovered
                     ToolTip.text: "Tick two or more cards, then Merge"
@@ -742,7 +742,7 @@ Window {
                             id: thumbArea
                             anchors.fill: parent
                             hoverEnabled: true
-                            enabled: card.status !== "uploading" && card.status !== "uploaded"
+                            enabled: !card.model.locked
                             cursorShape: enabled ? Qt.OpenHandCursor : Qt.ArrowCursor
                             drag.target: dragGhost
                             drag.threshold: 6

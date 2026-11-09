@@ -2,7 +2,9 @@
 
 * ``image://osmtile/{z}/{x}/{y}`` - a map tile from the disk cache (fetched
   from OpenStreetMap on a miss).
-* ``image://inatphoto/{index}?w=320`` - a card thumbnail, EXIF-rotated.
+* ``image://inatphoto/{batch}/{index}?w=320`` - a card thumbnail, EXIF-rotated.
+  ``batch`` changes every time the dialog opens a new set of photos, so Qt's
+  image cache never shows a thumbnail from the previous batch.
 
 Both are plain (synchronous) providers; QML ``Image { asynchronous: true }``
 runs them on Qt's image-loading threads, so a network fetch never blocks the
@@ -64,7 +66,8 @@ class CardPhotoProvider(QQuickImageProvider):
     def requestImage(self, id_str: str, size: QSize, requested: QSize) -> QImage:
         parts = urlsplit(id_str)
         try:
-            index = int(parts.path.strip("/").split("/")[0])
+            # "{batch}/{index}" (batch only defeats Qt's cache); older "{index}".
+            index = int(parts.path.strip("/").split("/")[-1])
         except ValueError:
             return self._fail(size)
         query = parse_qs(parts.query)

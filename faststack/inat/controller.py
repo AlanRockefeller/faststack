@@ -100,6 +100,14 @@ class Card:
     upload_error: str = ""
     photo_ids: dict[str, int] = field(default_factory=dict)
 
+    @property
+    def locked(self) -> bool:
+        """Photos can't move once an observation exists for them on iNat."""
+        return (
+            self.status in (STATUS_UPLOADING, STATUS_UPLOADED)
+            or self.obs_id is not None
+        )
+
     def location(self, spread_warning_m: float) -> Optional[Location]:
         if self.manual_location is not None:
             lat, lon = self.manual_location
@@ -135,6 +143,7 @@ class CardModel(QAbstractListModel):
         "obsUrl",
         "selected",
         "canSplit",
+        "locked",
     ]
 
     def __init__(self, controller: "INatUploadController"):
@@ -222,7 +231,8 @@ class INatUploadController(QObject):
     showMessage = Signal(str)
 
     _identifyDone = Signal(int, int, object, str)  # card id, token, result, error
-    _uploadCardDone = Signal(int, int, object, str)  # card id, token, obs id, error
+    # card id, token, obs id, keys of photos attached this run, error
+    _uploadCardDone = Signal(int, int, object, object, str)
     _uploadRunFinished = Signal()
     _usageDone = Signal(str)
     _verifyDone = Signal(str, str)  # login, error
@@ -254,6 +264,7 @@ class INatUploadController(QObject):
         self._thresholds_note = ""
         self._folder = ""
         self._manual_edits = False
+        self._batch_generation = 0
         self._tile_cache: Optional[TileCache] = None
         self._tile_fetcher: Optional[TileFetcher] = None
         self._tile_lock = threading.Lock()
@@ -565,6 +576,7 @@ class INatUploadController(QObject):
         self._uploaded_paths = []
         self._vision_cache = {}
         self._manual_edits = False
+        self._batch_generation += 1
         self._cancel_upload.clear()
         self._folder = str(records[0].path.parent)
         suggestion = self._history.suggest(
@@ -618,9 +630,7 @@ class INatUploadController(QObject):
 
     @Property(bool, notify=cardsChanged)
     def canRegroup(self) -> bool:  # noqa: N802
-        return bool(self._photos) and not any(
-            c.status in (STATUS_UPLOADING, STATUS_UPLOADED) for c in self._model.cards
-        )
+        return bool(self._photos) and not any(c.locked for c in self._model.cards)
 
     @Property(bool, notify=cardsChanged)
     def hasManualEdits(self) -> bool:  # noqa: N802
@@ -754,10 +764,9 @@ class INatUploadController(QObject):
         if name == "selected":
             return card.selected
         if name == "canSplit":
-            return len(card.group.photos) > 1 and card.status not in (
-                STATUS_UPLOADING,
-                STATUS_UPLOADED,
-            )
+            return len(card.group.photos) > 1 and not card.locked
+        if name == "locked":
+            return card.locked
         return None
 
     def _photo_dict(self, p: PhotoRecord) -> dict[str, Any]:
@@ -766,7 +775,7 @@ class INatUploadController(QObject):
             "index": index,
             "key": p.key,
             "name": p.path.name,
-            "source": f"image://inatphoto/{index}?w=360",
+            "source": f"image://inatphoto/{self._batch_generation}/{index}?w=360",
             "taken": p.taken.strftime("%H:%M:%S") if p.taken else "",
             "hasGps": p.has_gps,
         }
@@ -796,7 +805,7 @@ class INatUploadController(QObject):
     @Slot(int, int)
     def splitCard(self, card_id: int, n: int) -> None:  # noqa: N802
         card = self._card(card_id)
-        if card is None or card.status in (STATUS_UPLOADING, STATUS_UPLOADED):
+        if card is None or card.locked:
             return
         parts = split_group(card.group, max(2, n))
         if len(parts) < 2:
@@ -824,11 +833,7 @@ class INatUploadController(QObject):
 
     @Slot()
     def mergeSelected(self) -> None:  # noqa: N802
-        chosen = [
-            c
-            for c in self._model.cards
-            if c.selected and c.status not in (STATUS_UPLOADING, STATUS_UPLOADED)
-        ]
+        chosen = [c for c in self._model.cards if c.selected and not c.locked]
         if len(chosen) < 2:
             return
         merged = self._new_card(merge_groups([c.group for c in chosen]))
@@ -850,12 +855,12 @@ class INatUploadController(QObject):
             if any(p.key == photo_key for p in c.group.photos):
                 source = c
                 break
-        if source is None or source.status in (STATUS_UPLOADING, STATUS_UPLOADED):
+        if source is None or source.locked:
             return
         target = self._card(target_card_id) if target_card_id >= 0 else None
         if target is source:
             return
-        if target is not None and target.status in (STATUS_UPLOADING, STATUS_UPLOADED):
+        if target is not None and target.locked:
             return
         groups = [c.group for c in self._model.cards]
         target_index = (
@@ -986,7 +991,7 @@ class INatUploadController(QObject):
     @Slot(int)
     def identifyCard(self, card_id: int) -> None:  # noqa: N802
         card = self._card(card_id)
-        if card is None or card.status in (STATUS_UPLOADING, STATUS_UPLOADED):
+        if card is None or card.locked:
             return
         key = self._credentials.get(MYCOMAP_KEY)
         if not key:
@@ -1093,7 +1098,7 @@ class INatUploadController(QObject):
             card.status = STATUS_UPLOADING
             card.status_text = "Queued for upload"
             card.upload_error = ""
-            self._model.refresh(card, "status", "statusText", "canSplit")
+            self._model.refresh(card, "status", "statusText", "canSplit", "locked")
             loc = card.location(warn)
             observed = card.group.observed_at
             draft = ObservationDraft(
@@ -1112,14 +1117,21 @@ class INatUploadController(QObject):
                 species_guess=card.chosen_name,
                 description=card.description,
             )
+            # A card that already has an observation (an earlier run attached
+            # only some of its photos) resumes: no second observation, only
+            # the photos still missing go up.
+            pending_photos = [
+                p for p in card.group.sorted_photos() if p.key not in card.photo_ids
+            ]
             jobs.append(
                 (
                     card.id,
                     card.token,
                     draft,
-                    card.group.sorted_photos(),
+                    pending_photos,
                     card.chosen_name,
                     card.taxon,
+                    card.obs_id,
                 )
             )
         self._upload_done = 0
@@ -1132,44 +1144,50 @@ class INatUploadController(QObject):
 
         def work():
             client = INatClient(token, self._http)
-            for card_id, tok, draft, photos, name, taxon in jobs:
+            for card_id, tok, draft, photos, name, taxon, obs_id in jobs:
+                attached: list[tuple[str, int]] = []
                 if self._cancel_upload.is_set():
-                    self._uploadCardDone.emit(card_id, tok, None, "Cancelled")
+                    self._uploadCardDone.emit(
+                        card_id, tok, obs_id, attached, "Cancelled"
+                    )
                     continue
                 try:
-                    if draft.taxon_id is None and name and taxon is None:
-                        found = client.resolve_taxon(name)
-                        if found is not None:
-                            draft.taxon_id = found.id
-                    obs_id = client.create_observation(draft)
-                    failures = 0
-                    for p in photos:
-                        if self._cancel_upload.is_set():
-                            break
-                        data = images.prepare_jpeg(p.path, images.INAT_LONG_EDGE)
-                        try:
-                            client.add_photo(obs_id, p.path.name, data)
-                        except ApiError as exc:
-                            failures += 1
-                            log.warning("Photo upload failed %s: %s", p.path, exc)
-                    if failures:
-                        self._uploadCardDone.emit(
-                            card_id,
-                            tok,
-                            obs_id,
-                            f"{failures} photo(s) failed to attach; check the observation.",
-                        )
-                    else:
-                        self._uploadCardDone.emit(card_id, tok, obs_id, "")
+                    if obs_id is None:
+                        if draft.taxon_id is None and name and taxon is None:
+                            found = client.resolve_taxon(name)
+                            if found is not None:
+                                draft.taxon_id = found.id
+                        obs_id = client.create_observation(draft)
                 except ApiError as exc:
                     self._uploadCardDone.emit(
-                        card_id, tok, None, describe_inat_error(exc)
+                        card_id, tok, None, attached, describe_inat_error(exc)
                     )
+                    continue
                 except Exception as exc:
-                    log.exception("Upload failed")
+                    log.exception("Observation create failed")
                     self._uploadCardDone.emit(
-                        card_id, tok, None, f"Upload failed: {exc}"
+                        card_id, tok, None, attached, f"Upload failed: {exc}"
                     )
+                    continue
+                # The observation exists from here on: whatever happens to the
+                # photos, its id goes back so a retry resumes instead of
+                # creating a duplicate.
+                error = ""
+                for p in photos:
+                    if self._cancel_upload.is_set():
+                        error = "Cancelled before every photo was attached"
+                        break
+                    try:
+                        data = images.prepare_jpeg(p.path, images.INAT_LONG_EDGE)
+                        photo_id = client.add_photo(obs_id, p.path.name, data)
+                        attached.append((p.key, int(photo_id or 0)))
+                    except ApiError as exc:
+                        log.warning("Photo upload failed %s: %s", p.path, exc)
+                        error = describe_inat_error(exc)
+                    except Exception as exc:
+                        log.exception("Photo upload failed %s", p.path)
+                        error = f"Photo upload failed: {exc}"
+                self._uploadCardDone.emit(card_id, tok, obs_id, attached, error)
             self._uploadRunFinished.emit()
 
         self._executor.submit(work)
@@ -1194,9 +1212,9 @@ class INatUploadController(QObject):
     def cancelUpload(self) -> None:  # noqa: N802
         self._cancel_upload.set()
 
-    @Slot(int, int, object, str)
+    @Slot(int, int, object, object, str)
     def _on_upload_card_done(
-        self, card_id: int, token: int, obs_id, error: str
+        self, card_id: int, token: int, obs_id, attached, error: str
     ) -> None:
         self._upload_done += 1
         self.uploadProgressChanged.emit()
@@ -1205,14 +1223,30 @@ class INatUploadController(QObject):
             return
         if obs_id:
             card.obs_id = int(obs_id)
+        for key, photo_id in attached or []:
+            card.photo_ids[key] = photo_id
+        done_keys = set(card.photo_ids)
+        attached_paths = [str(p.path) for p in card.group.photos if p.key in done_keys]
+        missing = [p for p in card.group.photos if p.key not in done_keys]
+        if obs_id and not missing:
             card.status = STATUS_UPLOADED
-            card.status_text = "Uploaded" + (f" ({error})" if error else "")
-            self._uploaded_paths.extend(str(p.path) for p in card.group.photos)
+            card.status_text = "Uploaded"
+            card.upload_error = ""
+            self._uploaded_paths.extend(attached_paths)
         else:
             card.status = STATUS_ERROR
-            card.status_text = error or "Upload failed"
-            card.upload_error = error
-        self._model.refresh(card, "status", "statusText", "obsUrl", "canSplit")
+            if obs_id:
+                card.status_text = (
+                    f"{len(missing)} of {len(card.group.photos)} photo(s) not attached"
+                    f" ({error or 'cancelled'}). Upload again to attach the rest."
+                )
+            else:
+                card.status_text = error or "Upload failed"
+            card.upload_error = card.status_text
+            self._uploaded_paths.extend(attached_paths)
+        self._model.refresh(
+            card, "status", "statusText", "obsUrl", "canSplit", "locked"
+        )
         self.cardsChanged.emit()
 
     @Slot()
