@@ -831,6 +831,27 @@ Window {
                 color: dialog.warnColor
                 font.pixelSize: 12
             }
+            RowLayout {
+                Layout.fillWidth: true
+                visible: card.model.visionWarning !== ""
+                spacing: 10
+                Text {
+                    Layout.fillWidth: true
+                    text: "⚠ " + card.model.visionWarning
+                    color: dialog.warnColor
+                    font.pixelSize: 12
+                    font.bold: true
+                    wrapMode: Text.Wrap
+                }
+                Button {
+                    text: "Split by Vision"
+                    visible: card.model.canSplitByVision
+                    enabled: dialog.uploader && !dialog.uploader.busy
+                    onClicked: dialog.uploader.splitByVision(card.cardId)
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Put the photos Vision scores as a different genus into their own observation"
+                }
+            }
 
             // Vision choices
             Flow {

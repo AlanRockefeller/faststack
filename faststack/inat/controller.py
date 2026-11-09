@@ -144,6 +144,8 @@ class CardModel(QAbstractListModel):
         "selected",
         "canSplit",
         "locked",
+        "visionWarning",
+        "canSplitByVision",
     ]
 
     def __init__(self, controller: "INatUploadController"):
@@ -767,7 +769,73 @@ class INatUploadController(QObject):
             return len(card.group.photos) > 1 and not card.locked
         if name == "locked":
             return card.locked
+        if name == "visionWarning":
+            return self._vision_warning(card)
+        if name == "canSplitByVision":
+            return (
+                not card.locked
+                and card.vision is not None
+                and card.vision.disagreement() is not None
+            )
         return None
+
+    def _vision_warning(self, card: Card) -> str:
+        """Vision scored some photos as a different genus: probably two finds."""
+        if card.vision is None:
+            return ""
+        dis = card.vision.disagreement()
+        if dis is None:
+            return ""
+        by_key = {p.key: p for p in card.group.photos}
+        names = []
+        for index, genus in dis.outliers:
+            if index < len(card.vision.photo_keys):
+                photo = by_key.get(card.vision.photo_keys[index])
+                if photo is not None:
+                    names.append(f"{photo.path.name}: {genus}")
+        if not names:
+            return ""
+        return (
+            f"Vision sees {dis.combined_genus} in most photos but "
+            + ", ".join(names)
+            + " - this card may hold two different fungi."
+        )
+
+    @Slot(int)
+    def splitByVision(self, card_id: int) -> None:  # noqa: N802
+        """Partition the card by each photo's own top genus."""
+        card = self._card(card_id)
+        if card is None or card.locked or card.vision is None:
+            return
+        dis = card.vision.disagreement()
+        if dis is None:
+            return
+        keys = card.vision.photo_keys
+        by_key = {p.key: p for p in card.group.photos}
+        indices = [i for i, k in enumerate(keys) if k in by_key]
+        groups = dis.groups(indices)
+        if len(groups) < 2:
+            return
+        placed = set()
+        new_cards = []
+        for idx_list in groups:
+            photos = [by_key[keys[i]] for i in idx_list]
+            placed.update(p.key for p in photos)
+            new_cards.append(ObservationGroup(photos))
+        leftovers = [p for p in card.group.photos if p.key not in placed]
+        if leftovers:  # photos beyond Vision's 10-photo limit stay with the first
+            new_cards[0].photos.extend(leftovers)
+        cards = []
+        for g in new_cards:
+            c = self._new_card(g)
+            c.geoprivacy = card.geoprivacy
+            c.description = card.description
+            c.manual_location = card.manual_location
+            cards.append(c)
+        self._model.replace(card, cards)
+        self._manual_edits = True
+        self._set_status(f"Split into {len(cards)} by Vision's per-photo genus.")
+        self.cardsChanged.emit()
 
     def _photo_dict(self, p: PhotoRecord) -> dict[str, Any]:
         index = p.order
@@ -1023,6 +1091,7 @@ class INatUploadController(QObject):
                     observed_on=observed.strftime("%Y-%m-%d") if observed else None,
                     client_ref=client_ref_for([p.path for p in photos]),
                 )
+                result.photo_keys = [p.key for p in photos[:10]]
                 self._identifyDone.emit(card.id, token, result, "")
             except ApiError as exc:
                 self._identifyDone.emit(
@@ -1071,6 +1140,8 @@ class INatUploadController(QObject):
             "choices",
             "hints",
             "gateMessage",
+            "visionWarning",
+            "canSplitByVision",
         )
         if result.suggested_name:
             self.setChosenName(card.id, result.suggested_name, result.suggested_rank)

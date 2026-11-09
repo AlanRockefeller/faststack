@@ -34,6 +34,53 @@ class Candidate:
 
 
 @dataclass
+class PerPhoto:
+    """One photo's own answer, from the ``per_photo`` block."""
+
+    index: int
+    gate_verdict: Optional[str]
+    top_genus: Optional[str]
+    top_genus_confidence: Optional[float]
+    top_species: Optional[str]
+    combined_genus_position: Optional[int]  # where the combined top genus ranks here
+    photo_type: Optional[str] = None  # specimen, habitat, micrograph, ... (when tagged)
+
+    @property
+    def counts(self) -> bool:
+        """A clear fungus photo of the specimen itself; habitat shots, slips,
+        micrographs and gated-out photos say nothing about grouping."""
+        if self.gate_verdict is not None and self.gate_verdict != "fungus":
+            return False
+        if self.photo_type and self.photo_type != "specimen":
+            return False
+        return bool(self.top_genus)
+
+
+@dataclass
+class Disagreement:
+    """Photos whose own top genus is not the card's: likely two organisms."""
+
+    combined_genus: str
+    outliers: list[tuple[int, str]]  # (photo index, that photo's genus)
+
+    def groups(self, all_indices: list[int]) -> list[list[int]]:
+        """Partition photo indices by genus; non-counting photos follow their
+        nearest counting neighbour in order."""
+        genus_of = {i: g for i, g in self.outliers}
+        assigned: dict[int, str] = {}
+        for i in all_indices:
+            assigned[i] = genus_of.get(i, self.combined_genus)
+        return _runs_by_label(all_indices, assigned)
+
+
+def _runs_by_label(order: list[int], label: dict[int, str]) -> list[list[int]]:
+    buckets: dict[str, list[int]] = {}
+    for i in order:
+        buckets.setdefault(label[i], []).append(i)
+    return list(buckets.values())
+
+
+@dataclass
 class VisionResult:
     """What the card shows: the headline answer plus every rank's candidates."""
 
@@ -50,6 +97,53 @@ class VisionResult:
     photos_scored: int = 0
     usage: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
+    per_photo: list[PerPhoto] = field(default_factory=list)
+    # Keys of the photos sent, in the order Vision indexes them (set by the caller).
+    photo_keys: list[str] = field(default_factory=list)
+
+    @property
+    def top_genus(self) -> Optional[str]:
+        if self.answer_rank == "species" and self.answer_name:
+            return self.answer_name.split()[0]
+        if self.genus:
+            return self.genus[0].name
+        if self.species:
+            return self.species[0].name.split()[0]
+        return None
+
+    def disagreement(
+        self, min_confidence: float = 0.35, min_position: int = 3
+    ) -> Optional[Disagreement]:
+        """Photos that Vision scores as a different genus than the card.
+
+        A photo counts as an outlier when its own top genus differs from the
+        card's, it is reasonably sure of it, and the card's genus is not even
+        in that photo's top ``min_position``. One such photo among several is
+        normal (an odd angle); it is reported only when there are at least
+        two photos on the other side, or the card holds just two photos.
+        """
+        combined = self.top_genus
+        if not combined:
+            return None
+        counting = [p for p in self.per_photo if p.counts]
+        outliers = []
+        for p in counting:
+            if p.top_genus == combined:
+                continue
+            if (p.top_genus_confidence or 0.0) < min_confidence:
+                continue
+            pos = p.combined_genus_position
+            if pos is not None and pos <= min_position:
+                continue
+            outliers.append((p.index, p.top_genus))
+        if not outliers:
+            return None
+        agreeing = len(counting) - len(outliers)
+        if agreeing == 0:
+            return None  # every photo disagrees with the combined answer: no split
+        if len(outliers) < 2 and len(counting) > 2:
+            return None
+        return Disagreement(combined_genus=combined, outliers=outliers)
 
     @property
     def suggested_name(self) -> str:
@@ -203,6 +297,7 @@ def parse_result(data: dict[str, Any]) -> VisionResult:
     model = data.get("model") if isinstance(data.get("model"), dict) else {}
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     hints = [str(h) for h in data.get("hints") or [] if h]
+    per_photo = _per_photo(data.get("per_photo"))
     return VisionResult(
         answer_rank=answer.get("rank"),
         answer_name=answer.get("name"),
@@ -217,7 +312,49 @@ def parse_result(data: dict[str, Any]) -> VisionResult:
         photos_scored=int(data.get("photos") or 0),
         usage=usage,
         raw=data,
+        per_photo=per_photo,
     )
+
+
+def _per_photo(rows: Any) -> list[PerPhoto]:
+    out: list[PerPhoto] = []
+    if not isinstance(rows, list):
+        return out
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        ranks = row.get("ranks") if isinstance(row.get("ranks"), dict) else {}
+        genus_rows = _candidates("genus", ranks.get("genus"))
+        species_rows = _candidates("species", ranks.get("species"))
+        gate = row.get("gate") if isinstance(row.get("gate"), dict) else {}
+        overall = (
+            row.get("overall_top") if isinstance(row.get("overall_top"), dict) else {}
+        )
+        overall_genus = (
+            overall.get("genus") if isinstance(overall.get("genus"), dict) else {}
+        )
+        ptype = row.get("photo_type") if isinstance(row.get("photo_type"), dict) else {}
+        position = overall_genus.get("position")
+        try:
+            position = int(position) if position is not None else None
+        except (TypeError, ValueError):
+            position = None
+        try:
+            index = int(row.get("photo", i))
+        except (TypeError, ValueError):
+            index = i
+        out.append(
+            PerPhoto(
+                index=index,
+                gate_verdict=gate.get("verdict"),
+                top_genus=genus_rows[0].name if genus_rows else None,
+                top_genus_confidence=genus_rows[0].confidence if genus_rows else None,
+                top_species=species_rows[0].name if species_rows else None,
+                combined_genus_position=position,
+                photo_type=ptype.get("type") if ptype else None,
+            )
+        )
+    return out
 
 
 def describe_error(exc: ApiError) -> str:

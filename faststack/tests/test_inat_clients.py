@@ -266,3 +266,103 @@ def test_credential_store_file_fallback(tmp_path):
     store.set("x", "")
     assert store.get("x") == ""
     assert not (tmp_path / "secrets.json").exists()
+
+
+def _per_photo_payload(rows):
+    """rows: list of (genus, conf, combined_position, gate, photo_type)."""
+    out = []
+    for i, (genus, conf, pos, gate, ptype) in enumerate(rows):
+        row = {
+            "photo": i,
+            "gate": {"verdict": gate},
+            "ranks": {"genus": [{"name": genus, "confidence": conf}]},
+            "overall_top": {"genus": {"position": pos}},
+        }
+        if ptype:
+            row["photo_type"] = {"type": ptype}
+        out.append(row)
+    return out
+
+
+def test_vision_disagreement_flags_second_genus():
+    result = parse_result(
+        {
+            "answer": {"rank": "genus", "name": "Amanita", "confidence": 0.8},
+            "ranks": {"genus": [{"name": "Amanita", "confidence": 0.8}]},
+            "per_photo": _per_photo_payload(
+                [
+                    ("Amanita", 0.9, 1, "fungus", "specimen"),
+                    ("Amanita", 0.7, 1, "fungus", "specimen"),
+                    ("Russula", 0.8, 6, "fungus", "specimen"),
+                    ("Russula", 0.6, None, "fungus", "specimen"),
+                    ("Boletus", 0.9, 9, "unsure", "habitat"),  # habitat shot: ignored
+                ]
+            ),
+        }
+    )
+    dis = result.disagreement()
+    assert dis is not None
+    assert dis.combined_genus == "Amanita"
+    assert dis.outliers == [(2, "Russula"), (3, "Russula")]
+    assert dis.groups([0, 1, 2, 3, 4]) == [[0, 1, 4], [2, 3]]
+
+
+def test_vision_disagreement_ignores_single_odd_angle_and_low_confidence():
+    base = {
+        "answer": {"rank": "species", "name": "Amanita muscaria", "confidence": 0.8},
+        "ranks": {"genus": [{"name": "Amanita", "confidence": 0.9}]},
+    }
+    # One of four photos disagrees: an odd angle, not a second organism.
+    one_off = parse_result(
+        {
+            **base,
+            "per_photo": _per_photo_payload(
+                [
+                    ("Amanita", 0.9, 1, "fungus", None),
+                    ("Amanita", 0.9, 1, "fungus", None),
+                    ("Amanita", 0.9, 1, "fungus", None),
+                    ("Russula", 0.9, 8, "fungus", None),
+                ]
+            ),
+        }
+    )
+    assert one_off.disagreement() is None
+    # Two photos, the other one unsure of itself.
+    weak = parse_result(
+        {
+            **base,
+            "per_photo": _per_photo_payload(
+                [
+                    ("Amanita", 0.9, 1, "fungus", None),
+                    ("Russula", 0.2, 8, "fungus", None),
+                ]
+            ),
+        }
+    )
+    assert weak.disagreement() is None
+    # Two photos, combined genus still in the other's top 3: same thing, hard angle.
+    close = parse_result(
+        {
+            **base,
+            "per_photo": _per_photo_payload(
+                [
+                    ("Amanita", 0.9, 1, "fungus", None),
+                    ("Russula", 0.6, 2, "fungus", None),
+                ]
+            ),
+        }
+    )
+    assert close.disagreement() is None
+    # Two photos, clearly different: flagged.
+    two = parse_result(
+        {
+            **base,
+            "per_photo": _per_photo_payload(
+                [
+                    ("Amanita", 0.9, 1, "fungus", None),
+                    ("Russula", 0.7, None, "fungus", None),
+                ]
+            ),
+        }
+    )
+    assert two.disagreement() is not None
