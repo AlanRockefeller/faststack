@@ -673,6 +673,22 @@ DEFAULT_CONFIG = {
         "last_failed_update_check": "",
         "last_ignored_version": "",
     },
+    # Actions -> iNaturalist upload. Credentials live in the OS keyring, not
+    # here (see faststack/inat/credentials.py).
+    "inat": {
+        # Grouping: a new observation starts after this many minutes between
+        # photos, or a GPS move larger than distance_meters.
+        "time_gap_minutes": "10",
+        "distance_meters": "100",
+        # Warn when the EXIF fixes inside one card disagree by more than this.
+        "spread_warning_meters": "100",
+        # OpenStreetMap tile cache for the location picker. Empty dir = the app
+        # data folder; 0 MB = size the cache from free disk space.
+        "tile_cache_dir": "",
+        "tile_cache_mb": "0",
+        "geoprivacy": "open",
+        "inat_login": "",
+    },
 }
 
 

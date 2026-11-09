@@ -57,6 +57,14 @@ try:
 except Exception as exc:  # pragma: no cover - build-time diagnostics only
     raise RuntimeError("faststack distribution metadata is required") from exc
 
+# keyring discovers its backends through entry points in its dist-info; without
+# the metadata the frozen build sees no backend and the iNaturalist upload
+# falls back to a plain file for its tokens.
+try:
+    datas += copy_metadata("keyring")
+except Exception:  # pragma: no cover - keyring is optional at build time
+    print("[faststack] keyring metadata not found; OS keyring will be unavailable")
+
 # copy_metadata() copies whatever dist-info is *installed*, which can lag the
 # checkout being frozen (a stale editable install, an old wheel in the build
 # environment). Bundling that would make the frozen app report the wrong
@@ -223,6 +231,16 @@ hiddenimports = [
     "PySide6.QtWidgets",
     "cv2",
     "turbojpeg",
+    # iNaturalist upload keeps its tokens in the OS keyring; the backends are
+    # found through entry points, which PyInstaller cannot see.
+    "keyring",
+    "keyring.backends.Windows",
+    "keyring.backends.macOS",
+    "keyring.backends.SecretService",
+    "keyring.backends.kwallet",
+    "keyring.backends.chainer",
+    "keyring.backends.fail",
+    "keyring.backends.null",
 ]
 
 EXCLUDED_MODULES = [
