@@ -110,7 +110,8 @@ Dialog {
         }
     }
 
-    onOpened: {
+    // aboutToShow, not opened: see the note on aboutDialog in Main.qml.
+    onAboutToShow: {
         // Notify Python that a dialog is open
         if (deleteBatchDialog.controllerRef) {
             deleteBatchDialog.controllerRef.dialog_opened("qml-delete-batch")

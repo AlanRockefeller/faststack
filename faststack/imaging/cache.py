@@ -298,9 +298,12 @@ class ByteLRUCache(LRUCache):
             reason = "pressure" if is_pressure else "manual"
 
             super().__delitem__(key)
-            log.debug(
-                "Removed item '%s'. Cache size: %.2f MB", key, self.currsize / 1024**2
-            )
+            if not getattr(self, "_clearing", False):
+                log.debug(
+                    "Removed item '%s'. Cache size: %.2f MB",
+                    key,
+                    self.currsize / 1024**2,
+                )
 
             if self.on_evict:
                 info = self._build_eviction_info(reason, pre_usage)
@@ -345,11 +348,57 @@ class ByteLRUCache(LRUCache):
             _discard: list[Callable[[], None]] = []
             self._pending_callbacks = _discard
             self._pending_callbacks_owner = threading.get_ident()
+            entries = len(self)
+            size_mb = self.currsize / 1024**2
+            # One summary line instead of one "Removed item" per frame: a
+            # resize used to print the whole prefetch window twice over.
+            self._clearing = True
             try:
                 super().clear()
             finally:
+                self._clearing = False
                 self._pending_callbacks = None
                 self._pending_callbacks_owner = None
+        if entries:
+            log.debug("Cleared %d cached frame(s), %.2f MB", entries, size_mb)
+
+    def retain_generations(self, generations) -> int:
+        """Drop every frame whose display generation is not in ``generations``.
+
+        Keys are ``path::generation::quality`` (see ``build_cache_key``); a key
+        in any other form is dropped too. Like ``clear()`` this is a deliberate
+        removal, so no eviction callbacks fire. Returns the number dropped.
+        """
+        keep = {str(int(generation)) for generation in generations}
+        with self._lock:
+            doomed = []
+            for key in list(self.keys()):
+                parts = str(key).rsplit("::", 2)
+                if len(parts) != 3 or parts[1] not in keep:
+                    doomed.append(key)
+            if not doomed:
+                return 0
+            before_mb = self.currsize / 1024**2
+            _discard: list[Callable[[], None]] = []
+            self._pending_callbacks = _discard
+            self._pending_callbacks_owner = threading.get_ident()
+            self._clearing = True
+            try:
+                for key in doomed:
+                    self.pop(key, None)
+            finally:
+                self._clearing = False
+                self._pending_callbacks = None
+                self._pending_callbacks_owner = None
+            kept = len(self)
+            freed_mb = before_mb - self.currsize / 1024**2
+        log.debug(
+            "Dropped %d cached frame(s) of retired display sizes, %.2f MB; %d kept",
+            len(doomed),
+            freed_mb,
+            kept,
+        )
+        return len(doomed)
 
     def pop_path(self, path: Union[Path, str]):
         """Targeted invalidation of all generations for a given path.

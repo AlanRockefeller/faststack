@@ -26,7 +26,8 @@ Dialog {
         border.width: 1
     }
 
-    onOpened: {
+    // aboutToShow, not opened: see the note on aboutDialog in Main.qml.
+    onAboutToShow: {
         if (exifDialog.controllerRef) {
             exifDialog.controllerRef.dialog_opened("qml-exif")
         }

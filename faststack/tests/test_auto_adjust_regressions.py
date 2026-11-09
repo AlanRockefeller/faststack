@@ -88,6 +88,16 @@ class _Qt(IntFlag):
     Key_R = 135
     Key_Underscore = 136
     Key_Plus = 137
+    Key_Shift = 138
+    Key_Control = 139
+    Key_Alt = 140
+    Key_AltGr = 141
+    Key_Meta = 142
+    Key_Super_L = 143
+    Key_Super_R = 144
+    Key_CapsLock = 145
+    Key_NumLock = 146
+    Key_ScrollLock = 147
 
 
 def _load_keybinder_class():
@@ -256,7 +266,7 @@ def test_quick_auto_adjust_stays_preview_only():
         _seed_active_auto_adjust_state=Mock(return_value=object()),
     )
 
-    def apply_preview(_state):
+    def apply_preview(_state, **_kwargs):
         controller._last_auto_levels_msg = "levels"
 
     controller._apply_auto_adjust_preview = Mock(side_effect=apply_preview)
@@ -267,8 +277,12 @@ def test_quick_auto_adjust_stays_preview_only():
         "combined auto-adjust starts a fresh active auto-adjust state",
         clear_editor=False,
     )
-    controller.auto_white_balance.assert_called_once_with()
+    # White balance leaves the render to the levels step: one preview, not two.
+    controller.auto_white_balance.assert_called_once_with(kick_preview=False)
     controller._apply_auto_adjust_preview.assert_called_once()
+    assert controller._apply_auto_adjust_preview.call_args.kwargs == {
+        "force_preview": True
+    }
     controller.update_status_message.assert_called_with("awb; levels", timeout=9000)
 
 

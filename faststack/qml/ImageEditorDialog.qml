@@ -116,7 +116,7 @@ Window {
         width: 280
         standardButtons: Dialog.Yes | Dialog.No
 
-        onOpened: if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.dialog_opened("qml-expanded-discard")
+        onAboutToShow: if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.dialog_opened("qml-expanded-discard")
         onClosed: if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.dialog_closed("qml-expanded-discard")
         Component.onDestruction: if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.dialog_closed("qml-expanded-discard")
 

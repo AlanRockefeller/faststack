@@ -159,6 +159,13 @@ class LoupeDisplayMixin:
             and not pending["future"].done()
         ):
             return held
+        if getattr(self, "_entering_loupe", False):
+            # The grid-to-loupe switch is still being delivered to QML, and
+            # the loupe may be about to report a new image-area size. A decode
+            # started here would be for the old size and would occupy the
+            # demand worker; _finish_entering_loupe() requests the right one
+            # as soon as the switch has been delivered.
+            return held
         if not self._schedule_loupe_source_decode(target, index, seq):
             return self._publish_loupe_source(target)
         return held

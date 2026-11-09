@@ -1375,6 +1375,19 @@ class SpeculativeWorkloadGovernor:
             "effective=%d running=%d queued_interactive=%d queued_preload=%d "
             "restored=%s"
         )
+        if (
+            action in ("enter", "leave")
+            and reason == "preview_refinement"
+            and not (
+                summary["running"]
+                or summary["queued_interactive"]
+                or summary["queued_preload"]
+            )
+        ):
+            # Every settled slider nudge takes this constraint for ~250 ms.
+            # With no speculative decode running or queued there is nothing
+            # for it to hold back, and two lines per nudge bury the edit log.
+            return
         args = (
             _GOVERNOR_LOG_PREFIX,
             action,
@@ -1403,6 +1416,7 @@ class Prefetcher:
         prefetch_radius: int,
         get_display_info: Callable,
         debug: bool = False,
+        trace: bool = False,
         cache_contains: Optional[Callable[[str], bool]] = None,
         cache_get_quality: Optional[Callable[[str], Optional[str]]] = None,
         quality_is_current: Optional[Callable[..., bool]] = None,
@@ -1417,6 +1431,10 @@ class Prefetcher:
         self.prefetch_radius = prefetch_radius
         self.get_display_info = get_display_info
         self.debug = debug
+        # --debugcache-trace: the per-call [DBGCACHE] START/DONE records with
+        # absolute timestamps. Plain --debug gets one summary line per window
+        # update instead, so a navigation step is one line, not four.
+        self.trace = trace
         # Optional per-decode telemetry sink (navigation trace). Called from a
         # worker thread with a plain dict of stage timings + decode details;
         # must not touch Qt. See AppController._record_nav_worker_timing.
@@ -1737,8 +1755,8 @@ class Prefetcher:
             is_navigation: True if this is from user navigation (arrow keys, etc.)
             direction: 1 for forward, -1 for backward, None to use last direction
         """
-        if self.debug:
-            _t_start = time.perf_counter()
+        _t_start = time.perf_counter() if (self.debug or self.trace) else 0.0
+        if self.trace:
             log.info(
                 f"[DBGCACHE] {_t_start*1000:.3f} update_prefetch: START index={current_index} dir={direction}"
             )
@@ -1747,8 +1765,12 @@ class Prefetcher:
         # zoom state, or color mode changes - events that actually invalidate cached images.
         # Navigation just shifts which indices to prefetch.
 
-        # Track navigation direction
-        if direction is not None:
+        # Track navigation direction. Only a real step sets it: a jump or an
+        # image opened from the grid passes 0 ("no direction"), which used to
+        # be stored and then read as "backward" below - and made the priority
+        # pass in submit_task() cancel the window on BOTH sides, leaving just
+        # the current image and its nearest neighbours decoded.
+        if direction in (-1, 1):
             self._last_navigation_direction = direction
 
         # The whole configured window is warmed from the first navigation on;
@@ -1761,13 +1783,6 @@ class Prefetcher:
         cache_quality: DecodeQuality = (
             "fast" if display_width > 0 and display_height > 0 else "cover"
         )
-
-        if self.debug:
-            log.info(
-                "Prefetch radius: configured=%d, effective=%d",
-                self.prefetch_radius,
-                effective_radius,
-            )
 
         # Directional prefetching favors travel direction while retaining a
         # small tail behind the current image for short backtracking.
@@ -1798,7 +1813,7 @@ class Prefetcher:
             image_files = self.image_files
             n = len(image_files)
             if n == 0:
-                if self.debug:
+                if self.trace:
                     _t_end = time.perf_counter()
                     log.info(
                         f"[DBGCACHE] {_t_end*1000:.3f} update_prefetch: DONE submitted=0 empty=True total={(_t_end - _t_start)*1000:.2f}ms"
@@ -1807,20 +1822,21 @@ class Prefetcher:
             # Ensure current_index is clamped
             safe_current = max(0, min(n - 1, current_index))
 
+            # At either end of the list the travel direction points at
+            # nothing: after a jump to the last image (or a session restored
+            # there) "ahead" is past the end and only the short tail behind
+            # was decoded, though behind is the only way left to go. Give the
+            # slots the list cannot use to the other side.
+            unused_ahead = max(0, safe_current + ahead - (n - 1))
+            unused_behind = max(0, behind - safe_current)
+            if effective_radius > 0:
+                behind = min(effective_radius, behind + unused_ahead)
+                ahead = min(effective_radius, ahead + unused_behind)
+
             start = max(0, safe_current - behind)
             end = min(n, safe_current + ahead + 1)
             previous_window = self._active_window
             self._active_window = set(range(start, end))
-
-            log.debug(
-                "Prefetch range: [%d, %d) for index %d (direction=%d, behind=%d, ahead=%d)",
-                start,
-                end,
-                safe_current,
-                self._last_navigation_direction,
-                behind,
-                ahead,
-            )
 
             # Build priority order: current first, then in direction of travel
             priority_order = [safe_current]
@@ -1912,7 +1928,7 @@ class Prefetcher:
                             # that notification or raced this window update.
                             scheduled.discard(i)
                             if self.debug:
-                                log.info(
+                                log.debug(
                                     "[DBGCACHE] Recovering stale scheduled "
                                     "prefetch index=%d path=%s",
                                     i,
@@ -1930,10 +1946,26 @@ class Prefetcher:
                     scheduled.add(i)
                     tasks_submitted += 1
 
-        if self.debug:
+        if self.trace:
             _t_end = time.perf_counter()
             log.info(
                 f"[DBGCACHE] {_t_end*1000:.3f} update_prefetch: DONE submitted={tasks_submitted} total={(_t_end - _t_start)*1000:.2f}ms"
+            )
+        elif self.debug:
+            # One line per window update: where, which way, how much was new.
+            log.debug(
+                "Prefetch index=%d dir=%+d window=[%d, %d) submitted=%d %.2fms%s",
+                safe_current,
+                self._last_navigation_direction,
+                start,
+                end,
+                tasks_submitted,
+                (time.perf_counter() - _t_start) * 1000,
+                (
+                    f" radius={effective_radius}/{self.prefetch_radius}"
+                    if effective_radius != self.prefetch_radius
+                    else ""
+                ),
             )
 
     def submit_task(
@@ -1956,10 +1988,19 @@ class Prefetcher:
         if self._stop_event.is_set():
             return None
 
-        if self.debug and priority:
+        if self.trace and priority:
             _t_start = time.perf_counter()
+            # prefetch_gen is this module's cancellation counter, not the
+            # display generation in the cache key nor NAVTRACE's UI generation.
             log.info(
-                f"[DBGCACHE] {_t_start*1000:.3f} submit_task: PRIORITY index={index} gen={generation} override={override_path} quality={quality}"
+                f"[DBGCACHE] {_t_start*1000:.3f} submit_task: PRIORITY index={index} prefetch_gen={generation} override={override_path} quality={quality}"
+            )
+        elif self.debug and priority:
+            log.debug(
+                "Priority decode index=%d quality=%s%s",
+                index,
+                quality,
+                f" override={Path(override_path).name}" if override_path else "",
             )
 
         with self._futures_lock:
@@ -2090,6 +2131,14 @@ class Prefetcher:
                         self._navigation_cancel_indices.discard(task_index)
                         continue
                     if task_index == index or abs(task_index - index) <= safe_radius:
+                        continue
+                    # update_prefetch() decides what is worth decoding; a task
+                    # inside the window it last built is wanted. The demand
+                    # decode has its own reserved worker, so cancelling the
+                    # window "to prioritise" only threw away the frames behind
+                    # the travel direction - all of them, when the image is
+                    # the last in the list and behind is the only way to go.
+                    if task_index in self._active_window:
                         continue
 
                     # Don't cancel tasks ahead of travel direction — we'll need them

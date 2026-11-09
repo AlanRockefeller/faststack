@@ -596,7 +596,7 @@ Window {
         width: 260
         standardButtons: Dialog.Yes | Dialog.No
 
-        onOpened: {
+        onAboutToShow: {
             if (compactEditor.controllerRef)
                 compactEditor.controllerRef.dialog_opened("qml-compact-discard")
             if (compactEditor.controllerRef)

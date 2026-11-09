@@ -134,7 +134,13 @@ python -m faststack.app [options] [image_dir]
 - `--loupe`: Start directly in single-image loupe view and skip the initial
   thumbnail grid refresh for faster startup on large folders.
 - `--debug`: Enable verbose debug logging and timing information.
-- `--debugcache`: Enable cache telemetry/debug output.
+- `--debugcache`: Log one `[NAVTRACE]` line per image shown (cache hit or
+  miss, decode timings, time from key press to the frame on screen) plus a
+  summary after each burst of navigation, and show live cache stats in the
+  footer.
+- `--debugcache-trace`: Everything `--debugcache` logs, plus per-stage
+  `[DBGCACHE]` timing lines from the decode, prefetch and image-provider
+  code. Very verbose.
 - `--debug-thumbtiming`: Enable thumbnail pipeline timing logs. Implies
   `--debug`.
 - `--debug-thumbtrace`: Enable detailed thumbnail pipeline trace logs. Implies

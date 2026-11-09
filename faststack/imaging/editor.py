@@ -106,7 +106,10 @@ _AUTO_VIBRANCE_TARGET_SAT = 0.22
 _AUTO_VIBRANCE_SAT_CEILING = 0.18
 _AUTO_VIBRANCE_MIN_COLOR_DELTA = 0.015
 _AUTO_VIBRANCE_CLIP_TOLERANCE = 0.0001
-_AUTO_LEVELS_ANALYSIS_MAX_EDGE = 1920
+# Longest edge of the strided sample auto-levels renders and histograms. The
+# endpoints are percentiles of roughly a million pixels at this size; a larger
+# sample moved them by less than one 10-bit bin and cost in proportion.
+_AUTO_LEVELS_ANALYSIS_MAX_EDGE = 1280
 # Box the source-space preview master (``float_preview``) is fitted into.
 # Quick live-preview renders apply edits to that buffer, so this is the
 # resolution the user sees while editing until the display-resolution
@@ -193,6 +196,49 @@ def _resolve_tone_curve_version(value: Any = 1) -> int:
         f"Unsupported tone curve version {value!r}. "
         "Use a compatible FastStack version to edit or save this photo."
     )
+
+
+# Exports at or above this many pixels run their table-lookup colour-space
+# passes on several threads (see _apply_in_parallel_bands).
+_EXPORT_PARALLEL_MIN_PIXELS = 4_000_000
+_EXPORT_BAND_WORKERS = 4
+
+
+def _apply_in_parallel_bands(operation, source: np.ndarray) -> np.ndarray:
+    """Run a per-pixel ``operation`` over horizontal bands on several threads.
+
+    For the 65536-entry transfer lookups of a full-resolution export, which
+    are single-threaded numpy gathers that release the GIL: a 20 MP pass takes
+    roughly half as long on four threads. Not worth it for passes OpenCV
+    already threads or that are cheap to begin with, where the extra copy
+    costs more than it saves. ``operation`` must map every pixel independently
+    and return an array of the input's shape and dtype; the result is then
+    identical to a single call.
+    """
+    workers = max(1, min(_EXPORT_BAND_WORKERS, os.cpu_count() or 1))
+    rows = source.shape[0]
+    if workers < 2 or rows < workers:
+        return operation(source)
+    output = np.empty_like(source)
+    band_height = math.ceil(rows / workers)
+
+    def _band(top: int, bottom: int) -> None:
+        output[top:bottom] = operation(source[top:bottom])
+
+    executor = create_daemon_threadpool_executor(
+        max_workers=workers,
+        thread_name_prefix="ExportPixels",
+    )
+    try:
+        futures = [
+            executor.submit(_band, top, min(rows, top + band_height))
+            for top in range(0, rows, band_height)
+        ]
+        for future in futures:
+            future.result()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    return output
 
 
 def _apply_levels_ramp(arr: np.ndarray, blacks: float, whites: float) -> np.ndarray:
@@ -1818,7 +1864,16 @@ class ImageEditor:
             if cancel_check is not None and cancel_check():
                 raise EditRenderCancelled
 
-        def _cancellable_rows(operation, source: np.ndarray) -> np.ndarray:
+        def _cancellable_rows(
+            operation, source: np.ndarray, *, parallel_export: bool = False
+        ) -> np.ndarray:
+            if (
+                parallel_export
+                and for_export
+                and cancel_check is None
+                and source.shape[0] * source.shape[1] >= _EXPORT_PARALLEL_MIN_PIXELS
+            ):
+                return _apply_in_parallel_bands(operation, source)
             if cancel_check is None or source.shape[0] < 8:
                 return operation(source)
             output = np.empty_like(source)
@@ -1983,7 +2038,13 @@ class ImageEditor:
             if r > left and b > t:
                 arr = arr[t:b, left:r, :]
 
-        if debug_enabled:
+        # Only when geometry did something: this runs for every preview
+        # frame, and "src == out, no crop, angle 0" said nothing each time.
+        if debug_enabled and (
+            crop_box_vals is not None
+            or apply_rotation
+            or (arr.shape[1], arr.shape[0]) != (orig_w, orig_h)
+        ):
             log.debug(
                 "geometry: src=%dx%d crop_box=%s angle=%.3f for_export=%s out=%dx%d",
                 orig_w,
@@ -2075,9 +2136,6 @@ class ImageEditor:
         # computes from a 4x-strided view below. (_skip_linear is computed
         # above, before the protect_input check.)
 
-        if for_export:
-            log.debug("_apply_edits for_export: skip_linear=%s", _skip_linear)
-
         if _skip_linear and not for_export:
             upstream_hash, upstream_frozen = self._get_upstream_edits_hash(
                 edits, stack_ident
@@ -2157,9 +2215,12 @@ class ImageEditor:
             # is safe here; headroom (>1.0) only appears later, in linear space.
             # Exact 8-bit data takes the 256-entry path: same values, several
             # times faster on full-resolution exports.
+            # The exact path is two OpenCV calls that thread themselves; only
+            # the general table lookup gains from row bands on an export.
             arr = _cancellable_rows(
                 _srgb_u8_exact_to_linear if exact_u8 else _srgb_to_linear_fast,
                 arr,
+                parallel_export=not exact_u8,
             )
             _mark("linear_convert")
             _check_cancelled()
@@ -2533,7 +2594,7 @@ class ImageEditor:
             # 13. Conversion back to sRGB
             # The headroom shoulder above caps values at 1.05, inside the LUT
             # domain, so the fast version is exact here (within quantization).
-            arr = _cancellable_rows(_linear_to_srgb_fast, arr)
+            arr = _cancellable_rows(_linear_to_srgb_fast, arr, parallel_export=True)
             _mark("linear_exit")
             _check_cancelled()
 
@@ -2780,49 +2841,17 @@ class ImageEditor:
         else:
             black_threshold_percent = max(0.0, min(50.0, black_threshold_percent))
 
-        with self._lock:
-            # Auto-levels is an aggregate percentile estimate. If the full
-            # master is already warm, sample it down before copying so analysis
-            # follows source pixels without rendering a 20MP+ buffer. If not,
-            # fall back to the preview so the first quick auto-adjust keypress
-            # remains preview-only. Final saves still apply the scalar edits to
-            # the full-resolution master.
-            source_arr = None
-            source_label = "none"
-            source_is_full = False
-            if self.float_image is not None:
-                source_arr = self.float_image
-                source_label = "full"
-                source_is_full = True
-            elif self.float_preview is not None:
-                source_arr = self.float_preview
-                source_label = "preview"
-            edits_snapshot = dict(self.current_edits) if edits is None else dict(edits)
-
-        if source_arr is not None:
-            if source_is_full:
-                longest_edge = max(source_arr.shape[0], source_arr.shape[1])
-                stride = max(
-                    1,
-                    math.ceil(longest_edge / _AUTO_LEVELS_ANALYSIS_MAX_EDGE),
-                )
-                if stride > 1:
-                    source_arr = source_arr[::stride, ::stride, :]
-                    source_label = f"full/{stride}x"
-            img_arr = np.array(source_arr, dtype=np.float32, copy=True, order="C")
-        else:
-            img_arr = None
-
+        # Auto-levels is an aggregate percentile estimate: sample the source
+        # down before rendering so analysis follows source pixels without
+        # rendering a 20MP+ buffer. Final saves still apply the scalar edits
+        # to the full-resolution master.
+        img_arr, _stride, source_label = self._sample_source_for_analysis(
+            lambda h, w: math.ceil(max(h, w) / _AUTO_LEVELS_ANALYSIS_MAX_EDGE)
+        )
         if img_arr is None:
-            # Fallback for tests or cases where float data isn't initialized yet
-            if self.original_image is not None:
-                img_arr = (
-                    np.array(self.original_image.convert("RGB")).astype(np.float32)
-                    / 255.0
-                )
-                source_label = "pil"
-            else:
-                return 0.0, 0.0, 0.0, 255.0
+            return 0.0, 0.0, 0.0, 255.0
+        with self._lock:
+            edits_snapshot = dict(self.current_edits) if edits is None else dict(edits)
 
         if reset_levels:
             edits_snapshot["blacks"] = 0.0
@@ -2971,35 +3000,17 @@ class ImageEditor:
         whites: float,
     ) -> float:
         """Recommend a conservative vibrance boost for low-color auto-adjusts."""
-        with self._lock:
-            # Prefer the unedited master buffer so this analysis cannot double-apply
-            # edits if preview rendering semantics change.  float_preview is only a
-            # fallback for preview-only loads where no master buffer exists.
-            source_arr = (
-                self.float_image if self.float_image is not None else self.float_preview
-            )
-            edits_snapshot = dict(self.current_edits)
-            fallback_original = (
-                self.original_image.copy()
-                if source_arr is None and self.original_image is not None
-                else None
-            )
-
-        if source_arr is None:
-            if fallback_original is None:
-                return 0.0
-            source_arr = (
-                np.array(fallback_original.convert("RGB")).astype(np.float32) / 255.0
-            )
-
-        # Downsample the source before copying so full-resolution masters stay
-        # cheap while _apply_edits still receives a private mutable array.
-        longest_edge = max(source_arr.shape[0], source_arr.shape[1])
-        stride = max(1, math.ceil(longest_edge / _AUTO_VIBRANCE_ANALYSIS_MAX_EDGE))
-        analysis_source = (
-            source_arr[::stride, ::stride, :] if stride > 1 else source_arr
+        # Unedited source pixels, so this analysis cannot double-apply edits
+        # if preview rendering semantics change; sampled down so a
+        # full-resolution master stays cheap while _apply_edits still
+        # receives a private mutable array.
+        img_arr, _stride, _source_label = self._sample_source_for_analysis(
+            lambda h, w: math.ceil(max(h, w) / _AUTO_VIBRANCE_ANALYSIS_MAX_EDGE)
         )
-        img_arr = np.array(analysis_source, dtype=np.float32, copy=True, order="C")
+        if img_arr is None:
+            return 0.0
+        with self._lock:
+            edits_snapshot = dict(self.current_edits)
 
         try:
             current_vibrance = float(edits_snapshot.get("vibrance", 0.0))
@@ -3188,6 +3199,82 @@ class ImageEditor:
             return img_arr
         return view[top:bottom, left:right]
 
+    def _sample_source_for_analysis(
+        self,
+        stride_for: Callable[[int, int], int],
+        *,
+        crop_to_edits: bool = False,
+    ) -> Tuple[Optional[np.ndarray], int, str]:
+        """Every ``stride``-th source pixel, as a private float32 RGB array.
+
+        ``stride_for(height, width)`` picks the stride from the size of the
+        region being sampled. Returns ``(sample, stride, label)``; ``sample``
+        is None when no image is loaded.
+
+        The float master is read when it exists. When it does not (a
+        preview-only load whose master is still being built in the
+        background) the same pixels are read from the 8-bit original, so an
+        analysis gives the same answer whether or not the master happened to
+        be ready. The analyses used to fall back to the display-sized preview
+        instead, and the first auto adjust on an image could differ from a
+        repeat of it, and from one window size to another.
+        """
+        with self._lock:
+            master = self.float_image
+            original = self.original_image
+            preview = self.float_preview
+            eight_bit = self.bit_depth == 8
+
+        # A 16-bit source always has its master (preview-only loads are for
+        # 8-bit files), and its PIL image may not hold the full depth anyway.
+        if master is None and original is not None and eight_bit:
+            width, height = original.size
+            # A zero-channel array costs nothing and tells us whether a crop
+            # is in play without repeating _crop_view_for_analysis's rules.
+            probe = np.empty((height, width, 0), dtype=np.uint8)
+            cropped = crop_to_edits and self._crop_view_for_analysis(probe) is not probe
+            if cropped:
+                # Rare (a crop, then auto white balance, all before the master
+                # is ready): convert the whole frame and take the usual view.
+                rgb = original if original.mode == "RGB" else original.convert("RGB")
+                view = self._crop_view_for_analysis(np.asarray(rgb))
+                stride = max(1, int(stride_for(*view.shape[:2])))
+                sample = view[::stride, ::stride].astype(np.float32)
+            else:
+                stride = max(1, int(stride_for(height, width)))
+                small = original
+                if stride > 1:
+                    # Nearest-neighbour affine with the pixel centre moved
+                    # back by half a stride reads exactly arr[::stride,
+                    # ::stride] without first converting the whole frame.
+                    offset = 0.5 - stride / 2.0
+                    small = original.transform(
+                        (math.ceil(width / stride), math.ceil(height / stride)),
+                        Image.Transform.AFFINE,
+                        (stride, 0, offset, 0, stride, offset),
+                        resample=Image.Resampling.NEAREST,
+                    )
+                if small.mode != "RGB":
+                    small = small.convert("RGB")
+                sample = np.asarray(small).astype(np.float32)
+            # Same arithmetic as the master (see _ensure_float_image), so the
+            # values match it bit for bit.
+            sample *= np.float32(1.0 / 255.0)
+            label = "original" if stride == 1 else f"original/{stride}x"
+            return np.ascontiguousarray(sample), stride, label
+
+        source = master if master is not None else preview
+        if source is None:
+            return None, 1, "none"
+        view = self._crop_view_for_analysis(source) if crop_to_edits else source
+        stride = max(1, int(stride_for(*view.shape[:2])))
+        name = "full" if master is not None else "preview"
+        label = name if stride == 1 else f"{name}/{stride}x"
+        sample = np.array(
+            view[::stride, ::stride], dtype=np.float32, copy=True, order="C"
+        )
+        return sample, stride, label
+
     def estimate_auto_white_balance(
         self,
         *,
@@ -3199,7 +3286,7 @@ class ImageEditor:
         luma_upper_bound: int = 220,
         rgb_lower_bound: int = 5,
         rgb_upper_bound: int = 250,
-        target_pixels: int = 600_000,
+        target_pixels: int = 150_000,
     ) -> Optional[Dict[str, float]]:
         """Estimate white-balance sliders from a robust preview-sized sample.
 
@@ -3213,29 +3300,33 @@ class ImageEditor:
         if _debug:
             t0 = time.perf_counter()
 
-        img_arr = (
-            self.float_image if self.float_image is not None else self.float_preview
+        # The estimate is a set of means and one percentile over the frame,
+        # and every stage below is linear in the sample count. Against the
+        # 600 thousand samples used before, 150 thousand moved the sliders by
+        # 0.002 at most (a fifth of one slider step) on ordinary photos, and
+        # by 0.02 on one whose cast was strong enough to pin a slider.
+        srgb, stride, _source_label = self._sample_source_for_analysis(
+            lambda h, w: int(math.sqrt(max(1, h * w) / max(1, target_pixels))),
+            crop_to_edits=True,
         )
-        if img_arr is None:
-            if self.original_image is None:
-                return None
-            img_arr = (
-                np.asarray(self.original_image.convert("RGB"), dtype=np.float32) / 255.0
-            )
-
-        img_arr = self._crop_view_for_analysis(img_arr)
-        h, w = img_arr.shape[:2]
-        total_pixels = max(1, h * w)
-        stride = max(1, int(math.sqrt(total_pixels / max(1, target_pixels))))
-        srgb = np.ascontiguousarray(np.clip(img_arr[::stride, ::stride], 0.0, 1.0))
+        if srgb is None:
+            return None
+        np.clip(srgb, 0.0, 1.0, out=srgb)
 
         rgb_low = max(0.0, min(255.0, float(rgb_lower_bound))) / 255.0
         rgb_high = max(0.0, min(255.0, float(rgb_upper_bound))) / 255.0
         luma_low = max(0.0, min(255.0, float(luma_lower_bound))) / 255.0
         luma_high = max(0.0, min(255.0, float(luma_upper_bound))) / 255.0
 
-        mask = np.all(srgb > rgb_low, axis=2) & np.all(srgb < rgb_high, axis=2)
-        luma = 0.2126 * srgb[:, :, 0] + 0.7152 * srgb[:, :, 1] + 0.0722 * srgb[:, :, 2]
+        # Per-pixel channel extremes, taken channel by channel: the same
+        # values as np.min/np.max(axis=2), which reduce over a length-3 axis
+        # one pixel at a time and cost over ten times as much.
+        red, green, blue = srgb[:, :, 0], srgb[:, :, 1], srgb[:, :, 2]
+        channel_min = np.minimum(np.minimum(red, green), blue)
+        channel_max = np.maximum(np.maximum(red, green), blue)
+
+        mask = (channel_min > rgb_low) & (channel_max < rgb_high)
+        luma = 0.2126 * red + 0.7152 * green + 0.0722 * blue
         mask &= (luma > luma_low) & (luma < luma_high)
 
         if not np.any(mask):
@@ -3245,7 +3336,7 @@ class ImageEditor:
         # secondary Shades-of-Gray estimator below.
         broad_mask = mask
 
-        spread = np.max(srgb, axis=2) - np.min(srgb, axis=2)
+        spread = channel_max - channel_min
         chroma_ratio = spread / np.maximum(luma, 1.0 / 255.0)
         valid_ratio = chroma_ratio[mask]
 
@@ -3322,7 +3413,16 @@ class ImageEditor:
 
         # Few usable neutral pixels means an unreliable estimate; fade the
         # correction toward identity instead of failing or over-correcting.
-        confidence *= float(np.clip((selected_count - 64) / 2000.0, 0.0, 1.0))
+        # The 64..2064 ramp was set for a 600 thousand pixel sample; it scales
+        # with the sample so the same share of the frame earns the same trust.
+        count_scale = max(1, target_pixels) / 600_000.0
+        confidence *= float(
+            np.clip(
+                (selected_count - 64.0 * count_scale) / (2000.0 * count_scale),
+                0.0,
+                1.0,
+            )
+        )
         if confidence <= 0.0:
             return None
 

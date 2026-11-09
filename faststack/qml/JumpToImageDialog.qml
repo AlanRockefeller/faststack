@@ -24,11 +24,15 @@ Dialog {
         color: jumpDialog.backgroundColor
     }
 
-    onOpened: {
+    // aboutToShow, not opened: opened() fires only once the enter transition
+    // has finished. Until then the dialog was not registered and the field
+    // had no focus, so digits typed straight after "g" ran as shortcuts.
+    onAboutToShow: {
         if (jumpDialog.controllerRef) jumpDialog.controllerRef.dialog_opened("qml-jump")
         imageNumberField.text = ""
         imageNumberField.forceActiveFocus()
     }
+    onOpened: if (!imageNumberField.activeFocus) imageNumberField.forceActiveFocus()
     
     onClosed: {
         // Notify Python that dialog is closed

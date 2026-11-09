@@ -2264,7 +2264,10 @@ ApplicationWindow {
         width: 1000
         height: 750
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-about")
+        // Dialogs register in aboutToShow, not opened: opened() fires only
+        // once the enter transition has finished, and until a dialog is
+        // registered the keys typed in that gap ran as global shortcuts.
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-about")
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-about")
 
         background: Rectangle {
@@ -2391,7 +2394,7 @@ ApplicationWindow {
 
         property string readmeText: ""
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-readme")
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-readme")
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-readme")
 
         background: Rectangle {
@@ -2435,7 +2438,7 @@ ApplicationWindow {
         width: 400
         height: 300
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-stack-info")
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-stack-info")
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-stack-info")
 
         background: Rectangle {
@@ -2612,7 +2615,7 @@ ApplicationWindow {
         readonly property string releaseUrl: updateInfo && updateInfo.releaseUrl ? updateInfo.releaseUrl : ""
         readonly property string releaseSummary: updateInfo && updateInfo.summary ? updateInfo.summary : "Open the release page for details."
 
-        onOpened: {
+        onAboutToShow: {
             if (root.controllerRef) root.controllerRef.dialog_opened("qml-update")
         }
         onClosed: {
@@ -2753,14 +2756,21 @@ ApplicationWindow {
         width: Math.min(420, parent.width * 0.9)
         standardButtons: Dialog.Yes | Dialog.No
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-unsaved-close")
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-unsaved-close")
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-unsaved-close")
         Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-unsaved-close")
 
-        Label {
+        // A layout, not a bare Label with width: parent.width. The Dialog
+        // sizes itself from its content, so a wrapped Label sized from the
+        // Dialog is a binding loop on implicitHeight (Qt logs it, and picks
+        // the height from whichever pass ran last).
+        ColumnLayout {
             width: parent.width
-            text: "Your current edits could not be saved (see the status bar).\n\nQuit anyway and discard them?"
-            wrapMode: Text.WordWrap
+            Label {
+                Layout.fillWidth: true
+                text: "Your current edits could not be saved (see the status bar).\n\nQuit anyway and discard them?"
+                wrapMode: Text.WordWrap
+            }
         }
 
         onAccepted: {
@@ -2778,14 +2788,18 @@ ApplicationWindow {
         width: Math.min(420, parent.width * 0.9)
         standardButtons: Dialog.Yes | Dialog.No
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-clear-batches")
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-clear-batches")
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-clear-batches")
         Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-clear-batches")
 
-        Label {
+        // See unsavedCloseDialog for why this is a layout.
+        ColumnLayout {
             width: parent.width
-            text: "Remove every image in this folder from the drag & drop batch?\n\nCtrl+Z restores it."
-            wrapMode: Text.WordWrap
+            Label {
+                Layout.fillWidth: true
+                text: "Remove every image in this folder from the drag & drop batch?\n\nCtrl+Z restores it."
+                wrapMode: Text.WordWrap
+            }
         }
 
         onAccepted: if (root.uiStateRef) root.uiStateRef.clear_all_batches()
@@ -2806,7 +2820,7 @@ ApplicationWindow {
         // Set by the buttons; Escape or closing any other way cancels.
         property string choice: "cancel"
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-image-editor-unsaved")
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-image-editor-unsaved")
         onClosed: {
             if (root.controllerRef) {
                 root.controllerRef.dialog_closed("qml-image-editor-unsaved")
@@ -2888,10 +2902,8 @@ ApplicationWindow {
             }
         }
 
-        onOpened: {
-            if (root.controllerRef) root.controllerRef.dialog_opened("qml-recycle-cleanup")
-            refreshBinInfo()
-        }
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-recycle-cleanup")
+        onOpened: refreshBinInfo()
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-recycle-cleanup")
         Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-recycle-cleanup")
 

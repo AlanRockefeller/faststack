@@ -116,16 +116,65 @@ class Keybinder:
                 return method_name
         return None
 
+    # Pressing a modifier on its own is not a command; it used to be logged
+    # as one ("Key pressed: 16777248 ('')") every time Shift or Ctrl went down.
+    _MODIFIER_KEYS = frozenset(
+        {
+            Qt.Key_Shift,
+            Qt.Key_Control,
+            Qt.Key_Alt,
+            Qt.Key_AltGr,
+            Qt.Key_Meta,
+            Qt.Key_Super_L,
+            Qt.Key_Super_R,
+            Qt.Key_CapsLock,
+            Qt.Key_NumLock,
+            Qt.Key_ScrollLock,
+        }
+    )
+
+    @staticmethod
+    def describe_key(key, modifiers) -> str:
+        """``Ctrl+Shift+B`` rather than ``66 ... ControlModifier|ShiftModifier``."""
+        try:
+            name = Qt.Key(key).name.removeprefix("Key_")
+        except (ValueError, TypeError, AttributeError):
+            name = f"key {key}"
+        parts = [
+            label
+            for flag, label in (
+                (Qt.ControlModifier, "Ctrl"),
+                (Qt.AltModifier, "Alt"),
+                (Qt.MetaModifier, "Meta"),
+                (Qt.ShiftModifier, "Shift"),
+            )
+            if modifiers & flag
+        ]
+        return "+".join([*parts, name])
+
     def handle_key_press(self, event):
         key = event.key()
-        text = event.text()
+        if key in self._MODIFIER_KEYS:
+            return False
         modifiers = event.modifiers() & self._BINDING_MODIFIERS
-        log.debug(f"Key pressed: {key} ({text!r}) with modifiers {modifiers}")
+        method_name = self._binding_for(key, event.text(), modifiers)
+        if log.isEnabledFor(logging.DEBUG):
+            # One line per key: what was pressed and what it ran.
+            log.debug(
+                "Key %s -> %s",
+                self.describe_key(key, modifiers),
+                method_name or "(unbound)",
+            )
+        if not method_name:
+            return False
+        self._call(method_name)
+        return True
 
+    def _binding_for(self, key, text, modifiers):
+        """The action a key press runs, or None. Never calls anything."""
         method_name = self._CHARACTER_MAP.get(text)
         if method_name:
-            self._call(method_name)
-            return True
+            return method_name
 
         # Modifier combinations match exactly, so Ctrl+Shift+C is not Ctrl+C
         # and a future binding cannot be shadowed by a shorter one. Shift is
@@ -137,60 +186,48 @@ class Keybinder:
         for candidate in candidates:
             method_name = self._modifier_binding(key, candidate)
             if method_name:
-                log.debug(f"Matched modifier key: {key} + {candidate} -> {method_name}")
-                self._call(method_name)
-                return True
+                return method_name
 
         command_modifiers = modifiers & self._COMMAND_MODIFIERS
 
         # Check for single key presses
         if key == Qt.Key_L:
             if not command_modifiers:
-                self._call(
+                return (
                     "quick_auto_adjust"
                     if modifiers & Qt.ShiftModifier
                     else "quick_auto_levels"
                 )
-                return True
-            return False
+            return None
 
         if command_modifiers:
             # Unbound Ctrl/Alt/Meta chords (Ctrl+P, Alt+D, ...) no longer fall
             # through to the plain-key action.
-            return False
+            return None
 
         if text == "-":
-            self._call("reduce_auto_adjust_highlights")
-            return True
+            return "reduce_auto_adjust_highlights"
         if text == "_":
-            self._call("raise_auto_adjust_whites")
-            return True
+            return "raise_auto_adjust_whites"
         if text == "+":
-            self._call("raise_auto_adjust_blacks")
-            return True
+            return "raise_auto_adjust_blacks"
         if text == "=":
-            self._call("deepen_auto_adjust_blacks")
-            return True
+            return "deepen_auto_adjust_blacks"
         if key == Qt.Key_Minus and modifiers == Qt.NoModifier:
-            self._call("reduce_auto_adjust_highlights")
-            return True
+            return "reduce_auto_adjust_highlights"
         if key == Qt.Key_Underscore:
-            self._call("raise_auto_adjust_whites")
-            return True
+            return "raise_auto_adjust_whites"
         if key == Qt.Key_Plus:
-            self._call("raise_auto_adjust_blacks")
-            return True
+            return "raise_auto_adjust_blacks"
         if key == Qt.Key_Equal and modifiers == Qt.NoModifier:
-            self._call("deepen_auto_adjust_blacks")
-            return True
+            return "deepen_auto_adjust_blacks"
 
         method_name = self.key_map.get(key)
         if method_name:
             # Letter bindings are plain keys: Shift+letter is left unbound.
             # Symbol keys such as { } _ + need Shift to be typed at all.
             if self._is_letter_key(key) and modifiers & Qt.ShiftModifier:
-                return False
-            self._call(method_name)
-            return True
+                return None
+            return method_name
 
-        return False
+        return None

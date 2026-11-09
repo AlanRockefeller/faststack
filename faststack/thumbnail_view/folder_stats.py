@@ -1,13 +1,17 @@
 """Parse faststack.json for folder statistics display in thumbnail grid."""
 
+import dataclasses
 import json
 import logging
 import os
 import threading
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+from faststack.logging_setup import get_app_data_dir
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +52,135 @@ MAX_CACHE_SIZE = 1000
 # Folder stats are read from the UI thread and from thumbnail workers; the
 # FIFO trim iterates the dict, which must not race another thread's insert.
 _cache_lock = threading.Lock()
+
+
+# The same results, kept in the app-data folder between runs. Opening a folder
+# with many subfolders parsed every child's faststack.json and listed every
+# child directory on the GUI thread at each start; with this, an unchanged
+# child costs the two stat() calls that validate its entry. Entries are keyed
+# by folder path and checked against the same two mtimes as _stats_cache.
+_PERSISTED_FILENAME = "folder_stats_cache.json"
+_PERSISTED_VERSION = 1
+_PERSIST_DELAY_SECONDS = 2.0
+# abspath -> {"json": mtime_ns, "dir": mtime_ns, "stats": dict or None}.
+# None until first use; guarded by _cache_lock.
+_persisted: Optional[Dict[str, dict]] = None
+_persist_timer: Optional[threading.Timer] = None
+
+
+def _persisted_path() -> Path:
+    return get_app_data_dir() / _PERSISTED_FILENAME
+
+
+def _load_persisted_locked() -> Dict[str, dict]:
+    """Return the on-disk entries, reading the file on first use."""
+    global _persisted
+    if _persisted is None:
+        _persisted = {}
+        try:
+            with open(_persisted_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if (
+                isinstance(data, dict)
+                and data.get("version") == _PERSISTED_VERSION
+                and isinstance(data.get("folders"), dict)
+            ):
+                _persisted = data["folders"]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            log.debug("Ignoring unreadable folder stats cache: %s", e)
+    return _persisted
+
+
+def _stats_from_persisted(payload) -> Optional["FolderStats"]:
+    """Rebuild a FolderStats from its JSON form; raises on anything unexpected."""
+    if payload is None:
+        return None
+    values = dict(payload)
+    values["coverage_buckets"] = [
+        (float(a), float(b), float(c), float(d))
+        for a, b, c, d in values.get("coverage_buckets", [])
+    ]
+    values["batch_coverage_buckets"] = [
+        float(v) for v in values.get("batch_coverage_buckets", [])
+    ]
+    for name in (
+        "total_images",
+        "stacked_count",
+        "uploaded_count",
+        "edited_count",
+        "batch_count",
+        "jpg_count",
+        "raw_count",
+    ):
+        if name in values:
+            values[name] = int(values[name])
+    return FolderStats(**values)
+
+
+def _persisted_lookup_locked(
+    cache_key: Tuple[str, int, int],
+) -> Tuple[Optional["FolderStats"], bool]:
+    """Return ``(stats, found)`` for a key whose mtimes still match on disk."""
+    folder, json_mtime_ns, folder_mtime_ns = cache_key
+    entry = _load_persisted_locked().get(folder)
+    if not isinstance(entry, dict):
+        return None, False
+    if entry.get("json") != json_mtime_ns or entry.get("dir") != folder_mtime_ns:
+        return None, False
+    try:
+        return _stats_from_persisted(entry.get("stats")), True
+    except (TypeError, ValueError):
+        return None, False
+
+
+def _persisted_store_locked(
+    cache_key: Tuple[str, int, int], stats: Optional["FolderStats"]
+) -> None:
+    folder, json_mtime_ns, folder_mtime_ns = cache_key
+    entries = _load_persisted_locked()
+    entries.pop(folder, None)  # re-insert at the end: the trim is FIFO
+    entries[folder] = {
+        "json": json_mtime_ns,
+        "dir": folder_mtime_ns,
+        "stats": dataclasses.asdict(stats) if stats is not None else None,
+    }
+    _check_cache_size(entries)
+    _schedule_persist_locked()
+
+
+def _schedule_persist_locked() -> None:
+    """Write the entries out shortly, once, however many just changed."""
+    global _persist_timer
+    if _persist_timer is not None:
+        return
+    timer = threading.Timer(_PERSIST_DELAY_SECONDS, _flush_persisted)
+    timer.daemon = True
+    timer.name = "FolderStatsCache"
+    _persist_timer = timer
+    timer.start()
+
+
+def _flush_persisted() -> None:
+    """Timer thread: replace the cache file with the current entries."""
+    global _persist_timer
+    with _cache_lock:
+        _persist_timer = None
+        payload = json.dumps(
+            {"version": _PERSISTED_VERSION, "folders": _persisted or {}}
+        )
+    # Only a cache: no fsync, and a failed write just means a slower start.
+    try:
+        path = _persisted_path()
+        temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(payload, encoding="utf-8")
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    except OSError as e:
+        log.debug("Could not write folder stats cache: %s", e)
 
 
 def _check_cache_size(cache_dict):
@@ -104,6 +237,12 @@ def read_folder_stats(folder_path: Path) -> Optional[FolderStats]:
     with _cache_lock:
         if cache_key in _stats_cache:
             return _stats_cache[cache_key]
+        # A result from an earlier run, still valid for these two mtimes.
+        stats, found = _persisted_lookup_locked(cache_key)
+        if found:
+            _check_cache_size(_stats_cache)
+            _stats_cache[cache_key] = stats
+            return stats
 
     # Parse the JSON file
     stats = _parse_faststack_json(json_path)
@@ -112,6 +251,7 @@ def read_folder_stats(folder_path: Path) -> Optional[FolderStats]:
     with _cache_lock:
         _check_cache_size(_stats_cache)
         _stats_cache[cache_key] = stats
+        _persisted_store_locked(cache_key, stats)
 
     return stats
 
@@ -329,9 +469,14 @@ def _compute_folder_coverage(
 
 
 def clear_stats_cache():
-    """Clear the folder stats cache."""
+    """Clear the folder stats cache, including the copy kept between runs."""
+    global _persisted
     with _cache_lock:
         _stats_cache.clear()
+        had_persisted = bool(_load_persisted_locked())
+        _persisted = {}
+        if had_persisted:
+            _schedule_persist_locked()
     log.debug("Cleared folder stats cache")
 
 

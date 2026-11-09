@@ -1501,6 +1501,11 @@ class SavePipelineMixin:
                     self._reindex_after_save(preserved_path)
                 if saved_path:
                     self._invalidate_decoded_path(saved_path, force=True)
+                    # The saved image is usually the neighbour just left, and
+                    # its frames were dropped above. Rebuild the window so it
+                    # is decoded again; otherwise stepping back to it was a
+                    # cache miss on the image most likely to be revisited.
+                    self._do_prefetch(self.current_index)
 
             self._restart_quality_decode_timer()
 

@@ -901,7 +901,7 @@ class AppConfig:
             self.config = latest
             self._changed_options.clear()
             self._removed_options.clear()
-            log.info("Saved config to %s", self.config_path)
+            log.debug("Saved config to %s", self.config_path)
             return True
         except (OSError, configparser.Error) as e:
             log.error("Failed to save config to %s: %s", self.config_path, e)
