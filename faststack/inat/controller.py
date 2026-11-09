@@ -250,6 +250,7 @@ class INatUploadController(QObject):
         self._busy_jobs = 0
         self._status_text = ""
         self._usage_text = ""
+        self._vision_requests = 0  # identify calls sent this session
         self._upload_done = 0
         self._upload_total = 0
         self._cancel_upload = threading.Event()
@@ -366,6 +367,19 @@ class INatUploadController(QObject):
     @Property(str, notify=usageTextChanged)
     def usageText(self) -> str:
         return self._usage_text
+
+    @Property(int, notify=usageTextChanged)
+    def visionRequests(self) -> int:  # noqa: N802
+        """MycoMap Vision identify calls sent since FastStack started."""
+        return self._vision_requests
+
+    @Property(str, notify=usageTextChanged)
+    def visionCounterText(self) -> str:  # noqa: N802
+        """Lower-right counter: calls this session plus the account's period use."""
+        parts = [f"Vision requests this session: {self._vision_requests}"]
+        if self._usage_text and self._usage_text.startswith("MycoMap Vision: "):
+            parts.append(self._usage_text[len("MycoMap Vision: ") :])
+        return " · ".join(parts)
 
     @Property(int, notify=uploadProgressChanged)
     def uploadDone(self) -> int:
@@ -1071,6 +1085,8 @@ class INatUploadController(QObject):
         card.status_text = "Asking MycoMap Vision..."
         card.identify_pending = True
         self._model.refresh(card, "status", "statusText")
+        self._vision_requests += 1
+        self.usageTextChanged.emit()
         token = card.token
         photos = card.group.sorted_photos()
         loc = card.location(float(self.spreadWarningMeters))
@@ -1126,9 +1142,9 @@ class INatUploadController(QObject):
             limit = result.usage.get("limit")
             if used is not None:
                 self._usage_text = (
-                    f"MycoMap Vision: {used} / {limit} identifications used"
+                    f"MycoMap Vision: {used} / {limit} this period"
                     if limit is not None
-                    else f"MycoMap Vision: {used} identifications used"
+                    else f"MycoMap Vision: {used} this period (unlimited)"
                 )
                 self.usageTextChanged.emit()
         self._model.refresh(

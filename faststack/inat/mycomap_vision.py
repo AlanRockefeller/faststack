@@ -187,8 +187,8 @@ class Usage:
     @property
     def text(self) -> str:
         if self.limit is None:
-            return f"{self.used} identifications this period (unlimited)"
-        return f"{self.used} / {self.limit} identifications used ({self.period})"
+            return f"{self.used} this period (unlimited)"
+        return f"{self.used} / {self.limit} this period"
 
 
 def client_ref_for(paths: Sequence[Path]) -> str:

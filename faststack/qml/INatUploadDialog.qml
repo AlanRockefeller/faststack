@@ -119,11 +119,6 @@ Window {
                 color: dialog.uploader && dialog.uploader.inatLogin ? dialog.okColor : dialog.warnColor
                 font.pixelSize: 12
             }
-            Text {
-                text: dialog.uploader ? dialog.uploader.usageText : ""
-                color: dialog.mutedText
-                font.pixelSize: 12
-            }
             ToolButton {
                 text: "⚙ Settings"
                 onClicked: settingsPopup.open()
@@ -334,6 +329,17 @@ Window {
                 text: "Drag photos between cards to fix the grouping · tick cards and Merge to combine them"
                 color: "#666666"
                 font.pixelSize: 11
+            }
+            // Vision request counter: handy for people with a metered Vision plan.
+            Text {
+                text: dialog.uploader ? dialog.uploader.visionCounterText : ""
+                color: dialog.okColor
+                font.pixelSize: 12
+                font.bold: true
+                Layout.leftMargin: 12
+                ToolTip.visible: counterHover.containsMouse
+                ToolTip.text: "MycoMap Vision identify calls. Each card identified (or re-identified) is one request; the period figure comes from your MycoMap account."
+                MouseArea { id: counterHover; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
             }
         }
     }
