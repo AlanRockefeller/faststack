@@ -208,6 +208,49 @@ def _get_turbojpeg_scaling_factor(
     return supported_factors[-1] if supported_factors else None
 
 
+# How far past the target rectangle the quick ("fast") display frame's decode
+# may reach before the next size down is used instead.
+_FAST_DISPLAY_OVERSHOOT = 0.12
+
+
+def _get_turbojpeg_fast_display_factor(
+    width: int,
+    height: int,
+    max_width: int,
+    max_height: int,
+) -> Optional[Tuple[int, int]]:
+    """DCT scale for the quick display frame: fit within, with a little give.
+
+    libjpeg-turbo only offers eighths, so "largest scale that fits" drops a
+    whole size the moment the next one is a few pixels too big. A 5184x3888
+    photo in a 944 px tall area missed 1296x972 by 28 px and was decoded at
+    648x486, then stretched to nearly twice that on screen until the settled
+    frame replaced it. When the next size up overshoots the target by at most
+    ``_FAST_DISPLAY_OVERSHOOT``, take it; the caller scales it down to fit.
+    It costs about a third more decode time and four times the pixels, only
+    for targets that sit just under a size step. Upscaling factors are never
+    chosen this way.
+    """
+    base = _get_turbojpeg_scaling_factor(width, height, max_width, max_height)
+    if base is None:
+        return None
+    base_scale = base[0] / base[1]
+    larger = [
+        factor
+        for factor in JPEG_DECODER.scaling_factors
+        if factor[0] <= factor[1] and factor[0] / factor[1] > base_scale
+    ]
+    if not larger:
+        return base
+    num, den = min(larger, key=lambda factor: factor[0] / factor[1])
+    limit = 1.0 + _FAST_DISPLAY_OVERSHOOT
+    if (width * num / den) <= max_width * limit and (
+        height * num / den
+    ) <= max_height * limit:
+        return (num, den)
+    return base
+
+
 def _get_turbojpeg_covering_factor(
     constraining_dim: int, target: int
 ) -> Optional[Tuple[int, int]]:
@@ -313,7 +356,7 @@ def decode_jpeg_resized(
 
                 scale_factor = _get_turbojpeg_covering_factor(constraining_dim, max_dim)
             else:
-                scale_factor = _get_turbojpeg_scaling_factor(
+                scale_factor = _get_turbojpeg_fast_display_factor(
                     img_width,
                     img_height,
                     width,
