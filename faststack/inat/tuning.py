@@ -12,6 +12,7 @@ Stored as JSON in the app data directory; a few hundred batches is tiny.
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import math
@@ -137,11 +138,23 @@ def best_threshold(
         candidates.append(math.sqrt(a * b))
     candidates.append(xs[-1] * 2.0)
     candidates.append(max(floor, prefer))  # the default itself can win a tie
+    # Score every candidate from one sorted pass: a threshold T gets right
+    # the "same" pairs at or below it and the "different" pairs above it.
+    # Counting the pairs again per candidate is quadratic, and this runs on
+    # the GUI thread with the whole upload history each time the dialog opens.
+    ordered = sorted(values, key=lambda item: item[0])
+    raw = [v for v, _ in ordered]
+    same_upto = [0]
+    for _, same in ordered:
+        same_upto.append(same_upto[-1] + (1 if same else 0))
+    total_different = len(ordered) - same_upto[-1]
+
     best: Optional[float] = None
     best_score = -1
     best_dist = float("inf")
     for t in candidates:
-        score = sum(1 for v, same in values if (v <= t) == same)
+        k = bisect.bisect_right(raw, t)  # pairs with value <= t
+        score = same_upto[k] + total_different - (k - same_upto[k])
         dist = abs(math.log(max(t, 1e-9)) - math.log(max(prefer, 1e-9)))
         if score > best_score or (score == best_score and dist < best_dist):
             best, best_score, best_dist = t, score, dist
@@ -200,8 +213,17 @@ class GroupingHistory:
         pairs: Sequence[PairRecord],
         photos: int,
         observations: int,
+        replace_last: bool = False,
     ) -> None:
+        """Remember one upload's grouping.
+
+        ``replace_last`` swaps out the newest record when it is for the same
+        folder: pressing Upload again on the same batch (a retry after a
+        failed card) is one decision, not a second batch to learn from.
+        """
         self._ensure_loaded()
+        if replace_last and self._batches and self._batches[-1].folder == folder:
+            self._batches.pop()
         self._batches.append(
             BatchRecord(
                 folder=folder,

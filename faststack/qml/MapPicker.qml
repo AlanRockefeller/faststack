@@ -197,11 +197,20 @@ Item {
             }
         }
         onDoubleClicked: function(mouse) { map.zoomAt(1, mouse.x, mouse.y) }
+        // One zoom level per wheel notch (120 units). A touchpad or a
+        // high-resolution wheel sends many small deltas per gesture; zooming
+        // a level on each of them would jump from street to continent.
+        property real wheelRemainder: 0
         onWheel: function(wheel) {
-            if (wheel.angleDelta.y === 0) { wheel.accepted = true; return }  // horizontal scroll
-            var step = wheel.angleDelta.y > 0 ? 1 : -1
-            map.zoomAt(step, wheel.x, wheel.y)
             wheel.accepted = true
+            if (wheel.angleDelta.y === 0) return  // horizontal scroll
+            if ((wheel.angleDelta.y > 0) !== (wheelRemainder > 0)) wheelRemainder = 0
+            wheelRemainder += wheel.angleDelta.y
+            while (Math.abs(wheelRemainder) >= 120) {
+                var step = wheelRemainder > 0 ? 1 : -1
+                wheelRemainder -= step * 120
+                map.zoomAt(step, wheel.x, wheel.y)
+            }
         }
     }
 

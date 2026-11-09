@@ -12536,7 +12536,9 @@ class AppController(
         if current_path in catalogue and self._is_current_live_edit_session_dirty():
             if self._block_if_saving(current_path):
                 return False
-            if not self._flush_current_live_edit_session_for_drag():
+            if not self._flush_current_live_edit_session_for_drag(
+                saving_status="Saving edits before upload..."
+            ):
                 return False
         for path in send:
             if self._block_if_saving(path):

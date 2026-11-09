@@ -39,12 +39,20 @@ def prepare_jpeg(path: Path, long_edge: int, quality: int = JPEG_QUALITY) -> byt
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
         img.thumbnail((long_edge, long_edge), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
         kwargs = {"quality": quality, "optimize": True}
-        if exif:
-            kwargs["exif"] = exif
         if icc:
             kwargs["icc_profile"] = icc
+        if exif:
+            # A JPEG segment holds at most 64 KB. EXIF taken from another
+            # container (TIFF, HEIC) can be larger; the photo still has to go
+            # up, and the observation carries its own date and place.
+            buf = io.BytesIO()
+            try:
+                img.save(buf, format="JPEG", exif=exif, **kwargs)
+                return buf.getvalue()
+            except ValueError as exc:
+                log.warning("Sending %s without EXIF: %s", path.name, exc)
+        buf = io.BytesIO()
         img.save(buf, format="JPEG", **kwargs)
         return buf.getvalue()
 

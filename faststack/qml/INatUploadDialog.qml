@@ -48,10 +48,18 @@ Window {
     Component.onDestruction: { if (controllerRef) controllerRef.dialog_closed("qml-inat-upload") }
 
     onClosing: function(close) {
-        if (uploader && uploader.busy) {
+        // Only an upload has to finish (or be cancelled) first: closing in
+        // the middle of one would leave observations half attached. An
+        // identification can take minutes when Vision is rate limiting, and
+        // this window is application-modal, so waiting for one would lock
+        // the whole app; those are dropped instead and the cards stay as
+        // they are for the next time the dialog opens.
+        if (uploader && uploader.uploading) {
             close.accepted = false
-            dialog.toast("Wait for the current job to finish (or cancel it) before closing.")
+            dialog.toast("Wait for the upload to finish (or cancel it) before closing.")
+            return
         }
+        if (uploader) uploader.cancelIdentify()
     }
 
     function toast(text) {
@@ -469,7 +477,9 @@ Window {
         background: Rectangle { color: "#2a2a2a"; radius: 8; border.color: "#4a4a4a"; border.width: 1 }
         width: Math.min(720, dialog.width - 40)
         padding: 18
-        onOpened: {
+        // aboutToShow, not opened: opened() fires only after the enter
+        // transition, which wiped a token pasted the moment the popup appeared.
+        onAboutToShow: {
             tokenField.text = ""
             keyField.text = ""
             gapField.text = dialog.uploader ? dialog.uploader.timeGapMinutes : 10
@@ -484,7 +494,14 @@ Window {
             spacing: 10
             Text { text: "iNaturalist upload settings"; color: dialog.textColor; font.pixelSize: 16; font.bold: true }
 
-            Text { text: "Credentials (stored in the OS keyring: " + (dialog.uploader ? dialog.uploader.keyringBackend : "") + ")"; color: dialog.mutedText; font.pixelSize: 12 }
+            Text {
+                text: !dialog.uploader ? ""
+                      : (dialog.uploader.keyringBackend === "file"
+                         ? "Credentials (no OS keyring available: stored in an owner-only file in the FastStack data folder)"
+                         : "Credentials (stored in the OS keyring: " + dialog.uploader.keyringBackend + ")")
+                color: dialog.mutedText; font.pixelSize: 12
+                wrapMode: Text.Wrap; Layout.fillWidth: true
+            }
             GridLayout {
                 columns: 3
                 columnSpacing: 8

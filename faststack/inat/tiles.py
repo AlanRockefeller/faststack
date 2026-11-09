@@ -44,6 +44,9 @@ FREE_SPACE_HEADROOM = 1024 * 1024 * 1024
 _FREQUENCY_BONUS_SECONDS = 7 * 24 * 3600
 # A tile fetched within this window is never evicted (it is probably on screen).
 _FRESH_GRACE_SECONDS = 3600
+# Once over budget, evict down to this fraction of it. Stopping exactly at the
+# budget would re-sort the whole index for every tile downloaded afterwards.
+_EVICT_TO_FRACTION = 0.9
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tiles (
@@ -101,6 +104,14 @@ class TileCache:
         self._db = sqlite3.connect(
             str(self.directory / "index.sqlite"), check_same_thread=False
         )
+        # Every tile shown records a use. With SQLite's defaults that is a
+        # synced journal write per tile, which makes panning stutter; the
+        # index can be rebuilt from the files, so durability is not needed.
+        for pragma in ("journal_mode=WAL", "synchronous=NORMAL"):
+            try:
+                self._db.execute(f"PRAGMA {pragma}")
+            except sqlite3.Error as exc:  # e.g. a filesystem without WAL support
+                log.debug("Tile index: PRAGMA %s refused: %s", pragma, exc)
         self._db.executescript(_SCHEMA)
         self._db.commit()
         self._reconcile()
@@ -195,8 +206,9 @@ class TileCache:
                 "SELECT z,x,y,size,fetched_at,last_used,use_count FROM tiles"
             ).fetchall()
             scored = sorted(rows, key=lambda r: self._score(r[5], r[6]))
+            target = budget * _EVICT_TO_FRACTION
             for z, x, y, size, fetched_at, _last_used, _count in scored:
-                if total <= budget:
+                if total <= target:
                     break
                 if now - fetched_at < _FRESH_GRACE_SECONDS:
                     continue
@@ -216,10 +228,35 @@ class TileCache:
         return removed
 
     def clear(self) -> None:
+        """Delete every cached tile.
+
+        Only files this cache wrote are removed. The folder is chosen by the
+        user and may already hold a ``tiles`` directory of something else, so
+        a recursive delete of it is not safe.
+        """
         with self._lock:
+            rows = self._db.execute("SELECT z,x,y FROM tiles").fetchall()
             self._db.execute("DELETE FROM tiles")
             self._db.commit()
-        shutil.rmtree(self._tiles_dir, ignore_errors=True)
+        parents: set[Path] = set()
+        for z, x, y in rows:
+            path = self._tile_path(z, x, y)
+            for victim in (path, path.with_suffix(".tmp")):
+                try:
+                    victim.unlink(missing_ok=True)
+                except OSError as exc:
+                    log.debug("Could not delete tile %s: %s", victim, exc)
+            parents.add(path.parent)
+        # Remove the z/x folders that are now empty; rmdir refuses anything
+        # that still holds a file.
+        for folder in sorted(parents, key=lambda p: len(p.parts), reverse=True):
+            for candidate in (folder, folder.parent):
+                if candidate == self._tiles_dir:
+                    break
+                try:
+                    candidate.rmdir()
+                except OSError:
+                    break
         self._tiles_dir.mkdir(parents=True, exist_ok=True)
 
     # --- internals --------------------------------------------------------
@@ -274,7 +311,11 @@ class TileFetcher:
         x %= n
         if y < 0 or y >= n or z < MIN_ZOOM or z > MAX_ZOOM:
             return None
-        data = self.cache.get(z, x, y)
+        try:
+            data = self.cache.get(z, x, y)
+        except Exception as exc:  # index closed by a settings change, db locked
+            log.debug("Tile cache read failed %s/%s/%s: %s", z, x, y, exc)
+            data = None
         if data is not None:
             return data
         key = (z, x, y)

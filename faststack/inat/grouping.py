@@ -121,6 +121,11 @@ def _sort_key(p: PhotoRecord):
     return (0, p.taken.timestamp(), p.order)
 
 
+def group_sort_key(group: "ObservationGroup"):
+    """Where a group belongs in time order: the key of its earliest photo."""
+    return min((_sort_key(p) for p in group.photos), default=(2, 0.0, 0))
+
+
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in metres."""
     phi1 = math.radians(lat1)

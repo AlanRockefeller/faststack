@@ -118,7 +118,9 @@ class INatClient:
         data = self._http.request(
             "GET",
             f"{self._base}/taxa/autocomplete",
-            query={"q": query, "per_page": per_page},
+            # Active taxa only: a name that was merged or split away must not
+            # be attached to a new observation.
+            query={"q": query, "per_page": per_page, "is_active": "true"},
             timeout=30,
         )
         out: list[Taxon] = []
@@ -135,16 +137,27 @@ class INatClient:
             )
         return out
 
-    def resolve_taxon(self, name: str) -> Optional[Taxon]:
-        """Exact (case-insensitive) scientific-name match, or ``None``."""
+    def resolve_taxon(self, name: str, rank: str = "") -> Optional[Taxon]:
+        """Exact (case-insensitive) scientific-name match, or ``None``.
+
+        The same name can exist at two ranks or in two kingdoms. When
+        ``rank`` is given, a match at that rank wins over the first hit.
+        """
         name = (name or "").strip()
         if not name:
             return None
         wanted = name.casefold()
-        for taxon in self.taxa_autocomplete(name):
-            if taxon.name.casefold() == wanted:
-                return taxon
-        return None
+        matches = [
+            t for t in self.taxa_autocomplete(name) if t.name.casefold() == wanted
+        ]
+        if not matches:
+            return None
+        rank = (rank or "").strip().casefold()
+        if rank:
+            for taxon in matches:
+                if taxon.rank.casefold() == rank:
+                    return taxon
+        return matches[0]
 
     def create_observation(self, draft: ObservationDraft) -> int:
         data = self._http.request(

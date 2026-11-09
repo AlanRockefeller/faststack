@@ -25,6 +25,10 @@ class CredentialStore:
         self._fallback_dir = fallback_dir
         self._keyring = None
         self._keyring_checked = False
+        # Values read or written this session. The dialog asks for the same
+        # two secrets on every card action and property read; without this
+        # each one is a round trip to the OS keyring on the GUI thread.
+        self._cache: dict[str, str] = {}
 
     # --- public -----------------------------------------------------------
 
@@ -39,6 +43,14 @@ class CredentialStore:
             return "keyring"
 
     def get(self, name: str) -> str:
+        cached = self._cache.get(name)
+        if cached is not None:
+            return cached
+        value = self._read(name)
+        self._cache[name] = value
+        return value
+
+    def _read(self, name: str) -> str:
         kr = self._get_keyring()
         if kr is not None:
             try:
@@ -49,8 +61,18 @@ class CredentialStore:
                 log.warning("keyring read failed for %s: %s", name, exc)
         return self._read_fallback().get(name, "")
 
-    def set(self, name: str, value: str) -> None:
+    def set(self, name: str, value: str) -> bool:
+        """Store (or, for an empty value, forget) a secret. False if it could
+        not be written anywhere, so the caller can tell the user."""
         value = (value or "").strip()
+        stored = self._store(name, value)
+        if stored:
+            self._cache[name] = value
+        else:
+            self._cache.pop(name, None)
+        return stored
+
+    def _store(self, name: str, value: str) -> bool:
         kr = self._get_keyring()
         if kr is not None:
             try:
@@ -62,11 +84,19 @@ class CredentialStore:
                     except Exception:
                         pass
                 # Keep the fallback file free of a stale copy.
-                self._write_fallback_key(name, "")
-                return
+                try:
+                    self._write_fallback_key(name, "")
+                except OSError as exc:
+                    log.warning("Could not tidy the secrets file: %s", exc)
+                return True
             except Exception as exc:
                 log.warning("keyring write failed for %s; using file: %s", name, exc)
-        self._write_fallback_key(name, value)
+        try:
+            self._write_fallback_key(name, value)
+        except OSError as exc:
+            log.error("Could not save %s to the secrets file: %s", name, exc)
+            return False
+        return True
 
     # --- internals --------------------------------------------------------
 

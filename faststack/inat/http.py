@@ -80,6 +80,16 @@ def _urllib_transport(
         )
 
 
+def _header_filename(filename: str) -> str:
+    """A file name that cannot end or corrupt the part's header line.
+
+    Local files may be called ``my "best" shot.jpg``; a raw quote would close
+    the ``filename="..."`` value early and a line break would start a new
+    header. Quotes are percent-encoded as browsers do (RFC 7578 4.2).
+    """
+    return str(filename).replace("\r", " ").replace("\n", " ").replace('"', "%22")
+
+
 def encode_multipart(
     fields: dict[str, Any], files: Sequence[tuple[str, FilePart]]
 ) -> tuple[bytes, str]:
@@ -102,7 +112,8 @@ def encode_multipart(
         mime = mime or mimetypes.guess_type(filename)[0] or "application/octet-stream"
         out += f"--{boundary}\r\n".encode()
         out += (
-            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+            f'Content-Disposition: form-data; name="{name}"; '
+            f'filename="{_header_filename(filename)}"\r\n'
         ).encode()
         out += f"Content-Type: {mime}\r\n\r\n".encode()
         out += data

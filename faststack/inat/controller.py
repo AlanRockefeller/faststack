@@ -32,6 +32,7 @@ from faststack.inat.grouping import (
     Location,
     ObservationGroup,
     PhotoRecord,
+    group_sort_key,
     haversine_m,
     initial_grouping,
     merge_groups,
@@ -78,6 +79,26 @@ STATUS_IDENTIFIED = "identified"
 STATUS_UPLOADING = "uploading"
 STATUS_UPLOADED = "uploaded"
 STATUS_ERROR = "error"
+
+# MycoMap Vision limits each key to a number of photos per minute and refuses
+# calls while its queue is full. Both replies say when to come back, so an
+# identification waits and retries instead of failing the card - up to this
+# long in total, after which the card shows the error.
+IDENTIFY_MAX_WAIT_SECONDS = 180.0
+_RETRY_DELAY_RANGE = (2.0, 60.0)
+
+
+def retry_delay_seconds(exc: ApiError) -> Optional[float]:
+    """How long to wait before repeating a refused Vision call; None = don't."""
+    if exc.status == 429 and exc.code != "quota_exceeded":
+        default = 15.0
+    elif exc.status == 503:
+        default = 10.0
+    else:
+        return None
+    delay = float(exc.retry_after) if exc.retry_after else default
+    low, high = _RETRY_DELAY_RANGE
+    return max(low, min(high, delay))
 
 
 @dataclass
@@ -233,12 +254,13 @@ class INatUploadController(QObject):
     showMessage = Signal(str)
 
     _identifyDone = Signal(int, int, object, str)  # card id, token, result, error
+    _identifyProgress = Signal(int, int, str)  # card id, token, status line
     # card id, token, obs id, keys of photos attached this run, error
     _uploadCardDone = Signal(int, int, object, object, str)
     _uploadRunFinished = Signal()
     _usageDone = Signal(str)
     _verifyDone = Signal(str, str)  # login, error
-    _taxonLookupDone = Signal(int, int, object, str)
+    _taxonLookupDone = Signal(object, str, object)  # taxon, error, (name, rank)
 
     def __init__(self, config, parent: Optional[QObject] = None, user_agent: str = ""):
         super().__init__(parent)
@@ -259,6 +281,19 @@ class INatUploadController(QObject):
         )
         self._http = HttpClient(self._user_agent)
         self._executor = create_daemon_threadpool_executor(2, "inat-upload")
+        # Identifications run one at a time on their own thread: Vision meters
+        # photos per minute, and a call waiting out that limit must not hold up
+        # an upload or a taxon lookup on the shared pool.
+        self._identify_executor = create_daemon_threadpool_executor(1, "inat-identify")
+        self._cancel_identify = threading.Event()
+        self._upload_active = False
+        self._grouping_recorded = False
+        # iNat taxon for a (name, rank) the user or Vision chose. Regrouping
+        # re-creates cards with the same names; asking iNaturalist again for
+        # each one on every slider move would hit its rate limit.
+        self._taxon_cache: dict[tuple[str, str], Optional[Taxon]] = {}
+        # Cards waiting on a lookup that is already in flight, per (name, rank).
+        self._taxon_waiting: dict[tuple[str, str], list[tuple[int, int]]] = {}
         self._history = GroupingHistory(get_app_data_dir() / HISTORY_FILE)
         self._vision_cache: dict[frozenset, VisionResult] = {}
         self._time_gap_s = float(self.timeGapMinutes * 60)
@@ -276,6 +311,7 @@ class INatUploadController(QObject):
         self._uploaded_paths: list[str] = []
 
         self._identifyDone.connect(self._on_identify_done)
+        self._identifyProgress.connect(self._on_identify_progress)
         self._uploadCardDone.connect(self._on_upload_card_done)
         self._uploadRunFinished.connect(self._on_upload_run_finished)
         self._usageDone.connect(self._on_usage_done)
@@ -314,10 +350,12 @@ class INatUploadController(QObject):
 
     def shutdown(self) -> None:
         self._cancel_upload.set()
-        try:
-            self._executor.shutdown(wait=False)
-        except Exception:
-            pass
+        self._cancel_identify.set()
+        for executor in (self._executor, self._identify_executor):
+            try:
+                executor.shutdown(wait=False)
+            except Exception:
+                pass
         with self._tile_lock:
             if self._tile_cache is not None:
                 self._tile_cache.close()
@@ -359,6 +397,11 @@ class INatUploadController(QObject):
     @Property(bool, notify=busyChanged)
     def busy(self) -> bool:
         return self._busy_jobs > 0
+
+    @Property(bool, notify=busyChanged)
+    def uploading(self) -> bool:
+        """An upload run is in flight (the one job the dialog must not close on)."""
+        return self._upload_active
 
     @Property(str, notify=statusTextChanged)
     def statusText(self) -> str:
@@ -453,10 +496,15 @@ class INatUploadController(QObject):
 
     @Slot(str, str)
     def saveCredentials(self, inat_token: str, vision_key: str) -> None:  # noqa: N802
+        saved = True
         if inat_token.strip():
-            self._credentials.set(INAT_TOKEN, inat_token)
+            saved = self._credentials.set(INAT_TOKEN, inat_token) and saved
         if vision_key.strip():
-            self._credentials.set(MYCOMAP_KEY, vision_key)
+            saved = self._credentials.set(MYCOMAP_KEY, vision_key) and saved
+        if not saved:
+            self.showMessage.emit(
+                "Could not save the credentials (see the log); they are not stored."
+            )
         self.settingsChanged.emit()
         if inat_token.strip():
             self.verifyInat()
@@ -500,7 +548,13 @@ class INatUploadController(QObject):
 
     @Slot(str, int)
     def saveTileCacheSettings(self, directory: str, size_mb: int) -> None:  # noqa: N802
-        self._config.set(CONFIG_SECTION, "tile_cache_dir", directory.strip())
+        directory = directory.strip()
+        default_dir = get_app_data_dir() / "map_tiles"
+        if directory and Path(directory).expanduser() == default_dir:
+            # The field is pre-filled with the folder in use. Saving that back
+            # would pin today's app-data path in the config.
+            directory = ""
+        self._config.set(CONFIG_SECTION, "tile_cache_dir", directory)
         self._config.set(CONFIG_SECTION, "tile_cache_mb", str(max(0, size_mb)))
         self._config.save()
         with self._tile_lock:
@@ -576,12 +630,35 @@ class INatUploadController(QObject):
 
     @Slot(list, result=bool)
     def open(self, paths: list) -> bool:
-        """Load the batch and build the first grouping. False when empty."""
+        """Load the batch and build the first grouping. False when empty.
+
+        Opening the dialog again for the photos it already shows picks up
+        where it left off: identifications, edits and - most importantly -
+        the observations already created on iNaturalist stay attached to
+        their cards, so nothing is asked of Vision twice and a card that was
+        only partly uploaded is finished rather than uploaded a second time.
+        """
+        existing = [Path(str(raw)) for raw in paths]
+        existing = [path for path in existing if path.exists()]
+        if not existing:
+            return False
+        if self._upload_active:
+            # The dialog is modal and refuses to close mid-upload, so this is
+            # only a safety net: never rebuild the cards under a running upload.
+            return True
+        if self._model.cards and [str(p) for p in existing] == [
+            p.key for p in self._photos
+        ]:
+            # Thumbnails are re-read: a photo may have been edited meanwhile.
+            self._batch_generation += 1
+            self._model.reset(list(self._model.cards))
+            self._set_status("Picked up where you left off with these photos.")
+            self.cardsChanged.emit()
+            self.refreshUsage()
+            return True
+
         records: list[PhotoRecord] = []
-        for raw in paths:
-            path = Path(str(raw))
-            if not path.exists():
-                continue
+        for path in existing:
             try:
                 records.append(read_photo_facts(path, len(records)))
             except Exception as exc:
@@ -590,8 +667,14 @@ class INatUploadController(QObject):
             return False
         self._photos = records
         self._uploaded_paths = []
-        self._vision_cache = {}
+        keys = {p.key for p in records}
+        self._vision_cache = {
+            photo_set: result
+            for photo_set, result in self._vision_cache.items()
+            if photo_set <= keys
+        }
         self._manual_edits = False
+        self._grouping_recorded = False
         self._batch_generation += 1
         self._cancel_upload.clear()
         self._folder = str(records[0].path.parent)
@@ -619,12 +702,43 @@ class INatUploadController(QObject):
         return True
 
     def _regroup(self, announce: bool = False) -> None:
+        """Group the batch, keeping every card whose photos did not change.
+
+        A card with the same photos as before is the same observation: its
+        notes, name, map location and Vision answer carry over instead of
+        being thrown away by a slider nudge. A card that already has an
+        observation on iNaturalist is never regrouped at all - its photos
+        are taken out of the pool first - so it cannot be uploaded twice.
+        """
+        old_cards = list(self._model.cards)
+        by_key = {p.key: p for p in self._photos}
+        kept: list[Card] = []
+        claimed: set[str] = set()
+        for card in old_cards:
+            if not card.locked:
+                continue
+            keys = [p.key for p in card.group.photos]
+            if keys and all(k in by_key for k in keys) and not claimed & set(keys):
+                card.group = ObservationGroup([by_key[k] for k in keys])
+                card.selected = False
+                kept.append(card)
+                claimed.update(keys)
+        reusable = {self._photo_set(c): c for c in old_cards if not c.locked}
         groups = initial_grouping(
-            self._photos,
+            [p for p in self._photos if p.key not in claimed],
             time_gap_s=self._time_gap_s,
             distance_m=self._distance_m,
         )
-        cards = [self._new_card(g) for g in groups]
+        cards = list(kept)
+        for group in groups:
+            card = reusable.pop(frozenset(p.key for p in group.photos), None)
+            if card is None:
+                card = self._new_card(group)
+            else:
+                card.group = group  # same photos, this batch's records
+                card.selected = False
+            cards.append(card)
+        cards.sort(key=lambda c: group_sort_key(c.group))
         self._model.reset(cards)
         if announce:
             self._set_status(
@@ -654,10 +768,10 @@ class INatUploadController(QObject):
 
     @Slot(float, float)
     def setThresholds(self, time_gap_s: float, distance_m: float) -> None:  # noqa: N802
-        """The sliders moved: regroup from scratch with the new thresholds.
+        """The sliders moved: regroup with the new thresholds.
 
-        Manual edits (split / merge / drag) are discarded; Vision answers are
-        kept for any card whose photo set is unchanged.
+        Manual edits (split / merge / drag) are discarded; a card whose photos
+        come out the same keeps its name, notes, location and Vision answer.
         """
         if not self.canRegroup:
             return
@@ -922,6 +1036,11 @@ class INatUploadController(QObject):
         first = chosen[0]
         merged.geoprivacy = first.geoprivacy
         merged.description = first.description
+        # A point someone picked on the map is deliberate; keep the first one.
+        merged.manual_location = next(
+            (c.manual_location for c in chosen if c.manual_location is not None),
+            None,
+        )
         self._model.replace(first, [merged])
         for c in chosen[1:]:
             self._model.remove(c)
@@ -1033,42 +1152,94 @@ class INatUploadController(QObject):
         if name:
             self._lookup_taxon(card)
 
+    @staticmethod
+    def _taxon_key(name: str, rank: str) -> tuple[str, str]:
+        return (name.strip().casefold(), (rank or "").strip().casefold())
+
     def _lookup_taxon(self, card: Card) -> None:
-        token = self._credentials.get(INAT_TOKEN)
         name = card.chosen_name
-        tok = card.token
+        rank = card.chosen_rank
+        key = self._taxon_key(name, rank)
+        if key in self._taxon_cache:
+            card.taxon = self._taxon_cache[key]
+            self._model.refresh(card, "taxonLabel")
+            return
+        waiting = self._taxon_waiting.get(key)
+        if waiting is not None:
+            # The same name is already being looked up for another card.
+            waiting.append((card.id, card.token))
+            return
+        self._taxon_waiting[key] = [(card.id, card.token)]
+        token = self._credentials.get(INAT_TOKEN)
 
         def work():
             try:
-                taxon = INatClient(token, self._http).resolve_taxon(name)
-                self._taxonLookupDone.emit(card.id, tok, taxon, "")
+                taxon = INatClient(token, self._http).resolve_taxon(name, rank)
+                self._taxonLookupDone.emit(taxon, "", key)
             except Exception as exc:
-                self._taxonLookupDone.emit(card.id, tok, None, str(exc))
+                self._taxonLookupDone.emit(None, str(exc), key)
 
         self._executor.submit(work)
 
-    @Slot(int, int, object, str)
-    def _on_taxon_lookup_done(
-        self, card_id: int, token: int, taxon, error: str
-    ) -> None:
-        card = self._card(card_id)
-        if card is None or card.token != token:
-            return
-        if taxon is not None and taxon.name.casefold() == card.chosen_name.casefold():
-            card.taxon = taxon
-        self._model.refresh(card, "taxonLabel")
+    @Slot(object, str, object)
+    def _on_taxon_lookup_done(self, taxon, error: str, key) -> None:
+        key = tuple(key)
+        if not error:
+            # "No exact match" is an answer too; a failed call is not.
+            self._taxon_cache[key] = taxon
+        for card_id, token in self._taxon_waiting.pop(key, []):
+            card = self._card(card_id)
+            if card is None or card.token != token:
+                continue
+            if (
+                taxon is not None
+                and taxon.name.casefold() == card.chosen_name.casefold()
+            ):
+                card.taxon = taxon
+            self._model.refresh(card, "taxonLabel")
 
     # ------------------------------------------------------------------
     # Identification
 
     @Slot()
     def identifyAll(self) -> None:  # noqa: N802
+        """Identify every card that has no Vision answer yet.
+
+        A card can also be in the error state because its *upload* failed.
+        It already has its answer (and perhaps a name the user chose over
+        it); asking again would spend quota and overwrite that choice.
+        """
         for card in list(self._model.cards):
             if (
-                card.status in (STATUS_PENDING, STATUS_ERROR)
+                card.vision is None
+                and card.status in (STATUS_PENDING, STATUS_ERROR)
                 and not card.identify_pending
+                and not card.locked
             ):
                 self.identifyCard(card.id)
+
+    @Slot()
+    def cancelIdentify(self) -> None:  # noqa: N802
+        """Drop identifications that are queued, waiting or in flight.
+
+        Called when the dialog closes. Their results are ignored (the card
+        token moves on) and each card goes back to how it was, so closing
+        never has to wait out a slow or rate-limited Vision call.
+        """
+        self._cancel_identify.set()
+        self._cancel_identify = threading.Event()  # for the next batch of calls
+        for card in self._model.cards:
+            if not card.identify_pending:
+                continue
+            card.identify_pending = False
+            card.token += 1
+            if card.vision is not None:
+                card.status = STATUS_IDENTIFIED
+                card.status_text = self._vision_status_text(card.vision)
+            else:
+                card.status = STATUS_PENDING
+                card.status_text = ""
+            self._model.refresh(card, "status", "statusText")
 
     @Slot(int)
     def identifyCard(self, card_id: int) -> None:  # noqa: N802
@@ -1091,22 +1262,58 @@ class INatUploadController(QObject):
         photos = card.group.sorted_photos()
         loc = card.location(float(self.spreadWarningMeters))
         observed = card.group.observed_at_exif
+        cancel = self._cancel_identify
         self._begin_job()
 
         def work():
             try:
+                if cancel.is_set():
+                    self._identifyDone.emit(card.id, token, None, "Cancelled")
+                    return
                 payload = [
                     (p.path.name, images.prepare_jpeg(p.path, images.VISION_LONG_EDGE))
                     for p in photos[:10]
                 ]
                 client = MycoMapVisionClient(key, self._http)
-                result = client.identify(
-                    payload,
-                    latitude=loc.lat if loc else None,
-                    longitude=loc.lon if loc else None,
-                    observed_on=observed.strftime("%Y-%m-%d") if observed else None,
-                    client_ref=client_ref_for([p.path for p in photos]),
-                )
+                waited = 0.0
+                while True:
+                    try:
+                        result = client.identify(
+                            payload,
+                            latitude=loc.lat if loc else None,
+                            longitude=loc.lon if loc else None,
+                            observed_on=(
+                                observed.strftime("%Y-%m-%d") if observed else None
+                            ),
+                            client_ref=client_ref_for([p.path for p in photos]),
+                        )
+                        break
+                    except ApiError as exc:
+                        # "Too many photos this minute" and "queue full" both
+                        # say when to come back. Wait and repeat rather than
+                        # failing every card after the first few.
+                        delay = retry_delay_seconds(exc)
+                        if (
+                            delay is None
+                            or waited + delay > IDENTIFY_MAX_WAIT_SECONDS
+                            or cancel.is_set()
+                        ):
+                            raise
+                        reason = (
+                            "is busy" if exc.status == 503 else "rate limit reached"
+                        )
+                        self._identifyProgress.emit(
+                            card.id,
+                            token,
+                            f"MycoMap Vision {reason}; "
+                            f"trying again in {int(delay)} s...",
+                        )
+                        if cancel.wait(delay):
+                            raise
+                        waited += delay
+                        self._identifyProgress.emit(
+                            card.id, token, "Asking MycoMap Vision..."
+                        )
                 result.photo_keys = [p.key for p in photos[:10]]
                 self._identifyDone.emit(card.id, token, result, "")
             except ApiError as exc:
@@ -1119,7 +1326,15 @@ class INatUploadController(QObject):
                     card.id, token, None, f"Identification failed: {exc}"
                 )
 
-        self._executor.submit(work)
+        self._identify_executor.submit(work)
+
+    @Slot(int, int, str)
+    def _on_identify_progress(self, card_id: int, token: int, text: str) -> None:
+        card = self._card(card_id)
+        if card is None or card.token != token or not card.identify_pending:
+            return
+        card.status_text = text
+        self._model.refresh(card, "statusText")
 
     @Slot(int, int, object, str)
     def _on_identify_done(self, card_id: int, token: int, result, error: str) -> None:
@@ -1219,6 +1434,7 @@ class INatUploadController(QObject):
                     draft,
                     pending_photos,
                     card.chosen_name,
+                    card.chosen_rank,
                     card.taxon,
                     card.obs_id,
                 )
@@ -1227,13 +1443,15 @@ class INatUploadController(QObject):
         self._upload_total = len(jobs)
         self.uploadProgressChanged.emit()
         self._cancel_upload.clear()
+        self._upload_active = True
         self._begin_job()
+        self.busyChanged.emit()  # `uploading` changed even if a job was running
         self.cardsChanged.emit()
         self._record_grouping()
 
         def work():
             client = INatClient(token, self._http)
-            for card_id, tok, draft, photos, name, taxon, obs_id in jobs:
+            for card_id, tok, draft, photos, name, rank, taxon, obs_id in jobs:
                 attached: list[tuple[str, int]] = []
                 if self._cancel_upload.is_set():
                     self._uploadCardDone.emit(
@@ -1243,7 +1461,19 @@ class INatUploadController(QObject):
                 try:
                     if obs_id is None:
                         if draft.taxon_id is None and name and taxon is None:
-                            found = client.resolve_taxon(name)
+                            # Only a convenience: without a taxon id the name
+                            # still goes up as the species guess, so a failed
+                            # lookup must not cost the whole observation.
+                            try:
+                                found = client.resolve_taxon(name, rank)
+                            except Exception as exc:
+                                log.warning(
+                                    "Taxon lookup failed for %r; sending it as "
+                                    "a guess: %s",
+                                    name,
+                                    exc,
+                                )
+                                found = None
                             if found is not None:
                                 draft.taxon_id = found.id
                         obs_id = client.create_observation(draft)
@@ -1293,7 +1523,11 @@ class INatUploadController(QObject):
                 pairs,
                 photos=len(self._photos),
                 observations=len(groups),
+                # Upload pressed again on this batch (a retry) is the same
+                # decision, not a second batch to learn from.
+                replace_last=self._grouping_recorded,
             )
+            self._grouping_recorded = True
         except Exception:
             log.debug("Could not record grouping history", exc_info=True)
 
@@ -1340,7 +1574,9 @@ class INatUploadController(QObject):
 
     @Slot()
     def _on_upload_run_finished(self) -> None:
+        self._upload_active = False
         self._end_job()
+        self.busyChanged.emit()  # `uploading` changed even if a job still runs
         uploaded = sum(1 for c in self._model.cards if c.status == STATUS_UPLOADED)
         failed = sum(
             1 for c in self._model.cards if c.status == STATUS_ERROR and c.upload_error
