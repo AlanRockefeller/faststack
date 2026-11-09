@@ -97,10 +97,9 @@ class Keybinder:
     _COMMAND_MODIFIERS = Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
 
     # Bound by the character the active layout produced, whatever modifiers
-    # it took to type it: AltGr arrives as Ctrl+Alt on Windows, so [ ] { } |
+    # it took to type it: AltGr arrives as Ctrl+Alt on Windows, so [ ] { }
     # on many European layouts would otherwise never match.
     _CHARACTER_MAP = {
-        "|": "clear_all_batches",
         "[": "begin_new_stack",
         "]": "end_current_stack",
         "{": "begin_new_batch",

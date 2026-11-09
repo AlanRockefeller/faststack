@@ -184,7 +184,7 @@ faststack "C:\path\to\photos"
 - `C`: Clear all stacks (Ctrl+Z restores them)
 - `{`: Begin new drag & drop batch
 - `}`: End current drag & drop batch
-- `|` (Shift+`\`): Clear drag & drop batch (Ctrl+Z restores it)
+- Actions > Clear Batches: Clear drag & drop batch, after confirmation (Ctrl+Z restores it)
 - `U`: Toggle uploaded flag
 - `F`: Toggle favorite flag
 - `Ctrl+E`: Toggle edited flag

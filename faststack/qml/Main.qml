@@ -1229,6 +1229,16 @@ ApplicationWindow {
                     actionsMenu.close()
                 }
             }
+            MenuActionItem {
+                width: 220
+                text: "Clear Batches..."
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                onClicked: {
+                    root.openDialogSafely(clearBatchesDialog)
+                    actionsMenu.close()
+                }
+            }
 
             MenuActionItem {
                 width: 220
@@ -2305,7 +2315,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;{: Begin new batch<br>" +
                           "&nbsp;&nbsp;B: Toggle current image in/out of batch<br>" +
                           "&nbsp;&nbsp;}: End current batch<br>" +
-                          "&nbsp;&nbsp;|: Clear all batches<br><br>" +
+                          "&nbsp;&nbsp;Actions > Clear Batches: Clear all batches<br><br>" +
                           "<b>Flag Toggles:</b><br>" +
                           "&nbsp;&nbsp;D: Toggle todo flag<br>" +
                           "&nbsp;&nbsp;F: Toggle favorite flag<br>" +
@@ -2716,6 +2726,28 @@ ApplicationWindow {
             if (root.controllerRef) root.controllerRef.discard_unsaved_edits_for_close()
             Qt.callLater(root.close)
         }
+    }
+
+    Dialog {
+        id: clearBatchesDialog
+        title: "Clear Batches"
+        modal: true
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        width: Math.min(420, parent.width * 0.9)
+        standardButtons: Dialog.Yes | Dialog.No
+
+        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-clear-batches")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-clear-batches")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-clear-batches")
+
+        Label {
+            width: parent.width
+            text: "Remove every image in this folder from the drag & drop batch?\n\nCtrl+Z restores it."
+            wrapMode: Text.WordWrap
+        }
+
+        onAccepted: if (root.uiStateRef) root.uiStateRef.clear_all_batches()
     }
 
     Dialog {

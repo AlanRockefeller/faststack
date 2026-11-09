@@ -158,6 +158,9 @@ class _Controller:
     def clear_all_batches(self):
         self.calls.append("clear_all_batches")
 
+    def begin_new_batch(self):
+        self.calls.append("begin_new_batch")
+
 
 def test_clear_active_auto_adjust_state_clears_editor_even_if_editor_ui_is_open():
     clear_active_auto_adjust_state = _extract_app_method(
@@ -359,18 +362,28 @@ def test_shift_minus_character_still_triggers_highlight_adjust():
     assert controller.calls == ["reduce_auto_adjust_highlights"]
 
 
-def test_altgr_pipe_character_clears_batches():
+def test_altgr_brace_character_begins_batch():
     keybinder_cls = _load_keybinder_class()
     controller = _Controller()
     keybinder = keybinder_cls(controller)
 
     handled = keybinder.handle_key_press(
         _Event(
-            _Qt.Key_Backslash,
-            "|",
+            _Qt.Key_BraceLeft,
+            "{",
             _Qt.ControlModifier | _Qt.AltModifier,
         )
     )
 
     assert handled is True
-    assert controller.calls == ["clear_all_batches"]
+    assert controller.calls == ["begin_new_batch"]
+
+
+def test_pipe_character_no_longer_clears_batches():
+    keybinder_cls = _load_keybinder_class()
+    controller = _Controller()
+    keybinder = keybinder_cls(controller)
+
+    keybinder.handle_key_press(_Event(_Qt.Key_Backslash, "|", _Qt.ShiftModifier))
+
+    assert controller.calls == []
