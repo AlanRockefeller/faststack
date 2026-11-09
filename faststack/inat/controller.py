@@ -1090,7 +1090,7 @@ class INatUploadController(QObject):
         token = card.token
         photos = card.group.sorted_photos()
         loc = card.location(float(self.spreadWarningMeters))
-        observed = card.group.observed_at
+        observed = card.group.observed_at_exif
         self._begin_job()
 
         def work():
@@ -1187,7 +1187,9 @@ class INatUploadController(QObject):
             card.upload_error = ""
             self._model.refresh(card, "status", "statusText", "canSplit", "locked")
             loc = card.location(warn)
-            observed = card.group.observed_at
+            # Only a capture time from EXIF goes to iNaturalist; a file's
+            # modification time (the grouping fallback) is not when it was found.
+            observed = card.group.observed_at_exif
             draft = ObservationDraft(
                 observed_on_string=(
                     observed.strftime("%Y-%m-%d %H:%M:%S") if observed else None
@@ -1351,7 +1353,8 @@ class INatUploadController(QObject):
             self._set_status(f"Uploaded {uploaded} observation(s) to iNaturalist.")
         if self._uploaded_paths:
             paths = list(dict.fromkeys(self._uploaded_paths))
-            self.uploadFinished.emit(paths, failed == 0)
+            all_done = all(c.status == STATUS_UPLOADED for c in self._model.cards)
+            self.uploadFinished.emit(paths, all_done)
 
     @Property(bool, notify=cardsChanged)
     def allUploaded(self) -> bool:  # noqa: N802

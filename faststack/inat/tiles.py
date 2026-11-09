@@ -292,7 +292,10 @@ class TileFetcher:
                     self._failed_at[key] = time.time()
                 return None
         if data:
-            self.cache.put(z, x, y, data)
+            try:
+                self.cache.put(z, x, y, data)
+            except Exception as exc:  # disk full, read-only folder, db locked
+                log.warning("Could not cache tile %s/%s/%s: %s", z, x, y, exc)
         return data
 
     @staticmethod

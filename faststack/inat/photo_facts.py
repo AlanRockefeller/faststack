@@ -73,6 +73,7 @@ def read_photo_facts(path: Path, order: int) -> PhotoRecord:
     except Exception as exc:
         log.debug("EXIF read failed for %s: %s", path, exc)
 
+    from_exif = taken is not None
     if taken is None:
         try:
             taken = datetime.fromtimestamp(path.stat().st_mtime)
@@ -89,4 +90,5 @@ def read_photo_facts(path: Path, order: int) -> PhotoRecord:
         taken=taken,
         lat=coords[0] if coords else None,
         lon=coords[1] if coords else None,
+        taken_from_exif=from_exif,
     )

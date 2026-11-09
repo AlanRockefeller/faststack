@@ -136,6 +136,7 @@ def best_threshold(
     for a, b in zip(xs, xs[1:]):
         candidates.append(math.sqrt(a * b))
     candidates.append(xs[-1] * 2.0)
+    candidates.append(max(floor, prefer))  # the default itself can win a tie
     best: Optional[float] = None
     best_score = -1
     best_dist = float("inf")

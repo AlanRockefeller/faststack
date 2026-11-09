@@ -97,6 +97,15 @@ Item {
 
     Rectangle { anchors.fill: parent; color: "#1c1c1c" }
 
+    // Tiles and the marker live in one layer that is shifted by the drag
+    // offset while the mouse is down, so a pan does not rebuild every tile
+    // delegate per mouse move; the centre is committed on release (or once
+    // the offset nears the one-tile margin).
+    Item {
+        id: tileLayer
+        x: 0; y: 0
+        width: parent.width; height: parent.height
+
     Repeater {
         model: map.tileList
         delegate: Image {
@@ -131,6 +140,7 @@ Item {
         }
         Rectangle { width: 2; height: 14; x: -1; y: 6; color: "white" }
     }
+    }  // tileLayer
 
     // Crosshair at the centre so the user can see where "centre" is.
     Rectangle { x: map.width / 2 - 10; y: map.height / 2; width: 20; height: 1; color: "#80ffffff" }
@@ -153,18 +163,33 @@ Item {
             startCx = map.lonToX(map.centerLon, map.zoom)
             startCy = map.latToY(map.centerLat, map.zoom)
         }
+        function commitPan(dx, dy) {
+            map.centerLon = map.xToLon(startCx - dx / map.tileSize, map.zoom)
+            map.centerLat = map.yToLat(startCy - dy / map.tileSize, map.zoom)
+            startCx = map.lonToX(map.centerLon, map.zoom)
+            startCy = map.latToY(map.centerLat, map.zoom)
+            tileLayer.x = 0; tileLayer.y = 0
+            map.refreshTiles()
+        }
         onPositionChanged: function(mouse) {
             if (!pressed) return
             var dx = mouse.x - pressX
             var dy = mouse.y - pressY
             if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true
             if (!moved) return
-            map.centerLon = map.xToLon(startCx - dx / map.tileSize, map.zoom)
-            map.centerLat = map.yToLat(startCy - dy / map.tileSize, map.zoom)
-            map.refreshTiles()
+            if (Math.abs(dx) > map.tileSize * 0.8 || Math.abs(dy) > map.tileSize * 0.8) {
+                // Nearing the pre-fetched margin: commit and re-anchor the drag.
+                commitPan(dx, dy)
+                pressX = mouse.x; pressY = mouse.y
+                return
+            }
+            tileLayer.x = dx
+            tileLayer.y = dy
         }
         onReleased: function(mouse) {
-            if (!moved) {
+            if (moved) {
+                commitPan(mouse.x - pressX, mouse.y - pressY)
+            } else {
                 var lat = map.latAt(mouse.y)
                 var lon = map.lonAt(mouse.x)
                 map.setMarker(lat, lon)
@@ -173,6 +198,7 @@ Item {
         }
         onDoubleClicked: function(mouse) { map.zoomAt(1, mouse.x, mouse.y) }
         onWheel: function(wheel) {
+            if (wheel.angleDelta.y === 0) { wheel.accepted = true; return }  // horizontal scroll
             var step = wheel.angleDelta.y > 0 ? 1 : -1
             map.zoomAt(step, wheel.x, wheel.y)
             wheel.accepted = true

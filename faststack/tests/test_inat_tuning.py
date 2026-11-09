@@ -34,10 +34,12 @@ def test_pairs_from_groups_marks_same_and_gaps():
 def test_best_threshold_separates_clusters_and_prefers_default_on_ties():
     values = [(10, True), (20, True), (40, True), (900, False), (1500, False)]
     t = best_threshold(values, prefer=600, floor=1)
+    # Any T in (40, 900) scores the same; the preferred default is itself a
+    # candidate, so it wins the tie and the default is left alone.
+    assert t == 600
+    # When the default would misclassify, the data wins.
+    t = best_threshold(values, prefer=20, floor=1)
     assert 40 < t < 900
-    # Any T in (40, 900) scores the same; the geometric midpoint candidate is
-    # sqrt(40*900)=189.7, the nearest to the preferred 600 among candidates.
-    assert abs(t - (40 * 900) ** 0.5) < 1e-6
     assert best_threshold([], 1, 1) is None
 
 

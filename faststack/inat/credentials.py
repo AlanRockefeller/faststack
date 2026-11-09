@@ -118,10 +118,13 @@ class CredentialStore:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data))
+        # Create the file owner-only before any secret is written to it; a
+        # leftover .tmp with wider permissions is also tightened first.
         try:
             os.chmod(tmp, 0o600)
         except OSError:
             pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data))
         os.replace(tmp, path)

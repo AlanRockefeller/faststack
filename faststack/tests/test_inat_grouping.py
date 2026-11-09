@@ -192,3 +192,14 @@ def test_split_partition_covers_all_photos(n):
     assert len(parts) == n
     flat = [p.order for part in parts for p in part.photos]
     assert flat == list(range(1, 9))
+
+
+def test_observed_at_exif_ignores_mtime_fallback():
+    exif = _photo(1, 100)
+    fallback = PhotoRecord(
+        path=Path("/x/IMG_0002.jpg"), order=2, taken=T0, taken_from_exif=False
+    )
+    g = ObservationGroup([exif, fallback])
+    assert g.observed_at == T0  # grouping still uses the fallback
+    assert g.observed_at_exif == exif.taken  # uploads only trust EXIF
+    assert ObservationGroup([fallback]).observed_at_exif is None

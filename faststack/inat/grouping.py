@@ -47,6 +47,8 @@ class PhotoRecord:
     taken: Optional[datetime] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
+    # False when ``taken`` is the file's modification time, not EXIF.
+    taken_from_exif: bool = True
 
     @property
     def has_gps(self) -> bool:
@@ -83,6 +85,14 @@ class ObservationGroup:
     @property
     def observed_at(self) -> Optional[datetime]:
         times = [p.taken for p in self.photos if p.taken is not None]
+        return min(times) if times else None
+
+    @property
+    def observed_at_exif(self) -> Optional[datetime]:
+        """Earliest EXIF capture time, ignoring modification-time fallbacks."""
+        times = [
+            p.taken for p in self.photos if p.taken is not None and p.taken_from_exif
+        ]
         return min(times) if times else None
 
     def exif_location(

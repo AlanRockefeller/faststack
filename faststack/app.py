@@ -12569,6 +12569,21 @@ class AppController(
                 meta.uploaded = True
                 meta.uploaded_date = today
             self._persist_sidecar()
+            # Same fan-out as the flag toggles: drop the cached metadata line,
+            # re-run an active "uploaded" filter, and refresh grid and loupe.
+            self._metadata_cache_index = (-1, -1)
+            current_path = (
+                self.image_files[self.current_index].path
+                if 0 <= self.current_index < len(self.image_files)
+                else None
+            )
+            filter_reapplied = self._reapply_flag_filter_after_metadata_change(
+                "uploaded", current_path
+            )
+            self.dataChanged.emit()
+            if not filter_reapplied and getattr(self, "_thumbnail_model", None):
+                self._thumbnail_model.notify_batch_state_changed()
+            self.sync_ui_state(image_count_changed=filter_reapplied)
         self.update_status_message(
             f"Uploaded {len(catalogue_paths)} photo(s) to iNaturalist", 5000
         )
