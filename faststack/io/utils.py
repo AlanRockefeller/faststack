@@ -106,10 +106,15 @@ def fsync_file(path: Path, *, strict: bool = False) -> None:
 
 def atomic_write_json(path: Path, payload: object) -> None:
     """Write JSON atomically and flush the file and directory to disk."""
+    atomic_write_text(path, json.dumps(payload, indent=2))
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write text atomically and flush the file and directory to disk."""
     temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
     try:
         with temp_path.open("w") as f:
-            json.dump(payload, f, indent=2)
+            f.write(text)
             f.flush()
             os.fsync(f.fileno())
         temp_path.replace(path)
