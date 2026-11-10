@@ -1067,6 +1067,18 @@ ApplicationWindow {
             }
             MenuActionItem {
                 width: 220
+                text: "iNaturalist upload"
+                enabled: root.uiStateRef ? root.uiStateRef.imageCount > 0 : false
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                disabledTextColor: root.isDarkTheme ? "#666666" : "#999999"
+                onClicked: {
+                    actionsMenu.close()
+                    root.openINatUploadDialog()
+                }
+            }
+            MenuActionItem {
+                width: 220
                 text: "Clear Stacks"
                 hoverFillColor: root.menuHoverColor
                 defaultTextColor: root.currentTextColor
@@ -1226,6 +1238,16 @@ ApplicationWindow {
                 defaultTextColor: root.currentTextColor
                 onClicked: {
                     if (root.uiStateRef) root.uiStateRef.addEditedToBatch()
+                    actionsMenu.close()
+                }
+            }
+            MenuActionItem {
+                width: 220
+                text: "Clear Batches..."
+                hoverFillColor: root.menuHoverColor
+                defaultTextColor: root.currentTextColor
+                onClicked: {
+                    root.openDialogSafely(clearBatchesDialog)
                     actionsMenu.close()
                 }
             }
@@ -2242,7 +2264,10 @@ ApplicationWindow {
         width: 1000
         height: 750
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-about")
+        // Dialogs register in aboutToShow, not opened: opened() fires only
+        // once the enter transition has finished, and until a dialog is
+        // registered the keys typed in that gap ran as global shortcuts.
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-about")
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-about")
 
         background: Rectangle {
@@ -2305,7 +2330,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;{: Begin new batch<br>" +
                           "&nbsp;&nbsp;B: Toggle current image in/out of batch<br>" +
                           "&nbsp;&nbsp;}: End current batch<br>" +
-                          "&nbsp;&nbsp;|: Clear all batches<br><br>" +
+                          "&nbsp;&nbsp;Actions > Clear Batches: Clear all batches<br><br>" +
                           "<b>Flag Toggles:</b><br>" +
                           "&nbsp;&nbsp;D: Toggle todo flag<br>" +
                           "&nbsp;&nbsp;F: Toggle favorite flag<br>" +
@@ -2369,7 +2394,7 @@ ApplicationWindow {
 
         property string readmeText: ""
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-readme")
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-readme")
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-readme")
 
         background: Rectangle {
@@ -2413,7 +2438,7 @@ ApplicationWindow {
         width: 400
         height: 300
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-stack-info")
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-stack-info")
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-stack-info")
 
         background: Rectangle {
@@ -2439,6 +2464,35 @@ ApplicationWindow {
                 root.openDialogSafely(item)
                 openWhenLoaded = false
             }
+        }
+    }
+
+    // Actions -> iNaturalist upload. Loaded on first use; the controller
+    // collects the batch (or the current image) before the window opens.
+    Loader {
+        id: inatUploadLoader
+        property bool loadedOnce: false
+        property bool openWhenLoaded: false
+        active: loadedOnce
+        source: "INatUploadDialog.qml"
+        onLoaded: {
+            if (openWhenLoaded) {
+                item.show()
+                item.raise()
+                openWhenLoaded = false
+            }
+        }
+    }
+
+    function openINatUploadDialog() {
+        if (!root.controllerRef || !root.controllerRef.open_inat_upload())
+            return
+        inatUploadLoader.openWhenLoaded = true
+        inatUploadLoader.loadedOnce = true
+        if (inatUploadLoader.item && inatUploadLoader.openWhenLoaded) {
+            inatUploadLoader.item.show()
+            inatUploadLoader.item.raise()
+            inatUploadLoader.openWhenLoaded = false
         }
     }
 
@@ -2561,7 +2615,7 @@ ApplicationWindow {
         readonly property string releaseUrl: updateInfo && updateInfo.releaseUrl ? updateInfo.releaseUrl : ""
         readonly property string releaseSummary: updateInfo && updateInfo.summary ? updateInfo.summary : "Open the release page for details."
 
-        onOpened: {
+        onAboutToShow: {
             if (root.controllerRef) root.controllerRef.dialog_opened("qml-update")
         }
         onClosed: {
@@ -2702,20 +2756,53 @@ ApplicationWindow {
         width: Math.min(420, parent.width * 0.9)
         standardButtons: Dialog.Yes | Dialog.No
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-unsaved-close")
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-unsaved-close")
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-unsaved-close")
         Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-unsaved-close")
 
-        Label {
+        // A layout, not a bare Label with width: parent.width. The Dialog
+        // sizes itself from its content, so a wrapped Label sized from the
+        // Dialog is a binding loop on implicitHeight (Qt logs it, and picks
+        // the height from whichever pass ran last).
+        ColumnLayout {
             width: parent.width
-            text: "Your current edits could not be saved (see the status bar).\n\nQuit anyway and discard them?"
-            wrapMode: Text.WordWrap
+            Label {
+                Layout.fillWidth: true
+                text: "Your current edits could not be saved (see the status bar).\n\nQuit anyway and discard them?"
+                wrapMode: Text.WordWrap
+            }
         }
 
         onAccepted: {
             if (root.controllerRef) root.controllerRef.discard_unsaved_edits_for_close()
             Qt.callLater(root.close)
         }
+    }
+
+    Dialog {
+        id: clearBatchesDialog
+        title: "Clear Batches"
+        modal: true
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        width: Math.min(420, parent.width * 0.9)
+        standardButtons: Dialog.Yes | Dialog.No
+
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-clear-batches")
+        onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-clear-batches")
+        Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-clear-batches")
+
+        // See unsavedCloseDialog for why this is a layout.
+        ColumnLayout {
+            width: parent.width
+            Label {
+                Layout.fillWidth: true
+                text: "Remove every image in this folder from the drag & drop batch?\n\nCtrl+Z restores it."
+                wrapMode: Text.WordWrap
+            }
+        }
+
+        onAccepted: if (root.uiStateRef) root.uiStateRef.clear_all_batches()
     }
 
     Dialog {
@@ -2733,7 +2820,7 @@ ApplicationWindow {
         // Set by the buttons; Escape or closing any other way cancels.
         property string choice: "cancel"
 
-        onOpened: if (root.controllerRef) root.controllerRef.dialog_opened("qml-image-editor-unsaved")
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-image-editor-unsaved")
         onClosed: {
             if (root.controllerRef) {
                 root.controllerRef.dialog_closed("qml-image-editor-unsaved")
@@ -2815,10 +2902,8 @@ ApplicationWindow {
             }
         }
 
-        onOpened: {
-            if (root.controllerRef) root.controllerRef.dialog_opened("qml-recycle-cleanup")
-            refreshBinInfo()
-        }
+        onAboutToShow: if (root.controllerRef) root.controllerRef.dialog_opened("qml-recycle-cleanup")
+        onOpened: refreshBinInfo()
         onClosed: if (root.controllerRef) root.controllerRef.dialog_closed("qml-recycle-cleanup")
         Component.onDestruction: if (root.controllerRef) root.controllerRef.dialog_closed("qml-recycle-cleanup")
 

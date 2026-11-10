@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from faststack.io.child_process import child_environment
+from faststack.io.child_process import child_environment, log_tool_output
 from faststack.io.executable_validator import validate_executable_path
 
 log = logging.getLogger(__name__)
@@ -172,6 +172,9 @@ def _read_focus_with_exiftool(paths: list[Path]) -> list[FocusPosition]:
     except (OSError, subprocess.SubprocessError) as exc:
         log.info("Could not run ExifTool for Restack focus ordering: %s", exc)
         return []
+    # ExifTool's warnings are shown with its name in front; stdout is the
+    # JSON FastStack parses, not console output.
+    log_tool_output("exiftool", stderr)
     if process.returncode != 0:
         log.info("ExifTool could not read Restack focus metadata: %s", stderr.strip())
         return []

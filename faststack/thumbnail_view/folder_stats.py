@@ -1,13 +1,17 @@
 """Parse faststack.json for folder statistics display in thumbnail grid."""
 
+import dataclasses
 import json
 import logging
 import os
 import threading
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+from faststack.logging_setup import get_app_data_dir
 
 log = logging.getLogger(__name__)
 
@@ -16,7 +20,13 @@ SIDECAR_FILENAME = "faststack.json"
 
 @dataclass
 class FolderStats:
-    """Statistics parsed from a folder's faststack.json file."""
+    """Statistics parsed from a folder's faststack.json file.
+
+    The four counts and ``batch_count`` cover entries whose image is still in
+    the folder. An entry outlives its file when the file is deleted, moved or
+    renamed outside FastStack; counting those made a folder tile claim
+    uploads and edits for photos that were no longer there.
+    """
 
     total_images: int
     stacked_count: int
@@ -48,6 +58,137 @@ MAX_CACHE_SIZE = 1000
 # Folder stats are read from the UI thread and from thumbnail workers; the
 # FIFO trim iterates the dict, which must not race another thread's insert.
 _cache_lock = threading.Lock()
+
+
+# The same results, kept in the app-data folder between runs. Opening a folder
+# with many subfolders parsed every child's faststack.json and listed every
+# child directory on the GUI thread at each start; with this, an unchanged
+# child costs the two stat() calls that validate its entry. Entries are keyed
+# by folder path and checked against the same two mtimes as _stats_cache.
+_PERSISTED_FILENAME = "folder_stats_cache.json"
+# Bump when the meaning of a stored value changes, so results computed the
+# old way are recomputed. 2: counts exclude entries whose file is gone.
+_PERSISTED_VERSION = 2
+_PERSIST_DELAY_SECONDS = 2.0
+# abspath -> {"json": mtime_ns, "dir": mtime_ns, "stats": dict or None}.
+# None until first use; guarded by _cache_lock.
+_persisted: Optional[Dict[str, dict]] = None
+_persist_timer: Optional[threading.Timer] = None
+
+
+def _persisted_path() -> Path:
+    return get_app_data_dir() / _PERSISTED_FILENAME
+
+
+def _load_persisted_locked() -> Dict[str, dict]:
+    """Return the on-disk entries, reading the file on first use."""
+    global _persisted
+    if _persisted is None:
+        _persisted = {}
+        try:
+            with open(_persisted_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if (
+                isinstance(data, dict)
+                and data.get("version") == _PERSISTED_VERSION
+                and isinstance(data.get("folders"), dict)
+            ):
+                _persisted = data["folders"]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            log.debug("Ignoring unreadable folder stats cache: %s", e)
+    return _persisted
+
+
+def _stats_from_persisted(payload) -> Optional["FolderStats"]:
+    """Rebuild a FolderStats from its JSON form; raises on anything unexpected."""
+    if payload is None:
+        return None
+    values = dict(payload)
+    values["coverage_buckets"] = [
+        (float(a), float(b), float(c), float(d))
+        for a, b, c, d in values.get("coverage_buckets", [])
+    ]
+    values["batch_coverage_buckets"] = [
+        float(v) for v in values.get("batch_coverage_buckets", [])
+    ]
+    for name in (
+        "total_images",
+        "stacked_count",
+        "uploaded_count",
+        "edited_count",
+        "batch_count",
+        "jpg_count",
+        "raw_count",
+    ):
+        if name in values:
+            values[name] = int(values[name])
+    return FolderStats(**values)
+
+
+def _persisted_lookup_locked(
+    cache_key: Tuple[str, int, int],
+) -> Tuple[Optional["FolderStats"], bool]:
+    """Return ``(stats, found)`` for a key whose mtimes still match on disk."""
+    folder, json_mtime_ns, folder_mtime_ns = cache_key
+    entry = _load_persisted_locked().get(folder)
+    if not isinstance(entry, dict):
+        return None, False
+    if entry.get("json") != json_mtime_ns or entry.get("dir") != folder_mtime_ns:
+        return None, False
+    try:
+        return _stats_from_persisted(entry.get("stats")), True
+    except (TypeError, ValueError):
+        return None, False
+
+
+def _persisted_store_locked(
+    cache_key: Tuple[str, int, int], stats: Optional["FolderStats"]
+) -> None:
+    folder, json_mtime_ns, folder_mtime_ns = cache_key
+    entries = _load_persisted_locked()
+    entries.pop(folder, None)  # re-insert at the end: the trim is FIFO
+    entries[folder] = {
+        "json": json_mtime_ns,
+        "dir": folder_mtime_ns,
+        "stats": dataclasses.asdict(stats) if stats is not None else None,
+    }
+    _check_cache_size(entries)
+    _schedule_persist_locked()
+
+
+def _schedule_persist_locked() -> None:
+    """Write the entries out shortly, once, however many just changed."""
+    global _persist_timer
+    if _persist_timer is not None:
+        return
+    timer = threading.Timer(_PERSIST_DELAY_SECONDS, _flush_persisted)
+    timer.daemon = True
+    timer.name = "FolderStatsCache"
+    _persist_timer = timer
+    timer.start()
+
+
+def _flush_persisted() -> None:
+    """Timer thread: replace the cache file with the current entries."""
+    global _persist_timer
+    with _cache_lock:
+        _persist_timer = None
+        payload = json.dumps(
+            {"version": _PERSISTED_VERSION, "folders": _persisted or {}}
+        )
+    # Only a cache: no fsync, and a failed write just means a slower start.
+    try:
+        path = _persisted_path()
+        temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(payload, encoding="utf-8")
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    except OSError as e:
+        log.debug("Could not write folder stats cache: %s", e)
 
 
 def _check_cache_size(cache_dict):
@@ -104,6 +245,12 @@ def read_folder_stats(folder_path: Path) -> Optional[FolderStats]:
     with _cache_lock:
         if cache_key in _stats_cache:
             return _stats_cache[cache_key]
+        # A result from an earlier run, still valid for these two mtimes.
+        stats, found = _persisted_lookup_locked(cache_key)
+        if found:
+            _check_cache_size(_stats_cache)
+            _stats_cache[cache_key] = stats
+            return stats
 
     # Parse the JSON file
     stats = _parse_faststack_json(json_path)
@@ -112,6 +259,7 @@ def read_folder_stats(folder_path: Path) -> Optional[FolderStats]:
     with _cache_lock:
         _check_cache_size(_stats_cache)
         _stats_cache[cache_key] = stats
+        _persisted_store_locked(cache_key, stats)
 
     return stats
 
@@ -143,17 +291,34 @@ def _scan_folder_files(folder_path: Path) -> Tuple[int, int, list]:
         Tuple of (jpg_count, raw_count, jpg_filenames_sorted)
         jpg_filenames_sorted is a list of JPG filenames sorted alphabetically.
     """
+    jpg_count, raw_count, jpg_files, _names, _stems = _scan_folder_names(folder_path)
+    return jpg_count, raw_count, jpg_files
+
+
+def _scan_folder_names(
+    folder_path: Path,
+) -> Tuple[int, int, list, set, set]:
+    """``_scan_folder_files`` plus every file's lowercased name and stem.
+
+    The two sets are what a sidecar entry key is checked against: FastStack
+    keys a JPG by its file name and anything else (a RAW on its own, an entry
+    from an old release) by its stem.
+    """
     jpg_count = 0
     raw_count = 0
     jpg_files = []
+    names: set = set()
+    stems: set = set()
     try:
         with os.scandir(folder_path) as entries:
             scanned = list(entries)
         for entry in scanned:
             if entry.is_file():
                 # FASTER: os.path.splitext is string-based, avoids Path object creation
-                _, suffix = os.path.splitext(entry.name)
+                stem, suffix = os.path.splitext(entry.name)
                 suffix = suffix.lower()
+                names.add(entry.name.lower())
+                stems.add(stem.lower())
                 if suffix in JPG_EXTENSIONS:
                     jpg_count += 1
                     jpg_files.append(entry.name)
@@ -167,7 +332,19 @@ def _scan_folder_files(folder_path: Path) -> Tuple[int, int, list]:
     # two orders agree, and the sparkline only needs a coarse 40-bucket
     # progression, so this avoids a stat() per file in every subfolder.
     jpg_files.sort(key=str.lower)
-    return jpg_count, raw_count, jpg_files
+    return jpg_count, raw_count, jpg_files, names, stems
+
+
+def _entry_file_present(key, names: set, stems: set) -> bool:
+    """Whether the image a sidecar entry belongs to is in the folder."""
+    if not isinstance(key, str):
+        return False
+    if "/" in key:
+        # A file outside this folder's own listing (a subfolder or an
+        # absolute path): not looked up here, so it keeps being counted.
+        return True
+    lowered = key.lower()
+    return lowered in names or lowered in stems
 
 
 def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
@@ -196,14 +373,21 @@ def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
         log.debug("Invalid entries format in %s", json_path)
         return None
 
-    # Count statistics from entries
-    total_images = len(entries)
+    # Single-pass scan: count file types AND collect JPG filenames for sparkline
+    folder_path = json_path.parent
+    jpg_count, raw_count, jpg_files, names, stems = _scan_folder_names(folder_path)
+
+    # Count statistics from the entries whose image is still in the folder
+    total_images = 0
     stacked_count = 0
     uploaded_count = 0
     edited_count = 0
     batch_count = 0
 
-    for stem, meta in entries.items():
+    for key, meta in entries.items():
+        if not _entry_file_present(key, names, stems):
+            continue
+        total_images += 1
         if not isinstance(meta, dict):
             continue
 
@@ -215,10 +399,6 @@ def _parse_faststack_json(json_path: Path) -> Optional[FolderStats]:
             edited_count += 1
         if meta.get("batch", False):
             batch_count += 1
-
-    # Single-pass scan: count file types AND collect JPG filenames for sparkline
-    folder_path = json_path.parent
-    jpg_count, raw_count, jpg_files = _scan_folder_files(folder_path)
 
     # Compute coverage buckets for sparkline (using pre-collected JPG list)
     coverage_buckets, batch_coverage_buckets = _compute_folder_coverage(
@@ -329,9 +509,14 @@ def _compute_folder_coverage(
 
 
 def clear_stats_cache():
-    """Clear the folder stats cache."""
+    """Clear the folder stats cache, including the copy kept between runs."""
+    global _persisted
     with _cache_lock:
         _stats_cache.clear()
+        had_persisted = bool(_load_persisted_locked())
+        _persisted = {}
+        if had_persisted:
+            _schedule_persist_locked()
     log.debug("Cleared folder stats cache")
 
 

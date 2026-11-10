@@ -60,9 +60,13 @@ class TestReadFolderStats:
                 "IMG_001": {"stacked": True, "uploaded": False, "edited": False},
                 "IMG_002": {"stacked": False, "uploaded": True, "edited": True},
                 "IMG_003": {"stacked": True, "uploaded": True, "edited": False},
+                # An entry whose photo is no longer in the folder is not counted.
+                "IMG_GONE": {"stacked": True, "uploaded": True, "edited": True},
             },
         }
         json_path.write_text(json.dumps(data))
+        for stem in ("IMG_001", "IMG_002", "IMG_003"):
+            (temp_folder / f"{stem}.jpg").touch()
 
         stats = read_folder_stats(temp_folder)
 
@@ -107,6 +111,8 @@ class TestReadFolderStats:
             }
         }
         json_path.write_text(json.dumps(data))
+        (temp_folder / "IMG_001.jpg").touch()
+        (temp_folder / "IMG_002.jpg").touch()
 
         stats = read_folder_stats(temp_folder)
 
@@ -121,6 +127,7 @@ class TestReadFolderStats:
         json_path = temp_folder / "faststack.json"
         data = {"version": 2, "entries": {"IMG_001": {"stacked": True}}}
         json_path.write_text(json.dumps(data))
+        (temp_folder / "IMG_001.jpg").touch()
 
         # First read
         stats1 = read_folder_stats(temp_folder)
@@ -139,6 +146,8 @@ class TestReadFolderStats:
         json_path = temp_folder / "faststack.json"
         data = {"version": 2, "entries": {"IMG_001": {"stacked": True}}}
         json_path.write_text(json.dumps(data))
+        (temp_folder / "IMG_001.jpg").touch()
+        (temp_folder / "IMG_002.jpg").touch()
 
         # First read
         stats1 = read_folder_stats(temp_folder)
@@ -178,6 +187,8 @@ class TestReadFolderStats:
             },
         }
         json_path.write_text(json.dumps(data))
+        (temp_folder / "IMG_001.jpg").touch()
+        (temp_folder / "IMG_002.jpg").touch()
 
         stats = read_folder_stats(temp_folder)
 

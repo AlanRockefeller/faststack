@@ -155,7 +155,10 @@ Dialog {
         // Flags are now collected live via onCheckedChanged
     }
 
-    onOpened: {
+    // aboutToShow, not opened: opened() fires only once the enter transition
+    // has finished, so text typed straight after opening ran as shortcuts and
+    // was then replaced by the stored filter.
+    onAboutToShow: {
         // Register first: initialization below may call user/config code.
         if (filterDialog.controllerRef && filterDialog.controllerRef.dialog_opened) {
             filterDialog.controllerRef.dialog_opened("qml-filter")
@@ -177,6 +180,7 @@ Dialog {
         filterField.forceActiveFocus()
         filterField.selectAll()
     }
+    onOpened: if (!filterField.activeFocus) filterField.forceActiveFocus()
 
     onClosed: {
         // Notify Python that dialog is closed

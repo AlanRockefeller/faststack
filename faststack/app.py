@@ -81,8 +81,8 @@ from faststack.models import (
 )
 from faststack.io.child_process import (
     child_environment,
-    child_popen_kwargs,
-    reap_in_background,
+    launch_with_relayed_output,
+    log_tool_output,
 )
 from faststack.io.folder_delete import (
     delete_inspected_folder,
@@ -108,6 +108,8 @@ from faststack.io.helicon import (
 )
 from faststack.io.focus_order import order_focus_stack_inputs
 from faststack.io.arguments import parse_external_arguments
+from faststack.inat.controller import INatUploadController
+from faststack.inat.providers import CardPhotoProvider, TileImageProvider
 from faststack.io.executable_validator import validate_executable_path
 from faststack.io.utils import normalize_path_key, resolve_configured_path
 from faststack.imaging.cache import (
@@ -277,6 +279,43 @@ _STARTUP_T0 = time.perf_counter()
 def _startup_elapsed() -> float:
     """Seconds since process start, for the [STARTUP] trace."""
     return time.perf_counter() - _STARTUP_T0
+
+
+_TRACE_TIMESTAMP_RE = re.compile(r"^\[\s*[\d:.]+\]\s*")
+
+
+def _collapse_repeated_trace(lines) -> list[str]:
+    """Fold runs of identical protocol messages into one line each.
+
+    A drag hovering over its target gets the same ``wl_data_source.target()``
+    event once per pointer frame - some 70 lines a second that differ only in
+    their timestamp. The first line of a run is kept as is; when the run is
+    longer its line says how many followed and when the last one arrived.
+    """
+    out: list[str] = []
+    previous_body = None
+    run = 0
+    last_stamp = ""
+
+    def close_run() -> None:
+        if run > 1:
+            out[-1] = f"{out[-1]}  (x{run}, last at {last_stamp or 'unknown'})"
+
+    for line in lines:
+        match = _TRACE_TIMESTAMP_RE.match(line)
+        body = line[match.end() :] if match else line
+        if body == previous_body:
+            run += 1
+            if match:
+                last_stamp = match.group(0).strip().strip("[]").strip()
+            continue
+        close_run()
+        out.append(line)
+        previous_body = body
+        run = 1
+        last_stamp = ""
+    close_run()
+    return out
 
 
 # Bounds on core.editor_preview_long_edge (0 = auto). The ceiling caps the
@@ -826,6 +865,9 @@ class AppController(
         # to, the background decode it is waiting on, and a target whose
         # background decode failed (handed to the provider as before).
         self._published_loupe_source = ""
+        # True while QML is being told the loupe replaced the grid; see
+        # _set_grid_view_active and _resolve_loupe_image_source.
+        self._entering_loupe = False
         self._published_loupe_source_dir: Optional[Path] = None
         self._loupe_source_pending: Optional[dict] = None
         self._loupe_source_failed_target: Optional[str] = None
@@ -847,6 +889,13 @@ class AppController(
         # set_zoomed). (unzoomed, zoomed) generations of the current zoom pair.
         self._display_generation_counter = 0
         self._zoom_generation_pair: Optional[tuple[int, int]] = None
+        # Fit-to-window sizes used recently, each with the generation its
+        # frames live under, oldest first. A window that returns to a size it
+        # had a moment ago (a panel toggled, a tiling window manager making
+        # room for another window and taking it back) gets those frames back
+        # instead of decoding the whole prefetch window again. Emptied by
+        # _bump_display_generation(), which retires every frame.
+        self._display_size_generations: dict[tuple[int, int], int] = {}
         self._display_lock = threading.Lock()
         self._is_decoding = False
         self._quality_decode_token = 0
@@ -953,6 +1002,7 @@ class AppController(
             prefetch_radius=config.getint("core", "prefetch_radius", 20),
             get_display_info=self.get_display_info,
             debug=_debug_mode or self.debug_cache_trace,
+            trace=self.debug_cache_trace,
             cache_contains=self.image_cache.__contains__,
             cache_get_quality=self._cache_decode_quality,
             quality_is_current=self._quality_upgrade_still_current,
@@ -1241,8 +1291,11 @@ class AppController(
         # so an unexpected reboot can resume close to where they left off.
         self._session_registry = SessionRegistry()
         # Tracks the directory last written to config.last_directory so we only
-        # rewrite the INI when the open folder actually changes.
-        self._last_persisted_dir = None
+        # rewrite the INI when the open folder actually changes. Seeded from
+        # the stored value so reopening the same folder writes nothing.
+        self._last_persisted_dir = (
+            config.get("core", "last_directory", fallback="") or None
+        )
         self._session_save_timer = QTimer(self)
         self._session_save_timer.setSingleShot(True)
         self._session_save_timer.setInterval(1000)
@@ -1898,11 +1951,17 @@ class AppController(
         # Apply flag-based filtering (AND logic: image must have ALL checked flags)
         if self._filter_enabled and self._filter_flags:
             flags = self._filter_flags
+            # migrate=False: a bulk read. Most images have no entry, and the
+            # legacy-key migration scan walks every entry on each miss.
             result = [
                 img
                 for img in result
                 if (
-                    (meta := self.sidecar.get_metadata(img.path, create=False))
+                    (
+                        meta := self.sidecar.get_metadata(
+                            img.path, create=False, migrate=False
+                        )
+                    )
                     and all(getattr(meta, f, False) for f in flags)
                 )
             ]
@@ -1981,9 +2040,62 @@ class AppController(
         return self.display_generation
 
     def _bump_display_generation(self):
-        """Move to a fresh display_generation under _display_lock."""
+        """Move to a fresh display_generation under _display_lock.
+
+        Retires every cached frame, including those kept for other recent
+        window sizes: the caller is saying the pixels themselves are stale.
+        """
         with self._display_lock:
+            self._display_size_generations.clear()
             self._allocate_display_generation_locked()
+
+    # Sizes remembered at once, the current one included.
+    _REMEMBERED_DISPLAY_SIZES = 3
+
+    def _switch_display_generation_for_resize_locked(
+        self,
+        old_size: Optional[tuple[int, int]],
+        new_size: tuple[int, int],
+    ) -> None:
+        """Pick the generation for a new fit-to-window size.
+
+        Caller holds _display_lock. A size used a moment ago gets its
+        generation back, and with it every frame decoded for that size; any
+        other size gets a fresh one. Frames are stored with the size and
+        generation captured together when their decode was submitted, so a
+        generation never holds frames of two sizes. While zoomed the frames
+        are full resolution under the zoom pair, which a resize retires as
+        it always has.
+        """
+        remembered = self._display_size_generations
+        if self.is_zoomed:
+            remembered.clear()
+            self._allocate_display_generation_locked()
+            return
+        if old_size is not None:
+            remembered.pop(old_size, None)
+            remembered[old_size] = self.display_generation
+        generation = remembered.pop(new_size, None)
+        if generation is None:
+            generation = self._allocate_display_generation_locked()
+        else:
+            self.display_generation = generation
+        remembered[new_size] = generation
+        while len(remembered) > self._REMEMBERED_DISPLAY_SIZES:
+            del remembered[next(iter(remembered))]
+
+    def _reachable_display_generations(self) -> set[int]:
+        """Generations whose frames can still be shown without a new decode."""
+        with self._display_lock:
+            reachable = set(self._display_size_generations.values())
+            reachable.add(self.display_generation)
+            # The zoom pair is reachable through either of its halves: a zoom
+            # toggle moves between them. A pair left behind by a size that is
+            # no longer remembered is not.
+            pair = self._zoom_generation_pair
+            if pair is not None and not reachable.isdisjoint(pair):
+                reachable.update(pair)
+        return reachable
 
     def _cache_decode_quality(self, cache_key: str) -> Optional[str]:
         """Return cached display quality for ``cache_key`` without changing key format."""
@@ -2023,6 +2135,15 @@ class AppController(
             return False
         _, _, current_display_gen = self.get_display_info()
         return display_generation == current_display_gen
+
+    def _navigation_in_flight(self) -> bool:
+        """True while arrow navigation is held, queued or awaiting its frame."""
+        return (
+            self._held_navigation_direction != 0
+            or self._paced_navigation_pending is not None
+            or bool(self._paced_navigation_queue)
+            or self._paced_present_gate is not None
+        )
 
     def _restart_quality_decode_timer(self, *, immediate: bool = False) -> None:
         """Schedule settled quality, bypassing debounce after an explicit release."""
@@ -2372,25 +2493,38 @@ class AppController(
         with self._display_lock:
             first_report = not self.display_ready
             changed = width != self.display_width or height != self.display_height
+            if changed:
+                old_size = (
+                    (int(self.display_width), int(self.display_height))
+                    if self.display_ready
+                    else None
+                )
+                self._switch_display_generation_for_resize_locked(
+                    old_size, (width, height)
+                )
             self.display_width = width
             self.display_height = height
             self.display_ready = True
-            if changed:
-                self._allocate_display_generation_locked()
         return changed, first_report
 
-    def _handle_resize(self):
-        """Actual resize handler, called after debounce period."""
-        log.info(
-            "Display size changed to: %dx%d (physical pixels)",
-            self.pending_width,
-            self.pending_height,
-        )
+    def _handle_resize(self, *, keep_navigation_record: bool = False) -> bool:
+        """Actual resize handler, called after debounce period.
+
+        Returns True when the size changed and the view was refreshed for it.
+        ``keep_navigation_record`` is for a caller that knows no navigation is
+        in flight (see ``_finish_entering_loupe``).
+        """
         changed, is_first_resize = self._commit_pending_display_size()
         if not changed and not is_first_resize:
-            return
+            return False
+        log.info(
+            "Display size changed to: %dx%d (physical pixels)",
+            self.display_width,
+            self.display_height,
+        )
 
-        self._cancel_paced_navigation()
+        if not keep_navigation_record:
+            self._cancel_paced_navigation()
         if is_first_resize:
             log.info("Display size now stable, enabling prefetch")
 
@@ -2399,9 +2533,10 @@ class AppController(
         self._apply_editor_preview_master_box()
 
         self.prefetcher.cancel_all()  # Cancel stale tasks to avoid wasted work
-        # Cache keys include the monotonically increasing display generation;
-        # older sizes can never be reused and otherwise consume the byte budget.
-        self.image_cache.clear()
+        # Cache keys include the display generation. Keep the frames a recent
+        # size or the zoom pair can still reach; any other generation can
+        # never be shown again and would only consume the byte budget.
+        self.image_cache.retain_generations(self._reachable_display_generations())
 
         if self._loupe_decode_allowed():
             # On first resize, execute deferred prefetch; on subsequent resizes, do normal prefetch
@@ -2413,6 +2548,7 @@ class AppController(
 
         self.sync_ui_state()  # To refresh the image
         self._restart_quality_decode_timer()
+        return True
 
     @Slot(bool)
     def set_zoomed(self, zoomed: bool):
@@ -2733,6 +2869,14 @@ class AppController(
                 )
                 if not blocked_modifiers:
                     direction = 1 if event.key() == Qt.Key_Right else -1
+                    if not event.isAutoRepeat():
+                        # The Keybinder never sees arrows, so say so here: the
+                        # navigation that follows is otherwise unexplained.
+                        log.debug(
+                            "Key %s -> navigate %s",
+                            "Right" if direction > 0 else "Left",
+                            "next" if direction > 0 else "previous",
+                        )
                     # Do this for both the initial and auto-repeat presses. A
                     # healthy hold is a no-op in _begin_navigation_hold(); a
                     # hold whose state was cleared while the key remained down
@@ -2946,7 +3090,22 @@ class AppController(
 
     def load(self, skip_thumbnail_refresh: bool = False):
         """Loads images, sidecar data, and starts services."""
-        log.info("[STARTUP] %.3fs load() begin", _startup_elapsed())
+        # The first load is part of startup and shares its clock. Every later
+        # one (opening another folder) used to print the same "[STARTUP] 7.3s"
+        # lines; those get their own prefix and time from when the load began.
+        first_load = not getattr(self, "_startup_load_logged", False)
+        self._startup_load_logged = True
+        load_started = time.perf_counter()
+
+        def milestone(text: str, *args) -> None:
+            if first_load:
+                log.info("[STARTUP] %.3fs " + text, _startup_elapsed(), *args)
+            else:
+                log.info(
+                    "[LOAD] +%.3fs " + text, time.perf_counter() - load_started, *args
+                )
+
+        milestone("load() begin: %s", self.image_dir)
         self._cancel_paced_navigation()
         # Reset instrumentation for this load operation
         self._scan_count_variant = 0
@@ -2999,11 +3158,8 @@ class AppController(
         self._notify_thumbnail_current_path_changed(
             provisional_current_path, force=True
         )
-        log.info(
-            "[STARTUP] %.3fs index restored: index=%d of %d",
-            _startup_elapsed(),
-            self.current_index,
-            len(self.image_files),
+        milestone(
+            "index restored: index=%d of %d", self.current_index, len(self.image_files)
         )
         self._startup_restore_path = None
         self._startup_restore_index = None
@@ -3046,7 +3202,12 @@ class AppController(
         if not self._is_grid_view_active:
             folder_loaded_changed = self._set_folder_loaded(True, notify=False)
         self._do_prefetch(self.current_index)
-        log.info("[STARTUP] %.3fs first decode submitted", _startup_elapsed())
+        if not self.image_files:
+            milestone("nothing to decode (no images in this folder)")
+        elif not self._loupe_decode_allowed():
+            milestone("nothing decoded yet (grid view)")
+        else:
+            milestone("first decode submitted")
 
         # Publish count, index, and source from one generation. imageCountChanged
         # may synchronously evaluate the source binding, so generation/index must
@@ -3055,7 +3216,7 @@ class AppController(
         # sync_ui_state can evaluate the QML source binding inline, so this line
         # lands AFTER a blocking requestImage(). A long gap between it and the
         # previous line is the provider waiting on the first decode.
-        log.info("[STARTUP] %.3fs UI state published", _startup_elapsed())
+        milestone("UI state published")
         if folder_loaded_changed:
             self.ui_state.isFolderLoadedChanged.emit()
 
@@ -3832,8 +3993,17 @@ class AppController(
                 keys.add(key)
         return keys
 
-    def _persist_batch_flags(self) -> bool:
-        """Write the current runtime batch selection to per-entry sidecar flags."""
+    def _persist_batch_flags(
+        self, *, force: bool = False, background: bool = False
+    ) -> bool:
+        """Write the current runtime batch selection to per-entry sidecar flags.
+
+        The sidecar is written only when a batch flag changed. ``force`` writes
+        it regardless, for a caller with other metadata changes that should go
+        out in the same write. ``background`` hands the write to the
+        session-write worker and returns True at once; a write that fails
+        there is retried synchronously and reported the usual way.
+        """
         active_keys = self._current_batch_metadata_keys()
         # Only touch entries in the current (possibly filtered) view. active_keys
         # is derived from self.image_files, so iterating _all_images here would
@@ -3860,7 +4030,30 @@ class AppController(
                 meta.batch = should_be_batched
                 changed = True
 
-        return not changed or self._persist_sidecar()
+        if not (changed or force):
+            return True
+        if background:
+            self._queue_sidecar_write()
+            return True
+        return self._persist_sidecar()
+
+    def _queue_sidecar_write(self, manager: Optional[SidecarManager] = None) -> None:
+        """Write the folder sidecar on the session-write worker.
+
+        For metadata changes made in the middle of an interaction (a slider
+        drag, an auto-adjust keystroke, a save finishing while the user is
+        already on the next image), where a synchronous write would hold the
+        GUI thread for a serialise, a write and two fsyncs.
+        """
+        if manager is None:
+            manager = self.sidecar
+        try:
+            prepared = manager.prepare_background_write()
+        except Exception as e:
+            log.warning("Could not snapshot sidecar for a background write: %s", e)
+            _ = self._persist_sidecar(manager)
+            return
+        self._queue_session_write(manager, prepared, None)
 
     def _restore_batches_from_sidecar_flags(self) -> None:
         """Rebuild runtime batch ranges from sidecar flags for image_files order."""
@@ -3891,12 +4084,21 @@ class AppController(
         notify_model: bool = True,
         reapply_filter: bool = False,
         preserved_path: Optional[Path] = None,
+        force_persist: bool = False,
+        background_persist: bool = False,
     ) -> bool:
-        """Normalize batch state and fan out persistence/UI invalidations."""
+        """Normalize batch state and fan out persistence/UI invalidations.
+
+        ``force_persist`` writes the sidecar even when no batch flag changed
+        and ``background_persist`` writes it off the GUI thread (see
+        ``_persist_batch_flags``).
+        """
         self._normalize_batches()
         self._invalidate_batch_cache()
         self._update_filter_identity_snapshot("batch")
-        persisted = not persist or self._persist_batch_flags()
+        persisted = not persist or self._persist_batch_flags(
+            force=force_persist, background=background_persist
+        )
         filter_reapplied = False
         if reapply_filter and persist:
             if (
@@ -4222,7 +4424,7 @@ class AppController(
         if self._shutting_down:
             return  # the shutdown path does its own final synchronous save
         log.info(
-            "Background sidecar position write returned %s; saving synchronously",
+            "Background sidecar write returned %s; saving synchronously",
             outcome,
         )
         try:
@@ -5484,14 +5686,24 @@ class AppController(
         is_open = count > 0
         self._dialog_open_count = count
         if not was_open and is_open:
-            self._begin_direct_image_transition("dialog opened")
+            if self._navigation_in_flight():
+                # A modal takes the keyboard, so the release of a held arrow
+                # key never reaches the navigation code. Stop here, and
+                # schedule the settled decode that the release would have.
+                self._begin_direct_image_transition("dialog opened")
+                self._restart_quality_decode_timer()
+            # Otherwise the image on screen is not changing, so its settled
+            # decode and any preview refinement carry on behind the dialog.
+            # Cancelling them here left the image soft for as long as the
+            # dialog stayed open, then decoded it again after it closed. An
+            # action in the dialog that replaces the image begins its own
+            # transition.
             self._dialog_open = True
             self.dialogStateChanged.emit(True)
             log.debug("Dialog opened, disabling global keybindings")
         elif was_open and not is_open:
             self._dialog_open = False
             self.dialogStateChanged.emit(False)
-            self._restart_quality_decode_timer()
             log.debug("All dialogs closed, re-enabling global keybindings")
 
     @Slot()
@@ -5513,7 +5725,10 @@ class AppController(
         """Release a modal scope without allowing underflow or cross-close."""
         if token:
             if token not in self._active_modal_tokens:
-                log.debug("Ignoring unmatched dialog-close token %s", token)
+                if not self._shutting_down:
+                    # At exit every dialog's Component.onDestruction lands
+                    # here; that is teardown, not a mismatch worth a line each.
+                    log.debug("Ignoring unmatched dialog-close token %s", token)
                 return
             self._active_modal_tokens.remove(token)
         elif self._anonymous_dialog_depth > 0:
@@ -5625,13 +5840,44 @@ class AppController(
         else:
             # Entering loupe view
             log.info("Switched to loupe view")
-            # Trigger exactly one decode for the current index
-            self._maybe_decode_current_image("enter-loupe")
-            self._restart_quality_decode_timer()
             self._maybe_show_turbo_fallback_warning()
 
-        # Notify UI state via signal
-        self.ui_state.isGridViewActiveChanged.emit(active)
+        if active:
+            self.ui_state.isGridViewActiveChanged.emit(active)
+            return
+
+        # QML builds the loupe while this signal is delivered: it reads
+        # currentImageSource and reports the image area's size. The decode is
+        # requested afterwards, once that size is known. Requesting it first
+        # decoded for the size left over from before the grid was shown and
+        # again 150 ms later when the resize debounce fired.
+        self._entering_loupe = True
+        try:
+            self.ui_state.isGridViewActiveChanged.emit(active)
+        finally:
+            self._entering_loupe = False
+        self._finish_entering_loupe()
+
+    def _finish_entering_loupe(self) -> None:
+        """Request the decode for the image the loupe has just been built on."""
+        refreshed = False
+        if self.resize_timer.isActive():
+            # The loupe reported a size during the switch: commit it now so
+            # the one decode is at the right resolution. Entering the grid
+            # cancelled any paced navigation, and the trace record minted
+            # while QML read the source is for this very image; keeping it
+            # shows the switch as one navigation instead of an abandoned one
+            # followed by its replacement.
+            self.resize_timer.stop()
+            refreshed = self._handle_resize(keep_navigation_record=True)
+        if not refreshed:
+            # Trigger exactly one decode for the current index
+            self._maybe_decode_current_image("enter-loupe")
+            # The source read during the switch was held back when the image
+            # was not cached yet (_resolve_loupe_image_source); read it again
+            # now that its decode is queued.
+            self.ui_state.currentImageSourceChanged.emit()
+        self._restart_quality_decode_timer()
 
     def _grid_child_folder_for_delete(self, path: str) -> Optional[Path]:
         """Resolve *path* when it is a direct child of the grid directory."""
@@ -5766,11 +6012,13 @@ class AppController(
             # Image might be in a different directory - don't switch view
             return
 
-        # Switch to loupe view first (avoids transient work while still in grid)
-        self._set_grid_view_active(False)
-
-        # Then set index with navigation=True for proper state reset and prefetch
+        # Select the image while the grid is still showing: nothing is decoded
+        # or published for the loupe in grid view, so the loupe is then built
+        # directly on this image. Switching first bound the previously viewed
+        # image, decoded its neighbourhood, and showed it for about 100 ms
+        # before the image that was clicked.
         self._set_current_index(loupe_index, is_navigation=True)
+        self._set_grid_view_active(False)
 
         log.info("Opened image from grid: %s", entry.path)
 
@@ -6735,7 +6983,12 @@ class AppController(
                 in_batch = any(start <= i <= end for start, end in self.batches)
                 if not in_batch:
                     self.batches.append([i, i])
-                    if not self._finalize_batch_state(reapply_filter=True):
+                    # This runs inside the first slider move or auto-adjust
+                    # keystroke on an image, so the sidecar write goes to the
+                    # background worker instead of stalling that interaction.
+                    if not self._finalize_batch_state(
+                        reapply_filter=True, background_persist=True
+                    ):
                         return False
                     log.info("Auto-added edited image to batch: %s", image_path.name)
                 return True
@@ -7529,6 +7782,9 @@ class AppController(
         log.info("Clearing all defined stacks.")
         undo_data = self._snapshot_stacks_for_undo()
         if undo_data is not None:
+            undo_data["live_edit_mark"] = (
+                self._get_current_preview_session_provenance()
+            )
             # Recorded before the write so a failed persist is still undoable.
             self.undo_history.append(("clear_stacks", undo_data, time.time()))
         self.stacks = []
@@ -7578,6 +7834,9 @@ class AppController(
                         "directory": str(self.image_dir),
                         "paths": batched_paths,
                         "start": batch_start,
+                        "live_edit_mark": (
+                            self._get_current_preview_session_provenance()
+                        ),
                     },
                     time.time(),
                 )
@@ -8024,7 +8283,13 @@ class AppController(
 
     @Slot(result=str)
     def get_current_version(self):
-        return get_current_version()
+        # Resolved once per run. This backs a QML binding, and every read
+        # opened pyproject.toml and the package metadata again (and logged
+        # their mismatch each time on an editable install).
+        version = getattr(self, "_current_version", None)
+        if version is None:
+            version = self._current_version = get_current_version()
+        return version
 
     @Slot(result=str)
     def get_readme_text(self):
@@ -10975,6 +11240,27 @@ class AppController(
         if update_hist and self.ui_state.isHistogramVisible:
             self.update_histogram()
 
+    def _newest_undo_is_clear_after_live_edits(self) -> bool:
+        """True when Ctrl+Z should undo a clear before reverting unsaved edits.
+
+        Clear Stacks and Clear Batches record the editor's path, session and
+        edit revision. If those still match, nothing has been edited since the
+        clear, so the clear is the most recent action and is what the user
+        means to take back. Any edit made afterwards changes the revision and
+        the unsaved edits are reverted first, as before.
+        """
+        if not self.undo_history:
+            return False
+        action_type, action_data, _timestamp = self.undo_history[-1]
+        if action_type not in ("clear_stacks", "clear_batches"):
+            return False
+        if not isinstance(action_data, dict):
+            return False
+        mark = action_data.get("live_edit_mark")
+        return (
+            mark is not None and mark == self._get_current_preview_session_provenance()
+        )
+
     @Slot()
     def undo_delete(self):
         """Unified undo that handles delete, pending_delete, and edit operations."""
@@ -10985,8 +11271,12 @@ class AppController(
                 log.exception("Failed to flush pending auto-adjust save before undo")
 
         # If the live session has unsaved edits (e.g. crop or auto-levels
-        # applied as preview-only), revert them before touching undo_history.
-        if self._is_current_live_edit_session_dirty():
+        # applied as preview-only), revert them before touching undo_history,
+        # unless the newest history entry is a clear made after those edits.
+        if (
+            self._is_current_live_edit_session_dirty()
+            and not self._newest_undo_is_clear_after_live_edits()
+        ):
             self._clear_active_auto_adjust_state(
                 "undo reverted unsaved live edits",
                 clear_editor=False,
@@ -11411,6 +11701,12 @@ class AppController(
         log.info("Shutting down background resources.")
 
         self._shutting_down = True  # gate async callbacks during shutdown_nonqt too
+        inat_upload = getattr(self, "_inat_upload", None)
+        if inat_upload is not None:
+            try:
+                inat_upload.shutdown()
+            except Exception:
+                log.debug("iNat upload shutdown failed", exc_info=True)
         self._exif_pending_path = None  # optional but consistent with shutdown_qt
         self._cancel_raw_development_operations()
 
@@ -11842,14 +12138,14 @@ class AppController(
             self.update_status_message(f"RawTherapee validation failed: {error}")
             return
         try:
-            process = subprocess.Popen(
+            # Never a shell. RawTherapee's output is relayed as "[RawTherapee]"
+            # lines and the editor keeps running if FastStack is closed first.
+            launch_with_relayed_output(
                 [executable, str(raw_path.resolve())],
-                shell=False,
+                name="RawTherapee",
                 stdin=subprocess.DEVNULL,
                 close_fds=True,
-                **child_popen_kwargs(),
             )
-            reap_in_background(process, Path(executable).name)
             self.update_status_message(f"Opened {raw_path.name} in RawTherapee.")
         except OSError as exc:
             log.exception("Failed to launch RawTherapee")
@@ -12012,8 +12308,17 @@ class AppController(
         completed_edit_state_request_id: Optional[str] = None,
         saved_edit_state: Optional[dict[str, Any]] = None,
         clear_saved_edit_state: bool = False,
+        background: bool = False,
     ) -> Optional[dict]:
-        """Mark an image as edited and return the pre-save metadata snapshot."""
+        """Mark an image as edited and return the pre-save metadata snapshot.
+
+        ``background`` writes the sidecar on the session-write worker instead
+        of on the calling (GUI) thread. A write that fails there is retried
+        synchronously and reported. A crash before it lands leaves the saved
+        image without its edited flag, and its edit state as the start of the
+        save left it: still marked pending_save, or absent when no pending
+        state was written.
+        """
         old_meta = self._capture_metadata_snapshot(sidecar, image_path)
         new_meta = dict(old_meta or {})
         new_meta["edited"] = True
@@ -12049,7 +12354,12 @@ class AppController(
                 != completed_edit_state_request_id
             ):
                 new_meta["edit_state"] = None
-        if not sidecar.update_metadata(image_path, new_meta):
+        # Only the current folder's sidecar goes to the worker: it is the one
+        # the shutdown path saves, so a write still queued at exit is covered.
+        if background and sidecar is self.sidecar and not self._shutting_down:
+            sidecar.update_metadata(image_path, new_meta, save=False)
+            self._queue_sidecar_write(sidecar)
+        elif not sidecar.update_metadata(image_path, new_meta):
             log.error(
                 "Image pixels were saved but edited metadata remains pending for %s",
                 image_path,
@@ -12286,10 +12596,15 @@ class AppController(
                 log.info("[drag] drop target read %s", mime_type)
             drag_state["payload_read"] = True
             if _debug_mode:
-                size = len(data) if isinstance(data, (bytes, bytearray)) else None
+                if isinstance(data, (bytes, bytearray)):
+                    size = f"{len(data)} bytes"
+                elif isinstance(data, (list, tuple)):
+                    size = f"{len(data)} item(s)"
+                else:
+                    size = "size unknown"
                 drag_diag["reads"].append(mime_type)
                 log.debug(
-                    "[drag +%.0fms] payload read: %s (%s, %s bytes)",
+                    "[drag +%.0fms] payload read: %s (%s, %s)",
                     drag_elapsed_ms(),
                     mime_type,
                     type(data).__name__,
@@ -12407,7 +12722,7 @@ class AppController(
         if _debug_mode:
             elapsed = drag_elapsed_ms()
             if protocol_monitor is not None:
-                for line in protocol_monitor.take_trace():
+                for line in _collapse_repeated_trace(protocol_monitor.take_trace()):
                     log.debug("[drag wayland] %s", line)
                 protocol_outcome = protocol_monitor.outcome()
             elif on_wayland:
@@ -12477,6 +12792,111 @@ class AppController(
                 url.toString(),
             )
 
+    # --- iNaturalist upload (Actions menu) ---------------------------------
+
+    def _batch_export_paths(self) -> tuple[list[Path], list[Path]]:
+        """(files to send, their catalogue paths), batch files or the current image.
+
+        Same selection as drag-and-drop: every photo in every defined batch,
+        else the current image, preferring the developed JPG in RAW mode.
+        """
+        if not self.image_files:
+            return [], []
+        indices: set[int] = set()
+        for start, end in self.batches:
+            for idx in range(start, end + 1):
+                if 0 <= idx < len(self.image_files):
+                    indices.add(idx)
+        if not indices and 0 <= self.current_index < len(self.image_files):
+            indices.add(self.current_index)
+        send: list[Path] = []
+        catalogue: list[Path] = []
+        in_raw_mode = getattr(self, "current_edit_source_mode", "jpeg") == "raw"
+        for idx in sorted(indices):
+            img = self.image_files[idx]
+            if not img.path.exists():
+                continue
+            is_developed_artifact = img.path.stem.lower().endswith("-developed")
+            if (in_raw_mode or is_developed_artifact) and img.developed_jpg_path.exists():
+                send.append(img.developed_jpg_path)
+            else:
+                send.append(img.path)
+            catalogue.append(img.path)
+        return send, catalogue
+
+    @Slot(result=bool)
+    def open_inat_upload(self) -> bool:
+        """Prepare the iNaturalist upload dialog for the current batch."""
+        inat_upload = getattr(self, "_inat_upload", None)
+        if inat_upload is None:
+            self.update_status_message("iNaturalist upload is not available.")
+            return False
+        send, catalogue = self._batch_export_paths()
+        if not send:
+            self.update_status_message("No photos in the batch to upload.")
+            return False
+        current_path = (
+            self.image_files[self.current_index].path
+            if 0 <= self.current_index < len(self.image_files)
+            else None
+        )
+        if current_path in catalogue and self._is_current_live_edit_session_dirty():
+            if self._block_if_saving(current_path):
+                return False
+            if not self._flush_current_live_edit_session_for_drag(
+                saving_status="Saving edits before upload..."
+            ):
+                return False
+        for path in send:
+            if self._block_if_saving(path):
+                return False
+        self._inat_upload_catalogue = {str(s): c for s, c in zip(send, catalogue)}
+        if not inat_upload.open([str(p) for p in send]):
+            self.update_status_message("Could not read any of the batch photos.")
+            return False
+        return True
+
+    def _on_inat_upload_finished(self, uploaded_paths, all_done: bool) -> None:
+        """Mark the photos uploaded in the sidecar, like an accepted drag.
+
+        Batches are cleared only once every card went up, so a partial run
+        leaves the failed photos batched for another try.
+        """
+        lookup = getattr(self, "_inat_upload_catalogue", {}) or {}
+        catalogue_paths = []
+        for raw in uploaded_paths:
+            path = lookup.get(str(raw), Path(str(raw)))
+            catalogue_paths.append(Path(path))
+        if not catalogue_paths:
+            return
+        if all_done:
+            self._mark_drag_uploaded(catalogue_paths, "inaturalist upload")
+        else:
+            today = datetime.now().strftime("%Y-%m-%d")
+            for path in catalogue_paths:
+                meta = self.sidecar.get_metadata(path)
+                meta.uploaded = True
+                meta.uploaded_date = today
+            self._persist_sidecar()
+            # Same fan-out as the flag toggles: drop the cached metadata line,
+            # re-run an active "uploaded" filter, and refresh grid and loupe.
+            self._metadata_cache_index = (-1, -1)
+            current_path = (
+                self.image_files[self.current_index].path
+                if 0 <= self.current_index < len(self.image_files)
+                else None
+            )
+            filter_reapplied = self._reapply_flag_filter_after_metadata_change(
+                "uploaded", current_path
+            )
+            self.dataChanged.emit()
+            if not filter_reapplied and getattr(self, "_thumbnail_model", None):
+                self._thumbnail_model.notify_batch_state_changed()
+            self.sync_ui_state(image_count_changed=filter_reapplied)
+        self.update_status_message(
+            f"Uploaded {len(catalogue_paths)} photo(s) to iNaturalist", 5000
+        )
+
     def _mark_drag_uploaded(self, dragged_paths, trigger: str) -> None:
         """Mark dragged files uploaded and clear batches after an accepted drop."""
         today = datetime.now().strftime("%Y-%m-%d")
@@ -12486,13 +12906,12 @@ class AppController(
             meta.uploaded = True
             meta.uploaded_date = today
 
-        if not self._persist_sidecar():
-            return
-
-        # Clear all batches after successful drag (like pressing \)
+        # Clear all batches after successful drag (like pressing \). The
+        # uploaded flags and the cleared batch flags go out in one sidecar
+        # write; on failure everything stays in memory, marked dirty for retry.
         self.batches = []
         self.batch_start_index = None
-        if not self._finalize_batch_state(reapply_filter=True):
+        if not self._finalize_batch_state(reapply_filter=True, force_persist=True):
             return
         log.info(
             "Marked %d file(s) as uploaded on %s (%s). Cleared all batches.",
@@ -12744,6 +13163,11 @@ class AppController(
                     operation.cancel_requested = True
                     self._stop_raw_process(process)
                     raise
+                # Show what the CLI printed, with its name in front, like the
+                # tools FastStack does not wait for.
+                tool_name = Path(rt_exe).stem or "rawtherapee-cli"
+                log_tool_output(tool_name, stdout)
+                log_tool_output(tool_name, stderr)
 
                 if process.returncode == 0:
                     with self._raw_develop_lock:
@@ -14259,10 +14683,17 @@ class AppController(
                 result = []
             self._stackInputsReady.emit({"token": token, "paths": result})
 
+        def _search() -> list[Path]:
+            # Held-arrow navigation queues one search per step on this single
+            # worker. A search whose image is no longer current is skipped
+            # when its turn comes, so the directory scans for images already
+            # passed do not delay the result for the one finally shown.
+            if token != self._stack_inputs_token:
+                return []
+            return self._find_stack_input_jpgs(path)
+
         try:
-            future = self._stack_paint_executor.submit(
-                self._find_stack_input_jpgs, path
-            )
+            future = self._stack_paint_executor.submit(_search)
         except RuntimeError:
             return  # shutting down
         future.add_done_callback(_done)
@@ -14289,7 +14720,14 @@ class AppController(
         # Default to the frame focused furthest back.
         self.ui_state.stackInputName = paths[-1].name if paths else ""
         if paths:
-            log.debug("Stack inputs for current image: %s", [p.name for p in paths])
+            # Count and range, not every name: a 15-frame stack printed 15
+            # file names on each visit.
+            log.debug(
+                "Stack inputs for current image: %d frame(s), %s .. %s",
+                count,
+                paths[0].name,
+                paths[-1].name,
+            )
         self._ensure_stack_sources_for_edits()
 
     @Slot(str)
@@ -14950,13 +15388,28 @@ class AppController(
     def _display_preview_long_edge(self) -> Optional[int]:
         """Long-edge cap for display-only full-resolution renders.
 
+        The cap is the long edge of the image as fitted into the image area,
+        not of the area itself. A 4:3 photo fills only 2880 px of a 3840x2160
+        area, and rendering it 3840 px wide made 1.8 times the pixels the
+        screen can show (3.2 times for a portrait photo). A crop, straighten
+        or rotation changes the output's shape, so with one in play the
+        area's own long edge is used, as before.
+
         Returns None when the display size is unknown or the view is zoomed
         (get_display_info reports 0x0 while zoomed), which renders uncapped.
         """
         display_w, display_h, _ = self.get_display_info()
-        if display_w and display_h:
-            return max(int(display_w), int(display_h))
-        return None
+        if not (display_w and display_h):
+            return None
+        area_long_edge = max(int(display_w), int(display_h))
+        if self._current_live_session_has_geometry_edits():
+            return area_long_edge
+        native_w, native_h = self.get_current_display_native_size()
+        if native_w <= 0 or native_h <= 0:
+            return area_long_edge
+        scale = fit_scale_in_box(native_w, native_h, (display_w, display_h))
+        fitted_long_edge = max(1, round(max(native_w, native_h) * scale))
+        return min(area_long_edge, fitted_long_edge)
 
     def _live_preview_quick_target_size(self) -> Optional[Tuple[int, int]]:
         """Output size for quick (preview-master) live renders.
@@ -16682,13 +17135,19 @@ class AppController(
 
         # auto_white_balance() is preview-only here: it mutates the in-memory
         # editor session and status text, but does not save or append undo.
-        awb_msg = self.auto_white_balance()
+        # It does not start a render either. One render follows, with the
+        # levels in it; a white-balance-only frame would be replaced before it
+        # was seen, and rendering it competed with the levels analysis below
+        # and pushed the frame that mattered onto the coarser drag tier.
+        awb_msg = self.auto_white_balance(kick_preview=False)
         state = self._seed_active_auto_adjust_state(include_auto_vibrance=True)
         if state is None:
+            if awb_msg:
+                self._kick_preview_worker()
             self.update_status_message("Auto adjust failed")
             return
 
-        self._apply_auto_adjust_preview(state)
+        self._apply_auto_adjust_preview(state, force_preview=bool(awb_msg))
         levels_msg = self._last_auto_levels_msg
         self._last_auto_levels_msg = levels_msg
 
@@ -16759,8 +17218,15 @@ class AppController(
         state.extra_black_steps -= 1
         self._apply_auto_adjust_preview(state)
 
-    def _apply_auto_adjust_preview(self, state: ActiveAutoAdjustState) -> None:
-        """Render the current auto-adjust state into the editor/UI immediately."""
+    def _apply_auto_adjust_preview(
+        self, state: ActiveAutoAdjustState, *, force_preview: bool = False
+    ) -> None:
+        """Render the current auto-adjust state into the editor/UI immediately.
+
+        ``force_preview`` renders even when the levels themselves did not
+        move, for a caller that changed something else (white balance) and
+        left the render to this call.
+        """
         blacks, whites = self._derive_auto_adjust_levels(state)
         changed_levels = self._apply_levels_to_editor(
             blacks=blacks,
@@ -16773,7 +17239,7 @@ class AppController(
         changed_brightness = self._apply_brightness_to_editor(
             brightness=state.base_brightness,
         )
-        if changed_levels or changed_vibrance or changed_brightness:
+        if changed_levels or changed_vibrance or changed_brightness or force_preview:
             self._kick_preview_worker()
             if self.ui_state.isHistogramVisible:
                 self.update_histogram()
@@ -17022,27 +17488,28 @@ class AppController(
         self.auto_white_balance()
 
     @Slot()
-    def auto_white_balance(self) -> Optional[str]:
+    def auto_white_balance(self, kick_preview: bool = True) -> Optional[str]:
         """
         Dispatcher for auto white balance. Calls the appropriate method based on
         the mode set in the config ('lab' or 'rgb').
 
         Returns the detail message string if a correction was applied, or None
-        if no change / error.
+        if no change / error. ``kick_preview=False`` applies the correction
+        without starting a preview render; the caller then owns the render.
         """
         if self._block_auto_adjust_during_crop():
             return None
         mode = config.get("awb", "mode", fallback="lab")
         if mode == "lab":
-            return self.auto_white_balance_lab()
+            return self.auto_white_balance_lab(kick_preview=kick_preview)
         elif mode == "rgb":
-            return self.auto_white_balance_legacy()
+            return self.auto_white_balance_legacy(kick_preview=kick_preview)
         else:
             log.error("Unknown AWB mode: %s", mode)
             self.update_status_message(f"Error: Unknown AWB mode '{mode}'")
             return None
 
-    def auto_white_balance_legacy(self) -> Optional[str]:
+    def auto_white_balance_legacy(self, kick_preview: bool = True) -> Optional[str]:
         """
         Calculates and applies auto white balance using the legacy grey world
         assumption on the entire RGB image.
@@ -17088,7 +17555,8 @@ class AppController(
         self.ui_state.white_balance_by = by_value
         self.ui_state.white_balance_mg = mg_value
 
-        self._kick_preview_worker()
+        if kick_preview:
+            self._kick_preview_worker()
 
         by_dir = _awb_direction(by_value, "warming", "cooling")
         mg_dir = _awb_direction(mg_value, "magenta", "greener")
@@ -17101,7 +17569,7 @@ class AppController(
         self.update_status_message(msg)
         return msg
 
-    def auto_white_balance_lab(self) -> Optional[str]:
+    def auto_white_balance_lab(self, kick_preview: bool = True) -> Optional[str]:
         """
         Calculates and applies auto white balance using a robust preview-sized
         neutral-pixel estimate aligned to the editor's slider model.
@@ -17150,7 +17618,8 @@ class AppController(
         self.ui_state.white_balance_by = by_value
         self.ui_state.white_balance_mg = mg_value
 
-        self._kick_preview_worker()
+        if kick_preview:
+            self._kick_preview_worker()
 
         by_dir = _awb_direction(by_value, "warming", "cooling")
         mg_dir = _awb_direction(mg_value, "magenta", "greener")
@@ -17195,7 +17664,6 @@ class AppController(
             and self.stack_end_index == index
         ):
             info = "Stack End Marked"
-        log.debug("_get_stack_info for index %d: %s", index, info)
         return info
 
     def _get_batch_info(self, index: int) -> str:
@@ -17215,7 +17683,6 @@ class AppController(
         elif self.batch_start_index is not None and self.batch_start_index == index:
             info = "Batch Start Marked"
 
-        log.debug("_get_batch_info for index %d: %s", index, info)
         return info
 
     def get_stack_summary(self) -> str:
@@ -18146,11 +18613,24 @@ def main(
     # Register thumbnail provider for grid view
     engine.addImageProvider("thumbnail", controller._thumbnail_provider)
 
+    # Actions -> iNaturalist upload: its controller, card thumbnails and the
+    # OpenStreetMap tile provider for the location picker.
+    inat_upload = INatUploadController(
+        config,
+        parent=controller,
+        user_agent=f"FastStack/{get_current_version()} (+https://github.com/AlanRockefeller/faststack)",
+    )
+    controller._inat_upload = inat_upload
+    inat_upload.uploadFinished.connect(controller._on_inat_upload_finished)
+    engine.addImageProvider("inatphoto", CardPhotoProvider(inat_upload.photo_path))
+    engine.addImageProvider("osmtile", TileImageProvider(inat_upload.tile_fetcher))
+
     # Expose controller and UI state to QML
     context = engine.rootContext()
     context.setContextProperty("uiState", controller.ui_state)
     context.setContextProperty("controller", controller)
     context.setContextProperty("thumbnailModel", controller._thumbnail_model)
+    context.setContextProperty("inatUpload", inat_upload)
 
     if debug_requested:
         log.info(

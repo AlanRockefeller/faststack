@@ -61,7 +61,7 @@ Item {
         id: folderContextMenu
         implicitWidth: 240
 
-        onOpened: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_opened("qml-folder-context-menu")
+        onAboutToShow: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_opened("qml-folder-context-menu")
         onClosed: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_closed("qml-folder-context-menu")
         Component.onDestruction: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_closed("qml-folder-context-menu")
 
@@ -127,7 +127,7 @@ Item {
         title: "Delete almost-empty folder?"
         standardButtons: Dialog.Yes | Dialog.Cancel
 
-        onOpened: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_opened("qml-folder-delete-confirm")
+        onAboutToShow: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_opened("qml-folder-delete-confirm")
         onClosed: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_closed("qml-folder-delete-confirm")
         Component.onDestruction: if (gridViewRoot.controllerRef) gridViewRoot.controllerRef.dialog_closed("qml-folder-delete-confirm")
 

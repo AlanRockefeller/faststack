@@ -254,7 +254,7 @@ class Watcher:
                 self.event_handler = ImageDirectoryEventHandler(self.callback)
                 stopped = False
             else:
-                log.info("Stopped watching directory.")
+                log.info("Stopped watching directory: %s", self.directory)
             self.observer = None  # Clear instance after stopping
         return stopped
 

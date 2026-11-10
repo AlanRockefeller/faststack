@@ -23,7 +23,8 @@ Dialog {
         border.width: 1
     }
 
-    onOpened: {
+    // aboutToShow, not opened: see the note on aboutDialog in Main.qml.
+    onAboutToShow: {
         if (colorInfoDialog.controllerRef) {
             colorInfoDialog.controllerRef.dialog_opened("qml-color-info")
         }

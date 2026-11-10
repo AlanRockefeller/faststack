@@ -1451,6 +1451,9 @@ class SavePipelineMixin:
                     clear_saved_edit_state=not bool(
                         save_result.get("save_has_meaningful_edits", True)
                     ),
+                    # This runs on the GUI thread, usually a moment after the
+                    # user has moved on to the next image.
+                    background=True,
                 )
                 save_directory_key = save_result.get("save_directory_key")
                 current_directory_key = self._key(self.image_dir)
@@ -1501,6 +1504,11 @@ class SavePipelineMixin:
                     self._reindex_after_save(preserved_path)
                 if saved_path:
                     self._invalidate_decoded_path(saved_path, force=True)
+                    # The saved image is usually the neighbour just left, and
+                    # its frames were dropped above. Rebuild the window so it
+                    # is decoded again; otherwise stepping back to it was a
+                    # cache miss on the image most likely to be revisited.
+                    self._do_prefetch(self.current_index)
 
             self._restart_quality_decode_timer()
 

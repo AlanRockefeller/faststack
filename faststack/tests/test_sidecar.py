@@ -115,7 +115,8 @@ def test_favorite_toggle_sets_json(mock_sidecar_dir):
     meta.favorite = False
     sm.save()
     saved = json.loads((d / "faststack.json").read_text())
-    assert saved["entries"][expected_key]["favorite"] is False
+    # The file leaves out fields that hold their default value.
+    assert saved["entries"][expected_key].get("favorite", False) is False
 
 
 def test_favorite_loads_from_sidecar(mock_sidecar_dir):

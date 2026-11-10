@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterator, Literal, Optional, Union, overload
 
 from faststack.io.indexer import JPG_EXTENSIONS, RAW_EXTENSIONS
-from faststack.io.utils import atomic_write_json
+from faststack.io.utils import atomic_write_text
 from faststack.models import EntryMetadata, Sidecar
 
 log = logging.getLogger(__name__)
@@ -59,6 +59,84 @@ def _entrymetadata_to_json(meta: EntryMetadata) -> dict:
     else:
         data["edit_state"] = copy.deepcopy(edit_state)
     return data
+
+
+# An entry with every field at its default, in payload form. On disk a field
+# that holds its default is left out and the reader puts it back.
+_DEFAULT_ENTRY_JSON = _entrymetadata_to_json(EntryMetadata())
+
+
+def _compact_entry(entry: dict) -> dict:
+    """The fields of a payload entry that differ from their defaults."""
+    defaults = _DEFAULT_ENTRY_JSON
+    return {
+        name: value
+        for name, value in entry.items()
+        if name not in defaults or defaults[name] != value
+    }
+
+
+def _expand_entry(entry):
+    """A disk entry with its omitted default fields restored."""
+    if not isinstance(entry, dict):
+        return entry
+    return {**_DEFAULT_ENTRY_JSON, **entry}
+
+
+# Top-level keys in the order they are written; "entries" always comes last
+# and anything unrecognised (written by a newer version) goes before it.
+_FILE_KEY_ORDER = (
+    "version",
+    "last_index",
+    "last_path",
+    "sort_mode",
+    "stacks",
+    "stack_paths",
+    "stack_order",
+    "ambiguous_legacy_keys",
+)
+
+
+def _sidecar_file_text(payload: dict) -> str:
+    """Serialize a payload the way faststack.json is stored.
+
+    The folder-level values first, then one line per image sorted by name,
+    with no indentation and no fields that hold their default value. The
+    pretty-printed form spent fourteen lines on an image with nothing set,
+    which made a 3,900-image folder's file 1.3 MB instead of 0.1 MB, all of
+    it rewritten on every save. An image with nothing set keeps its (empty)
+    entry, so which images have an entry does not change. Sorting costs
+    nothing that matters and makes the order stable; a merge used to leave
+    it in set order. Still schema version 2: readers fill a missing field
+    with its default.
+    """
+
+    def dumps(value) -> str:
+        return json.dumps(value, separators=(",", ":"))
+
+    known = [key for key in _FILE_KEY_ORDER if key in payload]
+    other = sorted(
+        key for key in payload if key not in _FILE_KEY_ORDER and key != "entries"
+    )
+    parts = [f"{dumps(key)}:{dumps(payload[key])}" for key in known + other]
+    if "entries" in payload:
+        entries = payload["entries"]
+        if isinstance(entries, dict) and entries:
+            lines = []
+            for name in sorted(entries):
+                entry = entries[name]
+                if isinstance(entry, dict):
+                    entry = _compact_entry(entry)
+                    body = dumps(entry) if entry else "{}"
+                else:
+                    # A foreign or damaged value that a merge carried over
+                    # is written as it is.
+                    body = dumps(entry)
+                lines.append(f"{dumps(name)}:{body}")
+            parts.append('"entries":{\n' + ",\n".join(lines) + "\n}")
+        else:
+            parts.append(f'"entries":{dumps(entries)}')
+    return "{" + ",\n".join(parts) + "}\n"
 
 
 def _sidecar_to_json(sidecar: Sidecar) -> dict:
@@ -585,7 +663,7 @@ class SidecarManager:
     def _disk_stamp(self) -> Optional[tuple[int, int, int]]:
         """Return a cheap identity for the on-disk sidecar, or None if absent.
 
-        ``atomic_write_json`` replaces the file, so a write by any process
+        ``atomic_write_text`` replaces the file, so a write by any process
         changes mtime/size and, where the platform supports it, the inode.
 
         ``st_ino`` is only a bonus signal here: Windows network shares and some
@@ -634,6 +712,14 @@ class SidecarManager:
                 f"unsupported version {payload.get('version')!r}"
             )
             return None
+        # The file leaves default-valued fields out; the three-way merge
+        # compares this payload field by field with in-memory ones that
+        # carry every field.
+        entries = payload.get("entries")
+        if isinstance(entries, dict):
+            payload["entries"] = {
+                key: _expand_entry(entry) for key, entry in entries.items()
+            }
         return payload
 
     def load(self) -> Sidecar:
@@ -753,7 +839,7 @@ class SidecarManager:
                         # already discarded it. Both mean there is nothing to
                         # merge, so write our state straight out. This keeps a
                         # legacy or corrupt file from making every save a no-op.
-                        atomic_write_json(self.path, ours)
+                        atomic_write_text(self.path, _sidecar_file_text(ours))
                         self._baseline_payload = ours
                         self._baseline_stamp = self._disk_stamp()
                         self._dirty = False
@@ -766,7 +852,7 @@ class SidecarManager:
                         ours,
                         theirs,
                     )
-                    atomic_write_json(self.path, merged)
+                    atomic_write_text(self.path, _sidecar_file_text(merged))
                     self._baseline_stamp = self._disk_stamp()
 
                 # Incorporate changes from other processes into this manager so
@@ -1143,7 +1229,7 @@ class SidecarManager:
                 with _sidecar_write_lock(self._write_lock_path):
                     if not self._disk_matches_baseline():
                         return "conflict"
-                    atomic_write_json(self.path, ours)
+                    atomic_write_text(self.path, _sidecar_file_text(ours))
                     self._baseline_payload = ours
                     self._baseline_stamp = self._disk_stamp()
             except (OSError, TypeError, ValueError) as e:
@@ -1177,8 +1263,14 @@ class SidecarManager:
             self.data.last_index = index
             self.data.last_path = last_path
 
-    def update_metadata(self, image_ref: Union[str, Path], updates: dict) -> bool:
-        """Update multiple metadata fields for an image and save if changed."""
+    def update_metadata(
+        self, image_ref: Union[str, Path], updates: dict, *, save: bool = True
+    ) -> bool:
+        """Update multiple metadata fields for an image and save if changed.
+
+        ``save=False`` changes the in-memory entry only; the caller then owns
+        the write (see ``prepare_background_write``).
+        """
         meta = self.get_metadata(image_ref, create=True)
         changed = False
         for key, value in updates.items():
@@ -1189,6 +1281,6 @@ class SidecarManager:
             else:
                 log.warning(f"Unknown metadata key: {key}")
 
-        if changed:
+        if changed and save:
             return self.save()
         return True

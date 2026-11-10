@@ -88,6 +88,16 @@ class _Qt(IntFlag):
     Key_R = 135
     Key_Underscore = 136
     Key_Plus = 137
+    Key_Shift = 138
+    Key_Control = 139
+    Key_Alt = 140
+    Key_AltGr = 141
+    Key_Meta = 142
+    Key_Super_L = 143
+    Key_Super_R = 144
+    Key_CapsLock = 145
+    Key_NumLock = 146
+    Key_ScrollLock = 147
 
 
 def _load_keybinder_class():
@@ -157,6 +167,9 @@ class _Controller:
 
     def clear_all_batches(self):
         self.calls.append("clear_all_batches")
+
+    def begin_new_batch(self):
+        self.calls.append("begin_new_batch")
 
 
 def test_clear_active_auto_adjust_state_clears_editor_even_if_editor_ui_is_open():
@@ -253,7 +266,7 @@ def test_quick_auto_adjust_stays_preview_only():
         _seed_active_auto_adjust_state=Mock(return_value=object()),
     )
 
-    def apply_preview(_state):
+    def apply_preview(_state, **_kwargs):
         controller._last_auto_levels_msg = "levels"
 
     controller._apply_auto_adjust_preview = Mock(side_effect=apply_preview)
@@ -264,8 +277,12 @@ def test_quick_auto_adjust_stays_preview_only():
         "combined auto-adjust starts a fresh active auto-adjust state",
         clear_editor=False,
     )
-    controller.auto_white_balance.assert_called_once_with()
+    # White balance leaves the render to the levels step: one preview, not two.
+    controller.auto_white_balance.assert_called_once_with(kick_preview=False)
     controller._apply_auto_adjust_preview.assert_called_once()
+    assert controller._apply_auto_adjust_preview.call_args.kwargs == {
+        "force_preview": True
+    }
     controller.update_status_message.assert_called_with("awb; levels", timeout=9000)
 
 
@@ -359,18 +376,28 @@ def test_shift_minus_character_still_triggers_highlight_adjust():
     assert controller.calls == ["reduce_auto_adjust_highlights"]
 
 
-def test_altgr_pipe_character_clears_batches():
+def test_altgr_brace_character_begins_batch():
     keybinder_cls = _load_keybinder_class()
     controller = _Controller()
     keybinder = keybinder_cls(controller)
 
     handled = keybinder.handle_key_press(
         _Event(
-            _Qt.Key_Backslash,
-            "|",
+            _Qt.Key_BraceLeft,
+            "{",
             _Qt.ControlModifier | _Qt.AltModifier,
         )
     )
 
     assert handled is True
-    assert controller.calls == ["clear_all_batches"]
+    assert controller.calls == ["begin_new_batch"]
+
+
+def test_pipe_character_no_longer_clears_batches():
+    keybinder_cls = _load_keybinder_class()
+    controller = _Controller()
+    keybinder = keybinder_cls(controller)
+
+    keybinder.handle_key_press(_Event(_Qt.Key_Backslash, "|", _Qt.ShiftModifier))
+
+    assert controller.calls == []

@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from faststack.config import DEFAULT_CONFIG, config, detect_image_editor_path
 from faststack.io.arguments import parse_external_arguments
-from faststack.io.child_process import child_popen_kwargs, reap_in_background
+from faststack.io.child_process import launch_with_relayed_output
 from faststack.io.executable_validator import validate_executable_path
 from faststack.io.indexer import RAW_EXTENSIONS
 
@@ -475,15 +475,15 @@ class ImageEditorHandoffMixin:
             # Convert to string but keep it as a list element (not shell-interpolated)
             command.append(str(current_image_path.resolve()))
 
-            # SECURITY: Explicitly disable shell execution
-            process = subprocess.Popen(
+            # SECURITY: launch_with_relayed_output never uses a shell (user
+            # input stays a plain argv). The editor's output is relayed as
+            # "[<editor>]" lines and it keeps running if FastStack exits first.
+            launch_with_relayed_output(
                 command,
-                shell=False,  # CRITICAL: Never use shell=True with user input
+                name=Path(photoshop_exe).stem,
                 stdin=subprocess.DEVNULL,
                 close_fds=True,  # Close unused file descriptors
-                **child_popen_kwargs(),
             )
-            reap_in_background(process, Path(photoshop_exe).name)
 
             # Photoshop owns the image after handoff. Do not queue a competing
             # FastStack save; retire dirty in-memory edits so navigation or app

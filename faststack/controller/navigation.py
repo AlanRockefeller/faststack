@@ -1162,6 +1162,35 @@ class NavigationMixin:
                 self._format_ms(log_data["ready_ms"]),
                 self._present_field(log_data),
             )
+        elif (
+            log_data["is_initial_real"]
+            and log_data["cache_outcome"] == "hit"
+            and not self.debug_cache_trace
+        ):
+            # A frame decoded ahead of time: its queue/read/decode timings
+            # describe an earlier prefetch, not this navigation, and made the
+            # commonest line the longest one. --debugcache-trace still prints
+            # them; here the frame's size is enough to tell what was shown.
+            worker = log_data["worker"]
+            output = worker.get("output")
+            dct = worker.get("dct")
+            log.info(
+                "[NAVTRACE] seq=%s gen=%s index=%s file=%r "
+                "frame=initial quality=%s cache=hit %s%s"
+                "fast_buffer=%s provider=%s ready=%s ready_to_present=%s %s",
+                seq,
+                generation,
+                log_data["index"],
+                log_data["filename"],
+                log_data["quality"],
+                f"output={output[0]}x{output[1]} " if output else "",
+                f"dct={dct[0]}/{dct[1]} " if dct else "",
+                log_data["fast_buffer_depth"],
+                self._format_ms(log_data["provider_ms"]),
+                self._format_ms(log_data["ready_ms"]),
+                self._format_ms(log_data["ready_to_present_ms"]),
+                self._present_field(log_data),
+            )
         elif log_data["is_initial_real"]:
             worker = log_data["worker"]
             log.info(

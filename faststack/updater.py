@@ -108,6 +108,9 @@ def _read_pyproject_version(pyproject_path: Path) -> str | None:
     return None
 
 
+_version_mismatch_logged = False
+
+
 def get_current_version() -> str:
     """Return the user-facing FastStack version that is actually running.
 
@@ -139,7 +142,14 @@ def get_current_version() -> str:
         log.debug("Could not read faststack package metadata", exc_info=True)
 
     if pyproject_version:
-        if metadata_version and metadata_version != pyproject_version:
+        global _version_mismatch_logged
+        if (
+            metadata_version
+            and metadata_version != pyproject_version
+            and not _version_mismatch_logged
+        ):
+            # Once per run: this is asked several times at startup alone.
+            _version_mismatch_logged = True
             log.debug(
                 "FastStack version mismatch: pyproject.toml has %s, "
                 "package metadata has %s",

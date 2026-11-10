@@ -21,6 +21,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Dodge & Burn:** Paint any compact-editor slider (exposure, contrast, shadows, white balance, vibrance, color mix…) onto part of the photo (Shift+D). Each stroke adds one coat, so overlapping strokes build up; strokes are kept as layers you can re-edit, hide, or delete.
 - **Stack Paint:** For in-camera focus stacks (`... stacked.JPG`), paint any of the stack's input JPGs - or the stack output itself - back over the stacked photo, e.g. to restore a clean background or fix stacking halos. Each input is aligned to the stack automatically, the brush circle previews what a click will paint, and global edits and dodge & burn apply to the painted pixels too.
 - **Quick Auto Adjust:** Press `l` for quick auto-levels, `L` for auto white balance + auto-levels together, `A` for auto white balance, `-`/`_` to keep adjusting the highlight/white side in 14-point steps, and `=`/`+` to adjust the shadow/black side in 7-point steps. These update the live in-memory edit session immediately and save once when you navigate away, start a drag, or explicitly save. Auto-levels treats its clip threshold as a budget (a few already-clipped specular pixels won't disable the stretch), brightens underexposed midtones toward a configurable target, and rolls off stretched highlights smoothly instead of hard-clipping them. Auto white balance analyzes only the cropped area, fades its correction when the scene lacks reliable neutrals, and damps magenta/green corrections so foliage isn't mistaken for a color cast. The midtone target, channel clip budget, highlight rolloff, export dithering, and tint correction strength are all adjustable in Settings.
+- **iNaturalist Upload:** Actions > iNaturalist upload groups the batched photos into observations by time and GPS, identifies each with MycoMap Vision, lets you split, merge or drag photos between observation cards, place GPS-less finds on an OpenStreetMap map, and uploads them to your iNaturalist account.
 - **Photoshop / GIMP Integration:** Edit the current image in Photoshop or GIMP (P key). Photoshop gets the RAW file when one exists; GIMP gets the JPG.
 - **Image Filtering:** Filter images by filename
 - **Theme Support:** Toggle between light and dark themes
@@ -133,7 +134,13 @@ python -m faststack.app [options] [image_dir]
 - `--loupe`: Start directly in single-image loupe view and skip the initial
   thumbnail grid refresh for faster startup on large folders.
 - `--debug`: Enable verbose debug logging and timing information.
-- `--debugcache`: Enable cache telemetry/debug output.
+- `--debugcache`: Log one `[NAVTRACE]` line per image shown (cache hit or
+  miss, decode timings, time from key press to the frame on screen) plus a
+  summary after each burst of navigation, and show live cache stats in the
+  footer.
+- `--debugcache-trace`: Everything `--debugcache` logs, plus per-stage
+  `[DBGCACHE]` timing lines from the decode, prefetch and image-provider
+  code. Very verbose.
 - `--debug-thumbtiming`: Enable thumbnail pipeline timing logs. Implies
   `--debug`.
 - `--debug-thumbtrace`: Enable detailed thumbnail pipeline trace logs. Implies
@@ -184,7 +191,7 @@ faststack "C:\path\to\photos"
 - `C`: Clear all stacks (Ctrl+Z restores them)
 - `{`: Begin new drag & drop batch
 - `}`: End current drag & drop batch
-- `|` (Shift+`\`): Clear drag & drop batch (Ctrl+Z restores it)
+- Actions > Clear Batches: Clear drag & drop batch, after confirmation (Ctrl+Z restores it)
 - `U`: Toggle uploaded flag
 - `F`: Toggle favorite flag
 - `Ctrl+E`: Toggle edited flag
@@ -416,7 +423,10 @@ change; **Cancel** (or `Esc`) discards them.
 
 - `faststack.ini` holds the settings: `%APPDATA%\faststack\` on Windows,
   `~/.faststack/` on Linux and macOS. Logs go to a `logs` folder next to it
-  when FastStack runs without a console.
+  when FastStack runs without a console. Whatever the programs FastStack
+  launches print (OpenFocus or Helicon Focus, your image editor, RawTherapee,
+  ExifTool) is included, each line prefixed with the program's name, such as
+  `[OpenFocus] ...`.
 - `faststack.json` in each image folder (the *sidecar*) records flags
   (uploaded, edited, favorite, todo...), stacks, batches, sort mode and the
   last viewed image. Several FastStack windows can share one folder safely.

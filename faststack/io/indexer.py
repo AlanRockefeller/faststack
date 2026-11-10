@@ -300,17 +300,27 @@ def find_images_with_variants(
     # Same-stem JPGs that are not selected as developed/backups stay visible.
     t_phase = time.perf_counter()
     visible_variant_jpgs = []
+    hidden_count = 0
+    hidden_example = ""
     for p, stat in all_jpgs:
         p_norm = Path(norm_path(p))
         group = groups_by_path.get(p_norm)
         if group and _is_hidden_variant_path(p_norm, group):
-            log.debug(
-                "Filtering out variant %s (main=%s)",
-                p.name,
-                group.main_path.name if group.main_path else "?",
-            )
+            if not hidden_count:
+                main_name = group.main_path.name if group.main_path else "?"
+                hidden_example = f"{p.name} (main={main_name})"
+            hidden_count += 1
             continue
         visible_variant_jpgs.append((p, stat))
+    if hidden_count:
+        # One line per scan: a line per file repeated the whole list of
+        # backups on every rescan (each save and each watcher refresh).
+        log.debug(
+            "Filtered out %d variant file(s) shown through their main image, "
+            "e.g. %s",
+            hidden_count,
+            hidden_example,
+        )
     phase_timings["filter_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
     image_files = _build_image_list(

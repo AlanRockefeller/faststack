@@ -12,7 +12,7 @@ from typing import List, Optional, Tuple
 
 from faststack.config import config
 from faststack.io.arguments import parse_external_arguments
-from faststack.io.child_process import child_popen_kwargs
+from faststack.io.child_process import launch_with_relayed_output
 from faststack.io.executable_validator import validate_executable_path
 
 log = logging.getLogger(__name__)
@@ -155,13 +155,14 @@ def launch_focus_stacker(
 
         log.info("Launching OpenFocus with %d files: %s", len(validated_files), args)
         try:
-            process = subprocess.Popen(
+            # Never a shell; OpenFocus's progress is relayed as "[OpenFocus] ..."
+            # lines and the stacker keeps running if FastStack is closed first.
+            process = launch_with_relayed_output(
                 args,
+                name="OpenFocus",
                 cwd=str(working_directory),
-                shell=False,
                 stdin=subprocess.DEVNULL,
                 close_fds=True,
-                **child_popen_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             log.exception("Failed to launch OpenFocus: %s", exc)
@@ -204,13 +205,14 @@ def launch_focus_stacker(
         log.info(f"Launching Helicon Focus with {len(validated_files)} files")
         log.info(f"Command: {' '.join(args)}")
 
-        # SECURITY: Explicitly disable shell execution
-        process = subprocess.Popen(
+        # SECURITY: launch_with_relayed_output never uses a shell (user input
+        # stays a plain argv). Helicon's output is relayed as "[Helicon Focus]"
+        # lines and it keeps running if FastStack is closed first.
+        process = launch_with_relayed_output(
             args,
-            shell=False,  # CRITICAL: Never use shell=True with user input
+            name="Helicon Focus",
             stdin=subprocess.DEVNULL,
             close_fds=True,  # Close unused file descriptors
-            **child_popen_kwargs(),
         )
         return True, FocusStackerLaunch(process=process, manifest_path=tmp_path)
     except (OSError, subprocess.SubprocessError) as e:
