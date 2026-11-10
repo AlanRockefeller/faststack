@@ -24,6 +24,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 - Marking photos uploaded after a drag writes faststack.json once instead of twice, and the first slider move or auto adjust on a photo no longer stalls while "auto-add edited to batch" writes it.
 - Fixed a layout warning in the Clear Batches dialog.
 - Debug logging: `--debug` logs one readable line per key press ("Key Shift+L -> quick_auto_adjust") and one per prefetch update, and no longer logs bare modifier keys, every cache entry dropped on a resize, repeated Wayland drag traces, or the full list of backup files on every rescan. `--debugcache` lines for photos that were already decoded are less than half their old length. Startup and folder-load milestones say what happened instead of "first decode submitted" when nothing was decoded.
+- On Linux with photos on an NTFS drive, every photo could show up twice (double the image count, two arrow presses per photo). The ntfs3 driver lists a folder's files more than once when a file in it is written during the listing, which FastStack's own faststack.json save could cause. Folder listings now ignore the repeats.
 
 ## 1.7.0 (2026-11-06)
 

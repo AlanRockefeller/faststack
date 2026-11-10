@@ -12,6 +12,7 @@ from faststack.io.variants import (
     norm_path,
     parse_variant_stem,
 )
+from faststack.io.utils import scandir_unique
 from faststack.models import ImageFile, filesystem_source_identity
 
 log = logging.getLogger(__name__)
@@ -54,28 +55,27 @@ def _scan_directory(
     all_jpgs: List[Tuple[Path, os.stat_result]] = []
     raws: Dict[str, List[Tuple[Path, os.stat_result]]] = {}
 
-    with os.scandir(directory) as entries:
-        for entry in entries:
-            try:
-                if not entry.is_file():
-                    continue
+    for entry in scandir_unique(directory):
+        try:
+            if not entry.is_file():
+                continue
 
-                p = Path(entry.path)
-                ext = p.suffix.lower()
-                if ext in JPG_EXTENSIONS:
-                    stat = entry.stat()
-                    all_jpgs.append((p, stat))
-                    if include_visible_jpgs and not _is_backup_variant(p):
-                        visible_jpgs.append((p, stat))
-                elif ext in RAW_EXTENSIONS:
-                    stat = entry.stat()
-                    raws.setdefault(p.stem.casefold(), []).append((p, stat))
-            except OSError as exc:
-                log.debug(
-                    "Skipping unreadable or vanished directory entry %s: %s",
-                    entry.path,
-                    exc,
-                )
+            p = Path(entry.path)
+            ext = p.suffix.lower()
+            if ext in JPG_EXTENSIONS:
+                stat = entry.stat()
+                all_jpgs.append((p, stat))
+                if include_visible_jpgs and not _is_backup_variant(p):
+                    visible_jpgs.append((p, stat))
+            elif ext in RAW_EXTENSIONS:
+                stat = entry.stat()
+                raws.setdefault(p.stem.casefold(), []).append((p, stat))
+        except OSError as exc:
+            log.debug(
+                "Skipping unreadable or vanished directory entry %s: %s",
+                entry.path,
+                exc,
+            )
 
     return visible_jpgs, all_jpgs, raws
 

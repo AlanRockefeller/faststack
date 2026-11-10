@@ -16,6 +16,26 @@ log = logging.getLogger(__name__)
 _WINDOWS_DRIVE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/]*(.*)$")
 
 
+def scandir_unique(directory: Union[str, os.PathLike]) -> list[os.DirEntry]:
+    """List a directory once, dropping entries the kernel returns twice.
+
+    readdir may repeat entries when the directory changes during the walk.
+    Linux's ntfs3 driver goes further: a file created or renamed mid-walk
+    (FastStack's own atomic sidecar write is enough) makes it replay the
+    whole directory, so every file used to appear two or more times in the
+    image list. The first entry for a name wins.
+    """
+    seen: set[str] = set()
+    unique: list[os.DirEntry] = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.name in seen:
+                continue
+            seen.add(entry.name)
+            unique.append(entry)
+    return unique
+
+
 def resolve_configured_path(value: str) -> Path:
     """Turn a user-configured directory string into a usable local Path.
 
