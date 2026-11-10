@@ -171,10 +171,14 @@ class ToolOutputRelay:
 
     def popen_kwargs(self) -> dict:
         """Popen keyword arguments that send both streams into the relay."""
+        env = dict(child_environment())
+        # A file is not a TTY, so a Python tool (OpenFocus) would block-buffer
+        # stdout and the relay would only see its lines at exit.
+        env.setdefault("PYTHONUNBUFFERED", "1")
         return {
             "stdout": self._write_fd,
             "stderr": subprocess.STDOUT,
-            "env": child_environment(),
+            "env": env,
         }
 
     def start(self, process: subprocess.Popen) -> None:
