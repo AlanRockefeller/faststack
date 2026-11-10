@@ -14,6 +14,8 @@ UI thread.
 from __future__ import annotations
 
 import logging
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -54,12 +56,22 @@ class TileImageProvider(QQuickImageProvider):
         return image
 
 
+# The full-screen viewer's images are far larger than Qt's own pixmap cache
+# will hold once nothing displays them, so they are kept here instead.
+LARGE_PHOTO_MIN_WIDTH = 1024
+LARGE_PHOTO_CACHE_BYTES = 400 * 1024 * 1024
+
+
 class CardPhotoProvider(QQuickImageProvider):
     """Thumbnails for the observation cards, keyed by photo index."""
 
     def __init__(self, path_getter: Callable[[int], Optional[Path]]):
         super().__init__(QQuickImageProvider.ImageType.Image)
         self._path_getter = path_getter
+        # (path, mtime_ns, file size, width) -> decoded image, oldest first.
+        self._large: OrderedDict[tuple, QImage] = OrderedDict()
+        self._large_bytes = 0
+        self._large_lock = threading.Lock()
         self._placeholder = QImage(4, 3, QImage.Format.Format_RGB32)
         self._placeholder.fill(QColor("#444444"))
 
@@ -75,10 +87,26 @@ class CardPhotoProvider(QQuickImageProvider):
             width = int(query.get("w", ["320"])[0])
         except ValueError:
             width = 320
-        width = max(64, min(width, 1600))
+        width = max(64, min(width, 4096))  # the full-screen viewer asks for more
         path = self._path_getter(index)
         if path is None:
             return self._fail(size)
+        cache_key = None
+        if width >= LARGE_PHOTO_MIN_WIDTH:
+            try:
+                stat = path.stat()
+                cache_key = (str(path), stat.st_mtime_ns, stat.st_size, width)
+            except OSError:
+                cache_key = None
+        if cache_key is not None:
+            with self._large_lock:
+                cached = self._large.get(cache_key)
+                if cached is not None:
+                    self._large.move_to_end(cache_key)
+            if cached is not None:
+                size.setWidth(cached.width())
+                size.setHeight(cached.height())
+                return cached
         try:
             with Image.open(path) as img:
                 w, h = img.size
@@ -96,9 +124,31 @@ class CardPhotoProvider(QQuickImageProvider):
         except Exception as exc:
             log.debug("Card thumbnail failed for %s: %s", path, exc)
             return self._fail(size)
+        if cache_key is not None:
+            self._remember(cache_key, qimg)
         size.setWidth(qimg.width())
         size.setHeight(qimg.height())
         return qimg
+
+    def _remember(self, key: tuple, image: QImage) -> None:
+        cost = image.sizeInBytes()
+        if cost > LARGE_PHOTO_CACHE_BYTES:
+            return
+        with self._large_lock:
+            old = self._large.pop(key, None)
+            if old is not None:
+                self._large_bytes -= old.sizeInBytes()
+            self._large[key] = image
+            self._large_bytes += cost
+            while self._large_bytes > LARGE_PHOTO_CACHE_BYTES and len(self._large) > 1:
+                _, dropped = self._large.popitem(last=False)
+                self._large_bytes -= dropped.sizeInBytes()
+
+    def clear_large(self) -> None:
+        """Free the full-screen images (the upload dialog was closed)."""
+        with self._large_lock:
+            self._large.clear()
+            self._large_bytes = 0
 
     def _fail(self, size: QSize) -> QImage:
         size.setWidth(self._placeholder.width())

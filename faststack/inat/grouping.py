@@ -78,8 +78,14 @@ class Location:
 @dataclass
 class ObservationGroup:
     photos: list[PhotoRecord] = field(default_factory=list)
+    # True once the user has dragged the photos into an order of their own:
+    # ``photos`` is then that order and is no longer sorted by capture time.
+    ordered: bool = False
 
     def sorted_photos(self) -> list[PhotoRecord]:
+        """The photos as shown and uploaded: the user's order, else by time."""
+        if self.ordered:
+            return list(self.photos)
         return sorted(self.photos, key=_sort_key)
 
     @property
@@ -305,7 +311,7 @@ def split_group(group: ObservationGroup, n: int) -> list[ObservationGroup]:
     within-run variance of scaled (time, east, north). ``n`` is clamped to the
     photo count. ``n <= 1`` returns the group unchanged (as a new object).
     """
-    photos = group.sorted_photos()
+    photos = sorted(group.photos, key=_sort_key)
     count = len(photos)
     n = max(1, min(n, count))
     if n == 1 or count == 0:
@@ -372,6 +378,32 @@ def move_photo(
     if target_index >= len(groups):
         groups.append(ObservationGroup([photo]))
     else:
-        groups[target_index].photos.append(photo)
-        groups[target_index].photos.sort(key=_sort_key)
+        target = groups[target_index]
+        target.photos.append(photo)
+        if not target.ordered:  # a hand-ordered card takes the photo at its end
+            target.photos.sort(key=_sort_key)
     return [g for g in groups if g.photos]
+
+
+def reorder_photo(
+    group: ObservationGroup, photo_key: str, target_key: str, after: bool
+) -> bool:
+    """Put one photo of the group just before (or after) another one.
+
+    Returns False when nothing moved. The group keeps the new order from
+    then on (``ordered``).
+    """
+    photos = group.sorted_photos()
+    moved = next((p for p in photos if p.key == photo_key), None)
+    if moved is None or photo_key == target_key:
+        return False
+    rest = [p for p in photos if p is not moved]
+    index = next((i for i, p in enumerate(rest) if p.key == target_key), None)
+    if index is None:
+        return False
+    rest.insert(index + 1 if after else index, moved)
+    if rest == photos:
+        return False
+    group.photos = rest
+    group.ordered = True
+    return True

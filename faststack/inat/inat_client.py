@@ -11,7 +11,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 
 from faststack.inat.http import ApiError, HttpClient
 
@@ -49,6 +49,7 @@ class Taxon:
     name: str
     rank: str
     common_name: str = ""
+    iconic: str = ""  # iNaturalist's broad group: "Fungi", "Plantae", ...
 
     @property
     def label(self) -> str:
@@ -133,6 +134,7 @@ class INatClient:
                     name=str(row.get("name") or ""),
                     rank=str(row.get("rank") or ""),
                     common_name=str(row.get("preferred_common_name") or ""),
+                    iconic=str(row.get("iconic_taxon_name") or ""),
                 )
             )
         return out
@@ -173,9 +175,18 @@ class INatClient:
         return int(obs_id)
 
     def add_photo(
-        self, observation_id: int, filename: str, data: Union[Path, bytes]
+        self,
+        observation_id: int,
+        filename: str,
+        data: Union[Path, bytes],
+        position: Optional[int] = None,
     ) -> Optional[int]:
+        """Attach a photo. ``position`` (0 = first) is its place in the
+        observation, so a photo attached on a later retry still lands where
+        the card shows it."""
         fields = {"observation_photo[observation_id]": int(observation_id)}
+        if position is not None:
+            fields["observation_photo[position]"] = int(position)
         files = [("file", (filename, data, "image/jpeg"))]
         resp = self._http.request(
             "POST",
@@ -189,6 +200,52 @@ class INatClient:
             return int((row or {}).get("id"))
         except (TypeError, ValueError):
             return None
+
+
+def matches_abbreviation(query: str, name: str) -> bool:
+    """True when each typed word starts the same word of a scientific name.
+
+    "p semilanc" and "psil sem" both match "Psilocybe semilanceata"; a single
+    word matches the first word only ("amanita" matches the genus and its
+    species, not "Russula amanita").
+    """
+    typed = query.casefold().split()
+    words = name.casefold().split()
+    return (
+        bool(typed)
+        and len(words) >= len(typed)
+        and all(word.startswith(part) for word, part in zip(words, typed))
+    )
+
+
+def rank_suggestions(query: str, taxa: Sequence[Taxon]) -> list[Taxon]:
+    """Order autocomplete results for someone typing a scientific name.
+
+    iNaturalist also matches common names and words in the middle of a name,
+    so "p cub" returns a kingfisher and a palm ahead of Psilocybe cubensis.
+    An exact name comes first, then names the typed words abbreviate (fungi
+    ahead of the rest: this dialog identifies with a fungus model), then
+    everything else in iNaturalist's own order.
+    """
+    wanted = " ".join(query.casefold().split())
+
+    def key(item: tuple[int, Taxon]):
+        index, taxon = item
+        if taxon.name.casefold() == wanted:
+            group = 0
+        elif matches_abbreviation(query, taxon.name):
+            group = 1 if taxon.iconic == "Fungi" else 2
+        else:
+            group = 3
+        return (group, index)
+
+    seen: set[int] = set()
+    out: list[Taxon] = []
+    for _, taxon in sorted(enumerate(taxa), key=key):
+        if taxon.id not in seen:
+            seen.add(taxon.id)
+            out.append(taxon)
+    return out
 
 
 def _first_result(data: Any) -> Optional[dict[str, Any]]:

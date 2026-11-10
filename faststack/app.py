@@ -18622,7 +18622,9 @@ def main(
     )
     controller._inat_upload = inat_upload
     inat_upload.uploadFinished.connect(controller._on_inat_upload_finished)
-    engine.addImageProvider("inatphoto", CardPhotoProvider(inat_upload.photo_path))
+    inat_photo_provider = CardPhotoProvider(inat_upload.photo_path)
+    inat_upload.release_photo_cache = inat_photo_provider.clear_large
+    engine.addImageProvider("inatphoto", inat_photo_provider)
     engine.addImageProvider("osmtile", TileImageProvider(inat_upload.tile_fetcher))
 
     # Expose controller and UI state to QML

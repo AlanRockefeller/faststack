@@ -7,8 +7,9 @@ import QtQuick.Window 2.15
 
 // Actions -> iNaturalist upload. Groups the batch into observation cards,
 // identifies each with MycoMap Vision, lets the user fix the grouping
-// (split / merge / drag photos between cards), pick a location on a map, and
-// uploads to iNaturalist.
+// (split / merge / drag photos between cards), order the photos inside a card
+// by dragging, look at one full screen, pick a location on a map, and uploads
+// to iNaturalist.
 Window {
     id: dialog
     title: "Upload to iNaturalist"
@@ -42,6 +43,8 @@ Window {
             if (controllerRef) controllerRef.dialog_opened("qml-inat-upload")
             if (uploader && !(uploader.hasInatToken && uploader.hasVisionKey)) settingsPopup.open()
         } else {
+            photoViewer.close()
+            if (uploader) uploader.releasePhotoCache()
             if (controllerRef) controllerRef.dialog_closed("qml-inat-upload")
         }
     }
@@ -70,6 +73,34 @@ Window {
     Connections {
         target: dialog.uploader
         function onShowMessage(text) { dialog.toast(text) }
+        function onUploadCardFinished(cardId) { dialog.showCard(cardId) }
+        function onUploadFailed(uploaded, failures) {
+            uploadFailedDialog.uploaded = uploaded
+            uploadFailedDialog.failures = failures
+            uploadFailedDialog.open()
+        }
+    }
+
+    // Scroll the card list so this card is at the top (the next one to upload
+    // shows below it). Follows an upload as each observation finishes.
+    function showCard(cardId) {
+        var flick = scroller.contentItem
+        for (var i = 0; i < cardRepeater.count; i++) {
+            var item = cardRepeater.itemAt(i)
+            if (!item || item.cardId !== cardId) continue
+            var maxY = Math.max(0, flick.contentHeight - flick.height)
+            followScroll.stop()
+            followScroll.to = Math.max(0, Math.min(maxY, item.y - 8))
+            followScroll.start()
+            return
+        }
+    }
+    NumberAnimation {
+        id: followScroll
+        target: scroller.contentItem
+        property: "contentY"
+        duration: 250
+        easing.type: Easing.OutCubic
     }
 
     // ---------------------------------------------------------------
@@ -96,6 +127,38 @@ Window {
             asynchronous: true
         }
         Rectangle { anchors.fill: parent; color: "transparent"; border.color: dialog.accentColor; border.width: 2 }
+    }
+
+    // While a photo is dragged, holding it near the top or bottom edge of the
+    // card list scrolls the list, so it can be taken to a card that is off
+    // screen. The closer to the edge, the faster.
+    Timer {
+        interval: 16
+        repeat: true
+        running: dragGhost.dragging
+        onTriggered: {
+            var flick = scroller.contentItem
+            var y = dragGhost.mapToItem(scroller, dragGhost.width / 2, dragGhost.height / 2).y
+            var zone = 70
+            var speed = 0
+            if (y < zone) speed = -Math.min(1, (zone - y) / zone)
+            else if (y > scroller.height - zone) speed = Math.min(1, (y - (scroller.height - zone)) / zone)
+            if (speed === 0) return
+            var limit = Math.max(0, flick.contentHeight - flick.height)
+            flick.contentY = Math.max(0, Math.min(limit, flick.contentY + speed * 28))
+        }
+    }
+    // The list moved under a photo that is being held still (edge scrolling
+    // above, or the mouse wheel): no mouse move follows, so nudge the ghost
+    // to make Qt look again at which card is under it.
+    Connections {
+        target: scroller.contentItem
+        enabled: dragGhost.dragging
+        property bool flip: false
+        function onContentYChanged() {
+            flip = !flip
+            dragGhost.x += flip ? 0.5 : -0.5
+        }
     }
 
     // ---------------------------------------------------------------
@@ -270,6 +333,49 @@ Window {
             }
         }
 
+        // Upload progress: one segment per observation in the run, filled in
+        // the order they finish - green went up, red did not.
+        RowLayout {
+            Layout.fillWidth: true
+            visible: dialog.uploader && dialog.uploader.uploadTotal > 0
+            spacing: 10
+            Rectangle {
+                id: uploadBar
+                objectName: "uploadBar"
+                Layout.fillWidth: true
+                implicitHeight: 14
+                radius: 4
+                color: "#1c1c1c"
+                border.color: dialog.cardBorder
+                border.width: 1
+                clip: true
+                readonly property var results: dialog.uploader ? dialog.uploader.uploadResults : []
+                readonly property int total: dialog.uploader ? dialog.uploader.uploadTotal : 0
+                readonly property int failed: results.filter(function(ok) { return !ok }).length
+                Repeater {
+                    model: uploadBar.results
+                    Rectangle {
+                        required property var modelData
+                        required property int index
+                        readonly property real step: (uploadBar.width - 2) / Math.max(1, uploadBar.total)
+                        x: 1 + index * step
+                        y: 1
+                        // A hairline gap between segments while they are wide enough to tell apart.
+                        width: Math.max(1, step - (step >= 6 ? 1 : 0))
+                        height: uploadBar.height - 2
+                        color: modelData ? dialog.okColor : dialog.errColor
+                    }
+                }
+            }
+            Text {
+                text: uploadBar.results.length + " / " + uploadBar.total
+                      + (uploadBar.failed > 0 ? "  ·  " + uploadBar.failed + " failed" : "")
+                color: uploadBar.failed > 0 ? dialog.errColor : dialog.okColor
+                font.pixelSize: 12
+                font.bold: true
+            }
+        }
+
         // Cards
         ScrollView {
             id: scroller
@@ -285,6 +391,7 @@ Window {
                 spacing: 12
 
                 Repeater {
+                    id: cardRepeater
                     model: dialog.uploader ? dialog.uploader.cards : null
                     delegate: ObservationCard { width: cardColumn.width }
                 }
@@ -334,7 +441,7 @@ Window {
                 implicitWidth: 22; implicitHeight: 22
             }
             Text {
-                text: "Drag photos between cards to fix the grouping · tick cards and Merge to combine them"
+                text: "Click a photo for full screen · drag to reorder it or move it to another card (hold it at the top or bottom edge to scroll)"
                 color: "#666666"
                 font.pixelSize: 11
             }
@@ -346,9 +453,118 @@ Window {
                 font.bold: true
                 Layout.leftMargin: 12
                 ToolTip.visible: counterHover.containsMouse
-                ToolTip.text: "MycoMap Vision identify calls. Each card identified (or re-identified) is one request; the period figure comes from your MycoMap account."
+                ToolTip.text: "MycoMap Vision identify calls. Each card identified (or re-identified) is one request. The second figure is what MycoMap reports for your API key over its whole billing period, from everything that has used the key, not just these photos."
                 MouseArea { id: counterHover; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Full-screen photo viewer: click a thumbnail, arrow keys flip through
+    // the photos of that observation, Esc or a click goes back.
+    FocusScope {
+        id: photoViewer
+        anchors.fill: parent
+        z: 2000
+        visible: false
+        property var photos: []
+        property int current: 0
+        property int visibilityBefore: Window.Windowed
+        readonly property var photo: visible && current >= 0 && current < photos.length ? photos[current] : null
+        // Longest edge to decode: the screen's, rounded up so a small change
+        // in window size does not mean a different (uncached) image.
+        readonly property int decodeWidth: Math.min(4096, Math.ceil(Math.max(Screen.width, Screen.height)
+                                                                   * Screen.devicePixelRatio / 512) * 512)
+        function fullSource(i) {
+            if (!visible || photos.length === 0) return ""
+            var n = photos.length
+            return photos[((i % n) + n) % n].full + "?w=" + decodeWidth
+        }
+        function openFor(cardPhotos, index) {
+            photos = cardPhotos
+            current = index
+            visibilityBefore = dialog.visibility
+            visible = true
+            dialog.showFullScreen()
+            forceActiveFocus()
+        }
+        function close() {
+            if (!visible) return
+            visible = false
+            photos = []
+            // Not when the window itself is going away: that would show it again.
+            if (dialog.visible) dialog.visibility = visibilityBefore
+        }
+        function step(delta) {
+            var n = photos.length
+            if (n > 1) current = (current + delta + n) % n
+        }
+
+        Keys.onPressed: function(event) {
+            if (event.key === Qt.Key_Left || event.key === Qt.Key_Up) step(-1)
+            else if (event.key === Qt.Key_Right || event.key === Qt.Key_Down || event.key === Qt.Key_Space) step(1)
+            else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) close()
+            event.accepted = true
+        }
+
+        Rectangle { anchors.fill: parent; color: "black" }
+        // The card thumbnail (already loaded) stands in until the large one is decoded.
+        Image {
+            anchors.fill: parent
+            source: photoViewer.photo ? photoViewer.photo.source : ""
+            fillMode: Image.PreserveAspectFit
+            visible: fullImage.status !== Image.Ready
+        }
+        Image {
+            id: fullImage
+            objectName: "viewerFullImage"
+            anchors.fill: parent
+            source: photoViewer.fullSource(photoViewer.current)
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            visible: status === Image.Ready
+        }
+        // Decode the neighbours ahead of time so an arrow press shows at once.
+        // The provider keeps what it has decoded, so going back is instant too.
+        Repeater {
+            model: [1, -1, 2, -2].slice(0, Math.max(0, Math.min(4, photoViewer.photos.length - 1)))
+            Image {
+                required property int modelData
+                visible: false
+                asynchronous: true
+                // Only once the photo on screen is done, so it is never queued behind these.
+                source: fullImage.status === Image.Ready ? photoViewer.fullSource(photoViewer.current + modelData) : ""
+            }
+        }
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.AllButtons
+            hoverEnabled: true   // nothing underneath reacts while the viewer is up
+            onClicked: photoViewer.close()
+            onWheel: function(wheel) { photoViewer.step(wheel.angleDelta.y > 0 ? -1 : 1) }
+        }
+        Rectangle {
+            anchors.top: parent.top; anchors.right: parent.right
+            anchors.margins: 14
+            width: viewerNumber.implicitWidth + 18; height: viewerNumber.implicitHeight + 8
+            radius: 5
+            color: "#b0000000"
+            Text {
+                id: viewerNumber
+                anchors.centerIn: parent
+                text: (photoViewer.current + 1) + " / " + photoViewer.photos.length
+                color: dialog.okColor
+                font.pixelSize: 20
+                font.bold: true
+            }
+        }
+        Text {
+            anchors.bottom: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottomMargin: 10
+            text: (photoViewer.photo ? photoViewer.photo.name + "   ·   " : "") + "← → to flip · Esc or click to go back"
+            color: "#999999"
+            style: Text.Outline; styleColor: "black"
+            font.pixelSize: 12
         }
     }
 
@@ -366,6 +582,69 @@ Window {
         z: 900
         Text { id: toastLabel; anchors.centerIn: parent; color: "white"; font.pixelSize: 13 }
         Timer { id: toastTimer; interval: 4000 }
+    }
+
+    // An upload run ended with observations that did not (fully) go up.
+    Dialog {
+        id: uploadFailedDialog
+        objectName: "uploadFailedDialog"
+        property int uploaded: 0
+        property var failures: []
+        title: failures.length + (failures.length === 1 ? " observation was" : " observations were") + " not uploaded"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(620, dialog.width - 40)
+        closePolicy: Popup.CloseOnEscape
+        background: Rectangle { color: "#2a2a2a"; radius: 8; border.color: dialog.errColor; border.width: 2 }
+        contentItem: ColumnLayout {
+            spacing: 10
+            Text {
+                Layout.fillWidth: true
+                text: (uploadFailedDialog.uploaded > 0
+                       ? uploadFailedDialog.uploaded + " uploaded successfully. "
+                       : "Nothing was uploaded. ")
+                      + "The ones below are outlined in red in the list and are still waiting: fix what is wrong, then press Upload again. Nothing that already went up is sent twice."
+                color: dialog.textColor
+                wrapMode: Text.Wrap
+            }
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.min(failureColumn.implicitHeight, 300)
+                clip: true
+                contentWidth: availableWidth
+                Column {
+                    id: failureColumn
+                    width: parent.width
+                    spacing: 8
+                    Repeater {
+                        model: uploadFailedDialog.failures
+                        Text {
+                            required property var modelData
+                            width: failureColumn.width
+                            wrapMode: Text.Wrap
+                            textFormat: Text.PlainText
+                            color: dialog.errColor
+                            text: "Observation " + modelData.number
+                                  + (modelData.name ? " (" + modelData.name + ")" : "") + ": " + modelData.message
+                        }
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                Button {
+                    text: "Show the first one"
+                    highlighted: true
+                    onClicked: {
+                        var first = uploadFailedDialog.failures[0]
+                        uploadFailedDialog.close()
+                        if (first) dialog.showCard(first.cardId)
+                    }
+                }
+                Button { text: "OK"; onClicked: uploadFailedDialog.close() }
+            }
+        }
     }
 
     Dialog {
@@ -400,10 +679,18 @@ Window {
         property real pendingLat: 0
         property real pendingLon: 0
         property bool hasPending: false
+        property int accuracy: 25
 
-        function openFor(cardId, hasLocation, lat, lon) {
+        function setAccuracy(meters) {
+            accuracy = Math.max(1, Math.min(1000000, Math.round(meters)))
+            if (parseInt(accuracyField.text) !== accuracy) accuracyField.text = accuracy
+        }
+
+        function openFor(cardId, hasLocation, lat, lon, manualAccuracy) {
             mapPopup.cardId = cardId
             mapPopup.hasPending = false
+            // A point placed before keeps its accuracy; anything else starts at 25 m.
+            setAccuracy(manualAccuracy > 0 ? manualAccuracy : 25)
             open()
             if (hasLocation) {
                 mapPicker.setMarker(lat, lon)
@@ -439,6 +726,7 @@ Window {
             }
             MapPicker {
                 id: mapPicker
+                accuracyMeters: mapPopup.accuracy
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 onPicked: function(lat, lon) {
@@ -452,6 +740,32 @@ Window {
                     text: mapPopup.hasPending ? mapPopup.pendingLat.toFixed(5) + ", " + mapPopup.pendingLon.toFixed(5) : "No point chosen"
                     color: dialog.mutedText
                 }
+                Item { Layout.preferredWidth: 12 }
+                Text { text: "Accuracy"; color: dialog.textColor }
+                TextField {
+                    id: accuracyField
+                    objectName: "accuracyField"
+                    Layout.preferredWidth: 80
+                    horizontalAlignment: TextInput.AlignRight
+                    validator: IntValidator { bottom: 1; top: 1000000 }
+                    selectByMouse: true
+                    onTextEdited: if (acceptableInput) mapPopup.accuracy = parseInt(text)
+                    onEditingFinished: text = mapPopup.accuracy
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 600
+                    ToolTip.text: "How far the real spot could be from the marker, in metres.\nSent to iNaturalist as the observation's positional accuracy and drawn as the blue circle."
+                }
+                Text { text: "m"; color: dialog.mutedText }
+                Repeater {
+                    model: [10, 50, 100, 500, 1000]
+                    Button {
+                        required property int modelData
+                        flat: true
+                        implicitWidth: 64
+                        text: modelData >= 1000 ? (modelData / 1000) + " km" : modelData + " m"
+                        onClicked: mapPopup.setAccuracy(modelData)
+                    }
+                }
                 Item { Layout.fillWidth: true }
                 Button { text: "Cancel"; onClicked: mapPopup.close() }
                 Button {
@@ -459,7 +773,7 @@ Window {
                     highlighted: true
                     enabled: mapPopup.hasPending
                     onClicked: {
-                        dialog.uploader.setLocation(mapPopup.cardId, mapPopup.pendingLat, mapPopup.pendingLon)
+                        dialog.uploader.setLocation(mapPopup.cardId, mapPopup.pendingLat, mapPopup.pendingLon, mapPopup.accuracy)
                         mapPopup.close()
                     }
                 }
@@ -636,19 +950,51 @@ Window {
 
         implicitHeight: cardLayout.implicitHeight + 24
         radius: 8
-        color: cardDrop.containsDrag ? "#2a2a40" : dialog.cardColor
-        border.width: model.selected ? 2 : 1
+        // A photo from another card is being held over this one.
+        readonly property bool takingPhoto: cardDrop.containsDrag && dragGhost.sourceCardId !== cardId
+        color: takingPhoto ? "#2a2a40" : dialog.cardColor
+        border.width: model.selected || model.uploadError !== "" ? 2 : 1
         border.color: model.selected ? dialog.accentColor
-                      : (cardDrop.containsDrag ? dialog.accentColor
+                      : (takingPhoto ? dialog.accentColor
                          : (status === "error" ? dialog.errColor : dialog.cardBorder))
+
+        // Reordering: while one of this card's own photos is dragged over
+        // it, the photo it would land next to and on which side.
+        property string dropKey: ""
+        property bool dropAfter: false
+        function updateDropTarget(x, y) {
+            if (dragGhost.sourceCardId !== cardId) { dropKey = ""; return }
+            var p = cardDrop.mapToItem(photoFlow, x, y)
+            var best = null
+            var bestDistance = 0
+            for (var i = 0; i < photoFlow.children.length; i++) {
+                var item = photoFlow.children[i]
+                if (item.photoKey === undefined) continue
+                var dx = p.x - (item.x + item.width / 2)
+                var dy = p.y - (item.y + item.height / 2)
+                var distance = dx * dx + 9 * dy * dy   // prefer the row under the pointer
+                if (best === null || distance < bestDistance) { best = item; bestDistance = distance }
+            }
+            if (best === null || best.photoKey === dragGhost.photoKey) { dropKey = ""; return }
+            dropAfter = p.x > best.x + best.width / 2
+            dropKey = best.photoKey
+        }
 
         DropArea {
             id: cardDrop
             anchors.fill: parent
             keys: ["inat-photo"]
             enabled: !card.model.locked
+            onEntered: function(drag) { card.updateDropTarget(drag.x, drag.y) }
+            onPositionChanged: function(drag) { card.updateDropTarget(drag.x, drag.y) }
+            onExited: card.dropKey = ""
             onDropped: function(drop) {
-                dialog.uploader.movePhoto(dragGhost.photoKey, card.cardId)
+                var target = card.dropKey
+                card.dropKey = ""
+                if (dragGhost.sourceCardId !== card.cardId)
+                    dialog.uploader.movePhoto(dragGhost.photoKey, card.cardId)
+                else if (target !== "")
+                    dialog.uploader.reorderPhoto(dragGhost.photoKey, target, card.dropAfter)
                 drop.accept()
             }
         }
@@ -717,6 +1063,7 @@ Window {
 
             // Photos
             Flow {
+                id: photoFlow
                 Layout.fillWidth: true
                 spacing: 8
                 Repeater {
@@ -724,7 +1071,17 @@ Window {
                     delegate: Item {
                         id: thumb
                         required property var modelData
+                        required property int index
+                        readonly property string photoKey: modelData.key
                         width: 220; height: 180
+                        // Where a dragged photo of this card would be inserted.
+                        Rectangle {
+                            visible: card.dropKey === thumb.photoKey
+                            x: card.dropAfter ? thumb.width + 2 : -6
+                            width: 4; height: thumb.height
+                            radius: 2
+                            color: dialog.accentColor
+                        }
                         Rectangle {
                             anchors.fill: parent
                             color: "#151515"
@@ -760,15 +1117,32 @@ Window {
                                     font.pixelSize: 10
                                 }
                             }
+                            // Place in the observation; the full-screen view shows the same number.
+                            Rectangle {
+                                anchors.top: parent.top; anchors.right: parent.right
+                                anchors.margins: 4
+                                width: Math.max(20, thumbNumber.implicitWidth + 10); height: 20
+                                radius: 4
+                                color: "#b0000000"
+                                Text {
+                                    id: thumbNumber
+                                    anchors.centerIn: parent
+                                    text: thumb.index + 1
+                                    color: dialog.okColor
+                                    font.pixelSize: 13
+                                    font.bold: true
+                                }
+                            }
                         }
                         MouseArea {
                             id: thumbArea
                             anchors.fill: parent
                             hoverEnabled: true
-                            enabled: !card.model.locked
-                            cursorShape: enabled ? Qt.OpenHandCursor : Qt.ArrowCursor
-                            drag.target: dragGhost
+                            cursorShape: card.model.locked ? Qt.PointingHandCursor : Qt.OpenHandCursor
+                            // Photos of an uploaded card can still be looked at, not moved.
+                            drag.target: card.model.locked ? null : dragGhost
                             drag.threshold: 6
+                            onClicked: photoViewer.openFor(card.model.photos, thumb.index)
                             onPressed: function(mouse) {
                                 var p = thumbArea.mapToItem(dialog.contentItem, mouse.x, mouse.y)
                                 dragGhost.x = p.x - dragGhost.width / 2
@@ -799,7 +1173,7 @@ Window {
                 Text {
                     text: card.model.hasLocation
                           ? (card.model.lat.toFixed(5) + ", " + card.model.lon.toFixed(5)
-                             + (card.model.locationSource === "manual" ? "  (chosen on map)"
+                             + (card.model.locationSource === "manual" ? "  (chosen on map, ±" + card.model.accuracyMeters + " m)"
                                 : "  (EXIF, " + card.model.gpsCount + " fix" + (card.model.gpsCount === 1 ? "" : "es")
                                   + (card.model.gpsCount > 1 ? ", spread " + card.model.spreadMeters + " m" : "") + ")"))
                           : "No GPS in these photos"
@@ -817,7 +1191,8 @@ Window {
                     text: card.model.hasLocation ? "Change on map" : "Pick on map"
                     flat: true
                     visible: card.status !== "uploading" && card.status !== "uploaded"
-                    onClicked: mapPopup.openFor(card.cardId, card.model.hasLocation, card.model.lat, card.model.lon)
+                    onClicked: mapPopup.openFor(card.cardId, card.model.hasLocation, card.model.lat, card.model.lon,
+                                                card.model.locationSource === "manual" ? card.model.accuracyMeters : 0)
                 }
                 Button {
                     text: "Use EXIF again"
@@ -836,11 +1211,32 @@ Window {
                 }
             }
 
+            // A failed upload: loud, so it is not mistaken for a card that went up.
+            Rectangle {
+                Layout.fillWidth: true
+                visible: card.model.uploadError !== ""
+                implicitHeight: uploadErrorText.implicitHeight + 14
+                radius: 5
+                color: "#40ef5350"
+                border.color: dialog.errColor
+                border.width: 1
+                Text {
+                    id: uploadErrorText
+                    anchors.fill: parent
+                    anchors.margins: 7
+                    text: "⚠ Not uploaded: " + card.model.uploadError
+                    textFormat: Text.PlainText
+                    color: "white"
+                    font.pixelSize: 13
+                    font.bold: true
+                    wrapMode: Text.Wrap
+                }
+            }
             // Vision status
             Text {
                 Layout.fillWidth: true
                 text: card.model.statusText
-                visible: text !== ""
+                visible: text !== "" && text !== card.model.uploadError
                 wrapMode: Text.Wrap
                 font.pixelSize: 12
                 color: card.status === "error" ? dialog.errColor
@@ -925,8 +1321,107 @@ Window {
                     text: card.model.chosenName
                     placeholderText: "Scientific name (or leave blank)"
                     enabled: card.status !== "uploading" && card.status !== "uploaded"
-                    font.italic: true
-                    onEditingFinished: if (text !== card.model.chosenName) dialog.uploader.setChosenName(card.cardId, text, "")
+                    // Upright on purpose: italics are correct for a name but harder to read while typing.
+                    onEditingFinished: {
+                        suggestTimer.stop()
+                        suggestPopup.close()
+                        if (text !== card.model.chosenName) dialog.uploader.setChosenName(card.cardId, text, "")
+                    }
+
+                    // Autocomplete from iNaturalist. "p semilanc" offers Psilocybe semilanceata.
+                    property var suggestions: []
+                    property int highlighted: 0
+                    function accept(row) {
+                        suggestTimer.stop()
+                        suggestPopup.close()
+                        dialog.uploader.chooseSuggestion(card.cardId, row.taxonId)
+                        // Typing replaced the bound text; show the chosen name again.
+                        nameField.text = Qt.binding(function() { return card.model.chosenName })
+                    }
+                    onTextEdited: {
+                        if (text.trim().length < 2) { suggestTimer.stop(); suggestPopup.close() }
+                        else suggestTimer.restart()
+                    }
+                    onActiveFocusChanged: if (!activeFocus) { suggestTimer.stop(); suggestPopup.close() }
+                    Timer {
+                        id: suggestTimer
+                        interval: 250
+                        onTriggered: dialog.uploader.suggestTaxa(card.cardId, nameField.text)
+                    }
+                    Connections {
+                        target: dialog.uploader
+                        function onTaxonSuggestions(cardId, query, rows) {
+                            if (cardId !== card.cardId || query !== nameField.text || !nameField.activeFocus) return
+                            nameField.suggestions = rows
+                            nameField.highlighted = 0
+                            if (rows.length > 0) suggestPopup.open()
+                            else suggestPopup.close()
+                        }
+                    }
+                    Keys.priority: Keys.BeforeItem
+                    Keys.onPressed: function(event) {
+                        if (!suggestPopup.visible) return
+                        var n = nameField.suggestions.length
+                        if (event.key === Qt.Key_Down) {
+                            nameField.highlighted = (nameField.highlighted + 1) % n
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_Up) {
+                            nameField.highlighted = (nameField.highlighted + n - 1) % n
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Tab) {
+                            nameField.accept(nameField.suggestions[nameField.highlighted])
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_Escape) {
+                            suggestPopup.close()
+                            event.accepted = true
+                        }
+                    }
+                    Popup {
+                        id: suggestPopup
+                        y: nameField.height + 2
+                        width: Math.max(nameField.width, 440)
+                        padding: 4
+                        focus: false   // the field keeps the keyboard
+                        closePolicy: Popup.CloseOnPressOutsideParent
+                        background: Rectangle { color: "#2a2a2a"; radius: 6; border.color: "#4a4a4a" }
+                        contentItem: Column {
+                            Repeater {
+                                model: nameField.suggestions
+                                delegate: Rectangle {
+                                    id: suggestRow
+                                    required property var modelData
+                                    required property int index
+                                    width: suggestPopup.availableWidth
+                                    height: 28
+                                    radius: 4
+                                    color: suggestRow.index === nameField.highlighted ? dialog.accentColor : "transparent"
+                                    Text {
+                                        id: suggestName
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        anchors.left: parent.left; anchors.leftMargin: 8
+                                        text: suggestRow.modelData.name
+                                        color: "white"; font.pixelSize: 13
+                                    }
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        anchors.left: suggestName.right; anchors.leftMargin: 10
+                                        anchors.right: parent.right; anchors.rightMargin: 8
+                                        text: suggestRow.modelData.rank
+                                              + (suggestRow.modelData.commonName ? " · " + suggestRow.modelData.commonName : "")
+                                        color: suggestRow.index === nameField.highlighted ? "#e0e0ff" : dialog.mutedText
+                                        font.pixelSize: 11
+                                        elide: Text.ElideRight
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        onEntered: nameField.highlighted = suggestRow.index
+                                        onClicked: nameField.accept(suggestRow.modelData)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Text {
                     text: card.model.taxonLabel ? "✓ iNat: " + card.model.taxonLabel

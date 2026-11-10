@@ -15,6 +15,8 @@ Item {
     property bool hasMarker: false
     property real markerLat: 0
     property real markerLon: 0
+    // Radius of the accuracy circle drawn around the marker; 0 hides it.
+    property real accuracyMeters: 0
     property color textColor: "white"
 
     signal picked(real lat, real lon)
@@ -68,27 +70,59 @@ Item {
         refreshTiles()
     }
 
+    // Centre in tile units at the current zoom; every tile is placed from it.
+    readonly property real centerX: lonToX(centerLon, zoom)
+    readonly property real centerY: latToY(centerLat, zoom)
+
     // Tiles covering the viewport (a one-tile margin so panning shows no gaps).
-    property var tileList: []
+    // The model is updated in place: a tile that is still wanted keeps its
+    // Image (nothing is reloaded on a pan), and after a zoom the tiles of the
+    // previous level stay on screen, stretched, underneath the new ones until
+    // those have arrived - instead of the whole map blanking on each step.
+    ListModel { id: tileModel }
     function refreshTiles() {
         if (width <= 0 || height <= 0) return
         var n = Math.pow(2, zoom)
-        var cx = lonToX(centerLon, zoom)
-        var cy = latToY(centerLat, zoom)
         var halfW = width / 2 / tileSize
         var halfH = height / 2 / tileSize
-        var x0 = Math.floor(cx - halfW) - 1
-        var x1 = Math.floor(cx + halfW) + 1
-        var y0 = Math.max(0, Math.floor(cy - halfH) - 1)
-        var y1 = Math.min(n - 1, Math.floor(cy + halfH) + 1)
-        var list = []
-        for (var ty = y0; ty <= y1; ty++) {
-            for (var tx = x0; tx <= x1; tx++) {
-                var wrapped = ((tx % n) + n) % n
-                list.push({ z: zoom, x: wrapped, y: ty, px: (tx - cx) * tileSize + width / 2, py: (ty - cy) * tileSize + height / 2 })
+        var x0 = Math.floor(centerX - halfW) - 1
+        var x1 = Math.floor(centerX + halfW) + 1
+        var y0 = Math.max(0, Math.floor(centerY - halfH) - 1)
+        var y1 = Math.min(n - 1, Math.floor(centerY + halfH) + 1)
+        var wanted = {}
+        for (var ty = y0; ty <= y1; ty++)
+            for (var tx = x0; tx <= x1; tx++)
+                wanted[zoom + "/" + tx + "/" + ty] = { tz: zoom, tx: tx, ty: ty, wx: ((tx % n) + n) % n }
+        for (var i = tileModel.count - 1; i >= 0; i--) {
+            var tile = tileModel.get(i)
+            if (tile.tz === zoom) {
+                if (tile.key in wanted) delete wanted[tile.key]   // already there
+                else tileModel.remove(i)                          // scrolled out of view
+            } else {
+                // Another zoom level: worth keeping as a backdrop only if it
+                // has its picture; dropping the rest also cancels their loads.
+                var item = tileRepeater.itemAt(i)
+                if (!item || item.status !== Image.Ready) tileModel.remove(i)
             }
         }
-        tileList = list
+        for (var key in wanted) {
+            var w = wanted[key]
+            tileModel.append({ key: key, tz: w.tz, tx: w.tx, ty: w.ty, wx: w.wx })
+        }
+        Qt.callLater(dropBackdrop)
+    }
+    // Once every tile of the current level has its picture, the stretched
+    // tiles of other levels underneath are no longer needed.
+    function dropBackdrop() {
+        var others = false
+        for (var i = 0; i < tileModel.count; i++) {
+            if (tileModel.get(i).tz !== zoom) { others = true; continue }
+            var item = tileRepeater.itemAt(i)
+            if (!item || item.status === Image.Loading) return
+        }
+        if (!others) return
+        for (var j = tileModel.count - 1; j >= 0; j--)
+            if (tileModel.get(j).tz !== zoom) tileModel.remove(j)
     }
 
     onWidthChanged: refreshTiles()
@@ -107,22 +141,24 @@ Item {
         width: parent.width; height: parent.height
 
     Repeater {
-        model: map.tileList
+        id: tileRepeater
+        model: tileModel
         delegate: Image {
-            required property var modelData
-            x: modelData.px
-            y: modelData.py
-            width: map.tileSize
-            height: map.tileSize
+            required property int tz
+            required property int tx
+            required property int ty
+            required property int wx
+            // 1 at the current zoom; 2, 4, ... or 1/2, 1/4, ... for a backdrop tile.
+            readonly property real zoomScale: Math.pow(2, map.zoom - tz)
+            x: (tx * zoomScale - map.centerX) * map.tileSize + map.width / 2
+            y: (ty * zoomScale - map.centerY) * map.tileSize + map.height / 2
+            z: tz === map.zoom ? 1 : 0
+            width: map.tileSize * zoomScale
+            height: map.tileSize * zoomScale
             asynchronous: true
             cache: true
-            source: "image://osmtile/" + modelData.z + "/" + modelData.x + "/" + modelData.y
-            Rectangle {
-                anchors.fill: parent
-                color: "#262626"
-                visible: parent.status !== Image.Ready
-                Text { anchors.centerIn: parent; text: "…"; color: "#555555" }
-            }
+            source: "image://osmtile/" + tz + "/" + wx + "/" + ty
+            onStatusChanged: if (status !== Image.Loading) Qt.callLater(map.dropBackdrop)
         }
     }
 
@@ -132,6 +168,16 @@ Item {
         x: map.pixelX(map.markerLon)
         y: map.pixelY(map.markerLat)
         z: 5
+        Rectangle {
+            // Web Mercator: metres per pixel at this latitude and zoom.
+            readonly property real radiusPx: map.accuracyMeters
+                / (156543.03392 * Math.cos(map.markerLat * Math.PI / 180) / Math.pow(2, map.zoom))
+            visible: map.accuracyMeters > 0 && radiusPx >= 9 && radiusPx < 8000
+            width: radiusPx * 2; height: width; radius: radiusPx
+            x: -radiusPx; y: -radiusPx
+            color: "#302196f3"
+            border.color: "#2196f3"; border.width: 2
+        }
         Rectangle {
             width: 16; height: 16; radius: 8
             x: -8; y: -8

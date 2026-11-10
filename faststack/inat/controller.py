@@ -14,7 +14,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from PySide6.QtCore import (
     Property,
@@ -37,6 +37,7 @@ from faststack.inat.grouping import (
     initial_grouping,
     merge_groups,
     move_photo,
+    reorder_photo,
     split_group,
 )
 from faststack.inat.http import ApiError, HttpClient
@@ -46,6 +47,7 @@ from faststack.inat.inat_client import (
     INatClient,
     ObservationDraft,
     Taxon,
+    rank_suggestions,
 )
 from faststack.inat.inat_client import describe_error as describe_inat_error
 from faststack.inat.mycomap_vision import (
@@ -101,11 +103,16 @@ def retry_delay_seconds(exc: ApiError) -> Optional[float]:
     return max(low, min(high, delay))
 
 
+DEFAULT_MANUAL_ACCURACY_M = 25
+MAX_ACCURACY_M = 1_000_000
+
+
 @dataclass
 class Card:
     id: int
     group: ObservationGroup
     manual_location: Optional[tuple[float, float]] = None
+    manual_accuracy_m: Optional[int] = None  # the user's own estimate for a map point
     status: str = STATUS_PENDING
     status_text: str = ""
     vision: Optional[VisionResult] = None
@@ -135,6 +142,14 @@ class Card:
             return Location(lat=lat, lon=lon, source="manual")
         return self.group.exif_location(spread_warning_m)
 
+    def accuracy_m(self, loc: Optional[Location]) -> Optional[int]:
+        """Positional accuracy to send to iNaturalist for ``loc``."""
+        if loc is None:
+            return None
+        if loc.source == "exif":
+            return int(max(10.0, loc.spread_m))
+        return self.manual_accuracy_m or DEFAULT_MANUAL_ACCURACY_M
+
 
 class CardModel(QAbstractListModel):
     ROLE_NAMES = [
@@ -146,9 +161,11 @@ class CardModel(QAbstractListModel):
         "lat",
         "lon",
         "locationSource",
+        "accuracyMeters",
         "gpsCount",
         "spreadMeters",
         "spreadWarning",
+        "uploadError",
         "status",
         "statusText",
         "suggestedName",
@@ -252,6 +269,9 @@ class INatUploadController(QObject):
     thresholdsChanged = Signal()
     uploadFinished = Signal(list, bool)  # paths that went up, all cards done
     showMessage = Signal(str)
+    uploadCardFinished = Signal(int)  # card id; the dialog scrolls it into view
+    # Observations uploaded, then one {cardId, number, name, message} per failure.
+    uploadFailed = Signal(int, list)
 
     _identifyDone = Signal(int, int, object, str)  # card id, token, result, error
     _identifyProgress = Signal(int, int, str)  # card id, token, status line
@@ -261,6 +281,9 @@ class INatUploadController(QObject):
     _usageDone = Signal(str)
     _verifyDone = Signal(str, str)  # login, error
     _taxonLookupDone = Signal(object, str, object)  # taxon, error, (name, rank)
+    # Name-field autocomplete: card id, the text it answers, rows for the list
+    taxonSuggestions = Signal(int, str, list)
+    _suggestDone = Signal(int, int, str, object)  # card id, seq, text, taxa
 
     def __init__(self, config, parent: Optional[QObject] = None, user_agent: str = ""):
         super().__init__(parent)
@@ -275,6 +298,7 @@ class INatUploadController(QObject):
         self._vision_requests = 0  # identify calls sent this session
         self._upload_done = 0
         self._upload_total = 0
+        self._upload_results: list[bool] = []  # this run, in the order finished
         self._cancel_upload = threading.Event()
         self._user_agent = (
             user_agent or "FastStack (+https://github.com/AlanRockefeller/faststack)"
@@ -286,6 +310,12 @@ class INatUploadController(QObject):
         # an upload or a taxon lookup on the shared pool.
         self._identify_executor = create_daemon_threadpool_executor(1, "inat-identify")
         self._cancel_identify = threading.Event()
+        # Name autocomplete has its own thread too, so typing is answered
+        # while an upload holds the shared pool.
+        self._suggest_executor = create_daemon_threadpool_executor(1, "inat-suggest")
+        self._suggest_seq = 0  # only the newest request is worth sending
+        self._suggest_cache: dict[str, list[Taxon]] = {}
+        self._suggested: dict[int, Taxon] = {}  # taxon id -> rows offered so far
         self._upload_active = False
         self._grouping_recorded = False
         # iNat taxon for a (name, rank) the user or Vision chose. Regrouping
@@ -303,6 +333,8 @@ class INatUploadController(QObject):
         self._folder = ""
         self._manual_edits = False
         self._batch_generation = 0
+        # Set by the app to the photo provider's cache-clearing function.
+        self.release_photo_cache: Optional[Callable[[], None]] = None
         self._tile_cache: Optional[TileCache] = None
         self._tile_fetcher: Optional[TileFetcher] = None
         self._tile_lock = threading.Lock()
@@ -317,9 +349,16 @@ class INatUploadController(QObject):
         self._usageDone.connect(self._on_usage_done)
         self._verifyDone.connect(self._on_verify_done)
         self._taxonLookupDone.connect(self._on_taxon_lookup_done)
+        self._suggestDone.connect(self._on_suggest_done)
 
     # ------------------------------------------------------------------
     # Providers / lifecycle
+
+    @Slot()
+    def releasePhotoCache(self) -> None:  # noqa: N802
+        """The dialog closed: free the full-screen viewer's decoded photos."""
+        if self.release_photo_cache is not None:
+            self.release_photo_cache()
 
     def photo_path(self, index: int) -> Optional[Path]:
         if 0 <= index < len(self._photos):
@@ -351,7 +390,11 @@ class INatUploadController(QObject):
     def shutdown(self) -> None:
         self._cancel_upload.set()
         self._cancel_identify.set()
-        for executor in (self._executor, self._identify_executor):
+        for executor in (
+            self._executor,
+            self._identify_executor,
+            self._suggest_executor,
+        ):
             try:
                 executor.shutdown(wait=False)
             except Exception:
@@ -419,9 +462,12 @@ class INatUploadController(QObject):
     @Property(str, notify=usageTextChanged)
     def visionCounterText(self) -> str:  # noqa: N802
         """Lower-right counter: calls this session plus the account's period use."""
-        parts = [f"Vision requests this session: {self._vision_requests}"]
+        parts = [f"Vision requests: {self._vision_requests} this session"]
         if self._usage_text and self._usage_text.startswith("MycoMap Vision: "):
-            parts.append(self._usage_text[len("MycoMap Vision: ") :])
+            # MycoMap's own count for the whole API key, not for this batch.
+            parts.append(
+                "your key in total: " + self._usage_text[len("MycoMap Vision: ") :]
+            )
         return " · ".join(parts)
 
     @Property(int, notify=uploadProgressChanged)
@@ -431,6 +477,11 @@ class INatUploadController(QObject):
     @Property(int, notify=uploadProgressChanged)
     def uploadTotal(self) -> int:
         return self._upload_total
+
+    @Property(list, notify=uploadProgressChanged)
+    def uploadResults(self) -> list:  # noqa: N802
+        """One bool per observation finished in this run: did it go up whole?"""
+        return list(self._upload_results)
 
     @Property(str, notify=settingsChanged)
     def inatLogin(self) -> str:
@@ -675,6 +726,9 @@ class INatUploadController(QObject):
         }
         self._manual_edits = False
         self._grouping_recorded = False
+        self._upload_done = self._upload_total = 0
+        self._upload_results = []
+        self.uploadProgressChanged.emit()
         self._batch_generation += 1
         self._cancel_upload.clear()
         self._folder = str(records[0].path.parent)
@@ -719,7 +773,9 @@ class INatUploadController(QObject):
                 continue
             keys = [p.key for p in card.group.photos]
             if keys and all(k in by_key for k in keys) and not claimed & set(keys):
-                card.group = ObservationGroup([by_key[k] for k in keys])
+                card.group = ObservationGroup(
+                    [by_key[k] for k in keys], ordered=card.group.ordered
+                )
                 card.selected = False
                 kept.append(card)
                 claimed.update(keys)
@@ -735,6 +791,10 @@ class INatUploadController(QObject):
             if card is None:
                 card = self._new_card(group)
             else:
+                if card.group.ordered:  # keep the order the user dragged
+                    group = ObservationGroup(
+                        [by_key[p.key] for p in card.group.photos], ordered=True
+                    )
                 card.group = group  # same photos, this batch's records
                 card.selected = False
             cards.append(card)
@@ -848,12 +908,16 @@ class INatUploadController(QObject):
             return loc.lon if loc else 0.0
         if name == "locationSource":
             return loc.source if loc else ""
+        if name == "accuracyMeters":
+            return card.accuracy_m(loc) or 0
         if name == "gpsCount":
             return loc.photos_with_gps if loc else 0
         if name == "spreadMeters":
             return round(loc.spread_m) if loc else 0
         if name == "spreadWarning":
             return bool(loc and loc.spread_warning)
+        if name == "uploadError":
+            return card.upload_error if card.status == STATUS_ERROR else ""
         if name == "status":
             return card.status
         if name == "statusText":
@@ -959,6 +1023,7 @@ class INatUploadController(QObject):
             c.geoprivacy = card.geoprivacy
             c.description = card.description
             c.manual_location = card.manual_location
+            c.manual_accuracy_m = card.manual_accuracy_m
             cards.append(c)
         self._model.replace(card, cards)
         self._manual_edits = True
@@ -972,6 +1037,8 @@ class INatUploadController(QObject):
             "key": p.key,
             "name": p.path.name,
             "source": f"image://inatphoto/{self._batch_generation}/{index}?w=360",
+            # The full-screen viewer appends the width it needs.
+            "full": f"image://inatphoto/{self._batch_generation}/{index}",
             "taken": p.taken.strftime("%H:%M:%S") if p.taken else "",
             "hasGps": p.has_gps,
         }
@@ -1012,6 +1079,7 @@ class INatUploadController(QObject):
             c.geoprivacy = card.geoprivacy
             c.description = card.description
             c.manual_location = card.manual_location
+            c.manual_accuracy_m = card.manual_accuracy_m
             new_cards.append(c)
         self._model.replace(card, new_cards)
         self._manual_edits = True
@@ -1037,10 +1105,10 @@ class INatUploadController(QObject):
         merged.geoprivacy = first.geoprivacy
         merged.description = first.description
         # A point someone picked on the map is deliberate; keep the first one.
-        merged.manual_location = next(
-            (c.manual_location for c in chosen if c.manual_location is not None),
-            None,
-        )
+        placed = next((c for c in chosen if c.manual_location is not None), None)
+        if placed is not None:
+            merged.manual_location = placed.manual_location
+            merged.manual_accuracy_m = placed.manual_accuracy_m
         self._model.replace(first, [merged])
         for c in chosen[1:]:
             self._model.remove(c)
@@ -1084,18 +1152,50 @@ class INatUploadController(QObject):
         self._manual_edits = True
         self.cardsChanged.emit()
 
-    @Slot(int, float, float)
-    def setLocation(self, card_id: int, lat: float, lon: float) -> None:  # noqa: N802
+    @Slot(str, str, bool)
+    def reorderPhoto(  # noqa: N802
+        self, photo_key: str, target_key: str, after: bool
+    ) -> None:
+        """Drag-and-drop inside a card: put a photo before/after another.
+
+        The order is the order on iNaturalist (the first photo is the one
+        shown in lists). The photo set is unchanged, so an identification
+        the card already has stays.
+        """
+        card = next(
+            (
+                c
+                for c in self._model.cards
+                if any(p.key == photo_key for p in c.group.photos)
+            ),
+            None,
+        )
+        if card is None or card.locked:
+            return
+        if reorder_photo(card.group, photo_key, target_key, after):
+            self._model.refresh(card, "photos")
+
+    @Slot(int, float, float, int)
+    def setLocation(  # noqa: N802
+        self, card_id: int, lat: float, lon: float, accuracy_m: int
+    ) -> None:
+        """A point chosen on the map, with the user's accuracy estimate in metres."""
         card = self._card(card_id)
         if card is None:
             return
         card.manual_location = (float(lat), float(lon))
+        card.manual_accuracy_m = (
+            min(int(accuracy_m), MAX_ACCURACY_M)
+            if accuracy_m > 0
+            else DEFAULT_MANUAL_ACCURACY_M
+        )
         self._model.refresh(
             card,
             "hasLocation",
             "lat",
             "lon",
             "locationSource",
+            "accuracyMeters",
             "spreadWarning",
             "spreadMeters",
             "gpsCount",
@@ -1108,12 +1208,14 @@ class INatUploadController(QObject):
         if card is None:
             return
         card.manual_location = None
+        card.manual_accuracy_m = None
         self._model.refresh(
             card,
             "hasLocation",
             "lat",
             "lon",
             "locationSource",
+            "accuracyMeters",
             "spreadWarning",
             "spreadMeters",
             "gpsCount",
@@ -1151,6 +1253,66 @@ class INatUploadController(QObject):
         self._model.refresh(card, "chosenName", "chosenRank", "taxonLabel")
         if name:
             self._lookup_taxon(card)
+
+    @Slot(int, str)
+    def suggestTaxa(self, card_id: int, text: str) -> None:  # noqa: N802
+        """Autocomplete for the name field; answers with taxonSuggestions.
+
+        Abbreviations work: "p semilanc" finds Psilocybe semilanceata.
+        """
+        query = " ".join(text.split())
+        if len(query) < 2:
+            self.taxonSuggestions.emit(card_id, text, [])
+            return
+        self._suggest_seq += 1
+        seq = self._suggest_seq
+        cached = self._suggest_cache.get(query.casefold())
+        if cached is not None:
+            self._on_suggest_done(card_id, seq, text, cached)
+            return
+
+        def work():
+            if seq != self._suggest_seq:  # more was typed while this waited
+                return
+            try:
+                found = INatClient("", self._http).taxa_autocomplete(query, 30)
+            except Exception as exc:
+                log.debug("Taxon autocomplete failed for %r: %s", query, exc)
+                return
+            self._suggestDone.emit(card_id, seq, text, rank_suggestions(query, found))
+
+        self._suggest_executor.submit(work)
+
+    @Slot(int, int, str, object)
+    def _on_suggest_done(self, card_id: int, seq: int, text: str, taxa) -> None:
+        taxa = list(taxa)
+        if len(self._suggest_cache) > 500:
+            self._suggest_cache.clear()
+        self._suggest_cache[" ".join(text.split()).casefold()] = taxa
+        if seq != self._suggest_seq:
+            return
+        rows = []
+        for taxon in taxa[:8]:
+            self._suggested[taxon.id] = taxon
+            rows.append(
+                {
+                    "taxonId": taxon.id,
+                    "name": taxon.name,
+                    "rank": taxon.rank,
+                    "commonName": taxon.common_name,
+                }
+            )
+        self.taxonSuggestions.emit(card_id, text, rows)
+
+    @Slot(int, int)
+    def chooseSuggestion(self, card_id: int, taxon_id: int) -> None:  # noqa: N802
+        """A row of the autocomplete list was picked: name and iNat taxon."""
+        taxon = self._suggested.get(taxon_id)
+        if taxon is None:
+            return
+        # iNaturalist just returned this taxon; no second lookup needed.
+        self._taxon_cache[self._taxon_key(taxon.name, taxon.rank)] = taxon
+        self.setChosenName(card_id, taxon.name, taxon.rank)
 
     @staticmethod
     def _taxon_key(name: str, rank: str) -> tuple[str, str]:
@@ -1396,11 +1558,14 @@ class INatUploadController(QObject):
             return
         warn = float(self.spreadWarningMeters)
         jobs = []
+        positions: dict[str, int] = {}  # photo key -> place in its card
         for card in queue:
             card.status = STATUS_UPLOADING
             card.status_text = "Queued for upload"
             card.upload_error = ""
-            self._model.refresh(card, "status", "statusText", "canSplit", "locked")
+            self._model.refresh(
+                card, "status", "statusText", "uploadError", "canSplit", "locked"
+            )
             loc = card.location(warn)
             # Only a capture time from EXIF goes to iNaturalist; a file's
             # modification time (the grouping fallback) is not when it was found.
@@ -1411,11 +1576,7 @@ class INatUploadController(QObject):
                 ),
                 latitude=loc.lat if loc else None,
                 longitude=loc.lon if loc else None,
-                positional_accuracy_m=(
-                    int(max(10.0, loc.spread_m))
-                    if loc and loc.source == "exif"
-                    else (25 if loc else None)
-                ),
+                positional_accuracy_m=card.accuracy_m(loc),
                 geoprivacy=card.geoprivacy,
                 taxon_id=card.taxon.id if card.taxon else None,
                 species_guess=card.chosen_name,
@@ -1424,9 +1585,9 @@ class INatUploadController(QObject):
             # A card that already has an observation (an earlier run attached
             # only some of its photos) resumes: no second observation, only
             # the photos still missing go up.
-            pending_photos = [
-                p for p in card.group.sorted_photos() if p.key not in card.photo_ids
-            ]
+            card_photos = card.group.sorted_photos()
+            positions.update({p.key: i for i, p in enumerate(card_photos)})
+            pending_photos = [p for p in card_photos if p.key not in card.photo_ids]
             jobs.append(
                 (
                     card.id,
@@ -1441,6 +1602,7 @@ class INatUploadController(QObject):
             )
         self._upload_done = 0
         self._upload_total = len(jobs)
+        self._upload_results = []
         self.uploadProgressChanged.emit()
         self._cancel_upload.clear()
         self._upload_active = True
@@ -1498,7 +1660,9 @@ class INatUploadController(QObject):
                         break
                     try:
                         data = images.prepare_jpeg(p.path, images.INAT_LONG_EDGE)
-                        photo_id = client.add_photo(obs_id, p.path.name, data)
+                        photo_id = client.add_photo(
+                            obs_id, p.path.name, data, position=positions.get(p.key)
+                        )
                         attached.append((p.key, int(photo_id or 0)))
                     except ApiError as exc:
                         log.warning("Photo upload failed %s: %s", p.path, exc)
@@ -1540,9 +1704,10 @@ class INatUploadController(QObject):
         self, card_id: int, token: int, obs_id, attached, error: str
     ) -> None:
         self._upload_done += 1
-        self.uploadProgressChanged.emit()
         card = self._card(card_id)
         if card is None:
+            self._upload_results.append(False)
+            self.uploadProgressChanged.emit()
             return
         if obs_id:
             card.obs_id = int(obs_id)
@@ -1567,10 +1732,14 @@ class INatUploadController(QObject):
                 card.status_text = error or "Upload failed"
             card.upload_error = card.status_text
             self._uploaded_paths.extend(attached_paths)
+        self._upload_results.append(card.status == STATUS_UPLOADED)
+        self.uploadProgressChanged.emit()
         self._model.refresh(
-            card, "status", "statusText", "obsUrl", "canSplit", "locked"
+            card, "status", "statusText", "uploadError", "obsUrl", "canSplit", "locked"
         )
         self.cardsChanged.emit()
+        if error != "Cancelled":  # cards skipped after Cancel were never tried
+            self.uploadCardFinished.emit(card.id)
 
     @Slot()
     def _on_upload_run_finished(self) -> None:
@@ -1584,6 +1753,19 @@ class INatUploadController(QObject):
         if failed:
             self._set_status(
                 f"{uploaded} uploaded, {failed} failed. Fix and retry the failed cards."
+            )
+            self.uploadFailed.emit(
+                uploaded,
+                [
+                    {
+                        "cardId": c.id,
+                        "number": number,
+                        "name": c.chosen_name,
+                        "message": c.upload_error,
+                    }
+                    for number, c in enumerate(self._model.cards, start=1)
+                    if c.status == STATUS_ERROR and c.upload_error
+                ],
             )
         else:
             self._set_status(f"Uploaded {uploaded} observation(s) to iNaturalist.")
