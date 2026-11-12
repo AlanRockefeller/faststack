@@ -5,10 +5,18 @@
 * ``image://inatphoto/{batch}/{index}?w=320`` - a card thumbnail, EXIF-rotated.
   ``batch`` changes every time the dialog opens a new set of photos, so Qt's
   image cache never shows a thumbnail from the previous batch.
+* ``image://inatobs/{observation id}/{size}[/{index}]`` - a photo (the first
+  unless ``index`` says otherwise) of one of the user's observations on
+  iNaturalist ("square" or "small"), for the map and for an observation a
+  card adds photos to.
 
-Both are plain (synchronous) providers; QML ``Image { asynchronous: true }``
-runs them on Qt's image-loading threads, so a network fetch never blocks the
-UI thread.
+All are plain (synchronous) providers; QML ``Image { asynchronous: true }``
+runs them on Qt's image-loading thread, so a network fetch never blocks the
+UI thread.  That is one thread for every provider of the engine, so the map
+markers' images are downloaded by the iNat controller beforehand and
+``inatobs`` serves them from memory; only the single hover preview is
+fetched here.  (PySide6's ``QQuickAsyncImageProvider`` deadlocked the GUI
+thread when tried with PySide6 6.11.)
 """
 
 from __future__ import annotations
@@ -53,6 +61,36 @@ class TileImageProvider(QQuickImageProvider):
         image = QImage.fromData(data)
         if image.isNull():
             return self._blank
+        return image
+
+
+class ObservationThumbProvider(QQuickImageProvider):
+    """Photos of the user's iNaturalist observations shown on the map."""
+
+    def __init__(self, fetch: Callable[..., Optional[bytes]]):
+        super().__init__(QQuickImageProvider.ImageType.Image)
+        self._fetch = fetch
+
+    def requestImage(self, id_str: str, size: QSize, _requested: QSize) -> QImage:
+        # A null image is a failed load, which Qt does not cache, so the
+        # next request for this URL tries again (a placeholder would stick).
+        image = QImage()
+        # {observation id}/{size}[/{photo index}]
+        parts = id_str.split("?")[0].strip("/").split("/")
+        try:
+            size_name = parts[1] if len(parts) > 1 else "square"
+            if len(parts) > 2:
+                data = self._fetch(int(parts[0]), size_name, int(parts[2]))
+            else:
+                data = self._fetch(int(parts[0]), size_name)
+        except ValueError:
+            data = None
+        if data:
+            decoded = QImage.fromData(data)
+            if not decoded.isNull():
+                image = decoded
+        size.setWidth(image.width())
+        size.setHeight(image.height())
         return image
 
 

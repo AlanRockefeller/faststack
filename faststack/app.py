@@ -109,7 +109,11 @@ from faststack.io.helicon import (
 from faststack.io.focus_order import order_focus_stack_inputs
 from faststack.io.arguments import parse_external_arguments
 from faststack.inat.controller import INatUploadController
-from faststack.inat.providers import CardPhotoProvider, TileImageProvider
+from faststack.inat.providers import (
+    CardPhotoProvider,
+    ObservationThumbProvider,
+    TileImageProvider,
+)
 from faststack.io.executable_validator import validate_executable_path
 from faststack.io.utils import normalize_path_key, resolve_configured_path
 from faststack.imaging.cache import (
@@ -18626,6 +18630,9 @@ def main(
     inat_upload.release_photo_cache = inat_photo_provider.clear_large
     engine.addImageProvider("inatphoto", inat_photo_provider)
     engine.addImageProvider("osmtile", TileImageProvider(inat_upload.tile_fetcher))
+    engine.addImageProvider(
+        "inatobs", ObservationThumbProvider(inat_upload.observation_thumb)
+    )
 
     # Expose controller and UI state to QML
     context = engine.rootContext()

@@ -7,15 +7,54 @@ does.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import re
+import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
 from faststack.inat.http import ApiError, HttpClient
+from faststack.inat.matching import ExistingObservation, observation_from_row
 
 log = logging.getLogger(__name__)
+
+
+# Words botanists and mycologists write between a species and its
+# infraspecific epithet ("Lactarius deliciosus var. areolatus"). iNaturalist
+# names those taxa without them ("Lactarius deliciosus areolatus") and finds
+# nothing when they are included.
+_RANK_CONNECTORS = frozenset(
+    {
+        "var", "subsp", "ssp", "subvar", "f", "fo", "forma", "subf",
+        "nothosubsp", "nothovar", "morph",
+    }
+)
+
+
+def inat_taxon_name(name: str) -> str:
+    """``name`` as iNaturalist writes it: infraspecific rank words dropped.
+
+    "Lactarius deliciosus var. areolatus" becomes
+    "Lactarius deliciosus areolatus".  Only a rank word after the first two
+    words and followed by the epithet it qualifies goes, and only in a name
+    whose first word could be a genus.  So a name still being typed
+    ("Amanita muscaria f" on the way to "f. flavivolvata") and a common name
+    ("Red-tailed hawk dark morph") are left as they are.
+    """
+    words = (name or "").split()
+    if len(words) <= 2 or not words[0].isalpha():
+        return " ".join(words)
+    last = len(words) - 1
+    rest = [
+        w
+        for i, w in enumerate(words[2:], start=2)
+        if i == last or w.rstrip(".").casefold() not in _RANK_CONNECTORS
+    ]
+    return " ".join(words[:2] + rest)
 
 BASE_URL = "https://api.inaturalist.org/v1"
 API_TOKEN_URL = "https://www.inaturalist.org/users/api_token"
@@ -30,10 +69,73 @@ _JWT_RE = re.compile(
 )
 
 
+def _jwt_section(part: str) -> Optional[dict]:
+    """One base64url section of a JWT as JSON; None when it is not one."""
+    try:
+        data = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def is_jwt(token: str) -> bool:
+    """True when ``token`` is shaped like an iNaturalist API token (a JWT
+    whose first section names its signing algorithm)."""
+    parts = (token or "").split(".")
+    if len(parts) != 3:
+        return False
+    header = _jwt_section(parts[0])
+    return bool(header and "alg" in header)
+
+
 def normalise_token(raw: str) -> str:
+    """The token in whatever was pasted (JSON, quotes, the page's address).
+
+    Anything with two dots looks like a token ("www.inaturalist.org" does),
+    so a run that decodes as a JWT wins over the first one found.
+    """
     text = (raw or "").strip()
-    match = _JWT_RE.search(text)
-    return match.group(1) if match else text.strip("\"' ")
+    candidates = _JWT_RE.findall(text)
+    for candidate in candidates:
+        if is_jwt(candidate):
+            return candidate
+    return candidates[0] if candidates else text.strip("\"' ")
+
+
+def token_expires_at(token: str) -> Optional[float]:
+    """When the token stops working (Unix time), from its own ``exp``
+    claim; None when it is not a JWT or does not say."""
+    token = normalise_token(token)
+    if not is_jwt(token):
+        return None
+    payload = _jwt_section(token.split(".")[1])
+    try:
+        return float(payload["exp"]) if payload and payload.get("exp") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def describe_token(token: str, now: Optional[float] = None) -> str:
+    """Why a token iNaturalist refused was refused, as far as it shows."""
+    token = normalise_token(token)
+    if not token:
+        return "No iNaturalist token is saved."
+    if not is_jwt(token):
+        return (
+            "the saved token is not an iNaturalist API token (it should be "
+            "a long code starting with eyJ)"
+        )
+    expires = token_expires_at(token)
+    if expires is None:
+        return ""
+    now = time.time() if now is None else now
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(expires))
+    if expires <= now:
+        return f"it expired at {when}"
+    return (
+        f"it is not expired (good until {when}); iNaturalist may have "
+        "revoked it or be having trouble"
+    )
 
 
 @dataclass
@@ -56,6 +158,22 @@ class Taxon:
         if self.common_name:
             return f"{self.name} ({self.common_name})"
         return self.name
+
+
+@dataclass
+class MapObservation:
+    """One of the user's observations already on iNaturalist, for the map."""
+
+    id: int
+    lat: float
+    lon: float
+    name: str = ""
+    observed_on: str = ""
+    photo_url: str = ""  # the square (75 px) thumbnail; "" when it has no photo
+
+    def photo(self, size: str) -> str:
+        """The photo at another of iNaturalist's sizes ("small", "medium")."""
+        return re.sub(r"/square(\.\w+)(\?.*)?$", rf"/{size}\1\2", self.photo_url)
 
 
 @dataclass
@@ -113,7 +231,7 @@ class INatClient:
         )
 
     def taxa_autocomplete(self, query: str, per_page: int = 10) -> list[Taxon]:
-        query = (query or "").strip()
+        query = inat_taxon_name(query)
         if not query:
             return []
         data = self._http.request(
@@ -145,7 +263,7 @@ class INatClient:
         The same name can exist at two ranks or in two kingdoms. When
         ``rank`` is given, a match at that rank wins over the first hit.
         """
-        name = (name or "").strip()
+        name = inat_taxon_name(name)
         if not name:
             return None
         wanted = name.casefold()
@@ -160,6 +278,114 @@ class INatClient:
                 if taxon.rank.casefold() == rank:
                     return taxon
         return matches[0]
+
+    def observations_in_box(
+        self,
+        login: str,
+        swlat: float,
+        swlng: float,
+        nelat: float,
+        nelng: float,
+        per_page: int = 200,
+        authenticated: bool = True,
+    ) -> tuple[list[MapObservation], int]:
+        """``login``'s observations inside a bounding box, newest first.
+
+        Returns (observations, how many iNaturalist has there in total).
+        With the token sent, the user's own obscured and private
+        observations come back with their true coordinates.
+        """
+        data = self._http.request(
+            "GET",
+            f"{self._base}/observations",
+            headers=self._auth() if authenticated and self._token else None,
+            query={
+                "user_login": login,
+                "swlat": round(swlat, 6),
+                "swlng": round(swlng, 6),
+                "nelat": round(nelat, 6),
+                "nelng": round(nelng, 6),
+                "per_page": per_page,
+                "order_by": "observed_on",
+                "order": "desc",
+            },
+            timeout=60,
+        )
+        rows = data.get("results", []) if isinstance(data, dict) else []
+        out: list[MapObservation] = []
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            point = _lat_lon(row.get("private_location")) or _lat_lon(
+                row.get("location")
+            )
+            if point is None:
+                continue
+            taxon = row.get("taxon") if isinstance(row.get("taxon"), dict) else {}
+            photos = row.get("photos") or []
+            first = photos[0] if photos and isinstance(photos[0], dict) else {}
+            url = str(first.get("url") or "")
+            out.append(
+                MapObservation(
+                    id=int(row["id"]),
+                    lat=point[0],
+                    lon=point[1],
+                    name=str(taxon.get("name") or row.get("species_guess") or ""),
+                    observed_on=str(row.get("observed_on") or ""),
+                    photo_url=url if url.startswith("https://") else "",
+                )
+            )
+        try:
+            total = int(data.get("total_results"))
+        except (AttributeError, TypeError, ValueError):
+            total = len(out)
+        return out, total
+
+    def observations_between(
+        self,
+        login: str,
+        first: date,
+        last: date,
+        per_page: int = 200,
+        max_pages: int = 5,
+        authenticated: bool = True,
+    ) -> list[ExistingObservation]:
+        """``login``'s observations observed from ``first`` to ``last``
+        (inclusive), oldest first, up to ``max_pages`` pages.
+
+        With the token sent, the user's own obscured and private
+        observations come back with their true coordinates.
+        """
+        out: list[ExistingObservation] = []
+        for page in range(1, max_pages + 1):
+            data = self._http.request(
+                "GET",
+                f"{self._base}/observations",
+                headers=self._auth() if authenticated and self._token else None,
+                query={
+                    "user_login": login,
+                    "d1": first.isoformat(),
+                    "d2": last.isoformat(),
+                    "per_page": per_page,
+                    "page": page,
+                    "order_by": "observed_on",
+                    "order": "asc",
+                },
+                timeout=60,
+            )
+            rows = data.get("results", []) if isinstance(data, dict) else []
+            for row in rows:
+                if isinstance(row, dict):
+                    obs = observation_from_row(row)
+                    if obs is not None:
+                        out.append(obs)
+            try:
+                total = int(data.get("total_results"))
+            except (AttributeError, TypeError, ValueError):
+                total = 0
+            if len(rows) < per_page or page * per_page >= total:
+                break
+        return out
 
     def create_observation(self, draft: ObservationDraft) -> int:
         data = self._http.request(
@@ -200,6 +426,17 @@ class INatClient:
             return int((row or {}).get("id"))
         except (TypeError, ValueError):
             return None
+
+
+    def set_photo_position(self, observation_photo_id: int, position: int) -> None:
+        """Move a photo already on an observation to ``position`` (0 = first)."""
+        self._http.request(
+            "PUT",
+            f"{self._base}/observation_photos/{int(observation_photo_id)}",
+            headers=self._auth(),
+            multipart=({"observation_photo[position]": int(position)}, []),
+            timeout=60,
+        )
 
 
 def matches_abbreviation(query: str, name: str) -> bool:
@@ -259,9 +496,30 @@ def _first_result(data: Any) -> Optional[dict[str, Any]]:
     return None
 
 
-def describe_error(exc: ApiError) -> str:
+def _lat_lon(text: Any) -> Optional[tuple[float, float]]:
+    """iNaturalist's "lat,lon" string as numbers; None when it is not one."""
+    try:
+        lat, lon = (float(part) for part in str(text).split(","))
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return lat, lon
+
+
+# Every token problem message starts with this (the upload resumes on a new
+# token when a card failed with it).
+TOKEN_REJECTED = "iNaturalist rejected the API token"
+
+
+def describe_error(exc: ApiError, token: Optional[str] = None) -> str:
+    """A message for a failed iNaturalist call. With the ``token`` that was
+    sent, a 401 says why: iNaturalist itself only answers "Unauthorized"."""
     if exc.status == 401:
-        return "iNaturalist rejected the API token (they expire after 24 h). Paste a fresh one."
+        why = describe_token(token) if token is not None else ""
+        if why:
+            return f"{TOKEN_REJECTED}: {why}. Get a fresh one and paste it in Settings."
+        return f"{TOKEN_REJECTED} (they expire after 24 h). Paste a fresh one."
     if exc.status == 422:
         return f"iNaturalist refused the observation: {exc.detail or 'invalid fields'}"
     if exc.status == 429:

@@ -11,17 +11,22 @@ private ``_*Done`` signals, which Qt queues back to the controller's thread.
 from __future__ import annotations
 
 import logging
+import statistics
 import threading
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import (
     Property,
     QAbstractListModel,
     QModelIndex,
     QObject,
     Qt,
+    QTimer,
     Signal,
     Slot,
 )
@@ -36,8 +41,7 @@ from faststack.inat.grouping import (
     haversine_m,
     initial_grouping,
     merge_groups,
-    move_photo,
-    reorder_photo,
+    move_photos,
     split_group,
 )
 from faststack.inat.http import ApiError, HttpClient
@@ -45,9 +49,31 @@ from faststack.inat.inat_client import (
     API_TOKEN_URL,
     OBSERVATION_URL,
     INatClient,
+    MapObservation,
     ObservationDraft,
     Taxon,
+    inat_taxon_name,
     rank_suggestions,
+)
+from faststack.inat.inat_client import (
+    TOKEN_REJECTED,
+    describe_token,
+    is_jwt,
+    normalise_token,
+    token_expires_at,
+)
+from faststack.inat.matching import (
+    OFFSETS_FILE,
+    CardFacts,
+    ClockOffsetStore,
+    ExistingObservation,
+    Match,
+    OffsetGuess,
+    describe_offset,
+    detect_offsets,
+    fetch_window,
+    match_card,
+    offset_for_pair,
 )
 from faststack.inat.inat_client import describe_error as describe_inat_error
 from faststack.inat.mycomap_vision import (
@@ -104,7 +130,19 @@ def retry_delay_seconds(exc: ApiError) -> Optional[float]:
 
 
 DEFAULT_MANUAL_ACCURACY_M = 25
+# The user's own iNaturalist observations shown on the map picker: how many
+# one press of the button asks for, and how many thumbnails are kept.
+MAP_OBSERVATIONS_PER_FETCH = 200
+MAP_THUMB_CACHE_ENTRIES = 3000
+# Map marker thumbnails download in parallel on their own threads; markers
+# get their image only once it is here (see myObservations).
+MAP_THUMB_WORKERS = 4
+MAP_THUMB_TIMEOUT_S = 20
 MAX_ACCURACY_M = 1_000_000
+# iNaturalist API tokens last 24 hours. In their last minutes the dialog
+# warns, and Upload asks first: a run that outlives the token fails partway.
+TOKEN_WARN_SECONDS = 15 * 60
+TOKEN_TICK_MS = 30_000
 
 
 @dataclass
@@ -127,6 +165,14 @@ class Card:
     identify_pending: bool = False
     upload_error: str = ""
     photo_ids: dict[str, int] = field(default_factory=dict)
+    # Observations already on iNaturalist these photos may belong to.
+    matches: list[Match] = field(default_factory=list)
+    # The user chose one: upload adds the photos to it instead of creating
+    # an observation.
+    attach_to: Optional[ExistingObservation] = None
+    # Where the new photos go among the observation's own: "inat:<index>"
+    # for its photos, photo keys for this card's. None = after them.
+    merged_order: Optional[list[str]] = None
 
     @property
     def locked(self) -> bool:
@@ -184,6 +230,8 @@ class CardModel(QAbstractListModel):
         "locked",
         "visionWarning",
         "canSplitByVision",
+        "existingMatches",
+        "attachedObs",
     ]
 
     def __init__(self, controller: "INatUploadController"):
@@ -234,6 +282,35 @@ class CardModel(QAbstractListModel):
         roles = [self._role_by_name[n] for n in names if n in self._role_by_name]
         self.dataChanged.emit(idx, idx, roles)
 
+    def sync(self, cards: list[Card]) -> None:
+        """Make the list ``cards`` by removing and inserting rows only.
+
+        Unlike :meth:`reset`, the cards that stay keep their place in the
+        view (and the view its scroll position). Cards that stay must be in
+        the order they already have.
+        """
+        keep = {id(c) for c in cards}
+        for row in range(len(self._cards) - 1, -1, -1):
+            if id(self._cards[row]) not in keep:
+                self.beginRemoveRows(QModelIndex(), row, row)
+                del self._cards[row]
+                self.endRemoveRows()
+        for row, card in enumerate(cards):
+            if row < len(self._cards) and self._cards[row] is card:
+                continue
+            self.beginInsertRows(QModelIndex(), row, row)
+            self._cards.insert(row, card)
+            self.endInsertRows()
+
+    def refresh_all(self, card: Card) -> None:
+        """Every value of this card may have changed."""
+        try:
+            row = self._cards.index(card)
+        except ValueError:
+            return
+        idx = self.index(row, 0)
+        self.dataChanged.emit(idx, idx, [])
+
     def replace(self, old: Card, new_cards: list[Card]) -> None:
         try:
             row = self._cards.index(old)
@@ -269,21 +346,33 @@ class INatUploadController(QObject):
     thresholdsChanged = Signal()
     uploadFinished = Signal(list, bool)  # paths that went up, all cards done
     showMessage = Signal(str)
+    tokenClockChanged = Signal()  # the token's time left, every half minute
+    tokenRejected = Signal(str)  # the saved token no longer works (dialog open)
     uploadCardFinished = Signal(int)  # card id; the dialog scrolls it into view
     # Observations uploaded, then one {cardId, number, name, message} per failure.
     uploadFailed = Signal(int, list)
 
     _identifyDone = Signal(int, int, object, str)  # card id, token, result, error
     _identifyProgress = Signal(int, int, str)  # card id, token, status line
-    # card id, token, obs id, keys of photos attached this run, error
-    _uploadCardDone = Signal(int, int, object, object, str)
+    # card id, token, obs id, keys of photos attached this run, error, and
+    # why the photos of an existing observation could not be put in order
+    _uploadCardDone = Signal(int, int, object, object, str, str)
     _uploadRunFinished = Signal()
     _usageDone = Signal(str)
     _verifyDone = Signal(str, str)  # login, error
+    _tokenCheckDone = Signal(int, str, str, bool)  # seq, login, error, rejected
     _taxonLookupDone = Signal(object, str, object)  # taxon, error, (name, rank)
     # Name-field autocomplete: card id, the text it answers, rows for the list
     taxonSuggestions = Signal(int, str, list)
     _suggestDone = Signal(int, int, str, object)  # card id, seq, text, taxa
+    # The user's observations already on iNaturalist, shown on the map picker.
+    myObservationsChanged = Signal()
+    _myObservationsDone = Signal(int, object, int, str)  # seq, rows, total, error
+    _thumbFetched = Signal(int, int)  # seq, observation id
+    # Observations already on iNaturalist on the batch's dates, and the
+    # camera clock offsets matching them found.
+    existingChanged = Signal()
+    _existingDone = Signal(int, object, str)  # seq, observations, error
 
     def __init__(self, config, parent: Optional[QObject] = None, user_agent: str = ""):
         super().__init__(parent)
@@ -317,6 +406,10 @@ class INatUploadController(QObject):
         self._suggest_cache: dict[str, list[Taxon]] = {}
         self._suggested: dict[int, Taxon] = {}  # taxon id -> rows offered so far
         self._upload_active = False
+        # An upload run ended on a rejected token; saving a token that
+        # verifies picks the upload up again without another press.
+        self._token_failed_run = False
+        self._resume_after_verify = False
         self._grouping_recorded = False
         # iNat taxon for a (name, rank) the user or Vision chose. Regrouping
         # re-creates cards with the same names; asking iNaturalist again for
@@ -340,7 +433,52 @@ class INatUploadController(QObject):
         self._tile_lock = threading.Lock()
         self._inat_login = config.get(CONFIG_SECTION, "inat_login", "") or ""
         self._verify_error = ""
+        self._verify_seq = 0  # a newer check or verify outdates an older answer
         self._uploaded_paths: list[str] = []
+        self._my_observations: dict[int, MapObservation] = {}
+        self._my_observations_busy = False
+        self._my_observations_status = ""
+        self._my_observations_seq = 0  # a Clear drops the answer still on its way
+        # (observation id, size) -> image bytes, read by Qt's image threads.
+        self._thumb_cache: dict[tuple[int, str], bytes] = {}
+        self._thumb_lock = threading.Lock()
+        # Marker thumbnails are fetched here, not by the image provider: Qt
+        # runs every provider of the engine on one thread, so a provider
+        # downloading 200 of them in a row would hold up the map tiles.
+        self._thumb_executor = create_daemon_threadpool_executor(
+            MAP_THUMB_WORKERS, "inat-obs-thumb"
+        )
+        self._thumb_pending: set[int] = set()  # GUI thread only
+        # Markers are rebuilt once per burst of finished downloads.
+        self._thumb_refresh = QTimer(self)
+        self._thumb_refresh.setSingleShot(True)
+        self._thumb_refresh.setInterval(250)
+        self._thumb_refresh.timeout.connect(self.myObservationsChanged)
+        # Existing observations the cards may belong to (see matching.py).
+        self._existing: list[ExistingObservation] = []
+        self._existing_by_id: dict[int, ExistingObservation] = {}
+        self._existing_seq = 0
+        self._existing_busy = False
+        self._existing_fetched = False  # for this batch
+        self._existing_status = ""
+        self._offset_store = ClockOffsetStore(get_app_data_dir() / OFFSETS_FILE)
+        self._clock: dict[str, OffsetGuess] = {}  # camera -> offset in use
+        self._clock_saved: dict[str, OffsetGuess] = {}  # from the store, per batch
+        self._clock_decisions: dict[str, OffsetGuess] = {}  # the user's, this batch
+        self._camera_days: dict[str, Any] = {}  # camera -> the batch's middle date
+        self._match_signature: Any = None
+        self._clock_version = 0  # bumps on every clock decision
+        # Matches the user said are wrong: observation id -> keys of the
+        # photos it was offered for. A card holding any of them is not
+        # offered it again (also after a split or a regroup).
+        self._dismissed: dict[int, set[str]] = {}
+        self._dismiss_version = 0
+        # Matching reruns once per burst of card changes, after they settle.
+        self._rematch_timer = QTimer(self)
+        self._rematch_timer.setSingleShot(True)
+        self._rematch_timer.setInterval(0)
+        self._rematch_timer.timeout.connect(self._rematch)
+        self.cardsChanged.connect(self._rematch_timer.start)
 
         self._identifyDone.connect(self._on_identify_done)
         self._identifyProgress.connect(self._on_identify_progress)
@@ -348,8 +486,18 @@ class INatUploadController(QObject):
         self._uploadRunFinished.connect(self._on_upload_run_finished)
         self._usageDone.connect(self._on_usage_done)
         self._verifyDone.connect(self._on_verify_done)
+        self._tokenCheckDone.connect(self._on_token_check_done)
         self._taxonLookupDone.connect(self._on_taxon_lookup_done)
         self._suggestDone.connect(self._on_suggest_done)
+        self._myObservationsDone.connect(self._on_my_observations_done)
+        self._thumbFetched.connect(self._on_thumb_fetched)
+        self._existingDone.connect(self._on_existing_done)
+        self._token_warned_for = ""  # the token the "expires soon" toast was for
+        self._token_timer = QTimer(self)
+        self._token_timer.setInterval(TOKEN_TICK_MS)
+        self._token_timer.timeout.connect(self._on_token_tick)
+        self._token_timer.start()
+        self.settingsChanged.connect(self.tokenClockChanged)
 
     # ------------------------------------------------------------------
     # Providers / lifecycle
@@ -394,6 +542,7 @@ class INatUploadController(QObject):
             self._executor,
             self._identify_executor,
             self._suggest_executor,
+            self._thumb_executor,
         ):
             try:
                 executor.shutdown(wait=False)
@@ -430,8 +579,28 @@ class INatUploadController(QObject):
         return sum(
             1
             for c in self._model.cards
-            if c.location(warn) is None and c.status != STATUS_UPLOADED
+            if c.location(warn) is None
+            and c.status != STATUS_UPLOADED
+            and c.attach_to is None  # the observation has its own location
         )
+
+    @Slot(result=list)
+    def cardsWithoutLocationList(self) -> list:  # noqa: N802
+        """{cardId, number, name, photoCount} for each card that would go up
+        with no location, so the dialog can name them and jump to them."""
+        warn = self.spreadWarningMeters
+        return [
+            {
+                "cardId": c.id,
+                "number": number,
+                "name": c.chosen_name,
+                "photoCount": len(c.group.photos),
+            }
+            for number, c in enumerate(self._model.cards, start=1)
+            if c.location(warn) is None
+            and c.status != STATUS_UPLOADED
+            and c.attach_to is None
+        ]
 
     @Property(int, notify=cardsChanged)
     def cardsToUpload(self) -> int:
@@ -545,11 +714,83 @@ class INatUploadController(QObject):
     # ------------------------------------------------------------------
     # Settings slots
 
+    # ------------------------------------------------------------------
+    # Token lifetime
+
+    def _token_seconds_left(self) -> int:
+        """Seconds until the saved token expires; 0 once it has, -1 when
+        there is none or it does not say."""
+        token = self._credentials.get(INAT_TOKEN)
+        if not token:
+            return -1
+        expires = token_expires_at(token)
+        if expires is None:
+            return -1
+        return max(0, int(expires - time.time()))
+
+    @Property(int, notify=tokenClockChanged)
+    def tokenSecondsLeft(self) -> int:  # noqa: N802
+        return self._token_seconds_left()
+
+    @Property(int, constant=True)
+    def tokenWarnSeconds(self) -> int:  # noqa: N802
+        return TOKEN_WARN_SECONDS
+
+    @Property(str, notify=tokenClockChanged)
+    def tokenExpiryText(self) -> str:  # noqa: N802
+        left = self._token_seconds_left()
+        if left < 0:
+            return ""
+        if left == 0:
+            return "token expired"
+        hours, rest = divmod(left, 3600)
+        minutes = rest // 60
+        if hours:
+            return f"token good for {hours} h {minutes:02d} min"
+        return f"token expires in {max(1, minutes)} min"
+
+    @Slot()
+    def _on_token_tick(self) -> None:
+        self.tokenClockChanged.emit()
+        token = self._credentials.get(INAT_TOKEN)
+        left = self._token_seconds_left()
+        if 0 < left <= TOKEN_WARN_SECONDS and token != self._token_warned_for:
+            self._token_warned_for = token
+            self.showMessage.emit(
+                f"Your iNaturalist token expires in {max(1, left // 60)} min. "
+                "Get a fresh one (Settings) before a long upload."
+            )
+
+    @staticmethod
+    def _pasted_token_problem(token: str) -> str:
+        """Why a pasted token is not worth saving; "" when it is."""
+        if not is_jwt(token):
+            return (
+                "That is not an iNaturalist API token. On the token page, copy "
+                "the long code that starts with eyJ (between the quotes)."
+            )
+        expires = token_expires_at(token)
+        if expires is not None and expires <= time.time():
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(expires))
+            return (
+                f"That token already expired at {when}: it is an old copy. "
+                "Reload the token page (each visit makes a new one) and copy again."
+            )
+        return ""
+
     @Slot(str, str)
     def saveCredentials(self, inat_token: str, vision_key: str) -> None:  # noqa: N802
         saved = True
         if inat_token.strip():
-            saved = self._credentials.set(INAT_TOKEN, inat_token) and saved
+            token = normalise_token(inat_token)
+            problem = self._pasted_token_problem(token)
+            if problem:
+                # Not saved: the token that is there (if any) stays.
+                self._verify_error = problem
+                self.showMessage.emit(problem)
+                inat_token = ""
+            else:
+                saved = self._credentials.set(INAT_TOKEN, token) and saved
         if vision_key.strip():
             saved = self._credentials.set(MYCOMAP_KEY, vision_key) and saved
         if not saved:
@@ -558,6 +799,8 @@ class INatUploadController(QObject):
             )
         self.settingsChanged.emit()
         if inat_token.strip():
+            self._token_warned_for = ""
+            self._resume_after_verify = self._token_failed_run
             self.verifyInat()
         if vision_key.strip():
             self.refreshUsage()
@@ -629,6 +872,7 @@ class INatUploadController(QObject):
             self._verify_error = "No iNaturalist token saved."
             self.settingsChanged.emit()
             return
+        self._verify_seq += 1
         self._begin_job()
 
         def work():
@@ -636,7 +880,7 @@ class INatUploadController(QObject):
                 user = INatClient(token, self._http).me()
                 self._verifyDone.emit(user.login, "")
             except ApiError as exc:
-                self._verifyDone.emit("", describe_inat_error(exc))
+                self._verifyDone.emit("", describe_inat_error(exc, token))
             except Exception as exc:  # network
                 self._verifyDone.emit("", f"Could not reach iNaturalist: {exc}")
 
@@ -646,11 +890,68 @@ class INatUploadController(QObject):
     def _on_verify_done(self, login: str, error: str) -> None:
         self._end_job()
         self._verify_error = error
+        resume = self._resume_after_verify
+        self._resume_after_verify = False
         if login:
             self._inat_login = login
             self._config.set(CONFIG_SECTION, "inat_login", login)
             self._config.save()
         self.settingsChanged.emit()
+        self._check_existing_if_due()
+        if not resume or self._upload_active:
+            return
+        if login:
+            # The last run stopped on the old token and this one works: carry
+            # on with the cards that are still waiting.
+            self.showMessage.emit("Token accepted. Uploading the rest...")
+            self.uploadAll()
+        else:
+            self.showMessage.emit(f"Still not uploading: {error}")
+
+    @Slot()
+    def checkToken(self) -> None:  # noqa: N802
+        """Ask iNaturalist whether the saved token still works (dialog opened).
+
+        Tokens last 24 hours, so the one from yesterday's session is usually
+        dead; finding that out now beats finding it out as every card fails.
+        Quiet: the dialog is not marked busy while the answer is on its way.
+        """
+        token = self._credentials.get(INAT_TOKEN)
+        if not token or self._upload_active:
+            return
+        self._verify_seq += 1
+        seq = self._verify_seq
+
+        def work():
+            try:
+                user = INatClient(token, self._http).me()
+                self._tokenCheckDone.emit(seq, user.login, "", False)
+            except ApiError as exc:
+                self._tokenCheckDone.emit(
+                    seq, "", describe_inat_error(exc, token), exc.status == 401
+                )
+            except Exception as exc:  # network
+                self._tokenCheckDone.emit(
+                    seq, "", f"Could not reach iNaturalist: {exc}", False
+                )
+
+        self._executor.submit(work)
+
+    @Slot(int, str, str, bool)
+    def _on_token_check_done(
+        self, seq: int, login: str, error: str, rejected: bool
+    ) -> None:
+        if seq != self._verify_seq:
+            return
+        self._verify_error = error
+        if login:
+            self._inat_login = login
+            self._config.set(CONFIG_SECTION, "inat_login", login)
+            self._config.save()
+        self.settingsChanged.emit()
+        self._check_existing_if_due()
+        if rejected:
+            self.tokenRejected.emit(error)
 
     @Slot()
     def refreshUsage(self) -> None:  # noqa: N802
@@ -726,6 +1027,8 @@ class INatUploadController(QObject):
         }
         self._manual_edits = False
         self._grouping_recorded = False
+        self._token_failed_run = False
+        self._resume_after_verify = False
         self._upload_done = self._upload_total = 0
         self._upload_results = []
         self.uploadProgressChanged.emit()
@@ -751,8 +1054,10 @@ class INatUploadController(QObject):
         else:
             self._thresholds_note = "sliders at the settings defaults"
         self.thresholdsChanged.emit()
+        self._reset_existing()
         self._regroup(announce=True)
         self.refreshUsage()
+        self.checkExisting()
         return True
 
     def _regroup(self, announce: bool = False) -> None:
@@ -897,8 +1202,24 @@ class INatUploadController(QObject):
         if name == "photoCount":
             return len(card.group.photos)
         if name == "dateText":
-            when = card.group.observed_at
-            return when.strftime("%Y-%m-%d %H:%M") if when else "No capture time"
+            when, own = self._observed_at(card, exif_only=False)
+            if when is None:
+                return "No capture time"
+            text = when.strftime("%Y-%m-%d %H:%M")
+            if own is not None and own != when:
+                fmt = "%H:%M" if own.date() == when.date() else "%Y-%m-%d %H:%M"
+                text += f" (camera clock {own.strftime(fmt)})"
+            return text
+        if name == "existingMatches":
+            if card.locked:
+                return []
+            return [self._match_dict(card, m) for m in card.matches]
+        if name == "attachedObs":
+            if card.attach_to is None:
+                return {"obsId": 0}
+            out = self._obs_dict(card.attach_to)
+            out["order"] = self._order_dicts(card)
+            return out
         loc = card.location(warn)
         if name == "hasLocation":
             return loc is not None
@@ -1086,6 +1407,37 @@ class INatUploadController(QObject):
         self._set_status(f"Split into {len(new_cards)} observations.")
         self.cardsChanged.emit()
 
+    @Slot(int, list)
+    def splitOffPhotos(self, card_id: int, photo_keys: list) -> None:  # noqa: N802
+        """Split with photos selected: those become their own observation,
+        placed right after the card they came from."""
+        card = self._card(card_id)
+        if card is None or card.locked:
+            return
+        wanted = {str(k) for k in photo_keys}
+        shown = card.group.sorted_photos()
+        taken = [p for p in shown if p.key in wanted]
+        if not taken or len(taken) == len(shown):
+            return
+        split = self._new_card(ObservationGroup(taken, ordered=card.group.ordered))
+        split.geoprivacy = card.geoprivacy
+        split.description = card.description
+        split.manual_location = card.manual_location
+        split.manual_accuracy_m = card.manual_accuracy_m
+        card.group.photos = [p for p in card.group.photos if p.key not in wanted]
+        self._touch(card)
+        cards = list(self._model.cards)
+        cards.insert(cards.index(card) + 1, split)
+        self._model.sync(cards)  # the card itself stays put on screen
+        self._model.refresh_all(card)
+        self._manual_edits = True
+        count = len(taken)
+        self._set_status(
+            f"Split {count} selected photo{'' if count == 1 else 's'} "
+            "into their own observation."
+        )
+        self.cardsChanged.emit()
+
     @Slot(int)
     def toggleSelected(self, card_id: int) -> None:  # noqa: N802
         card = self._card(card_id)
@@ -1116,64 +1468,327 @@ class INatUploadController(QObject):
         self._set_status(f"Merged {len(chosen)} cards.")
         self.cardsChanged.emit()
 
-    @Slot(str, int)
-    def movePhoto(self, photo_key: str, target_card_id: int) -> None:  # noqa: N802
-        """Drag-and-drop: move a photo into another card (-1 = a new card)."""
-        source = None
-        for c in self._model.cards:
-            if any(p.key == photo_key for p in c.group.photos):
-                source = c
-                break
-        if source is None or source.locked:
+    @Slot(list, int, str, bool)
+    def movePhotos(  # noqa: N802
+        self, photo_keys: list, target_card_id: int, target_key: str, after: bool
+    ) -> None:
+        """Drag-and-drop of one or more photos onto a card (-1 = a new card).
+
+        They land just before (or ``after``) the photo ``target_key`` of that
+        card, or at its end when ``target_key`` is empty, and that order is
+        the order on iNaturalist. Photos dragged within their own card are
+        reordered; the card's identification stays, since its photo set did
+        not change.
+        """
+        cards = self._model.cards
+        wanted = {str(k) for k in photo_keys}
+        movable = {
+            p.key
+            for c in cards
+            if not c.locked
+            for p in c.group.photos
+            if p.key in wanted
+        }
+        if not movable:
             return
         target = self._card(target_card_id) if target_card_id >= 0 else None
-        if target is source:
+        if target_card_id >= 0 and (target is None or target.locked):
             return
-        if target is not None and target.locked:
-            return
-        groups = [c.group for c in self._model.cards]
-        target_index = (
-            self._model.cards.index(target) if target is not None else len(groups)
-        )
-        before = {id(g): c for g, c in zip(groups, self._model.cards)}
-        new_groups = move_photo(groups, photo_key, target_index)
-        # Rebuild the card list, keeping Card objects for surviving groups.
+        if target is None and any(self._photo_set(c) == movable for c in cards):
+            return  # they already are an observation of their own
+        source = next(c for c in cards if self._photo_set(c) & movable)
+        shown_before = {c.id: [p.key for p in c.group.sorted_photos()] for c in cards}
+        by_group = {id(c.group): c for c in cards}
+        groups = [c.group for c in cards]
+        target_index = cards.index(target) if target is not None else len(groups)
+        new_groups = move_photos(groups, movable, target_index, target_key, after)
         new_cards: list[Card] = []
+        reordered: list[Card] = []
+        changed: list[Card] = []
+        regrouped = len(new_groups) != len(cards)
         for g in new_groups:
-            card = before.get(id(g))
+            card = by_group.get(id(g))
             if card is None:
                 card = self._new_card(g)
                 card.geoprivacy = source.geoprivacy
+                regrouped = True
+            else:
+                shown = [p.key for p in g.sorted_photos()]
+                if set(shown) != set(shown_before[card.id]):
+                    self._touch(card)
+                    changed.append(card)
+                    regrouped = True
+                elif shown != shown_before[card.id]:
+                    reordered.append(card)
             new_cards.append(card)
-        self._touch(source)
-        if target is not None:
-            self._touch(target)
-        self._model.reset(new_cards)
-        self._manual_edits = True
-        self.cardsChanged.emit()
+        if regrouped:
+            # Row by row, not a reset: the cards that stay are not rebuilt,
+            # so the list does not jump while the user is looking at it.
+            self._model.sync(new_cards)
+            for card in changed:
+                self._model.refresh_all(card)
+            self._manual_edits = True
+            self.cardsChanged.emit()
+        else:
+            for card in reordered:
+                self._model.refresh(card, "photos", "attachedObs")
 
-    @Slot(str, str, bool)
-    def reorderPhoto(  # noqa: N802
-        self, photo_key: str, target_key: str, after: bool
+    # ------------------------------------------------------------------
+    # Map picker: where the other observations are
+
+    @Slot(str)
+    def copyText(self, text: str) -> None:  # noqa: N802
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+
+    @Slot(int, result=list)
+    def mapNeighbours(self, card_id: int) -> list:  # noqa: N802
+        """The other cards of this upload that have a location, for the map."""
+        warn = float(self.spreadWarningMeters)
+        cards = self._model.cards
+        here = next((i for i, c in enumerate(cards) if c.id == card_id), 0)
+        out = []
+        for i, card in enumerate(cards):
+            loc = card.location(warn)
+            photos = card.group.sorted_photos()
+            if card.id == card_id or loc is None or not photos:
+                continue
+            base = f"image://inatphoto/{self._batch_generation}/{photos[0].order}"
+            label = f"Observation {i + 1}"
+            if card.chosen_name:
+                label += f" · {card.chosen_name}"
+            out.append(
+                {
+                    "kind": "upload",
+                    "lat": loc.lat,
+                    "lon": loc.lon,
+                    "source": base + "?w=128",
+                    "preview": base + "?w=360",
+                    "label": label,
+                    "cardsAway": abs(i - here),
+                }
+            )
+        return out
+
+    @Property(list, notify=myObservationsChanged)
+    def myObservations(self) -> list:  # noqa: N802
+        with self._thumb_lock:
+            have = {key[0] for key in self._thumb_cache if key[1] == "square"}
+        return [
+            {
+                "kind": "inat",
+                "lat": o.lat,
+                "lon": o.lon,
+                # Only once downloaded: the provider never fetches a marker
+                # image, and a missing one is just an empty frame.
+                "source": f"image://inatobs/{o.id}/square" if o.id in have else "",
+                "preview": f"image://inatobs/{o.id}/small" if o.photo_url else "",
+                "label": " · ".join(
+                    bit for bit in (o.name or "Unknown", o.observed_on) if bit
+                ),
+            }
+            for o in self._my_observations.values()
+        ]
+
+    @Property(bool, notify=myObservationsChanged)
+    def myObservationsBusy(self) -> bool:  # noqa: N802
+        return self._my_observations_busy
+
+    @Property(str, notify=myObservationsChanged)
+    def myObservationsStatus(self) -> str:  # noqa: N802
+        return self._my_observations_status
+
+    @Slot(float, float, float, float)
+    def fetchMyObservations(  # noqa: N802
+        self, swlat: float, swlng: float, nelat: float, nelng: float
     ) -> None:
-        """Drag-and-drop inside a card: put a photo before/after another.
+        """Add the user's iNaturalist observations inside this map view.
 
-        The order is the order on iNaturalist (the first photo is the one
-        shown in lists). The photo set is unchanged, so an identification
-        the card already has stays.
+        Each call adds to what is already shown, so zooming out and asking
+        again brings in more.
         """
-        card = next(
-            (
-                c
-                for c in self._model.cards
-                if any(p.key == photo_key for p in c.group.photos)
-            ),
-            None,
-        )
-        if card is None or card.locked:
+        if self._my_observations_busy:
             return
-        if reorder_photo(card.group, photo_key, target_key, after):
-            self._model.refresh(card, "photos")
+        login = self._inat_login
+        if not login:
+            self._my_observations_status = (
+                "Not signed in: add your iNaturalist token in Settings first."
+            )
+            self.myObservationsChanged.emit()
+            return
+        token = self._credentials.get(INAT_TOKEN) or ""
+        box = (
+            max(-90.0, float(swlat)),
+            max(-180.0, float(swlng)),
+            min(90.0, float(nelat)),
+            min(180.0, float(nelng)),
+        )
+        self._my_observations_seq += 1
+        seq = self._my_observations_seq
+        self._my_observations_busy = True
+        self._my_observations_status = "Asking iNaturalist…"
+        self.myObservationsChanged.emit()
+
+        def work():
+            client = INatClient(token, self._http)
+            try:
+                try:
+                    rows, total = client.observations_in_box(
+                        login, *box, per_page=MAP_OBSERVATIONS_PER_FETCH
+                    )
+                except ApiError as exc:
+                    if exc.status != 401:
+                        raise
+                    # The token ran out (24 h); the public record still answers.
+                    rows, total = client.observations_in_box(
+                        login,
+                        *box,
+                        per_page=MAP_OBSERVATIONS_PER_FETCH,
+                        authenticated=False,
+                    )
+                self._myObservationsDone.emit(seq, rows, total, "")
+            except ApiError as exc:
+                self._myObservationsDone.emit(seq, [], 0, describe_inat_error(exc, token))
+            except Exception as exc:  # network
+                self._myObservationsDone.emit(
+                    seq, [], 0, f"Could not reach iNaturalist: {exc}"
+                )
+
+        self._executor.submit(work)
+
+    @Slot(int, object, int, str)
+    def _on_my_observations_done(self, seq: int, rows, total: int, error: str) -> None:
+        if seq != self._my_observations_seq:
+            return
+        self._my_observations_busy = False
+        if error:
+            self._my_observations_status = error
+        else:
+            added = 0
+            for row in rows:
+                if row.id not in self._my_observations:
+                    added += 1
+                self._my_observations[row.id] = row
+            if not rows:
+                text = "You have no iNaturalist observations in this view."
+            elif total > len(rows):
+                text = (
+                    f"Showing the newest {len(rows)} of your {total} observations "
+                    "here; zoom in and press again for the rest."
+                )
+            else:
+                text = f"{len(rows)} of your observations here ({added} new)."
+            self._my_observations_status = text
+            self._prefetch_marker_thumbs()
+        self.myObservationsChanged.emit()
+
+    @Slot()
+    def clearMyObservations(self) -> None:  # noqa: N802
+        self._my_observations_seq += 1
+        self._my_observations_busy = False
+        self._my_observations = {}
+        self._my_observations_status = ""
+        self._thumb_pending = set()
+        self._thumb_refresh.stop()
+        with self._thumb_lock:
+            self._thumb_cache.clear()
+        self.myObservationsChanged.emit()
+
+    def _download_thumb(self, observation, size: str) -> Optional[bytes]:
+        try:
+            return self._http.get_bytes(
+                observation.photo(size), timeout=MAP_THUMB_TIMEOUT_S
+            )
+        except Exception as exc:
+            log.debug("Observation photo %s failed: %s", observation.id, exc)
+            return None
+
+    def _remember_thumb(self, key: tuple[int, str], data: bytes) -> None:
+        with self._thumb_lock:
+            while len(self._thumb_cache) >= MAP_THUMB_CACHE_ENTRIES:
+                self._thumb_cache.pop(next(iter(self._thumb_cache)))
+            self._thumb_cache[key] = data
+
+    def _prefetch_marker_thumbs(self) -> None:
+        """Download the marker image of every observation that lacks one."""
+        seq = self._my_observations_seq
+        with self._thumb_lock:
+            have = {key[0] for key in self._thumb_cache if key[1] == "square"}
+        for observation in list(self._my_observations.values()):
+            oid = observation.id
+            if not observation.photo_url or oid in have or oid in self._thumb_pending:
+                continue
+            self._thumb_pending.add(oid)
+
+            def work(observation=observation) -> None:
+                data = None
+                if seq == self._my_observations_seq:  # not cleared meanwhile
+                    data = self._download_thumb(observation, "square")
+                if data and seq == self._my_observations_seq:
+                    self._remember_thumb((observation.id, "square"), data)
+                self._thumbFetched.emit(seq, observation.id)
+
+            try:
+                self._thumb_executor.submit(work)
+            except RuntimeError:  # shut down
+                return
+
+    @Slot(int, int)
+    def _on_thumb_fetched(self, seq: int, obs_id: int) -> None:
+        if seq != self._my_observations_seq:
+            return
+        self._thumb_pending.discard(obs_id)
+        if not self._thumb_refresh.isActive():
+            self._thumb_refresh.start()
+
+    def observation_thumb(
+        self, obs_id: int, size: str, index: int = 0
+    ) -> Optional[bytes]:
+        """A photo of one of the fetched observations; runs on image threads.
+
+        Marker images ("square") come from the cache only (downloaded by
+        ``_prefetch_marker_thumbs``); the one large preview ("small") of the
+        marker under the pointer is downloaded here, as are the photos of an
+        existing observation a card adds to (``index`` > 0 for the others).
+        """
+        if size not in ("square", "small"):
+            return None
+        key = (obs_id, size if index == 0 else f"{size}:{index}")
+        with self._thumb_lock:
+            cached = self._thumb_cache.get(key)
+        if cached is not None or size == "square":
+            return cached
+        observation = (
+            self._my_observations.get(obs_id)
+            if index == 0
+            else None
+        ) or self._existing_observation(obs_id)
+        if observation is None or not observation.photo_url:
+            return None
+        if index == 0:
+            data = self._download_thumb(observation, size)
+        else:
+            url = observation.photo(size, index)
+            try:
+                data = self._http.get_bytes(url, timeout=MAP_THUMB_TIMEOUT_S) if url else None
+            except Exception as exc:
+                log.debug("Observation %s photo %s failed: %s", obs_id, index, exc)
+                data = None
+        if data:
+            self._remember_thumb(key, data)
+        return data
+
+    def _existing_observation(self, obs_id: int) -> Optional[ExistingObservation]:
+        """A fetched observation, or the one a card adds to (kept after a
+        fresh fetch no longer lists it). Safe from image threads."""
+        found = self._existing_by_id.get(obs_id)
+        if found is not None:
+            return found
+        for card in list(self._model.cards):
+            if card.attach_to is not None and card.attach_to.id == obs_id:
+                return card.attach_to
+        return None
 
     @Slot(int, float, float, int)
     def setLocation(  # noqa: N802
@@ -1244,7 +1859,7 @@ class INatUploadController(QObject):
         card = self._card(card_id)
         if card is None:
             return
-        name = name.strip()
+        name = inat_taxon_name(name)
         if name == card.chosen_name and card.taxon is not None:
             return
         card.chosen_name = name
@@ -1361,6 +1976,552 @@ class INatUploadController(QObject):
             self._model.refresh(card, "taxonLabel")
 
     # ------------------------------------------------------------------
+    # Observations already on iNaturalist (phone observations, earlier
+    # uploads of the same find) and the camera clock offset
+
+    def _reset_existing(self) -> None:
+        """A new batch: forget the last one's observations and decisions,
+        and start each camera from the offset saved nearest its dates."""
+        self._existing_seq += 1
+        self._existing = []
+        self._existing_by_id = {}
+        self._existing_busy = False
+        self._existing_fetched = False
+        self._existing_status = ""
+        self._clock_decisions = {}
+        self._clock_version += 1
+        self._dismissed = {}
+        self._dismiss_version += 1
+        self._match_signature = None
+        days: dict[str, list] = {}
+        for p in self._photos:
+            if p.taken is not None and p.taken_from_exif:
+                days.setdefault(p.camera, []).append(p.taken.date())
+        self._camera_days = {
+            camera: statistics.median_low(dates) for camera, dates in days.items()
+        }
+        self._clock_saved = {}
+        for camera, day in self._camera_days.items():
+            record = self._offset_store.lookup(camera, day)
+            if record is not None:
+                self._clock_saved[camera] = OffsetGuess(
+                    offset_s=record.offset_s,
+                    source="saved",
+                    from_obs=[record.obs_id] if record.obs_id else [],
+                    saved_on=record.on,
+                )
+        self._clock = dict(self._clock_saved)
+        self.existingChanged.emit()
+
+    def _check_existing_if_due(self) -> None:
+        if self._photos and not self._existing_fetched and not self._existing_busy:
+            self.checkExisting()
+
+    @Slot()
+    def checkExisting(self) -> None:  # noqa: N802
+        """Fetch the user's observations on the batch's dates, then match."""
+        if self._existing_busy:
+            return
+        window = fetch_window(self._photos)
+        login = self._inat_login
+        if window is None:
+            self._existing_status = (
+                "No EXIF capture times: not checking for observations "
+                "already on iNaturalist."
+            )
+            self.existingChanged.emit()
+            return
+        if not login:
+            self._existing_status = (
+                "Add your iNaturalist token in Settings to check for "
+                "observations you already made of these finds."
+            )
+            self.existingChanged.emit()
+            return
+        token = self._credentials.get(INAT_TOKEN) or ""
+        self._existing_seq += 1
+        seq = self._existing_seq
+        self._existing_busy = True
+        self._existing_status = (
+            "Checking iNaturalist for observations you made on these dates…"
+        )
+        self.existingChanged.emit()
+        first, last = window
+
+        def work():
+            client = INatClient(token, self._http)
+            try:
+                try:
+                    rows = client.observations_between(login, first, last)
+                except ApiError as exc:
+                    if exc.status != 401:
+                        raise
+                    # The token ran out (24 h); the public record still
+                    # answers, without the true spot of obscured ones.
+                    rows = client.observations_between(
+                        login, first, last, authenticated=False
+                    )
+                self._existingDone.emit(seq, rows, "")
+            except ApiError as exc:
+                self._existingDone.emit(seq, [], describe_inat_error(exc, token))
+            except Exception as exc:  # network
+                self._existingDone.emit(seq, [], f"Could not reach iNaturalist: {exc}")
+
+        self._executor.submit(work)
+
+    @Slot(int, object, str)
+    def _on_existing_done(self, seq: int, rows, error: str) -> None:
+        if seq != self._existing_seq:
+            return
+        self._existing_busy = False
+        if error:
+            self._existing_status = f"Could not check for existing observations: {error}"
+            self.existingChanged.emit()
+            return
+        self._existing_fetched = True
+        self._existing = list(rows)
+        self._existing_by_id = {o.id: o for o in self._existing}
+        self._match_signature = None
+        self._rematch()
+
+    def _card_facts(self, card: Card) -> CardFacts:
+        loc = card.location(float(self.spreadWarningMeters))
+        return CardFacts(
+            key=card.id,
+            photos=card.group.photos,
+            lat=loc.lat if loc else None,
+            lon=loc.lon if loc else None,
+            spread_m=loc.spread_m if loc else 0.0,
+        )
+
+    def _rematch(self) -> None:
+        """Work out the clock offsets and each card's possible matches.
+
+        Runs after every change to the cards (coalesced by a timer), but
+        only does the work when a photo set, a location, the observations
+        or a clock decision changed.
+        """
+        cards = list(self._model.cards)
+        facts = {c.id: self._card_facts(c) for c in cards}
+        signature = (
+            self._existing_seq,
+            self._clock_version,
+            self._dismiss_version,
+            tuple(
+                (c.id, self._photo_set(c), facts[c.id].lat, facts[c.id].lon, c.locked)
+                for c in cards
+            ),
+        )
+        if signature == self._match_signature:
+            return
+        self._match_signature = signature
+        before = {
+            c.id: (self.card_value(c, "existingMatches"), self.card_value(c, "dateText"))
+            for c in cards
+        }
+        priors = dict(self._clock_saved)
+        priors.update(self._clock_decisions)
+        dismissed = {c.id: self._dismissed_for(c) for c in cards}
+        if self._existing:
+            self._clock = detect_offsets(
+                list(facts.values()),
+                self._existing,
+                priors,
+                skip_pairs={(cid, oid) for cid, ids in dismissed.items() for oid in ids},
+            )
+        else:
+            self._clock = priors
+        offsets = {camera: g.offset_s for camera, g in self._clock.items()}
+        exclude = {c.obs_id for c in cards if c.obs_id}
+        for c in cards:
+            if c.locked or not self._existing:
+                c.matches = []
+            else:
+                c.matches = match_card(
+                    facts[c.id], self._existing, offsets, exclude | dismissed[c.id]
+                )
+        for c in cards:
+            after = (self.card_value(c, "existingMatches"), self.card_value(c, "dateText"))
+            if after != before[c.id]:
+                self._model.refresh(c, "existingMatches", "dateText")
+        if self._existing_fetched:
+            window = fetch_window(self._photos)
+            span = (
+                f" from {window[0]:%b %d} to {window[1]:%b %d}" if window else ""
+            )
+            waiting = sum(
+                1 for c in cards if c.matches and c.attach_to is None and not c.locked
+            )
+            adding = sum(1 for c in cards if c.attach_to is not None)
+            parts = []
+            if waiting:
+                parts.append(
+                    f"{waiting} card{'' if waiting == 1 else 's'} may already be "
+                    "on iNaturalist (see the blue boxes)"
+                )
+            if adding:
+                parts.append(
+                    f"{adding} card{'' if adding == 1 else 's'} "
+                    f"add{'s' if adding == 1 else ''} photos to one of them"
+                )
+            self._existing_status = (
+                f"{len(self._existing)} of your iNaturalist observations{span}; "
+                + ("; ".join(parts) if parts else "none of the cards look like one of them")
+                + "."
+            )
+        self.existingChanged.emit()
+
+    def _card_offset(self, card: Card) -> int:
+        camera = self._card_facts(card).main_camera()
+        guess = self._clock.get(camera) if camera is not None else None
+        return guess.offset_s if guess is not None else 0
+
+    def _obs_dict(self, obs: ExistingObservation) -> dict[str, Any]:
+        if obs.wall_time is not None:
+            when = obs.wall_time.strftime("%Y-%m-%d %H:%M")
+        elif obs.observed_on is not None:
+            when = obs.observed_on.isoformat()
+        else:
+            when = "no date"
+        return {
+            "obsId": obs.id,
+            "url": OBSERVATION_URL.format(id=obs.id),
+            "name": obs.name or "Unknown",
+            "photoCount": obs.photo_count,
+            "thumb": f"image://inatobs/{obs.id}/small" if obs.photo_url else "",
+            "when": when,
+            "detail": "",
+        }
+
+    def _match_dict(self, card: Card, match: Match) -> dict[str, Any]:
+        out = self._obs_dict(match.obs)
+        bits = []
+        if match.time_gap_s is None:
+            bits.append("same day (it has no time of day)")
+        elif match.time_gap_s < 60:
+            bits.append("taken while these photos were")
+        else:
+            bits.append(f"{round(match.time_gap_s / 60)} min from these photos")
+        if match.camera_clock:
+            bits.append("by this camera's own clock")
+        else:
+            offset = self._card_offset(card)
+            if offset:
+                bits.append(f"with the camera clock {describe_offset(offset)}")
+        if match.distance_m is None:
+            bits.append("no GPS to compare")
+        elif match.distance_m < 1000:
+            bits.append(f"{round(match.distance_m)} m away")
+        else:
+            bits.append(f"{match.distance_m / 1000:.1f} km away")
+        out["detail"] = ", ".join(bits)
+        return out
+
+    def _local_time(self, p: PhotoRecord) -> Optional[datetime]:
+        """``p``'s capture time corrected by a confirmed camera clock offset."""
+        if p.taken is None:
+            return None
+        guess = self._clock.get(p.camera)
+        if p.taken_from_exif and guess is not None and guess.corrects_times:
+            return p.taken + timedelta(seconds=guess.offset_s)
+        return p.taken
+
+    def _observed_at(
+        self, card: Card, exif_only: bool
+    ) -> tuple[Optional[datetime], Optional[datetime]]:
+        """(earliest local time of the card's photos, that photo's own time)."""
+        best: Optional[tuple[datetime, datetime]] = None
+        for p in card.group.photos:
+            if p.taken is None or (exif_only and not p.taken_from_exif):
+                continue
+            local = self._local_time(p)
+            if best is None or local < best[0]:
+                best = (local, p.taken)
+        return best if best is not None else (None, None)
+
+    def _dismissed_for(self, card: Card) -> set[int]:
+        keys = self._photo_set(card)
+        return {oid for oid, held in self._dismissed.items() if held & keys}
+
+    @Slot(int, int)
+    def dismissMatch(self, card_id: int, obs_id: int) -> None:  # noqa: N802
+        """"Not this one": stop offering ``obs_id`` for this card's photos.
+
+        The pair also stops counting as evidence for a camera clock offset.
+        """
+        card = self._card(card_id)
+        if card is None:
+            return
+        self._dismissed.setdefault(int(obs_id), set()).update(self._photo_set(card))
+        self._dismiss_version += 1
+        self._rematch()
+
+    @Slot(int)
+    def dismissAllMatches(self, card_id: int) -> None:  # noqa: N802
+        """Close the card's box: none of the offered observations is it."""
+        card = self._card(card_id)
+        if card is None or not card.matches:
+            return
+        keys = self._photo_set(card)
+        for match in card.matches:
+            self._dismissed.setdefault(match.obs.id, set()).update(keys)
+        self._dismiss_version += 1
+        self._rematch()
+
+    @Property(int, notify=existingChanged)
+    def dismissedCount(self) -> int:  # noqa: N802
+        return len(self._dismissed)
+
+    @Slot()
+    def restoreDismissed(self) -> None:  # noqa: N802
+        """Offer every dismissed match again."""
+        if not self._dismissed:
+            return
+        self._dismissed = {}
+        self._dismiss_version += 1
+        self._rematch()
+
+    def _combined_order(self, card: Card) -> list[str]:
+        """The observation's photos ("inat:<index>") and the card's (photo
+        keys), in the order they will be on iNaturalist.
+
+        The card's photos keep the places the user dragged them to among
+        the observation's; which of them sits in each place follows the
+        card's own order, so reordering either view agrees with the other.
+        Photos that joined the card since go last.
+        """
+        obs = card.attach_to
+        if obs is None:
+            return []
+        existing = [f"inat:{i}" for i in range(len(obs.photos))]
+        local = [p.key for p in card.group.sorted_photos()]
+        if card.merged_order is None:
+            return existing + local
+        known = set(existing)
+        present = set(local)
+        slots = [t for t in card.merged_order if t in known or t in present]
+        out: list[str] = []
+        taken = 0
+        for token in slots:
+            if token in known:
+                out.append(token)
+            else:
+                out.append(local[taken])
+                taken += 1
+        out.extend(local[taken:])
+        missing = [t for t in existing if t not in out]
+        return missing + out
+
+    def _order_dicts(self, card: Card) -> list[dict[str, Any]]:
+        obs = card.attach_to
+        by_key = {p.key: p for p in card.group.photos}
+        out = []
+        for token in self._combined_order(card):
+            if token.startswith("inat:"):
+                index = int(token[5:])
+                photo = obs.photos[index] if index < len(obs.photos) else None
+                out.append(
+                    {
+                        "token": token,
+                        "isNew": False,
+                        "thumb": (
+                            f"image://inatobs/{obs.id}/small/{index}"
+                            if photo is not None and photo.url
+                            else ""
+                        ),
+                    }
+                )
+            else:
+                p = by_key.get(token)
+                if p is None:
+                    continue
+                out.append(
+                    {
+                        "token": token,
+                        "isNew": True,
+                        "thumb": f"image://inatphoto/{self._batch_generation}/{p.order}?w=360",
+                    }
+                )
+        return out
+
+    @Slot(int, int, int)
+    def moveInObservation(  # noqa: N802
+        self, card_id: int, from_index: int, to_index: int
+    ) -> None:
+        """Drag in the "order on iNaturalist" strip: the item at
+        ``from_index`` goes before the one now at ``to_index`` (the length
+        of the list = last)."""
+        card = self._card(card_id)
+        if card is None or card.locked or card.attach_to is None:
+            return
+        order = self._combined_order(card)
+        if not (0 <= from_index < len(order)):
+            return
+        to_index = max(0, min(len(order), to_index))
+        token = order.pop(from_index)
+        if to_index > from_index:
+            to_index -= 1
+        order.insert(to_index, token)
+        card.merged_order = order
+        # The card's own photos follow the same order.
+        local = [t for t in order if not t.startswith("inat:")]
+        if local != [p.key for p in card.group.sorted_photos()]:
+            by_key = {p.key: p for p in card.group.photos}
+            card.group.photos = [by_key[k] for k in local if k in by_key]
+            card.group.ordered = True
+            self._model.refresh(card, "photos", "attachedObs")
+        else:
+            self._model.refresh(card, "attachedObs")
+
+    @Property(str, notify=existingChanged)
+    def existingStatus(self) -> str:  # noqa: N802
+        return self._existing_status
+
+    @Property(bool, notify=existingChanged)
+    def existingBusy(self) -> bool:  # noqa: N802
+        return self._existing_busy
+
+    @Property(list, notify=existingChanged)
+    def clockNotes(self) -> list:  # noqa: N802
+        """One line per camera whose clock looks off, for the dialog banner."""
+        out = []
+        for camera, guess in sorted(self._clock.items()):
+            if guess.offset_s == 0 or guess.source not in (
+                "detected",
+                "saved",
+                "confirmed",
+            ):
+                continue
+            label = camera.split(" #")[0] or "camera"
+            how = describe_offset(guess.offset_s)
+            source = ""
+            if guess.from_obs:
+                source = f"observation {guess.from_obs[0]}"
+            if guess.source == "detected":
+                count = guess.support
+                cards_text = "1 card lines up" if count == 1 else f"{count} cards line up"
+                text = (
+                    f"{label} clock looks {how}: {cards_text} with your "
+                    "observations at that offset. Matching uses it; upload "
+                    "times change only if you use it."
+                )
+            else:
+                when = (
+                    f"confirmed {guess.saved_on:%b %d}"
+                    if guess.source == "saved" and guess.saved_on
+                    else "confirmed"
+                )
+                text = (
+                    f"{label} clock is {how} ({when}"
+                    + (f" from {source}" if source else "")
+                    + "). New observations get the corrected time."
+                )
+            out.append({"camera": camera, "source": guess.source, "text": text})
+        return out
+
+    def _decide_clock(self, camera: str, guess: OffsetGuess, save: bool) -> None:
+        self._clock_decisions[camera] = guess
+        if save:
+            day = self._camera_days.get(camera)
+            if day is not None:
+                obs_id = guess.from_obs[0] if guess.from_obs else None
+                self._offset_store.record(camera, guess.offset_s, day, obs_id)
+        self._clock_version += 1
+        self._rematch()  # refreshes every card whose date or matches moved
+
+    @Slot(str)
+    def useClockOffset(self, camera: str) -> None:  # noqa: N802
+        """Trust a detected offset: correct upload times, remember it."""
+        guess = self._clock.get(camera)
+        if guess is None or guess.offset_s == 0:
+            return
+        self._decide_clock(
+            camera,
+            OffsetGuess(
+                offset_s=guess.offset_s,
+                source="confirmed",
+                support=guess.support,
+                from_obs=list(guess.from_obs),
+                saved_on=self._camera_days.get(camera),
+            ),
+            save=True,
+        )
+        self._set_status(
+            f"Camera clock: {describe_offset(guess.offset_s)}. "
+            "New observations get the corrected time."
+        )
+
+    @Slot(str)
+    def ignoreClockOffset(self, camera: str) -> None:  # noqa: N802
+        """A detected offset is wrong: match on the camera's own clock."""
+        self._decide_clock(camera, OffsetGuess(0, "ignored"), save=False)
+
+    @Slot(str)
+    def clockWasRight(self, camera: str) -> None:  # noqa: N802
+        """A saved or confirmed offset does not hold for these photos."""
+        self._decide_clock(camera, OffsetGuess(0, "confirmed"), save=True)
+        self._set_status("Camera clock taken as right for these dates.")
+
+    @Slot(int, int)
+    def attachToExisting(self, card_id: int, obs_id: int) -> None:  # noqa: N802
+        """Upload adds this card's photos to observation ``obs_id``.
+
+        The observation's time is local time from a phone (or wherever it
+        was made), so the gap to the camera's photos is the camera clock
+        offset: it is confirmed for this camera and remembered, unless the
+        match was on the camera's own clock.
+        """
+        card = self._card(card_id)
+        if card is None or card.locked:
+            return
+        match = next((m for m in card.matches if m.obs.id == obs_id), None)
+        obs = match.obs if match is not None else self._existing_by_id.get(obs_id)
+        if obs is None:
+            return
+        card.attach_to = obs
+        card.merged_order = None
+        note = ""
+        facts = self._card_facts(card)
+        camera = facts.main_camera()
+        if camera is not None and not (match is not None and match.camera_clock):
+            held = self._clock.get(camera)
+            current = held.offset_s if held is not None else 0
+            offset = offset_for_pair(facts, obs, camera, current)
+            if offset is not None and not (
+                held is not None
+                and held.source == "confirmed"
+                and held.offset_s == offset
+            ):
+                span = facts.span(camera=camera)
+                self._clock_decisions[camera] = OffsetGuess(
+                    offset_s=offset,
+                    source="confirmed",
+                    from_obs=[obs.id],
+                    saved_on=span[0].date() if span else None,
+                )
+                if span is not None:
+                    self._offset_store.record(camera, offset, span[0].date(), obs.id)
+                self._clock_version += 1
+                if offset:
+                    note = f" Camera clock: {describe_offset(offset)}."
+        self._model.refresh(card, "attachedObs", "existingMatches")
+        self._set_status(
+            f"Upload will add these photos to observation {obs.id} "
+            f"({obs.name or 'unnamed'}) instead of making a new one.{note}"
+        )
+        self.cardsChanged.emit()  # reruns matching with the confirmed offset
+
+    @Slot(int)
+    def detachFromExisting(self, card_id: int) -> None:  # noqa: N802
+        card = self._card(card_id)
+        if card is None or card.locked or card.attach_to is None:
+            return
+        card.attach_to = None
+        self._model.refresh(card, "attachedObs", "existingMatches")
+        self._set_status("These photos will be a new observation again.")
+        self.cardsChanged.emit()
+
+    # ------------------------------------------------------------------
     # Identification
 
     @Slot()
@@ -1377,6 +2538,7 @@ class INatUploadController(QObject):
                 and card.status in (STATUS_PENDING, STATUS_ERROR)
                 and not card.identify_pending
                 and not card.locked
+                and card.attach_to is None  # identified on iNaturalist already
             ):
                 self.identifyCard(card.id)
 
@@ -1423,7 +2585,7 @@ class INatUploadController(QObject):
         token = card.token
         photos = card.group.sorted_photos()
         loc = card.location(float(self.spreadWarningMeters))
-        observed = card.group.observed_at_exif
+        observed, _ = self._observed_at(card, exif_only=True)
         cancel = self._cancel_identify
         self._begin_job()
 
@@ -1548,6 +2710,18 @@ class INatUploadController(QObject):
         if not token:
             self.showMessage.emit("Add an iNaturalist API token in settings first.")
             return
+        if self._token_seconds_left() == 0:
+            # Expired by its own clock: every card would fail on it. Say so
+            # now; saving a fresh token then starts the upload by itself.
+            message = (
+                f"{TOKEN_REJECTED}: {describe_token(token)}. "
+                "Get a fresh one and paste it in Settings."
+            )
+            self._verify_error = message
+            self._token_failed_run = True
+            self.settingsChanged.emit()
+            self.tokenRejected.emit(message)
+            return
         queue = [
             c
             for c in self._model.cards
@@ -1559,6 +2733,9 @@ class INatUploadController(QObject):
         warn = float(self.spreadWarningMeters)
         jobs = []
         positions: dict[str, int] = {}  # photo key -> place in its card
+        # Existing observation id -> where the next card's photos go in it,
+        # after the photos it already has (two cards may add to one).
+        attach_next: dict[int, int] = {}
         for card in queue:
             card.status = STATUS_UPLOADING
             card.status_text = "Queued for upload"
@@ -1568,8 +2745,9 @@ class INatUploadController(QObject):
             )
             loc = card.location(warn)
             # Only a capture time from EXIF goes to iNaturalist; a file's
-            # modification time (the grouping fallback) is not when it was found.
-            observed = card.group.observed_at_exif
+            # modification time (the grouping fallback) is not when it was
+            # found. A confirmed camera clock offset is applied.
+            observed, _ = self._observed_at(card, exif_only=True)
             draft = ObservationDraft(
                 observed_on_string=(
                     observed.strftime("%Y-%m-%d %H:%M:%S") if observed else None
@@ -1586,7 +2764,34 @@ class INatUploadController(QObject):
             # only some of its photos) resumes: no second observation, only
             # the photos still missing go up.
             card_photos = card.group.sorted_photos()
-            positions.update({p.key: i for i, p in enumerate(card_photos)})
+            target = card.obs_id
+            reposition: list[tuple[int, int]] = []
+            if card.attach_to is not None and target in (None, card.attach_to.id):
+                # Photos for an observation that is already on iNaturalist
+                # (a phone observation, an earlier upload): no new one.
+                target = card.attach_to.id
+                if target in attach_next:
+                    # A second card adding to it: after the first card's.
+                    base = attach_next[target]
+                    positions.update(
+                        {p.key: base + i for i, p in enumerate(card_photos)}
+                    )
+                    attach_next[target] = base + len(card_photos)
+                else:
+                    # Every photo goes to its place in the order shown;
+                    # the observation's own photos move only if theirs
+                    # changed (or never had one).
+                    order = self._combined_order(card)
+                    for index, entry in enumerate(order):
+                        if entry.startswith("inat:"):
+                            photo = card.attach_to.photos[int(entry[5:])]
+                            if photo.op_id and photo.position != index:
+                                reposition.append((photo.op_id, index))
+                        else:
+                            positions[entry] = index
+                    attach_next[target] = len(order)
+            else:
+                positions.update({p.key: i for i, p in enumerate(card_photos)})
             pending_photos = [p for p in card_photos if p.key not in card.photo_ids]
             jobs.append(
                 (
@@ -1597,7 +2802,8 @@ class INatUploadController(QObject):
                     card.chosen_name,
                     card.chosen_rank,
                     card.taxon,
-                    card.obs_id,
+                    target,
+                    reposition,
                 )
             )
         self._upload_done = 0
@@ -1605,19 +2811,35 @@ class INatUploadController(QObject):
         self._upload_results = []
         self.uploadProgressChanged.emit()
         self._cancel_upload.clear()
+        self._token_failed_run = False
         self._upload_active = True
         self._begin_job()
         self.busyChanged.emit()  # `uploading` changed even if a job was running
         self.cardsChanged.emit()
         self._record_grouping()
 
+        # The worker reads this name when it runs, not now: bind the token
+        # under a name nothing else in this method assigns. (A loop above
+        # once reused ``token`` and every upload sent a photo path instead.)
+        api_token = token
+
         def work():
-            client = INatClient(token, self._http)
-            for card_id, tok, draft, photos, name, rank, taxon, obs_id in jobs:
+            client = INatClient(api_token, self._http)
+            for (
+                card_id,
+                tok,
+                draft,
+                photos,
+                name,
+                rank,
+                taxon,
+                obs_id,
+                reposition,
+            ) in jobs:
                 attached: list[tuple[str, int]] = []
                 if self._cancel_upload.is_set():
                     self._uploadCardDone.emit(
-                        card_id, tok, obs_id, attached, "Cancelled"
+                        card_id, tok, obs_id, attached, "Cancelled", ""
                     )
                     continue
                 try:
@@ -1641,13 +2863,13 @@ class INatUploadController(QObject):
                         obs_id = client.create_observation(draft)
                 except ApiError as exc:
                     self._uploadCardDone.emit(
-                        card_id, tok, None, attached, describe_inat_error(exc)
+                        card_id, tok, None, attached, describe_inat_error(exc, api_token), ""
                     )
                     continue
                 except Exception as exc:
                     log.exception("Observation create failed")
                     self._uploadCardDone.emit(
-                        card_id, tok, None, attached, f"Upload failed: {exc}"
+                        card_id, tok, None, attached, f"Upload failed: {exc}", ""
                     )
                     continue
                 # The observation exists from here on: whatever happens to the
@@ -1666,11 +2888,27 @@ class INatUploadController(QObject):
                         attached.append((p.key, int(photo_id or 0)))
                     except ApiError as exc:
                         log.warning("Photo upload failed %s: %s", p.path, exc)
-                        error = describe_inat_error(exc)
+                        error = describe_inat_error(exc, api_token)
                     except Exception as exc:
                         log.exception("Photo upload failed %s", p.path)
                         error = f"Photo upload failed: {exc}"
-                self._uploadCardDone.emit(card_id, tok, obs_id, attached, error)
+                # Photos already on the observation that the new ones now
+                # sit among move to their places, once the new ones are in.
+                order_error = ""
+                for op_id, position in reposition:
+                    if self._cancel_upload.is_set():
+                        break
+                    try:
+                        client.set_photo_position(op_id, position)
+                    except ApiError as exc:
+                        log.warning("Reordering photo %s failed: %s", op_id, exc)
+                        order_error = describe_inat_error(exc, api_token)
+                    except Exception as exc:
+                        log.exception("Reordering photo %s failed", op_id)
+                        order_error = str(exc)
+                self._uploadCardDone.emit(
+                    card_id, tok, obs_id, attached, error, order_error
+                )
             self._uploadRunFinished.emit()
 
         self._executor.submit(work)
@@ -1699,9 +2937,15 @@ class INatUploadController(QObject):
     def cancelUpload(self) -> None:  # noqa: N802
         self._cancel_upload.set()
 
-    @Slot(int, int, object, object, str)
+    @Slot(int, int, object, object, str, str)
     def _on_upload_card_done(
-        self, card_id: int, token: int, obs_id, attached, error: str
+        self,
+        card_id: int,
+        token: int,
+        obs_id,
+        attached,
+        error: str,
+        order_error: str = "",
     ) -> None:
         self._upload_done += 1
         card = self._card(card_id)
@@ -1718,7 +2962,16 @@ class INatUploadController(QObject):
         missing = [p for p in card.group.photos if p.key not in done_keys]
         if obs_id and not missing:
             card.status = STATUS_UPLOADED
-            card.status_text = "Uploaded"
+            card.status_text = (
+                "Photos added to your existing observation"
+                if card.attach_to is not None and card.obs_id == card.attach_to.id
+                else "Uploaded"
+            )
+            if order_error:
+                card.status_text += (
+                    f", but its photos could not all be put in the order shown "
+                    f"({order_error}); drag them on iNaturalist"
+                )
             card.upload_error = ""
             self._uploaded_paths.extend(attached_paths)
         else:
@@ -1750,9 +3003,18 @@ class INatUploadController(QObject):
         failed = sum(
             1 for c in self._model.cards if c.status == STATUS_ERROR and c.upload_error
         )
+        self._token_failed_run = any(
+            c.status == STATUS_ERROR and TOKEN_REJECTED in c.upload_error
+            for c in self._model.cards
+        )
         if failed:
             self._set_status(
-                f"{uploaded} uploaded, {failed} failed. Fix and retry the failed cards."
+                f"{uploaded} uploaded, {failed} failed. "
+                + (
+                    "Save a fresh token in Settings and the upload continues."
+                    if self._token_failed_run
+                    else "Fix and retry the failed cards."
+                )
             )
             self.uploadFailed.emit(
                 uploaded,

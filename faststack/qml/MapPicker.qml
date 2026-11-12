@@ -5,6 +5,9 @@ import QtQuick.Controls 2.15
 // A small slippy map drawn from cached OpenStreetMap tiles
 // (image://osmtile/z/x/y, served by faststack.inat.providers).
 // Drag to pan, wheel or +/- to zoom, click to place the marker.
+// photoMarkers puts small photos on the map (other observations): hovering
+// one shows it larger with its label, a right-click asks to copy its position.
+// The right button drags the map too.
 Item {
     id: map
     clip: true
@@ -19,7 +22,18 @@ Item {
     property real accuracyMeters: 0
     property color textColor: "white"
 
+    // Photos pinned to the map: [{ lat, lon, source, preview, label, kind }].
+    // kind "inat" (already on iNaturalist) gets a green frame, anything else
+    // the accent colour.
+    property var photoMarkers: []
+    property int markerSize: 64
+    property int hoveredMarker: -1
+    readonly property var hoveredPhoto: hoveredMarker >= 0 && hoveredMarker < photoMarkers.length
+                                        ? photoMarkers[hoveredMarker] : null
+    onPhotoMarkersChanged: hoveredMarker = -1
+
     signal picked(real lat, real lon)
+    signal markerCopyRequested(var marker)
 
     readonly property int tileSize: 256
     readonly property int minZoom: 2
@@ -42,6 +56,24 @@ Item {
     function pixelY(lat) { return (latToY(lat, zoom) - latToY(centerLat, zoom)) * tileSize + height / 2 }
     function lonAt(px) { return xToLon(lonToX(centerLon, zoom) + (px - width / 2) / tileSize, zoom) }
     function latAt(py) { return yToLat(latToY(centerLat, zoom) + (py - height / 2) / tileSize, zoom) }
+
+    // The area on screen, for asking what else is in it.
+    function viewBounds() {
+        return {
+            swlat: Math.max(-90, latAt(height)), swlng: Math.max(-180, lonAt(0)),
+            nelat: Math.min(90, latAt(0)), nelng: Math.min(180, lonAt(width))
+        }
+    }
+    // The photo marker drawn at this pixel (the topmost one), or -1.
+    function markerAt(px, py) {
+        var half = markerSize / 2
+        for (var i = photoMarkers.length - 1; i >= 0; i--) {
+            var dx = px - pixelX(photoMarkers[i].lon)
+            var dy = py - pixelY(photoMarkers[i].lat)
+            if (Math.abs(dx) <= half && dy <= 4 && dy >= -(markerSize + 8)) return i
+        }
+        return -1
+    }
 
     function centerOn(lat, lon, z) {
         centerLat = lat
@@ -162,6 +194,42 @@ Item {
         }
     }
 
+    // Photo markers: a thumbnail on a short stem that ends at the spot.
+    Repeater {
+        model: map.photoMarkers
+        delegate: Item {
+            id: pin
+            required property var modelData
+            required property int index
+            readonly property bool hovered: map.hoveredMarker === index
+            readonly property color frameColor: hovered ? "white" : (modelData.kind === "inat" ? "#74ac00" : "#6366f1")
+            x: map.pixelX(modelData.lon)
+            y: map.pixelY(modelData.lat)
+            z: hovered ? 4 : 3
+            Rectangle { x: -1; y: -8; width: 2; height: 8; color: pin.frameColor }
+            Rectangle { x: -3; y: -3; width: 6; height: 6; radius: 3; color: pin.frameColor; border.color: "black"; border.width: 1 }
+            Rectangle {
+                x: -map.markerSize / 2
+                y: -map.markerSize - 8
+                width: map.markerSize; height: map.markerSize
+                radius: 4
+                color: "#333333"
+                border.color: pin.frameColor
+                border.width: 2
+                Image {
+                    anchors.fill: parent
+                    anchors.margins: 2
+                    source: pin.modelData.source
+                    fillMode: Image.PreserveAspectCrop
+                    clip: true
+                    asynchronous: true
+                    sourceSize.width: 128
+                    sourceSize.height: 128
+                }
+            }
+        }
+    }
+
     // Marker
     Item {
         visible: map.hasMarker
@@ -195,8 +263,10 @@ Item {
     MouseArea {
         id: panArea
         anchors.fill: parent
-        acceptedButtons: Qt.LeftButton
+        acceptedButtons: Qt.LeftButton | Qt.RightButton
         hoverEnabled: true
+        property bool rightPress: false
+        onExited: map.hoveredMarker = -1
         property real pressX: 0
         property real pressY: 0
         property real startCx: 0
@@ -205,6 +275,9 @@ Item {
         cursorShape: pressed ? Qt.ClosedHandCursor : Qt.CrossCursor
 
         onPressed: function(mouse) {
+            // Either button drags the map; they differ only in what a
+            // click without a drag does (place the marker / copy a photo's spot).
+            rightPress = mouse.button === Qt.RightButton
             pressX = mouse.x; pressY = mouse.y; moved = false
             startCx = map.lonToX(map.centerLon, map.zoom)
             startCy = map.latToY(map.centerLat, map.zoom)
@@ -218,7 +291,8 @@ Item {
             map.refreshTiles()
         }
         onPositionChanged: function(mouse) {
-            if (!pressed) return
+            if (!pressed) { map.hoveredMarker = map.markerAt(mouse.x, mouse.y); return }
+            map.hoveredMarker = -1
             var dx = mouse.x - pressX
             var dy = mouse.y - pressY
             if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true
@@ -235,6 +309,9 @@ Item {
         onReleased: function(mouse) {
             if (moved) {
                 commitPan(mouse.x - pressX, mouse.y - pressY)
+            } else if (rightPress) {
+                var hit = map.markerAt(mouse.x, mouse.y)
+                if (hit >= 0) map.markerCopyRequested(map.photoMarkers[hit])
             } else {
                 var lat = map.latAt(mouse.y)
                 var lon = map.lonAt(mouse.x)
@@ -242,7 +319,7 @@ Item {
                 map.picked(lat, lon)
             }
         }
-        onDoubleClicked: function(mouse) { map.zoomAt(1, mouse.x, mouse.y) }
+        onDoubleClicked: function(mouse) { if (mouse.button === Qt.LeftButton) map.zoomAt(1, mouse.x, mouse.y) }
         // One zoom level per wheel notch (120 units). A touchpad or a
         // high-resolution wheel sends many small deltas per gesture; zooming
         // a level on each of them would jump from street to continent.
@@ -256,6 +333,51 @@ Item {
                 var step = wheelRemainder > 0 ? 1 : -1
                 wheelRemainder -= step * 120
                 map.zoomAt(step, wheel.x, wheel.y)
+            }
+        }
+    }
+
+    // The photo marker under the mouse, larger, with what it is.
+    Rectangle {
+        id: markerPreview
+        readonly property var marker: map.hoveredPhoto
+        readonly property real pinX: marker ? map.pixelX(marker.lon) : 0
+        readonly property real pinY: marker ? map.pixelY(marker.lat) : 0
+        readonly property real side: map.markerSize / 2 + 10
+        visible: marker !== null
+        z: 7
+        width: 248
+        height: previewColumn.implicitHeight + 12
+        x: pinX + side + width <= map.width ? pinX + side : Math.max(4, pinX - side - width)
+        y: Math.max(4, Math.min(map.height - height - 4, pinY - map.markerSize / 2 - height / 2))
+        radius: 6
+        color: "#f0222222"
+        border.color: "#666666"
+        Column {
+            id: previewColumn
+            x: 6; y: 6
+            width: parent.width - 12
+            spacing: 4
+            Image {
+                width: parent.width
+                height: 177
+                visible: source != ""
+                source: markerPreview.marker && markerPreview.marker.preview ? markerPreview.marker.preview : ""
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+            }
+            Text {
+                width: parent.width
+                text: markerPreview.marker ? markerPreview.marker.label : ""
+                color: "white"; font.pixelSize: 12; font.bold: true
+                wrapMode: Text.Wrap
+            }
+            Text {
+                width: parent.width
+                text: markerPreview.marker
+                      ? markerPreview.marker.lat.toFixed(5) + ", " + markerPreview.marker.lon.toFixed(5) + " · right-click to copy"
+                      : ""
+                color: "#aaaaaa"; font.pixelSize: 11
             }
         }
     }

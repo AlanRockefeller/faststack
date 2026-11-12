@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from faststack.inat.http import ApiError, HttpClient
+from faststack.inat.inat_client import inat_taxon_name
 
 log = logging.getLogger(__name__)
 
@@ -269,7 +270,7 @@ def _candidates(rank: str, rows: Any) -> list[Candidate]:
         out.append(
             Candidate(
                 rank=rank,
-                name=str(row["name"]),
+                name=inat_taxon_name(str(row["name"])),
                 confidence=_float(row.get("confidence")),
                 score=_float(row.get("score")),
                 confident=bool(row.get("confident")),
@@ -300,7 +301,7 @@ def parse_result(data: dict[str, Any]) -> VisionResult:
     per_photo = _per_photo(data.get("per_photo"))
     return VisionResult(
         answer_rank=answer.get("rank"),
-        answer_name=answer.get("name"),
+        answer_name=inat_taxon_name(str(answer["name"])) if answer.get("name") else None,
         answer_confidence=_float(answer.get("confidence")),
         species=_candidates("species", ranks.get("species")),
         genus=_candidates("genus", ranks.get("genus")),

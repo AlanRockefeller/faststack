@@ -49,6 +49,9 @@ class PhotoRecord:
     lon: Optional[float] = None
     # False when ``taken`` is the file's modification time, not EXIF.
     taken_from_exif: bool = True
+    # Which camera took it (EXIF make, model and serial), so a clock offset
+    # learned for one camera is not applied to another (or to a phone).
+    camera: str = ""
 
     @property
     def has_gps(self) -> bool:
@@ -385,25 +388,47 @@ def move_photo(
     return [g for g in groups if g.photos]
 
 
-def reorder_photo(
-    group: ObservationGroup, photo_key: str, target_key: str, after: bool
-) -> bool:
-    """Put one photo of the group just before (or after) another one.
+def move_photos(
+    groups: list[ObservationGroup],
+    photo_keys: Iterable[str],
+    target_index: int,
+    target_key: str = "",
+    after: bool = False,
+) -> list[ObservationGroup]:
+    """Move photos into ``groups[target_index]`` at a chosen place.
 
-    Returns False when nothing moved. The group keeps the new order from
-    then on (``ordered``).
+    They go just before (or ``after``) the photo ``target_key`` of that
+    group, or to its end when ``target_key`` is not one of its photos, and
+    keep the order they are shown in. The group keeps the resulting order
+    from then on (``ordered``). Photos already in the target group move
+    too, so this also reorders inside one group.
+
+    ``target_index == len(groups)`` puts them in a new group at the end,
+    sorted by capture time. Groups left empty are dropped.
     """
-    photos = group.sorted_photos()
-    moved = next((p for p in photos if p.key == photo_key), None)
-    if moved is None or photo_key == target_key:
-        return False
-    rest = [p for p in photos if p is not moved]
-    index = next((i for i, p in enumerate(rest) if p.key == target_key), None)
-    if index is None:
-        return False
-    rest.insert(index + 1 if after else index, moved)
-    if rest == photos:
-        return False
-    group.photos = rest
-    group.ordered = True
-    return True
+    wanted = set(photo_keys)
+    moved = [p for g in groups for p in g.sorted_photos() if p.key in wanted]
+    if not moved:
+        return groups
+    if target_index >= len(groups):
+        for g in groups:
+            g.photos = [p for p in g.photos if p.key not in wanted]
+        groups.append(ObservationGroup(sorted(moved, key=_sort_key)))
+        return [g for g in groups if g.photos]
+    target = groups[target_index]
+    shown = target.sorted_photos()
+    rest = [p for p in shown if p.key not in wanted]
+    index = len(rest)
+    position = next((i for i, p in enumerate(shown) if p.key == target_key), None)
+    if position is not None:
+        cut = position + 1 if after else position
+        index = sum(1 for p in shown[:cut] if p.key not in wanted)
+    arranged = rest[:index] + moved + rest[index:]
+    if arranged == shown:
+        return groups
+    for g in groups:
+        if g is not target:
+            g.photos = [p for p in g.photos if p.key not in wanted]
+    target.photos = arranged
+    target.ordered = True
+    return [g for g in groups if g.photos]
