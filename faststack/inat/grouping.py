@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -52,6 +52,18 @@ class PhotoRecord:
     # Which camera took it (EXIF make, model and serial), so a clock offset
     # learned for one camera is not applied to another (or to a phone).
     camera: str = ""
+    # Seconds to add to the EXIF time for local time: the confirmed offset of
+    # a camera set to the wrong time zone (see matching.py). 0 otherwise.
+    clock_offset_s: int = 0
+
+    @property
+    def time(self) -> Optional[datetime]:
+        """The capture time to group, sort and upload by: ``taken`` with the
+        camera's clock offset applied. ``taken`` stays the camera's own
+        clock, which is what matching compares against."""
+        if self.taken is None or not self.clock_offset_s or not self.taken_from_exif:
+            return self.taken
+        return self.taken + timedelta(seconds=self.clock_offset_s)
 
     @property
     def has_gps(self) -> bool:
@@ -93,14 +105,14 @@ class ObservationGroup:
 
     @property
     def observed_at(self) -> Optional[datetime]:
-        times = [p.taken for p in self.photos if p.taken is not None]
+        times = [p.time for p in self.photos if p.taken is not None]
         return min(times) if times else None
 
     @property
     def observed_at_exif(self) -> Optional[datetime]:
         """Earliest EXIF capture time, ignoring modification-time fallbacks."""
         times = [
-            p.taken for p in self.photos if p.taken is not None and p.taken_from_exif
+            p.time for p in self.photos if p.taken is not None and p.taken_from_exif
         ]
         return min(times) if times else None
 
@@ -127,7 +139,7 @@ def _sort_key(p: PhotoRecord):
     # Photos without a capture time go after those with one, in batch order.
     if p.taken is None:
         return (1, 0.0, p.order)
-    return (0, p.taken.timestamp(), p.order)
+    return (0, p.time.timestamp(), p.order)
 
 
 def group_sort_key(group: "ObservationGroup"):
@@ -170,7 +182,7 @@ def average_coordinates(fixes: Sequence[tuple[float, float]]) -> tuple[float, fl
 def _gap_seconds(a: PhotoRecord, b: PhotoRecord) -> Optional[float]:
     if a.taken is None or b.taken is None:
         return None
-    return abs((b.taken - a.taken).total_seconds())
+    return abs((b.time - a.time).total_seconds())
 
 
 def _gap_meters(a: PhotoRecord, b: PhotoRecord) -> Optional[float]:
@@ -226,7 +238,7 @@ def _features(photos: Sequence[PhotoRecord]) -> list[tuple[float, float, float]]
     nor repels a cut on its own."""
     n = len(photos)
     times: list[Optional[float]] = [
-        p.taken.timestamp() if p.taken is not None else None for p in photos
+        p.time.timestamp() if p.taken is not None else None for p in photos
     ]
     _fill_missing(times, fallback=[float(i) for i in range(n)])
     # Local equirectangular projection around the mean of the fixes.

@@ -98,8 +98,14 @@ def pairs_from_groups(groups: Sequence[Sequence], haversine) -> list[PairRecord]
     """Consecutive-photo pairs across a final grouping.
 
     ``groups`` is a list of photo lists (any objects with ``taken``, ``lat``,
-    ``lon``, ``has_gps``). Photos without a capture time are skipped.
+    ``lon``, ``has_gps``). Photos without a capture time are skipped. A
+    photo's ``time`` (its camera clock offset applied) is used when it has
+    one, so the gaps are the ones grouping saw.
     """
+
+    def when(p):
+        return getattr(p, "time", None) or p.taken
+
     owner: dict[int, int] = {}
     photos = []
     for gi, group in enumerate(groups):
@@ -108,10 +114,10 @@ def pairs_from_groups(groups: Sequence[Sequence], haversine) -> list[PairRecord]
                 continue
             owner[id(p)] = gi
             photos.append(p)
-    photos.sort(key=lambda p: p.taken)
+    photos.sort(key=when)
     out: list[PairRecord] = []
     for a, b in zip(photos, photos[1:]):
-        gap_s = abs((b.taken - a.taken).total_seconds())
+        gap_s = abs((when(b) - when(a)).total_seconds())
         gap_m = (
             haversine(a.lat, a.lon, b.lat, b.lon) if a.has_gps and b.has_gps else None
         )

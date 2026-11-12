@@ -14,8 +14,8 @@ import logging
 import statistics
 import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -468,6 +468,10 @@ class INatUploadController(QObject):
         self._camera_days: dict[str, Any] = {}  # camera -> the batch's middle date
         self._match_signature: Any = None
         self._clock_version = 0  # bumps on every clock decision
+        # Offset sets this batch was already regrouped for. Regrouping
+        # changes the cards, the cards feed offset detection, so each set
+        # regroups once at most: no back and forth between two answers.
+        self._regrouped_for_clock: set[frozenset] = set()
         # Matches the user said are wrong: observation id -> keys of the
         # photos it was offered for. A card holding any of them is not
         # offered it again (also after a split or a regroup).
@@ -1055,6 +1059,12 @@ class INatUploadController(QObject):
             self._thresholds_note = "sliders at the settings defaults"
         self.thresholdsChanged.emit()
         self._reset_existing()
+        # An offset confirmed earlier for a camera (same trip) shapes the
+        # first grouping already.
+        self._photos, _ = self._with_clock(self._photos)
+        self._regrouped_for_clock.add(
+            frozenset((p.camera, p.clock_offset_s) for p in self._photos)
+        )
         self._regroup(announce=True)
         self.refreshUsage()
         self.checkExisting()
@@ -1090,11 +1100,27 @@ class INatUploadController(QObject):
             time_gap_s=self._time_gap_s,
             distance_m=self._distance_m,
         )
+        # Photos the user said go to an existing observation keep going there
+        # when a regroup moves them into a new card (unless that card would
+        # mix photos meant for two different observations).
+        attached_by_key = {
+            p.key: c.attach_to
+            for c in old_cards
+            if not c.locked and c.attach_to is not None
+            for p in c.group.photos
+        }
         cards = list(kept)
         for group in groups:
             card = reusable.pop(frozenset(p.key for p in group.photos), None)
             if card is None:
                 card = self._new_card(group)
+                targets = {
+                    attached_by_key[p.key].id: attached_by_key[p.key]
+                    for p in group.photos
+                    if p.key in attached_by_key
+                }
+                if len(targets) == 1:
+                    card.attach_to = next(iter(targets.values()))
             else:
                 if card.group.ordered:  # keep the order the user dragged
                     group = ObservationGroup(
@@ -1360,7 +1386,8 @@ class INatUploadController(QObject):
             "source": f"image://inatphoto/{self._batch_generation}/{index}?w=360",
             # The full-screen viewer appends the width it needs.
             "full": f"image://inatphoto/{self._batch_generation}/{index}",
-            "taken": p.taken.strftime("%H:%M:%S") if p.taken else "",
+            # Local time when the camera clock is corrected (cards sort by it).
+            "taken": p.time.strftime("%H:%M:%S") if p.taken else "",
             "hasGps": p.has_gps,
         }
 
@@ -1990,6 +2017,7 @@ class INatUploadController(QObject):
         self._existing_status = ""
         self._clock_decisions = {}
         self._clock_version += 1
+        self._regrouped_for_clock = set()
         self._dismissed = {}
         self._dismiss_version += 1
         self._match_signature = None
@@ -2131,6 +2159,8 @@ class INatUploadController(QObject):
             )
         else:
             self._clock = priors
+        if self._apply_clock_to_photos():
+            return  # the cards changed under us; matching runs again
         offsets = {camera: g.offset_s for camera, g in self._clock.items()}
         exclude = {c.obs_id for c in cards if c.obs_id}
         for c in cards:
@@ -2218,13 +2248,72 @@ class INatUploadController(QObject):
         return out
 
     def _local_time(self, p: PhotoRecord) -> Optional[datetime]:
-        """``p``'s capture time corrected by a confirmed camera clock offset."""
-        if p.taken is None:
-            return None
-        guess = self._clock.get(p.camera)
-        if p.taken_from_exif and guess is not None and guess.corrects_times:
-            return p.taken + timedelta(seconds=guess.offset_s)
-        return p.taken
+        """``p``'s capture time corrected by a confirmed camera clock offset
+        (the records carry it, see ``_apply_clock_to_photos``)."""
+        return p.time
+
+    def _with_clock(
+        self, records: list[PhotoRecord]
+    ) -> tuple[list[PhotoRecord], bool]:
+        """``records`` with each camera's confirmed clock offset in them
+        (0 for a camera without one); and whether any changed."""
+        wanted = {
+            camera: guess.offset_s
+            for camera, guess in self._clock.items()
+            if guess.corrects_times
+        }
+        out = []
+        changed = False
+        for p in records:
+            offset = wanted.get(p.camera, 0) if p.taken_from_exif else 0
+            if p.clock_offset_s != offset:
+                p = replace(p, clock_offset_s=offset)
+                changed = True
+            out.append(p)
+        return out, changed
+
+    def _apply_clock_to_photos(self) -> bool:
+        """A confirmed offset changed: give the photos their corrected times.
+
+        A constant offset leaves the gaps between one camera's photos as
+        they were, so only a batch from more than one camera (a phone and
+        a camera, say) can group differently. Such a batch is regrouped,
+        unless that would throw away the user's own splits, merges and
+        drags, or a card is already on iNaturalist. False when nothing
+        changed.
+        """
+        records, changed = self._with_clock(self._photos)
+        if not changed:
+            return False
+        state = frozenset((p.camera, p.clock_offset_s) for p in records)
+        first_time = state not in self._regrouped_for_clock
+        self._regrouped_for_clock.add(state)
+        self._photos = records
+        by_key = {p.key: p for p in records}
+        for card in self._model.cards:
+            card.group.photos = [by_key.get(p.key, p) for p in card.group.photos]
+        cameras = {p.camera for p in records if p.taken is not None and p.taken_from_exif}
+        if len(cameras) > 1:
+            if not first_time:
+                pass  # regrouped for these offsets already
+            elif self.canRegroup and not self._manual_edits:
+                before = len(self._model.cards)
+                self._regroup()
+                self._set_status(
+                    "Regrouped with the camera clock corrected: "
+                    f"{before} → {len(self._model.cards)} observation(s)."
+                )
+            else:
+                self._set_status(
+                    "Camera clock corrected. The photos of more than one camera "
+                    "may now group differently; move a grouping slider to "
+                    "regroup (that undoes your own splits and merges)."
+                )
+        for card in self._model.cards:
+            self._model.refresh(card, "photos", "dateText")
+        self._match_signature = None
+        self._rematch_timer.start()
+        return True
 
     def _observed_at(
         self, card: Card, exif_only: bool
@@ -2435,6 +2524,7 @@ class INatUploadController(QObject):
         guess = self._clock.get(camera)
         if guess is None or guess.offset_s == 0:
             return
+        status_before = self._status_text
         self._decide_clock(
             camera,
             OffsetGuess(
@@ -2446,9 +2536,11 @@ class INatUploadController(QObject):
             ),
             save=True,
         )
+        regrouped = self._status_text if self._status_text != status_before else ""
         self._set_status(
             f"Camera clock: {describe_offset(guess.offset_s)}. "
             "New observations get the corrected time."
+            + (f" {regrouped}" if regrouped else "")
         )
 
     @Slot(str)
