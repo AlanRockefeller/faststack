@@ -30,15 +30,21 @@ Item {
     // Expose zoom state to parent (Main.qml title bar)
     readonly property real currentZoomScale: imageRotator.zoomScale
     readonly property real currentFitScale: imageRotator.fitScale
+    // Python-backed values the zoom path needs. Bound here so they are read
+    // again only when their notify signal fires, never per animation frame:
+    // each read of a uiState property is a call into Python that waits for the
+    // GIL, which the decode workers a zoom starts are competing for.
+    readonly property int nativeImageWidth: loupeView.uiStateRef ? loupeView.uiStateRef.currentNativeImageWidth : 0
+    readonly property int nativeImageHeight: loupeView.uiStateRef ? loupeView.uiStateRef.currentNativeImageHeight : 0
+    readonly property bool hiResActive: loupeView.uiStateRef ? loupeView.uiStateRef.isZoomed : false
+    readonly property bool histogramVisible: loupeView.uiStateRef ? loupeView.uiStateRef.isHistogramVisible : false
+
     readonly property real currentPixelZoomScale: {
-        if (!loupeView.uiStateRef || !mainImage || mainImage.sourceSize.width <= 0 || mainImage.sourceSize.height <= 0) return currentZoomScale
+        if (!mainImage || mainImage.sourceSize.width <= 0 || mainImage.sourceSize.height <= 0) return currentZoomScale
+        if (nativeImageWidth <= 0 || nativeImageHeight <= 0) return currentZoomScale
 
-        var nativeW = loupeView.uiStateRef.currentNativeImageWidth
-        var nativeH = loupeView.uiStateRef.currentNativeImageHeight
-        if (nativeW <= 0 || nativeH <= 0) return currentZoomScale
-
-        var scaleW = imageRotator.zoomScale * mainImage.sourceSize.width / nativeW
-        var scaleH = imageRotator.zoomScale * mainImage.sourceSize.height / nativeH
+        var scaleW = imageRotator.zoomScale * mainImage.sourceSize.width / nativeImageWidth
+        var scaleH = imageRotator.zoomScale * mainImage.sourceSize.height / nativeImageHeight
         if (scaleW > 0 && scaleH > 0) return Math.min(scaleW, scaleH)
         return currentZoomScale
     }
@@ -51,12 +57,36 @@ Item {
     readonly property bool isCropSourceFrozen: cropDragImageSource !== "" && ((mainMouseArea && mainMouseArea.isCropDragging) || (loupeView.uiStateRef && loupeView.uiStateRef.isCropping))
     property string displayedImageSource: ""
 
+    // True when two provider URLs (image://provider/<index>/<generation>/<seq>)
+    // differ only in generation: same image, different pixels.
+    function sourceShowsSameImage(a, b) {
+        if (!a || !b) return false
+        var pa = String(a).split("/")
+        var pb = String(b).split("/")
+        return pa.length === 6 && pb.length === 6 && pa[3] === pb[3] && pa[5] === pb[5]
+    }
+
+    // Set while a source change is being held back for a moving zoom (below).
+    property bool sourceSwapDeferred: false
+
     // Loading a source can synchronously reset rotation/zoom and make Python
     // request another source. Apply it outside the binding evaluation so that
     // feedback cannot re-enter displayedImageSource's binding. The named
     // callback coalesces changes and reads the latest crop/source state.
+    //
+    // New pixels for the image already on screen (the full-resolution frame
+    // after a zoom, the settled-quality refresh) wait until the zoom comes to
+    // rest: loading them converts and uploads a whole frame, which would stall
+    // the animation it landed in. Navigation is never held.
     function updateDisplayedImageSource() {
-        displayedImageSource = isCropSourceFrozen ? cropDragImageSource : requestedImageSource
+        var wanted = isCropSourceFrozen ? cropDragImageSource : requestedImageSource
+        if (wanted !== displayedImageSource && imageRotator.zoomMoving
+                && sourceShowsSameImage(wanted, displayedImageSource)) {
+            sourceSwapDeferred = true
+            return
+        }
+        sourceSwapDeferred = false
+        displayedImageSource = wanted
     }
 
     onRequestedImageSourceChanged: Qt.callLater(loupeView.updateDisplayedImageSource)
@@ -122,15 +152,16 @@ Item {
 
             // Smart High-Res Logic:
             // Before the new image loads, decide if we should keep high-res mode.
-            // Rule: Only keep high-res if we are currently "meaningfully zoomed" (> 1.1x fit).
-            // This prevents "sticky" high-res where zooming in once keeps it forever.
-            
-            if (imageRotator.zoomScale > imageRotator.fitScale * 1.1) {
+            // Rule: Only keep high-res if we are, or are heading, "meaningfully
+            // zoomed" (> 1.1x fit). This prevents "sticky" high-res where
+            // zooming in once keeps it forever.
+
+            if (Math.max(imageRotator.relZoom(), imageRotator.zoomTargetRel) > 1.1) {
                 // Keep high-res (setZoomed true if not already)
-                if (!loupeView.uiStateRef.isZoomed) loupeView.uiStateRef.setZoomed(true)
+                if (!loupeView.hiResActive) loupeView.uiStateRef.setZoomed(true)
             } else {
                 // Drop to low-res for the next image
-                if (loupeView.uiStateRef.isZoomed) loupeView.uiStateRef.setZoomed(false)
+                if (loupeView.hiResActive) loupeView.uiStateRef.setZoomed(false)
             }
         }
         function onIsCroppingChanged() {
@@ -212,20 +243,11 @@ Item {
     // Connection to handle zoom/pan reset signal from Python
     Connections {
         target: loupeView.uiStateRef
-        function onResetZoomPanRequested() {
-            imageRotator.zoomScale = imageRotator.fitScale
-            panTransform.x = 0
-            panTransform.y = 0
+        function onResetZoomPanRequested(animated) {
+            imageRotator.resetView(animated)
         }
         function onAbsoluteZoomRequested(scale) {
-             imageRotator.zoomScale = scale
-             
-             // If we need to switch to high-res, flag this scale as the target 
-             // for the incoming source change so recomputeFitScale doesn't clobber it.
-             if (loupeView.uiStateRef && !loupeView.uiStateRef.isZoomed) {
-                 imageRotator.targetAbsoluteZoom = scale
-                 loupeView.uiStateRef.setZoomed(true)
-             }
+            imageRotator.zoomToPixelScale(scale)
         }
     }
 
@@ -252,25 +274,228 @@ Item {
             implicitHeight: 0
             property bool isUpdatingGeometry: false
             
-            // Fix A: Atomic Zoom Scale
+            // Scale applied to the loaded texture's logical size. Written only
+            // by the view driver below and by recomputeFitScale().
             property real zoomScale: 1.0
-            
-            // Fix C: Persist requested absolute zoom across source changes
-            property real targetAbsoluteZoom: -1.0
-            
+
             // Zoom/pan lock: when >= 0, any change to zoomScale is reverted.
             // Active only during crop drag to keep the coordinate system stable.
             property real _lockedZoom: -1
             property real _lockedPanX: -1e9
             property real _lockedPanY: -1e9
-            
+
             onZoomScaleChanged: {
                 // During crop drag, revert any zoom changes to keep coordinates stable
                 if (_lockedZoom >= 0 && Math.abs(zoomScale - _lockedZoom) > 0.0001) {
                     zoomScale = _lockedZoom
                     return
                 }
-                mainImage.updateZoomState()
+                mainImage.updateHistogramWithZoom()
+            }
+
+            // ---- View driver ------------------------------------------------
+            // Every zoom and pan change goes through the functions below;
+            // nothing else assigns zoomScale or panTransform.x/y.
+            // (recomputeFitScale() keeps zoomScale / fitScale constant, so it
+            // does not disturb a view that is moving.)
+            //
+            // Zoom is tracked relative to fit (1.0 = fit to window) and the held
+            // point in screen px at fit, so neither changes when the texture is
+            // swapped for one of another resolution or the window is resized.
+            // Input moves a target; a FrameAnimation eases the view to it, so
+            // the per-frame path is QML only.
+            readonly property real zoomPerNotch: 1.2    // one 15-degree wheel notch
+            readonly property real zoomTau: 0.07        // seconds; easing time constant
+            readonly property real minZoomRel: 0.1      // 10% of fit
+            readonly property real maxPixelZoom: 20.0   // 2000% of native pixels
+            // Slowest the view moves while it still has somewhere to go, so a
+            // step ends cleanly instead of creeping up on its target.
+            readonly property real minZoomRate: 0.25    // natural-log zoom per second
+            readonly property real minAnchorRate: 150   // px per second
+
+            property real zoomTargetRel: 1.0
+            // The image point being held (offset from the image centre) and
+            // where it sits in the viewport (offset from the viewport centre),
+            // now and when the motion ends.
+            property real anchorImageX: 0
+            property real anchorImageY: 0
+            property real anchorViewX: 0
+            property real anchorViewY: 0
+            property real anchorViewTargetX: 0
+            property real anchorViewTargetY: 0
+            readonly property bool zoomMoving: zoomFrame.running || loupePinchHandler.active
+
+            onZoomMovingChanged: {
+                if (!zoomMoving && loupeView.sourceSwapDeferred) {
+                    Qt.callLater(loupeView.updateDisplayedImageSource)
+                }
+            }
+
+            function relZoom() {
+                return fitScale > 0 ? zoomScale / fitScale : 1.0
+            }
+
+            // Native-pixel zoom per unit of relative zoom. The same whichever
+            // texture is loaded: fitScale * sourceSize does not depend on it.
+            function pixelZoomPerRel() {
+                var sourceW = mainImage.sourceSize.width
+                if (sourceW > 0 && loupeView.nativeImageWidth > 0) {
+                    return fitScale * sourceW / loupeView.nativeImageWidth
+                }
+                return fitScale
+            }
+
+            function clampRel(rel) {
+                var perRel = pixelZoomPerRel()
+                var maxRel = perRel > 0 ? Math.max(1.0, maxPixelZoom / perRel) : 20.0
+                return Math.max(minZoomRel, Math.min(maxRel, rel))
+            }
+
+            // Where the pan may rest at a given zoom: centred on an axis where
+            // the image is no larger than the viewport, otherwise anywhere that
+            // keeps the image covering it.
+            function boundedPan(rel, panX, panY) {
+                var limitX = Math.max(0, (width * fitScale * rel - imageViewport.width) / 2)
+                var limitY = Math.max(0, (height * fitScale * rel - imageViewport.height) / 2)
+                return Qt.point(Math.max(-limitX, Math.min(limitX, panX)),
+                                Math.max(-limitY, Math.min(limitY, panY)))
+            }
+
+            function applyView(rel, panX, panY) {
+                zoomScale = fitScale * rel
+                panTransform.x = panX
+                panTransform.y = panY
+            }
+
+            // Ease to `rel` holding image point (imageX, imageY), which is at
+            // (viewX, viewY) now and ends where the pan is (restPanX, restPanY).
+            function startZoomMotion(rel, imageX, imageY, viewX, viewY, restPanX, restPanY) {
+                zoomTargetRel = rel
+                anchorImageX = imageX
+                anchorImageY = imageY
+                anchorViewX = viewX
+                anchorViewY = viewY
+                anchorViewTargetX = restPanX + imageX * rel
+                anchorViewTargetY = restPanY + imageY * rel
+                mainImage.updateHiResState()
+                zoomFrame.running = true
+            }
+
+            // Ease to `rel`, keeping the image point at (viewX, viewY) -- an
+            // offset from the viewport centre -- in place as far as the view
+            // bounds allow. Re-anchors from wherever the view is right now, so
+            // a new step in mid-motion continues smoothly.
+            function zoomTo(rel, viewX, viewY) {
+                if (_lockedZoom >= 0) return
+                var current = relZoom()
+                if (!(current > 0)) return
+                rel = clampRel(rel)
+                var imageX = (viewX - panTransform.x) / current
+                var imageY = (viewY - panTransform.y) / current
+                var rest = boundedPan(rel, viewX - imageX * rel, viewY - imageY * rel)
+                startZoomMotion(rel, imageX, imageY, viewX, viewY, rest.x, rest.y)
+            }
+
+            function zoomBy(factor, viewX, viewY) {
+                var from = zoomFrame.running ? zoomTargetRel : relZoom()
+                if (Math.abs(from - 1.0) < 0.001) from = 1.0
+                var rel = from * factor
+                // Land exactly on fit when a step crosses it, so the view never
+                // rests a few percent off; the next step is what takes it past.
+                if ((from - 1.0) * (rel - 1.0) < 0 || Math.abs(rel - 1.0) < 0.001) rel = 1.0
+                zoomTo(rel, viewX, viewY)
+            }
+
+            // `scale` is in native image pixels per screen pixel (1.0 = 100%).
+            function zoomToPixelScale(scale) {
+                var perRel = pixelZoomPerRel()
+                if (!(perRel > 0)) return
+                zoomTo(scale / perRel, 0, 0)
+            }
+
+            function resetView(animated) {
+                if (!animated) {
+                    setView(1.0, 0, 0)
+                    return
+                }
+                if (_lockedZoom >= 0) return
+                // Hold the image centre: it sits at the current pan and ends
+                // at the viewport centre.
+                startZoomMotion(1.0, 0, 0, panTransform.x, panTransform.y, 0, 0)
+            }
+
+            // Put the view somewhere at once, ending any motion.
+            function setView(rel, panX, panY) {
+                zoomFrame.running = false
+                zoomTargetRel = rel
+                applyView(rel, panX, panY)
+                mainImage.updateHiResState()
+            }
+
+            function stopZoomMotion() {
+                if (!zoomFrame.running) return
+                zoomFrame.running = false
+                zoomTargetRel = relZoom()
+                mainImage.updateHiResState()
+            }
+
+            // Drag panning. A view in motion keeps easing around the moved point.
+            function panBy(dx, dy) {
+                if (zoomFrame.running) {
+                    anchorViewX += dx
+                    anchorViewY += dy
+                    anchorViewTargetX += dx
+                    anchorViewTargetY += dy
+                }
+                panTransform.x += dx
+                panTransform.y += dy
+            }
+
+            // How far to move this frame toward a target `delta` away: a share
+            // `k` of what is left, but never slower than `floor`, and never past.
+            function easeStep(delta, k, floor) {
+                var step = delta * k
+                if (Math.abs(step) >= floor) return step
+                if (Math.abs(delta) <= floor) return delta
+                return delta > 0 ? floor : -floor
+            }
+
+            function stepZoomMotion(frameTime) {
+                var current = relZoom()
+                if (!(current > 0) || !(zoomTargetRel > 0)) {
+                    zoomFrame.running = false
+                    return
+                }
+                var dt = frameTime > 0 ? Math.min(frameTime, 0.1) : 0.016
+                var k = 1 - Math.exp(-dt / zoomTau)
+                var logCurrent = Math.log(current)
+                var logLeft = Math.log(zoomTargetRel) - logCurrent
+                var logStep = easeStep(logLeft, k, minZoomRate * dt)
+                var leftX = anchorViewTargetX - anchorViewX
+                var leftY = anchorViewTargetY - anchorViewY
+                var stepX = easeStep(leftX, k, minAnchorRate * dt)
+                var stepY = easeStep(leftY, k, minAnchorRate * dt)
+                var arrived = logStep === logLeft && stepX === leftX && stepY === leftY
+                var rel = zoomTargetRel
+                if (arrived) {
+                    anchorViewX = anchorViewTargetX
+                    anchorViewY = anchorViewTargetY
+                } else {
+                    rel = Math.exp(logCurrent + logStep)
+                    anchorViewX += stepX
+                    anchorViewY += stepY
+                }
+                applyView(rel, anchorViewX - anchorImageX * rel, anchorViewY - anchorImageY * rel)
+                if (arrived) {
+                    zoomFrame.running = false
+                    mainImage.updateHiResState()
+                }
+            }
+
+            FrameAnimation {
+                id: zoomFrame
+                running: false
+                onTriggered: imageRotator.stepZoomMotion(frameTime)
             }
 
             // Fix B: Stable Logical Size
@@ -339,16 +564,10 @@ Item {
 
                 fitScale = s;
 
-                // Restore zoom level
-                if (targetAbsoluteZoom > 0) {
-                     // Check if we have a pending absolute zoom request (e.g. from Ctrl+1)
-                     // If so, use it directly (1.0 = 1:1 pixels) and consume the flag.
-                     imageRotator.zoomScale = targetAbsoluteZoom;
-                     targetAbsoluteZoom = -1.0;
-                } else {
-                     // Otherwise, preserve relative visual size (fit ratio)
-                     imageRotator.zoomScale = fitScale * ratio;
-                }
+                // Preserve relative visual size (fit ratio). The view driver
+                // relies on this: zoom relative to fit is unchanged by a
+                // texture swap or a resize, even in mid-motion.
+                imageRotator.zoomScale = fitScale * ratio;
                 // Preserve Pan (don't reset to 0) as pan is in screen pixels (mostly)
             }
 
@@ -600,6 +819,10 @@ Item {
                     mainImage._presentSeq = loupeView.uiStateRef ? loupeView.uiStateRef.currentNavSeq : -1
                     mainImage._presentGeneration = loupeView.uiStateRef ? loupeView.uiStateRef.currentImageGeneration : -1
 
+                    var boundSource = "" + mainImage.source
+                    var sameImage = loupeView.sourceShowsSameImage(mainImage._boundSource, boundSource)
+                    mainImage._boundSource = boundSource
+
                     if (mainMouseArea.isCropDragging) {
                         // Source changed mid-drag (e.g. high-res edit buffer loading).
                         // Defer ALL visual/geometry resets so the coordinate system
@@ -610,30 +833,33 @@ Item {
 
                     imageRotator.baseW = 0
                     imageRotator.baseH = 0
-                    
+
                     // Smart Zoom Reset:
                     // If we intended to keep high-res (isZoomed is true), preserve capabilities.
                     // If not (isZoomed is false), reset to "fit" state for speed and consistency.
-                    if (loupeView.uiStateRef && !loupeView.uiStateRef.isZoomed) {
+                    if (loupeView.uiStateRef && !loupeView.hiResActive) {
                         mainMouseArea.resetCropRotation()
                         mainMouseArea.isRotating = false
                         mainMouseArea.cropDragMode = "none"
-                        
-                        imageRotator.zoomScale = imageRotator.fitScale
-                        panTransform.x = 0
-                        panTransform.y = 0
+
+                        // A different image starts at fit. New pixels for the
+                        // image already shown (the fit-size frame coming back
+                        // after a zoom out, a quality or preview refresh) leave
+                        // the view where it is: it may be resting below fit.
+                        if (!sameImage) imageRotator.setView(1.0, 0, 0)
                     }
                 }
                 fillMode: Image.PreserveAspectFit
                 cache: false // We do our own caching in Python
-                // Fast navigation may intentionally use the nearest smaller
-                // JPEG DCT scale. Let the GPU smooth that small upscale; at
-                // 1:1 settled resolution this has no visible effect.
-                smooth: !isZooming
+                // Always filtered, including while the zoom is moving: on the
+                // GPU it costs nothing, and unfiltered frames shimmer. (Fast
+                // navigation may also use the nearest smaller JPEG DCT scale,
+                // which this smooths; at 1:1 it has no visible effect.)
+                smooth: true
                 mipmap: false // Crisp rendering
-                
+
                 property bool _sourceSizeStale: false
-                property bool isZooming: false
+                property string _boundSource: ""
                 property bool initialDisplaySizeReported: false
         
                 // IMPORTANT: tell Python the *viewport* size, not the sourceSize size
@@ -671,49 +897,62 @@ Item {
                     interval: 200 // 200ms debounce to prevent thrashing
                     repeat: false
                     onTriggered: {
-                        if (loupeView.uiStateRef && loupeView.uiStateRef.isZoomed) {
+                        if (loupeView.uiStateRef && loupeView.hiResActive) {
                             loupeView.uiStateRef.setZoomed(false)
                         }
                     }
                 }
 
-                function updateZoomState() {
-                    if (!loupeView.uiStateRef) return;
-                    
-                    // Thresholds for hysteresis
-                    var highResThreshold = imageRotator.fitScale * 1.1
-                    var lowResThreshold = imageRotator.fitScale * 1.02
-                    
-                    // Enable High-Res if zoomed in significantly
-                    if (imageRotator.zoomScale > highResThreshold) {
-                         lowResDebounceTimer.stop()
-                         if (!loupeView.uiStateRef.isZoomed) {
-                             loupeView.uiStateRef.setZoomed(true);
-                         }
-                    } 
-                    // Disable High-Res (return to low-res) if zoomed out to near-fit
-                    // formatting note: added hysteresis check AND debounce
-                    else if (imageRotator.zoomScale <= lowResThreshold) {
-                        if (loupeView.uiStateRef.isZoomed) {
-                            // Only drop to low-res after delay to handle wheel overshoot/jitter
-                            if (!lowResDebounceTimer.running) lowResDebounceTimer.start()
-                        }
+                // Ask Python for full-resolution frames once the view is, or is
+                // heading, meaningfully past fit, and give them up shortly after
+                // it is back at fit. Judged on the larger of where the zoom is
+                // and where it is going, so the decode starts with the first
+                // wheel step. Called when the target changes or the motion
+                // ends, not per frame.
+                function updateHiResState() {
+                    if (!loupeView.uiStateRef) return
+
+                    // Relative to fit, with hysteresis between the two.
+                    var highResThreshold = 1.1
+                    var lowResThreshold = 1.02
+                    var rel = Math.max(imageRotator.relZoom(), imageRotator.zoomTargetRel)
+
+                    if (rel > highResThreshold) {
+                        lowResDebounceTimer.stop()
+                        if (!loupeView.hiResActive) loupeView.uiStateRef.setZoomed(true)
+                    } else if (rel <= lowResThreshold) {
+                        // Only drop to low-res after a delay, in case the user
+                        // zooms straight back in.
+                        if (loupeView.hiResActive && !lowResDebounceTimer.running) lowResDebounceTimer.start()
                     } else {
                         // In hysteresis band: cancel any pending low-res switch
                         lowResDebounceTimer.stop()
                     }
-                    
-                    updateHistogramWithZoom()
                 }
-                
-                function updateHistogramWithZoom() {
-                    if (loupeView.uiStateRef && loupeView.uiStateRef.isHistogramVisible && loupeView.controllerRef) {
-                        var zoom = imageRotator.zoomScale
-                        var panX = panTransform.x
-                        var panY = panTransform.y
-                        var imageScale = imageRotator.zoomScale
-                        loupeView.controllerRef.update_histogram(zoom, panX, panY, imageScale)
+
+                // Zoom and pan change every frame while the view is moving; the
+                // histogram only needs the latest values now and then. While a
+                // zoom is in motion it waits altogether: a histogram of a
+                // full-resolution frame is heavy Python work that would compete
+                // with the animation, and one update follows when it rests.
+                Timer {
+                    id: histogramThrottle
+                    interval: 50
+                    repeat: false
+                    onTriggered: {
+                        if (imageRotator.zoomMoving) {
+                            histogramThrottle.start()
+                            return
+                        }
+                        if (loupeView.histogramVisible && loupeView.controllerRef) {
+                            var zoom = imageRotator.zoomScale
+                            loupeView.controllerRef.update_histogram(zoom, panTransform.x, panTransform.y, zoom)
+                        }
                     }
+                }
+
+                function updateHistogramWithZoom() {
+                    if (loupeView.histogramVisible && !histogramThrottle.running) histogramThrottle.start()
                 }
 
 
@@ -1077,24 +1316,33 @@ Item {
             target: null
             enabled: !mainMouseArea.isCropDragging && !mainMouseArea.isBrushPainting
 
-            property real startZoomScale: 1
+            // Zoom relative to fit and the held image point when the pinch
+            // began, and where the centroid last was (viewport-centre offsets).
+            property real startRel: 1
             property real startImagePointX: 0
             property real startImagePointY: 0
+            property real lastViewX: 0
+            property real lastViewY: 0
+
+            function centroidInView() {
+                var p = mainMouseArea.mapToItem(
+                    imageViewport, centroid.position.x, centroid.position.y
+                )
+                lastViewX = p.x - imageViewport.width / 2
+                lastViewY = p.y - imageViewport.height / 2
+            }
 
             onActiveChanged: {
                 if (active) {
-                    startZoomScale = imageRotator.zoomScale
-
-                    var p = mainMouseArea.mapToItem(
-                        imageViewport, centroid.position.x, centroid.position.y
-                    )
-                    var centerX = imageViewport.width / 2
-                    var centerY = imageViewport.height / 2
-                    startImagePointX = (p.x - centerX - panTransform.x) / startZoomScale
-                    startImagePointY = (p.y - centerY - panTransform.y) / startZoomScale
-                    mainImage.isZooming = true
+                    imageRotator.stopZoomMotion()
+                    startRel = imageRotator.relZoom()
+                    centroidInView()
+                    startImagePointX = (lastViewX - panTransform.x) / startRel
+                    startImagePointY = (lastViewY - panTransform.y) / startRel
                 } else {
-                    zoomSmoothTimer.restart()
+                    // The fingers track the image directly; once they lift,
+                    // ease back inside the view bounds around where they were.
+                    imageRotator.zoomTo(imageRotator.relZoom(), lastViewX, lastViewY)
                 }
             }
 
@@ -1103,18 +1351,11 @@ Item {
 
                 // activeScale grows when the fingers move apart and shrinks
                 // when they move together.
-                var newScale = Math.max(
-                    0.05, Math.min(20.0, startZoomScale * activeScale)
-                )
-                var p = mainMouseArea.mapToItem(
-                    imageViewport, centroid.position.x, centroid.position.y
-                )
-                var centerX = imageViewport.width / 2
-                var centerY = imageViewport.height / 2
-
-                imageRotator.zoomScale = newScale
-                panTransform.x = p.x - centerX - startImagePointX * newScale
-                panTransform.y = p.y - centerY - startImagePointY * newScale
+                var rel = imageRotator.clampRel(startRel * activeScale)
+                centroidInView()
+                imageRotator.setView(rel,
+                                     lastViewX - startImagePointX * rel,
+                                     lastViewY - startImagePointY * rel)
             }
         }
         
@@ -1226,6 +1467,8 @@ Item {
         function beginCropInteraction() {
             loupeView.freezeCropImageSource()
             isCropDragging = true
+            // The lock below pins the view; end any zoom still easing first.
+            imageRotator.stopZoomMotion()
             imageRotator._lockedZoom = imageRotator.zoomScale
             imageRotator._lockedPanX = panTransform.x
             imageRotator._lockedPanY = panTransform.y
@@ -1452,8 +1695,7 @@ Item {
                 updateBrushCursor(mouse.x, mouse.y)
 
             if (middlePanning) {
-                panTransform.x += (mouse.x - lastX)
-                panTransform.y += (mouse.y - lastY)
+                imageRotator.panBy(mouse.x - lastX, mouse.y - lastY)
                 lastX = mouse.x
                 lastY = mouse.y
                 return
@@ -1566,8 +1808,7 @@ Item {
                 
                 // Normal pan behavior (only when not cropping)
                 if (!loupeView.uiStateRef || !loupeView.uiStateRef.isCropping) {
-                    panTransform.x += (mouse.x - lastX)
-                    panTransform.y += (mouse.y - lastY)
+                    imageRotator.panBy(mouse.x - lastX, mouse.y - lastY)
                     lastX = mouse.x
                     lastY = mouse.y
                 }
@@ -1599,66 +1840,19 @@ Item {
             }
         }
 
-        // Wheel for zoom - zooms in towards cursor, zooms out towards center
+        // Wheel zoom. Each event moves the zoom target in proportion to its
+        // angle (one 15-degree notch = zoomPerNotch, so a high-resolution
+        // wheel or a touchpad zooms as far per turn as a notched one) and the
+        // view driver eases to it, holding the image point under the cursor.
         onWheel: function(wheel) {
-            // Disable smooth rendering during zoom for better performance
-            mainImage.isZooming = true
-            
-            // Use a smaller scale factor for smoother, more responsive zoom
-            var isZoomingIn = wheel.angleDelta.y > 0
-            var scaleFactor = isZoomingIn ? 1.1 : 1 / 1.1;
-            
-            // Calculate old and new scale
-            var oldScale = imageRotator.zoomScale
-            var newScale = oldScale * scaleFactor
-            // Allow zooming out past "Fit" to 5%. Cap max at 20x.
-            newScale = Math.max(0.05, Math.min(20.0, newScale))
+            var notches = wheel.angleDelta.y / 120
+            if (notches === 0) return  // horizontal scroll
 
-            // Current state
-            var currentPanX = panTransform.x
-            var currentPanY = panTransform.y
-            
-            // Screen center (Viewport center)
-            var centerX = imageViewport.width / 2
-            var centerY = imageViewport.height / 2
-
-            // Fix C: Use Viewport Coordinates (account for footer offset etc)
+            // Viewport coordinates (the mouse area also covers the footer).
             var p = mainMouseArea.mapToItem(imageViewport, wheel.x, wheel.y)
-            var mouseX = p.x
-            var mouseY = p.y
-            
-            var mouseOffsetFromCenterX = mouseX - centerX
-            var mouseOffsetFromCenterY = mouseY - centerY
-
-            // Calculate the "image point" currently under the cursor (relative to image center, unscaled)
-            // ScreenPos = Center + Pan + (ImagePoint * Scale)
-            // ImagePoint = (ScreenPos - Center - Pan) / Scale
-            // ImagePoint = (MouseOffsetFromCenter - Pan) / Scale
-            var imagePointX = (mouseOffsetFromCenterX - currentPanX) / oldScale
-            var imagePointY = (mouseOffsetFromCenterY - currentPanY) / oldScale
-
-            // We want to keep this ImagePoint under the cursor after scaling:
-            // MouseOffsetFromCenter = Pan_New + (ImagePoint * Scale_New)
-            // Pan_New = MouseOffsetFromCenter - (ImagePoint * Scale_New)
-            
-            var newPanX = mouseOffsetFromCenterX - (imagePointX * newScale)
-            var newPanY = mouseOffsetFromCenterY - (imagePointY * newScale)
-
-            // Apply updates
-            imageRotator.zoomScale = newScale
-            panTransform.x = newPanX
-            panTransform.y = newPanY
-
-            // Re-enable smooth rendering after a short delay
-            zoomSmoothTimer.restart()
-        }
-        
-        Timer {
-            id: zoomSmoothTimer
-            interval: 150  // Re-enable smooth rendering 150ms after last zoom
-            onTriggered: {
-                mainImage.isZooming = false
-            }
+            imageRotator.zoomBy(Math.pow(imageRotator.zoomPerNotch, notches),
+                                p.x - imageViewport.width / 2,
+                                p.y - imageViewport.height / 2)
         }
         
         function updateCropBox(x1, y1, x2, y2, applyAspectRatio = false) {

@@ -157,6 +157,7 @@ from faststack.imaging.mask_engine import (
 )
 from faststack.imaging.metadata import get_exif_data
 from faststack.imaging.optional_deps import get_cv2
+from faststack.imaging.halo_fix import halo_layers, is_halo_layer
 from faststack.imaging.stack_paint import (
     BASE_SPACE_EDITS,
     STACK_OUTPUT_SOURCE,
@@ -497,6 +498,7 @@ from faststack.controller.image_editor_handoff import (
     ImageEditorHandoffMixin,
     PhotoshopHandoffState,
 )
+from faststack.controller.halo_removal import HaloRemovalMixin
 from faststack.controller.loupe_display import LoupeDisplayMixin
 from faststack.controller.navigation import NavigationMixin
 from faststack.controller.save_pipeline import SavePipelineMixin
@@ -507,6 +509,7 @@ class AppController(
     NavigationMixin,
     SavePipelineMixin,
     ImageEditorHandoffMixin,
+    HaloRemovalMixin,
     QObject,
 ):
     dataChanged = Signal()  # New signal for general data changes
@@ -555,6 +558,9 @@ class AppController(
     _restackOrderReady = Signal(object)  # Restack EXIF ordering result
     _stackInputsReady = Signal(object)  # Stack paint: input JPG discovery result
     _stackSourceReady = Signal(object)  # Stack paint: decoded + registered input
+    _haloResultReady = Signal(object)  # Halo removal: one layer's correction
+    _haloInstallProgress = Signal(object)  # Halo removal: download progress
+    _haloInstallDone = Signal(object)  # Halo removal: download finished/failed
     _stackHoverReady = Signal(object)  # Stack paint: hover preview render
     # (SidecarManager, outcome) from the background session-position write
     _sessionSidecarWriteFinished = Signal(object, str)
@@ -1099,6 +1105,8 @@ class AppController(
         self.keybinder = Keybinder(self)
         self.ui_state.debugCache = self.debug_cache  # Pass debug_cache state to UI
         self.ui_state.isDecoding = False  # Initialize decoding indicator
+        # Halo removal brush (faststack/controller/halo_removal.py).
+        self._init_halo_removal()
         self.is_zoomed = False  # Track zoom state for high-res loading logic
 
         # Connect model selection changes to UIState for QML property notification
@@ -4771,7 +4779,11 @@ class AppController(
             if normalized_crop_box != (0, 0, 1000, 1000):
                 return True
 
-        for layer in (*effective_layers(edits), *stack_layers(edits)):
+        for layer in (
+            *effective_layers(edits),
+            *stack_layers(edits),
+            *halo_layers(edits),
+        ):
             mask_data = self.image_editor._mask_assets.get(layer["id"])
             if mask_data is not None and mask_data.has_strokes():
                 return True
@@ -11758,6 +11770,7 @@ class AppController(
             "stack paint",
             wait=False,
         )
+        self._shutdown_halo_removal()
         # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
         self._safe_shutdown_executor(
             self._save_executor, "save", wait=True, cancel_futures=False
@@ -12170,7 +12183,7 @@ class AppController(
     def reset_zoom_pan(self):
         """Resets zoom and pan to fit the image in the window (like Ctrl+0 in Photoshop)."""
         log.info("Resetting zoom and pan to fit window")
-        self.ui_state.resetZoomPan()
+        self.ui_state.resetZoomPan(True)  # the user asked: ease back to fit
         self.update_status_message("Reset zoom and pan")
 
     def _persist_sidecar(
@@ -13646,6 +13659,7 @@ class AppController(
         # a no-op when the inputs for this image are already known.
         self._refresh_stack_inputs()
         self._ensure_stack_sources_for_edits()
+        self._schedule_halo_jobs()
         edits = self.image_editor.current_edits
         for key, value in edits.items():
             if hasattr(self.ui_state, key):
@@ -13919,6 +13933,8 @@ class AppController(
         editor._local_density_cache.clear()
         editor._stack_sources = {}
         editor._stack_sources_session_id = None
+        editor._halo_results = {}
+        self._halo_reset_for_navigation()
         if editor.current_edits.get("local_layers"):
             editor.set_local_layers([])
         self._reset_local_brush_session_state()
@@ -14027,6 +14043,10 @@ class AppController(
     def _after_local_edit(self, reason: str) -> None:
         self._clear_active_auto_adjust_state(reason, clear_editor=False)
         self._kick_preview_worker()
+        # Halo layers whose strokes (or the stack paint under them) changed
+        # get a fresh correction; before the refresh, so the layer list
+        # shows the new job.
+        self._schedule_halo_jobs(refresh_ui=False)
         self._refresh_local_brush_ui()
 
     @Slot(str, float)
@@ -14058,8 +14078,9 @@ class AppController(
 
         An empty id also returns to the brush recipe.
         """
-        if is_stack_layer(self._local_layer(layer_id)):
-            return  # stack layers have no recipe to edit
+        layer = self._local_layer(layer_id)
+        if is_stack_layer(layer) or is_halo_layer(layer):
+            return  # stack and halo layers have no recipe to edit
         if not layer_id or layer_id == self._local_editing_layer_id:
             previous = self._local_layer(self._local_editing_layer_id)
             self._local_editing_layer_id = None
@@ -14206,6 +14227,8 @@ class AppController(
             return
         if self.ui_state.brushTool == "stack":
             layer_ids = self._stack_stroke_targets(bool(erase))
+        elif self.ui_state.brushTool == "halo":
+            layer_ids = self._halo_stroke_targets(bool(erase))
         else:
             layer_id = self._local_stroke_target(bool(erase))
             layer_ids = [layer_id] if layer_id is not None else []
@@ -14407,20 +14430,27 @@ class AppController(
         for layer in self._local_layers():
             mask = self.image_editor._mask_assets.get(layer["id"])
             stack = is_stack_layer(layer)
+            halo = is_halo_layer(layer)
             rows.append(
                 {
                     "id": layer["id"],
-                    "kind": "stack" if stack else "recipe",
+                    "kind": "stack" if stack else ("halo" if halo else "recipe"),
                     "source": layer.get("source", ""),
                     "name": f"Layer {layer['id'].removeprefix('L')}",
                     "visible": bool(layer.get("visible", True)),
                     "summary": (
                         stack_input_label(layer["source"])
                         if stack
-                        else self._local_recipe_summary(layer["recipe"])
+                        else (
+                            self._halo_layer_summary(layer)
+                            if halo
+                            else self._local_recipe_summary(layer["recipe"])
+                        )
                     ),
                     "strokes": len(mask.strokes) if mask is not None else 0,
-                    "active": not stack and layer["id"] == self._local_active_layer_id,
+                    "active": not stack
+                    and not halo
+                    and layer["id"] == self._local_active_layer_id,
                     "editing": editing is not None and layer["id"] == editing["id"],
                 }
             )
@@ -14453,18 +14483,21 @@ class AppController(
         scale = self._LOCAL_OVERLAY_LONG_EDGE / max(h, w, 1)
         return max(1, round(h * scale)), max(1, round(w * scale))
 
-    def _update_stack_overlay(self) -> None:
+    def _update_stack_overlay(self, layers: Optional[list] = None) -> None:
         """Mask overlay for stack paint: every visible stack layer, flat.
 
         Rasterised in base image space and warped through the renderer's
         exact geometry, so it lines up with the painted pixels. Stack paint
-        is opaque after one coat, so the overlay does not build up.
+        is opaque after one coat, so the overlay does not build up. The halo
+        brush shows its layers the same way (*layers*).
         """
         ui = self.ui_state
         assets = self.image_editor._mask_assets
+        if layers is None:
+            layers = stack_layers(self.image_editor.current_edits)
         masks = [
             (layer["id"], assets[layer["id"]])
-            for layer in stack_layers(self.image_editor.current_edits)
+            for layer in layers
             if assets.get(layer["id"]) is not None
         ]
         geometry = self._stack_geometry()
@@ -14542,6 +14575,9 @@ class AppController(
         assets = self.image_editor._mask_assets
         if ui.brushTool == "stack":
             self._update_stack_overlay()
+            return
+        if ui.brushTool == "halo":
+            self._update_stack_overlay(halo_layers(self.image_editor.current_edits))
             return
         layer_ids = [self._local_editing_layer_id or self._local_active_layer_id]
         masks = [
@@ -14841,6 +14877,9 @@ class AppController(
         editor._stack_sources = sources
         editor.invalidate_render_cache()
         self._kick_preview_worker()
+        # A halo correction computed while this input was missing did not
+        # include the stack paint that uses it.
+        self._schedule_halo_jobs()
         if self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
             self.update_status_message(
                 f"Stack paint: paint to reveal {label}. "

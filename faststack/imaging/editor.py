@@ -49,6 +49,12 @@ from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orie
 from faststack.imaging.prefetch import apply_loupe_color_correction
 
 # Stack paint: focus-stack input pixels painted over the stacked output
+from faststack.imaging.halo_fix import (
+    HaloResult,
+    composite_halo_layers,
+    halo_identity,
+    halo_layers,
+)
 from faststack.imaging.stack_paint import (
     STACK_OUTPUT_SOURCE,
     StackAlignError,
@@ -1088,6 +1094,10 @@ class ImageEditor:
         # the GUI thread), and the load session they were registered against.
         self._stack_sources: Dict[str, StackSource] = {}
         self._stack_sources_session_id: Optional[str] = None
+        # Halo removal: corrected pixels per halo layer id, computed by the
+        # controller on a worker for this load session (HaloResult is
+        # immutable; the dict is only rebound on the GUI thread).
+        self._halo_results: Dict[str, HaloResult] = {}
 
         # Rendering preferences pushed in from AppController config:
         # soft shoulder/toe on the levels ramp, and TPDF dither on 8-bit
@@ -1144,6 +1154,7 @@ class ImageEditor:
             self._mask_assets.clear()
             self._local_density_cache.clear()
             self._stack_sources = {}
+            self._halo_results = {}
             self._stack_sources_session_id = None
 
     def set_source_exif(self, exif_bytes: Optional[bytes]):
@@ -1341,6 +1352,7 @@ class ImageEditor:
                 self._mask_assets.clear()
                 self._local_density_cache.clear()
                 self._stack_sources = {}
+                self._halo_results = {}
                 self._stack_sources_session_id = None
             log.error("Image file not found: %s", filepath)
             return False
@@ -1366,6 +1378,7 @@ class ImageEditor:
             # same-path replacement can have different geometry, so every real
             # reload gets a fresh set rather than reusing path-keyed sources.
             self._stack_sources = {}
+            self._halo_results = {}
             self._stack_sources_session_id = None
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
@@ -1725,6 +1738,7 @@ class ImageEditor:
                 self._mask_assets.clear()
                 self._local_density_cache.clear()
                 self._stack_sources = {}
+                self._halo_results = {}
                 self._stack_sources_session_id = None
             return False
 
@@ -1799,6 +1813,7 @@ class ImageEditor:
         mask_assets_override: Optional[Dict[str, "MaskData"]] = None,
         cache_override: Optional["LayerDensityCache"] = None,
         stack_sources_override: Optional[Dict[str, StackSource]] = None,
+        halo_results_override: Optional[Dict[str, HaloResult]] = None,
         cache_context: Optional[dict] = None,
         update_highlight_state: bool = True,
         downscale_long_edge: Optional[int] = None,
@@ -1839,7 +1854,9 @@ class ImageEditor:
         stroke masks and their raster cache (export snapshots); by default the
         live ``_mask_assets`` and the preview-thread cache are used.
         ``stack_sources_override`` likewise supplies the registered stack
-        inputs for stack layers (default: the live ``_stack_sources``).
+        inputs for stack layers (default: the live ``_stack_sources``), and
+        ``halo_results_override`` the halo layers' corrected pixels (default:
+        the live ``_halo_results``).
         """
         cv2 = _get_cv2()
         if edits is None:
@@ -1942,6 +1959,22 @@ class ImageEditor:
                 exact_u8 = False
                 stack_ident = stack_identity(edits, stack_masks, stack_sources)
             _mark("stack_paint")
+
+        # 0b. Halo removal: blend the cached corrections the same way (base
+        # space, before geometry). Computing them is the controller's job.
+        if halo_layers(edits):
+            halo_results = (
+                halo_results_override
+                if halo_results_override is not None
+                else self._halo_results
+            )
+            arr, halo_painted = composite_halo_layers(arr, edits, halo_results)
+            if halo_painted:
+                exact_u8 = False
+                stack_ident = (stack_ident or ()) + (
+                    ("halo", halo_identity(edits, halo_results)),
+                )
+            _mark("halo_fix")
 
         # NOTE: For UI analysis, we want to capture the state AFTER White Balance and Exposure
         # but BEFORE Highlights/Shadows/ToneMapping, so the indicators reflect the
@@ -4689,6 +4722,7 @@ class ImageEditor:
 
             # --- Stack paint inputs (immutable objects; copy the dict) ---
             stack_sources_snapshot = dict(self._stack_sources)
+            halo_results_snapshot = dict(self._halo_results)
 
             # --- Paths ---
             filepath_snapshot = self.current_filepath
@@ -4728,6 +4762,7 @@ class ImageEditor:
             "developed_path": developed_path,
             "mask_assets": mask_assets_snapshot,
             "stack_sources": stack_sources_snapshot,
+            "halo_results": halo_results_snapshot,
             # Optional callable(name) -> Path the controller may add so the
             # save worker can load stack inputs that were not loaded yet.
             "stack_source_resolver": None,
@@ -4815,6 +4850,15 @@ class ImageEditor:
             snapshot.get("stack_source_resolver"),
             source_arr,
         )
+        # Halo corrections a layer needs but the preview has not finished
+        # (or that are stale) are computed here.
+        halo_results = self._halo_results_for_export(
+            edits_snapshot,
+            mask_override,
+            dict(snapshot.get("halo_results") or {}),
+            source_arr,
+            stack_sources,
+        )
 
         # 1. Apply edits to full resolution — uses only snapshot data
         # Use isolated snapshot context so background export doesn't pollute self._cached_*
@@ -4827,6 +4871,7 @@ class ImageEditor:
             mask_assets_override=mask_override,
             cache_override=export_cache,
             stack_sources_override=stack_sources,
+            halo_results_override=halo_results,
             cache_context=export_cache_context,
             update_highlight_state=False,
             # The snapshot shares the live editor's float_image (see
@@ -4994,6 +5039,65 @@ class ImageEditor:
         finally:
             for tmp_output, _destination in temp_outputs:
                 tmp_output.unlink(missing_ok=True)
+
+    @staticmethod
+    def _halo_results_for_export(
+        edits: Dict[str, Any],
+        masks: Dict[str, MaskData],
+        results: Dict[str, HaloResult],
+        source_arr: np.ndarray,
+        stack_sources: Dict[str, StackSource],
+    ) -> Dict[str, HaloResult]:
+        """Compute halo corrections the export needs; runs on the save worker.
+
+        A layer whose correction cannot be computed here (the model is not
+        installed on this machine, or its strokes cannot be analysed) is left
+        out, as the preview leaves it out, rather than failing the save.
+        """
+        from faststack.imaging.halo_fix import (
+            HaloFixError,
+            compute_halo_fix,
+            halo_base,
+            halo_signature,
+        )
+
+        base: Optional[np.ndarray] = None
+        for layer in halo_layers(edits):
+            layer_id = layer["id"]
+            signature = halo_signature(
+                masks.get(layer_id), edits, masks, stack_sources
+            )
+            if signature is None:
+                results.pop(layer_id, None)
+                continue
+            have = results.get(layer_id)
+            if (
+                have is not None
+                and have.signature == signature
+                and have.base_shape == tuple(source_arr.shape[:2])
+            ):
+                continue
+            from faststack.ai.inpaint import InpaintUnavailable, get_inpainter
+
+            try:
+                inpainter = get_inpainter()
+                if base is None:
+                    base = halo_base(source_arr, edits, masks, stack_sources)
+                result = compute_halo_fix(
+                    base, masks[layer_id], signature, inpainter.inpaint
+                )
+            except (InpaintUnavailable, HaloFixError) as exc:
+                log.warning(
+                    "Halo removal layer %s left out of the saved photo: %s",
+                    layer_id,
+                    exc,
+                )
+                result = None
+            if result is None:
+                results.pop(layer_id, None)
+            else:
+                results[layer_id] = result
+        return results
 
     @staticmethod
     def _stack_sources_for_export(
