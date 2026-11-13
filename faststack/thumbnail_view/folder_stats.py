@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from faststack.io.utils import scandir_unique
 from faststack.logging_setup import get_app_data_dir
 
 log = logging.getLogger(__name__)
@@ -310,8 +311,7 @@ def _scan_folder_names(
     names: set = set()
     stems: set = set()
     try:
-        with os.scandir(folder_path) as entries:
-            scanned = list(entries)
+        scanned = scandir_unique(folder_path)
         for entry in scanned:
             if entry.is_file():
                 # FASTER: os.path.splitext is string-based, avoids Path object creation
@@ -589,8 +589,7 @@ def get_file_counts_by_extension(folder_path: Path) -> Dict[str, int]:
     """
     counts: Counter[str] = Counter()
     try:
-        with os.scandir(folder_path) as entries:
-            scanned = list(entries)
+        scanned = scandir_unique(folder_path)
         for entry in scanned:
             if entry.is_file():
                 name = entry.name

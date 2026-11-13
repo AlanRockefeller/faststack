@@ -566,6 +566,22 @@ def _sidecar_write_lock(lock_path: Path) -> Iterator[None]:
             _unlock_sidecar_file(lock_file)
 
 
+def _directory_has_images(directory: Path) -> bool:
+    """True if ``directory`` holds at least one JPEG or RAW file.
+
+    Stops at the first match. An unreadable directory counts as having
+    images, so a failure to look never suppresses a save.
+    """
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                if os.path.splitext(entry.name)[1].lower() in KNOWN_IMAGE_EXTENSIONS:
+                    return True
+    except OSError:
+        return True
+    return False
+
+
 class SidecarManager:
     def __init__(self, directory: Path, watcher, debug: bool = False):
         self.directory = directory
@@ -775,6 +791,31 @@ class SidecarManager:
         self._recovery_backup_notice = None
         return backup
 
+    def _skip_write_for_imageless_folder(self, payload: dict) -> bool:
+        """True when writing would only litter a folder that has no images.
+
+        Opening a folder without images (a parent folder, a download folder)
+        still runs the session-position and shutdown saves. Those would create
+        ``faststack.json`` and ``faststack.json.lock`` holding nothing but a
+        position. Skip the write, and the lock that comes with it, while no
+        sidecar exists yet, the payload carries no per-image or stack data,
+        and the folder holds no JPEG or RAW file.
+        """
+        if self.path.exists():
+            return False
+        if any(
+            payload.get(key)
+            for key in (
+                "entries",
+                "stacks",
+                "stack_paths",
+                "stack_order",
+                "ambiguous_legacy_keys",
+            )
+        ):
+            return False
+        return not _directory_has_images(self.directory)
+
     def save(self, *, replace_unreadable: bool = False) -> bool:
         """Merge and atomically persist state, returning durable success.
 
@@ -801,6 +842,12 @@ class SidecarManager:
                     # shutdown all call save() back to back, usually with no
                     # new state. A foreign write after this stat cannot lose
                     # anything of ours, since we have nothing new to contribute.
+                    self._dirty = False
+                    self._last_save_error = None
+                    return True
+                if not self._load_failed and self._skip_write_for_imageless_folder(
+                    ours
+                ):
                     self._dirty = False
                     self._last_save_error = None
                     return True
@@ -1221,6 +1268,12 @@ class SidecarManager:
                 return "conflict"
             try:
                 if ours == self._baseline_payload and self._disk_matches_baseline():
+                    with self._state_lock:
+                        if seq == self._latest_save_seq:
+                            self._dirty = False
+                    self._last_save_error = None
+                    return "unchanged"
+                if self._skip_write_for_imageless_folder(ours):
                     with self._state_lock:
                         if seq == self._latest_save_seq:
                             self._dirty = False

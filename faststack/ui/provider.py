@@ -681,7 +681,8 @@ class UIState(QObject):
         Signal()
     )  # Optional override color for the status message
     automaticMonitoringAvailableChanged = Signal()
-    resetZoomPanRequested = Signal()  # Signal to tell QML to reset zoom/pan
+    # Tell QML to reset zoom/pan; True eases there instead of jumping.
+    resetZoomPanRequested = Signal(bool)
     absoluteZoomRequested = Signal(
         float
     )  # New: Request absolute zoom level (1.0, 2.0, etc.)
@@ -777,6 +778,7 @@ class UIState(QObject):
     brush_tool_changed = Signal(str)
     stack_inputs_changed = Signal()
     stack_input_name_changed = Signal(str)
+    halo_state_changed = Signal()
     stack_hover_generation_changed = Signal()
 
     # Debug Cache Signals
@@ -875,8 +877,9 @@ class UIState(QObject):
         self._local_editing_layer_id = ""
         self._local_recipe: dict = {}
         self._local_brush_summary = ""
-        # Which brush is active in brush mode: "local" (dodge & burn) or
-        # "stack" (paint a focus-stack input over the stacked photo).
+        # Which brush is active in brush mode: "local" (dodge & burn),
+        # "stack" (paint a focus-stack input over the stacked photo) or
+        # "halo" (paint over a stacking halo to remove it).
         self._brush_tool = "local"
         self._stack_inputs: list = []  # [{"name", "label"}], near to far
         self._stack_input_name = ""
@@ -884,6 +887,9 @@ class UIState(QObject):
         self._stack_hover_image = None
         self._stack_hover_generation = 0
         self._stack_hover_serial = 0
+        # Halo removal: download prompt/progress and work status, one map so
+        # QML binds to a single property (see AppController._set_halo_state).
+        self._halo_state: dict = {}
 
         # Debug Cache State
         self._debug_cache = False
@@ -929,6 +935,14 @@ class UIState(QObject):
         if hasattr(self.app_controller, "batchAutoLevelsFinished"):
             self.app_controller.batchAutoLevelsFinished.connect(
                 self._on_batch_al_finished
+            )
+
+        # isZoomed is driven by AppController.set_zoomed. Forward its change so
+        # QML bindings on isZoomed update: the loupe keeps a bound copy rather
+        # than calling into Python on every zoom frame.
+        if hasattr(self.app_controller, "is_zoomed_changed"):
+            self.app_controller.is_zoomed_changed.connect(
+                lambda _zoomed: self.isZoomedChanged.emit()
             )
 
         # Ensure image source updates when switching grid/loupe
@@ -1832,9 +1846,14 @@ class UIState(QObject):
         self.app_controller.on_display_size_changed(width, height)
 
     @Slot()
-    def resetZoomPan(self):
-        """Triggers a reset of zoom and pan in QML."""
-        self.resetZoomPanRequested.emit()
+    @Slot(bool)
+    def resetZoomPan(self, animated: bool = False):
+        """Triggers a reset of zoom and pan in QML.
+
+        ``animated`` eases the view back to fit (the user asked for it);
+        otherwise it is put there at once.
+        """
+        self.resetZoomPanRequested.emit(animated)
 
     # --- Image Editor Properties ---
 
@@ -2592,6 +2611,17 @@ class UIState(QObject):
         if self._stack_inputs != new_value:
             self._stack_inputs = new_value
             self.stack_inputs_changed.emit()
+
+    @Property("QVariantMap", notify=halo_state_changed)
+    def haloState(self) -> dict:
+        """Halo removal status: install prompt, download progress, busy."""
+        return self._halo_state
+
+    @haloState.setter
+    def haloState(self, new_value: dict):
+        if self._halo_state != new_value:
+            self._halo_state = dict(new_value)
+            self.halo_state_changed.emit()
 
     @Property(str, notify=stack_input_name_changed)
     def stackInputName(self) -> str:

@@ -5,15 +5,25 @@
 * ``image://inatphoto/{batch}/{index}?w=320`` - a card thumbnail, EXIF-rotated.
   ``batch`` changes every time the dialog opens a new set of photos, so Qt's
   image cache never shows a thumbnail from the previous batch.
+* ``image://inatobs/{observation id}/{size}[/{index}]`` - a photo (the first
+  unless ``index`` says otherwise) of one of the user's observations on
+  iNaturalist ("square" or "small"), for the map and for an observation a
+  card adds photos to.
 
-Both are plain (synchronous) providers; QML ``Image { asynchronous: true }``
-runs them on Qt's image-loading threads, so a network fetch never blocks the
-UI thread.
+All are plain (synchronous) providers; QML ``Image { asynchronous: true }``
+runs them on Qt's image-loading thread, so a network fetch never blocks the
+UI thread.  That is one thread for every provider of the engine, so the map
+markers' images are downloaded by the iNat controller beforehand and
+``inatobs`` serves them from memory; only the single hover preview is
+fetched here.  (PySide6's ``QQuickAsyncImageProvider`` deadlocked the GUI
+thread when tried with PySide6 6.11.)
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -54,12 +64,55 @@ class TileImageProvider(QQuickImageProvider):
         return image
 
 
+class ObservationThumbProvider(QQuickImageProvider):
+    """Photos of the user's iNaturalist observations shown on the map."""
+
+    def __init__(self, fetch: Callable[..., Optional[bytes]]):
+        super().__init__(QQuickImageProvider.ImageType.Image)
+        self._fetch = fetch
+
+    def requestImage(self, id_str: str, size: QSize, _requested: QSize) -> QImage:
+        # A null image is a failed load, which Qt does not cache, so the
+        # next request for this URL tries again (a placeholder would stick).
+        image = QImage()
+        # {observation id}/{size}[/{photo index}]
+        parts = id_str.split("?")[0].strip("/").split("/")
+        try:
+            size_name = parts[1] if len(parts) > 1 else "square"
+            if len(parts) > 2:
+                data = self._fetch(int(parts[0]), size_name, int(parts[2]))
+            else:
+                data = self._fetch(int(parts[0]), size_name)
+        except ValueError:
+            data = None
+        if data:
+            decoded = QImage.fromData(data)
+            if not decoded.isNull():
+                image = decoded
+        size.setWidth(image.width())
+        size.setHeight(image.height())
+        return image
+
+
+# The full-screen viewer's images are far larger than Qt's own pixmap cache
+# will hold once nothing displays them, so they are kept here instead.
+LARGE_PHOTO_MIN_WIDTH = 1024
+LARGE_PHOTO_CACHE_BYTES = 400 * 1024 * 1024
+
+
 class CardPhotoProvider(QQuickImageProvider):
     """Thumbnails for the observation cards, keyed by photo index."""
 
     def __init__(self, path_getter: Callable[[int], Optional[Path]]):
         super().__init__(QQuickImageProvider.ImageType.Image)
         self._path_getter = path_getter
+        # (path, mtime_ns, file size, width) -> decoded image, oldest first.
+        self._large: OrderedDict[tuple, QImage] = OrderedDict()
+        self._large_bytes = 0
+        self._large_lock = threading.Lock()
+        # Bumped by clear_large(): a decode that started before the clear
+        # must not put its image back into the emptied cache.
+        self._large_generation = 0
         self._placeholder = QImage(4, 3, QImage.Format.Format_RGB32)
         self._placeholder.fill(QColor("#444444"))
 
@@ -75,10 +128,27 @@ class CardPhotoProvider(QQuickImageProvider):
             width = int(query.get("w", ["320"])[0])
         except ValueError:
             width = 320
-        width = max(64, min(width, 1600))
+        width = max(64, min(width, 4096))  # the full-screen viewer asks for more
         path = self._path_getter(index)
         if path is None:
             return self._fail(size)
+        cache_key = None
+        if width >= LARGE_PHOTO_MIN_WIDTH:
+            try:
+                stat = path.stat()
+                cache_key = (str(path), stat.st_mtime_ns, stat.st_size, width)
+            except OSError:
+                cache_key = None
+        if cache_key is not None:
+            with self._large_lock:
+                generation = self._large_generation
+                cached = self._large.get(cache_key)
+                if cached is not None:
+                    self._large.move_to_end(cache_key)
+            if cached is not None:
+                size.setWidth(cached.width())
+                size.setHeight(cached.height())
+                return cached
         try:
             with Image.open(path) as img:
                 w, h = img.size
@@ -96,9 +166,34 @@ class CardPhotoProvider(QQuickImageProvider):
         except Exception as exc:
             log.debug("Card thumbnail failed for %s: %s", path, exc)
             return self._fail(size)
+        if cache_key is not None:
+            self._remember(cache_key, qimg, generation)
         size.setWidth(qimg.width())
         size.setHeight(qimg.height())
         return qimg
+
+    def _remember(self, key: tuple, image: QImage, generation: int) -> None:
+        cost = image.sizeInBytes()
+        if cost > LARGE_PHOTO_CACHE_BYTES:
+            return
+        with self._large_lock:
+            if generation != self._large_generation:
+                return  # the dialog closed while this was decoding
+            old = self._large.pop(key, None)
+            if old is not None:
+                self._large_bytes -= old.sizeInBytes()
+            self._large[key] = image
+            self._large_bytes += cost
+            while self._large_bytes > LARGE_PHOTO_CACHE_BYTES and len(self._large) > 1:
+                _, dropped = self._large.popitem(last=False)
+                self._large_bytes -= dropped.sizeInBytes()
+
+    def clear_large(self) -> None:
+        """Free the full-screen images (the upload dialog was closed)."""
+        with self._large_lock:
+            self._large.clear()
+            self._large_bytes = 0
+            self._large_generation += 1
 
     def _fail(self, size: QSize) -> QImage:
         size.setWidth(self._placeholder.width())

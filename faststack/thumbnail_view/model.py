@@ -19,7 +19,11 @@ from PySide6.QtCore import (
 )
 
 from faststack.io.indexer import DirectoryScanError, find_images
-from faststack.io.utils import compute_path_hash, normalize_path_key
+from faststack.io.utils import (
+    compute_path_hash,
+    normalize_path_key,
+    scandir_unique,
+)
 from faststack.models import filesystem_source_identity
 from faststack.thumbnail_view.folder_stats import (
     FolderStats,
@@ -367,8 +371,7 @@ class ThumbnailModel(QAbstractListModel):
         # Scan for folders
         folders: List[ThumbnailEntry] = []
         try:
-            with os.scandir(self._current_directory) as dir_entries:
-                scanned = list(dir_entries)
+            scanned = scandir_unique(self._current_directory)
             for entry in scanned:
                 if entry.is_dir() and not entry.name.startswith("."):
                     folder_path = Path(entry.path)

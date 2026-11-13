@@ -12,7 +12,13 @@ Window {
     id: compactEditor
     width: 320
     height: Screen.desktopAvailableHeight * 0.85
-    minimumWidth: 280
+    // Never narrower than the widest row needs: the header's buttons have
+    // fixed widths, and a viewport narrower than them pushes every row right
+    // (the slider readouts end up under the scrollbar and clipped). Fonts
+    // decide the exact figure, so it is measured rather than hard-coded.
+    minimumWidth: Math.min(maximumWidth, Math.max(280, Math.ceil(editorColumn.implicitWidth)
+                  + editorScroll.anchors.leftMargin + editorScroll.anchors.rightMargin
+                  + editorScroll.leftPadding + editorScroll.rightPadding))
     maximumWidth: 400
     minimumHeight: 500
     title: "Image Editor"
@@ -121,6 +127,11 @@ Window {
     onXChanged: saveGeometryTimer.restart()
     onYChanged: saveGeometryTimer.restart()
     onWidthChanged: saveGeometryTimer.restart()
+    // A minimum that rises after the window is shown (fonts loaded, scrollbar
+    // appeared) does not always resize it, so do it here.
+    onMinimumWidthChanged: {
+        if (compactEditor.width < compactEditor.minimumWidth) compactEditor.width = compactEditor.minimumWidth
+    }
     onHeightChanged: saveGeometryTimer.restart()
     onActiveChanged: {
         if (active) {
@@ -138,12 +149,18 @@ Window {
     // --- Color Palette (matches full editor) ---
     readonly property color backgroundColor: "#1e1e1e"
     readonly property color textColor: "white"
-    // Brush mode has two tools. Dodge & burn (recipeMode) tints the sliders
-    // orange: they edit a local recipe instead of the global edit. Stack
-    // paint (stackMode) paints a stack input frame; the sliders stay global.
+    // Brush mode has three tools. Dodge & burn (recipeMode) tints the
+    // sliders orange: they edit a local recipe instead of the global edit.
+    // Stack paint (stackMode) paints a stack input frame and halo removal
+    // (haloMode) paints over a stacking halo; for both the sliders stay global.
     readonly property bool brushMode: compactEditor.uiStateRef ? compactEditor.uiStateRef.isBrushMode : false
     readonly property bool stackMode: compactEditor.brushMode && !!compactEditor.uiStateRef && compactEditor.uiStateRef.brushTool === "stack"
-    readonly property bool recipeMode: compactEditor.brushMode && !compactEditor.stackMode
+    readonly property bool haloMode: compactEditor.brushMode && !!compactEditor.uiStateRef && compactEditor.uiStateRef.brushTool === "halo"
+    readonly property bool recipeMode: compactEditor.brushMode && !compactEditor.stackMode && !compactEditor.haloMode
+    // Halo removal: install prompt, download progress and work status.
+    readonly property var haloState: compactEditor.uiStateRef ? compactEditor.uiStateRef.haloState : ({})
+    readonly property color haloAccent: "#38bdf8"
+    readonly property color haloAccentHover: "#7dd3fc"
     // Stack paint needs an in-camera stacked JPG whose input JPGs were found.
     readonly property bool stackPaintAvailable: !!compactEditor.uiStateRef && compactEditor.uiStateRef.stackInputs.length > 0
     readonly property int stackInputIndex: {
@@ -160,8 +177,10 @@ Window {
     readonly property color accentColor: compactEditor.recipeMode ? "#f59e0b" : "#6366f1"
     readonly property color accentColorHover: compactEditor.recipeMode ? "#fbbf24" : "#818cf8"
     // Accent of the brush panel (brush size, mask toggle, layer rows).
-    readonly property color panelAccent: compactEditor.stackMode ? compactEditor.stackAccent : compactEditor.accentColor
-    readonly property color panelAccentHover: compactEditor.stackMode ? compactEditor.stackAccentHover : compactEditor.accentColorHover
+    readonly property color panelAccent: compactEditor.stackMode ? compactEditor.stackAccent
+                                         : compactEditor.haloMode ? compactEditor.haloAccent : compactEditor.accentColor
+    readonly property color panelAccentHover: compactEditor.stackMode ? compactEditor.stackAccentHover
+                                              : compactEditor.haloMode ? compactEditor.haloAccentHover : compactEditor.accentColorHover
     readonly property color controlBg: "#10ffffff"
     readonly property color controlBorder: "#30ffffff"
     readonly property color separatorColor: "#20ffffff"
@@ -523,6 +542,197 @@ Window {
         "• The sliders keep editing the whole photo, painted frame included, and dodge &amp; burn layers apply on top.<br>" +
         "• Layers are saved with the edit; reopening the photo re-aligns the frames."
 
+    readonly property string haloHelpText:
+        "<b>Remove Halo</b><br>" +
+        "Paint over a focus-stacking halo — the dark ring, ghost edge or glow around a subject — and FastStack rebuilds the background there.<br><br>" +
+        "<b>Painting</b><br>" +
+        "• Paint over the halo, overlapping the subject's edge a little. Going round the whole subject works best: what the stroke encloses is taken as the subject and kept.<br>" +
+        "• Paint as far out as the glow reaches; the glow is only removed where you paint.<br>" +
+        "• Stems and twigs the stroke crosses are rebuilt along with the background.<br>" +
+        "• Each stroke is processed in the background (about 10–30 s); the photo updates when it is done.<br>" +
+        "• Right-drag or Alt+drag: erase (brings that part of the halo back)<br><br>" +
+        "<b>Keys</b><br>" +
+        "• <b>[ ]</b> brush size &nbsp;·&nbsp; <b>Ctrl+Z</b>: undo last stroke<br>" +
+        "• hold <b>Space</b>: show original &nbsp;·&nbsp; <b>M</b>: toggle mask overlay &nbsp;·&nbsp; <b>Esc</b>: leave<br><br>" +
+        "<b>Good to know</b><br>" +
+        "• The rebuilt background is generated by the LaMa model from the surrounding pixels, not recorded by the camera.<br>" +
+        "• Everything runs on this computer; nothing is uploaded.<br>" +
+        "• The layer is saved with the edit and recomputed when the photo is reopened."
+
+    // First use of halo removal: say what would be downloaded, from where,
+    // how big, what it does and what to keep in mind, before anything is
+    // fetched. Turns into the download's progress once accepted.
+    Popup {
+        id: haloInstallPopup
+        x: 8
+        y: 40
+        width: compactEditor.width - 16
+        height: Math.min(compactEditor.height - 56, haloInstallColumn.implicitHeight + 24)
+        padding: 12
+        modal: true
+        closePolicy: Popup.CloseOnEscape
+        // Driven by haloState.promptVisible (open()/close(), not a visible
+        // binding, which Esc would break).
+        Connections {
+            target: compactEditor
+            function onHaloStateChanged() {
+                var want = !!compactEditor.haloState.promptVisible
+                if (want && !haloInstallPopup.opened) haloInstallPopup.open()
+                else if (!want && haloInstallPopup.opened) haloInstallPopup.close()
+            }
+        }
+        onClosed: {
+            if (compactEditor.haloState.promptVisible && compactEditor.controllerRef)
+                compactEditor.controllerRef.halo_install_decline()
+            compactEditor.focusKeyboardHandler()
+        }
+        background: Rectangle {
+            color: "#262626"
+            radius: 6
+            border.color: compactEditor.haloAccent
+            border.width: 1
+        }
+
+        Flickable {
+            anchors.fill: parent
+            contentHeight: haloInstallColumn.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            ColumnLayout {
+                id: haloInstallColumn
+                width: parent.width
+                spacing: 8
+
+                Text {
+                    Layout.fillWidth: true
+                    text: "Download halo removal?"
+                    color: "#e8e6e3"
+                    font.pixelSize: 13
+                    font.weight: Font.DemiBold
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    textFormat: Text.StyledText
+                    color: "#e8e6e3"
+                    font.pixelSize: 11
+                    text: {
+                        var st = compactEditor.haloState
+                        var parts = []
+                        if (st.runtimeNeeded)
+                            parts.push("• <b>ONNX Runtime " + st.runtimeVersion + "</b> — the engine that runs the model " +
+                                       "(Microsoft, MIT licence), from PyPI")
+                        if (st.modelNeeded)
+                            parts.push("• <b>LaMa inpainting model</b> — fills in background " +
+                                       "(Samsung AI Center, Apache-2.0 licence), from Hugging Face")
+                        return "<b>What you get</b><br>" +
+                            "Paint over the halo around a focus-stacked subject — the dark ring, ghost edge and glow — " +
+                            "and FastStack rebuilds the background there from its surroundings. " +
+                            "The subject itself is kept as it is.<br><br>" +
+                            "<b>What gets downloaded</b><br>" +
+                            "Halo removal uses an AI inpainting model that is not part of FastStack:<br>" +
+                            parts.join("<br>") + "<br>" +
+                            "Download: about " + st.downloadMB + " MB &nbsp;·&nbsp; disk space: about " + st.diskMB + " MB, in<br>" +
+                            "<i>" + st.folder + "</i><br><br>" +
+                            "<b>Good to know</b><br>" +
+                            "• It runs on this computer and works offline after the download. Your photos are never uploaded.<br>" +
+                            "• Each brush stroke takes roughly 10–30 seconds to process, on the CPU.<br>" +
+                            "• The rebuilt background is generated from the surrounding pixels, not recorded by the camera: " +
+                            "right for a blurred background, not where the background itself is what the photo documents.<br>" +
+                            "• Both files are checked against published checksums before use. Deleting the folder above removes them."
+                    }
+                }
+
+                // Download progress.
+                ColumnLayout {
+                    visible: !!compactEditor.haloState.downloading
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: 6
+                        radius: 3
+                        color: "#18ffffff"
+                        Rectangle {
+                            width: parent.width * Math.max(0, Math.min(1, compactEditor.haloState.progress || 0))
+                            height: parent.height
+                            radius: 3
+                            color: compactEditor.haloAccent
+                        }
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: compactEditor.haloState.progressText || ""
+                        color: "#9a9795"
+                        font.pixelSize: 10
+                        elide: Text.ElideRight
+                    }
+                }
+
+                Text {
+                    visible: !!compactEditor.haloState.error
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    text: compactEditor.haloState.error || ""
+                    color: "#f87171"
+                    font.pixelSize: 11
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    Item { Layout.fillWidth: true }
+
+                    Button {
+                        id: haloDeclineBtn
+                        implicitHeight: 26
+                        leftPadding: 10; rightPadding: 10
+                        flat: true
+                        onClicked: if (compactEditor.controllerRef) compactEditor.controllerRef.halo_install_decline()
+                        contentItem: Text {
+                            text: compactEditor.haloState.downloading ? "Cancel" : "Not now"
+                            font.pixelSize: 11
+                            color: haloDeclineBtn.hovered ? "#e8e6e3" : "#9a9795"
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: haloDeclineBtn.hovered ? "#30ffffff" : "#18ffffff"
+                            border.color: "#3a3a3a"; border.width: 1
+                        }
+                    }
+
+                    Button {
+                        id: haloAcceptBtn
+                        visible: !compactEditor.haloState.downloading
+                        implicitHeight: 26
+                        leftPadding: 10; rightPadding: 10
+                        flat: true
+                        onClicked: if (compactEditor.controllerRef) compactEditor.controllerRef.halo_install_accept()
+                        contentItem: Text {
+                            text: (compactEditor.haloState.error ? "Try again" : "Download") +
+                                  " (" + compactEditor.haloState.downloadMB + " MB)"
+                            font.pixelSize: 11
+                            font.weight: Font.DemiBold
+                            color: "#1e1e1e"
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: haloAcceptBtn.hovered ? compactEditor.haloAccentHover : compactEditor.haloAccent
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Brush quick reference (the ? button in brush mode).
     Popup {
         id: brushHelpPopup
@@ -561,7 +771,7 @@ Window {
                 color: "#e8e6e3"
                 font.pixelSize: 11
                 linkColor: compactEditor.panelAccentHover
-                text: compactEditor.stackMode ? compactEditor.stackHelpText : "<b>Dodge &amp; Burn</b><br>" +
+                text: compactEditor.stackMode ? compactEditor.stackHelpText : compactEditor.haloMode ? compactEditor.haloHelpText : "<b>Dodge &amp; Burn</b><br>" +
                       "Paint any of the slider effects onto part of the photo.<br><br>" +
                       "<b>Choosing the effect</b><br>" +
                       "• With <i>New strokes</i> selected, the orange sliders set the recipe for the next stroke (e.g. Exposure −30 to burn, +30 to dodge; mix in any sliders).<br>" +
@@ -620,13 +830,17 @@ Window {
         id: editorScroll
         anchors.fill: parent
         anchors.margins: 8
-        rightPadding: editorScroll.ScrollBar.vertical.visible ? editorScroll.ScrollBar.vertical.width + 4 : 0
+        // Room for the scrollbar only while there is something to scroll: an
+        // AsNeeded bar stays "visible" (just faded out) when everything fits,
+        // which left a lopsided gap on the right.
+        rightPadding: editorScroll.ScrollBar.vertical.size < 1.0 ? editorScroll.ScrollBar.vertical.width + 4 : 0
         clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         ScrollBar.vertical.policy: ScrollBar.AsNeeded
         contentWidth: editorScroll.availableWidth
 
         ColumnLayout {
+            id: editorColumn
             width: editorScroll.availableWidth
             spacing: 6
 
@@ -791,6 +1005,44 @@ Window {
                                 border.color: "#3a3a3a"
                                 border.width: 1
                             }
+                        }
+                    }
+
+                    // Halo removal (downloads its model the first time).
+                    Button {
+                        id: haloModeBtn
+                        implicitHeight: 26
+                        Layout.preferredHeight: 26
+                        enabled: !compactEditor.cropActive
+                        padding: 0
+                        leftPadding: 6; rightPadding: 6
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.haloMode ? "Leave halo removal"
+                                      : (compactEditor.haloState.installed ? "Remove halo: paint over a stacking halo"
+                                         : "Remove halo: paint over a stacking halo (downloads an AI model the first time)")
+                        onClicked: {
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_halo_brush_mode()
+                            compactEditor.focusKeyboardHandler()
+                        }
+                        contentItem: Text {
+                            text: "Halo"
+                            font.pixelSize: 11
+                            font.weight: compactEditor.haloMode ? Font.DemiBold : Font.Normal
+                            color: !haloModeBtn.enabled ? "#55524f"
+                                   : compactEditor.haloMode ? "#1e1e1e"
+                                   : (haloModeBtn.hovered ? compactEditor.haloAccentHover : compactEditor.textColor)
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: compactEditor.haloMode ? compactEditor.haloAccent
+                                   : (haloModeBtn.hovered ? "#30ffffff" : "transparent")
+                            border.color: compactEditor.haloMode ? "transparent"
+                                          : (haloModeBtn.enabled ? compactEditor.controlBorder : "#18ffffff")
+                            border.width: 1
                         }
                     }
                 }
@@ -1075,7 +1327,7 @@ Window {
                     spacing: 4
 
                     Text {
-                        text: compactEditor.stackMode ? "STACK PAINT" : "DODGE & BURN"
+                        text: compactEditor.stackMode ? "STACK PAINT" : compactEditor.haloMode ? "REMOVE HALO" : "DODGE & BURN"
                         font.pixelSize: 9
                         font.weight: Font.DemiBold
                         font.letterSpacing: 1.0
@@ -1123,7 +1375,8 @@ Window {
                         flat: true
                         ToolTip.visible: hovered
                         ToolTip.delay: 500
-                        ToolTip.text: compactEditor.stackMode ? "How stack paint works" : "How dodge & burn works"
+                        ToolTip.text: compactEditor.stackMode ? "How stack paint works"
+                                      : compactEditor.haloMode ? "How halo removal works" : "How dodge & burn works"
                         onClicked: brushHelpPopup.opened ? brushHelpPopup.close() : brushHelpPopup.open()
                         contentItem: Text {
                             text: "?"
@@ -1188,11 +1441,36 @@ Window {
                     }
                 }
 
+                // Halo removal: what to do, or that a stroke is being worked on.
+                Rectangle {
+                    visible: compactEditor.haloMode
+                    Layout.fillWidth: true
+                    implicitHeight: haloStatusText.implicitHeight + 8
+                    radius: 3
+                    color: "#3338bdf8"
+                    border.color: compactEditor.haloAccent
+                    border.width: 1
+
+                    Text {
+                        id: haloStatusText
+                        anchors.fill: parent
+                        anchors.margins: 4
+                        anchors.leftMargin: 6
+                        verticalAlignment: Text.AlignVCenter
+                        wrapMode: Text.WordWrap
+                        text: compactEditor.haloState.busy
+                              ? "Removing halo… the photo updates when it is done."
+                              : "Paint over the halo, a little onto the subject's edge."
+                        color: compactEditor.textColor
+                        font.pixelSize: 10
+                    }
+                }
+
                 // The recipe the next new layer gets. Selected whenever no
                 // layer is being edited.
                 Rectangle {
                     id: newStrokesRow
-                    visible: !compactEditor.stackMode
+                    visible: !compactEditor.stackMode && !compactEditor.haloMode
                     readonly property bool selected: !compactEditor.uiStateRef || compactEditor.uiStateRef.localEditingLayerId === ""
                     Layout.fillWidth: true
                     implicitHeight: 22
@@ -1229,8 +1507,11 @@ Window {
                         id: layerRow
                         required property var modelData
                         readonly property bool isStack: layerRow.modelData.kind === "stack"
+                        readonly property bool isHalo: layerRow.modelData.kind === "halo"
                         // Each tool lists only its own layers.
-                        visible: layerRow.isStack === compactEditor.stackMode
+                        visible: compactEditor.stackMode ? layerRow.isStack
+                                 : compactEditor.haloMode ? layerRow.isHalo
+                                 : (!layerRow.isStack && !layerRow.isHalo)
                         Layout.fillWidth: true
                         implicitHeight: 22
                         radius: 3
@@ -1249,7 +1530,7 @@ Window {
                                     // A stack layer has no recipe: clicking it
                                     // picks its frame for the next strokes.
                                     if (layerRow.isStack) compactEditor.controllerRef.set_stack_input(layerRow.modelData.source)
-                                    else compactEditor.controllerRef.select_local_layer(layerRow.modelData.id)
+                                    else if (!layerRow.isHalo) compactEditor.controllerRef.select_local_layer(layerRow.modelData.id)
                                 }
                                 compactEditor.focusKeyboardHandler()
                             }

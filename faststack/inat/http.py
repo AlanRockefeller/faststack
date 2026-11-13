@@ -164,6 +164,14 @@ class HttpClient:
             return resp.json()
         raise self._error(resp)
 
+    def get_bytes(self, url: str, timeout: Optional[float] = None) -> bytes:
+        """The body of a GET as it came (an image, say)."""
+        hdrs = {"User-Agent": self.user_agent}
+        resp = self._transport("GET", url, hdrs, None, timeout or self.timeout)
+        if 200 <= resp.status < 300:
+            return resp.body
+        raise self._error(resp)
+
     @staticmethod
     def _error(resp: HttpResponse) -> ApiError:
         data = resp.json()

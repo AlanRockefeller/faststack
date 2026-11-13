@@ -21,6 +21,9 @@ log = logging.getLogger(__name__)
 
 _DATETIME_ORIGINAL = 0x9003
 _DATETIME = 0x0132
+_MAKE = 0x010F
+_MODEL = 0x0110
+_BODY_SERIAL = 0xA431
 _EXIF_DT_RE = re.compile(r"(\d{4})[:\-](\d{2})[:\-](\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
 
 
@@ -42,6 +45,20 @@ def parse_exif_datetime(value: object) -> Optional[datetime]:
     return dt
 
 
+def camera_identity(exif, sub: dict) -> str:
+    """"Make Model #serial" from EXIF, as far as the camera wrote it."""
+    parts = []
+    for raw in (exif.get(_MAKE), exif.get(_MODEL)):
+        text = clean_exif_value(raw) if raw is not None else ""
+        text = " ".join(str(text or "").replace("\x00", " ").split())
+        if text and text not in parts:
+            parts.append(text)
+    name = " ".join(parts)
+    serial = sub.get(_BODY_SERIAL)
+    serial = " ".join(str(clean_exif_value(serial) or "").split()) if serial else ""
+    return f"{name} #{serial}" if name and serial else name
+
+
 def read_photo_facts(path: Path, order: int) -> PhotoRecord:
     """Build a :class:`PhotoRecord` for ``path``; missing EXIF leaves fields None.
 
@@ -50,6 +67,7 @@ def read_photo_facts(path: Path, order: int) -> PhotoRecord:
     """
     taken: Optional[datetime] = None
     coords: Optional[tuple[float, float]] = None
+    camera = ""
     try:
         with Image.open(path) as img:
             exif = img.getexif()
@@ -61,6 +79,10 @@ def read_photo_facts(path: Path, order: int) -> PhotoRecord:
                     sub = {}
                 raw_dt = sub.get(_DATETIME_ORIGINAL) or exif.get(_DATETIME)
                 taken = parse_exif_datetime(raw_dt)
+                try:
+                    camera = camera_identity(exif, sub)
+                except Exception:
+                    camera = ""
                 gps_ifd = {}
                 try:
                     gps_ifd = dict(exif.get_ifd(_GPS_IFD_TAG) or {})
@@ -91,4 +113,5 @@ def read_photo_facts(path: Path, order: int) -> PhotoRecord:
         lat=coords[0] if coords else None,
         lon=coords[1] if coords else None,
         taken_from_exif=from_exif,
+        camera=camera,
     )

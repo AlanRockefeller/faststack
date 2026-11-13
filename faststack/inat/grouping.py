@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -49,6 +49,21 @@ class PhotoRecord:
     lon: Optional[float] = None
     # False when ``taken`` is the file's modification time, not EXIF.
     taken_from_exif: bool = True
+    # Which camera took it (EXIF make, model and serial), so a clock offset
+    # learned for one camera is not applied to another (or to a phone).
+    camera: str = ""
+    # Seconds to add to the EXIF time for local time: the confirmed offset of
+    # a camera set to the wrong time zone (see matching.py). 0 otherwise.
+    clock_offset_s: int = 0
+
+    @property
+    def time(self) -> Optional[datetime]:
+        """The capture time to group, sort and upload by: ``taken`` with the
+        camera's clock offset applied. ``taken`` stays the camera's own
+        clock, which is what matching compares against."""
+        if self.taken is None or not self.clock_offset_s or not self.taken_from_exif:
+            return self.taken
+        return self.taken + timedelta(seconds=self.clock_offset_s)
 
     @property
     def has_gps(self) -> bool:
@@ -78,20 +93,26 @@ class Location:
 @dataclass
 class ObservationGroup:
     photos: list[PhotoRecord] = field(default_factory=list)
+    # True once the user has dragged the photos into an order of their own:
+    # ``photos`` is then that order and is no longer sorted by capture time.
+    ordered: bool = False
 
     def sorted_photos(self) -> list[PhotoRecord]:
+        """The photos as shown and uploaded: the user's order, else by time."""
+        if self.ordered:
+            return list(self.photos)
         return sorted(self.photos, key=_sort_key)
 
     @property
     def observed_at(self) -> Optional[datetime]:
-        times = [p.taken for p in self.photos if p.taken is not None]
+        times = [p.time for p in self.photos if p.taken is not None]
         return min(times) if times else None
 
     @property
     def observed_at_exif(self) -> Optional[datetime]:
         """Earliest EXIF capture time, ignoring modification-time fallbacks."""
         times = [
-            p.taken for p in self.photos if p.taken is not None and p.taken_from_exif
+            p.time for p in self.photos if p.taken is not None and p.taken_from_exif
         ]
         return min(times) if times else None
 
@@ -118,7 +139,7 @@ def _sort_key(p: PhotoRecord):
     # Photos without a capture time go after those with one, in batch order.
     if p.taken is None:
         return (1, 0.0, p.order)
-    return (0, p.taken.timestamp(), p.order)
+    return (0, p.time.timestamp(), p.order)
 
 
 def group_sort_key(group: "ObservationGroup"):
@@ -161,7 +182,7 @@ def average_coordinates(fixes: Sequence[tuple[float, float]]) -> tuple[float, fl
 def _gap_seconds(a: PhotoRecord, b: PhotoRecord) -> Optional[float]:
     if a.taken is None or b.taken is None:
         return None
-    return abs((b.taken - a.taken).total_seconds())
+    return abs((b.time - a.time).total_seconds())
 
 
 def _gap_meters(a: PhotoRecord, b: PhotoRecord) -> Optional[float]:
@@ -217,7 +238,7 @@ def _features(photos: Sequence[PhotoRecord]) -> list[tuple[float, float, float]]
     nor repels a cut on its own."""
     n = len(photos)
     times: list[Optional[float]] = [
-        p.taken.timestamp() if p.taken is not None else None for p in photos
+        p.time.timestamp() if p.taken is not None else None for p in photos
     ]
     _fill_missing(times, fallback=[float(i) for i in range(n)])
     # Local equirectangular projection around the mean of the fixes.
@@ -305,7 +326,7 @@ def split_group(group: ObservationGroup, n: int) -> list[ObservationGroup]:
     within-run variance of scaled (time, east, north). ``n`` is clamped to the
     photo count. ``n <= 1`` returns the group unchanged (as a new object).
     """
-    photos = group.sorted_photos()
+    photos = sorted(group.photos, key=_sort_key)
     count = len(photos)
     n = max(1, min(n, count))
     if n == 1 or count == 0:
@@ -372,6 +393,54 @@ def move_photo(
     if target_index >= len(groups):
         groups.append(ObservationGroup([photo]))
     else:
-        groups[target_index].photos.append(photo)
-        groups[target_index].photos.sort(key=_sort_key)
+        target = groups[target_index]
+        target.photos.append(photo)
+        if not target.ordered:  # a hand-ordered card takes the photo at its end
+            target.photos.sort(key=_sort_key)
+    return [g for g in groups if g.photos]
+
+
+def move_photos(
+    groups: list[ObservationGroup],
+    photo_keys: Iterable[str],
+    target_index: int,
+    target_key: str = "",
+    after: bool = False,
+) -> list[ObservationGroup]:
+    """Move photos into ``groups[target_index]`` at a chosen place.
+
+    They go just before (or ``after``) the photo ``target_key`` of that
+    group, or to its end when ``target_key`` is not one of its photos, and
+    keep the order they are shown in. The group keeps the resulting order
+    from then on (``ordered``). Photos already in the target group move
+    too, so this also reorders inside one group.
+
+    ``target_index == len(groups)`` puts them in a new group at the end,
+    sorted by capture time. Groups left empty are dropped.
+    """
+    wanted = set(photo_keys)
+    moved = [p for g in groups for p in g.sorted_photos() if p.key in wanted]
+    if not moved:
+        return groups
+    if target_index >= len(groups):
+        for g in groups:
+            g.photos = [p for p in g.photos if p.key not in wanted]
+        groups.append(ObservationGroup(sorted(moved, key=_sort_key)))
+        return [g for g in groups if g.photos]
+    target = groups[target_index]
+    shown = target.sorted_photos()
+    rest = [p for p in shown if p.key not in wanted]
+    index = len(rest)
+    position = next((i for i, p in enumerate(shown) if p.key == target_key), None)
+    if position is not None:
+        cut = position + 1 if after else position
+        index = sum(1 for p in shown[:cut] if p.key not in wanted)
+    arranged = rest[:index] + moved + rest[index:]
+    if arranged == shown:
+        return groups
+    for g in groups:
+        if g is not target:
+            g.photos = [p for p in g.photos if p.key not in wanted]
+    target.photos = arranged
+    target.ordered = True
     return [g for g in groups if g.photos]

@@ -13,7 +13,8 @@ so two coats of Exposure +20 render exactly as Exposure +40 there.
 Layers live in the edit dict as ``edits["local_layers"]``: a list of plain
 JSON-safe dicts ``{"id": str, "visible": bool, "recipe": {key: float}}``.
 A layer with a ``"source"`` key is a stack layer instead (see
-``faststack.imaging.stack_paint``); it has no recipe.
+``faststack.imaging.stack_paint``), and one with ``"halo": True`` a halo
+removal layer (see ``faststack.imaging.halo_fix``); neither has a recipe.
 The list and its dicts are treated as immutable — the controller replaces
 them on every change — so shallow edit snapshots are safe to hand to the
 render and save workers.
@@ -118,12 +119,17 @@ def normalize_local_layers(value: Any) -> List[Dict[str, Any]]:
         if isinstance(source, str) and source:
             layer["source"] = source
             layer["recipe"] = {}
+        # Halo layers (faststack.imaging.halo_fix) remove stacking halos.
+        elif item.get("halo") is True:
+            layer["halo"] = True
+            layer["recipe"] = {}
         layers.append(layer)
     return layers
 
 
 def effective_layers(edits: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Visible recipe layers that move at least one slider (no stack layers)."""
+    """Visible recipe layers that move at least one slider (no stack or halo
+    layers)."""
     layers = edits.get("local_layers") or ()
     return [
         layer
@@ -132,6 +138,7 @@ def effective_layers(edits: Dict[str, Any]) -> List[Dict[str, Any]]:
         and layer.get("visible", True)
         and layer.get("recipe")
         and not layer.get("source")
+        and not layer.get("halo")
     ]
 
 
