@@ -319,9 +319,8 @@ def _plausible_day(span: tuple[datetime, datetime], obs: ExistingObservation) ->
         slack = timedelta(seconds=MAX_OFFSET_S + MATCH_WINDOW_S)
         return span[0] - slack <= obs.wall_time <= span[1] + slack
     if obs.observed_on is not None:
-        return span[0].date() - timedelta(days=1) <= obs.observed_on <= (
-            span[1].date() + timedelta(days=1)
-        )
+        slack = timedelta(seconds=MAX_OFFSET_S + MATCH_WINDOW_S)
+        return (span[0] - slack).date() <= obs.observed_on <= (span[1] + slack).date()
     return False
 
 
@@ -410,22 +409,48 @@ def offset_for_pair(
 def _one_to_one(
     triples: Sequence[tuple[float, int, int]],
 ) -> list[tuple[float, int, int]]:
-    """Pair cards with observations, closest first, each used at most once.
+    """Pair as many cards with observations as possible, each used at most
+    once, starting from the closest pairs.
 
     One observation is one find: lined up with two cards it is evidence
     for one of them, not for both (which would let an offset that puts a
-    single phone observation between two cards beat the true one).
+    single phone observation between two cards beat the true one).  The
+    count must be the most pairs possible: closest-first alone can take the
+    one observation a second card needed while another was free.
     """
-    used_cards: set[int] = set()
-    used_obs: set[int] = set()
-    out = []
-    for residual, card_key, obs_id in sorted(triples):
-        if card_key in used_cards or obs_id in used_obs:
-            continue
-        used_cards.add(card_key)
-        used_obs.add(obs_id)
-        out.append((residual, card_key, obs_id))
-    return out
+    residual: dict[tuple[int, int], float] = {}
+    for r, card_key, obs_id in triples:
+        pair = (card_key, obs_id)
+        if pair not in residual or r < residual[pair]:
+            residual[pair] = r
+    options: dict[int, list[int]] = {}
+    for (card_key, obs_id), _ in sorted(residual.items(), key=lambda kv: kv[1]):
+        options.setdefault(card_key, []).append(obs_id)
+    card_of: dict[int, int] = {}  # observation id -> card key
+    obs_of: dict[int, int] = {}  # card key -> observation id
+    # Closest first, then augmenting paths (Kuhn) for any card left over.
+    for (card_key, obs_id), _ in sorted(residual.items(), key=lambda kv: kv[1]):
+        if card_key not in obs_of and obs_id not in card_of:
+            obs_of[card_key], card_of[obs_id] = obs_id, card_key
+
+    def place(card_key: int, seen: set[int]) -> bool:
+        for obs_id in options[card_key]:
+            if obs_id in seen:
+                continue
+            seen.add(obs_id)
+            holder = card_of.get(obs_id)
+            if holder is None or place(holder, seen):
+                obs_of[card_key], card_of[obs_id] = obs_id, card_key
+                return True
+        return False
+
+    for card_key in options:
+        if card_key not in obs_of:
+            place(card_key, set())
+    return sorted(
+        (residual[(card_key, obs_id)], card_key, obs_id)
+        for card_key, obs_id in obs_of.items()
+    )
 
 
 def detect_offsets(
@@ -453,7 +478,9 @@ def detect_offsets(
     """
     priors = priors or {}
     skip = set(skip_pairs)
-    cameras = {p.camera for c in cards for p in c.timed()}
+    # Photos with no camera make or model share the key "": they may come
+    # from several cameras, so no one clock offset can be found for them.
+    cameras = {p.camera for c in cards for p in c.timed() if p.camera}
     evidence = [
         o
         for o in observations
@@ -606,16 +633,20 @@ def fetch_window(
 ) -> Optional[tuple[date, date]]:
     """The observed-on dates to ask iNaturalist about for these photos.
 
-    A day either side, for a camera clock off by a time zone across
-    midnight. A batch spanning months asks about its newest ``max_days``.
+    Widened by the largest camera clock offset allowed (and the match
+    window), so a clock off across midnight still finds its observation.
+    A batch spanning months asks about its newest ``max_days``.
     """
-    days = [p.taken.date() for p in photos if p.taken is not None and p.taken_from_exif]
-    if not days:
+    times = [p.taken for p in photos if p.taken is not None and p.taken_from_exif]
+    if not times:
         return None
-    first, last = min(days), max(days)
-    if (last - first).days > max_days:
-        first = last - timedelta(days=max_days)
-    return first - timedelta(days=1), last + timedelta(days=1)
+    earliest, latest = min(times), max(times)
+    if (latest.date() - earliest.date()).days > max_days:
+        earliest = datetime.combine(
+            latest.date() - timedelta(days=max_days), datetime.min.time()
+        )
+    slack = timedelta(seconds=MAX_OFFSET_S + MATCH_WINDOW_S)
+    return (earliest - slack).date(), (latest + slack).date()
 
 
 # --- Remembered offsets -----------------------------------------------------

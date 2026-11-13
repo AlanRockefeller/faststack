@@ -398,8 +398,17 @@ class HaloRemovalMixin:
             base = halo_base(base, edits, masks, sources)
             if cancelled():
                 return None
+
+            def inpaint(image, hole):
+                # LaMa checks between tiles, so a superseded job stops early
+                # instead of holding the single worker for every tile.
+                try:
+                    return inpainter.inpaint(image, hole, cancelled=cancelled)
+                except ai_inpaint.DownloadCancelled:
+                    raise HaloFixError("cancelled") from None
+
             return compute_halo_fix(
-                base, masks[layer_id], signature, inpainter.inpaint, cancelled=cancelled
+                base, masks[layer_id], signature, inpaint, cancelled=cancelled
             )
 
         def done(future: concurrent.futures.Future) -> None:

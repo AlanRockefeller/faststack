@@ -110,6 +110,9 @@ class CardPhotoProvider(QQuickImageProvider):
         self._large: OrderedDict[tuple, QImage] = OrderedDict()
         self._large_bytes = 0
         self._large_lock = threading.Lock()
+        # Bumped by clear_large(): a decode that started before the clear
+        # must not put its image back into the emptied cache.
+        self._large_generation = 0
         self._placeholder = QImage(4, 3, QImage.Format.Format_RGB32)
         self._placeholder.fill(QColor("#444444"))
 
@@ -138,6 +141,7 @@ class CardPhotoProvider(QQuickImageProvider):
                 cache_key = None
         if cache_key is not None:
             with self._large_lock:
+                generation = self._large_generation
                 cached = self._large.get(cache_key)
                 if cached is not None:
                     self._large.move_to_end(cache_key)
@@ -163,16 +167,18 @@ class CardPhotoProvider(QQuickImageProvider):
             log.debug("Card thumbnail failed for %s: %s", path, exc)
             return self._fail(size)
         if cache_key is not None:
-            self._remember(cache_key, qimg)
+            self._remember(cache_key, qimg, generation)
         size.setWidth(qimg.width())
         size.setHeight(qimg.height())
         return qimg
 
-    def _remember(self, key: tuple, image: QImage) -> None:
+    def _remember(self, key: tuple, image: QImage, generation: int) -> None:
         cost = image.sizeInBytes()
         if cost > LARGE_PHOTO_CACHE_BYTES:
             return
         with self._large_lock:
+            if generation != self._large_generation:
+                return  # the dialog closed while this was decoding
             old = self._large.pop(key, None)
             if old is not None:
                 self._large_bytes -= old.sizeInBytes()
@@ -187,6 +193,7 @@ class CardPhotoProvider(QQuickImageProvider):
         with self._large_lock:
             self._large.clear()
             self._large_bytes = 0
+            self._large_generation += 1
 
     def _fail(self, size: QSize) -> QImage:
         size.setWidth(self._placeholder.width())

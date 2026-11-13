@@ -397,6 +397,7 @@ Item {
             }
 
             function zoomBy(factor, viewX, viewY) {
+                _pendingPixelScale = 0
                 var from = zoomFrame.running ? zoomTargetRel : relZoom()
                 if (Math.abs(from - 1.0) < 0.001) from = 1.0
                 var rel = from * factor
@@ -406,14 +407,48 @@ Item {
                 zoomTo(rel, viewX, viewY)
             }
 
+            // A Ctrl+1 style request made while the previous photo's texture
+            // is still shown (see zoomToPixelScale); 0 = none.
+            property real _pendingPixelScale: 0
+
+            // Whether the loaded texture is the current photo's: right after
+            // navigation the old one stays up, and its fit scale does not
+            // belong with the new photo's native size.
+            function textureMatchesImage() {
+                var sw = mainImage.sourceSize.width
+                var sh = mainImage.sourceSize.height
+                var nw = loupeView.nativeImageWidth
+                var nh = loupeView.nativeImageHeight
+                if (!(sw > 0 && sh > 0 && nw > 0 && nh > 0)) return true
+                var want = nw / nh
+                return Math.abs(sw / sh - want) <= 0.02 * want
+            }
+
             // `scale` is in native image pixels per screen pixel (1.0 = 100%).
             function zoomToPixelScale(scale) {
+                if (!textureMatchesImage()) {
+                    // Apply it once the new photo's geometry is in.
+                    _pendingPixelScale = scale
+                    return
+                }
+                _pendingPixelScale = 0
                 var perRel = pixelZoomPerRel()
                 if (!(perRel > 0)) return
                 zoomTo(scale / perRel, 0, 0)
             }
 
+            // After a source geometry update. Applied even if the shapes still
+            // differ, so a request is deferred once at most and never lost.
+            function applyPendingPixelScale() {
+                if (!(_pendingPixelScale > 0)) return
+                var scale = _pendingPixelScale
+                _pendingPixelScale = 0
+                var perRel = pixelZoomPerRel()
+                if (perRel > 0) zoomTo(scale / perRel, 0, 0)
+            }
+
             function resetView(animated) {
+                _pendingPixelScale = 0
                 if (!animated) {
                     setView(1.0, 0, 0)
                     return
@@ -777,6 +812,7 @@ Item {
 
                     // Force fit recompute so fitScale / zoom logic stabilizes immediately
                     imageRotator.recomputeFitScale(true)
+                    imageRotator.applyPendingPixelScale()
                 }
 
                 property bool _geometryUpdatePending: false

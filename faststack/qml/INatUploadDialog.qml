@@ -339,7 +339,9 @@ Window {
             }
             Item { Layout.fillWidth: true }
             Text {
-                readonly property bool tokenBad: dialog.uploader && dialog.uploader.hasInatToken && dialog.uploader.verifyError !== ""
+                // Only a token iNaturalist turned down: a network error, a server
+                // error or a refused paste leave the saved token as it was.
+                readonly property bool tokenBad: dialog.uploader && dialog.uploader.hasInatToken && dialog.uploader.tokenRejectedState
                 text: tokenBad ? "iNat: token not accepted"
                       : (dialog.uploader && dialog.uploader.inatLogin ? "iNat: " + dialog.uploader.inatLogin : "iNat: not signed in")
                 color: !tokenBad && dialog.uploader && dialog.uploader.inatLogin ? dialog.okColor : dialog.warnColor

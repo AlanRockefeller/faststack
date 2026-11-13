@@ -359,7 +359,7 @@ class INatUploadController(QObject):
     _uploadCardDone = Signal(int, int, object, object, str, str)
     _uploadRunFinished = Signal()
     _usageDone = Signal(str)
-    _verifyDone = Signal(str, str)  # login, error
+    _verifyDone = Signal(str, str, bool)  # login, error, rejected (401)
     _tokenCheckDone = Signal(int, str, str, bool)  # seq, login, error, rejected
     _taxonLookupDone = Signal(object, str, object)  # taxon, error, (name, rank)
     # Name-field autocomplete: card id, the text it answers, rows for the list
@@ -372,7 +372,7 @@ class INatUploadController(QObject):
     # Observations already on iNaturalist on the batch's dates, and the
     # camera clock offsets matching them found.
     existingChanged = Signal()
-    _existingDone = Signal(int, object, str)  # seq, observations, error
+    _existingDone = Signal(int, object, str)  # seq, (observations, complete), error
 
     def __init__(self, config, parent: Optional[QObject] = None, user_agent: str = ""):
         super().__init__(parent)
@@ -433,6 +433,8 @@ class INatUploadController(QObject):
         self._tile_lock = threading.Lock()
         self._inat_login = config.get(CONFIG_SECTION, "inat_login", "") or ""
         self._verify_error = ""
+        # iNaturalist answered 401 to the saved token (not a network error).
+        self._token_rejected = False
         self._verify_seq = 0  # a newer check or verify outdates an older answer
         self._uploaded_paths: list[str] = []
         self._my_observations: dict[int, MapObservation] = {}
@@ -456,6 +458,7 @@ class INatUploadController(QObject):
         self._thumb_refresh.timeout.connect(self.myObservationsChanged)
         # Existing observations the cards may belong to (see matching.py).
         self._existing: list[ExistingObservation] = []
+        self._existing_complete = True  # all of them fetched
         self._existing_by_id: dict[int, ExistingObservation] = {}
         self._existing_seq = 0
         self._existing_busy = False
@@ -665,6 +668,12 @@ class INatUploadController(QObject):
         return self._verify_error
 
     @Property(bool, notify=settingsChanged)
+    def tokenRejectedState(self) -> bool:  # noqa: N802
+        """The saved token was turned down (401 or expired), as opposed to
+        any other ``verifyError`` (network, server, a refused paste)."""
+        return self._token_rejected
+
+    @Property(bool, notify=settingsChanged)
     def hasInatToken(self) -> bool:
         return bool(self._credentials.get(INAT_TOKEN))
 
@@ -795,6 +804,7 @@ class INatUploadController(QObject):
                 inat_token = ""
             else:
                 saved = self._credentials.set(INAT_TOKEN, token) and saved
+                self._token_rejected = False  # a new token: not yet asked
         if vision_key.strip():
             saved = self._credentials.set(MYCOMAP_KEY, vision_key) and saved
         if not saved:
@@ -812,6 +822,7 @@ class INatUploadController(QObject):
     @Slot()
     def clearInatToken(self) -> None:  # noqa: N802
         self._credentials.set(INAT_TOKEN, "")
+        self._token_rejected = False
         self._inat_login = ""
         self._config.set(CONFIG_SECTION, "inat_login", "")
         self._config.save()
@@ -882,18 +893,21 @@ class INatUploadController(QObject):
         def work():
             try:
                 user = INatClient(token, self._http).me()
-                self._verifyDone.emit(user.login, "")
+                self._verifyDone.emit(user.login, "", False)
             except ApiError as exc:
-                self._verifyDone.emit("", describe_inat_error(exc, token))
+                self._verifyDone.emit(
+                    "", describe_inat_error(exc, token), exc.status == 401
+                )
             except Exception as exc:  # network
-                self._verifyDone.emit("", f"Could not reach iNaturalist: {exc}")
+                self._verifyDone.emit("", f"Could not reach iNaturalist: {exc}", False)
 
         self._executor.submit(work)
 
-    @Slot(str, str)
-    def _on_verify_done(self, login: str, error: str) -> None:
+    @Slot(str, str, bool)
+    def _on_verify_done(self, login: str, error: str, rejected: bool) -> None:
         self._end_job()
         self._verify_error = error
+        self._note_token_answer(login, rejected)
         resume = self._resume_after_verify
         self._resume_after_verify = False
         if login:
@@ -911,6 +925,14 @@ class INatUploadController(QObject):
             self.uploadAll()
         else:
             self.showMessage.emit(f"Still not uploading: {error}")
+
+    def _note_token_answer(self, login: str, rejected: bool) -> None:
+        # A network or server error says nothing about the token: keep the
+        # last answer iNaturalist gave.
+        if login:
+            self._token_rejected = False
+        elif rejected:
+            self._token_rejected = True
 
     @Slot()
     def checkToken(self) -> None:  # noqa: N802
@@ -948,6 +970,7 @@ class INatUploadController(QObject):
         if seq != self._verify_seq:
             return
         self._verify_error = error
+        self._note_token_answer(login, rejected)
         if login:
             self._inat_login = login
             self._config.set(CONFIG_SECTION, "inat_login", login)
@@ -2011,6 +2034,7 @@ class INatUploadController(QObject):
         and start each camera from the offset saved nearest its dates."""
         self._existing_seq += 1
         self._existing = []
+        self._existing_complete = True
         self._existing_by_id = {}
         self._existing_busy = False
         self._existing_fetched = False
@@ -2023,7 +2047,8 @@ class INatUploadController(QObject):
         self._match_signature = None
         days: dict[str, list] = {}
         for p in self._photos:
-            if p.taken is not None and p.taken_from_exif:
+            # No make/model ("") may be several cameras: no saved offset.
+            if p.taken is not None and p.taken_from_exif and p.camera:
                 days.setdefault(p.camera, []).append(p.taken.date())
         self._camera_days = {
             camera: statistics.median_low(dates) for camera, dates in days.items()
@@ -2080,25 +2105,29 @@ class INatUploadController(QObject):
             client = INatClient(token, self._http)
             try:
                 try:
-                    rows = client.observations_between(login, first, last)
+                    found = client.observations_between(login, first, last)
                 except ApiError as exc:
                     if exc.status != 401:
                         raise
                     # The token ran out (24 h); the public record still
                     # answers, without the true spot of obscured ones.
-                    rows = client.observations_between(
+                    found = client.observations_between(
                         login, first, last, authenticated=False
                     )
-                self._existingDone.emit(seq, rows, "")
+                self._existingDone.emit(seq, found, "")
             except ApiError as exc:
-                self._existingDone.emit(seq, [], describe_inat_error(exc, token))
+                self._existingDone.emit(
+                    seq, ([], True), describe_inat_error(exc, token)
+                )
             except Exception as exc:  # network
-                self._existingDone.emit(seq, [], f"Could not reach iNaturalist: {exc}")
+                self._existingDone.emit(
+                    seq, ([], True), f"Could not reach iNaturalist: {exc}"
+                )
 
         self._executor.submit(work)
 
     @Slot(int, object, str)
-    def _on_existing_done(self, seq: int, rows, error: str) -> None:
+    def _on_existing_done(self, seq: int, found, error: str) -> None:
         if seq != self._existing_seq:
             return
         self._existing_busy = False
@@ -2106,7 +2135,9 @@ class INatUploadController(QObject):
             self._existing_status = f"Could not check for existing observations: {error}"
             self.existingChanged.emit()
             return
+        rows, complete = found
         self._existing_fetched = True
+        self._existing_complete = bool(complete)
         self._existing = list(rows)
         self._existing_by_id = {o.id: o for o in self._existing}
         self._match_signature = None
@@ -2194,9 +2225,17 @@ class INatUploadController(QObject):
                     f"{adding} card{'' if adding == 1 else 's'} "
                     f"add{'s' if adding == 1 else ''} photos to one of them"
                 )
+            if not parts:
+                parts.append("none of the cards look like one of them")
+            if not self._existing_complete:
+                # Fetched oldest first: the newest observations are missing.
+                parts.append(
+                    "you have more on these dates than were fetched, so the "
+                    "latest ones were not checked"
+                )
             self._existing_status = (
                 f"{len(self._existing)} of your iNaturalist observations{span}; "
-                + ("; ".join(parts) if parts else "none of the cards look like one of them")
+                + "; ".join(parts)
                 + "."
             )
         self.existingChanged.emit()
@@ -2575,7 +2614,8 @@ class INatUploadController(QObject):
         note = ""
         facts = self._card_facts(card)
         camera = facts.main_camera()
-        if camera is not None and not (match is not None and match.camera_clock):
+        # "" is no camera make/model: maybe several cameras, so no offset.
+        if camera and not (match is not None and match.camera_clock):
             held = self._clock.get(camera)
             current = held.offset_s if held is not None else 0
             offset = offset_for_pair(facts, obs, camera, current)
@@ -2810,6 +2850,7 @@ class INatUploadController(QObject):
                 "Get a fresh one and paste it in Settings."
             )
             self._verify_error = message
+            self._token_rejected = True
             self._token_failed_run = True
             self.settingsChanged.emit()
             self.tokenRejected.emit(message)
@@ -2828,7 +2869,23 @@ class INatUploadController(QObject):
         # Existing observation id -> where the next card's photos go in it,
         # after the photos it already has (two cards may add to one).
         attach_next: dict[int, int] = {}
-        for card in queue:
+        queued = {id(c) for c in queue}
+        for card in self._model.cards:
+            if id(card) not in queued:
+                # Uploaded (or going up) already: a card retried after it,
+                # adding to the same observation, keeps its photos after
+                # this card's, where the first run put them.
+                if (
+                    card.status in (STATUS_UPLOADING, STATUS_UPLOADED)
+                    and card.attach_to is not None
+                    and card.obs_id in (None, card.attach_to.id)
+                ):
+                    target = card.attach_to.id
+                    if target in attach_next:
+                        attach_next[target] += len(card.group.sorted_photos())
+                    else:
+                        attach_next[target] = len(self._combined_order(card))
+                continue
             card.status = STATUS_UPLOADING
             card.status_text = "Queued for upload"
             card.upload_error = ""
@@ -3099,6 +3156,9 @@ class INatUploadController(QObject):
             c.status == STATUS_ERROR and TOKEN_REJECTED in c.upload_error
             for c in self._model.cards
         )
+        if self._token_failed_run and not self._token_rejected:
+            self._token_rejected = True
+            self.settingsChanged.emit()
         if failed:
             self._set_status(
                 f"{uploaded} uploaded, {failed} failed. "

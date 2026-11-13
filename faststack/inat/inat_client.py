@@ -316,9 +316,11 @@ class INatClient:
         for row in rows:
             if not isinstance(row, dict) or not row.get("id"):
                 continue
-            point = _lat_lon(row.get("private_location")) or _lat_lon(
-                row.get("location")
-            )
+            point = _lat_lon(row.get("private_location"))
+            if point is None and not row.get("obscured"):
+                # Without the owner's token an obscured one has a made-up
+                # point: no marker rather than one in the wrong place.
+                point = _lat_lon(row.get("location"))
             if point is None:
                 continue
             taxon = row.get("taxon") if isinstance(row.get("taxon"), dict) else {}
@@ -349,14 +351,17 @@ class INatClient:
         per_page: int = 200,
         max_pages: int = 5,
         authenticated: bool = True,
-    ) -> list[ExistingObservation]:
+    ) -> tuple[list[ExistingObservation], bool]:
         """``login``'s observations observed from ``first`` to ``last``
         (inclusive), oldest first, up to ``max_pages`` pages.
 
-        With the token sent, the user's own obscured and private
-        observations come back with their true coordinates.
+        Returns (observations, complete): ``complete`` is False when
+        iNaturalist has more than ``max_pages`` pages there, so the newest
+        ones were not fetched.  With the token sent, the user's own obscured
+        and private observations come back with their true coordinates.
         """
         out: list[ExistingObservation] = []
+        complete = False
         for page in range(1, max_pages + 1):
             data = self._http.request(
                 "GET",
@@ -384,8 +389,9 @@ class INatClient:
             except (AttributeError, TypeError, ValueError):
                 total = 0
             if len(rows) < per_page or page * per_page >= total:
+                complete = True
                 break
-        return out
+        return out, complete
 
     def create_observation(self, draft: ObservationDraft) -> int:
         data = self._http.request(
@@ -464,6 +470,8 @@ def rank_suggestions(query: str, taxa: Sequence[Taxon]) -> list[Taxon]:
     ahead of the rest: this dialog identifies with a fungus model), then
     everything else in iNaturalist's own order.
     """
+    # As searched: "var." and the like dropped (see inat_taxon_name).
+    query = inat_taxon_name(query)
     wanted = " ".join(query.casefold().split())
 
     def key(item: tuple[int, Taxon]):

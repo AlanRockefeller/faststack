@@ -5093,6 +5093,14 @@ class ImageEditor:
                     exc,
                 )
                 result = None
+            except Exception:  # pylint: disable=broad-exception-caught
+                # ONNX Runtime, OpenCV or numpy failing on these strokes: as
+                # the preview does, leave the layer out rather than fail
+                # every save of this photo.
+                log.exception(
+                    "Halo removal layer %s left out of the saved photo", layer_id
+                )
+                result = None
             if result is None:
                 results.pop(layer_id, None)
             else:
