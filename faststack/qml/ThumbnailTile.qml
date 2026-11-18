@@ -3,6 +3,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import "MouseButtons.js" as MouseButtons
 
 // Tile delegate for thumbnail grid view
 Item {
@@ -642,8 +643,10 @@ Item {
         acceptedButtons: Qt.LeftButton | Qt.RightButton
 
         onClicked: function(mouse) {
+            // Settings > Swap Mouse Buttons
+            var button = MouseButtons.button(mouse.button, !!(tile.uiStateRef && tile.uiStateRef.swapMouseButtons))
             if (tile.tileIsFolder) {
-                if (mouse.button === Qt.RightButton) {
+                if (button === Qt.RightButton) {
                     // Right-click: context menu (never on the ".." entry)
                     if (!tile.tileIsParentFolder)
                         tile.folderContextMenuRequested(tile.tileFilePath, mouse.x, mouse.y)
@@ -655,7 +658,7 @@ Item {
                 // Handle selection or opening
                 var hasShift = (mouse.modifiers & Qt.ShiftModifier)
                 var hasCtrl = (mouse.modifiers & Qt.ControlModifier)
-                var isRightClick = (mouse.button === Qt.RightButton)
+                var isRightClick = (button === Qt.RightButton)
 
                 if (isRightClick) {
                     // Right-click: toggle selection (as per help text)

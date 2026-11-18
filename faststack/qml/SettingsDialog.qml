@@ -50,6 +50,7 @@ Window {
     property string additionalRawSourceDirs: ""
     property string optimizeFor: "speed"
     property bool updateCheckEnabled: true
+    property bool swapMouseButtons: false
 
     property string awbMode: "lab"
     property double awbStrength: 0.7
@@ -193,6 +194,7 @@ Window {
             settingsDialog.defaultDirectory = settingsDialog.uiStateRef.get_default_directory()
             settingsDialog.optimizeFor = settingsDialog.uiStateRef.get_optimize_for()
             settingsDialog.updateCheckEnabled = settingsDialog.uiStateRef.get_update_check_enabled()
+            settingsDialog.swapMouseButtons = settingsDialog.uiStateRef.swapMouseButtons
             settingsDialog.autoLevelClippingThreshold = settingsDialog.uiStateRef.autoLevelClippingThreshold
             settingsDialog.autoLevelBlackThreshold = settingsDialog.uiStateRef.autoLevelBlackThreshold
             settingsDialog.autoLevelStrength = settingsDialog.uiStateRef.autoLevelStrength
@@ -266,6 +268,7 @@ Window {
         state.set_default_directory(settingsDialog.defaultDirectory)
         state.set_optimize_for(settingsDialog.optimizeFor)
         state.set_update_check_enabled(settingsDialog.updateCheckEnabled)
+        state.swapMouseButtons = settingsDialog.swapMouseButtons
         state.autoLevelClippingThreshold = settingsDialog.autoLevelClippingThreshold
         state.autoLevelBlackThreshold = settingsDialog.autoLevelBlackThreshold
         state.autoLevelStrength = settingsDialog.autoLevelStrength
@@ -1064,6 +1067,51 @@ Window {
                                 }
                                 contentItem: Text { text: themeCombo.displayText; color: settingsDialog.textColor; verticalAlignment: Text.AlignVCenter; leftPadding: 10 }
                                 background: Rectangle { color: "#10ffffff"; border.color: settingsDialog.controlBorder; radius: 4 }
+                            }
+                        }
+
+                        Loader { sourceComponent: sectionSeparator }
+
+                        Loader {
+                            sourceComponent: sectionHeader
+                            onLoaded: item.text = "Mouse"
+                        }
+
+                        GridLayout {
+                            columns: 2
+                            columnSpacing: 20
+                            rowSpacing: 12
+                            Layout.fillWidth: true
+
+                            Label {
+                                text: "Swap Mouse Buttons"
+                                color: settingsDialog.textColor
+                            }
+                            CheckBox {
+                                id: swapMouseCheckBox
+                                text: "Enabled"
+                                Accessible.name: "Swap Mouse Buttons"
+                                checked: settingsDialog.swapMouseButtons
+                                onCheckedChanged: settingsDialog.swapMouseButtons = checked
+                                contentItem: Text { text: swapMouseCheckBox.text; color: settingsDialog.textColor; leftPadding: swapMouseCheckBox.indicator.width + swapMouseCheckBox.spacing; verticalAlignment: Text.AlignVCenter }
+                                indicator: Rectangle {
+                                    implicitWidth: 18; implicitHeight: 18
+                                    x: swapMouseCheckBox.leftPadding; y: parent.height / 2 - height / 2
+                                    radius: 3
+                                    border.color: settingsDialog.accentColor
+                                    color: swapMouseCheckBox.checked ? settingsDialog.accentColor : "transparent"
+                                    Text { text: "✓"; color: "white"; anchors.centerIn: parent; visible: swapMouseCheckBox.checked; font.bold: true }
+                                }
+                            }
+
+                            Label {
+                                text: "Swaps what the left and right buttons do on the image (pan vs. crop, paint vs. erase), on thumbnails (open vs. select) and on the map. Buttons and menus are not affected."
+                                color: settingsDialog.textColor
+                                opacity: 0.7
+                                font.pixelSize: 12
+                                wrapMode: Text.WordWrap
+                                Layout.columnSpan: 2
+                                Layout.fillWidth: true
                             }
                         }
 

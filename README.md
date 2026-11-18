@@ -1,6 +1,6 @@
 # FastStack
 
-# Version 1.7.0 - November 6, 2026
+# Version 1.7.0 - November 18, 2026
 
 # By Alan Rockefeller
 
@@ -11,7 +11,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 ## Features
 
 - **Crop:** Added the ability to crop and rotate images via the cr(O)p hotkey (or right mouse click). It can be a freeform crop, or constrained to several popular aspect ratios.
-- **Zoom & Pan:** Smooth zooming and panning.
+- **Zoom & Pan:** Smooth zooming and panning. Each mouse-wheel step glides to the new size, keeping the point under the cursor in place.
 - **Stack Selection:** Group images into stacks (`[`, `]`) and select them for processing (`S`).
 - **Spark Line**: In grid view, a spark line is visible on each folder, so you can see how far you have gotten in uploading photos in each directory.
 - **Helicon Focus Integration:** Launch Helicon Focus with your selected RAW files with a single keypress (`Enter`).
@@ -20,8 +20,9 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Image Editor:** Built-in editor with exposure, contrast, white balance, sharpness, and more (E key)
 - **Dodge & Burn:** Paint any compact-editor slider (exposure, contrast, shadows, white balance, vibrance, color mix…) onto part of the photo (Shift+D). Each stroke adds one coat, so overlapping strokes build up; strokes are kept as layers you can re-edit, hide, or delete.
 - **Stack Paint:** For in-camera focus stacks (`... stacked.JPG`), paint any of the stack's input JPGs - or the stack output itself - back over the stacked photo, e.g. to restore a clean background or fix stacking halos. Each input is aligned to the stack automatically, the brush circle previews what a click will paint, and global edits and dodge & burn apply to the painted pixels too.
+- **Halo Removal:** The compact editor's "Halo" brush removes the halo a focus stack leaves around a subject: paint loosely over it and FastStack rebuilds the background there with the LaMa inpainting model, leaving the in-focus subject alone. The model (about 230 MB) is downloaded only after you agree, the first time you press Halo, and runs offline.
 - **Quick Auto Adjust:** Press `l` for quick auto-levels, `L` for auto white balance + auto-levels together, `A` for auto white balance, `-`/`_` to keep adjusting the highlight/white side in 14-point steps, and `=`/`+` to adjust the shadow/black side in 7-point steps. These update the live in-memory edit session immediately and save once when you navigate away, start a drag, or explicitly save. Auto-levels treats its clip threshold as a budget (a few already-clipped specular pixels won't disable the stretch), brightens underexposed midtones toward a configurable target, and rolls off stretched highlights smoothly instead of hard-clipping them. Auto white balance analyzes only the cropped area, fades its correction when the scene lacks reliable neutrals, and damps magenta/green corrections so foliage isn't mistaken for a color cast. The midtone target, channel clip budget, highlight rolloff, export dithering, and tint correction strength are all adjustable in Settings.
-- **iNaturalist Upload:** Actions > iNaturalist upload groups the batched photos into observations by time and GPS, identifies each with MycoMap Vision, lets you split, merge or drag photos between observation cards, place GPS-less finds on an OpenStreetMap map, and uploads them to your iNaturalist account.
+- **iNaturalist Upload:** Actions > iNaturalist upload groups the batched photos into observations by time and GPS, identifies each with MycoMap Vision, lets you split, merge or drag photos between observation cards, place GPS-less finds on an OpenStreetMap map, and uploads them to your iNaturalist account. It corrects for a camera clock set to the wrong time zone, and photos of a find you already put on iNaturalist (from your phone, say) can be added to that observation instead of making a duplicate.
 - **Photoshop / GIMP Integration:** Edit the current image in Photoshop or GIMP (P key). Photoshop gets the RAW file when one exists; GIMP gets the JPG.
 - **Image Filtering:** Filter images by filename
 - **Theme Support:** Toggle between light and dark themes
@@ -382,6 +383,8 @@ change; **Cancel** (or `Esc`) discards them.
 
 - **Focus Stacker Path**: Helicon Focus executable, or OpenFocus's `main.py`
   (or its project folder). Used by `Enter` and the **Run Stacks** menu items.
+  On macOS you can pick the Helicon Focus app itself; it is found
+  automatically when installed in Applications.
 - **Image Editor Path**: Photoshop, GIMP or another editor for `P`. Recently
   used editors are offered in the dropdown.
 - **RawTherapee Path**: `rawtherapee-cli` is used by **Develop RAW** (the
@@ -404,6 +407,9 @@ change; **Cancel** (or `Esc`) discards them.
 - **Optimize For**: *Speed* uses the fastest JPEG decode path; *Quality* uses
   the slower, exact one. Changing it re-decodes the images around you.
 - **Theme**: Dark or light.
+- **Swap Mouse Buttons**: Swaps what the left and right buttons do on the
+  image (pan vs. crop, paint vs. erase), on thumbnails (open vs. select) and
+  on the iNaturalist map. Buttons and menus are not affected. Off by default.
 - **Check for Updates**: Lets FastStack tell you when a new release is on
   GitHub. Nothing is downloaded or installed automatically.
 

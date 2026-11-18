@@ -1346,6 +1346,11 @@ class AppController(
             "core", "auto_vibrance_enabled", True
         )
         self.auto_level_midtone = config.getboolean("core", "auto_level_midtone", True)
+        # Swap what the left and right buttons do in the image view, the
+        # thumbnail grid and the map picker (left-handed use).
+        self.swap_mouse_buttons = config.getboolean(
+            "core", "swap_mouse_buttons", False
+        )
         self.auto_level_midtone_target = config.getfloat(
             "core", "auto_level_midtone_target", 0.38
         )
@@ -9113,6 +9118,20 @@ class AppController(
         config.save()
 
     @Slot(result=bool)
+    def get_swap_mouse_buttons(self):
+        return self.swap_mouse_buttons
+
+    @Slot(bool)
+    def set_swap_mouse_buttons(self, value):
+        self.swap_mouse_buttons = bool(value)
+        config.set(
+            "core",
+            "swap_mouse_buttons",
+            "true" if self.swap_mouse_buttons else "false",
+        )
+        config.save()
+
+    @Slot(result=bool)
     def get_auto_level_midtone(self):
         return self.auto_level_midtone
 
@@ -13999,8 +14018,13 @@ class AppController(
             return
         if self._enter_brush_mode("local"):
             self.update_status_message(
-                "Dodge & burn: set sliders, then paint. Right/Alt-drag erases."
+                "Dodge & burn: set sliders, then paint. "
+                f"{self._erase_drag_hint()} erases."
             )
+
+    def _erase_drag_hint(self) -> str:
+        """Name the drag that erases in a brush, following Swap Mouse Buttons."""
+        return "Left/Alt-drag" if self.swap_mouse_buttons else "Right/Alt-drag"
 
     @Slot()
     def toggle_stack_brush_mode(self):
@@ -14020,7 +14044,7 @@ class AppController(
         if name == STACK_OUTPUT_SOURCE or name in self.image_editor._stack_sources:
             self.update_status_message(
                 f"Stack paint: paint to reveal {stack_input_label(name)}. "
-                "Right/Alt-drag restores the stack."
+                f"{self._erase_drag_hint()} restores the stack."
             )
         else:
             self._request_stack_source(name)
@@ -14883,7 +14907,7 @@ class AppController(
         if self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
             self.update_status_message(
                 f"Stack paint: paint to reveal {label}. "
-                "Right/Alt-drag restores the stack."
+                f"{self._erase_drag_hint()} restores the stack."
             )
 
     def _clear_stack_hover(self) -> None:

@@ -2,6 +2,7 @@
 
 import logging
 import os
+import plistlib
 import stat
 from pathlib import Path, PureWindowsPath
 from typing import Optional
@@ -30,8 +31,54 @@ else:
 
 # Known executable names that are safe to run
 KNOWN_SAFE_EXECUTABLES = {
-    "helicon": ["HeliconFocus.exe"],
+    "helicon": ["HeliconFocus.exe", "HeliconFocus", "Helicon Focus"],
 }
+
+
+def macos_bundle_executable(bundle_path: str | os.PathLike) -> Optional[str]:
+    """Return the main executable inside a macOS ``.app`` bundle, or None.
+
+    Picking an app in the macOS file dialog yields the bundle directory
+    (``/Applications/HeliconFocus.app``), not the binary inside it. The binary
+    is named by ``CFBundleExecutable`` in ``Contents/Info.plist``; when that
+    is missing or unreadable, a lone executable in ``Contents/MacOS`` is used.
+    """
+    bundle = Path(bundle_path)
+    if bundle.suffix.lower() != ".app" or not bundle.is_dir():
+        return None
+
+    macos_dir = bundle / "Contents" / "MacOS"
+    try:
+        with (bundle / "Contents" / "Info.plist").open("rb") as plist_file:
+            info = plistlib.load(plist_file)
+        name = info.get("CFBundleExecutable") if isinstance(info, dict) else None
+        if isinstance(name, str) and name and "/" not in name:
+            candidate = macos_dir / name
+            if candidate.is_file():
+                return str(candidate)
+    except Exception:  # unreadable or malformed plist (ExpatError, ValueError, ...)
+        log.debug("No usable Info.plist in %s", bundle, exc_info=True)
+
+    try:
+        executables = [
+            entry
+            for entry in macos_dir.iterdir()
+            if entry.is_file() and os.access(entry, os.X_OK)
+        ]
+    except OSError:
+        return None
+    if len(executables) == 1:
+        return str(executables[0])
+    return None
+
+
+def resolve_app_bundle(path: str) -> str:
+    """Map a macOS ``.app`` bundle path to its executable; else return ``path``."""
+    if path and path.rstrip("/").lower().endswith(".app"):
+        executable = macos_bundle_executable(path.rstrip("/"))
+        if executable:
+            return executable
+    return path
 
 
 def validate_executable_path(

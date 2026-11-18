@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import "MouseButtons.js" as MouseButtons
 
 // A small slippy map drawn from cached OpenStreetMap tiles
 // (image://osmtile/z/x/y, served by faststack.inat.providers).
@@ -266,6 +267,8 @@ Item {
         acceptedButtons: Qt.LeftButton | Qt.RightButton
         hoverEnabled: true
         property bool rightPress: false
+        // Settings > Swap Mouse Buttons
+        readonly property bool swapButtons: typeof uiState !== "undefined" && !!uiState && !!uiState.swapMouseButtons
         onExited: map.hoveredMarker = -1
         property real pressX: 0
         property real pressY: 0
@@ -277,7 +280,7 @@ Item {
         onPressed: function(mouse) {
             // Either button drags the map; they differ only in what a
             // click without a drag does (place the marker / copy a photo's spot).
-            rightPress = mouse.button === Qt.RightButton
+            rightPress = MouseButtons.button(mouse.button, swapButtons) === Qt.RightButton
             pressX = mouse.x; pressY = mouse.y; moved = false
             startCx = map.lonToX(map.centerLon, map.zoom)
             startCy = map.latToY(map.centerLat, map.zoom)
@@ -319,7 +322,7 @@ Item {
                 map.picked(lat, lon)
             }
         }
-        onDoubleClicked: function(mouse) { if (mouse.button === Qt.LeftButton) map.zoomAt(1, mouse.x, mouse.y) }
+        onDoubleClicked: function(mouse) { if (MouseButtons.button(mouse.button, swapButtons) === Qt.LeftButton) map.zoomAt(1, mouse.x, mouse.y) }
         // One zoom level per wheel notch (120 units). A touchpad or a
         // high-resolution wheel sends many small deltas per gesture; zooming
         // a level on each of them would jump from street to continent.

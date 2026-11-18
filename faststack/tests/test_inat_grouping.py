@@ -176,10 +176,10 @@ def test_merge_and_move():
         ObservationGroup([_photo(1, 0), _photo(2, 5)]),
         ObservationGroup([_photo(3, 9)]),
     ]
-    groups = move_photo(groups, "/x/IMG_0002.jpg", 1)
+    groups = move_photo(groups, str(Path("/x/IMG_0002.jpg")), 1)
     assert [[p.order for p in g.photos] for g in groups] == [[1], [2, 3]]
     # Moving into a new group at the end
-    groups = move_photo(groups, "/x/IMG_0001.jpg", len(groups))
+    groups = move_photo(groups, str(Path("/x/IMG_0001.jpg")), len(groups))
     assert [[p.order for p in g.photos] for g in groups] == [[2, 3], [1]]
     # Unknown key is a no-op
     assert move_photo(groups, "/nope.jpg", 0) == groups

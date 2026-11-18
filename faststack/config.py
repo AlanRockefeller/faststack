@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 from typing import BinaryIO, Iterator, overload
 
+from faststack.io.executable_validator import macos_bundle_executable
 from faststack.logging_setup import get_app_data_dir
 
 log = logging.getLogger(__name__)
@@ -320,6 +321,65 @@ def _macos_tool_patterns(tool_name: str) -> list[str]:
     return patterns
 
 
+def _macos_bundle_patterns(tool_name: str) -> list[str]:
+    """Globs for whole ``.app`` bundles; the binary is read from Info.plist.
+
+    Helicon Focus has shipped as ``HeliconFocus.app``, ``Helicon Focus.app``
+    and ``Helicon Focus 8.app``, sometimes inside a ``Helicon Software`` or
+    ``Helicon Focus`` folder, so match the bundle and let its Info.plist name
+    the binary rather than guessing the executable's name.
+    """
+    if tool_name != "helicon":
+        return []
+    patterns = []
+    for applications_dir in [*_application_dirs(), "/Applications/Setapp"]:
+        patterns.extend(
+            [
+                _join(applications_dir, "Helicon*.app"),
+                _join(applications_dir, "Helicon*", "Helicon*.app"),
+            ]
+        )
+    return patterns
+
+
+def _macos_spotlight_bundles(tool_name: str) -> list[str]:
+    """Ask Spotlight for app bundles installed outside the usual folders."""
+    if tool_name != "helicon":
+        return []
+    mdfind = shutil.which("mdfind") or "/usr/bin/mdfind"
+    if not os.path.isfile(mdfind):
+        return []
+
+    import subprocess
+
+    from faststack.io.child_process import child_environment
+
+    query = (
+        "kMDItemContentType == 'com.apple.application-bundle' && "
+        "kMDItemFSName == 'Helicon*.app'c"
+    )
+    try:
+        process = subprocess.Popen(
+            [mdfind, query],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=child_environment(),
+            text=True,
+        )
+        try:
+            output, _ = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            log.info("Spotlight search for Helicon Focus timed out")
+            return []
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.info("Spotlight search for Helicon Focus failed: %s", exc)
+        return []
+    return [line for line in output.splitlines() if line.endswith(".app")]
+
+
 def _linux_tool_patterns(tool_name: str) -> list[str]:
     home = str(Path.home())
 
@@ -479,6 +539,17 @@ def detect_external_tool_path(tool_name: str) -> str | None:
                 if existing:
                     matches.append(existing)
 
+        if os_name == "macos":
+            bundles = []
+            for pattern in _macos_bundle_patterns(tool_name):
+                bundles.extend(glob.glob(os.path.expanduser(pattern)))
+            if not bundles and not matches:
+                bundles = _macos_spotlight_bundles(tool_name)
+            for bundle in bundles:
+                executable = macos_bundle_executable(bundle)
+                if executable:
+                    matches.append(executable)
+
         matches = _dedupe_paths(matches)
         if not matches:
             return None
@@ -536,7 +607,8 @@ def detect_rawtherapee_path():
 
 
 # Increment when detection logic changes so existing configs re-detect once.
-_EXTERNAL_TOOL_DETECTION_VERSION = 2
+# 3: macOS Helicon Focus bundles found by Info.plist and Spotlight.
+_EXTERNAL_TOOL_DETECTION_VERSION = 3
 
 _TOOL_DETECTORS = {
     "helicon": detect_helicon_path,
