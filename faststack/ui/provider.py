@@ -710,6 +710,7 @@ class UIState(QObject):
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
     autoVibranceEnabledChanged = Signal(bool)
+    swapMouseButtonsChanged = Signal(bool)
     autoLevelMidtoneChanged = Signal(bool)
     autoLevelMidtoneTargetChanged = Signal(float)
     autoLevelChannelBudgetChanged = Signal(float)
@@ -1741,6 +1742,18 @@ class UIState(QObject):
             return
         self.app_controller.set_auto_vibrance_enabled(value)
         self.autoVibranceEnabledChanged.emit(value)
+
+    @Property(bool, notify=swapMouseButtonsChanged)
+    def swapMouseButtons(self):
+        return self.app_controller.get_swap_mouse_buttons()
+
+    @swapMouseButtons.setter
+    def swapMouseButtons(self, value):
+        value = bool(value)
+        if self.app_controller.get_swap_mouse_buttons() == value:
+            return
+        self.app_controller.set_swap_mouse_buttons(value)
+        self.swapMouseButtonsChanged.emit(value)
 
     @Property(bool, notify=autoLevelMidtoneChanged)
     def autoLevelMidtone(self):

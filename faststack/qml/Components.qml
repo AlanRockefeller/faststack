@@ -3,6 +3,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Effects
 import QtQuick.Window
+import "MouseButtons.js" as MouseButtons
 
 // This file is intended to hold QML components like the main image view.
 // For simplicity, we'll start with just the main image view.
@@ -1471,8 +1472,18 @@ Item {
             setCropViewStart(r.x, r.y, r.x + r.width, r.y + r.height)
         }
 
+        // Settings > Swap Mouse Buttons: everything below reads the logical
+        // button through these, never mouse.button / pressedButtons directly.
+        readonly property bool swapButtons: !!(loupeView.uiStateRef && loupeView.uiStateRef.swapMouseButtons)
+        function logicalButton(mouse) {
+            return MouseButtons.button(mouse.button, swapButtons)
+        }
+        function logicalButtons(mask) {
+            return MouseButtons.buttons(mask, swapButtons)
+        }
+
         function hasRightButton(mouse) {
-            return mouse.button === Qt.RightButton || (mouse.buttons & Qt.RightButton)
+            return logicalButton(mouse) === Qt.RightButton || (logicalButtons(mouse.buttons) & Qt.RightButton)
         }
 
         function setInitialCropBoxAt(mx, my) {
@@ -1585,7 +1596,7 @@ Item {
                 if (imgCoords.x < -0.05 || imgCoords.x > 1.05 || imgCoords.y < -0.05 || imgCoords.y > 1.05) {
                     return
                 }
-                var erase = mouse.button === Qt.RightButton || (mouse.modifiers & Qt.AltModifier)
+                var erase = logicalButton(mouse) === Qt.RightButton || (mouse.modifiers & Qt.AltModifier)
                 loupeView.controllerRef.start_local_stroke(imgCoords.x, imgCoords.y, !!erase)
                 isBrushPainting = true
                 brushErasing = !!erase
@@ -1823,7 +1834,7 @@ Item {
                 return
             }
             
-            if (pressed && (pressedButtons & Qt.LeftButton) && !(pressedButtons & Qt.RightButton) && !isDraggingOutside) {
+            if (pressed && (logicalButtons(pressedButtons) & Qt.LeftButton) && !(logicalButtons(pressedButtons) & Qt.RightButton) && !isDraggingOutside) {
                 // Check if we've moved beyond the threshold
                 var dx = mouse.x - startX
                 var dy = mouse.y - startY

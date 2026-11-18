@@ -1346,6 +1346,11 @@ class AppController(
             "core", "auto_vibrance_enabled", True
         )
         self.auto_level_midtone = config.getboolean("core", "auto_level_midtone", True)
+        # Swap what the left and right buttons do in the image view, the
+        # thumbnail grid and the map picker (left-handed use).
+        self.swap_mouse_buttons = config.getboolean(
+            "core", "swap_mouse_buttons", False
+        )
         self.auto_level_midtone_target = config.getfloat(
             "core", "auto_level_midtone_target", 0.38
         )
@@ -9109,6 +9114,20 @@ class AppController(
             "core",
             "auto_vibrance_enabled",
             "true" if self.auto_vibrance_enabled else "false",
+        )
+        config.save()
+
+    @Slot(result=bool)
+    def get_swap_mouse_buttons(self):
+        return self.swap_mouse_buttons
+
+    @Slot(bool)
+    def set_swap_mouse_buttons(self, value):
+        self.swap_mouse_buttons = bool(value)
+        config.set(
+            "core",
+            "swap_mouse_buttons",
+            "true" if self.swap_mouse_buttons else "false",
         )
         config.save()
 
