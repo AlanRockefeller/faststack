@@ -1090,6 +1090,7 @@ Window {
                             CheckBox {
                                 id: swapMouseCheckBox
                                 text: "Enabled"
+                                Accessible.name: "Swap Mouse Buttons"
                                 checked: settingsDialog.swapMouseButtons
                                 onCheckedChanged: settingsDialog.swapMouseButtons = checked
                                 contentItem: Text { text: swapMouseCheckBox.text; color: settingsDialog.textColor; leftPadding: swapMouseCheckBox.indicator.width + swapMouseCheckBox.spacing; verticalAlignment: Text.AlignVCenter }
