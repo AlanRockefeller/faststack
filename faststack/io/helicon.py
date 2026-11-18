@@ -13,7 +13,10 @@ from typing import List, Optional, Tuple
 from faststack.config import config
 from faststack.io.arguments import parse_external_arguments
 from faststack.io.child_process import launch_with_relayed_output
-from faststack.io.executable_validator import validate_executable_path
+from faststack.io.executable_validator import (
+    resolve_app_bundle,
+    validate_executable_path,
+)
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +87,8 @@ def validate_focus_stacker_path(path: str) -> Tuple[bool, str]:
         return False, "Focus stacker path is not configured."
 
     configured = os.path.expanduser(os.path.expandvars(path.strip().strip('"')))
+    # A macOS app picked in the file dialog is the .app bundle; run its binary.
+    configured = resolve_app_bundle(configured)
     target = Path(configured).absolute()
     if _is_openfocus_target(target):
         if target.is_dir() or target.name.casefold() == "main.py":
@@ -110,6 +115,7 @@ def launch_focus_stacker(
         return False, None
 
     configured = os.path.expanduser(os.path.expandvars(configured.strip().strip('"')))
+    configured = resolve_app_bundle(configured)
     # Popen resolves argv[0] relative to ``cwd``. Keep this absolute before
     # changing the child directory, while leaving interpreter symlinks intact.
     target = Path(configured).absolute()

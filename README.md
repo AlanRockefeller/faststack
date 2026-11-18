@@ -383,6 +383,8 @@ change; **Cancel** (or `Esc`) discards them.
 
 - **Focus Stacker Path**: Helicon Focus executable, or OpenFocus's `main.py`
   (or its project folder). Used by `Enter` and the **Run Stacks** menu items.
+  On macOS you can pick the Helicon Focus app itself; it is found
+  automatically when installed in Applications.
 - **Image Editor Path**: Photoshop, GIMP or another editor for `P`. Recently
   used editors are offered in the dropdown.
 - **RawTherapee Path**: `rawtherapee-cli` is used by **Develop RAW** (the
