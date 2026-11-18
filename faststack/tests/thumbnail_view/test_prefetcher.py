@@ -283,12 +283,15 @@ class TestThumbnailPrefetcher:
                 mtime_ns = test_image.stat().st_mtime_ns
                 prefetcher.submit(test_image, mtime_ns)
 
-                # Wait for decode completion (cache fill proves the worker finished)
+                # Wait for the cache fill and the delivery: the worker fills
+                # the cache before it calls back, so on a slow runner the
+                # cache alone can be ready a moment before the callback.
                 path_hash = compute_path_hash(test_image)
                 cache_key = f"200/{path_hash}/{mtime_ns}"
                 assert _wait_until(
-                    lambda: cache.get(cache_key) is not None,
-                    timeout_s=2.0,
+                    lambda: cache.get(cache_key) is not None
+                    and callback.call_count + callback.emit.call_count > 0,
+                    timeout_s=5.0,
                     qt_app=qt_app,
                 )
 
