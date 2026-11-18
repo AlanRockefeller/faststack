@@ -2,6 +2,7 @@
 
 import logging
 import os
+import plistlib
 import stat
 from pathlib import Path, PureWindowsPath
 from typing import Optional
@@ -48,15 +49,14 @@ def macos_bundle_executable(bundle_path: str | os.PathLike) -> Optional[str]:
 
     macos_dir = bundle / "Contents" / "MacOS"
     try:
-        import plistlib
-
         with (bundle / "Contents" / "Info.plist").open("rb") as plist_file:
-            name = plistlib.load(plist_file).get("CFBundleExecutable")
+            info = plistlib.load(plist_file)
+        name = info.get("CFBundleExecutable") if isinstance(info, dict) else None
         if isinstance(name, str) and name and "/" not in name:
             candidate = macos_dir / name
             if candidate.is_file():
                 return str(candidate)
-    except (OSError, ValueError, plistlib.InvalidFileException):
+    except Exception:  # unreadable or malformed plist (ExpatError, ValueError, ...)
         log.debug("No usable Info.plist in %s", bundle, exc_info=True)
 
     try:
