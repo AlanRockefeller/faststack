@@ -4,7 +4,7 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 
 ## Unreleased
 
-- Stack input folders kept under a year folder (`2026/2026-11-05`) are now matched with the plain dated folder in the Main Photo Directory (`2026-11-05`), and the other way round. Restack, finding the input JPGs of an in-camera stacked JPG, and Actions > Switch to Stack Input Directory / Switch to Main Photo Directory all try the plain folder first, then the year-wrapped one. Subfolders of a dated folder (`2026-11-05/sub`) work the same way.
+- Dated folders now match between the Main Photo Directory and the stack input folders when only one of them keeps them under a year folder (`2026-11-05` in one, `2026/2026-11-05` in the other, either way round). Restack, finding the input JPGs of an in-camera stacked JPG, and Actions > Switch to Stack Input Directory / Switch to Main Photo Directory try the same relative folder first, then the other layout. Subfolders of a dated folder (`2026-11-05/sub`) work too; other folders (`2026/2026-archive`) are matched only as they are.
 
 ## 1.7.0 (2026-11-18)
 

@@ -7988,7 +7988,7 @@ class AppController(
                 relative_directory = current_directory.relative_to(root)
             except ValueError:
                 continue
-            return root, self._unwrap_restack_year(relative_directory)
+            return root, relative_directory
         return None
 
     def _matching_stack_input_directory(self) -> Path | None:
@@ -16700,31 +16700,29 @@ class AppController(
         else:
             self.update_status_message("Failed to launch focus stacker.")
 
-    @staticmethod
-    def _restack_relative_candidates(relative: Path) -> list[Path]:
-        """Relative folders to try under each stack-input root.
+    _RESTACK_DATED_FOLDER_RE = re.compile(r"(\d{4})-\d{2}-\d{2}(?!\d)")
 
-        The main photo tree holds dated folders directly (``2026-11-05``), but
-        the stack-input tree usually adds a year folder (``2026/2026-11-05``).
-        So when the path starts with a dated folder (``2026-11-05`` or
-        ``2026-11-05/sub``) we try the plain path first, then the year-wrapped
-        one.
+    @classmethod
+    def _restack_relative_candidates(cls, relative: Path) -> list[Path]:
+        """Relative folders to try when mapping between the photo trees.
+
+        One tree may keep dated folders directly (``2026-11-05``) while the
+        other adds a year folder (``2026/2026-11-05``). The identical relative
+        path is always tried first; when it starts with a dated folder, the
+        other layout is tried next. Subfolders (``2026-11-05/sub``) carry
+        over. Anything else, such as ``2026/2026-archive``, is left as is.
         """
-        candidates = [relative]
-        if relative.parts:
-            match = re.match(r"(\d{4})-\d{2}-\d{2}", relative.parts[0])
-            if match:
-                candidates.append(Path(match.group(1)) / relative)
-        return candidates
-
-    @staticmethod
-    def _unwrap_restack_year(relative: Path) -> Path:
-        """Inverse of the year wrap: ``2026/2026-11-05`` -> ``2026-11-05``."""
         parts = relative.parts
+        if not parts:
+            return [relative]
+        match = cls._RESTACK_DATED_FOLDER_RE.match(parts[0])
+        if match:
+            return [relative, Path(match.group(1)) / relative]
         if len(parts) >= 2 and re.fullmatch(r"\d{4}", parts[0]):
-            if parts[1].startswith(parts[0] + "-"):
-                return Path(*parts[1:])
-        return relative
+            match = cls._RESTACK_DATED_FOLDER_RE.match(parts[1])
+            if match and match.group(1) == parts[0]:
+                return [relative, Path(*parts[1:])]
+        return [relative]
 
     def _configured_restack_raw_locations(self) -> list[tuple[str, Path]]:
         raw_source_dir = config.get("raw", "source_dir", fallback="")
