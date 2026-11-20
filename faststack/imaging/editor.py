@@ -2854,8 +2854,15 @@ class ImageEditor:
         reset_levels: bool = True,
         channel_budget: float = 3.0,
         black_threshold_percent: Optional[float] = None,
+        white_threshold_percent: Optional[float] = None,
     ) -> Tuple[float, float, float, float]:
         """Analyze auto-levels on the current edited baseline without mutating edits.
+
+        ``white_threshold_percent`` is the highlight-end counterpart: the
+        share of pixels the white point may clip (luma, with each channel
+        allowed ``channel_budget`` times that). Lower it to brighten less and
+        keep highlights; None keeps it tied to ``threshold_percent``. It never
+        touches the shadow end.
 
         ``black_threshold_percent`` clips the shadow end independently of
         ``threshold_percent``. The black point can never sit above this
@@ -2873,6 +2880,10 @@ class ImageEditor:
             black_threshold_percent = threshold_percent
         else:
             black_threshold_percent = max(0.0, min(50.0, black_threshold_percent))
+        if white_threshold_percent is None:
+            white_threshold_percent = threshold_percent
+        else:
+            white_threshold_percent = max(0.0, min(10.0, white_threshold_percent))
 
         # Auto-levels is an aggregate percentile estimate: sample the source
         # down before rendering so analysis follows source pixels without
@@ -2924,6 +2935,7 @@ class ImageEditor:
         # stretch.
         channel_budget = max(1.0, min(10.0, float(channel_budget)))
         chan_t = min(50.0, threshold_percent * channel_budget)
+        chan_t_high = min(50.0, white_threshold_percent * channel_budget)
 
         # No explicit pre-clip pinning is needed: percentile ranks already
         # count clipped pixels, so stretching to the q-th percentile keeps the
@@ -2936,7 +2948,7 @@ class ImageEditor:
             hist = np.bincount(quantized[:, :, c].reshape(-1), minlength=nbins)
             chan_lows.append(self._percentile_from_hist(hist, chan_t, method="lower"))
             chan_highs.append(
-                self._percentile_from_hist(hist, 100.0 - chan_t, method="higher")
+                self._percentile_from_hist(hist, 100.0 - chan_t_high, method="higher")
             )
 
         luma_q = (_rec601_gray(scaled) * (nbins - 1)).astype(np.uint16)
@@ -2945,7 +2957,7 @@ class ImageEditor:
             luma_hist, black_threshold_percent, method="lower"
         )
         luma_high = self._percentile_from_hist(
-            luma_hist, 100.0 - threshold_percent, method="higher"
+            luma_hist, 100.0 - white_threshold_percent, method="higher"
         )
         median_luma = self._percentile_from_hist(luma_hist, 50.0, method="lower") / (
             nbins - 1

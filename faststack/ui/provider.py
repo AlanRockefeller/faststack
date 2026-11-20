@@ -707,6 +707,7 @@ class UIState(QObject):
     imageEditorUnsavedPromptRequested = Signal(str, bool)
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelBlackThresholdChanged = Signal(float)
+    autoLevelWhiteThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
     autoVibranceEnabledChanged = Signal(bool)
@@ -1709,6 +1710,17 @@ class UIState(QObject):
             return
         self.app_controller.set_auto_level_black_threshold(value)
         self.autoLevelBlackThresholdChanged.emit(value)
+
+    @Property(float, notify=autoLevelWhiteThresholdChanged)
+    def autoLevelWhiteThreshold(self):
+        return self.app_controller.get_auto_level_white_threshold()
+
+    @autoLevelWhiteThreshold.setter
+    def autoLevelWhiteThreshold(self, value):
+        if self.app_controller.get_auto_level_white_threshold() == value:
+            return
+        self.app_controller.set_auto_level_white_threshold(value)
+        self.autoLevelWhiteThresholdChanged.emit(value)
 
     @Property(float, notify=autoLevelStrengthChanged)
     def autoLevelStrength(self):

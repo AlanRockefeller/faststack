@@ -200,9 +200,9 @@ Window {
                     ListElement { name: "Exposure"; key: "exposure"; reverse: false; min: -100; max: 100 }
                     ListElement { name: "Brightness"; key: "brightness"; reverse: false; min: -100; max: 100 }
                     ListElement { name: "Highlights"; key: "highlights"; reverse: false; min: -100; max: 100 }
-                    ListElement { name: "Whites"; key: "whites"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Whites"; key: "whites"; reverse: false; min: -100; max: 300 }
                     ListElement { name: "Shadows"; key: "shadows"; reverse: false; min: -100; max: 100 }
-                    ListElement { name: "Blacks"; key: "blacks"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Blacks"; key: "blacks"; reverse: false; min: -300; max: 100 }
                     ListElement { name: "Contrast"; key: "contrast"; reverse: false; min: -100; max: 100 }
                 }
                 Repeater { model: lightModel; delegate: editSlider }
@@ -647,13 +647,15 @@ Window {
                     property real editScale: imageEditorDialog.sliderEditScale(sliderRow.key)
                 
                 property real backendValue: {
-                    var val = imageEditorDialog.getBackendValue(sliderRow.key) / slider.editScale * sliderRow.maxVal
+                    // 100 slider units per edit unit, whatever the range (Whites and
+                    // Blacks extend past +/-100 to fit auto-levels results).
+                    var val = imageEditorDialog.getBackendValue(sliderRow.key) / slider.editScale * 100
                     return sliderRow.isReversed ? -val : val
                 }
 
                 function editValueFromSliderValue(sliderValue) {
                     var sendValue = sliderRow.isReversed ? -sliderValue : sliderValue
-                    return sendValue / sliderRow.maxVal * slider.editScale
+                    return sendValue / 100 * slider.editScale
                 }
                 
                 // Auto-sync visual slider with backend changes when not dragging
@@ -855,7 +857,10 @@ Window {
 
             Text {
                 id: valueReadout
-                property int displayValue: Math.round(sliderRow.isReversed ? -slider.value : slider.value)
+                // Read the edit itself when idle so a value past the slider's
+                // end shows its real number instead of the pinned endpoint.
+                property real shownValue: slider.pressed ? slider.value : slider.backendValue
+                property int displayValue: Math.round(sliderRow.isReversed ? -shownValue : shownValue)
 
                 text: displayValue === 0 ? "0" : (displayValue > 0 ? "+" + displayValue : "−" + Math.abs(displayValue))
                 Layout.preferredWidth: 40

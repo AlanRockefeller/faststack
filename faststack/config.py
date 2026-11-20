@@ -697,8 +697,13 @@ DEFAULT_CONFIG = {
         #     cannot raise that ceiling. Raise it (1-3) if backgrounds that
         #     should read as black come out grey; it clips that share of the
         #     darkest pixels, so shadow detail goes with them.
+        #   - auto_level_white_threshold: same units, highlight end only. 0 means
+        #     "follow auto_level_threshold". Lower it (e.g. 0.01) when auto
+        #     levels brightens too far and blows highlights; a dark photo with
+        #     no bright pixels is still stretched all the way up.
         "auto_level_threshold": "0.1",
         "auto_level_black_threshold": "0",
+        "auto_level_white_threshold": "0",
         "auto_level_strength": "1.0",
         "auto_level_strength_auto": "False",
         "auto_vibrance_enabled": "True",

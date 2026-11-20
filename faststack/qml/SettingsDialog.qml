@@ -25,6 +25,7 @@ Window {
     property double cacheSize: 1.5
     property double autoLevelClippingThreshold: 0.1
     property double autoLevelBlackThreshold: 0.0
+    property double autoLevelWhiteThreshold: 0.0
     property double autoLevelStrength: 1.0
     property bool autoLevelStrengthAuto: false
     property bool autoVibranceEnabled: true
@@ -197,6 +198,7 @@ Window {
             settingsDialog.swapMouseButtons = settingsDialog.uiStateRef.swapMouseButtons
             settingsDialog.autoLevelClippingThreshold = settingsDialog.uiStateRef.autoLevelClippingThreshold
             settingsDialog.autoLevelBlackThreshold = settingsDialog.uiStateRef.autoLevelBlackThreshold
+            settingsDialog.autoLevelWhiteThreshold = settingsDialog.uiStateRef.autoLevelWhiteThreshold
             settingsDialog.autoLevelStrength = settingsDialog.uiStateRef.autoLevelStrength
             settingsDialog.autoLevelStrengthAuto = settingsDialog.uiStateRef.autoLevelStrengthAuto
             settingsDialog.autoVibranceEnabled = settingsDialog.uiStateRef.autoVibranceEnabled
@@ -271,6 +273,7 @@ Window {
         state.swapMouseButtons = settingsDialog.swapMouseButtons
         state.autoLevelClippingThreshold = settingsDialog.autoLevelClippingThreshold
         state.autoLevelBlackThreshold = settingsDialog.autoLevelBlackThreshold
+        state.autoLevelWhiteThreshold = settingsDialog.autoLevelWhiteThreshold
         state.autoLevelStrength = settingsDialog.autoLevelStrength
         state.autoLevelStrengthAuto = settingsDialog.autoLevelStrengthAuto
         state.autoVibranceEnabled = settingsDialog.autoVibranceEnabled
@@ -1221,7 +1224,7 @@ Window {
                                 }
                                 
                                 ToolTip.visible: clipThresholdHover.containsMouse
-                                ToolTip.text: "Percentage of pixels to clip at the dark and light ends of the histogram when auto-levels is applied. Higher values (e.g., 5%) increase contrast but risk making highlights appear clipped. Lower values (e.g., 0.1%) preserve more dynamic range. Default: 0.1%"
+                                ToolTip.text: "Percentage of pixels to clip at the dark and light ends of the histogram when auto-levels is applied. Higher values (e.g., 5%) increase contrast but risk making highlights appear clipped. Lower values (e.g., 0.1%) preserve more dynamic range. Whites Clip % and Blacks Clip % override it for one end. Default: 0.1%"
                             }
                             Loader {
                                 id: clipThresholdLoader
@@ -1242,6 +1245,41 @@ Window {
                                     property: "text"
                                     value: settingsDialog.autoLevelClippingThreshold.toFixed(4)
                                     when: clipThresholdLoader.item && !settingsDialog.loaderProperty(clipThresholdLoader, "activeFocus", false)
+                                }
+                            }
+
+                            Label {
+                                text: "Whites Clip %"
+                                color: settingsDialog.textColor
+
+                                MouseArea {
+                                    id: whiteThresholdHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                }
+
+                                ToolTip.visible: whiteThresholdHover.containsMouse
+                                ToolTip.text: "Clips the bright end only, separately from Clip Threshold and Blacks Clip. 0 means follow Clip Threshold. Lower it (try 0.01-0.02%) when auto levels brightens too far and blows out highlights; use 0.0001 for almost no clipping. A dark photo with no bright pixels is still brightened all the way, because this limits how many pixels may clip, not how far the image is lifted."
+                            }
+                            Loader {
+                                id: whiteThresholdLoader
+                                sourceComponent: styledTextField
+                                Layout.preferredWidth: 80
+                                onLoaded: {
+                                     settingsDialog.setLoaderProperty(whiteThresholdLoader, "text", settingsDialog.autoLevelWhiteThreshold.toFixed(4))
+                                     settingsDialog.connectLoaderSignal(whiteThresholdLoader, "editingFinished", function() {
+                                         var value = parseFloat(settingsDialog.loaderProperty(whiteThresholdLoader, "text", settingsDialog.autoLevelWhiteThreshold.toFixed(4)))
+                                         if (!isNaN(value) && value >= 0.0 && value <= 1.0) {
+                                             settingsDialog.autoLevelWhiteThreshold = value
+                                         }
+                                         settingsDialog.setLoaderProperty(whiteThresholdLoader, "text", settingsDialog.autoLevelWhiteThreshold.toFixed(4))
+                                     })
+                                }
+                                Binding {
+                                    target: whiteThresholdLoader.item
+                                    property: "text"
+                                    value: settingsDialog.autoLevelWhiteThreshold.toFixed(4)
+                                    when: whiteThresholdLoader.item && !settingsDialog.loaderProperty(whiteThresholdLoader, "activeFocus", false)
                                 }
                             }
 

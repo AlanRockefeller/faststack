@@ -152,3 +152,48 @@ def test_auto_levels_normal_range():
 
     assert whites == _approx_slider((255.0 - 200.0) / 40.0)
     assert blacks == _approx_slider(-50.0 / 40.0)
+
+
+def _gradient_editor():
+    """Editor on a smooth 0..255 ramp with a few near-white highlights."""
+    editor = ImageEditor()
+    ramp = np.linspace(20, 200, 200 * 200).reshape(200, 200)
+    arr = np.repeat(ramp[:, :, None], 3, axis=2)
+    # 0.5% of the frame is a bright highlight that a 2% clip blows out.
+    arr[:1, :, :] = 245
+    img = Image.fromarray(arr.astype(np.uint8), "RGB")
+    editor.original_image = img
+    editor._preview_image = img
+    return editor
+
+
+def test_white_threshold_none_matches_shared_threshold():
+    editor = _gradient_editor()
+    baseline = editor.analyze_auto_levels(0.5)
+    explicit = editor.analyze_auto_levels(0.5, white_threshold_percent=None)
+    assert explicit == baseline
+
+
+def test_white_threshold_moves_only_the_white_point():
+    editor = _gradient_editor()
+    b0, w0, lo0, hi0 = editor.analyze_auto_levels(2.0)
+    b1, w1, lo1, hi1 = editor.analyze_auto_levels(2.0, white_threshold_percent=0.01)
+    # Blacks stay bit-identical; the tighter highlight clip brightens less.
+    assert (b1, lo1) == (b0, lo0)
+    assert hi1 > hi0
+    assert w1 < w0
+
+
+def test_white_threshold_still_lifts_a_dark_photo_fully():
+    # No bright pixels at all: a tiny whites clip must not stop the stretch.
+    editor = ImageEditor()
+    ramp = np.linspace(10, 90, 100 * 100).reshape(100, 100)
+    arr = np.repeat(ramp[:, :, None], 3, axis=2).astype(np.uint8)
+    img = Image.fromarray(arr, "RGB")
+    editor.original_image = img
+    editor._preview_image = img
+    _b, whites, _lo, p_high = editor.analyze_auto_levels(
+        0.1, white_threshold_percent=0.0001
+    )
+    assert p_high == _approx_255(90.0)
+    assert whites == _approx_slider((255.0 - 90.0) / 40.0)
