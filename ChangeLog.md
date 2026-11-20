@@ -2,6 +2,10 @@
 
 Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation / help. Add splash screen / icon. Fix raw image support.
 
+## Unreleased
+
+- Stack input folders kept under a year folder (`2026/2026-11-05`) are now matched with the plain dated folder in the Main Photo Directory (`2026-11-05`), and the other way round. Restack, finding the input JPGs of an in-camera stacked JPG, and Actions > Switch to Stack Input Directory / Switch to Main Photo Directory all try the plain folder first, then the year-wrapped one. Subfolders of a dated folder (`2026-11-05/sub`) work the same way.
+
 ## 1.7.0 (2026-11-18)
 
 - macOS: Helicon Focus is found wherever it is usually installed: `HeliconFocus.app`, `Helicon Focus.app` or `Helicon Focus 8.app` in Applications (the system's or your own), inside a `Helicon Software` or `Helicon Focus` folder, or in Setapp, with Spotlight as a last resort. The program inside the app is read from the app itself rather than guessed from its name. Picking the app itself as the Focus Stacker Path in Settings now works too; it used to be refused because it is a folder. Existing settings that never found Helicon look again once.

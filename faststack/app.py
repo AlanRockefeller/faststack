@@ -7988,7 +7988,7 @@ class AppController(
                 relative_directory = current_directory.relative_to(root)
             except ValueError:
                 continue
-            return root, relative_directory
+            return root, self._unwrap_restack_year(relative_directory)
         return None
 
     def _matching_stack_input_directory(self) -> Path | None:
@@ -8008,9 +8008,10 @@ class AppController(
             stack_input_root = self._resolve_configured_directory(configured_root)
             if stack_input_root is None:
                 continue
-            candidate = stack_input_root / relative_directory
-            if candidate.is_dir():
-                return candidate
+            for relative in self._restack_relative_candidates(relative_directory):
+                candidate = stack_input_root / relative
+                if candidate.is_dir():
+                    return candidate
         return None
 
     def is_in_stack_input_directory(self) -> bool:
@@ -8035,8 +8036,13 @@ class AppController(
                     "The main photo directory is not configured or available"
                 )
                 return
-            target_directory = main_photo_directory / relative_directory
-            if not target_directory.is_dir():
+            target_directory = None
+            for candidate in self._restack_relative_candidates(relative_directory):
+                if (main_photo_directory / candidate).is_dir():
+                    target_directory = main_photo_directory / candidate
+                    break
+            if target_directory is None:
+                target_directory = main_photo_directory / relative_directory
                 self.update_status_message(
                     f"Matching main photo directory is not available: {target_directory}"
                 )
@@ -14682,8 +14688,9 @@ class AppController(
                 relative = None
             if relative is not None:
                 search_dirs.extend(
-                    base / relative
+                    base / candidate
                     for _label, base in self._configured_restack_raw_locations()
+                    for candidate in self._restack_relative_candidates(relative)
                 )
         search_dirs.append(image_path.parent)
         for directory in search_dirs:
@@ -16526,8 +16533,9 @@ class AppController(
 
         raw_locations = self._configured_restack_raw_locations()
         search_locations = [
-            (label, base_dir, base_dir / relative_part)
+            (label, base_dir, base_dir / candidate)
             for label, base_dir in raw_locations
+            for candidate in self._restack_relative_candidates(relative_part)
         ]
         if not search_locations:
             self._show_missing_restack_raws_dialog(
@@ -16691,6 +16699,32 @@ class AppController(
                 self.update_status_message("Focus stacker launched successfully.")
         else:
             self.update_status_message("Failed to launch focus stacker.")
+
+    @staticmethod
+    def _restack_relative_candidates(relative: Path) -> list[Path]:
+        """Relative folders to try under each stack-input root.
+
+        The main photo tree holds dated folders directly (``2026-11-05``), but
+        the stack-input tree usually adds a year folder (``2026/2026-11-05``).
+        So when the path starts with a dated folder (``2026-11-05`` or
+        ``2026-11-05/sub``) we try the plain path first, then the year-wrapped
+        one.
+        """
+        candidates = [relative]
+        if relative.parts:
+            match = re.match(r"(\d{4})-\d{2}-\d{2}", relative.parts[0])
+            if match:
+                candidates.append(Path(match.group(1)) / relative)
+        return candidates
+
+    @staticmethod
+    def _unwrap_restack_year(relative: Path) -> Path:
+        """Inverse of the year wrap: ``2026/2026-11-05`` -> ``2026-11-05``."""
+        parts = relative.parts
+        if len(parts) >= 2 and re.fullmatch(r"\d{4}", parts[0]):
+            if parts[1].startswith(parts[0] + "-"):
+                return Path(*parts[1:])
+        return relative
 
     def _configured_restack_raw_locations(self) -> list[tuple[str, Path]]:
         raw_source_dir = config.get("raw", "source_dir", fallback="")
