@@ -4,6 +4,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import "TouchpadScroll.js" as TouchpadScroll
 
 // Actions -> iNaturalist upload. Groups the batch into observation cards,
 // identifies each with MycoMap Vision, lets the user fix the grouping
@@ -659,7 +660,8 @@ Window {
 
                 // The mouse wheel moves the list a good part of a card per
                 // notch; the Flickable's own step is a few text lines, which
-                // crawls past cards this tall. A touchpad keeps its own pace.
+                // crawls past cards this tall. A touchpad's pixel deltas are
+                // scaled up by TouchpadScroll for the same reason.
                 WheelHandler {
                     acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
                     onWheel: function(event) {
@@ -668,7 +670,7 @@ Window {
                         var touchpad = event.device.type === PointerDevice.TouchPad && event.pixelDelta.y !== 0
                         if (touchpad) {
                             wheelScroll.stop()
-                            flick.contentY = Math.max(0, Math.min(maxY, flick.contentY - event.pixelDelta.y))
+                            flick.contentY = Math.max(0, Math.min(maxY, flick.contentY - TouchpadScroll.pixels(event.pixelDelta.y)))
                             return
                         }
                         if (event.angleDelta.y === 0) return
