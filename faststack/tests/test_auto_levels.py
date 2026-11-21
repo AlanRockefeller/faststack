@@ -197,3 +197,47 @@ def test_white_threshold_still_lifts_a_dark_photo_fully():
     )
     assert p_high == _approx_255(90.0)
     assert whites == _approx_slider((255.0 - 90.0) / 40.0)
+
+
+def _recommend(editor, white=0.0):
+    import types
+
+    from faststack.app import AppController
+
+    ns = types.SimpleNamespace(
+        image_editor=editor,
+        auto_level_threshold=0.1,
+        auto_level_black_threshold=0.0,
+        auto_level_white_threshold=white,
+        auto_level_strength=1.0,
+        auto_level_strength_auto=False,
+        auto_level_midtone=True,
+        auto_level_midtone_target=0.38,
+        auto_level_channel_budget=3.0,
+    )
+    ns._black_threshold_percent = lambda: None
+    ns._white_threshold_percent = lambda: white if white > 0 else None
+    return AppController._compute_auto_levels_recommendation(ns)
+
+
+def _dim_subject_editor(highlight=True):
+    editor = ImageEditor()
+    ramp = np.linspace(5, 90, 200 * 200).reshape(200, 200)
+    arr = np.repeat(ramp[:, :, None], 3, axis=2)
+    if highlight:
+        arr[:2, :, :] = 250  # 1% bright highlight
+    img = Image.fromarray(arr.astype(np.uint8), "RGB")
+    editor.original_image = img
+    editor._preview_image = img
+    return editor
+
+
+def test_explicit_whites_clip_blocks_midtone_lift_into_highlights():
+    editor = _dim_subject_editor()
+    default = _recommend(editor)
+    capped = _recommend(editor, white=0.01)
+    # The default path lifts the dim subject; an explicit Whites Clip % keeps
+    # the lift from rolling the full-stretch white point toward white.
+    assert default["base_brightness"] > 0.0
+    assert capped["base_brightness"] == 0.0
+    assert capped["base_blacks"] == default["base_blacks"]

@@ -5293,6 +5293,17 @@ class AppController(
                     factor = max(
                         _AUTO_MIDTONE_MAX_DROP, min(_AUTO_MIDTONE_MAX_LIFT, factor)
                     )
+                    if factor > 1.0 and self._white_threshold_percent() is not None:
+                        # An explicit Whites Clip % is the user's highlight
+                        # budget, so the lift may not spend more of it. A
+                        # positive Brightness rolls everything above 0.9
+                        # output toward white; keep the post-stretch white
+                        # point below that knee. A full stretch already puts
+                        # it at 1.0, which leaves no room to lift, while a
+                        # dark photo whose stretch hit the cap still has room.
+                        white_ref = (p_high / 255.0 - bp) / span
+                        if white_ref > 0.0:
+                            factor = min(factor, max(1.0, 0.9 / white_ref))
                     if abs(factor - 1.0) >= 0.02:
                         base_brightness = factor - 1.0
 

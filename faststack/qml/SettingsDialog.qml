@@ -1259,7 +1259,7 @@ Window {
                                 }
 
                                 ToolTip.visible: whiteThresholdHover.containsMouse
-                                ToolTip.text: "Clips the bright end only, separately from Clip Threshold and Blacks Clip. 0 means follow Clip Threshold. Lower it (try 0.01-0.02%) when auto levels brightens too far and blows out highlights; use 0.0001 for almost no clipping. A dark photo with no bright pixels is still brightened all the way, because this limits how many pixels may clip, not how far the image is lifted."
+                                ToolTip.text: "Clips the bright end only, separately from Clip Threshold and Blacks Clip. 0 means follow Clip Threshold. Lower it (try 0.01-0.02%) when auto levels brightens too far and blows out highlights; use 0.0001 for almost no clipping. While set, it also keeps the midtone brightening from pushing the brightest pixels toward white. A dark photo with no bright pixels is still brightened all the way, because this limits how many pixels may clip, not how far the image is lifted."
                             }
                             Loader {
                                 id: whiteThresholdLoader
