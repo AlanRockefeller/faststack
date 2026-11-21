@@ -247,12 +247,28 @@ def _apply_in_parallel_bands(operation, source: np.ndarray) -> np.ndarray:
     return output
 
 
-def _apply_levels_ramp(arr: np.ndarray, blacks: float, whites: float) -> np.ndarray:
-    """Set the working black/white range without clipping or mutating input."""
+# Narrowest black-to-white span the levels ramp accepts (a 20x stretch). The
+# Whites/Blacks sliders reach far enough that the endpoints could otherwise
+# cross and turn the image into a negative. Any span the old +/-100 sliders
+# could produce is >= 0.55, so this never changes an existing edit.
+_LEVELS_MIN_SPAN = 0.05
+
+
+def _levels_endpoints(blacks: float, whites: float) -> Tuple[float, float]:
+    """Black and white points (bp, wp) of the levels ramp, never crossed."""
     bp = -blacks * 0.15
     wp = 1.0 - whites * 0.15
-    if abs(wp - bp) < 0.0001:
-        wp = bp + 0.0001
+    if wp - bp < _LEVELS_MIN_SPAN:
+        # Split the shortfall so neither slider alone wins the collision.
+        mid = 0.5 * (bp + wp)
+        bp = mid - 0.5 * _LEVELS_MIN_SPAN
+        wp = mid + 0.5 * _LEVELS_MIN_SPAN
+    return bp, wp
+
+
+def _apply_levels_ramp(arr: np.ndarray, blacks: float, whites: float) -> np.ndarray:
+    """Set the working black/white range without clipping or mutating input."""
+    bp, wp = _levels_endpoints(blacks, whites)
     return (arr - bp) / (wp - bp)
 
 
@@ -4804,9 +4820,8 @@ class ImageEditor:
             whites = float(edits.get("whites", 0.0))
         except (TypeError, ValueError):
             return final_float
-        bp = -blacks * 0.15
-        wp = 1.0 - (whites * 0.15)
-        gain = 1.0 / max(wp - bp, 1e-4)
+        bp, wp = _levels_endpoints(blacks, whites)
+        gain = 1.0 / (wp - bp)
         if gain < _EXPORT_DITHER_MIN_GAIN:
             return final_float
 
@@ -5294,10 +5309,7 @@ class ImageEditor:
         if abs(blacks) <= 0.001 and abs(whites) <= 0.001:
             return None
 
-        bp = -blacks * 0.15
-        wp = 1.0 - (whites * 0.15)
-        if abs(wp - bp) < 0.0001:
-            wp = bp + 0.0001
+        bp, wp = _levels_endpoints(blacks, whites)
 
         # A LUT cannot dither (it is pointwise), so when the stretch is strong
         # enough to band 8-bit sources, decline the fast path and let the

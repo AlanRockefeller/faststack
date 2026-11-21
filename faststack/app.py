@@ -5294,6 +5294,18 @@ class AppController(
                         _AUTO_MIDTONE_MAX_DROP, min(_AUTO_MIDTONE_MAX_LIFT, factor)
                     )
                     if factor > 1.0 and self._white_threshold_percent() is not None:
+                        # Positive contrast renders after brightness but is
+                        # already in p_high, so the projection below would be
+                        # wrong; skip the lift rather than guess.
+                        try:
+                            contrast = float(
+                                self.image_editor.get_edit_value("contrast", 0.0)
+                                or 0.0
+                            )
+                        except (TypeError, ValueError):
+                            contrast = 0.0
+                        if contrast > 0.001:
+                            factor = 1.0
                         # An explicit Whites Clip % is the user's highlight
                         # budget, so the lift may not spend more of it. A
                         # positive Brightness rolls everything above 0.9

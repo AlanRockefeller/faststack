@@ -1270,6 +1270,9 @@ Window {
                                      settingsDialog.connectLoaderSignal(whiteThresholdLoader, "editingFinished", function() {
                                          var value = parseFloat(settingsDialog.loaderProperty(whiteThresholdLoader, "text", settingsDialog.autoLevelWhiteThreshold.toFixed(4)))
                                          if (!isNaN(value) && value >= 0.0 && value <= 1.0) {
+                                             // Below 0.0001 the field would read 0.0000, which
+                                             // looks like "follow Clip Threshold"; round up.
+                                             if (value > 0.0 && value < 0.0001) value = 0.0001
                                              settingsDialog.autoLevelWhiteThreshold = value
                                          }
                                          settingsDialog.setLoaderProperty(whiteThresholdLoader, "text", settingsDialog.autoLevelWhiteThreshold.toFixed(4))

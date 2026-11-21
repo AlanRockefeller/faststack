@@ -713,10 +713,20 @@ Window {
                     resetTimer.restart()
                 }
 
+                // Keyboard steps start from the edit itself, not slider.value:
+                // Qt bounds value to from..to, so an edit past the slider's
+                // end (an extreme auto-levels result) would otherwise snap to
+                // the endpoint. It may step back toward the range one unit at
+                // a time but never jumps.
+                property bool _keyAdjusting: false
                 function nudgeByKeyboard(step) {
                     if (slider.isResetting) return false
-                    var nextValue = Math.max(slider.from, Math.min(slider.to, slider.value + step))
-                    if (nextValue === slider.value) return true
+                    var base = slider._keyAdjusting ? _pendingValue : slider.backendValue
+                    var lo = Math.min(slider.from, base)
+                    var hi = Math.max(slider.to, base)
+                    var nextValue = Math.max(lo, Math.min(hi, base + step))
+                    slider._keyAdjusting = true
+                    if (nextValue === base) return true
                     slider.value = nextValue
                     _pendingValue = nextValue
                     if (!sendTimer.running) sendTimer.start()
@@ -724,10 +734,13 @@ Window {
                 }
 
                 function commitKeyboardAdjust() {
+                    var keyed = slider._keyAdjusting
+                    slider._keyAdjusting = false
                     if (slider.isResetting) {
                         if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
                     } else {
-                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
+                        var committed = keyed ? _pendingValue : value
+                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(committed))
                     }
                     if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.update_histogram()
                 }

@@ -241,3 +241,22 @@ def test_explicit_whites_clip_blocks_midtone_lift_into_highlights():
     assert default["base_brightness"] > 0.0
     assert capped["base_brightness"] == 0.0
     assert capped["base_blacks"] == default["base_blacks"]
+
+
+def test_levels_endpoints_never_cross():
+    from faststack.imaging.editor import _apply_levels_ramp, _levels_endpoints
+
+    # Slider extremes: Whites +300 (6.0) with Blacks -300 (-3.0) would put
+    # the white point below the black point and render a negative.
+    bp, wp = _levels_endpoints(-3.0, 6.0)
+    assert wp - bp == pytest.approx(0.05)
+    ramp = _apply_levels_ramp(np.array([0.0, 0.5, 1.0], dtype=np.float32), -3.0, 6.0)
+    assert np.all(np.diff(ramp) > 0)
+    # Anything the old +/-100 sliders could reach is untouched.
+    assert _levels_endpoints(-1.0, 2.0) == pytest.approx((0.15, 0.7))
+
+
+def test_whites_clip_skips_lift_under_positive_contrast():
+    editor = _dim_subject_editor()
+    editor.current_edits["contrast"] = 0.5
+    assert _recommend(editor, white=0.01)["base_brightness"] <= 0.0

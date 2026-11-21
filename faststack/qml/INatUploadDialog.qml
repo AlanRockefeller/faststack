@@ -643,9 +643,10 @@ Window {
             contentWidth: availableWidth
             // The vertical scroll bar sits on the right edge of the view; keep
             // a fixed gutter for it so it runs beside the cards, not over
-            // them. Fixed rather than visibility-dependent so the cards don't
-            // reflow (and re-run applyHold) when the bar appears.
-            rightPadding: ScrollBar.vertical.width + 6
+            // them. A constant, wide enough for the bar in mouse and touch
+            // modes (Material: 8-16 px), so the cards never reflow (and
+            // re-run applyHold) when the bar appears or changes width.
+            rightPadding: 22
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             Column {
