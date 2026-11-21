@@ -247,12 +247,28 @@ def _apply_in_parallel_bands(operation, source: np.ndarray) -> np.ndarray:
     return output
 
 
-def _apply_levels_ramp(arr: np.ndarray, blacks: float, whites: float) -> np.ndarray:
-    """Set the working black/white range without clipping or mutating input."""
+# Narrowest black-to-white span the levels ramp accepts (a 20x stretch). The
+# Whites/Blacks sliders reach far enough that the endpoints could otherwise
+# cross and turn the image into a negative. Any span the old +/-100 sliders
+# could produce is >= 0.55, so this never changes an existing edit.
+_LEVELS_MIN_SPAN = 0.05
+
+
+def _levels_endpoints(blacks: float, whites: float) -> Tuple[float, float]:
+    """Black and white points (bp, wp) of the levels ramp, never crossed."""
     bp = -blacks * 0.15
     wp = 1.0 - whites * 0.15
-    if abs(wp - bp) < 0.0001:
-        wp = bp + 0.0001
+    if wp - bp < _LEVELS_MIN_SPAN:
+        # Split the shortfall so neither slider alone wins the collision.
+        mid = 0.5 * (bp + wp)
+        bp = mid - 0.5 * _LEVELS_MIN_SPAN
+        wp = mid + 0.5 * _LEVELS_MIN_SPAN
+    return bp, wp
+
+
+def _apply_levels_ramp(arr: np.ndarray, blacks: float, whites: float) -> np.ndarray:
+    """Set the working black/white range without clipping or mutating input."""
+    bp, wp = _levels_endpoints(blacks, whites)
     return (arr - bp) / (wp - bp)
 
 
@@ -2854,8 +2870,15 @@ class ImageEditor:
         reset_levels: bool = True,
         channel_budget: float = 3.0,
         black_threshold_percent: Optional[float] = None,
+        white_threshold_percent: Optional[float] = None,
     ) -> Tuple[float, float, float, float]:
         """Analyze auto-levels on the current edited baseline without mutating edits.
+
+        ``white_threshold_percent`` is the highlight-end counterpart: the
+        share of pixels the white point may clip (luma, with each channel
+        allowed ``channel_budget`` times that). Lower it to brighten less and
+        keep highlights; None keeps it tied to ``threshold_percent``. It never
+        touches the shadow end.
 
         ``black_threshold_percent`` clips the shadow end independently of
         ``threshold_percent``. The black point can never sit above this
@@ -2873,6 +2896,10 @@ class ImageEditor:
             black_threshold_percent = threshold_percent
         else:
             black_threshold_percent = max(0.0, min(50.0, black_threshold_percent))
+        if white_threshold_percent is None:
+            white_threshold_percent = threshold_percent
+        else:
+            white_threshold_percent = max(0.0, min(10.0, white_threshold_percent))
 
         # Auto-levels is an aggregate percentile estimate: sample the source
         # down before rendering so analysis follows source pixels without
@@ -2924,6 +2951,7 @@ class ImageEditor:
         # stretch.
         channel_budget = max(1.0, min(10.0, float(channel_budget)))
         chan_t = min(50.0, threshold_percent * channel_budget)
+        chan_t_high = min(50.0, white_threshold_percent * channel_budget)
 
         # No explicit pre-clip pinning is needed: percentile ranks already
         # count clipped pixels, so stretching to the q-th percentile keeps the
@@ -2936,7 +2964,7 @@ class ImageEditor:
             hist = np.bincount(quantized[:, :, c].reshape(-1), minlength=nbins)
             chan_lows.append(self._percentile_from_hist(hist, chan_t, method="lower"))
             chan_highs.append(
-                self._percentile_from_hist(hist, 100.0 - chan_t, method="higher")
+                self._percentile_from_hist(hist, 100.0 - chan_t_high, method="higher")
             )
 
         luma_q = (_rec601_gray(scaled) * (nbins - 1)).astype(np.uint16)
@@ -2945,7 +2973,7 @@ class ImageEditor:
             luma_hist, black_threshold_percent, method="lower"
         )
         luma_high = self._percentile_from_hist(
-            luma_hist, 100.0 - threshold_percent, method="higher"
+            luma_hist, 100.0 - white_threshold_percent, method="higher"
         )
         median_luma = self._percentile_from_hist(luma_hist, 50.0, method="lower") / (
             nbins - 1
@@ -4792,9 +4820,8 @@ class ImageEditor:
             whites = float(edits.get("whites", 0.0))
         except (TypeError, ValueError):
             return final_float
-        bp = -blacks * 0.15
-        wp = 1.0 - (whites * 0.15)
-        gain = 1.0 / max(wp - bp, 1e-4)
+        bp, wp = _levels_endpoints(blacks, whites)
+        gain = 1.0 / (wp - bp)
         if gain < _EXPORT_DITHER_MIN_GAIN:
             return final_float
 
@@ -5282,10 +5309,7 @@ class ImageEditor:
         if abs(blacks) <= 0.001 and abs(whites) <= 0.001:
             return None
 
-        bp = -blacks * 0.15
-        wp = 1.0 - (whites * 0.15)
-        if abs(wp - bp) < 0.0001:
-            wp = bp + 0.0001
+        bp, wp = _levels_endpoints(blacks, whites)
 
         # A LUT cannot dither (it is pointwise), so when the stretch is strong
         # enough to band 8-bit sources, decline the fast path and let the

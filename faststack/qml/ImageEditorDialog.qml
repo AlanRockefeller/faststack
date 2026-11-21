@@ -200,9 +200,9 @@ Window {
                     ListElement { name: "Exposure"; key: "exposure"; reverse: false; min: -100; max: 100 }
                     ListElement { name: "Brightness"; key: "brightness"; reverse: false; min: -100; max: 100 }
                     ListElement { name: "Highlights"; key: "highlights"; reverse: false; min: -100; max: 100 }
-                    ListElement { name: "Whites"; key: "whites"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Whites"; key: "whites"; reverse: false; min: -100; max: 300 }
                     ListElement { name: "Shadows"; key: "shadows"; reverse: false; min: -100; max: 100 }
-                    ListElement { name: "Blacks"; key: "blacks"; reverse: false; min: -100; max: 100 }
+                    ListElement { name: "Blacks"; key: "blacks"; reverse: false; min: -300; max: 100 }
                     ListElement { name: "Contrast"; key: "contrast"; reverse: false; min: -100; max: 100 }
                 }
                 Repeater { model: lightModel; delegate: editSlider }
@@ -647,13 +647,15 @@ Window {
                     property real editScale: imageEditorDialog.sliderEditScale(sliderRow.key)
                 
                 property real backendValue: {
-                    var val = imageEditorDialog.getBackendValue(sliderRow.key) / slider.editScale * sliderRow.maxVal
+                    // 100 slider units per edit unit, whatever the range (Whites and
+                    // Blacks extend past +/-100 to fit auto-levels results).
+                    var val = imageEditorDialog.getBackendValue(sliderRow.key) / slider.editScale * 100
                     return sliderRow.isReversed ? -val : val
                 }
 
                 function editValueFromSliderValue(sliderValue) {
                     var sendValue = sliderRow.isReversed ? -sliderValue : sliderValue
-                    return sendValue / sliderRow.maxVal * slider.editScale
+                    return sendValue / 100 * slider.editScale
                 }
                 
                 // Auto-sync visual slider with backend changes when not dragging
@@ -711,10 +713,20 @@ Window {
                     resetTimer.restart()
                 }
 
+                // Keyboard steps start from the edit itself, not slider.value:
+                // Qt bounds value to from..to, so an edit past the slider's
+                // end (an extreme auto-levels result) would otherwise snap to
+                // the endpoint. It may step back toward the range one unit at
+                // a time but never jumps.
+                property bool _keyAdjusting: false
                 function nudgeByKeyboard(step) {
                     if (slider.isResetting) return false
-                    var nextValue = Math.max(slider.from, Math.min(slider.to, slider.value + step))
-                    if (nextValue === slider.value) return true
+                    var base = slider._keyAdjusting ? _pendingValue : slider.backendValue
+                    var lo = Math.min(slider.from, base)
+                    var hi = Math.max(slider.to, base)
+                    var nextValue = Math.max(lo, Math.min(hi, base + step))
+                    slider._keyAdjusting = true
+                    if (nextValue === base) return true
                     slider.value = nextValue
                     _pendingValue = nextValue
                     if (!sendTimer.running) sendTimer.start()
@@ -722,10 +734,13 @@ Window {
                 }
 
                 function commitKeyboardAdjust() {
+                    var keyed = slider._keyAdjusting
+                    slider._keyAdjusting = false
                     if (slider.isResetting) {
                         if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
                     } else {
-                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
+                        var committed = keyed ? _pendingValue : value
+                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(committed))
                     }
                     if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.update_histogram()
                 }
@@ -855,7 +870,10 @@ Window {
 
             Text {
                 id: valueReadout
-                property int displayValue: Math.round(sliderRow.isReversed ? -slider.value : slider.value)
+                // Read the edit itself when idle so a value past the slider's
+                // end shows its real number instead of the pinned endpoint.
+                property real shownValue: slider.pressed ? slider.value : slider.backendValue
+                property int displayValue: Math.round(sliderRow.isReversed ? -shownValue : shownValue)
 
                 text: displayValue === 0 ? "0" : (displayValue > 0 ? "+" + displayValue : "−" + Math.abs(displayValue))
                 Layout.preferredWidth: 40

@@ -4,6 +4,10 @@ Todo: More testing Linux / Mac. Create Windows .exe. Write better documentation 
 
 ## Unreleased
 
+- Editors: the Whites slider now goes to +300 and Blacks to −300 (other sliders are unchanged). Auto levels (L) often sets Whites well past +100, but the slider stopped there: the readout said +100 and nudging the slider off and back threw most of the edit away. The slider now reaches what L sets, and the readout always shows the real value. Saved edits are not affected.
+- New setting: File > Settings > Auto Levels > Whites Clip %. Sets how many pixels auto levels may clip at the bright end, separately from the dark end (Blacks Clip %). 0 (the default) follows Clip Threshold, so nothing changes until you set it. Lower it (try 0.01%) when L blows out highlights. Setting it also stops L's midtone brightening from pushing the brightest pixels toward white. A dark photo with no bright pixels is still brightened all the way.
+- iNaturalist upload: the scroll bar sits to the right of the cards instead of over them.
+- Trackpad scrolling in the thumbnail grid and in the iNaturalist upload card list moves about five times as far per swipe; it used to crawl on Linux. The mouse wheel is unchanged (one row per notch in the grid), and so is macOS, which already speeds trackpad scrolling up itself.
 - Dated folders now match between the Main Photo Directory and the stack input folders when only one of them keeps them under a year folder (`2026-11-05` in one, `2026/2026-11-05` in the other, either way round). Restack, finding the input JPGs of an in-camera stacked JPG, and Actions > Switch to Stack Input Directory / Switch to Main Photo Directory try the same relative folder first, then the other layout. Subfolders of a dated folder (`2026-11-05/sub`) work too; other folders (`2026/2026-archive`) are matched only as they are.
 
 ## 1.7.0 (2026-11-18)

@@ -232,7 +232,12 @@ Window {
         // Convert the stored edit-space value into slider space, step it, clamp,
         // then convert back to edit space the way the sliders do.
         var sliderVal = compactEditor.getBackendValue(key) / scale * 100
-        sliderVal = Math.max(-100, Math.min(100, sliderVal + delta))
+        // A value already past the slider's end (an extreme auto-levels
+        // result) may step back toward the range but must not snap to it.
+        var range = compactEditor.sliderRange(key)
+        var lo = Math.min(range.min, sliderVal)
+        var hi = Math.max(range.max, sliderVal)
+        sliderVal = Math.max(lo, Math.min(hi, sliderVal + delta))
         compactEditor.setEditValue(key, sliderVal / 100 * scale)
         compactEditor.updatePulse++  // refreshes sliders + histogram
     }
@@ -422,6 +427,16 @@ Window {
         if (!compactEditor.controllerRef) return
         if (compactEditor.recipeMode) compactEditor.controllerRef.set_local_recipe_param(key, value)
         else compactEditor.controllerRef.set_edit_parameter(key, value)
+    }
+
+    // Slider units are always 100 per edit unit (x editScale). Whites and
+    // Blacks reach past +/-100 because auto levels (L) routinely sets them
+    // there; a +/-100 cap would show +100 while the edit is really stronger.
+    // Keep in sync with the Whites/Blacks ListElements below.
+    function sliderRange(key) {
+        if (key === "whites") return { min: -100, max: 300 }
+        if (key === "blacks") return { min: -300, max: 100 }
+        return { min: -100, max: 100 }
     }
 
     function sliderEditScale(key) {
@@ -1769,9 +1784,9 @@ Window {
                 ListElement { name: "Brightness"; key: "brightness"; min: -100; max: 100 }
                 ListElement { name: "Contrast"; key: "contrast"; min: -100; max: 100 }
                 ListElement { name: "Highlights"; key: "highlights"; min: -100; max: 100 }
-                ListElement { name: "Whites"; key: "whites"; min: -100; max: 100 }
+                ListElement { name: "Whites"; key: "whites"; min: -100; max: 300 }
                 ListElement { name: "Shadows"; key: "shadows"; min: -100; max: 100 }
-                ListElement { name: "Blacks"; key: "blacks"; min: -100; max: 100 }
+                ListElement { name: "Blacks"; key: "blacks"; min: -300; max: 100 }
             }
             Repeater { model: lightModel; delegate: compactSlider }
 
@@ -2012,10 +2027,10 @@ Window {
                 stepSize: 1
                 property real editScale: compactEditor.sliderEditScale(sliderRow.key)
 
-                property real backendValue: compactEditor.getBackendValue(sliderRow.key) / slider.editScale * sliderRow.max
+                property real backendValue: compactEditor.getBackendValue(sliderRow.key) / slider.editScale * 100
 
                 function editValueFromSliderValue(sliderValue) {
-                    return sliderValue / sliderRow.max * slider.editScale
+                    return sliderValue / 100 * slider.editScale
                 }
 
                 Binding {
@@ -2143,7 +2158,9 @@ Window {
 
             Text {
                 id: valueReadout
-                property int displayValue: Math.round(slider.value)
+                // Read the edit itself when idle so a value past the slider's
+                // end shows its real number instead of the pinned endpoint.
+                property int displayValue: Math.round(slider.pressed ? slider.value : slider.backendValue)
                 text: displayValue === 0 ? "0" : (displayValue > 0 ? "+" + displayValue : "−" + Math.abs(displayValue))
                 Layout.preferredWidth: 32
                 Layout.alignment: Qt.AlignVCenter

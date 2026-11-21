@@ -1338,6 +1338,10 @@ class AppController(
         self.auto_level_black_threshold = config.getfloat(
             "core", "auto_level_black_threshold", 0.0
         )
+        # 0 == follow auto_level_threshold. See _white_threshold_percent().
+        self.auto_level_white_threshold = config.getfloat(
+            "core", "auto_level_white_threshold", 0.0
+        )
         self.auto_level_strength = config.getfloat("core", "auto_level_strength", 1.0)
         self.auto_level_strength_auto = config.getboolean(
             "core", "auto_level_strength_auto", False
@@ -5187,6 +5191,11 @@ class AppController(
         value = self.auto_level_black_threshold
         return value if value > 0.0 else None
 
+    def _white_threshold_percent(self) -> Optional[float]:
+        """Highlight-end clip percentile, or None to follow the shared threshold."""
+        value = self.auto_level_white_threshold
+        return value if value > 0.0 else None
+
     def _compute_auto_levels_recommendation(self) -> dict[str, Any]:
         """Compute the current baseline auto-level recommendation."""
         blacks, whites, p_low, p_high = self.image_editor.analyze_auto_levels(
@@ -5194,6 +5203,7 @@ class AppController(
             reset_levels=True,
             channel_budget=self.auto_level_channel_budget,
             black_threshold_percent=self._black_threshold_percent(),
+            white_threshold_percent=self._white_threshold_percent(),
         )
 
         dynamic_range = p_high - p_low
@@ -5283,6 +5293,29 @@ class AppController(
                     factor = max(
                         _AUTO_MIDTONE_MAX_DROP, min(_AUTO_MIDTONE_MAX_LIFT, factor)
                     )
+                    if factor > 1.0 and self._white_threshold_percent() is not None:
+                        # Positive contrast renders after brightness but is
+                        # already in p_high, so the projection below would be
+                        # wrong; skip the lift rather than guess.
+                        try:
+                            contrast = float(
+                                self.image_editor.get_edit_value("contrast", 0.0)
+                                or 0.0
+                            )
+                        except (TypeError, ValueError):
+                            contrast = 0.0
+                        if contrast > 0.001:
+                            factor = 1.0
+                        # An explicit Whites Clip % is the user's highlight
+                        # budget, so the lift may not spend more of it. A
+                        # positive Brightness rolls everything above 0.9
+                        # output toward white; keep the post-stretch white
+                        # point below that knee. A full stretch already puts
+                        # it at 1.0, which leaves no room to lift, while a
+                        # dark photo whose stretch hit the cap still has room.
+                        white_ref = (p_high / 255.0 - bp) / span
+                        if white_ref > 0.0:
+                            factor = min(factor, max(1.0, 0.9 / white_ref))
                     if abs(factor - 1.0) >= 0.02:
                         base_brightness = factor - 1.0
 
@@ -9084,6 +9117,18 @@ class AppController(
         value = max(0.0, min(50.0, value))
         self.auto_level_black_threshold = value
         config.set("core", "auto_level_black_threshold", f"{value:.6g}")
+        config.save()
+
+    @Slot(result=float)
+    def get_auto_level_white_threshold(self):
+        return self.auto_level_white_threshold
+
+    @Slot(float)
+    def set_auto_level_white_threshold(self, value):
+        # 0 means "follow the shared clip threshold"; same bounds as it.
+        value = max(0.0, min(1.0, value))
+        self.auto_level_white_threshold = value
+        config.set("core", "auto_level_white_threshold", f"{value:.6g}")
         config.save()
 
     @Slot(result=float)
