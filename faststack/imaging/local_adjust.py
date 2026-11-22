@@ -306,12 +306,25 @@ def apply_local_shadows(arr: np.ndarray, shadows: np.ndarray) -> np.ndarray:
     return arr * factor[..., None].astype(np.float32, copy=False)
 
 
+# Narrowest black-to-white span a levels ramp accepts (a 20x stretch), shared
+# with the global ramp in editor._levels_endpoints. Spans the old +/-100
+# sliders could produce are >= 0.55, so it never changes an existing edit.
+LEVELS_MIN_SPAN = 0.05
+
+
 def _levels_ramp_map(arr: np.ndarray, blacks: np.ndarray, whites: np.ndarray):
     bp = -blacks * 0.15
     wp = 1.0 - whites * 0.15
-    # The global ramp only nudges a degenerate span; built-up local coats can
-    # push it negative, which would invert the image, so floor it instead.
-    span = np.maximum(wp - bp, 0.0001)
+    # Same rule as the global ramp, per pixel: endpoints closer than the
+    # minimum span (or crossed, which would invert the image) are spread
+    # evenly about their midpoint, so a painted region meets the rest of the
+    # image with the same tonal mapping.
+    narrow = (wp - bp) < LEVELS_MIN_SPAN
+    if np.any(narrow):
+        mid = 0.5 * (bp + wp)
+        bp = np.where(narrow, mid - 0.5 * LEVELS_MIN_SPAN, bp)
+        wp = np.where(narrow, mid + 0.5 * LEVELS_MIN_SPAN, wp)
+    span = wp - bp
     return (arr - bp[..., None]) / span[..., None]
 
 

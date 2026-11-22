@@ -644,9 +644,10 @@ Window {
                     focusPolicy: Qt.StrongFocus
                     // slider.value is the handle position (-100..+100, 0 in the
                     // middle); minVal/maxVal are the value range, which can
-                    // reach further on one side (see SliderCurve.js).
-                    from: -100
-                    to: 100
+                    // reach further on one side (see SliderCurve.js). A
+                    // one-sided control (Vignette, 0..100) keeps its own side.
+                    from: sliderRow.minVal < 0 ? -100 : 0
+                    to: sliderRow.maxVal > 0 ? 100 : 0
                     stepSize: 1
                     property real editScale: imageEditorDialog.sliderEditScale(sliderRow.key)
                 
@@ -751,8 +752,13 @@ Window {
                     if (slider.isResetting) {
                         if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
                     } else {
-                        var committed = keyed ? _pendingValue : value
-                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(committed))
+                        // A keyboard adjust commits the stepped value itself, so a
+                        // step that could not move (already at the end) leaves
+                        // the edit exactly as it was.
+                        var edit = keyed
+                            ? (sliderRow.isReversed ? -slider._keyValue : slider._keyValue) / 100 * slider.editScale
+                            : slider.editValueFromSliderValue(value)
+                        if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, edit)
                     }
                     if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.update_histogram()
                 }

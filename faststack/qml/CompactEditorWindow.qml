@@ -2026,8 +2026,8 @@ Window {
                 // slider.value is the handle position (-100..+100, 0 in the
                 // middle); sliderRow.min/max are the value range, which can
                 // reach further on one side (see SliderCurve.js).
-                from: -100
-                to: 100
+                from: sliderRow.min < 0 ? -100 : 0
+                to: sliderRow.max > 0 ? 100 : 0
                 stepSize: 1
                 property real editScale: compactEditor.sliderEditScale(sliderRow.key)
 

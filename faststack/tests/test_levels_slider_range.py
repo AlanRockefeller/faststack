@@ -107,4 +107,7 @@ def test_slider_curve_puts_plus_100_at_three_quarters():
 def test_slider_handle_runs_minus_to_plus_100(qml):
     text = (QML_DIR / qml).read_text(encoding="utf-8")
     assert 'import "SliderCurve.js" as SliderCurve' in text
-    assert re.search(r"from: -100\s+to: 100\s+stepSize: 1", text)
+    # Centred travel for bipolar controls; a one-sided control (Vignette)
+    # keeps 0..100 so it can never send a negative value.
+    assert re.search(r"from: sliderRow\.min(Val)? < 0 \? -100 : 0", text)
+    assert re.search(r"to: sliderRow\.max(Val)? > 0 \? 100 : 0", text)

@@ -21,6 +21,7 @@ from faststack.imaging.jpeg import TURBO_AVAILABLE, decode_jpeg_rgb
 
 # Local adjustment layers (dodge & burn)
 from faststack.imaging.local_adjust import (
+    LEVELS_MIN_SPAN as _LEVELS_MIN_SPAN,
     LOCAL_GAIN_KEYS,
     LOCAL_LINEAR_KEYS,
     LOCAL_SRGB_KEYS,
@@ -247,11 +248,10 @@ def _apply_in_parallel_bands(operation, source: np.ndarray) -> np.ndarray:
     return output
 
 
-# Narrowest black-to-white span the levels ramp accepts (a 20x stretch). The
-# Whites/Blacks sliders reach far enough that the endpoints could otherwise
-# cross and turn the image into a negative. Any span the old +/-100 sliders
-# could produce is >= 0.55, so this never changes an existing edit.
-_LEVELS_MIN_SPAN = 0.05
+# _LEVELS_MIN_SPAN (from local_adjust, shared with the painted ramp) is the
+# narrowest black-to-white span the levels ramp accepts. The Whites/Blacks
+# sliders reach far enough that the endpoints could otherwise cross and turn
+# the image into a negative.
 
 
 def _levels_endpoints(blacks: float, whites: float) -> Tuple[float, float]:

@@ -260,3 +260,13 @@ def test_whites_clip_skips_lift_under_positive_contrast():
     editor = _dim_subject_editor()
     editor.current_edits["contrast"] = 0.5
     assert _recommend(editor, white=0.01)["base_brightness"] <= 0.0
+
+
+def test_local_levels_ramp_uses_the_same_min_span():
+    from faststack.imaging.editor import _apply_levels_ramp
+    from faststack.imaging.local_adjust import _levels_ramp_map
+
+    arr = np.linspace(0.0, 1.0, 12, dtype=np.float32).reshape(2, 2, 3)
+    for blacks, whites in ((-3.0, 6.0), (-1.0, 2.0), (0.2, -0.5)):
+        local = _levels_ramp_map(arr, np.full((2, 2), blacks), np.full((2, 2), whites))
+        assert np.allclose(local, _apply_levels_ramp(arr, blacks, whites))
