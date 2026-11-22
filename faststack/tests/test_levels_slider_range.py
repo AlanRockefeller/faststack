@@ -54,3 +54,57 @@ def test_blacks_slider_extends_below_minus_100(qml):
 @pytest.mark.parametrize("key", ["whites", "blacks"])
 def test_compact_keyboard_range_matches_slider(key):
     assert _compact_function_range(key) == _slider_range("CompactEditorWindow.qml", key)
+
+
+def _curve_engine():
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtQml import QJSEngine
+
+    # QJSEngine aborts without an application object.
+    if QCoreApplication.instance() is None:
+        _curve_engine.app = QCoreApplication([])
+    engine = QJSEngine()
+    source = (QML_DIR / "SliderCurve.js").read_text(encoding="utf-8")
+    result = engine.evaluate(source.replace(".pragma library", "", 1))
+    assert not result.isError(), result.toString()
+    return engine
+
+
+def _call(engine, fn, *args):
+    result = engine.globalObject().property(fn).call(list(args))
+    assert not result.isError(), result.toString()
+    return result.toNumber()
+
+
+@pytest.mark.parametrize("lo,hi", [(-100, 300), (-300, 100), (-100, 100)])
+def test_slider_curve_centres_zero_and_reaches_extents(lo, hi):
+    eng = _curve_engine()
+    val = lambda p: _call(eng, "valueForPosition", p, lo, hi)  # noqa: E731
+    pos = lambda v: _call(eng, "positionForValue", v, lo, hi)  # noqa: E731
+    assert val(0) == 0 and pos(0) == 0
+    assert val(100) == pytest.approx(hi)
+    assert val(-100) == pytest.approx(lo)
+    # One to one near the middle: everyday edits feel as before.
+    for p in (-50, -20, 1, 37, 50):
+        assert val(p) == pytest.approx(p)
+    # Monotonic and invertible across the whole travel.
+    prev = None
+    for p in range(-100, 101):
+        v = val(p)
+        assert pos(v) == pytest.approx(p, abs=1e-6)
+        if prev is not None:
+            assert v > prev
+        prev = v
+
+
+def test_slider_curve_puts_plus_100_at_three_quarters():
+    eng = _curve_engine()
+    assert _call(eng, "positionForValue", 100, -100, 300) == pytest.approx(75)
+    assert _call(eng, "positionForValue", -100, -300, 100) == pytest.approx(-75)
+
+
+@pytest.mark.parametrize("qml", ["CompactEditorWindow.qml", "ImageEditorDialog.qml"])
+def test_slider_handle_runs_minus_to_plus_100(qml):
+    text = (QML_DIR / qml).read_text(encoding="utf-8")
+    assert 'import "SliderCurve.js" as SliderCurve' in text
+    assert re.search(r"from: -100\s+to: 100\s+stepSize: 1", text)

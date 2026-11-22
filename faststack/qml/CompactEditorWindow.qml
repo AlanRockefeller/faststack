@@ -7,6 +7,7 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import QtCore
 import "WindowPlacement.js" as WP
+import "SliderCurve.js" as SliderCurve
 
 Window {
     id: compactEditor
@@ -2022,21 +2023,30 @@ Window {
                 Layout.alignment: Qt.AlignVCenter
                 enabled: !compactEditor.cropActive
                 focusPolicy: Qt.NoFocus
-                from: sliderRow.min
-                to: sliderRow.max
+                // slider.value is the handle position (-100..+100, 0 in the
+                // middle); sliderRow.min/max are the value range, which can
+                // reach further on one side (see SliderCurve.js).
+                from: -100
+                to: 100
                 stepSize: 1
                 property real editScale: compactEditor.sliderEditScale(sliderRow.key)
 
+                // The edit in display units (100 per edit unit x editScale).
                 property real backendValue: compactEditor.getBackendValue(sliderRow.key) / slider.editScale * 100
+                property real backendPosition: SliderCurve.positionForValue(slider.backendValue, sliderRow.min, sliderRow.max)
 
-                function editValueFromSliderValue(sliderValue) {
-                    return sliderValue / 100 * slider.editScale
+                function displayValueForPosition(pos) {
+                    return SliderCurve.valueForPosition(pos, sliderRow.min, sliderRow.max)
+                }
+
+                function editValueFromSliderValue(pos) {
+                    return slider.displayValueForPosition(pos) / 100 * slider.editScale
                 }
 
                 Binding {
                     target: slider
                     property: "value"
-                    value: slider.backendValue
+                    value: slider.backendPosition
                     when: !slider.pressed && !slider.isResetting
                 }
 
@@ -2160,7 +2170,7 @@ Window {
                 id: valueReadout
                 // Read the edit itself when idle so a value past the slider's
                 // end shows its real number instead of the pinned endpoint.
-                property int displayValue: Math.round(slider.pressed ? slider.value : slider.backendValue)
+                property int displayValue: Math.round(slider.pressed ? slider.displayValueForPosition(slider.value) : slider.backendValue)
                 text: displayValue === 0 ? "0" : (displayValue > 0 ? "+" + displayValue : "−" + Math.abs(displayValue))
                 Layout.preferredWidth: 32
                 Layout.alignment: Qt.AlignVCenter

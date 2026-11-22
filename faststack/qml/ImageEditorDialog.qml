@@ -5,6 +5,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import "SliderCurve.js" as SliderCurve
 
 Window {
     id: imageEditorDialog
@@ -641,20 +642,28 @@ Window {
                     Layout.fillWidth: true
                     Layout.alignment: Qt.AlignVCenter
                     focusPolicy: Qt.StrongFocus
-                    from: sliderRow.minVal
-                    to: sliderRow.maxVal
+                    // slider.value is the handle position (-100..+100, 0 in the
+                    // middle); minVal/maxVal are the value range, which can
+                    // reach further on one side (see SliderCurve.js).
+                    from: -100
+                    to: 100
                     stepSize: 1
                     property real editScale: imageEditorDialog.sliderEditScale(sliderRow.key)
                 
+                // The edit in display units: 100 per edit unit (x editScale).
                 property real backendValue: {
-                    // 100 slider units per edit unit, whatever the range (Whites and
-                    // Blacks extend past +/-100 to fit auto-levels results).
                     var val = imageEditorDialog.getBackendValue(sliderRow.key) / slider.editScale * 100
                     return sliderRow.isReversed ? -val : val
                 }
+                property real backendPosition: SliderCurve.positionForValue(slider.backendValue, sliderRow.minVal, sliderRow.maxVal)
 
-                function editValueFromSliderValue(sliderValue) {
-                    var sendValue = sliderRow.isReversed ? -sliderValue : sliderValue
+                function displayValueForPosition(pos) {
+                    return SliderCurve.valueForPosition(pos, sliderRow.minVal, sliderRow.maxVal)
+                }
+
+                function editValueFromSliderValue(pos) {
+                    var shown = slider.displayValueForPosition(pos)
+                    var sendValue = sliderRow.isReversed ? -shown : shown
                     return sendValue / 100 * slider.editScale
                 }
                 
@@ -662,7 +671,7 @@ Window {
                 Binding {
                     target: slider
                     property: "value"
-                    value: slider.backendValue
+                    value: slider.backendPosition
                     when: !slider.pressed && !slider.isResetting
                 }
 
@@ -713,22 +722,25 @@ Window {
                     resetTimer.restart()
                 }
 
-                // Keyboard steps start from the edit itself, not slider.value:
-                // Qt bounds value to from..to, so an edit past the slider's
-                // end (an extreme auto-levels result) would otherwise snap to
-                // the endpoint. It may step back toward the range one unit at
-                // a time but never jumps.
+                // Keyboard steps move the shown value by one, starting from the
+                // edit itself rather than slider.value: Qt bounds the handle to
+                // from..to, so an edit past the slider's end (an extreme
+                // auto-levels result) would otherwise snap to the endpoint. It
+                // may step back toward the range but never jumps.
                 property bool _keyAdjusting: false
+                property real _keyValue: 0
                 function nudgeByKeyboard(step) {
                     if (slider.isResetting) return false
-                    var base = slider._keyAdjusting ? _pendingValue : slider.backendValue
-                    var lo = Math.min(slider.from, base)
-                    var hi = Math.max(slider.to, base)
+                    var base = slider._keyAdjusting ? slider._keyValue : slider.backendValue
+                    var lo = Math.min(sliderRow.minVal, base)
+                    var hi = Math.max(sliderRow.maxVal, base)
                     var nextValue = Math.max(lo, Math.min(hi, base + step))
                     slider._keyAdjusting = true
+                    slider._keyValue = nextValue
                     if (nextValue === base) return true
-                    slider.value = nextValue
-                    _pendingValue = nextValue
+                    var pos = SliderCurve.positionForValue(nextValue, sliderRow.minVal, sliderRow.maxVal)
+                    slider.value = pos
+                    _pendingValue = pos
                     if (!sendTimer.running) sendTimer.start()
                     return true
                 }
@@ -872,7 +884,7 @@ Window {
                 id: valueReadout
                 // Read the edit itself when idle so a value past the slider's
                 // end shows its real number instead of the pinned endpoint.
-                property real shownValue: slider.pressed ? slider.value : slider.backendValue
+                property real shownValue: slider.pressed ? slider.displayValueForPosition(slider.value) : slider.backendValue
                 property int displayValue: Math.round(sliderRow.isReversed ? -shownValue : shownValue)
 
                 text: displayValue === 0 ? "0" : (displayValue > 0 ? "+" + displayValue : "−" + Math.abs(displayValue))
