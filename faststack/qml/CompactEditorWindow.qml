@@ -2579,12 +2579,25 @@ Window {
                 property real _grabValue: 0
                 property bool _dragging: false
 
+                // Some Qt versions (reported for 6.5) emit no moved for a
+                // press on the handle's centre, as the handle stays put; the
+                // first moved is then the pointer's own travel, which must not
+                // become the grab point. Once Qt has handled the press, one
+                // that no moved has classified yet grabs the handle where it is.
+                function grabIfUnmoved() {
+                    if (slider.pressed && !slider._grabbed && !slider._dragging) {
+                        slider._grabbed = true
+                        slider._grabValue = slider.value
+                    }
+                }
+
                 onPressedChanged: {
                     if (pressed) {
                         // Qt has not moved the handle to the press point yet.
                         slider._pressValue = value
                         slider._grabbed = false
                         slider._dragging = false
+                        Qt.callLater(slider.grabIfUnmoved)
                         if (compactEditor.controllerRef) compactEditor.controllerRef.set_editor_slider_drag_active(true)
                         compactEditor.ensureEditorLoaded("slider-change")
                         compactEditor.highlightedSliderKey = sliderRow.key

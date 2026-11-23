@@ -10,14 +10,20 @@
 // ---- Mouse (values are handle positions) ----------------------------------
 //
 // Qt moves the handle to the press point straight away, and emits moved on
-// every press, even one that moved nothing. Taken as it comes, a click a few
-// pixels off the handle's centre would change the edit, and a click on a
-// pinned handle would cut an edit past the end back to the end. So:
+// every press, even one that moved nothing (6.11; 6.5 is reported to emit
+// nothing for a press that leaves the handle where it is). Taken as it
+// comes, a click a few pixels off the handle's centre would change the edit,
+// and a click on a pinned handle would cut an edit past the end back to the
+// end. So:
 //  - a press beside the handle (on the track) jumps there at once, as usual;
 //  - a press on the handle only grabs it. Where Qt put the handle then is
 //    the grab point, and the press becomes a drag once the pointer has moved
 //    DRAG_START_PX from there. A click that never gets that far leaves the
 //    edit alone.
+//  - a press that no moved has classified once Qt has handled it (a press on
+//    the handle's centre where Qt emits nothing) grabs the handle where it
+//    is (the editors' grabIfUnmoved), so the pointer's first pixels of
+//    travel count towards the drag instead of becoming the grab point.
 
 var DRAG_START_PX = 2
 

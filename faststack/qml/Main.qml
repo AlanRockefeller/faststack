@@ -1542,9 +1542,12 @@ ApplicationWindow {
     Shortcut {
         sequence: "Escape"
         context: Qt.ApplicationShortcut
+        // While picking white balance, Esc cancels the picker first (the
+        // controller's key handler); the next Esc leaves full screen.
         enabled: root.fullScreenLoupe
                  && (!root.uiStateRef
-                     || (!root.uiStateRef.isCropping && !root.uiStateRef.isDialogOpen))
+                     || (!root.uiStateRef.isCropping && !root.uiStateRef.isDialogOpen
+                         && !root.uiStateRef.isWbPicking))
         onActivated: root.exitFullScreenLoupe()
     }
 

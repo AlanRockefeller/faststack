@@ -4,20 +4,22 @@ The depth model is not available in tests; a stub estimator that returns a
 synthetic map (a near disc in the middle of a far background) stands in.
 """
 
+import dataclasses
+
 import numpy as np
 import pytest
 
 from faststack.imaging.depth_select import (
     DepthMap,
-    joint_bilateral_upsample,
-    sharpness_map,
     compute_depth_map,
     depth_layer_density,
     depth_selection,
     edits_need_depth_map,
     is_depth_layer,
+    joint_bilateral_upsample,
     normalize_depth_params,
     selection_from_near,
+    sharpness_map,
 )
 from faststack.imaging.editor import geometry_normalized_affine
 from faststack.imaging.local_adjust import (
@@ -26,7 +28,11 @@ from faststack.imaging.local_adjust import (
     normalize_local_layers,
 )
 from faststack.imaging.mask import STROKE_ERASE, STROKE_PAINT, MaskData, MaskStroke
-from faststack.imaging.mask_engine import LayerDensityCache, rasterize_layer_erased
+from faststack.imaging.mask_engine import (
+    LayerDensityCache,
+    rasterize_layer_density,
+    rasterize_layer_erased,
+)
 
 pytest.importorskip("cv2")
 
@@ -181,6 +187,105 @@ def test_erase_cuts_the_selection_and_paint_adds_to_it():
     assert full[60, 80] == pytest.approx(1.0)  # painted onto the subject
     assert full[110, 150] == pytest.approx(1.0)  # untouched background
     assert full.max() <= 1.0  # painting over the selection does not double it
+
+
+def _in_order(selection, strokes, shape, t):
+    """The depth layer's mask worked out the slow way: each stroke in turn
+    on top of the selection, a paint stroke adding one coat up to full and
+    an erase stroke cutting what is there."""
+    out = selection.copy()
+    for stroke in strokes:
+        one = MaskData()
+        one.add_stroke(dataclasses.replace(stroke, mode=STROKE_PAINT))
+        d = rasterize_layer_density("ref", one, shape, {}, point_transform=t)
+        cov = np.zeros(shape, np.float32)
+        if d is not None:
+            cov[d.y0 : d.y1, d.x0 : d.x1] = d.arr
+        if stroke.mode == STROKE_ERASE:
+            out *= 1.0 - cov
+        else:
+            out = np.minimum(out + cov, 1.0)
+    return out
+
+
+def _full(density, shape):
+    full = np.zeros(shape, np.float32)
+    if density is not None:
+        full[density.y0 : density.y1, density.x0 : density.x1] = density.arr
+    return full
+
+
+# Hard paint and a wider soft erase over the selected background (0.15, 0.2)
+# and over the unselected subject (0.5, 0.5).
+_HARD_PAINT = [_stroke(STROKE_PAINT, x, y) for x, y in ((0.15, 0.2), (0.5, 0.5))]
+_SOFT_ERASE = [
+    MaskStroke(points=[(x, y)], radius=0.08, hardness=0.0, mode=STROKE_ERASE)
+    for x, y in ((0.15, 0.2), (0.5, 0.5))
+]
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        "paint, erase",
+        "paint, paint, erase",
+        "erase, paint",  # painting over an erase still brings it back
+        "paint, erase, paint, erase",
+    ],
+)
+@pytest.mark.parametrize("with_map", [True, False])
+def test_soft_erase_over_paint_cuts_a_depth_layer_once(order, with_map):
+    # Painting over the selection does not double it, so erasing that spot
+    # must cut it like any other: a half erase used to leave the paint and
+    # the selection at half each, which added back up to full.
+    dm = _depth_map() if with_map else None
+    shape = (120, 160)
+    t = _identity_transform(shape)
+    layer = _layer(0.5, 0.0)
+    strokes = []
+    for step in order.split(", "):
+        strokes += _HARD_PAINT if step == "paint" else _SOFT_ERASE
+    selection = _full(depth_selection(dm, layer["depth"], shape, t), shape)
+    expected = _in_order(selection, strokes, shape, t)
+    mask = MaskData()
+    for stroke in strokes:
+        mask.add_stroke(stroke)
+    got = _full(depth_layer_density(layer, mask, shape, {}, dm, t), shape)
+    np.testing.assert_allclose(got, expected, atol=1e-5)
+    # The same, built up a stroke at a time from the cache.
+    cache = LayerDensityCache()
+    mask = MaskData()
+    for stroke in strokes:
+        mask.add_stroke(stroke)
+        depth_layer_density(layer, mask, shape, {}, dm, t, cache=cache)
+    got = _full(depth_layer_density(layer, mask, shape, {}, dm, t, cache=cache), shape)
+    np.testing.assert_allclose(got, expected, atol=1e-5)
+    if order == "paint, erase":
+        # Half way out from the erase's centre, both on and off the selection.
+        assert 0.2 < got[24, 24 + 5] < 0.8
+        assert 0.2 < got[60, 80 + 5] < 0.8
+
+
+@pytest.mark.parametrize("live", ["erase", "paint"])
+def test_a_live_stroke_counts_in_order_on_a_depth_layer(live):
+    dm = _depth_map()
+    shape = (120, 160)
+    t = _identity_transform(shape)
+    layer = _layer(0.5, 0.0)
+    committed = _HARD_PAINT if live == "erase" else _HARD_PAINT + _SOFT_ERASE
+    mask = MaskData()
+    for stroke in committed:
+        mask.add_stroke(stroke)
+    cache = LayerDensityCache()
+    depth_layer_density(layer, mask, shape, {}, dm, t, cache=cache)  # fill the cache
+    mask.live_stroke = (_SOFT_ERASE if live == "erase" else _HARD_PAINT)[0]
+    selection = _full(depth_selection(dm, layer["depth"], shape, t), shape)
+    expected = _in_order(selection, [*committed, mask.live_stroke], shape, t)
+    got = _full(depth_layer_density(layer, mask, shape, {}, dm, t, cache=cache), shape)
+    np.testing.assert_allclose(got, expected, atol=1e-5)
+    assert got[24, 29] == pytest.approx(expected[24, 29])
+    if live == "erase":
+        assert got[24, 29] < 0.8
 
 
 def test_without_depth_map_only_strokes_apply():
@@ -357,6 +462,58 @@ def test_upsampling_keeps_the_rim_at_the_objects_depth():
     plain = cv2.resize(low, (320, 240), interpolation=cv2.INTER_LINEAR)
     assert up[rim].mean() > 0.75 > plain[rim].mean() + 0.15
     assert up[outside_ring].mean() < 0.15 < plain[outside_ring].mean() - 0.15
+
+
+@pytest.mark.parametrize("with_confidence", [False, True])
+def test_upsampling_keeps_depth_under_a_colour_unlike_every_sample(with_confidence):
+    # A thin white twig against black: every sample near the white pixel is
+    # black, so all its colour weights are far below what float32 holds.
+    # It used to come out at 0 depth (far background) instead of the 0.8
+    # every sample says.
+    guide = np.zeros((16, 16, 3), np.float32)
+    guide[7, 7] = 1.0
+    low = np.full((2, 2), 0.8, np.float32)
+    confidence = np.full((2, 2), 0.05, np.float32) if with_confidence else None
+    up = joint_bilateral_upsample(guide, low, confidence)
+    assert up == pytest.approx(np.full((16, 16), 0.8), abs=1e-5)
+
+
+def test_upsampling_matches_a_float64_reference_on_noisy_colours():
+    # Random colours: each pixel's samples differ wildly, so the weights'
+    # reference is raised part way through for many pixels.
+    import cv2
+
+    from faststack.imaging import depth_select as ds
+
+    rng = np.random.default_rng(1)
+    H, W, h, w = 18, 27, 6, 9
+    guide = rng.random((H, W, 3), dtype=np.float32)
+    low = rng.random((h, w), dtype=np.float32)
+    confidence = rng.random((h, w), dtype=np.float32) + 0.05
+    guide_low = cv2.resize(guide, (w, h), interpolation=cv2.INTER_AREA).astype(np.float64)
+    fy = (np.arange(H) + 0.5) * h / H - 0.5
+    fx = (np.arange(W) + 0.5) * w / W - 0.5
+    taps = range(-ds._JBU_RADIUS, ds._JBU_RADIUS + 1)
+    expected = np.zeros((H, W))
+    for y in range(H):
+        for x in range(W):
+            logw, vals = [], []
+            for dy in taps:
+                for dx in taps:
+                    qy = int(np.clip(np.round(fy[y]) + dy, 0, h - 1))
+                    qx = int(np.clip(np.round(fx[x]) + dx, 0, w - 1))
+                    d2 = ((guide_low[qy, qx] - guide[y, x]) ** 2).sum()
+                    s2 = (qy - fy[y]) ** 2 + (qx - fx[x]) ** 2
+                    logw.append(
+                        -0.5 * d2 / ds._JBU_SIGMA_COLOR**2
+                        - 0.5 * s2 / ds._JBU_SIGMA_SPACE**2
+                        + np.log(confidence[qy, qx])
+                    )
+                    vals.append(low[qy, qx])
+            wgt = np.exp(np.array(logw) - max(logw))
+            expected[y, x] = (wgt * vals).sum() / wgt.sum()
+    up = joint_bilateral_upsample(guide, low, confidence)
+    np.testing.assert_allclose(up, expected, atol=1e-5)
 
 
 def test_sharpness_map_separates_texture_from_flat_background():

@@ -68,14 +68,6 @@ def test_neutral_spot_gives_zero():
     assert abs(pick.by) < 1e-6 and abs(pick.mg) < 1e-6
 
 
-def test_result_does_not_depend_on_the_current_sliders():
-    # The pick reads the unedited pixels, so it is absolute: the same spot
-    # gives the same values whatever Temp / Tint were before.
-    a = solve_white_balance(_srgb_patch((0.2, 0.18, 0.12)))
-    b = solve_white_balance(_srgb_patch((0.2, 0.18, 0.12)))
-    assert (a.by, a.mg) == (b.by, b.mg)
-
-
 def test_blown_out_spot_is_refused():
     blown = np.tile(np.array([1.0, 0.99, 0.95], np.float32), (100, 1))
     pick = solve_white_balance(blown)
@@ -154,6 +146,24 @@ def test_read_disc_tiny_radius_reads_the_pixel_under_the_centre():
     pixels = read_disc(u8, 0.25, 0.5, 0.0)
     assert pixels.shape == (1, 3)
     np.testing.assert_allclose(pixels[0], u8[40, 30] / 255.0, atol=1e-7)
+
+
+def test_tiny_disc_on_a_pixel_edge_reads_the_pixel_clicked_not_its_neighbour():
+    # A click exactly on the edge between columns 49 and 50 (and rows 49 and
+    # 50) is in pixel (50, 50); the nearest centres tie, and the first of
+    # them would be (49, 49), on the other side of this colour edge.
+    arr = np.zeros((100, 100, 3), np.float32)
+    arr[50:, 50:] = 0.8
+    pixels = read_disc(arr, 0.5, 0.5, 0.001)
+    assert pixels.shape == (1, 3)
+    np.testing.assert_allclose(pixels[0], 0.8)
+
+
+def test_read_disc_scales_16_bit_data_of_either_byte_order():
+    for dtype in ("<u2", ">u2"):
+        arr = np.full((20, 20, 3), 32768, dtype=dtype)
+        pixels = read_disc(arr, 0.5, 0.5, 0.05)
+        np.testing.assert_allclose(pixels, 32768 / 65535, rtol=1e-6)
 
 
 def test_read_disc_samples_a_huge_spot_sparsely():
@@ -303,6 +313,25 @@ def test_picking_the_card_makes_it_neutral_on_the_rendered_photo(geometry):
     assert _rendered_spread_at(editor, x, y) < 0.004
 
 
+def test_the_pick_replaces_temp_and_tint_instead_of_adding_to_them():
+    # Two sessions that start from different sliders get the same values
+    # from the same card: the spot is read from the unedited pixels.
+    results = []
+    for start in ({}, {"white_balance_by": 0.6, "white_balance_mg": -0.4}):
+        editor = _editor(start)
+        stub = _picker_stub(editor)
+        stub.start_white_balance_pick()
+        stub.pick_white_balance_at(*_card_centre_displayed(editor))
+        results.append(
+            (
+                editor.current_edits["white_balance_by"],
+                editor.current_edits["white_balance_mg"],
+            )
+        )
+    assert results[0] == results[1]
+    assert results[0] != (0.6, -0.4)
+
+
 def test_picking_a_blown_spot_changes_nothing_and_stays_in_the_picker():
     editor = _editor({})
     editor.float_image[_CARD_ROWS, _CARD_COLS] = 1.0
@@ -340,15 +369,21 @@ def test_toggle_and_cancel_clear_the_hint():
 
 
 class _Key:
-    def __init__(self, key, modifiers=None, auto_repeat=False):
+    def __init__(self, key, modifiers=None, auto_repeat=False, text=None):
         from PySide6.QtCore import Qt
 
         self._key = key
         self._mods = Qt.NoModifier if modifiers is None else modifiers
         self._repeat = auto_repeat
+        if text is None:
+            text = {Qt.Key_BracketLeft: "[", Qt.Key_BracketRight: "]"}.get(key, "")
+        self._text = text
 
     def key(self):
         return self._key
+
+    def text(self):
+        return self._text
 
     def modifiers(self):
         return self._mods
@@ -372,8 +407,26 @@ def test_bracket_keys_size_the_spot_within_its_range():
     for _ in range(100):
         stub._handle_wb_pick_key(_Key(Qt.Key_BracketRight))
     assert stub.ui_state.wbPickRadius == PICK_RADIUS_MAX
-    # Ctrl+[ is not the picker's.
-    assert not stub._handle_wb_pick_key(_Key(Qt.Key_BracketLeft, Qt.ControlModifier))
+    # Ctrl+[ (no bracket typed) and Shift+[ ("{", start a batch) are not
+    # the picker's.
+    assert not stub._handle_wb_pick_key(
+        _Key(Qt.Key_BracketLeft, Qt.ControlModifier, text="\x1b")
+    )
+    assert not stub._handle_wb_pick_key(
+        _Key(Qt.Key_BraceLeft, Qt.ShiftModifier, text="{")
+    )
+
+
+def test_bracket_typed_with_altgr_sizes_the_spot():
+    # Layouts that type [ with AltGr report Ctrl+Alt with it; the Keybinder
+    # matches the typed "[" whatever the modifiers and would start a stack.
+    from PySide6.QtCore import Qt
+
+    stub = _picker_stub(_editor({}))
+    start = stub.ui_state.wbPickRadius
+    altgr = Qt.ControlModifier | Qt.AltModifier
+    assert stub._handle_wb_pick_key(_Key(Qt.Key_BracketRight, altgr))
+    assert stub.ui_state.wbPickRadius == pytest.approx(start * 1.2)
 
 
 def test_escape_cancels_the_picker_unless_the_histogram_is_up():

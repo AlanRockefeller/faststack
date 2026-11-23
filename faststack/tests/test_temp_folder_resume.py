@@ -36,12 +36,16 @@ def test_folders_in_the_temp_dir_are_temporary(temp_folder):
 
 
 def test_other_folders_are_not_temporary(tmp_path):
-    # pytest's basetemp is ./.pytest-temp in the repo, not the system temp dir.
-    if _is_temporary_directory(Path(__file__).resolve().parent):
-        pytest.skip("the checkout itself lives in the temp directory")
-    assert not _is_temporary_directory(tmp_path)
+    # The filesystem root is never inside the temp dir: checked before the
+    # skip below, so a check that took every folder for temporary still fails.
+    assert not _is_temporary_directory(Path(tmp_path.anchor))
     assert not _is_temporary_directory("")
     assert not _is_temporary_directory(None)
+    # pytest's basetemp is ./.pytest-temp in the repo, not the system temp
+    # dir, unless the checkout lives there or --basetemp points there.
+    if _is_temporary_directory(tmp_path):
+        pytest.skip("pytest's temp folder is inside the system temp directory")
+    assert not _is_temporary_directory(tmp_path)
 
 
 def _remember(image_dir):

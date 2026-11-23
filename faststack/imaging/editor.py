@@ -2903,7 +2903,9 @@ class ImageEditor:
         share of pixels the white point may clip (luma, with each channel
         allowed ``channel_budget`` times that). Lower it to brighten less and
         keep highlights; None keeps it tied to ``threshold_percent``. It never
-        touches the shadow end.
+        touches the shadow end: when it would put the white point on the
+        black point (in a frame that is not flat at ``threshold_percent``),
+        only the white stretch is dropped, and p_high comes back as 255.
 
         ``black_threshold_percent`` clips the shadow end independently of
         ``threshold_percent``. The black point can never sit above this
@@ -2976,7 +2978,6 @@ class ImageEditor:
         # stretch.
         channel_budget = max(1.0, min(10.0, float(channel_budget)))
         chan_t = min(50.0, threshold_percent * channel_budget)
-        chan_t_high = min(50.0, white_threshold_percent * channel_budget)
 
         # No explicit pre-clip pinning is needed: percentile ranks already
         # count clipped pixels, so stretching to the q-th percentile keeps the
@@ -2984,22 +2985,31 @@ class ImageEditor:
         # threshold rather than disabling the stretch outright the moment a
         # few specular pixels sit at 255.
         chan_lows = []
-        chan_highs = []
+        chan_hists = []
         for c in range(3):
             hist = np.bincount(quantized[:, :, c].reshape(-1), minlength=nbins)
             chan_lows.append(self._percentile_from_hist(hist, chan_t, method="lower"))
-            chan_highs.append(
-                self._percentile_from_hist(hist, 100.0 - chan_t_high, method="higher")
-            )
+            chan_hists.append(hist)
 
         luma_q = (_rec601_gray(scaled) * (nbins - 1)).astype(np.uint16)
         luma_hist = np.bincount(luma_q.reshape(-1), minlength=nbins)
         luma_low = self._percentile_from_hist(
             luma_hist, black_threshold_percent, method="lower"
         )
-        luma_high = self._percentile_from_hist(
-            luma_hist, 100.0 - white_threshold_percent, method="higher"
-        )
+
+        def white_point(white_t: float) -> float:
+            """0-255 white point clipping *white_t* percent: luma-driven,
+            floored by the per-channel budgets."""
+            chan_t_high = min(50.0, white_t * channel_budget)
+            luma_high = self._percentile_from_hist(
+                luma_hist, 100.0 - white_t, method="higher"
+            )
+            chan_highs = [
+                self._percentile_from_hist(h, 100.0 - chan_t_high, method="higher")
+                for h in chan_hists
+            ]
+            return max(0.0, min(255.0, max(luma_high, max(chan_highs)) * bin_to_255))
+
         median_luma = self._percentile_from_hist(luma_hist, 50.0, method="lower") / (
             nbins - 1
         )
@@ -3037,12 +3047,16 @@ class ImageEditor:
             p_low = luma_low * bin_to_255
         else:
             p_low = min(luma_low, min(chan_lows)) * bin_to_255
-        # White point: luma-driven target, floored by the per-channel budgets.
-        p_high = max(luma_high, max(chan_highs)) * bin_to_255
-
-        # Safety
         p_low = max(0.0, min(255.0, p_low))
-        p_high = max(0.0, min(255.0, p_high))
+        p_high = white_point(white_threshold_percent)
+
+        # A white point on the black point would stretch without limit. When
+        # the frame is not flat at the shared threshold, only a wider Whites
+        # clip took it there: drop the white stretch alone (white point back
+        # at 255) and keep the black point, which the Whites clip has no say
+        # in. Resetting both would let the Whites clip undo the blacks.
+        if (p_high - p_low) < 1.0 and white_point(threshold_percent) - p_low >= 1.0:
+            p_high = 255.0
 
         # Check for degenerate range (e.g. flat image) to prevent extreme stretching
         if (p_high - p_low) < 1.0:

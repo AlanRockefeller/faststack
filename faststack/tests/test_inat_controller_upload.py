@@ -31,6 +31,7 @@ class ScriptedTransport:
         self.calls = []
         self.fail_photo_names = set(fail_photo_names)
         self.fail_create = fail_create
+        self.fail_create_marker = b""  # fail only creates whose body has it
         self.next_obs = 1000
         self.next_photo = 1
         self.lock = threading.Lock()
@@ -39,7 +40,9 @@ class ScriptedTransport:
         with self.lock:
             self.calls.append((method, url))
             if url.endswith("/observations") and method == "POST":
-                if self.fail_create:
+                if self.fail_create or (
+                    self.fail_create_marker and self.fail_create_marker in body
+                ):
                     return HttpResponse(500, {}, b'{"error":"boom"}')
                 self.next_obs += 1
                 return HttpResponse(200, {}, json.dumps({"id": self.next_obs}).encode())
@@ -280,7 +283,7 @@ def _identify(up, card, name):
         answer_rank="species", answer_name=name, answer_confidence=0.9
     )
     up._begin_job()  # _on_identify_done ends the job identifyCard began
-    up._on_identify_done(card.id, card.token, result, "")
+    up._on_identify_done(card.id, card.token, up._identify_run, result, "")
     return result
 
 
@@ -336,4 +339,218 @@ def test_vision_cache_keeps_only_the_newest_answers(qapp, tmp_path, monkeypatch)
         assert up.open([path])
         _identify(up, up._model.cards[0], f"Species {i}")
     assert set(up._vision_cache) == {frozenset([paths[1]]), frozenset([paths[2]])}
+    up.shutdown()
+
+
+def _uploads(transport):
+    creates = [u for m, u in transport.calls if u.endswith("/observations")]
+    photos = [u for m, u in transport.calls if u.endswith("/observation_photos")]
+    return len(creates), len(photos)
+
+
+def test_full_stash_does_not_drop_the_batch_being_reopened(
+    qapp, tmp_path, monkeypatch
+):
+    """With the stash full, the batch asked for is the oldest one in it:
+    putting the current batch aside must not push it out first."""
+    monkeypatch.setattr(ctl, "MAX_STASHED_BATCHES", 2)
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    batches = []
+    for name in "abc":
+        folder = tmp_path / name
+        folder.mkdir()
+        batches.append(_photos(folder, 1))
+    assert up.open(batches[0])
+    up.setDescription(up._model.cards[0].id, "first")
+    before = _card_state(up)
+    assert up.open(batches[1])
+    assert up.open(batches[2])  # stash: a, b - full
+    assert up.open(batches[0])
+    assert _card_state(up) == before
+    assert len(up._stashed) == 2
+    up.shutdown()
+
+
+def test_uploads_from_a_batch_put_aside_stay_locked_in_a_rebuilt_one(
+    qapp, tmp_path
+):
+    """A, then B (part of A) uploaded, then C (other photos), then A again:
+    B's photos come back as B's observation, not as a new card to upload."""
+    transport = ScriptedTransport()
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 4)
+    other = tmp_path / "other"
+    other.mkdir()
+    assert up.open(paths)
+    assert up.cardCount == 1
+    up.setDescription(up._model.cards[0].id, "the whole find")
+    assert up.open(paths[:2])
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (1, 2)
+    assert up.open(_photos(other, 1))
+
+    assert up.open(paths)
+    for card in up._model.cards:
+        if {p.key for p in card.group.photos} & set(paths[:2]):
+            assert card.locked
+            assert card.obs_id == 1001
+    records = {id(p) for p in up._photos}
+    assert all(id(p) in records for c in up._model.cards for p in c.group.photos)
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (2, 4)  # one more observation, for photos 2-3
+    up.shutdown()
+
+
+def test_restored_partial_upload_picks_up_photos_attached_from_another_batch(
+    qapp, tmp_path
+):
+    """A attaches only its first photo; B (same photos, other order) attaches
+    the rest; back in A the card knows, and nothing goes up twice."""
+    transport = ScriptedTransport(fail_photo_names={"IMG_1.jpg"})
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 2)
+    assert up.open(paths)
+    up.uploadAll()
+    _pump(qapp, up)
+    card = up._model.cards[0]
+    assert card.obs_id == 1001 and set(card.photo_ids) == {paths[0]}
+    assert up.open(list(reversed(paths)))
+    transport.fail_photo_names.clear()
+    up.uploadAll()
+    _pump(qapp, up)
+    assert up._model.cards[0].status == ctl.STATUS_UPLOADED
+    assert _uploads(transport) == (1, 3)  # photo 1 failed once, then went up
+
+    assert up.open(paths)
+    restored = up._model.cards[0]
+    assert restored.obs_id == 1001
+    assert set(restored.photo_ids) == set(paths)
+    assert restored.status == ctl.STATUS_UPLOADED
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (1, 3)
+    up.shutdown()
+
+
+def test_rebuilt_batch_keeps_the_most_complete_copy_of_an_uploaded_card(
+    qapp, tmp_path
+):
+    """A attaches one photo of two, B (same photos, other order) the other;
+    A and B are both put aside, each with its own copy of the card. A new
+    batch with those photos and one more keeps B's copy, so photo 1 is not
+    sent again."""
+    transport = ScriptedTransport(fail_photo_names={"IMG_1.jpg"})
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 3)
+    other = tmp_path / "other"
+    other.mkdir()
+    assert up.open(paths[:2])
+    up.uploadAll()
+    _pump(qapp, up)
+    assert up.open(list(reversed(paths[:2])))
+    transport.fail_photo_names.clear()
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (1, 3)
+    assert up.open(_photos(other, 1))
+
+    assert up.open(paths)
+    by_photo = {p.key: c for c in up._model.cards for p in c.group.photos}
+    card = by_photo[paths[0]]
+    assert by_photo[paths[1]] is card
+    assert card.status == ctl.STATUS_UPLOADED
+    assert set(card.photo_ids) == set(paths[:2])
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (2, 4)  # only photo 2, as its own observation
+    up.shutdown()
+
+
+def test_identification_cancelled_by_a_restore_does_not_land_on_it(
+    qapp, tmp_path, monkeypatch
+):
+    """B (A's photos, other order) shares A's card. An answer to an
+    identification B asked for, still on its way when A is opened again,
+    must not land on A's card (it has the same id and token) over its name."""
+    from faststack.inat.credentials import MYCOMAP_KEY
+    from faststack.inat.mycomap_vision import VisionResult
+
+    class Vision:
+        def __init__(self, key, http):
+            pass
+
+        def identify(self, payload, **kwargs):
+            return VisionResult(
+                answer_rank="species",
+                answer_name="Amanita muscaria",
+                answer_confidence=0.9,
+            )
+
+    monkeypatch.setattr(ctl, "MycoMapVisionClient", Vision)
+    monkeypatch.setattr(ctl.images, "prepare_jpeg", lambda path, edge: b"jpeg")
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    up._credentials.set(MYCOMAP_KEY, "key")
+    submitted = []
+    monkeypatch.setattr(up._identify_executor, "submit", submitted.append)
+    paths = _photos(tmp_path, 2)
+    assert up.open(paths)
+    card_id = up._model.cards[0].id
+    up.setChosenName(card_id, "Russula", "genus")
+    assert up.open(list(reversed(paths)))
+    assert up._model.cards[0].id == card_id  # the same card, shared
+    up.identifyCard(card_id)
+    assert len(submitted) == 1
+    # Vision answers before A is opened; the answer waits in the event queue.
+    worker = threading.Thread(target=submitted[0])
+    worker.start()
+    worker.join()
+
+    assert up.open(paths)
+    restored = up._card(card_id)
+    assert restored.chosen_name == "Russula"
+    _pump(qapp, up)
+    assert restored.chosen_name == "Russula"
+    assert restored.vision is None
+    assert restored.status == ctl.STATUS_PENDING
+    assert not up.busy
+    up.shutdown()
+
+
+def test_rejected_restore_keeps_the_batch_own_uploaded_cards(qapp, tmp_path):
+    """A uploads one card (the other fails), B uploads the failed card's
+    photos, then A again: A can't come back as it was (its failed card would
+    send B's photos twice), and the rebuilt A keeps the card it uploaded."""
+    transport = ScriptedTransport()
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 4)
+    assert up.open(paths)
+    up.splitCard(up._model.cards[0].id, 2)
+    first, second = up._model.cards
+    assert [p.key for p in first.group.photos] == paths[:2]
+    up.setDescription(second.id, "no signal")
+    transport.fail_create_marker = b"no signal"
+    up.uploadAll()
+    _pump(qapp, up)
+    assert first.locked and first.obs_id == 1001
+    assert not second.locked
+    transport.fail_create_marker = b""
+
+    assert up.open(paths[2:])
+    up.uploadAll()
+    _pump(qapp, up)
+    assert up._model.cards[0].obs_id == 1002
+    assert _uploads(transport) == (3, 4)
+
+    assert up.open(paths)
+    by_photo = {p.key: c for c in up._model.cards for p in c.group.photos}
+    assert by_photo[paths[0]].obs_id == by_photo[paths[1]].obs_id == 1001
+    assert by_photo[paths[2]].obs_id == by_photo[paths[3]].obs_id == 1002
+    assert all(c.locked for c in up._model.cards)
+    records = {id(p) for p in up._photos}
+    assert all(id(p) in records for c in up._model.cards for p in c.group.photos)
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (3, 4)
     up.shutdown()

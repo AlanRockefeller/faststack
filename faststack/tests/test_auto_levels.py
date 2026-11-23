@@ -199,6 +199,49 @@ def test_white_threshold_still_lifts_a_dark_photo_fully():
     assert whites == _approx_slider((255.0 - 90.0) / 40.0)
 
 
+def _editor_from(arr):
+    editor = ImageEditor()
+    img = Image.fromarray(arr, "RGB")
+    editor.original_image = img
+    editor._preview_image = img
+    return editor
+
+
+def test_wide_whites_clip_keeps_the_black_point():
+    # 95% of the frame one grey, 5% brighter: a 10% Whites clip takes the
+    # white point down onto the black point. That rules out the white
+    # stretch, not the black point the shadow analysis found, which used to
+    # be reset along with it.
+    arr = np.full((100, 100, 3), 102, np.uint8)
+    arr[:5] = 204
+    editor = _editor_from(arr)
+    b0, _w0, lo0, _hi0 = editor.analyze_auto_levels(0.1, white_threshold_percent=0.1)
+    b1, w1, lo1, hi1 = editor.analyze_auto_levels(0.1, white_threshold_percent=10.0)
+    assert b0 == _approx_slider(-102.0 / 40.0)
+    assert (b1, lo1) == (b0, lo0)
+    # No white stretch: the white point stays at 255.
+    assert (w1, hi1) == (0.0, 255.0)
+    for white in (0.1, 10.0):
+        rec = _recommend(editor, white=white)
+        assert rec["base_blacks"] == pytest.approx(b0)
+        assert rec["noop_reason"] is None
+
+
+@pytest.mark.parametrize("white", [None, 0.1, 10.0])
+def test_flat_frame_with_stray_pixels_stays_untouched(white):
+    # Flat but for a few stray pixels (within the clip budget at either
+    # end): no stretch, however wide the Whites clip.
+    arr = np.full((200, 200, 3), 128, np.uint8)
+    arr[0, :10] = 250
+    arr[1, :10] = 5
+    editor = _editor_from(arr)
+    blacks, whites, p_low, p_high = editor.analyze_auto_levels(
+        0.1, white_threshold_percent=white
+    )
+    assert (blacks, whites) == (0.0, 0.0)
+    assert p_low == _approx_255(128.0) and p_high == _approx_255(128.0)
+
+
 def _recommend(editor, white=0.0):
     import types
 

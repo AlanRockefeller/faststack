@@ -55,6 +55,7 @@ _PROBE = textwrap.dedent(
         @Slot()
         def cancel_white_balance_pick(self):
             self.calls.append(["cancel"])
+            ui.insert("isWbPicking", False)
 
         @Slot()
         def toggle_crop_mode(self):
@@ -137,6 +138,28 @@ _PROBE = textwrap.dedent(
     ui.insert("isWbPicking", True)
     settle(5)
     result["rightDragWhilePicking"] = drag(Qt.RightButton)
+    result["pickingAfterRightClick"] = bool(ui.value("isWbPicking"))
+    result["dragAfterCancel"] = drag(Qt.LeftButton)  # picker off: pans again
+
+    # Pick with the left button, then press and let go of the right while
+    # the left is still down: still the picker's gesture, so no crop and no
+    # pan, although the pick has already ended the picker.
+    ui.insert("isWbPicking", True)
+    settle(5)
+    before = main_image.mapToScene(QPointF(0, 0))
+    QTest.mousePress(window, Qt.LeftButton, Qt.NoModifier, centre)
+    settle(2)
+    QTest.mousePress(window, Qt.RightButton, Qt.NoModifier, centre)
+    settle(2)
+    QTest.mouseRelease(window, Qt.RightButton, Qt.NoModifier, centre)
+    for k in range(1, 8):
+        QTest.mouseMove(window, QPoint(centre.x() + 15 * k, centre.y() + 10 * k))
+        settle(2)
+    QTest.mouseRelease(window, Qt.LeftButton, Qt.NoModifier,
+                       QPoint(centre.x() + 105, centre.y() + 70))
+    settle(10)
+    after = main_image.mapToScene(QPointF(0, 0))
+    result["chordAfterPick"] = [after.x() - before.x(), after.y() - before.y()]
     result["calls"] = controller.calls
     print("RESULT " + json.dumps(result))
     """
@@ -196,7 +219,15 @@ def test_the_press_that_picked_does_not_pan(probe):
 
 
 def test_right_click_cancels_instead_of_cropping(probe):
-    assert probe["calls"][-1] == ["cancel"]
+    assert [c[0] for c in probe["calls"]] == ["pick", "pick", "cancel", "pick"]
     assert ["crop"] not in probe["calls"]
     assert ["stroke"] not in probe["calls"]
     assert probe["rightDragWhilePicking"] == [0.0, 0.0]
+    # Once cancelled, a drag pans as usual.
+    assert not probe["pickingAfterRightClick"]
+    assert abs(probe["dragAfterCancel"][0]) > 20
+
+
+def test_second_button_during_a_pick_neither_crops_nor_pans(probe):
+    # The calls check above covers the crop; this covers the pan.
+    assert probe["chordAfterPick"] == [0.0, 0.0]

@@ -115,9 +115,11 @@ def read_disc(
     xs = x0 + stride * np.arange(patch.shape[1]) + 0.5
     inside = (xs[None, :] - cx) ** 2 + (ys[:, None] - cy) ** 2 <= r * r
     if not inside.any():
-        # Under half a pixel across: the pixel nearest the centre.
-        iy = int(np.argmin(np.abs(ys - cy)))
-        ix = int(np.argmin(np.abs(xs - cx)))
+        # Too small to reach a pixel centre: the pixel the click is in (the
+        # nearest centre could be a neighbour, across a colour edge).
+        px, py = min(width - 1, int(cx)), min(height - 1, int(cy))
+        iy = min(patch.shape[0] - 1, max(0, (py - y0) // stride))
+        ix = min(patch.shape[1] - 1, max(0, (px - x0) // stride))
         return patch[iy : iy + 1, ix].copy()
     return patch[inside]
 
@@ -131,10 +133,10 @@ def _as_unit_rgb(patch: np.ndarray) -> np.ndarray:
         patch = np.repeat(patch, 3, axis=2)
     else:
         patch = patch[:, :, :3]
-    if patch.dtype == np.uint8:
-        return patch.astype(np.float32) / np.float32(255.0)
-    if patch.dtype == np.uint16:
-        return patch.astype(np.float32) / np.float32(65535.0)
+    # By kind and size, so a big-endian 16-bit array is scaled too.
+    if patch.dtype.kind == "u" and patch.dtype.itemsize in (1, 2):
+        full_scale = 255.0 if patch.dtype.itemsize == 1 else 65535.0
+        return patch.astype(np.float32) / np.float32(full_scale)
     return patch.astype(np.float32, copy=False)
 
 

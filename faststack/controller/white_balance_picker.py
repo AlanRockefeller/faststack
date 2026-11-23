@@ -25,6 +25,7 @@ from faststack.imaging.wb_pick import (
     WhiteBalancePick,
     solve_white_balance,
 )
+from faststack.ui.keystrokes import bracket_size_step
 
 log = logging.getLogger(__name__)
 
@@ -194,8 +195,9 @@ class WhiteBalancePickerMixin:
                 return False  # Esc closes the histogram first, as elsewhere
             self.cancel_white_balance_pick()
             return True
-        if key in (Qt.Key_BracketLeft, Qt.Key_BracketRight) and not mods:
-            self.adjust_white_balance_pick_size(1 if key == Qt.Key_BracketRight else -1)
+        step = bracket_size_step(event)
+        if step:
+            self.adjust_white_balance_pick_size(step)
             return True
         if key == Qt.Key_Space and not mods:
             # As in the brushes: Space shows the original, and Space+drag

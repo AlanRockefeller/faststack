@@ -24,13 +24,11 @@ size.  It is computed once per photo by the
 controller (``faststack.controller.depth_select``) or, when a save needs one
 the preview never got, by the save worker; it is not stored with the edit.
 
-The layer's mask is::
-
-    min(1, selection * (1 - erased) + painted)
-
-so erase strokes cut holes in the selection and paint strokes add to it (a
-depth layer is one coat: painting over what is already selected does not
-double the recipe).  Until the depth map exists only the strokes count.
+The layer's mask is the selection with the layer's strokes laid over it in
+order: paint strokes add to it, up to full (a depth layer is one coat:
+painting over what is already selected does not double the recipe), and
+erase strokes cut holes in it, painted or not.  Until the depth map exists
+only the strokes count.
 """
 
 from __future__ import annotations
@@ -43,10 +41,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from faststack.imaging.mask import MaskData
+from faststack.imaging.mask import STROKE_ERASE, MaskData, MaskStroke
 from faststack.imaging.mask_engine import (
     LayerDensity,
     LayerDensityCache,
+    _base_diagonal_px,
+    _extends,
+    _geometry_key,
+    _stroke_coverage,
+    _stroke_pixel_points,
     rasterize_layer_density,
     rasterize_layer_erased,
 )
@@ -238,6 +241,15 @@ def joint_bilateral_upsample(
     r, g, b = guide[..., 0], guide[..., 1], guide[..., 2]
     acc = np.zeros((H, W, channels), np.float32)
     wsum = np.zeros((H, W), np.float32)
+    # Each pixel's weights are taken relative to one of its own samples' (the
+    # first, raised to a much better one when it comes). A guide colour unlike
+    # every sample around it (a thin white twig against black) has all its
+    # weights far below what float32 holds: taken as they are they would all
+    # round to 0, and the pixel would come out at 0 depth whatever the samples
+    # said. Raising the reference only past a wide margin keeps the weights
+    # from overflowing without rescaling every pixel at every sample.
+    ref = None
+    headroom = np.float32(40.0)
     inv_c = np.float32(-0.5 / _JBU_SIGMA_COLOR**2)
     inv_s = np.float32(-0.5 / _JBU_SIGMA_SPACE**2)
     for dy in range(-_JBU_RADIUS, _JBU_RADIUS + 1):
@@ -253,7 +265,17 @@ def joint_bilateral_upsample(
             if val.ndim == 2:
                 val = val[..., None]
             d2 = (col[..., 0] - r) ** 2 + (col[..., 1] - g) ** 2 + (col[..., 2] - b) ** 2
-            wgt = np.exp(d2 * inv_c + ly + lx)
+            logw = d2 * inv_c + ly + lx
+            if ref is None:
+                ref = logw
+            else:
+                better = logw > ref + headroom
+                if better.any():
+                    shift = np.exp(ref[better] - logw[better])
+                    acc[better] *= shift[:, None]
+                    wsum[better] *= shift
+                    ref[better] = logw[better]
+            wgt = np.exp(logw - ref)
             if confidence is not None:
                 wgt *= val[..., channels]
             acc += wgt[..., None] * val[..., :channels]
@@ -427,6 +449,141 @@ def _paste(out: np.ndarray, y0: int, x0: int, part: LayerDensity):
     return out[part.y0 - y0 : part.y1 - y0, part.x0 - x0 : part.x1 - x0]
 
 
+# The strokes laid over a selection in order, a paint stroke capped at full,
+# come out as::
+#
+#     min(selection * (1 - erased) + painted, 1 - uncovered)
+#
+# where *painted* and *erased* are the layer's ordinary rasters and
+# *uncovered* is what the strokes alone leave of a fully selected pixel: an
+# erase stroke cuts into it, a later paint stroke fills it back in. None of
+# the three depends on the selection, so all are cached and a depth slider
+# drag re-rasterises no strokes. The first term alone is not enough: where
+# paint covers the selection, a half erase leaves half of each, which add
+# back up to full.
+
+
+def _apply_uncovered(
+    base: Optional[LayerDensity],
+    strokes: Tuple[MaskStroke, ...],
+    edits: Dict[str, Any],
+    shape: Tuple[int, int],
+    base_shape: Optional[Tuple[int, int]] = None,
+    point_transform: Optional[np.ndarray] = None,
+) -> Optional[LayerDensity]:
+    """Lay *strokes* in order over the uncovered fraction *base* (never
+    mutated)."""
+    diag = _base_diagonal_px(edits, shape, base_shape, point_transform)
+    covered = []
+    for stroke in strokes:
+        cov = _stroke_coverage(
+            _stroke_pixel_points(stroke, edits, shape, point_transform),
+            stroke.radius * diag,
+            stroke.hardness,
+            shape,
+        )
+        if cov is not None:
+            covered.append((stroke.mode == STROKE_ERASE, cov))
+    # Paint only fills back what an erase uncovered, so erase strokes alone
+    # make the box.
+    boxes = [cov[:4] for erase, cov in covered if erase]
+    if base is not None:
+        boxes.append((base.y0, base.y1, base.x0, base.x1))
+    if not covered or not boxes:
+        return base
+    y0 = min(b[0] for b in boxes)
+    y1 = max(b[1] for b in boxes)
+    x0 = min(b[2] for b in boxes)
+    x1 = max(b[3] for b in boxes)
+    out = np.zeros((y1 - y0, x1 - x0), dtype=np.float32)
+    if base is not None:
+        _paste(out, y0, x0, base)[...] = base.arr
+    for erase, (sy0, sy1, sx0, sx1, cov) in covered:
+        cy0, cy1 = max(sy0, y0), min(sy1, y1)
+        cx0, cx1 = max(sx0, x0), min(sx1, x1)
+        if cy1 <= cy0 or cx1 <= cx0:
+            continue
+        c = cov[cy0 - sy0 : cy1 - sy0, cx0 - sx0 : cx1 - sx0]
+        region = out[cy0 - y0 : cy1 - y0, cx0 - x0 : cx1 - x0]
+        if erase:
+            region += c * (1.0 - region)
+        else:
+            region -= c
+            np.maximum(region, 0.0, out=region)
+    return LayerDensity(y0, y1, x0, x1, out)
+
+
+def _rasterize_uncovered(
+    layer_id: str,
+    mask_data: MaskData,
+    shape: Tuple[int, int],
+    edits: Dict[str, Any],
+    cache: Optional[LayerDensityCache] = None,
+    include_live: bool = True,
+    base_shape: Optional[Tuple[int, int]] = None,
+    point_transform: Optional[np.ndarray] = None,
+) -> Optional[LayerDensity]:
+    """The *uncovered* raster above, or None while nothing is erased.
+
+    Cached like ``rasterize_layer_erased``, under its own cache id (pruned
+    with the layer); the live stroke goes on top fresh each call.
+    """
+    strokes = tuple(mask_data.strokes)
+    live = mask_data.live_stroke if include_live else None
+    if live is not None and not live.points:
+        live = None
+    if not any(s.mode == STROKE_ERASE for s in strokes) and (
+        live is None or live.mode != STROKE_ERASE
+    ):
+        return None
+    key = (
+        mask_data.uid,
+        tuple(shape),
+        _geometry_key(edits, base_shape, point_transform),
+    )
+    cache_id = f"{layer_id}\0uncovered"
+    entry = cache.get(cache_id, key) if cache is not None else None
+    if entry is not None and len(entry[0]) == len(strokes) and _extends(strokes, entry[0]):
+        committed = entry[1]
+    else:
+        if entry is not None and _extends(strokes, entry[0]):
+            committed = _apply_uncovered(
+                entry[1],
+                strokes[len(entry[0]) :],
+                edits,
+                shape,
+                base_shape,
+                point_transform,
+            )
+        else:
+            committed = _apply_uncovered(
+                None, strokes, edits, shape, base_shape, point_transform
+            )
+        if cache is not None:
+            cache.put(cache_id, key, strokes, committed)
+    if live is None:
+        return committed
+    return _apply_uncovered(committed, (live,), edits, shape, base_shape, point_transform)
+
+
+def _cap_uncovered(
+    out: np.ndarray, y0: int, x0: int, uncovered: Optional[LayerDensity]
+) -> None:
+    """Hold *out* (whose top left is at y0, x0) to 1 - *uncovered*."""
+    if uncovered is None:
+        return
+    h, w = out.shape
+    oy0, oy1 = max(y0, uncovered.y0), min(y0 + h, uncovered.y1)
+    ox0, ox1 = max(x0, uncovered.x0), min(x0 + w, uncovered.x1)
+    if oy1 <= oy0 or ox1 <= ox0:
+        return
+    region = out[oy0 - y0 : oy1 - y0, ox0 - x0 : ox1 - x0]
+    kept = 1.0 - uncovered.arr[
+        oy0 - uncovered.y0 : oy1 - uncovered.y0, ox0 - uncovered.x0 : ox1 - uncovered.x0
+    ]
+    np.minimum(region, kept, out=region)
+
+
 def depth_layer_density(
     layer: Dict[str, Any],
     mask_data: Optional[MaskData],
@@ -440,9 +597,22 @@ def depth_layer_density(
 ) -> Optional[LayerDensity]:
     """The mask of a depth layer at *shape* (see the module docstring)."""
     layer_id = layer["id"]
-    painted = erased = None
+    painted = erased = uncovered = None
     if mask_data is not None:
         painted = rasterize_layer_density(
+            layer_id,
+            mask_data,
+            shape,
+            edits,
+            cache=cache,
+            include_live=include_live,
+            base_shape=base_shape,
+            point_transform=point_transform,
+        )
+    if painted is not None:
+        # Without paint the erase strokes alone cut the selection, and
+        # selection * (1 - erased) is already the whole answer.
+        uncovered = _rasterize_uncovered(
             layer_id,
             mask_data,
             shape,
@@ -467,9 +637,9 @@ def depth_layer_density(
     if selection is None:
         if painted is None:
             return None
-        return LayerDensity(
-            painted.y0, painted.y1, painted.x0, painted.x1, np.minimum(painted.arr, 1.0)
-        )
+        out = np.minimum(painted.arr, 1.0)
+        _cap_uncovered(out, painted.y0, painted.x0, uncovered)
+        return LayerDensity(painted.y0, painted.y1, painted.x0, painted.x1, out)
     if erased is not None:
         # selection.arr is this call's own array: scale it in place over the
         # overlap of the two boxes.
@@ -491,4 +661,5 @@ def depth_layer_density(
     region = _paste(out, y0, x0, painted)
     region += painted.arr
     np.minimum(out, 1.0, out=out)
+    _cap_uncovered(out, y0, x0, uncovered)
     return LayerDensity(y0, y1, x0, x1, out)

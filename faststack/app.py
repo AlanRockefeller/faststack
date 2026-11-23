@@ -133,7 +133,7 @@ from faststack.imaging.prefetch import (
     held_navigation_quality_max_dimension,
     normalize_held_navigation_quality,
 )
-from faststack.ui.keystrokes import Keybinder
+from faststack.ui.keystrokes import Keybinder, bracket_size_step
 from faststack.imaging.editor import (
     ASPECT_RATIOS,
     DEFAULT_PREVIEW_MASTER_BOX,
@@ -2955,8 +2955,9 @@ class AppController(
                 return False  # Esc closes the histogram first, as elsewhere
             self.exit_local_brush_mode()
             return True
-        if key in (Qt.Key_BracketLeft, Qt.Key_BracketRight) and not mods:
-            self.adjust_brush_size(1 if key == Qt.Key_BracketRight else -1)
+        step = bracket_size_step(event)
+        if step:
+            self.adjust_brush_size(step)
             return True
         if key == Qt.Key_Z and mods == Qt.ControlModifier:
             self.undo_local_stroke()

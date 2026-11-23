@@ -5,6 +5,33 @@ from PySide6.QtCore import Qt
 
 log = logging.getLogger(__name__)
 
+_BRACKET_STEP = {"[": -1, "]": 1}
+_SIZE_STEP_MODIFIERS = (
+    Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier
+)
+
+
+def bracket_size_step(event) -> int:
+    """-1 for [ and +1 for ] (the brush and picker size keys), else 0.
+
+    The typed character decides first, as it does for the Keybinder's
+    stack keys: layouts that type [ with AltGr report Ctrl+Alt with it, and
+    a key code check that refused modifiers would leave the press to the
+    Keybinder, which starts a stack instead. The key codes count only
+    without modifiers, so Ctrl+[ (which types no bracket) stays unclaimed.
+    """
+    step = _BRACKET_STEP.get(event.text(), 0)
+    if step:
+        return step
+    if event.modifiers() & _SIZE_STEP_MODIFIERS:
+        return 0
+    key = event.key()
+    if key == Qt.Key_BracketLeft:
+        return -1
+    if key == Qt.Key_BracketRight:
+        return 1
+    return 0
+
 
 class Keybinder:
     def __init__(self, controller):

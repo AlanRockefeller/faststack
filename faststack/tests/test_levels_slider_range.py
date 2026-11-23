@@ -139,9 +139,14 @@ def _px(px, handle=10, available=240):
     return px / (available - handle) * 200
 
 
-def _press(eng, press_value, *values, handle=10, available=240):
-    """Feed one press's moved values through pressMove: True once it drags."""
-    grabbed, grab = False, 0.0
+def _press(eng, press_value, *values, handle=10, available=240, unmoved=False):
+    """Feed one press's moved values through pressMove: True once it drags.
+
+    ``unmoved``: Qt emitted no moved for the press itself (as reported for
+    6.5, on a press on the handle's centre), so the editors' grabIfUnmoved
+    grabbed the handle where it was before the first of *values*.
+    """
+    grabbed, grab = (True, press_value) if unmoved else (False, 0.0)
     geometry = (handle, available, -100, 100)
     for value in values:
         step = _call(eng, "pressMove", press_value, grabbed, grab, value, *geometry)
@@ -179,6 +184,30 @@ def test_short_drag_from_the_handle_is_a_drag(grab_px, moves):
     eng = _curve_engine("SliderInput.js")
     grab = 20 + _px(grab_px)
     assert _press(eng, 20, grab, *(grab + _px(m) for m in moves))
+
+
+@pytest.mark.parametrize("move_px", [3, -3, 6])
+def test_short_drag_from_an_unmoved_press_is_a_drag(move_px):
+    # Where Qt emits no moved for a press on the handle's centre, the first
+    # moved is the pointer's own travel. Taken as the grab point, a quick
+    # 3 px drag was swallowed; the handle is grabbed at the press instead.
+    eng = _curve_engine("SliderInput.js")
+    assert _press(eng, 20, 20 + _px(move_px), unmoved=True)
+    assert not _press(eng, 20, unmoved=True)  # a click: no moved at all
+    assert not _press(eng, 20, 20 + _px(1), 20 - _px(1), unmoved=True)  # a wobble
+
+
+@pytest.mark.parametrize("qml", ["CompactEditorWindow.qml", "ImageEditorDialog.qml"])
+def test_editors_grab_a_press_no_moved_has_classified(qml):
+    text = (QML_DIR / qml).read_text(encoding="utf-8")
+    press = text[text.index("onPressedChanged: {", text.index("property bool _dragging")) :]
+    press = press[: press.index("} else {")]
+    assert "Qt.callLater(slider.grabIfUnmoved)" in press
+    grab = text[text.index("function grabIfUnmoved() {") :]
+    grab = grab[: grab.index("\n                }\n")]
+    assert "if (slider.pressed && !slider._grabbed && !slider._dragging) {" in grab
+    assert "slider._grabbed = true" in grab
+    assert "slider._grabValue = slider.value" in grab
 
 
 def test_press_on_handle_allowance_never_below_three_pixels():

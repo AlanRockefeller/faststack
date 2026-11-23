@@ -1574,6 +1574,10 @@ Item {
         }
 
         onPressed: function(mouse) {
+            // Another button pressed while a press the picker consumed is
+            // still held belongs to that gesture: the pick has ended the
+            // picker, but this must not start a crop (right) or a pan.
+            if (wbPickPress) return
             // The middle button only pans, and only in brush mode; elsewhere
             // it keeps passing through as before.
             if (mouse.button === Qt.MiddleButton) {
@@ -1894,12 +1898,14 @@ Item {
         }
         
         onReleased: function(mouse) {
-            if (mouse.button === Qt.MiddleButton) {
-                middlePanning = false
+            // released comes once per button: the gesture the picker took
+            // lasts until the last one is up.
+            if (wbPickPress) {
+                if (pressedButtons === Qt.NoButton) wbPickPress = false
                 return
             }
-            if (wbPickPress) {
-                wbPickPress = false
+            if (mouse.button === Qt.MiddleButton) {
+                middlePanning = false
                 return
             }
             // Dodge & burn stroke release
