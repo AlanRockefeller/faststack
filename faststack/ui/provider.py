@@ -1307,6 +1307,19 @@ class UIState(QObject):
             self._status_message_color = value
             self.statusMessageColorChanged.emit()
 
+    # W (RAW white balance) progress for the status bar meter; see
+    # RawWhiteBalanceMixin._publish_raw_awb_progress for the keys.
+    rawAwbProgressChanged = Signal()
+
+    @Property("QVariantMap", notify=rawAwbProgressChanged)
+    def rawAwbProgress(self):
+        return getattr(self, "_raw_awb_progress", None) or {"active": False}
+
+    @rawAwbProgress.setter
+    def rawAwbProgress(self, value):
+        self._raw_awb_progress = dict(value or {})
+        self.rawAwbProgressChanged.emit()
+
     @Property(bool, notify=automaticMonitoringAvailableChanged)
     def automaticMonitoringAvailable(self) -> bool:
         return self._automatic_monitoring_available

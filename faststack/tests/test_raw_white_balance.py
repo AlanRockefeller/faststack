@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 from PIL import Image
 from PySide6.QtCore import QCoreApplication, QEventLoop, QObject, Qt, QTimer
@@ -39,10 +40,18 @@ def _write_jpg(path: Path, size, color, orientation=None):
 
 
 def _fake_cli(
-    tmp_path: Path, *, size=(60, 40), exit_code=0, write=True, source=None
+    tmp_path: Path,
+    *,
+    size=(60, 40),
+    exit_code=0,
+    write=True,
+    source=None,
+    clip_without_compression=False,
 ) -> Path:
-    """A stand-in rawtherapee-cli: records argv + profile, writes a JPEG
-    (flat grey, or a copy of ``source``)."""
+    """A stand-in rawtherapee-cli: records argv + profile (the last run in
+    cli-log.json, every profile in cli-runs.log), writes a JPEG (flat grey,
+    a copy of ``source``, or blown white until highlight compression is
+    asked for)."""
     log_path = tmp_path / "cli-log.json"
     script = tmp_path / "bin" / "rawtherapee-cli"
     script.parent.mkdir()
@@ -61,7 +70,11 @@ def _fake_cli(
             Path({str(log_path)!r}).write_text(
                 json.dumps({{"argv": argv, "profile": profile}})
             )
-            if {write!r} and {str(source) if source else None!r}:
+            with open({str(tmp_path / "cli-runs.log")!r}, "a") as runs:
+                runs.write(profile.replace("\\n", "|") + "\\n")
+            if {clip_without_compression!r} and "HighlightCompr" not in profile:
+                Image.new("RGB", {size!r}, (255, 255, 255)).save(out, "JPEG")
+            elif {write!r} and {str(source) if source else None!r}:
                 Image.open({str(source) if source else None!r}).save(out, "JPEG")
             elif {write!r}:
                 Image.new("RGB", {size!r}, (128, 128, 128)).save(out, "JPEG")
@@ -105,6 +118,15 @@ def _controller(tmp_path: Path, cli: Path, *, image_size=(60, 40)):
     controller._refresh_after_raw_awb = MagicMock()
     controller._auto_add_edited_to_batch_if_enabled = MagicMock()
     controller._configured_rawtherapee_executable = lambda: str(cli)
+    # Editor plumbing W touches when the editor holds the photo.
+    controller._clear_active_auto_adjust_state = MagicMock()
+    controller._clear_live_edit_session_state = MagicMock()
+    controller._preview_lock = threading.Lock()
+    controller._clear_last_rendered_preview_locked = MagicMock()
+    controller.load_image_for_editing = MagicMock(return_value=True)
+    controller.sync_ui_state = MagicMock()
+    controller._persist_sidecar = MagicMock(return_value=True)
+    controller._pending_save_recovery = {}
     return controller, jpg, raw
 
 
@@ -189,7 +211,13 @@ def test_replaces_jpg_with_backup_and_undo(qt_app, tmp_path):
     assert jpg.stat().st_mtime == pytest.approx(old_mtime, abs=1e-3)
     # No staging or RawTherapee leftovers next to the photo.
     assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == sorted(
-        ["P1010001.JPG", "P1010001-backup.JPG", "P1010001.ORF", "cli-log.json"]
+        [
+            "P1010001.JPG",
+            "P1010001-backup.JPG",
+            "P1010001.ORF",
+            "cli-log.json",
+            "cli-runs.log",
+        ]
     )
 
     action, data, _ts = controller.undo_history[-1]
@@ -204,7 +232,9 @@ def test_replaces_jpg_with_backup_and_undo(qt_app, tmp_path):
         ]
         is True
     )
-    controller._refresh_after_raw_awb.assert_called_once_with(jpg, on_current=True)
+    controller._refresh_after_raw_awb.assert_called_once_with(
+        jpg, on_current=True, keep_editor=False
+    )
     assert "Ctrl+Z" in controller.status_messages[-1]
 
 
@@ -227,31 +257,76 @@ def test_undo_restores_camera_jpg(qt_app, tmp_path):
     assert controller.status_messages[-1] == "Undid RAW white balance"
 
 
-def test_refuses_with_unsaved_edits(qt_app, tmp_path):
+def _wait_until(predicate, timeout_ms=10000):
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setInterval(10)
+    timer.timeout.connect(lambda: predicate() and loop.quit())
+    timer.start()
+    QTimer.singleShot(timeout_ms, loop.quit)
+    loop.exec()
+    timer.stop()
+    QCoreApplication.processEvents()
+    return predicate()
+
+
+def test_unsaved_edits_are_saved_first(qt_app, tmp_path):
     cli = _fake_cli(tmp_path)
     controller, jpg, _raw = _controller(tmp_path, cli)
     controller._is_current_live_edit_session_dirty.return_value = True
     controller.image_editor.current_filepath = jpg
+    key = controller._key(jpg)
 
-    # In the loupe Ctrl+S toggles Stacked, so the hint must not suggest it.
-    controller.ui_state.isEditorOpen = False
-    assert controller.raw_white_balance_to_jpg() is False
-    assert "unsaved edits" in controller.status_messages[-1]
-    assert "Ctrl+S" not in controller.status_messages[-1]
+    def flush():
+        # The save goes off in the background and the session is clean.
+        controller._saving_keys[key] = 1
+        controller._is_current_live_edit_session_dirty.return_value = False
+        return True
 
-    controller.ui_state.isEditorOpen = True
-    assert controller.raw_white_balance_to_jpg() is False
-    assert "Ctrl+S" in controller.status_messages[-1]
+    controller._flush_current_live_edit_session_for_navigation = MagicMock(
+        side_effect=flush
+    )
+    controller._pending_save_recovery = {}
+
+    assert controller.raw_white_balance_to_jpg() is True
+    controller._flush_current_live_edit_session_for_navigation.assert_called_once()
+    assert "Saving your edits" in controller.status_messages[-1]
+    assert key in controller._raw_awb_waiting
+    assert not (tmp_path / "cli-log.json").exists()
+
+    controller._saving_keys.pop(key)  # the save landed
+    assert _wait_until(lambda: bool(controller.undo_history))
+    assert controller.undo_history[-1][0] == rawb.RAW_WHITE_BALANCE_ACTION
+    assert (tmp_path / "cli-log.json").exists()
+
+
+def test_failed_save_cancels_w(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller._is_current_live_edit_session_dirty.return_value = True
+    controller.image_editor.current_filepath = jpg
+    controller._flush_current_live_edit_session_for_navigation = MagicMock(
+        return_value=True
+    )
+    controller._pending_save_recovery = {str(jpg): {"failed": True}}
+
+    assert controller.raw_white_balance_to_jpg() is True
+    assert _wait_until(lambda: not controller._raw_awb_waiting)
+    assert "failed" in controller.status_messages[-1]
     assert not (tmp_path / "cli-log.json").exists()
 
 
-def test_refuses_while_saving(qt_app, tmp_path):
+def test_waits_while_saving(qt_app, tmp_path):
     cli = _fake_cli(tmp_path)
     controller, jpg, _raw = _controller(tmp_path, cli)
-    controller._saving_keys[controller._key(jpg)] = 1
+    key = controller._key(jpg)
+    controller._saving_keys[key] = 1
+    controller._pending_save_recovery = {}
 
-    assert controller.raw_white_balance_to_jpg() is False
-    assert "saving" in controller.status_messages[-1]
+    assert controller.raw_white_balance_to_jpg() is True
+    assert not (tmp_path / "cli-log.json").exists()
+    controller._saving_keys.pop(key)
+    assert _wait_until(lambda: bool(controller.undo_history))
 
 
 def test_needs_a_raw_pair(qt_app, tmp_path):
@@ -463,3 +538,348 @@ def test_refuses_when_photo_is_not_the_one_shown(
     assert controller.raw_white_balance_to_jpg() is False
     assert expected in controller.status_messages[-1]
     assert not (tmp_path / "cli-log.json").exists()
+
+
+def _stub_refresh(controller, jpg):
+    """Stub what the real _refresh_after_raw_awb calls around the editor."""
+    controller._refresh_after_raw_awb = AppController._refresh_after_raw_awb.__get__(
+        controller
+    )
+    controller._preview_lock = threading.Lock()
+    controller._clear_last_rendered_preview_locked = MagicMock()
+    controller._clear_live_edit_session_state = MagicMock()
+    controller._clear_active_auto_adjust_state = MagicMock()
+    controller._current_image_path = MagicMock(return_value=jpg)
+    controller._begin_direct_image_transition = MagicMock()
+    controller.refresh_image_list = MagicMock()
+    controller._reindex_after_save = MagicMock()
+    controller._invalidate_decoded_path = MagicMock()
+    controller.prefetcher = MagicMock()
+    controller.sync_ui_state = MagicMock()
+    controller._do_prefetch = MagicMock()
+    controller._restart_quality_decode_timer = MagicMock()
+    controller.load_image_for_editing = MagicMock(return_value=True)
+    controller.ui_state.isHistogramVisible = False
+    controller.image_editor.current_filepath = jpg
+
+
+def test_open_editor_stays_open_on_the_new_pixels(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    _stub_refresh(controller, jpg)
+    controller.ui_state.isEditorOpen = True
+
+    controller._refresh_after_raw_awb(jpg, on_current=True)
+
+    assert controller.ui_state.isEditorOpen is True
+    controller.image_editor.clear.assert_called_once()
+    controller.load_image_for_editing.assert_called_once()
+
+
+def test_editor_closes_when_the_reload_fails(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    _stub_refresh(controller, jpg)
+    controller.ui_state.isEditorOpen = True
+    controller.load_image_for_editing.return_value = False
+
+    controller._refresh_after_raw_awb(jpg, on_current=True)
+
+    assert controller.ui_state.isEditorOpen is False
+
+
+def test_editor_on_a_photo_no_longer_shown_is_closed(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    _stub_refresh(controller, jpg)
+    controller.ui_state.isEditorOpen = True
+
+    controller._refresh_after_raw_awb(jpg, on_current=False)
+
+    assert controller.ui_state.isEditorOpen is False
+    controller.image_editor.clear.assert_called_once()
+    controller.load_image_for_editing.assert_not_called()
+
+
+# -- Highlights, framing, meter ----------------------------------------------
+
+
+def test_profile_adds_highlight_compression():
+    profile = rawb.build_raw_awb_profile("Auto", 250)
+    assert "[Exposure]\nHighlightCompr=250\nHighlightComprThreshold=0\n" in profile
+    assert rawb.build_raw_awb_profile("Auto", 0) == rawb.build_raw_awb_profile("Auto")
+
+
+@pytest.mark.parametrize(
+    "clipped, expected", [(0.0, 0), (0.004, 0), (0.01, 250), (0.2, 400)]
+)
+def test_highlight_compression_follows_the_render(clipped, expected):
+    assert rawb.highlight_compression_for(clipped) == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected", [("auto", None), ("", None), ("off", 0), ("300", 300)]
+)
+def test_highlight_mode_config(value, expected):
+    with patch.object(rawb.config, "get", return_value=value):
+        assert rawb._raw_awb_highlight_mode() == expected
+
+
+def test_blown_render_gets_a_second_pass(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path, clip_without_compression=True)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller.raw_white_balance_to_jpg()
+    _wait(controller)
+
+    runs = (tmp_path / "cli-runs.log").read_text().splitlines()
+    assert len(runs) == 2
+    assert "HighlightCompr" not in runs[0]
+    assert "HighlightCompr=400" in runs[1]
+    with Image.open(jpg) as img:
+        assert img.getpixel((5, 5)) == pytest.approx((128, 128, 128), abs=3)
+    assert "highlights pulled back" in controller.status_messages[-1]
+
+
+def test_clean_render_is_developed_once(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, _jpg, _raw = _controller(tmp_path, cli)
+    controller.raw_white_balance_to_jpg()
+    _wait(controller)
+    assert len((tmp_path / "cli-runs.log").read_text().splitlines()) == 1
+
+
+def test_frame_crop_box_finds_an_off_centre_frame():
+    rng = np.random.default_rng(3)
+    big = cv2_blur(rng.integers(0, 256, (330, 490)).astype(np.float32))
+    # The camera's frame sits 9 px right and 4 px up of centre.
+    x0, y0 = (490 - 470) // 2 + 9, (330 - 314) // 2 - 4
+    reference = big[y0 : y0 + 314, x0 : x0 + 470]
+    assert rawb.frame_crop_box(reference, big) == (x0, y0, x0 + 470, y0 + 314)
+
+
+def cv2_blur(arr):
+    from faststack.imaging.optional_deps import get_cv2
+
+    return get_cv2().GaussianBlur(arr, (0, 0), 2.0)
+
+
+def test_render_is_trimmed_to_the_camera_frame(qt_app, tmp_path):
+    scene = _textured_scene((490, 330))
+    rt_output = tmp_path / "rt-output.jpg"
+    scene.save(rt_output, "JPEG", quality=95)
+    cli = _fake_cli(tmp_path, source=rt_output)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    scene.crop((10, 8, 480, 322)).save(jpg, "JPEG", quality=95)
+
+    controller.raw_white_balance_to_jpg()
+    _wait(controller)
+    with Image.open(jpg) as img:
+        assert img.size == (470, 314)
+
+
+def test_narrow_crop_of_an_upright_frame_keeps_rawtherapee_turn(tmp_path):
+    # Smooth picture: turned sideways it still correlates well with a
+    # narrow strip, which used to win because of the strip's own shape.
+    w, h = 480, 320
+    ramp = np.linspace(0, 255, w, dtype=np.float32)[None, :].repeat(h, 0)
+    ramp += np.linspace(0, 60, h, dtype=np.float32)[:, None]
+    frame = Image.fromarray(np.clip(ramp, 0, 255).astype(np.uint8), "L")
+    frame = frame.convert("RGB")
+    shown = tmp_path / "shown.jpg"
+    frame.crop((200, 20, 250, 300)).save(shown, "JPEG", quality=95)
+    out = tmp_path / "out.jpg"
+    frame.save(out, "JPEG", quality=95)
+    assert rawb.match_output_rotation(shown, out) == 0
+
+
+def test_meter_ends_done(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, _jpg, _raw = _controller(tmp_path, cli)
+    seen = []
+    controller.ui_state = MagicMock(isCropping=False)
+    type(controller.ui_state).rawAwbProgress = property(
+        lambda self: seen[-1] if seen else {},
+        lambda self, value: seen.append(dict(value)),
+    )
+    controller.raw_white_balance_to_jpg()
+    _wait(controller)
+    stages = [m.get("stage") for m in seen if m.get("state") == "running"]
+    assert stages[0] == "develop" and "finish" in stages
+    assert seen[-1]["state"] == "done" and seen[-1]["active"] is True
+    # Progress only reaches the end of its span when the run is done.
+    assert all(m["to"] < 1.0 for m in seen if m.get("state") == "running")
+
+
+# -- Review fixes -------------------------------------------------------------
+
+
+def test_result_after_folder_change_is_not_applied(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    old = jpg.read_bytes()
+    controller.raw_white_balance_to_jpg()
+    controller.image_dir = tmp_path / "elsewhere"
+    _wait(controller)
+    assert jpg.read_bytes() == old
+    assert controller.undo_history == []
+    assert "another folder" in controller.status_messages[-1]
+
+
+def test_result_during_crop_is_not_applied(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    old = jpg.read_bytes()
+    controller.raw_white_balance_to_jpg()
+    controller.ui_state.isCropping = True
+    _wait(controller)
+    assert jpg.read_bytes() == old
+    assert "crop" in controller.status_messages[-1]
+
+
+def test_worker_that_cannot_start_is_unregistered(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, _jpg, _raw = _controller(tmp_path, cli)
+    with patch.object(
+        rawb.threading.Thread, "start", side_effect=RuntimeError("no threads")
+    ):
+        assert controller.raw_white_balance_to_jpg() is False
+    assert controller._raw_awb_operations == {}
+    assert controller.raw_awb_pending_for_current() is False
+
+
+def test_failed_staging_leaves_nothing_beside_the_jpg(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, _jpg, _raw = _controller(tmp_path, cli)
+    real_copy = rawb.shutil.copyfile
+
+    def broken_copy(src, dst):
+        Path(dst).write_bytes(b"partial")
+        raise OSError("disk full")
+
+    with patch.object(rawb.shutil, "copyfile", side_effect=broken_copy):
+        controller.raw_white_balance_to_jpg()
+        _wait(controller)
+    assert real_copy is not None
+    assert not any(p.name.endswith(".raw-awb.tmp") for p in tmp_path.iterdir())
+    assert "disk full" in controller.status_messages[-1]
+
+
+# -- Edits made while W runs ---------------------------------------------------
+
+
+def _save_request(jpg: Path, key: str) -> dict:
+    source = np.full((40, 60, 3), 0.2, np.float32)
+    return {
+        "snapshot": {
+            "source_arr": source,
+            "source_shape": source.shape[:2],
+            "edits": {"brightness": 0.3},
+            "halo_results": {"layer": object()},
+            "depth_map": object(),
+        },
+        "context": {
+            "target": str(jpg),
+            "save_image_key": key,
+            "save_revision": 3,
+            "edit_source_path": str(jpg.with_name("P1010001-backup.JPG")),
+        },
+    }
+
+
+def test_save_made_while_w_runs_goes_onto_the_new_pixels(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path, size=(60, 40))
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller._mark_current_live_edit_session_submitted = MagicMock()
+    controller._remember_pending_edit_save_request = MagicMock()
+    submitted = []
+    controller._submit_save_request_async = MagicMock(
+        side_effect=lambda request, saving_status=None: submitted.append(request)
+        or True
+    )
+    gate = threading.Event()
+    real_worker = controller._raw_awb_worker
+    controller._raw_awb_worker = lambda *a: (gate.wait(5), real_worker(*a))
+
+    controller.raw_white_balance_to_jpg()
+    request = _save_request(jpg, controller._key(jpg))
+    # The user edits and moves on: the save is held, not written.
+    assert controller._raw_awb_park_save(request, None) is True
+    assert submitted == []
+    gate.set()
+    _wait(controller)
+
+    assert submitted == [request]
+    snapshot = request["snapshot"]
+    # Rendered from the new JPG (flat grey), edits kept.
+    assert snapshot["source_arr"].mean() == pytest.approx(128 / 255, abs=0.02)
+    assert snapshot["edits"] == {"brightness": 0.3}
+    assert request["context"]["edit_source_path"] == str(jpg)
+    assert "your edits moved onto it" in controller.status_messages[-1]
+
+
+def test_held_save_is_written_unchanged_when_w_fails(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path, exit_code=3, write=False)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller._mark_current_live_edit_session_submitted = MagicMock()
+    controller._remember_pending_edit_save_request = MagicMock()
+    submitted = []
+    controller._submit_save_request_async = MagicMock(
+        side_effect=lambda request, saving_status=None: submitted.append(request)
+        or True
+    )
+    gate = threading.Event()
+    real_worker = controller._raw_awb_worker
+    controller._raw_awb_worker = lambda *a: (gate.wait(5), real_worker(*a))
+
+    controller.raw_white_balance_to_jpg()
+    request = _save_request(jpg, controller._key(jpg))
+    original = request["snapshot"]["source_arr"]
+    controller._raw_awb_park_save(request, None)
+    gate.set()
+    _wait(controller)
+
+    assert submitted == [request]
+    assert request["snapshot"]["source_arr"] is original
+
+
+def test_live_edits_stay_live_on_the_new_pixels(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    gate = threading.Event()
+    real_worker = controller._raw_awb_worker
+    controller._raw_awb_worker = lambda *a: (gate.wait(5), real_worker(*a))
+    controller._raw_awb_carry_live_session = MagicMock(return_value=True)
+
+    controller.raw_white_balance_to_jpg()
+    # The user opens the editor and edits while RawTherapee runs.
+    controller.image_editor.current_filepath = jpg
+    controller._current_live_session_has_meaningful_edits = MagicMock(return_value=True)
+    gate.set()
+    _wait(controller)
+
+    controller._raw_awb_carry_live_session.assert_called_once_with(jpg)
+    controller._refresh_after_raw_awb.assert_called_once_with(
+        jpg, on_current=True, keep_editor=True
+    )
+
+
+def test_quit_writes_held_saves(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller._mark_current_live_edit_session_submitted = MagicMock()
+    controller._remember_pending_edit_save_request = MagicMock()
+    controller._run_save_request_sync = MagicMock(return_value=True)
+    gate = threading.Event()
+    real_worker = controller._raw_awb_worker
+    controller._raw_awb_worker = lambda *a: (gate.wait(5), real_worker(*a))
+
+    controller.raw_white_balance_to_jpg()
+    request = _save_request(jpg, controller._key(jpg))
+    controller._raw_awb_park_save(request, None)
+    controller._flush_raw_awb_parked_saves()
+
+    controller._run_save_request_sync.assert_called_once_with(
+        request, saving_status=None
+    )
+    gate.set()
+    controller._cancel_raw_white_balance_operations()

@@ -206,7 +206,7 @@ faststack "C:\path\to\photos"
 - `Ctrl+Z`: Undo. If the current image has unsaved live edits (quick auto adjust, crop, editor sliders), the first press discards those; otherwise it undoes the last saved action (delete, saved edit, or clearing stacks/batches)
 - `A`: Quick auto white balance (live session; saved on navigation, drag, or Ctrl+S)
 - `Ctrl+Shift+B`: Quick auto white balance (alternate)
-- `W`: RAW white balance. Develops the paired RAW with `rawtherapee-cli` using automatic white balance and saves it over the JPG (the camera JPG is kept as `-backup.jpg`; `Ctrl+Z` puts it back). For casts too strong for `A`, such as flash shots. Edit the new JPG as usual afterwards
+- `W`: RAW white balance. Develops the paired RAW with `rawtherapee-cli` using automatic white balance and saves it over the JPG (the camera JPG is kept as `-backup.jpg`; `Ctrl+Z` puts it back). For casts too strong for `A`, such as flash shots. Unsaved edits are saved first; edits made while it runs are applied to the new JPG. Blown highlights get a second render with highlight compression. A green meter on the right of the status bar shows its progress
 - `l`: Quick auto levels + vibrance (live session; saved on navigation, drag, or Ctrl+S)
 - `L`: Quick auto white balance + auto levels + vibrance (live session; saved on navigation, drag, or Ctrl+S)
 - `-`: Darken the current auto-adjust highlights/whites by 14 points in the live session
@@ -401,8 +401,10 @@ change; **Cancel** (or `Esc`) discards them.
   `W` uses your RawTherapee default RAW profile with white balance set to
   automatic. `awb_method` under `[rawtherapee]` in `faststack.ini` picks the
   method (`Auto`, or on RawTherapee 5.9+ `autold` for RGB grey and
-  `autitcgreen` for temperature correlation), and `awb_jpeg_quality` sets the
-  JPEG quality (default 95).
+  `autitcgreen` for temperature correlation), `awb_jpeg_quality` sets the
+  JPEG quality (default 95), and `awb_highlights` controls the highlight pass
+  (`auto` renders again with highlight compression when the first render
+  clips; `off`; or a fixed strength 0-500).
 - **Default Image Directory**: Opened at startup when no folder is given on
   the command line. Leave it empty to reopen the last folder you used.
 - **Restack RAW Locations**: Where **Restack Source RAWs** looks for the input

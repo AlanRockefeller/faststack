@@ -557,6 +557,7 @@ class AppController(
     rawDevelopmentStateChanged = Signal()  # Notify when RAW development starts/stops
     _rawDevelopmentFinished = Signal(object)
     _rawWhiteBalanceFinished = Signal(object)  # W: RawTherapee auto-WB JPG
+    _rawWhiteBalanceProgress = Signal(object)  # W: stage updates for the meter
     _saveFinished = Signal(
         object
     )  # Signal for save completion (result or error from background)
@@ -1369,9 +1370,7 @@ class AppController(
         self.auto_level_midtone = config.getboolean("core", "auto_level_midtone", True)
         # Swap what the left and right buttons do in the image view, the
         # thumbnail grid and the map picker (left-handed use).
-        self.swap_mouse_buttons = config.getboolean(
-            "core", "swap_mouse_buttons", False
-        )
+        self.swap_mouse_buttons = config.getboolean("core", "swap_mouse_buttons", False)
         self.auto_level_midtone_target = config.getfloat(
             "core", "auto_level_midtone_target", 0.38
         )
@@ -5329,8 +5328,7 @@ class AppController(
                         # wrong; skip the lift rather than guess.
                         try:
                             contrast = float(
-                                self.image_editor.get_edit_value("contrast", 0.0)
-                                or 0.0
+                                self.image_editor.get_edit_value("contrast", 0.0) or 0.0
                             )
                         except (TypeError, ValueError):
                             contrast = 0.0
@@ -7868,9 +7866,7 @@ class AppController(
         log.info("Clearing all defined stacks.")
         undo_data = self._snapshot_stacks_for_undo()
         if undo_data is not None:
-            undo_data["live_edit_mark"] = (
-                self._get_current_preview_session_provenance()
-            )
+            undo_data["live_edit_mark"] = self._get_current_preview_session_provenance()
             # Recorded before the write so a failed persist is still undoable.
             self.undo_history.append(("clear_stacks", undo_data, time.time()))
         self.stacks = []
@@ -11695,6 +11691,8 @@ class AppController(
 
     def shutdown_qt(self):
         """Shutdown Qt objects only - MUST run on main/Qt thread."""
+        # Edits parked behind a running W are written before anything else.
+        self._flush_raw_awb_parked_saves()
         # Persist the current live edit session before tearing down Qt so
         # preview-only quick actions and editor changes are not lost on exit.
         if not self._shutdown_flush_prepared:
@@ -12942,7 +12940,9 @@ class AppController(
             if not img.path.exists():
                 continue
             is_developed_artifact = img.path.stem.lower().endswith("-developed")
-            if (in_raw_mode or is_developed_artifact) and img.developed_jpg_path.exists():
+            if (
+                in_raw_mode or is_developed_artifact
+            ) and img.developed_jpg_path.exists():
                 send.append(img.developed_jpg_path)
             else:
                 send.append(img.path)
@@ -16567,6 +16567,12 @@ class AppController(
             current_path = self.image_files[self.current_index].path
             if self._block_if_saving(current_path):
                 return
+            # W is about to replace these pixels; a crop would be thrown away.
+            if self.raw_awb_pending_for_current():
+                self.update_status_message(
+                    "RAW white balance is still running; crop when it is done."
+                )
+                return
 
             self._begin_direct_image_transition("crop mode activated")
             if not self.load_image_for_editing():
@@ -18758,7 +18764,9 @@ def main(
         # Never offer to reopen a folder in the system temp dir (see
         # _is_temporary_directory). Its record stays in stale_paths, so it is
         # pruned below rather than offered again next launch.
-        skipped_temp = [r for r in stale_records if _is_temporary_directory(r.get("dir", ""))]
+        skipped_temp = [
+            r for r in stale_records if _is_temporary_directory(r.get("dir", ""))
+        ]
         if skipped_temp:
             log.info(
                 "Not offering to reopen %d temporary folder(s): %s",

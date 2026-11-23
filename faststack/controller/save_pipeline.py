@@ -872,6 +872,10 @@ class SavePipelineMixin:
         saving_status: Optional[str] = None,
     ) -> bool:
         """Submit a captured save request to the background save executor."""
+        # A save of a JPG that W is re-rendering waits for the new pixels
+        # (faststack/controller/raw_white_balance.py).
+        if self._raw_awb_park_save(request, saving_status):
+            return True
         context = request["context"]
         export_snapshot = request["snapshot"]
         target = context.get("target")

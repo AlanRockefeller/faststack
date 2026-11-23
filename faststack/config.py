@@ -742,6 +742,9 @@ DEFAULT_CONFIG = {
         # 5.9+ also takes "autold" (RGB grey) or "autitcgreen".
         "awb_method": "Auto",
         "awb_jpeg_quality": "95",
+        # W: "auto" renders again with highlight compression when the first
+        # render clips; "off" never does; a number (0-500) always uses it.
+        "awb_highlights": "auto",
     },
     "raw": {
         "source_dir": "",

@@ -2150,6 +2150,15 @@ ApplicationWindow {
                 ToolTip.delay: 300
             }
 
+            // W (RAW white balance) progress meter.
+            RawAwbMeter {
+                info: root.uiStateRef ? root.uiStateRef.rawAwbProgress : ({ active: false })
+                Layout.preferredWidth: implicitWidth
+                Layout.preferredHeight: implicitHeight
+                Layout.rightMargin: 10
+                Layout.alignment: Qt.AlignVCenter
+            }
+
             // Grid view controls (visible when in grid view) - right side
             Row {
                 visible: root.uiStateRef && root.uiStateRef.isGridViewActive
@@ -2372,7 +2381,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;&nbsp;&nbsp;S: Save&nbsp;&nbsp;E / Esc: Close&nbsp;&nbsp;O: Crop<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;B, F, D, I, etc. work as in the main view<br>" +
                           "&nbsp;&nbsp;A: Quick auto white balance (live)<br>" +
-                          "&nbsp;&nbsp;W: Redo the JPG from its RAW with RawTherapee auto white balance (for flash shots; Ctrl+Z restores)<br>" +
+                          "&nbsp;&nbsp;W: Redo the JPG from its RAW with RawTherapee auto white balance and highlight recovery (for flash shots; Ctrl+Z restores)<br>" +
                           "&nbsp;&nbsp;l: Quick auto levels + vibrance (live)<br>" +
                           "&nbsp;&nbsp;L: Quick auto white balance + auto levels + vibrance (live)<br>" +
                           "&nbsp;&nbsp;-: Darken current auto-adjust highlights/whites (live)<br>" +
