@@ -214,6 +214,11 @@ class Card:
     # Where the new photos go among the observation's own: "inat:<index>"
     # for its photos, photo keys for this card's. None = after them.
     merged_order: Optional[list[str]] = None
+    # A card for only the photos of an uploaded card that a later batch has:
+    # the whole card's order on iNaturalist (photo keys, "inat:<index>" for
+    # an existing observation's own), so a retry from the part puts its
+    # photos where the whole card would have rather than first.
+    upload_order: Optional[list[str]] = None
 
     @property
     def locked(self) -> bool:
@@ -1310,6 +1315,10 @@ class INatUploadController(QObject):
         by_key = {p.key: p for p in self._photos}
         kept: list[Card] = []
         claimed: set[str] = set()
+        # An upload's answer finds its card by id, so no two shown cards may
+        # share one. Copies of one card from different batches do when each
+        # holds a part of it, or when the card was split differently in each.
+        taken = {c.id for c in old_cards if not c.locked}
         for card in old_cards if locked is None else locked:
             if not card.locked:
                 continue
@@ -1321,9 +1330,16 @@ class INatUploadController(QObject):
             if not keys:
                 continue
             partial = len(keys) < len(card.group.photos)
+            if partial and card.upload_order is None:
+                card.upload_order = self._combined_order(card) or [
+                    p.key for p in card.group.sorted_photos()
+                ]
             card.group = ObservationGroup(
                 [by_key[k] for k in keys], ordered=card.group.ordered
             )
+            if partial or card.id in taken:
+                card.id = self._next_card_id
+                self._next_card_id += 1
             if partial:
                 # Only some of its photos are in this batch. They belong to its
                 # observation still: a card for just those keeps them on it -
@@ -1333,6 +1349,7 @@ class INatUploadController(QObject):
             card.selected = False
             kept.append(card)
             claimed.update(keys)
+            taken.add(card.id)
         if locked is not None:
             self._catch_up_uploads(kept, locked)
         reusable = {self._photo_set(c): c for c in old_cards if not c.locked}
@@ -3123,7 +3140,9 @@ class INatUploadController(QObject):
                     if target in attach_next:
                         attach_next[target] += len(card.group.sorted_photos())
                     else:
-                        attach_next[target] = len(self._combined_order(card))
+                        attach_next[target] = len(
+                            card.upload_order or self._combined_order(card)
+                        )
                 continue
             card.status = STATUS_UPLOADING
             card.status_text = "Queued for upload"
@@ -3152,14 +3171,17 @@ class INatUploadController(QObject):
             # only some of its photos) resumes: no second observation, only
             # the photos still missing go up.
             card_photos = card.group.sorted_photos()
+            # A part card's order also has the whole card's other photos.
+            own_keys = {p.key for p in card_photos}
             target = card.obs_id
             reposition: list[tuple[int, int]] = []
             if card.attach_to is not None and target in (None, card.attach_to.id):
                 # Photos for an observation that is already on iNaturalist
                 # (a phone observation, an earlier upload): no new one.
                 target = card.attach_to.id
-                if target in attach_next:
+                if target in attach_next and card.upload_order is None:
                     # A second card adding to it: after the first card's.
+                    # (A part card has its whole card's places to go to.)
                     base = attach_next[target]
                     positions.update(
                         {p.key: base + i for i, p in enumerate(card_photos)}
@@ -3169,17 +3191,20 @@ class INatUploadController(QObject):
                     # Every photo goes to its place in the order shown;
                     # the observation's own photos move only if theirs
                     # changed (or never had one).
-                    order = self._combined_order(card)
+                    order = card.upload_order or self._combined_order(card)
                     for index, entry in enumerate(order):
                         if entry.startswith("inat:"):
                             photo = card.attach_to.photos[int(entry[5:])]
                             if photo.op_id and photo.position != index:
                                 reposition.append((photo.op_id, index))
-                        else:
+                        elif entry in own_keys:
                             positions[entry] = index
                     attach_next[target] = len(order)
             else:
-                positions.update({p.key: i for i, p in enumerate(card_photos)})
+                order = card.upload_order or [p.key for p in card_photos]
+                positions.update(
+                    {key: i for i, key in enumerate(order) if key in own_keys}
+                )
             pending_photos = [p for p in card_photos if p.key not in card.photo_ids]
             jobs.append(
                 (

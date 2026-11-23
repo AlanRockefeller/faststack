@@ -32,6 +32,7 @@ class ScriptedTransport:
         self.fail_photo_names = set(fail_photo_names)
         self.fail_create = fail_create
         self.fail_create_marker = b""  # fail only creates whose body has it
+        self.placed = []  # (observation id, file name, position) per photo added
         self.next_obs = 1000
         self.next_photo = 1
         self.lock = threading.Lock()
@@ -50,6 +51,15 @@ class ScriptedTransport:
                 name = body.split(b'filename="', 1)[1].split(b'"', 1)[0].decode()
                 if name in self.fail_photo_names:
                     return HttpResponse(422, {}, b'{"error":"bad photo"}')
+                fields = {}
+                for field in (b"observation_id", b"position"):
+                    marker = b'name="observation_photo[' + field + b']"\r\n\r\n'
+                    if marker in body:
+                        value = body.split(marker, 1)[1].split(b"\r\n", 1)[0]
+                        fields[field] = int(value)
+                self.placed.append(
+                    (fields.get(b"observation_id"), name, fields.get(b"position"))
+                )
                 self.next_photo += 1
                 return HttpResponse(
                     200, {}, json.dumps({"id": self.next_photo}).encode()
@@ -655,4 +665,143 @@ def test_retry_of_a_restored_batch_keeps_another_batch_grouping_record(
     _pump(qapp, up)
     assert all(c.status == ctl.STATUS_UPLOADED for c in up._model.cards)
     assert [b.photos for b in up._history.batches] == [2, 3, 2]
+    up.shutdown()
+
+
+def test_cards_for_parts_of_one_observation_get_their_own_ids(
+    qapp, tmp_path, monkeypatch
+):
+    """A card of photos 0-2 is uploaded with photo 1 failing; photo 0 alone,
+    then photo 1 alone, each show a card for that observation. Once the
+    whole card's batch is gone from the stash, opening photos 0 and 1 shows
+    both of those cards: each has its own id, so the retry's answer reaches
+    the card that sent it."""
+    monkeypatch.setattr(ctl, "MAX_STASHED_BATCHES", 2)
+    transport = ScriptedTransport(fail_photo_names={"IMG_1.jpg"})
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 3)
+    assert up.open(paths)
+    up.uploadAll()
+    _pump(qapp, up)
+    whole = up._model.cards[0]
+    assert whole.obs_id == 1001 and set(whole.photo_ids) == {paths[0], paths[2]}
+    assert up.open(paths[:1])
+    assert up.open(paths[1:2])
+
+    assert up.open(paths[:2])  # the whole card's batch drops out of the stash
+    assert tuple(paths) not in up._stashed
+    cards = up._model.cards
+    assert len(cards) == 2
+    assert len({c.id for c in cards}) == 2
+    assert all(c.obs_id == 1001 for c in cards)
+    transport.fail_photo_names.clear()
+    up.uploadAll()
+    _pump(qapp, up)
+    assert all(c.status == ctl.STATUS_UPLOADED for c in cards)
+    assert transport.placed[-1][:2] == (1001, "IMG_1.jpg")
+    assert _uploads(transport) == (1, 4)
+    up.shutdown()
+
+
+def test_retry_from_a_part_card_keeps_the_photo_place(qapp, tmp_path):
+    """Photo 1 of a card failed; retried from a card holding only it, it
+    goes where the whole card put it, after photo 0, not first."""
+    transport = ScriptedTransport(fail_photo_names={"IMG_1.jpg"})
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 2)
+    assert up.open(paths)
+    up.uploadAll()
+    _pump(qapp, up)
+    assert transport.placed == [(1001, "IMG_0.jpg", 0)]
+
+    assert up.open(paths[1:])
+    transport.fail_photo_names.clear()
+    up.uploadAll()
+    _pump(qapp, up)
+    assert transport.placed[-1] == (1001, "IMG_1.jpg", 1)
+    up.shutdown()
+
+
+def test_retry_from_a_part_card_keeps_the_place_among_existing_photos(
+    qapp, tmp_path
+):
+    """The same for photos added to an observation already on iNaturalist:
+    after its own photo and photo 0, as the whole card had them."""
+    from faststack.inat.matching import ExistingObservation, ExistingPhoto
+
+    transport = ScriptedTransport(fail_photo_names={"IMG_1.jpg"})
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 2)
+    assert up.open(paths)
+    up._model.cards[0].attach_to = ExistingObservation(
+        id=500, photos=(ExistingPhoto(op_id=0, position=0, url=""),)
+    )
+    up.uploadAll()
+    _pump(qapp, up)
+    assert transport.placed == [(500, "IMG_0.jpg", 1)]
+    assert _uploads(transport) == (0, 2)
+
+    assert up.open(paths[1:])
+    card = up._model.cards[0]
+    assert card.obs_id == 500 and card.attach_to is not None
+    transport.fail_photo_names.clear()
+    up.uploadAll()
+    _pump(qapp, up)
+    assert card.status == ctl.STATUS_UPLOADED
+    assert transport.placed[-1] == (500, "IMG_1.jpg", 2)
+    assert _uploads(transport) == (0, 3)
+    up.shutdown()
+
+
+def test_parts_of_one_card_added_to_an_existing_observation_keep_places(
+    qapp, tmp_path, monkeypatch
+):
+    """Two parts of one card for an observation already on iNaturalist,
+    shown together: retrying the second puts its photo where the whole card
+    had it, not after everything the first part's whole card holds."""
+    from faststack.inat.matching import ExistingObservation, ExistingPhoto
+
+    monkeypatch.setattr(ctl, "MAX_STASHED_BATCHES", 2)
+    transport = ScriptedTransport(fail_photo_names={"IMG_1.jpg"})
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 3)
+    assert up.open(paths)
+    up._model.cards[0].attach_to = ExistingObservation(
+        id=500, photos=(ExistingPhoto(op_id=0, position=0, url=""),)
+    )
+    up.uploadAll()
+    _pump(qapp, up)
+    assert transport.placed == [(500, "IMG_0.jpg", 1), (500, "IMG_2.jpg", 3)]
+    assert up.open(paths[:1])
+    assert up.open(paths[1:2])
+    assert up.open(paths[:2])
+    assert len(up._model.cards) == 2
+    transport.fail_photo_names.clear()
+    up.uploadAll()
+    _pump(qapp, up)
+    assert all(c.status == ctl.STATUS_UPLOADED for c in up._model.cards)
+    assert transport.placed[-1] == (500, "IMG_1.jpg", 2)
+    up.shutdown()
+
+
+def test_cards_shown_together_never_share_an_id(qapp, tmp_path):
+    """Copies of one card from different batches can share an id while
+    holding different photos (a card split differently in each). Shown
+    together, each gets an id of its own - uploaded or not."""
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    paths = _photos(tmp_path, 3)
+    assert up.open(paths[:1])
+    up.uploadAll()
+    _pump(qapp, up)
+    uploaded_id = up._model.cards[0].id
+    assert up.open(paths[1:2])
+    up.uploadAll()
+    _pump(qapp, up)
+    up._model.cards[0].id = uploaded_id  # two uploaded cards, one id
+    assert up.open(paths[2:])
+    up._model.cards[0].id = uploaded_id  # and a card not uploaded yet
+
+    assert up.open(paths)
+    ids = [c.id for c in up._model.cards]
+    assert len(ids) == 3 and len(set(ids)) == 3
     up.shutdown()
