@@ -213,9 +213,7 @@ def test_reopening_after_another_batch_restores_the_first(qapp, tmp_path):
     up.shutdown()
 
 
-def test_unreadable_photo_does_not_stop_the_batch_resuming(
-    qapp, tmp_path, monkeypatch
-):
+def test_unreadable_photo_does_not_stop_the_batch_resuming(qapp, tmp_path, monkeypatch):
     up = _make_controller(qapp, ScriptedTransport(), tmp_path)
     paths = _photos(tmp_path, 3)
     real = ctl.read_photo_facts
@@ -358,9 +356,7 @@ def _uploads(transport):
     return len(creates), len(photos)
 
 
-def test_full_stash_does_not_drop_the_batch_being_reopened(
-    qapp, tmp_path, monkeypatch
-):
+def test_full_stash_does_not_drop_the_batch_being_reopened(qapp, tmp_path, monkeypatch):
     """With the stash full, the batch asked for is the oldest one in it:
     putting the current batch aside must not push it out first."""
     monkeypatch.setattr(ctl, "MAX_STASHED_BATCHES", 2)
@@ -381,9 +377,7 @@ def test_full_stash_does_not_drop_the_batch_being_reopened(
     up.shutdown()
 
 
-def test_uploads_from_a_batch_put_aside_stay_locked_in_a_rebuilt_one(
-    qapp, tmp_path
-):
+def test_uploads_from_a_batch_put_aside_stay_locked_in_a_rebuilt_one(qapp, tmp_path):
     """A, then B (part of A) uploaded, then C (other photos), then A again:
     B's photos come back as B's observation, not as a new card to upload."""
     transport = ScriptedTransport()
@@ -444,9 +438,7 @@ def test_restored_partial_upload_picks_up_photos_attached_from_another_batch(
     up.shutdown()
 
 
-def test_rebuilt_batch_keeps_the_most_complete_copy_of_an_uploaded_card(
-    qapp, tmp_path
-):
+def test_rebuilt_batch_keeps_the_most_complete_copy_of_an_uploaded_card(qapp, tmp_path):
     """A attaches one photo of two, B (same photos, other order) the other;
     A and B are both put aside, each with its own copy of the card. A new
     batch with those photos and one more keeps B's copy, so photo 1 is not
@@ -594,9 +586,7 @@ def test_photos_of_an_uploaded_card_opened_alone_stay_on_its_observation(
     up.shutdown()
 
 
-def test_photo_left_over_from_a_partial_upload_goes_to_its_observation(
-    qapp, tmp_path
-):
+def test_photo_left_over_from_a_partial_upload_goes_to_its_observation(qapp, tmp_path):
     """Photo 1 of a card failed to attach. Opened alone it goes to the card's
     observation on a retry; the whole card, rebuilt or restored, then knows
     it is there and sends nothing twice."""
@@ -636,9 +626,7 @@ def test_photo_left_over_from_a_partial_upload_goes_to_its_observation(
     up.shutdown()
 
 
-def test_retry_of_a_restored_batch_keeps_another_batch_grouping_record(
-    qapp, tmp_path
-):
+def test_retry_of_a_restored_batch_keeps_another_batch_grouping_record(qapp, tmp_path):
     """A fails, B (same folder) is uploaded, A is retried: the history keeps
     B's grouping, and a second retry of A does not add another record."""
     transport = ScriptedTransport(fail_create=True)
@@ -722,9 +710,7 @@ def test_retry_from_a_part_card_keeps_the_photo_place(qapp, tmp_path):
     up.shutdown()
 
 
-def test_retry_from_a_part_card_keeps_the_place_among_existing_photos(
-    qapp, tmp_path
-):
+def test_retry_from_a_part_card_keeps_the_place_among_existing_photos(qapp, tmp_path):
     """The same for photos added to an observation already on iNaturalist:
     after its own photo and photo 0, as the whole card had them."""
     from faststack.inat.matching import ExistingObservation, ExistingPhoto
@@ -847,4 +833,54 @@ def test_part_of_a_second_card_on_an_existing_observation_keeps_its_place(
     up.uploadAll()
     _pump(qapp, up)
     assert transport.placed[-1] == (500, "IMG_3.jpg", 4)
+    up.shutdown()
+
+
+@pytest.mark.parametrize(
+    "first_part_uploaded", [False, True], ids=["queued", "uploaded"]
+)
+def test_next_card_on_an_observation_goes_after_every_part_cards_places(
+    qapp, tmp_path, first_part_uploaded
+):
+    """Two part cards for one observation, the first holding the longer
+    whole-card order (5 places), the second a shorter one (3). A new card
+    for the same observation goes after the longest, at 5. The shorter
+    order must not move the cursor back to 3, onto places already taken."""
+    from faststack.inat.matching import ExistingObservation, ExistingPhoto
+
+    paths = []
+    for i, when in enumerate(["10:00:00", "15:00:00", "20:00:00"]):
+        p = tmp_path / f"IMG_{i}.jpg"
+        exif = Image.Exif()
+        exif[0x0132] = f"2026:11:01 {when}"
+        Image.new("RGB", (400, 300), (i * 30, 90, 50)).save(
+            p, "JPEG", exif=exif.tobytes()
+        )
+        paths.append(str(p))
+    transport = ScriptedTransport()
+    up = _make_controller(qapp, transport, tmp_path)
+    assert up.open(paths)
+    assert len(up._model.cards) == 3
+    observation = ExistingObservation(
+        id=500, photos=(ExistingPhoto(op_id=0, position=0, url=""),)
+    )
+    long_part, short_part, new_card = up._model.cards
+    for card in up._model.cards:
+        card.attach_to = observation
+    (long_key,) = [p.key for p in long_part.group.sorted_photos()]
+    (short_key,) = [p.key for p in short_part.group.sorted_photos()]
+    # Places held by the whole cards' other photos, not in this batch.
+    long_part.upload_order = ["inat:0", long_key, "gone-a", "gone-b", "gone-c"]
+    short_part.upload_order = ["inat:0", "gone-d", short_key]
+    if first_part_uploaded:
+        long_part.status = ctl.STATUS_UPLOADED
+        long_part.obs_id = 500
+        long_part.photo_ids = {long_key: 9001}
+    up.uploadAll()
+    _pump(qapp, up)
+    placed = {name: position for _obs, name, position in transport.placed}
+    assert placed["IMG_2.jpg"] == 5
+    assert placed["IMG_1.jpg"] == 2
+    if not first_part_uploaded:
+        assert placed["IMG_0.jpg"] == 1
     up.shutdown()

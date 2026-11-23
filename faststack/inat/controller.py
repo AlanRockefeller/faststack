@@ -3148,12 +3148,16 @@ class INatUploadController(QObject):
                     and card.obs_id in (None, card.attach_to.id)
                 ):
                     target = card.attach_to.id
-                    if target in attach_next:
+                    if card.upload_order is not None:
+                        # A part card holds its whole card's places: the
+                        # cursor goes past them, and never back.
+                        attach_next[target] = max(
+                            attach_next.get(target, 0), len(card.upload_order)
+                        )
+                    elif target in attach_next:
                         attach_next[target] += len(card.group.sorted_photos())
                     else:
-                        attach_next[target] = len(
-                            card.upload_order or self._combined_order(card)
-                        )
+                        attach_next[target] = len(self._combined_order(card))
                 continue
             card.status = STATUS_UPLOADING
             card.status_text = "Queued for upload"
@@ -3213,7 +3217,9 @@ class INatUploadController(QObject):
                                 reposition.append((photo.op_id, index))
                         elif entry in own_keys:
                             positions[entry] = index
-                    attach_next[target] = len(order)
+                    # Never back: an earlier part card may have a longer
+                    # whole-card order, and its places are taken.
+                    attach_next[target] = max(attach_next.get(target, 0), len(order))
             else:
                 order = card.upload_order or [p.key for p in card_photos]
                 positions.update(
