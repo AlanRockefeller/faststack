@@ -219,6 +219,10 @@ class Card:
     # an existing observation's own), so a retry from the part puts its
     # photos where the whole card would have rather than first.
     upload_order: Optional[list[str]] = None
+    # Set when this card's photos went to an existing observation after
+    # another card's (two cards adding to one): the place its first photo
+    # went to. A part card of it keeps those places.
+    attach_base: Optional[int] = None
 
     @property
     def locked(self) -> bool:
@@ -1331,9 +1335,16 @@ class INatUploadController(QObject):
                 continue
             partial = len(keys) < len(card.group.photos)
             if partial and card.upload_order is None:
-                card.upload_order = self._combined_order(card) or [
-                    p.key for p in card.group.sorted_photos()
-                ]
+                if card.attach_base is not None:
+                    # Its photos went after another card's ("slot:" marks a
+                    # place taken by a photo that is not this card's).
+                    card.upload_order = [
+                        f"slot:{i}" for i in range(card.attach_base)
+                    ] + [p.key for p in card.group.sorted_photos()]
+                else:
+                    card.upload_order = self._combined_order(card) or [
+                        p.key for p in card.group.sorted_photos()
+                    ]
             card.group = ObservationGroup(
                 [by_key[k] for k in keys], ordered=card.group.ordered
             )
@@ -3187,10 +3198,13 @@ class INatUploadController(QObject):
                         {p.key: base + i for i, p in enumerate(card_photos)}
                     )
                     attach_next[target] = base + len(card_photos)
+                    card.attach_base = base
                 else:
                     # Every photo goes to its place in the order shown;
                     # the observation's own photos move only if theirs
                     # changed (or never had one).
+                    if card.upload_order is None:
+                        card.attach_base = None  # first to add to it now
                     order = card.upload_order or self._combined_order(card)
                     for index, entry in enumerate(order):
                         if entry.startswith("inat:"):

@@ -197,7 +197,8 @@ Item {
         if (meter.runState === "done") what = "done"
         if (meter.runState === "failed") what = "failed (see the status message)"
         var s = "W " + (meter.info.name || "") + ": " + what
-        if (meter.info.edits) s += "\nYour edits will be applied to the new JPG."
+        if (meter.info.edits && meter.runState === "running")
+            s += "\nYour edits will be applied to the new JPG."
         if (meter.info.count > 1) s += "\n" + meter.info.count + " photos in progress"
         return s
     }

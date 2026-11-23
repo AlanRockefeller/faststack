@@ -30,6 +30,7 @@ controller instance.
 """
 
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -145,10 +146,9 @@ class RawWhiteBalanceOperation:
     worker: Optional[threading.Thread] = None
     cancel_requested: bool = False
     staged_path: Optional[Path] = None
-    # The JPG's saved edit state, taken out while W runs (see
-    # _raw_awb_zero_baseline) and put back if W does not finish.
-    stashed_edit_state: Any = None
-    stashed: bool = False
+    # The JPG's saved edit state is hidden from the editor (in memory only)
+    # while W runs; see _raw_awb_zero_baseline.
+    recipe_hidden: bool = False
     # Newest save of this JPG made while W runs: {"request", "saving_status"}.
     parked: Optional[dict] = None
 
@@ -248,9 +248,12 @@ def _raw_awb_highlight_mode() -> Optional[int]:
     if value in ("off", "no", "false", "none"):
         return 0
     try:
-        return max(0, min(500, int(float(value))))
+        number = float(value)
     except ValueError:
         return None
+    if not math.isfinite(number):
+        return None
+    return max(0, min(500, int(number)))
 
 
 def clipped_fraction(path: Path) -> float:
@@ -553,6 +556,7 @@ class RawWhiteBalanceMixin:
         self._raw_awb_waiting: dict[str, _WaitingForSave] = {}
         self._raw_awb_pass_seconds = _DEFAULT_PASS_SECONDS
         self._raw_awb_meter: dict[str, dict] = {}
+        self._raw_awb_hidden_recipes: set[str] = set()
         self._raw_awb_wait_timer = QTimer(self)
         self._raw_awb_wait_timer.setInterval(150)
         self._raw_awb_wait_timer.timeout.connect(self._poll_raw_awb_waiting)
@@ -641,6 +645,8 @@ class RawWhiteBalanceMixin:
                 raw_path=Path(raw_path),
                 rt_exe=rt_exe,
                 deadline=time.monotonic() + _SAVE_WAIT_SECONDS,
+                sidecar=self.sidecar,
+                directory_key=self._key(self.image_dir),
             )
             self._raw_awb_meter_stage(
                 operation_id, "save", _SAVE_SECONDS, jpg_path.name
@@ -658,6 +664,17 @@ class RawWhiteBalanceMixin:
         """Start the W presses whose edits have finished saving."""
         now = time.monotonic()
         for jpg_key, waiting in list(self._raw_awb_waiting.items()):
+            if waiting.directory_key != self._key(self.image_dir):
+                # Its undo entry and sidecar belong to the folder W was
+                # pressed in, which is no longer open.
+                self._raw_awb_waiting.pop(jpg_key, None)
+                self._raw_awb_meter_end(waiting.operation_id, ok=False)
+                self.update_status_message(
+                    f"W cancelled for {waiting.jpg_path.name}: another folder "
+                    "was opened.",
+                    timeout=6000,
+                )
+                continue
             if self._raw_awb_save_failed(waiting.jpg_path, jpg_key):
                 self._raw_awb_waiting.pop(jpg_key, None)
                 self._raw_awb_meter_end(waiting.operation_id, ok=False)
@@ -714,6 +731,10 @@ class RawWhiteBalanceMixin:
             self._raw_awb_meter_end(operation_id, ok=False)
             self.update_status_message(f"{jpg_path.name} or its RAW is missing.")
             return False
+        # Settings first: nothing is registered or hidden until they are read.
+        method = _raw_awb_method()
+        quality = _raw_awb_jpeg_quality()
+        highlights = _raw_awb_highlight_mode()
         operation = RawWhiteBalanceOperation(
             operation_id=operation_id,
             jpg_key=jpg_key,
@@ -728,9 +749,6 @@ class RawWhiteBalanceMixin:
         with self._raw_awb_lock:
             self._raw_awb_operations[jpg_key] = operation
 
-        method = _raw_awb_method()
-        quality = _raw_awb_jpeg_quality()
-        highlights = _raw_awb_highlight_mode()
         log.info(
             "Starting RAW auto white balance (%s, highlights %s): %s -> %s",
             method,
@@ -775,21 +793,14 @@ class RawWhiteBalanceMixin:
         Reopening a FastStack-edited JPG loads its backup and replays the
         saved edits; a tweak made then would carry those earlier edits onto
         the new render as well (a white balance fix applied twice). So the
-        saved edit state is taken out until W ends, and an editor session
-        still holding the JPG is dropped.
+        saved edit state is hidden from the editor until W ends, and an
+        editor session still holding the JPG is dropped. It is hidden in
+        memory only: the sidecar keeps it until the new JPG is in place, so
+        quitting (or a crash) while RawTherapee works loses nothing.
         """
         jpg_path = operation.jpg_path
-        sidecar = operation.sidecar
-        try:
-            meta = sidecar.get_metadata(jpg_path, create=False)
-            state = getattr(meta, "edit_state", None) if meta is not None else None
-            if isinstance(state, dict):
-                operation.stashed_edit_state = state
-                operation.stashed = True
-                meta.edit_state = None
-                self._persist_sidecar(sidecar)
-        except Exception:
-            log.exception("Could not set aside the edit state of %s", jpg_path)
+        operation.recipe_hidden = True
+        self._raw_awb_hidden_recipes.add(operation.jpg_key)
         if self._raw_awb_editor_holds(jpg_path):
             # An editor open on the photo shown stays open, reloaded from the
             # JPG as saved (sliders at zero); one left on another photo closes.
@@ -811,17 +822,16 @@ class RawWhiteBalanceMixin:
             self.sync_ui_state()
 
     def _raw_awb_restore_stash(self, operation: RawWhiteBalanceOperation) -> None:
-        """Put the set-aside edit state back, unless a save replaced it."""
-        if not operation.stashed:
+        """Show the JPG's saved edit state to the editor again."""
+        if not operation.recipe_hidden:
             return
-        operation.stashed = False
-        try:
-            meta = operation.sidecar.get_metadata(operation.jpg_path, create=False)
-            if meta is not None and getattr(meta, "edit_state", None) is None:
-                meta.edit_state = operation.stashed_edit_state
-                self._persist_sidecar(operation.sidecar)
-        except Exception:
-            log.exception("Could not restore the edit state of %s", operation.jpg_path)
+        operation.recipe_hidden = False
+        self._raw_awb_hidden_recipes.discard(operation.jpg_key)
+
+    def raw_awb_recipe_hidden(self, metadata_key: Optional[str]) -> bool:
+        """Whether W hides this JPG's saved edit state (see save_pipeline)."""
+        hidden = getattr(self, "_raw_awb_hidden_recipes", None)
+        return bool(hidden) and metadata_key in hidden
 
     # -- Guards ----------------------------------------------------------------
 
@@ -920,14 +930,18 @@ class RawWhiteBalanceMixin:
         if not operations:
             return False
         context = request.get("context", {}) if isinstance(request, dict) else {}
+        # Matched by the file the save writes: a save of the photo's
+        # -developed variant carries the main JPG's image key but does not
+        # touch the JPG W replaces.
         keys = set()
-        if context.get("save_image_key"):
+        target = context.get("target")
+        if target:
+            try:
+                keys.add(self._key(Path(target)))
+            except (OSError, TypeError, ValueError):
+                return False
+        elif context.get("save_image_key"):
             keys.add(context["save_image_key"])
-        try:
-            if context.get("target"):
-                keys.add(self._key(Path(context["target"])))
-        except (OSError, TypeError, ValueError):
-            pass
         with self._raw_awb_lock:
             operation = next(
                 (
@@ -1002,7 +1016,6 @@ class RawWhiteBalanceMixin:
         fresh = self._raw_awb_fresh_editor(jpg_path)
         new = fresh.snapshot_for_export(save_target_path=jpg_path)
         snapshot = request["snapshot"]
-        old_shape = snapshot.get("source_shape")
         for key in (
             "source_arr",
             "source_shape",
@@ -1015,11 +1028,11 @@ class RawWhiteBalanceMixin:
             "source_icc_bytes",
         ):
             snapshot[key] = new[key]
-        if tuple(old_shape or ()) != tuple(new["source_shape"]):
-            # Results worked out on the old pixels no longer line up; the
-            # save works them out again.
-            snapshot["halo_results"] = {}
-            snapshot["depth_map"] = None
+        # Results worked out on the old pixels do not fit the new ones, even
+        # at the same size (the trimmed render usually is); the save works
+        # them out again.
+        snapshot["halo_results"] = {}
+        snapshot["depth_map"] = None
         snapshot["export_cache"] = LayerDensityCache()
         # The saved edit state must name the new JPG (then its backup) as the
         # source, or reopening the editor would bring the camera JPG back.
@@ -1039,8 +1052,6 @@ class RawWhiteBalanceMixin:
             return False
         editor = self.image_editor
         with editor._lock:
-            old = editor.float_image
-            old_shape = old.shape[:2] if old is not None else None
             editor.original_image = fresh.original_image
             editor.float_image = fresh.float_image
             editor.float_preview = fresh.float_preview
@@ -1048,9 +1059,10 @@ class RawWhiteBalanceMixin:
             editor.current_mtime = fresh.current_mtime
             editor.source_filepath = jpg_path
             editor._source_exif_bytes = fresh._source_exif_bytes
-            if old_shape != fresh.float_image.shape[:2]:
-                editor._halo_results = {}
-                editor._depth_map = None
+            # Halo and depth results belong to the old pixels; they are
+            # worked out again (below) for the layers that need them.
+            editor._halo_results = {}
+            editor._depth_map = None
             editor._local_density_cache.clear()
             for name in (
                 "_cached_preview",
@@ -1066,6 +1078,15 @@ class RawWhiteBalanceMixin:
             editor._edits_rev += 1
         # Auto-adjust steps (-/+) were measured on the old pixels.
         self._active_auto_adjust_state = None
+        # Halo and depth work in flight is for the old pixels too: drop it
+        # and start again on the new ones.
+        self._halo_reset_for_navigation()
+        self._depth_reset_for_navigation()
+        try:
+            self._schedule_halo_jobs()
+            self._schedule_depth_job()
+        except Exception:
+            log.exception("Could not restart halo/depth work on the new JPG")
         return True
 
     # -- Worker ----------------------------------------------------------------
@@ -1345,8 +1366,9 @@ class RawWhiteBalanceMixin:
             self._retire_pending_saves_for_photoshop(jpg_path, jpg_path)
         except Exception:
             log.exception("Could not retire pending saves for %s", jpg_path)
-        operation.stashed = False  # the old edit state belongs to the backup
 
+        # The saved edit state belongs to the old pixels (now the backup): it
+        # is cleared here, and the undo record keeps it for Ctrl+Z.
         sidecar = operation.sidecar or self.sidecar
         metadata_before = self._mark_image_edited_in_sidecar(
             sidecar,
@@ -1354,6 +1376,7 @@ class RawWhiteBalanceMixin:
             clear_saved_edit_state=True,
             background=True,
         )
+        self._raw_awb_restore_stash(operation)
         self.undo_history.append(
             (
                 RAW_WHITE_BALANCE_ACTION,
@@ -1368,26 +1391,28 @@ class RawWhiteBalanceMixin:
             )
         )
 
-        carried = False
-        if live:
-            carried = self._raw_awb_carry_live_session(jpg_path)
-            if carried and parked_request is not None:
-                # The live session has every edit the held save had.
-                operation.parked = None
-                self._raw_awb_forget_request(parked_request)
-        if not carried and operation.parked:
-            carried = self._raw_awb_release_parked(operation, onto_new_pixels=True)
+        live_carried = live and self._raw_awb_carry_live_session(jpg_path)
+        saved = False
+        if parked_request is not None:
+            # The held save is written from the new pixels even when the
+            # editor stays open on the photo (Ctrl+S, then kept editing):
+            # the JPG gets what was saved, and later edits stay live.
+            saved = self._raw_awb_release_parked(operation, onto_new_pixels=True)
 
         self._refresh_after_raw_awb(
-            jpg_path, on_current=on_current, keep_editor=live and carried
+            jpg_path, on_current=on_current, keep_editor=live_carried
         )
         self._auto_add_edited_to_batch_if_enabled(jpg_path)
         self._raw_awb_meter_end(operation.operation_id, ok=True)
         parts = [f"Auto white balance from {operation.raw_path.name} applied"]
         if detail:
             parts.append(detail)
-        if carried:
+        if live_carried or saved:
             parts.append("your edits moved onto it")
+        elif parked_request is not None:
+            parts.append(
+                "but the edits saved while it ran could not be moved onto it"
+            )
         self.update_status_message(", ".join(parts) + " (Ctrl+Z to undo).")
         return None
 
@@ -1540,6 +1565,29 @@ class RawWhiteBalanceMixin:
         }
 
     # -- Shutdown --------------------------------------------------------------
+
+    def _raw_awb_drop_parked_for(self, target: Optional[str]) -> None:
+        """A newer save of ``target`` was written (the save made on quit):
+        a held save of the same file is older and must not overwrite it."""
+        operations = getattr(self, "_raw_awb_operations", None)
+        if not operations or not target:
+            return
+        try:
+            target_key = self._key(Path(target))
+        except (OSError, TypeError, ValueError):
+            return
+        with self._raw_awb_lock:
+            for operation in operations.values():
+                parked = operation.parked
+                if not parked:
+                    continue
+                context = parked["request"].get("context", {})
+                try:
+                    parked_key = self._key(Path(context.get("target") or ""))
+                except (OSError, TypeError, ValueError):
+                    continue
+                if parked_key == target_key:
+                    operation.parked = None
 
     def _flush_raw_awb_parked_saves(self) -> None:
         """At quit: write held saves as they are (onto the old pixels)."""

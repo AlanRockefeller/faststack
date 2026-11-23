@@ -360,6 +360,10 @@ class SavePipelineMixin:
                     request = None
         if request is not None:
             return self._build_pending_edit_state(request)
+        if self.raw_awb_recipe_hidden(metadata_key):
+            # W is re-rendering this JPG: edits made meanwhile start from zero
+            # (faststack/controller/raw_white_balance.py).
+            return None
 
         meta = self.sidecar.get_metadata(metadata_path, create=False)
         edit_state = getattr(meta, "edit_state", None) if meta is not None else None
@@ -1174,9 +1178,12 @@ class SavePipelineMixin:
 
         target = request.get("context", {}).get("target")
         if self._run_save_request_sync(request, saving_status=None):
+            # Newer than any save of this file held behind a running W.
+            self._raw_awb_drop_parked_for(target)
             self._shutdown_flush_prepared = True
             return True
         if target and self._pending_save_recovery.get(target) is request:
+            self._raw_awb_drop_parked_for(target)
             self._shutdown_flush_prepared = True
             return True
         return False

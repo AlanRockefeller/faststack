@@ -805,3 +805,46 @@ def test_cards_shown_together_never_share_an_id(qapp, tmp_path):
     ids = [c.id for c in up._model.cards]
     assert len(ids) == 3 and len(set(ids)) == 3
     up.shutdown()
+
+
+def test_part_of_a_second_card_on_an_existing_observation_keeps_its_place(
+    qapp, tmp_path
+):
+    """Two cards add photos to one observation already on iNaturalist: the
+    second card's go after the first card's. Its last photo failed; retried
+    from a card holding only it, it goes where it was sent, not among the
+    first card's photos."""
+    from faststack.inat.matching import ExistingObservation, ExistingPhoto
+
+    paths = []
+    for i, when in enumerate(["10:00:00", "10:01:00", "15:00:00", "15:01:00"]):
+        p = tmp_path / f"IMG_{i}.jpg"
+        exif = Image.Exif()
+        exif[0x0132] = f"2026:11:01 {when}"
+        Image.new("RGB", (400, 300), (i * 30, 90, 50)).save(
+            p, "JPEG", exif=exif.tobytes()
+        )
+        paths.append(str(p))
+    transport = ScriptedTransport(fail_photo_names={"IMG_3.jpg"})
+    up = _make_controller(qapp, transport, tmp_path)
+    assert up.open(paths)
+    assert len(up._model.cards) == 2
+    observation = ExistingObservation(
+        id=500, photos=(ExistingPhoto(op_id=0, position=0, url=""),)
+    )
+    for card in up._model.cards:
+        card.attach_to = observation
+    up.uploadAll()
+    _pump(qapp, up)
+    assert transport.placed == [
+        (500, "IMG_0.jpg", 1),
+        (500, "IMG_1.jpg", 2),
+        (500, "IMG_2.jpg", 3),
+    ]
+
+    assert up.open(paths[3:])
+    transport.fail_photo_names.clear()
+    up.uploadAll()
+    _pump(qapp, up)
+    assert transport.placed[-1] == (500, "IMG_3.jpg", 4)
+    up.shutdown()
