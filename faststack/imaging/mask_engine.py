@@ -428,7 +428,8 @@ class LayerDensityCache:
     def prune(self, keep_ids) -> None:
         with self._lock:
             for layer_id in list(self._entries):
-                if layer_id not in keep_ids:
+                # "<id>\0erased" entries (rasterize_layer_erased) go with <id>.
+                if layer_id.split("\0", 1)[0] not in keep_ids:
                     self._entries.pop(layer_id, None)
 
 
@@ -488,3 +489,98 @@ def rasterize_layer_density(
     if live is None or not live.points:
         return committed
     return _apply_strokes(committed, [live], edits, shape, base_shape, point_transform)
+
+
+def _apply_erased(
+    base: Optional[LayerDensity],
+    strokes: Sequence[MaskStroke],
+    edits: Dict[str, Any],
+    shape: Tuple[int, int],
+    base_shape: Optional[Tuple[int, int]] = None,
+    point_transform: Optional[np.ndarray] = None,
+) -> Optional[LayerDensity]:
+    """Add erase *strokes* to the erased fraction *base* (never mutated)."""
+    diag = _base_diagonal_px(edits, shape, base_shape, point_transform)
+    covered = []
+    for stroke in strokes:
+        cov = _stroke_coverage(
+            _stroke_pixel_points(stroke, edits, shape, point_transform),
+            stroke.radius * diag,
+            stroke.hardness,
+            shape,
+        )
+        if cov is not None:
+            covered.append(cov)
+    if not covered:
+        return base
+    boxes = [c[:4] for c in covered]
+    if base is not None:
+        boxes.append((base.y0, base.y1, base.x0, base.x1))
+    y0 = min(b[0] for b in boxes)
+    y1 = max(b[1] for b in boxes)
+    x0 = min(b[2] for b in boxes)
+    x1 = max(b[3] for b in boxes)
+    kept = np.ones((y1 - y0, x1 - x0), dtype=np.float32)
+    if base is not None:
+        kept[base.y0 - y0 : base.y1 - y0, base.x0 - x0 : base.x1 - x0] -= base.arr
+    for sy0, sy1, sx0, sx1, cov in covered:
+        kept[sy0 - y0 : sy1 - y0, sx0 - x0 : sx1 - x0] *= 1.0 - cov
+    np.subtract(1.0, kept, out=kept)
+    return LayerDensity(y0, y1, x0, x1, kept)
+
+
+def rasterize_layer_erased(
+    layer_id: str,
+    mask_data: MaskData,
+    shape: Tuple[int, int],
+    edits: Dict[str, Any],
+    cache: Optional[LayerDensityCache] = None,
+    include_live: bool = True,
+    base_shape: Optional[Tuple[int, int]] = None,
+    point_transform: Optional[np.ndarray] = None,
+) -> Optional[LayerDensity]:
+    """Fraction (0..1) the layer's erase strokes remove at *shape*, or None.
+
+    ``rasterize_layer_density`` applies erase strokes to the paint beneath
+    them; a layer whose mask also has a part that is not painted (a depth
+    selection, see ``faststack.imaging.depth_select``) scales that part by
+    one minus this.  Cached like the density, under its own cache id.
+    """
+    strokes = tuple(s for s in mask_data.strokes if s.mode == STROKE_ERASE)
+    live = mask_data.live_stroke if include_live else None
+    if live is not None and (live.mode != STROKE_ERASE or not live.points):
+        live = None
+    if not strokes and live is None:
+        return None
+    key = (
+        mask_data.uid,
+        tuple(shape),
+        _geometry_key(edits, base_shape, point_transform),
+    )
+    cache_id = f"{layer_id}\0erased"
+    entry = cache.get(cache_id, key) if cache is not None else None
+    if (
+        entry is not None
+        and len(entry[0]) == len(strokes)
+        and _extends(strokes, entry[0])
+    ):
+        committed = entry[1]
+    else:
+        if entry is not None and _extends(strokes, entry[0]):
+            committed = _apply_erased(
+                entry[1],
+                strokes[len(entry[0]) :],
+                edits,
+                shape,
+                base_shape,
+                point_transform,
+            )
+        else:
+            committed = _apply_erased(
+                None, strokes, edits, shape, base_shape, point_transform
+            )
+        if cache is not None:
+            cache.put(cache_id, key, strokes, committed)
+    if live is None:
+        return committed
+    return _apply_erased(committed, [live], edits, shape, base_shape, point_transform)

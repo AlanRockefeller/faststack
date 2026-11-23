@@ -39,6 +39,14 @@ Item {
     readonly property int nativeImageHeight: loupeView.uiStateRef ? loupeView.uiStateRef.currentNativeImageHeight : 0
     readonly property bool hiResActive: loupeView.uiStateRef ? loupeView.uiStateRef.isZoomed : false
     readonly property bool histogramVisible: loupeView.uiStateRef ? loupeView.uiStateRef.isHistogramVisible : false
+    // White balance picker (the compact editor's "Pick"): a ring like the
+    // brushes' follows the cursor and the next left click sets white balance
+    // from the spot under it.
+    readonly property bool wbPicking: !!loupeView.uiStateRef && loupeView.uiStateRef.isWbPicking
+                                      && !loupeView.uiStateRef.isCropping
+    // A tool that draws the ring and owns left clicks: a brush or the picker.
+    readonly property bool ringToolActive: !!loupeView.uiStateRef && !loupeView.uiStateRef.isCropping
+                                           && (loupeView.uiStateRef.isBrushMode || loupeView.uiStateRef.isWbPicking)
 
     readonly property real currentPixelZoomScale: {
         if (!mainImage || mainImage.sourceSize.width <= 0 || mainImage.sourceSize.height <= 0) return currentZoomScale
@@ -747,17 +755,19 @@ Item {
 
                 // Brush outline. Lives in mainImage coordinates so it scales
                 // with zoom; the inner ring marks where the falloff starts.
+                // The white balance picker shows it too (no inner ring: the
+                // spot has no falloff).
                 Item {
                     id: brushCursor
                     z: 95
                     readonly property var cropScale: loupeView.uiStateRef ? loupeView.uiStateRef.brushCropScale : [1, 1]
                     readonly property real radius: loupeView.uiStateRef
-                        ? loupeView.uiStateRef.brushRadius * Math.sqrt(
+                        ? (loupeView.wbPicking ? loupeView.uiStateRef.wbPickRadius : loupeView.uiStateRef.brushRadius) * Math.sqrt(
                               Math.pow(mainImage.width / Math.max(0.001, brushCursor.cropScale[0]), 2)
                               + Math.pow(mainImage.height / Math.max(0.001, brushCursor.cropScale[1]), 2))
                         : 0
                     readonly property real lineWidth: 1.25 / Math.max(0.01, imageRotator.zoomScale)
-                    visible: !!loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode
+                    visible: loupeView.ringToolActive
                              && !loupeView.uiStateRef.brushPanHeld && mainMouseArea.brushCursorInside
                              && !mainMouseArea.middlePanning
                     x: mainMouseArea.brushCursorX
@@ -777,7 +787,7 @@ Item {
                     }
                     Rectangle {
                         readonly property real r: brushCursor.radius * (loupeView.uiStateRef ? loupeView.uiStateRef.brushHardness : 0.5)
-                        visible: r > brushCursor.lineWidth * 3
+                        visible: !loupeView.wbPicking && r > brushCursor.lineWidth * 3
                         x: -r; y: -r
                         width: r * 2; height: width; radius: width / 2
                         color: "transparent"
@@ -1273,7 +1283,7 @@ Item {
             acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
             hoverEnabled: true
             cursorShape: {
-                if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode && !loupeView.uiStateRef.isCropping) {
+                if (loupeView.ringToolActive) {
                     if (mainMouseArea.middlePanning) return Qt.ClosedHandCursor
                     if (loupeView.uiStateRef.brushPanHeld) return mainMouseArea.pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
                     return Qt.CrossCursor
@@ -1286,6 +1296,9 @@ Item {
         // coordinates.
         property bool isBrushPainting: false
         property bool brushErasing: false
+        // A press that picked white balance (or cancelled the picker): the
+        // rest of it must not pan, even though the picker has ended.
+        property bool wbPickPress: false
         // Brush mode: middle-drag pans (as Space+drag does).
         property bool middlePanning: false
         property real brushCursorX: 0
@@ -1296,6 +1309,7 @@ Item {
         onCanceled: {
             middlePanning = false
             brushErasing = false
+            wbPickPress = false
             if (isBrushPainting) {
                 isBrushPainting = false
                 if (loupeView.controllerRef) loupeView.controllerRef.finish_local_stroke()
@@ -1563,7 +1577,7 @@ Item {
             // The middle button only pans, and only in brush mode; elsewhere
             // it keeps passing through as before.
             if (mouse.button === Qt.MiddleButton) {
-                if (!loupeView.uiStateRef || !loupeView.uiStateRef.isBrushMode || loupeView.uiStateRef.isCropping) {
+                if (!loupeView.ringToolActive) {
                     mouse.accepted = false
                     return
                 }
@@ -1584,6 +1598,22 @@ Item {
             // drags and stuttered trackpad presses from the current visible box.
             if (cropReleasePending) {
                 endCropInteraction()
+            }
+
+            // White balance picker: left picks the spot under the ring,
+            // right cancels, and Space+left pans (the normal pan path below).
+            if (loupeView.wbPicking && loupeView.controllerRef) {
+                updateBrushCursor(mouse.x, mouse.y)
+                if (logicalButton(mouse) === Qt.RightButton) {
+                    wbPickPress = true
+                    loupeView.controllerRef.cancel_white_balance_pick()
+                    return
+                }
+                if (loupeView.uiStateRef.brushPanHeld) return
+                var pickCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
+                wbPickPress = true
+                loupeView.controllerRef.pick_white_balance_at(pickCoords.x, pickCoords.y)
+                return
             }
 
             // Dodge & burn: left paints, right or Alt+left erases, and
@@ -1738,7 +1768,7 @@ Item {
             return { x: p.x / w, y: p.y / h }
         }
         onPositionChanged: function(mouse) {
-            if (loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode)
+            if (loupeView.uiStateRef && (loupeView.uiStateRef.isBrushMode || loupeView.wbPicking))
                 updateBrushCursor(mouse.x, mouse.y)
 
             if (middlePanning) {
@@ -1754,10 +1784,11 @@ Item {
                 loupeView.controllerRef.continue_local_stroke(imgCoords.x, imgCoords.y)
                 return
             }
+            if (wbPickPress) return
             // In brush mode a plain drag must not fall through to panning or
-            // drag-and-drop; only Space+drag pans.
-            if (pressed && loupeView.uiStateRef && loupeView.uiStateRef.isBrushMode
-                    && !loupeView.uiStateRef.brushPanHeld && !loupeView.uiStateRef.isCropping) {
+            // drag-and-drop; only Space+drag pans. The same goes for the
+            // white balance picker.
+            if (pressed && loupeView.ringToolActive && !loupeView.uiStateRef.brushPanHeld) {
                 return
             }
 
@@ -1865,6 +1896,10 @@ Item {
         onReleased: function(mouse) {
             if (mouse.button === Qt.MiddleButton) {
                 middlePanning = false
+                return
+            }
+            if (wbPickPress) {
+                wbPickPress = false
                 return
             }
             // Dodge & burn stroke release

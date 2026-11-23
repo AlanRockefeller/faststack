@@ -6,6 +6,7 @@ import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import "SliderCurve.js" as SliderCurve
+import "SliderInput.js" as SliderInput
 
 Window {
     id: imageEditorDialog
@@ -684,8 +685,16 @@ Window {
                     repeat: true
                     onTriggered: {
                         if (Math.abs(slider._pendingValue - slider._lastSentValue) > 0.001) {
-                            if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(slider._pendingValue))
+                            var keyHold = slider._keyAdjusting && !slider.pressed
                             slider._lastSentValue = slider._pendingValue
+                            // The edit changed under a key hold (auto levels,
+                            // another key): drop the hold's stale step.
+                            if (keyHold && !SliderInput.keyHoldCurrent(slider._keySentValue, slider.backendValue)) {
+                                slider.value = slider.backendPosition
+                                return
+                            }
+                            if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(slider._pendingValue))
+                            if (keyHold) slider._keySentValue = slider.displayValueForPosition(slider._pendingValue)
                         }
                     }
                 }
@@ -727,15 +736,22 @@ Window {
                 // edit itself rather than slider.value: Qt bounds the handle to
                 // from..to, so an edit past the slider's end (an extreme
                 // auto-levels result) would otherwise snap to the endpoint. It
-                // may step back toward the range but never jumps.
+                // may step back toward the range but never jumps. A held key
+                // steps on from the value it reached; a new press, or the edit
+                // changing under the hold, starts again from the edit (see
+                // SliderInput.js), so a lost key release cannot bring back an
+                // old value.
                 property bool _keyAdjusting: false
                 property real _keyValue: 0
-                function nudgeByKeyboard(step) {
+                // The edit the current key hold last left in place.
+                property real _keySentValue: 0
+                function nudgeByKeyboard(step, fresh) {
                     if (slider.isResetting) return false
-                    var base = slider._keyAdjusting ? slider._keyValue : slider.backendValue
-                    var lo = Math.min(sliderRow.minVal, base)
-                    var hi = Math.max(sliderRow.maxVal, base)
-                    var nextValue = Math.max(lo, Math.min(hi, base + step))
+                    var holding = !fresh && slider._keyAdjusting
+                        && SliderInput.keyHoldCurrent(slider._keySentValue, slider.backendValue)
+                    var base = holding ? slider._keyValue : slider.backendValue
+                    if (!holding) slider._keySentValue = slider.backendValue
+                    var nextValue = SliderInput.keyStep(base, step, sliderRow.minVal, sliderRow.maxVal)
                     slider._keyAdjusting = true
                     slider._keyValue = nextValue
                     if (nextValue === base) return true
@@ -748,19 +764,31 @@ Window {
 
                 function commitKeyboardAdjust() {
                     var keyed = slider._keyAdjusting
+                        && SliderInput.keyHoldCurrent(slider._keySentValue, slider.backendValue)
                     slider._keyAdjusting = false
                     if (slider.isResetting) {
                         if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
-                    } else {
+                    } else if (keyed) {
                         // A keyboard adjust commits the stepped value itself, so a
                         // step that could not move (already at the end) leaves
                         // the edit exactly as it was.
-                        var edit = keyed
-                            ? (sliderRow.isReversed ? -slider._keyValue : slider._keyValue) / 100 * slider.editScale
-                            : slider.editValueFromSliderValue(value)
+                        var edit = (sliderRow.isReversed ? -slider._keyValue : slider._keyValue) / 100 * slider.editScale
                         if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, edit)
+                    } else {
+                        // No hold of ours behind this release (it already ended),
+                        // or something else changed the edit meanwhile: leave it.
+                        slider.value = slider.backendPosition
+                        return
                     }
                     if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.update_histogram()
+                }
+
+                // A key let go after focus moved on never reaches this slider:
+                // end the hold here instead.
+                onActiveFocusChanged: {
+                    if (activeFocus || !slider._keyAdjusting) return
+                    if (!slider.pressed) sendTimer.stop()
+                    slider.commitKeyboardAdjust()
                 }
 
                 Keys.priority: Keys.BeforeItem
@@ -773,9 +801,9 @@ Window {
                         return
                     }
                     if (event.key === Qt.Key_Up || event.key === Qt.Key_Right) {
-                        if (slider.nudgeByKeyboard(1)) event.accepted = true
+                        if (slider.nudgeByKeyboard(1, !event.isAutoRepeat)) event.accepted = true
                     } else if (event.key === Qt.Key_Down || event.key === Qt.Key_Left) {
-                        if (slider.nudgeByKeyboard(-1)) event.accepted = true
+                        if (slider.nudgeByKeyboard(-1, !event.isAutoRepeat)) event.accepted = true
                     }
                 }
 
@@ -794,8 +822,20 @@ Window {
                     }
                 }
 
+                // A press beside the handle jumps there; a press on the handle
+                // only grabs it until the pointer moves (SliderInput.js). A
+                // click leaves the edit as it is, even one past the slider's end.
+                property real _pressValue: 0
+                property bool _grabbed: false
+                property real _grabValue: 0
+                property bool _dragging: false
+
                 onPressedChanged: {
                     if (pressed) {
+                        // Qt has not moved the handle to the press point yet.
+                        slider._pressValue = value
+                        slider._grabbed = false
+                        slider._dragging = false
                         // Initialize drag logic only if not resetting
                         if (!slider.isResetting) {
                             _pendingValue = value
@@ -804,21 +844,34 @@ Window {
                         }
                     } else {
                         sendTimer.stop()
-                        
+                        var dragged = slider._dragging
+                        slider._dragging = false
+
                         if (slider.isResetting) {
                              // Force backend to 0 on release (redundant but safe)
                              if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, 0.0)
-                        } else {
+                        } else if (dragged) {
                              // Send final value immediately
                              if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.set_edit_parameter(sliderRow.key, slider.editValueFromSliderValue(value))
                         }
-                        
+
                         if (imageEditorDialog.controllerRef) imageEditorDialog.controllerRef.update_histogram()
                     }
                 }
-                
+
                 onMoved: {
                     if (slider.isResetting) return
+                    if (slider.pressed && !slider._dragging) {
+                        var step = SliderInput.pressMove(slider._pressValue, slider._grabbed, slider._grabValue, value,
+                                                         slider.handle ? slider.handle.width : 0,
+                                                         slider.availableWidth, slider.from, slider.to)
+                        if (step === "grab") {
+                            slider._grabbed = true
+                            slider._grabValue = value
+                        }
+                        if (step !== "drag") return
+                        slider._dragging = true
+                    }
                     _pendingValue = value
                     if (!sendTimer.running) sendTimer.start()
                 }

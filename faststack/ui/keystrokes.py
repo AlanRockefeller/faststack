@@ -46,6 +46,7 @@ class Keybinder:
             Qt.Key_R: "open_raw_in_rawtherapee",
             Qt.Key_C: "clear_all_stacks",
             Qt.Key_A: "quick_auto_white_balance",
+            Qt.Key_W: "raw_white_balance_to_jpg",
             Qt.Key_O: "toggle_crop_mode",
             Qt.Key_H: "toggle_histogram",
             Qt.Key_Delete: "delete_current_image",

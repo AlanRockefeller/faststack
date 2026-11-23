@@ -49,6 +49,8 @@ from faststack.imaging.math_utils import (
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
 
+from faststack.imaging.depth_select import DepthMap, edits_need_depth_map
+
 # Stack paint: focus-stack input pixels painted over the stacked output
 from faststack.imaging.halo_fix import (
     HaloResult,
@@ -67,6 +69,7 @@ from faststack.imaging.stack_paint import (
     stack_layers,
     warp_source_to_base,
 )
+from faststack.imaging.wb_pick import read_disc
 from faststack.io.indexer import JPG_EXTENSIONS
 from faststack.io.utils import fsync_directory, fsync_file
 from faststack.models import DecodedImage
@@ -83,6 +86,9 @@ log = logging.getLogger(__name__)
 
 _CV2_UNLOADED = object()
 cv2: Any = _CV2_UNLOADED
+
+# _apply_edits default for depth_map_override: use the live editor's map.
+_LIVE_DEPTH_MAP: Any = object()
 
 
 def _get_cv2():
@@ -1114,6 +1120,11 @@ class ImageEditor:
         # controller on a worker for this load session (HaloResult is
         # immutable; the dict is only rebound on the GUI thread).
         self._halo_results: Dict[str, HaloResult] = {}
+        # Background selection: the photo's estimated depth, computed by the
+        # controller's worker (faststack/controller/depth_select.py) or the
+        # save worker. Replaced wholesale, never mutated, so the render and
+        # save workers read it without locking.
+        self._depth_map: Optional[DepthMap] = None
 
         # Rendering preferences pushed in from AppController config:
         # soft shoulder/toe on the levels ramp, and TPDF dither on 8-bit
@@ -1171,6 +1182,7 @@ class ImageEditor:
             self._local_density_cache.clear()
             self._stack_sources = {}
             self._halo_results = {}
+            self._depth_map = None
             self._stack_sources_session_id = None
 
     def set_source_exif(self, exif_bytes: Optional[bytes]):
@@ -1369,6 +1381,7 @@ class ImageEditor:
                 self._local_density_cache.clear()
                 self._stack_sources = {}
                 self._halo_results = {}
+                self._depth_map = None
                 self._stack_sources_session_id = None
             log.error("Image file not found: %s", filepath)
             return False
@@ -1395,6 +1408,7 @@ class ImageEditor:
             # reload gets a fresh set rather than reusing path-keyed sources.
             self._stack_sources = {}
             self._halo_results = {}
+            self._depth_map = None
             self._stack_sources_session_id = None
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
@@ -1755,6 +1769,7 @@ class ImageEditor:
                 self._local_density_cache.clear()
                 self._stack_sources = {}
                 self._halo_results = {}
+                self._depth_map = None
                 self._stack_sources_session_id = None
             return False
 
@@ -1830,6 +1845,7 @@ class ImageEditor:
         cache_override: Optional["LayerDensityCache"] = None,
         stack_sources_override: Optional[Dict[str, StackSource]] = None,
         halo_results_override: Optional[Dict[str, HaloResult]] = None,
+        depth_map_override: Any = _LIVE_DEPTH_MAP,
         cache_context: Optional[dict] = None,
         update_highlight_state: bool = True,
         downscale_long_edge: Optional[int] = None,
@@ -1872,7 +1888,11 @@ class ImageEditor:
         ``stack_sources_override`` likewise supplies the registered stack
         inputs for stack layers (default: the live ``_stack_sources``), and
         ``halo_results_override`` the halo layers' corrected pixels (default:
-        the live ``_halo_results``).
+        the live ``_halo_results``).  ``depth_map_override`` is the estimated
+        depth for depth layers (default: the live ``_depth_map``); an explicit
+        None means "no depth map", so an export whose map could not be
+        computed never falls back to the live editor's, which may belong to
+        another photo by then.
         """
         cv2 = _get_cv2()
         if edits is None:
@@ -2153,6 +2173,11 @@ class ImageEditor:
                 ),
                 base_shape=mask_base_shape,
                 point_transform=mask_point_transform,
+                depth_map=(
+                    self._depth_map
+                    if depth_map_override is _LIVE_DEPTH_MAP
+                    else depth_map_override
+                ),
             )
             _mark("local_masks")
 
@@ -3335,6 +3360,33 @@ class ImageEditor:
             view[::stride, ::stride], dtype=np.float32, copy=True, order="C"
         )
         return sample, stride, label
+
+    def read_base_disc(
+        self, u: float, v: float, radius: float
+    ) -> Optional[np.ndarray]:
+        """sRGB pixels, (N, 3) in [0, 1], of a disc on the unedited image.
+
+        ``(u, v)`` is in the oriented base image's [0, 1] coordinates (what
+        the brushes map a click to) and ``radius`` a fraction of its diagonal.
+        These are the pixels white balance works on: every edit that changes
+        colour comes after it. Reads the float master, else the 8-bit original
+        (the same pixels; see _sample_source_for_analysis), else the preview.
+        None when no image is loaded or the centre is off the image.
+        """
+        with self._lock:
+            master = self.float_image
+            original = self.original_image
+            preview = self.float_preview
+            eight_bit = self.bit_depth == 8
+        if master is not None:
+            source = master
+        elif original is not None and eight_bit:
+            source = original
+        elif preview is not None:
+            source = preview
+        else:
+            return None
+        return read_disc(source, u, v, radius)
 
     def estimate_auto_white_balance(
         self,
@@ -4751,6 +4803,7 @@ class ImageEditor:
             # --- Stack paint inputs (immutable objects; copy the dict) ---
             stack_sources_snapshot = dict(self._stack_sources)
             halo_results_snapshot = dict(self._halo_results)
+            depth_map_snapshot = self._depth_map
 
             # --- Paths ---
             filepath_snapshot = self.current_filepath
@@ -4791,6 +4844,7 @@ class ImageEditor:
             "mask_assets": mask_assets_snapshot,
             "stack_sources": stack_sources_snapshot,
             "halo_results": halo_results_snapshot,
+            "depth_map": depth_map_snapshot,
             # Optional callable(name) -> Path the controller may add so the
             # save worker can load stack inputs that were not loaded yet.
             "stack_source_resolver": None,
@@ -4886,6 +4940,11 @@ class ImageEditor:
             source_arr,
             stack_sources,
         )
+        # The depth map a background selection needs but the preview has
+        # not finished is computed here too.
+        depth_map = self._depth_map_for_export(
+            edits_snapshot, snapshot.get("depth_map"), source_arr
+        )
 
         # 1. Apply edits to full resolution — uses only snapshot data
         # Use isolated snapshot context so background export doesn't pollute self._cached_*
@@ -4899,6 +4958,7 @@ class ImageEditor:
             cache_override=export_cache,
             stack_sources_override=stack_sources,
             halo_results_override=halo_results,
+            depth_map_override=depth_map,
             cache_context=export_cache_context,
             update_highlight_state=False,
             # The snapshot shares the live editor's float_image (see
@@ -5066,6 +5126,40 @@ class ImageEditor:
         finally:
             for tmp_output, _destination in temp_outputs:
                 tmp_output.unlink(missing_ok=True)
+
+    @staticmethod
+    def _depth_map_for_export(
+        edits: Dict[str, Any],
+        depth_map: Optional[DepthMap],
+        source_arr: np.ndarray,
+    ) -> Optional[DepthMap]:
+        """The depth map the export needs; runs on the save worker.
+
+        Computes it when the preview's is missing (a save right after
+        selecting the background, or of a restored edit).  When it cannot be
+        computed here (the model is not installed on this machine), depth
+        layers apply only where they were painted, as the preview shows them,
+        rather than failing the save.
+        """
+        if not edits_need_depth_map(edits):
+            return None
+        shape = tuple(source_arr.shape[:2])
+        if depth_map is not None and depth_map.base_shape == shape:
+            return depth_map
+        from faststack.ai import depth as ai_depth
+        from faststack.imaging.depth_select import compute_depth_map
+
+        try:
+            return compute_depth_map(source_arr, ai_depth.get_estimator().estimate)
+        except ai_depth.DepthUnavailable as exc:
+            log.warning(
+                "Background selection left out of the saved photo: %s", exc
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            # ONNX Runtime, OpenCV or numpy failing on this photo: leave the
+            # selection out rather than fail every save of it.
+            log.exception("Background selection left out of the saved photo")
+        return None
 
     @staticmethod
     def _halo_results_for_export(

@@ -154,3 +154,186 @@ def test_thumbnail_urls_change_per_batch(qapp, tmp_path):
     assert first != second
     assert first.endswith("/0?w=360") and second.endswith("/0?w=360")
     up.shutdown()
+
+
+def _card_state(up):
+    return [
+        (
+            c.id,
+            [p.key for p in c.group.photos],
+            up.card_value(c, "chosenName"),
+            up.card_value(c, "description"),
+        )
+        for c in up._model.cards
+    ]
+
+
+def test_reopening_after_another_batch_restores_the_first(qapp, tmp_path):
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    first_dir = tmp_path / "a"
+    second_dir = tmp_path / "b"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = _photos(first_dir, 4)
+    second = _photos(second_dir, 2)
+
+    assert up.open(first)
+    up.splitCard(up._model.cards[0].id, 2)
+    card = up._model.cards[0]
+    up.setChosenName(card.id, "Amanita muscaria", "")
+    up.setDescription(card.id, "under birch")
+    up.setLocation(card.id, 10.0, 20.0, 30)
+    qapp.processEvents()
+    before = _card_state(up)
+    assert up.hasManualEdits
+
+    assert up.open(second)
+    assert [p.key for p in up._photos] == second
+    assert not up.hasManualEdits
+
+    assert up.open(first)
+    qapp.processEvents()
+    assert _card_state(up) == before
+    assert up.hasManualEdits
+    restored = up._card(card.id)
+    assert restored.manual_location is not None
+    up.shutdown()
+
+
+def test_unreadable_photo_does_not_stop_the_batch_resuming(
+    qapp, tmp_path, monkeypatch
+):
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    paths = _photos(tmp_path, 3)
+    real = ctl.read_photo_facts
+
+    def flaky(path, order):
+        if path.name == "IMG_1.jpg":
+            raise OSError("unreadable")
+        return real(path, order)
+
+    monkeypatch.setattr(ctl, "read_photo_facts", flaky)
+    assert up.open(paths)
+    assert len(up._photos) == 2
+    assert len(up._model.cards) == 1
+    up.splitCard(up._model.cards[0].id, 2)  # a regroup would merge them again
+    up.setDescription(up._model.cards[0].id, "kept")
+    before = _card_state(up)
+    assert len(before) == 2
+
+    assert up.open(paths)
+    assert _card_state(up) == before
+    up.shutdown()
+
+
+def test_batch_sharing_uploaded_photos_is_not_restored_stale(qapp, tmp_path):
+    """A, then B (part of A) uploaded, then A again: B's photos stay locked."""
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    paths = _photos(tmp_path, 4)
+    first, second = paths, paths[:2]
+
+    assert up.open(first)
+    assert up.cardCount == 1
+    up.setDescription(up._model.cards[0].id, "the whole find")
+    assert up.open(second)
+    up.uploadAll()
+    _pump(qapp, up)
+    assert all(c.status == ctl.STATUS_UPLOADED for c in up._model.cards)
+
+    assert up.open(first)
+    uploaded = set(second)
+    for card in up._model.cards:
+        keys = {p.key for p in card.group.photos}
+        if keys & uploaded:
+            assert card.locked
+    records = {id(p) for p in up._photos}
+    for card in up._model.cards:
+        for p in card.group.photos:
+            assert id(p) in records
+    up.shutdown()
+
+
+def test_stashed_batch_is_not_changed_by_the_next_one(qapp, tmp_path):
+    """Two batches with the same photo set share no card objects."""
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    paths = _photos(tmp_path, 2)
+    first = paths
+    second = list(reversed(paths))  # same photos, another selection order
+
+    assert up.open(first)
+    up.setDescription(up._model.cards[0].id, "first")
+    before = _card_state(up)
+    assert up.open(second)
+    up.setDescription(up._model.cards[0].id, "second")
+    assert up.open(first)
+    assert _card_state(up) == before
+    records = {id(p) for p in up._photos}
+    assert all(id(p) in records for c in up._model.cards for p in c.group.photos)
+    up.shutdown()
+
+
+def _identify(up, card, name):
+    """Vision answers for ``card``; the answer is handed in, no network."""
+    from faststack.inat.mycomap_vision import VisionResult
+
+    result = VisionResult(
+        answer_rank="species", answer_name=name, answer_confidence=0.9
+    )
+    up._begin_job()  # _on_identify_done ends the job identifyCard began
+    up._on_identify_done(card.id, card.token, result, "")
+    return result
+
+
+def test_vision_answers_from_other_batches_reach_a_restored_one(qapp, tmp_path):
+    """A (two cards), then B and C (one of A's cards each) identified, then A
+    again: A's cards get those answers instead of asking Vision again, and a
+    name typed on A's card meanwhile stays."""
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    paths = _photos(tmp_path, 4)
+    assert up.open(paths)
+    up.splitCard(up._model.cards[0].id, 2)
+    first, second = up._model.cards
+    assert [p.key for p in first.group.photos] == paths[:2]
+    up.setChosenName(second.id, "Russula", "genus")  # typed, not identified
+
+    assert up.open(paths[:2])
+    _identify(up, up._model.cards[0], "Amanita muscaria")
+    assert up.open(paths[2:])
+    _identify(up, up._model.cards[0], "Boletus edulis")
+
+    assert up.open(paths)
+    restored_first = up._card(first.id)
+    restored_second = up._card(second.id)
+    assert restored_first.status == ctl.STATUS_IDENTIFIED
+    assert restored_first.vision.answer_name == "Amanita muscaria"
+    assert restored_first.chosen_name == "Amanita muscaria"
+    assert restored_second.status == ctl.STATUS_IDENTIFIED
+    assert restored_second.vision.answer_name == "Boletus edulis"
+    assert restored_second.chosen_name == "Russula"
+    up.shutdown()
+
+
+def test_vision_answers_of_a_batch_outlive_a_visit_to_another(qapp, tmp_path):
+    """An answer A got for photos B does not have is still there for A's
+    regroups after B was open: a split and re-merge does not ask again."""
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    paths = _photos(tmp_path, 4)
+    assert up.open(paths)
+    up.splitCard(up._model.cards[0].id, 2)
+    _identify(up, up._model.cards[1], "Boletus edulis")  # photos 2 and 3
+
+    assert up.open(paths[:2])
+    assert up.open(paths)
+    assert frozenset(paths[2:]) in up._vision_cache
+    up.shutdown()
+
+
+def test_vision_cache_keeps_only_the_newest_answers(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(ctl, "MAX_VISION_CACHE", 2)
+    up = _make_controller(qapp, ScriptedTransport(), tmp_path)
+    paths = _photos(tmp_path, 3)
+    for i, path in enumerate(paths):
+        assert up.open([path])
+        _identify(up, up._model.cards[0], f"Species {i}")
+    assert set(up._vision_cache) == {frozenset([paths[1]]), frozenset([paths[2]])}
+    up.shutdown()

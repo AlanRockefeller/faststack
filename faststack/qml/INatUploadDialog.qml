@@ -81,7 +81,10 @@ Window {
         if (visible) {
             clearPhotoSelection()
             if (controllerRef) controllerRef.dialog_opened("qml-inat-upload")
-            if (uploader && !(uploader.hasInatToken && uploader.hasVisionKey)) settingsPopup.open()
+            // Settings only when there is no usable token: none saved, or
+            // one that has expired. A token iNaturalist turns down opens
+            // them too, once checkToken hears back (onTokenRejected).
+            if (uploader && (!uploader.hasInatToken || uploader.tokenSecondsLeft === 0)) settingsPopup.open()
             if (uploader) uploader.checkToken()
         } else {
             photoViewer.close()
@@ -104,6 +107,10 @@ Window {
             return
         }
         if (uploader) uploader.cancelIdentify()
+        // A name or note still being typed is only saved on editingFinished,
+        // which closing the window does not send: save it here.
+        var focused = dialog.activeFocusItem
+        if (focused && typeof focused.commitEdit === "function") focused.commitEdit()
     }
 
     // Upload, after asking about a token in its last minutes and about
@@ -2156,10 +2163,13 @@ Window {
                     placeholderText: card.attached ? "The existing observation keeps its own name" : "Scientific name (or leave blank)"
                     enabled: card.status !== "uploading" && card.status !== "uploaded" && !card.attached
                     // Upright on purpose: italics are correct for a name but harder to read while typing.
+                    function commitEdit() {
+                        if (text !== card.model.chosenName) dialog.uploader.setChosenName(card.cardId, text, "")
+                    }
                     onEditingFinished: {
                         suggestTimer.stop()
                         suggestPopup.close()
-                        if (text !== card.model.chosenName) dialog.uploader.setChosenName(card.cardId, text, "")
+                        commitEdit()
                     }
 
                     // Autocomplete from iNaturalist. "p semilanc" offers Psilocybe semilanceata.
@@ -2284,6 +2294,9 @@ Window {
                     text: card.model.description
                     placeholderText: "Description for iNaturalist (habitat, substrate, smell…)"
                     enabled: card.status !== "uploading" && card.status !== "uploaded" && !card.attached
+                    function commitEdit() {
+                        if (text !== card.model.description) dialog.uploader.setDescription(card.cardId, text)
+                    }
                     onEditingFinished: dialog.uploader.setDescription(card.cardId, text)
                 }
             }

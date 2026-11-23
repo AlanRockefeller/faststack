@@ -21,6 +21,7 @@ This tool is optimized for speed, using `libjpeg-turbo` for decoding, aggressive
 - **Dodge & Burn:** Paint any compact-editor slider (exposure, contrast, shadows, white balance, vibrance, color mix…) onto part of the photo (Shift+D). Each stroke adds one coat, so overlapping strokes build up; strokes are kept as layers you can re-edit, hide, or delete.
 - **Stack Paint:** For in-camera focus stacks (`... stacked.JPG`), paint any of the stack's input JPGs - or the stack output itself - back over the stacked photo, e.g. to restore a clean background or fix stacking halos. Each input is aligned to the stack automatically, the brush circle previews what a click will paint, and global edits and dodge & burn apply to the painted pixels too.
 - **Halo Removal:** The compact editor's "Halo" brush removes the halo a focus stack leaves around a subject: paint loosely over it and FastStack rebuilds the background there with the LaMa inpainting model, leaving the in-focus subject alone. The model (about 230 MB) is downloaded only after you agree, the first time you press Halo, and runs offline.
+- **Background Selection:** The compact editor's "Bkgd" button selects the background by estimated depth, as a dodge & burn layer: an Amount slider sets how much of the scene, back to front, is selected, the sliders then change only that part, and the brush adds to or removes from the selection. The depth model (Depth Anything V2 Small, about 100 MB) is downloaded only after you agree, the first time you press Bkgd, and runs offline.
 - **Quick Auto Adjust:** Press `l` for quick auto-levels, `L` for auto white balance + auto-levels together, `A` for auto white balance, `-`/`_` to keep adjusting the highlight/white side in 14-point steps, and `=`/`+` to adjust the shadow/black side in 7-point steps. These update the live in-memory edit session immediately and save once when you navigate away, start a drag, or explicitly save. Auto-levels treats its clip threshold as a budget (a few already-clipped specular pixels won't disable the stretch), brightens underexposed midtones toward a configurable target, and rolls off stretched highlights smoothly instead of hard-clipping them. Auto white balance analyzes only the cropped area, fades its correction when the scene lacks reliable neutrals, and damps magenta/green corrections so foliage isn't mistaken for a color cast. The midtone target, channel clip budget, highlight rolloff, export dithering, and tint correction strength are all adjustable in Settings.
 - **iNaturalist Upload:** Actions > iNaturalist upload groups the batched photos into observations by time and GPS, identifies each with MycoMap Vision, lets you split, merge or drag photos between observation cards, place GPS-less finds on an OpenStreetMap map, and uploads them to your iNaturalist account. It corrects for a camera clock set to the wrong time zone, and photos of a find you already put on iNaturalist (from your phone, say) can be added to that observation instead of making a duplicate.
 - **Photoshop / GIMP Integration:** Edit the current image in Photoshop or GIMP (P key). Photoshop gets the RAW file when one exists; GIMP gets the JPG.
@@ -205,6 +206,7 @@ faststack "C:\path\to\photos"
 - `Ctrl+Z`: Undo. If the current image has unsaved live edits (quick auto adjust, crop, editor sliders), the first press discards those; otherwise it undoes the last saved action (delete, saved edit, or clearing stacks/batches)
 - `A`: Quick auto white balance (live session; saved on navigation, drag, or Ctrl+S)
 - `Ctrl+Shift+B`: Quick auto white balance (alternate)
+- `W`: RAW white balance. Develops the paired RAW with `rawtherapee-cli` using automatic white balance and saves it over the JPG (the camera JPG is kept as `-backup.jpg`; `Ctrl+Z` puts it back). For casts too strong for `A`, such as flash shots. Edit the new JPG as usual afterwards
 - `l`: Quick auto levels + vibrance (live session; saved on navigation, drag, or Ctrl+S)
 - `L`: Quick auto white balance + auto levels + vibrance (live session; saved on navigation, drag, or Ctrl+S)
 - `-`: Darken the current auto-adjust highlights/whites by 14 points in the live session
@@ -255,6 +257,13 @@ histogram (overlay or per-channel R/G/B) and grouped adjustments:
 - **Color** — Temp (Blue/Yellow), Tint (Green/Magenta), and Vibrance (the full
   editor adds Saturation, Clarity, Texture, Sharpness, Vignette, and more).
 - **Auto** buttons next to each group apply auto-levels or auto white balance.
+- **Pick** (next to Color's Auto) sets white balance from a spot you choose:
+  click it, then click something in the photo that should be white or grey (a
+  grey card, a white wall, a colourless stone). The cursor shows a ring; `[` /
+  `]` change its size, and the colour is averaged over the ring. Temp and Tint
+  are set so that spot comes out neutral, replacing their previous values.
+  Avoid blown-out highlights: a spot that is mostly clipped (or black) is
+  refused and you can click again. `Esc` or a right click cancels.
 
 Drag a slider to adjust it. **Double-click a slider** (or click its numeric
 value) to reset that one control to 0. **Reset** clears every adjustment back
@@ -388,7 +397,12 @@ change; **Cancel** (or `Esc`) discards them.
 - **Image Editor Path**: Photoshop, GIMP or another editor for `P`. Recently
   used editors are offered in the dropdown.
 - **RawTherapee Path**: `rawtherapee-cli` is used by **Develop RAW** (the
-  editor's experimental 16-bit workflow); `R` opens the GUI sibling.
+  editor's experimental 16-bit workflow) and by `W`; `R` opens the GUI sibling.
+  `W` uses your RawTherapee default RAW profile with white balance set to
+  automatic. `awb_method` under `[rawtherapee]` in `faststack.ini` picks the
+  method (`Auto`, or on RawTherapee 5.9+ `autold` for RGB grey and
+  `autitcgreen` for temperature correlation), and `awb_jpeg_quality` sets the
+  JPEG quality (default 95).
 - **Default Image Directory**: Opened at startup when no folder is given on
   the command line. Leave it empty to reopen the last folder you used.
 - **Restack RAW Locations**: Where **Restack Source RAWs** looks for the input

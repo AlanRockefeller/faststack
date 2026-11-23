@@ -737,6 +737,11 @@ DEFAULT_CONFIG = {
     "rawtherapee": {
         "exe": DEFAULT_RT_PATH,
         "args": "",
+        # W (RAW white balance): RawTherapee's [White Balance] Setting and the
+        # JPEG quality of the JPG it writes. "Auto" works on every version;
+        # 5.9+ also takes "autold" (RGB grey) or "autitcgreen".
+        "awb_method": "Auto",
+        "awb_jpeg_quality": "95",
     },
     "raw": {
         "source_dir": "",

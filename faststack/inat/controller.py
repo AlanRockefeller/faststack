@@ -10,6 +10,7 @@ private ``_*Done`` signals, which Qt queues back to the controller's thread.
 
 from __future__ import annotations
 
+import copy
 import logging
 import statistics
 import threading
@@ -143,6 +144,46 @@ MAX_ACCURACY_M = 1_000_000
 # warns, and Upload asks first: a run that outlives the token fails partway.
 TOKEN_WARN_SECONDS = 15 * 60
 TOKEN_TICK_MS = 30_000
+# Batches the dialog was last opened for, kept (until the app exits) so going
+# back to one picks up its cards where they were left.
+MAX_STASHED_BATCHES = 8
+# Vision answers kept (until the app exits) for photo sets no card shows any
+# more; enough for every card of the stashed batches.
+MAX_VISION_CACHE = 1000
+# Everything open() and _reset_existing() set up for one batch. A batch that
+# is put aside saves these together with its cards; restoring only some of
+# them would let the next rematch or regroup throw the cards away. The Vision
+# cache is not one of them: it is shared by every batch, so an answer given
+# while one batch was open is not asked for again from another.
+_BATCH_STATE_ATTRS = (
+    "_photos",
+    "_opened_keys",
+    "_uploaded_paths",
+    "_manual_edits",
+    "_grouping_recorded",
+    "_token_failed_run",
+    "_resume_after_verify",
+    "_upload_done",
+    "_upload_total",
+    "_upload_results",
+    "_folder",
+    "_time_gap_s",
+    "_distance_m",
+    "_thresholds_source",
+    "_thresholds_note",
+    "_existing",
+    "_existing_complete",
+    "_existing_by_id",
+    "_existing_fetched",
+    "_existing_status",
+    "_clock",
+    "_clock_saved",
+    "_clock_decisions",
+    "_camera_days",
+    "_regrouped_for_clock",
+    "_dismissed",
+    "_match_signature",
+)
 
 
 @dataclass
@@ -380,6 +421,11 @@ class INatUploadController(QObject):
         self._credentials = CredentialStore()
         self._model = CardModel(self)
         self._photos: list[PhotoRecord] = []
+        # The paths open() was asked for: a photo that could not be read is
+        # missing from _photos, and must not stop the same batch resuming.
+        self._opened_keys: list[str] = []
+        # Batches put aside when another one was opened, newest last.
+        self._stashed: dict[tuple[str, ...], dict[str, Any]] = {}
         self._next_card_id = 1
         self._busy_jobs = 0
         self._status_text = ""
@@ -418,6 +464,8 @@ class INatUploadController(QObject):
         # Cards waiting on a lookup that is already in flight, per (name, rank).
         self._taxon_waiting: dict[tuple[str, str], list[tuple[int, int]]] = {}
         self._history = GroupingHistory(get_app_data_dir() / HISTORY_FILE)
+        # Vision's answer per photo set (photo keys), oldest first, for every
+        # batch: a card with the same photos never asks Vision twice.
         self._vision_cache: dict[frozenset, VisionResult] = {}
         self._time_gap_s = float(self.timeGapMinutes * 60)
         self._distance_m = float(self.distanceMeters)
@@ -1025,15 +1073,14 @@ class INatUploadController(QObject):
             # The dialog is modal and refuses to close mid-upload, so this is
             # only a safety net: never rebuild the cards under a running upload.
             return True
-        if self._model.cards and [str(p) for p in existing] == [
-            p.key for p in self._photos
-        ]:
-            # Thumbnails are re-read: a photo may have been edited meanwhile.
-            self._batch_generation += 1
-            self._model.reset(list(self._model.cards))
-            self._set_status("Picked up where you left off with these photos.")
-            self.cardsChanged.emit()
-            self.refreshUsage()
+        keys = [str(p) for p in existing]
+        if self._model.cards and keys == self._opened_keys:
+            self._resume_batch()
+            return True
+        self.cancelIdentify()  # nothing of this batch may land on the next
+        self._stash_batch()
+        if self._restore_batch(tuple(keys)):
+            self._resume_batch()
             return True
 
         records: list[PhotoRecord] = []
@@ -1045,13 +1092,8 @@ class INatUploadController(QObject):
         if not records:
             return False
         self._photos = records
+        self._opened_keys = keys
         self._uploaded_paths = []
-        keys = {p.key for p in records}
-        self._vision_cache = {
-            photo_set: result
-            for photo_set, result in self._vision_cache.items()
-            if photo_set <= keys
-        }
         self._manual_edits = False
         self._grouping_recorded = False
         self._token_failed_run = False
@@ -1091,6 +1133,74 @@ class INatUploadController(QObject):
         self._regroup(announce=True)
         self.refreshUsage()
         self.checkExisting()
+        return True
+
+    def _resume_batch(self) -> None:
+        """Show the current batch again, cards as they were left."""
+        # Thumbnails are re-read: a photo may have been edited meanwhile.
+        self._batch_generation += 1
+        self._model.reset(list(self._model.cards))
+        self._set_status("Picked up where you left off with these photos.")
+        self.thresholdsChanged.emit()
+        self.uploadProgressChanged.emit()
+        self.existingChanged.emit()
+        self.cardsChanged.emit()
+        self.refreshUsage()
+        self._check_existing_if_due()
+
+    def _stash_batch(self) -> None:
+        """Put the current batch aside before another one is opened."""
+        if not self._model.cards or not self._opened_keys:
+            return
+        state = {name: getattr(self, name) for name in _BATCH_STATE_ATTRS}
+        state["cards"] = list(self._model.cards)
+        # A copy: the next batch's regroup reuses (and edits) these cards when
+        # the two batches share photos. One deepcopy keeps the references
+        # between cards, photos and observations pointing at each other.
+        state = copy.deepcopy(state)
+        key = tuple(self._opened_keys)
+        self._stashed.pop(key, None)
+        self._stashed[key] = state
+        while len(self._stashed) > MAX_STASHED_BATCHES:
+            self._stashed.pop(next(iter(self._stashed)))
+
+    def _restore_batch(self, key: tuple[str, ...]) -> bool:
+        """Bring back a batch put aside earlier; False when there is none."""
+        state = self._stashed.pop(key, None)
+        if state is None:
+            return False
+        cards = state["cards"]
+        # A photo that went up from another batch since is on iNaturalist now;
+        # an old card offering it again would upload it twice. Building the
+        # batch afresh keeps the card that uploaded it instead.
+        uploaded = {
+            p.key
+            for batch in [self._model.cards, *(s["cards"] for s in self._stashed.values())]
+            for c in batch
+            if c.locked
+            for p in c.group.photos
+        }
+        if any(
+            p.key in uploaded for c in cards if not c.locked for p in c.group.photos
+        ):
+            return False
+        state = dict(state)
+        state.pop("cards")
+        for name, value in state.items():
+            setattr(self, name, value)
+        # Answers still on their way were for the batch just put aside.
+        self._existing_seq += 1
+        self._existing_busy = False
+        self._clock_version += 1
+        self._dismiss_version += 1
+        self._cancel_upload.clear()
+        for card in cards:
+            card.selected = False
+            # Vision may have answered for these photos while another batch
+            # was open; a name typed here meanwhile stays.
+            if not card.locked and card.vision is None and not card.identify_pending:
+                self._apply_cached_vision(card, keep_name=True)
+        self._model.reset(cards)
         return True
 
     def _regroup(self, announce: bool = False) -> None:
@@ -1217,15 +1327,19 @@ class INatUploadController(QObject):
     def _photo_set(card: Card) -> frozenset:
         return frozenset(p.key for p in card.group.photos)
 
-    def _apply_cached_vision(self, card: Card) -> None:
-        """Reuse an earlier Vision answer when the card's photo set is the same."""
+    def _apply_cached_vision(self, card: Card, keep_name: bool = False) -> None:
+        """Reuse an earlier Vision answer when the card's photo set is the same.
+
+        ``keep_name`` leaves a name already chosen on the card in place of
+        Vision's suggestion.
+        """
         result = self._vision_cache.get(self._photo_set(card))
         if result is None:
             return
         card.vision = result
         card.status = STATUS_IDENTIFIED
         card.status_text = self._vision_status_text(result)
-        if result.suggested_name:
+        if result.suggested_name and not (keep_name and card.chosen_name):
             card.chosen_name = result.suggested_name
             card.chosen_rank = result.suggested_rank
             self._lookup_taxon(card)
@@ -2805,7 +2919,11 @@ class INatUploadController(QObject):
             self._model.refresh(card, "status", "statusText")
             return
         card.vision = result
-        self._vision_cache[self._photo_set(card)] = result
+        photo_set = self._photo_set(card)
+        self._vision_cache.pop(photo_set, None)  # newest last
+        self._vision_cache[photo_set] = result
+        while len(self._vision_cache) > MAX_VISION_CACHE:
+            self._vision_cache.pop(next(iter(self._vision_cache)))
         card.status = STATUS_IDENTIFIED
         card.status_text = self._vision_status_text(result)
         if result.usage:
