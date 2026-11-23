@@ -735,6 +735,12 @@ class RawWhiteBalanceMixin:
         method = _raw_awb_method()
         quality = _raw_awb_jpeg_quality()
         highlights = _raw_awb_highlight_mode()
+        fingerprint = self._file_state_fingerprint(jpg_path)
+        if fingerprint is None:
+            # Without it, an outside change to the JPG could not be told apart.
+            self._raw_awb_meter_end(operation_id, ok=False)
+            self.update_status_message(f"Could not read {jpg_path.name}.")
+            return False
         operation = RawWhiteBalanceOperation(
             operation_id=operation_id,
             jpg_key=jpg_key,
@@ -744,8 +750,8 @@ class RawWhiteBalanceMixin:
             directory_key=self._key(self.image_dir),
             sidecar=self.sidecar,
         )
+        operation.jpg_fingerprint = fingerprint
         self._raw_awb_zero_baseline(operation)
-        operation.jpg_fingerprint = self._file_state_fingerprint(jpg_path)
         with self._raw_awb_lock:
             self._raw_awb_operations[jpg_key] = operation
 
@@ -1026,9 +1032,12 @@ class RawWhiteBalanceMixin:
         return True
 
     def _raw_awb_jpg_unchanged(self, operation: RawWhiteBalanceOperation) -> bool:
-        return self._file_state_fingerprint(operation.jpg_path) == (
-            operation.jpg_fingerprint
-        )
+        """True only when the JPG is known to be as it was when W started (an
+        unreadable JPG counts as changed)."""
+        if operation.jpg_fingerprint is None:
+            return False
+        current = self._file_state_fingerprint(operation.jpg_path)
+        return current is not None and current == operation.jpg_fingerprint
 
     def _raw_awb_forget_request(self, request: dict) -> None:
         pending = getattr(self, "_pending_edit_save_requests", None)
@@ -1096,6 +1105,10 @@ class RawWhiteBalanceMixin:
         snapshot["halo_results"] = {}
         snapshot["depth_map"] = None
         snapshot["export_cache"] = LayerDensityCache()
+        # Auto-adjust steps (-/+) were measured on the old pixels; the editor
+        # measures the new ones when the photo is reopened (as for a carried
+        # live session).
+        request["context"]["auto_adjust_state"] = None
         # The saved edit state must name the new JPG (then its backup) as the
         # source, or reopening the editor would bring the camera JPG back.
         request["context"]["edit_source_path"] = str(new_snapshot["filepath_snapshot"])
@@ -1426,6 +1439,9 @@ class RawWhiteBalanceMixin:
             except OSError:
                 pass
             if isinstance(exc, _JpgChanged):
+                # The watcher is muted for this path just now, so its event
+                # for the outside write may be dropped: show that write.
+                self._invalidate_decoded_path(jpg_path, force=True)
                 return f"{jpg_path.name} changed while RawTherapee was running."
             log.exception("Could not replace %s", jpg_path)
             return f"could not replace {jpg_path.name}: {exc}"
@@ -1682,17 +1698,16 @@ class RawWhiteBalanceMixin:
             pending = list(operations.values())
             for operation in pending:
                 operation.cancel_requested = True
-        held = []
         for operation in pending:
             if not operation.parked:
                 continue
-            if self._raw_awb_jpg_unchanged(operation):
-                held.append(operation.parked)
-                operation.parked = None
-            else:
-                # Changed outside FastStack: the held save would replace it.
+            # Checked right before each write, not once for all: an earlier
+            # write takes time, and a JPG changed meanwhile must not be
+            # replaced.
+            if not self._raw_awb_jpg_unchanged(operation):
                 self._raw_awb_drop_parked(operation)
-        for parked in held:
+                continue
+            parked, operation.parked = operation.parked, None
             try:
                 self._run_save_request_sync(parked["request"], saving_status=None)
             except Exception:

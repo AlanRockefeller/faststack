@@ -4263,6 +4263,19 @@ class AppController(
         """Switch loupe view to a different variant file."""
         norm = norm_path(Path(path_str))
 
+        if (
+            self.image_files
+            and self.current_index < len(self.image_files)
+            and norm != norm_path(self.image_files[self.current_index].path)
+            and self.raw_awb_pending_for_current()
+        ):
+            # A save from a backup view writes the main JPG, which W is
+            # replacing (faststack/controller/raw_white_balance.py).
+            self.update_status_message(
+                "RAW white balance is still running; switch versions when it is done."
+            )
+            return
+
         # If selecting main, clear override
         if self.image_files and self.current_index < len(self.image_files):
             main_norm = norm_path(self.image_files[self.current_index].path)

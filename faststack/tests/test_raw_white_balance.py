@@ -123,6 +123,7 @@ def _controller(tmp_path: Path, cli: Path, *, image_size=(60, 40)):
     controller.sync_ui_state = MagicMock()
     controller._persist_sidecar = MagicMock(return_value=True)
     controller._pending_save_recovery = {}
+    controller._invalidate_decoded_path = MagicMock()
     return controller, jpg, raw
 
 
@@ -807,6 +808,7 @@ def test_save_made_while_w_runs_goes_onto_the_new_pixels(qt_app, tmp_path):
 
     controller.raw_white_balance_to_jpg()
     request = _save_request(jpg, controller._key(jpg))
+    request["context"]["auto_adjust_state"] = {"base_whites": 0.4}
     # The user edits and moves on: the save is held, not written.
     assert controller._raw_awb_park_save(request, None) is True
     assert submitted == []
@@ -824,6 +826,8 @@ def test_save_made_while_w_runs_goes_onto_the_new_pixels(qt_app, tmp_path):
     assert snapshot["halo_results"] == {}
     assert snapshot["depth_map"] is None
     assert request["context"]["edit_source_path"] == str(jpg)
+    # Auto-adjust (-/+) was measured on the old pixels.
+    assert request["context"]["auto_adjust_state"] is None
     assert "your edits moved onto it" in controller.status_messages[-1]
 
 
@@ -1276,5 +1280,126 @@ def test_write_during_the_backup_is_not_replaced(qt_app, tmp_path):
     outside = Image.open(jpg).convert("RGB").getpixel((5, 5))
     assert outside[1] > 150  # still the outside write's green
     assert "changed while RawTherapee was running" in controller.status_messages[-1]
+    # The watcher was muted for the swap: the outside write is shown anyway.
+    controller._invalidate_decoded_path.assert_called_with(jpg, force=True)
     assert not list(tmp_path.glob("*backup*"))
     assert not list(tmp_path.glob(".*.raw-awb.tmp"))
+
+
+# -- Fourth review round -------------------------------------------------------
+
+
+def test_w_refuses_a_jpg_it_cannot_fingerprint(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller._file_state_fingerprint = MagicMock(return_value=None)
+
+    assert controller.raw_white_balance_to_jpg() is False
+    assert controller._raw_awb_operations == {}
+    assert controller.raw_awb_recipe_hidden(controller._key(jpg)) is False
+    assert "Could not read" in controller.status_messages[-1]
+
+
+def test_an_unreadable_jpg_counts_as_changed(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, raw = _controller(tmp_path, cli)
+    operation = rawb.RawWhiteBalanceOperation(
+        operation_id="op",
+        jpg_key=controller._key(jpg),
+        jpg_path=jpg,
+        raw_path=raw,
+        jpg_fingerprint=None,
+        directory_key=controller._key(tmp_path),
+        sidecar=None,
+    )
+    controller._file_state_fingerprint = MagicMock(return_value=None)
+    assert controller._raw_awb_jpg_unchanged(operation) is False
+    operation.jpg_fingerprint = [1, 2]
+    assert controller._raw_awb_jpg_unchanged(operation) is False
+
+
+def test_switching_versions_waits_for_w(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller.view_override_path = None
+    controller.view_override_kind = None
+    controller._maybe_decode_current_image = MagicMock()
+    gate = _gated(controller)
+
+    controller.raw_white_balance_to_jpg()
+    # A save from the backup view would write the JPG W is replacing.
+    controller.set_variant_override(str(tmp_path / "P1010001-backup.JPG"))
+    assert controller.view_override_path is None
+    controller._maybe_decode_current_image.assert_not_called()
+    assert "switch versions when it is done" in controller.status_messages[-1]
+    gate.set()
+    _wait(controller)
+
+
+def test_quit_rechecks_each_jpg_right_before_its_held_save(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, raw = _controller(tmp_path, cli)
+    controller._mark_current_live_edit_session_save_failed = MagicMock()
+    other = tmp_path / "P1010002.JPG"
+    _write_jpg(other, (60, 40), (90, 90, 90))
+    operations = []
+    for path in (jpg, other):
+        operation = rawb.RawWhiteBalanceOperation(
+            operation_id=path.stem,
+            jpg_key=controller._key(path),
+            jpg_path=path,
+            raw_path=raw,
+            jpg_fingerprint=controller._file_state_fingerprint(path),
+            directory_key=controller._key(tmp_path),
+            sidecar=None,
+        )
+        operation.parked = {"request": _save_request(path, operation.jpg_key)}
+        controller._raw_awb_operations[operation.jpg_key] = operation
+        operations.append(operation)
+    second = operations[1].parked["request"]
+    written = []
+
+    def write(request, saving_status=None):
+        written.append(request)
+        # Another program rewrites the second JPG while the first is saved.
+        _touch_externally(other)
+        return True
+
+    controller._run_save_request_sync = MagicMock(side_effect=write)
+    controller._flush_raw_awb_parked_saves()
+
+    assert len(written) == 1 and written[0] is not second
+    assert operations[1].parked is None
+
+
+def test_close_with_an_outside_change_writes_only_the_newest_save(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller._mark_current_live_edit_session_submitted = MagicMock()
+    controller._remember_pending_edit_save_request = MagicMock()
+    controller._mark_current_live_edit_session_save_failed = MagicMock()
+    written = []
+    controller._run_save_request_sync = MagicMock(
+        side_effect=lambda request, saving_status=None: written.append(request) or True
+    )
+    gate = _gated(controller)
+
+    controller.raw_white_balance_to_jpg()
+    held = _save_request(jpg, controller._key(jpg))  # revision 3, Ctrl+S
+    controller._raw_awb_park_save(held, None)
+    _touch_externally(jpg)
+    outside = jpg.read_bytes()
+    newer = _save_request(jpg, controller._key(jpg))  # revision 4, on quit
+    newer["context"]["save_revision"] = 4
+    controller._close_discard_token = None
+    controller._prepare_current_session_save_request = MagicMock(return_value=newer)
+    controller._last_save_prepare_error = None
+
+    assert controller.prepare_for_app_close() is True
+    controller._flush_raw_awb_parked_saves()
+    # The stale held snapshot never reaches the writer (the writer here is a
+    # stand-in, so the JPG keeps the outside bytes).
+    assert written == [newer]
+    assert jpg.read_bytes() == outside
+    gate.set()
+    controller._cancel_raw_white_balance_operations()
