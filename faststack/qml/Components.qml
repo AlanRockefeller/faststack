@@ -1610,12 +1610,16 @@ Item {
                 updateBrushCursor(mouse.x, mouse.y)
                 if (logicalButton(mouse) === Qt.RightButton) {
                     wbPickPress = true
+                    // The picker owns the gesture now: a middle-drag that
+                    // was under way must not go on panning after it.
+                    middlePanning = false
                     loupeView.controllerRef.cancel_white_balance_pick()
                     return
                 }
                 if (loupeView.uiStateRef.brushPanHeld) return
                 var pickCoords = mapToImageCoordinates(Qt.point(mouse.x, mouse.y))
                 wbPickPress = true
+                middlePanning = false
                 loupeView.controllerRef.pick_white_balance_at(pickCoords.x, pickCoords.y)
                 return
             }
@@ -1901,7 +1905,10 @@ Item {
             // released comes once per button: the gesture the picker took
             // lasts until the last one is up.
             if (wbPickPress) {
-                if (pressedButtons === Qt.NoButton) wbPickPress = false
+                if (pressedButtons === Qt.NoButton) {
+                    wbPickPress = false
+                    middlePanning = false
+                }
                 return
             }
             if (mouse.button === Qt.MiddleButton) {

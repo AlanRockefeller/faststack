@@ -463,6 +463,10 @@ class INatUploadController(QObject):
         self._token_failed_run = False
         self._resume_after_verify = False
         self._grouping_recorded = False
+        # The batch (its photo paths) that made the newest grouping-history
+        # entry. Not kept per batch: a stashed batch's retry must not replace
+        # an entry another batch made since.
+        self._history_newest: Optional[tuple[str, ...]] = None
         # iNat taxon for a (name, rank) the user or Vision chose. Regrouping
         # re-creates cards with the same names; asking iNaturalist again for
         # each one on every slider move would hit its rate limit.
@@ -1186,14 +1190,11 @@ class INatUploadController(QObject):
         in another order share it), each copy as it was when its batch was
         left. Uploads only ever add photos to a card, so the copy with the
         most photos attached is what is on iNaturalist now: only that one is
-        returned, and those with more photos attached come first.
+        returned. Bigger cards come first, so a regroup keeps a card whole
+        rather than the part of it a batch with only some of its photos had.
         """
         newest: dict[tuple[Optional[int], frozenset], Card] = {}
-        for batch in [
-            self._model.cards,
-            *(s["cards"] for s in self._stashed.values()),
-            *batches,
-        ]:
+        for batch in self._held_batches(*batches):
             for card in batch:
                 if not card.locked:
                     continue
@@ -1202,33 +1203,77 @@ class INatUploadController(QObject):
                 held = newest.get(key)
                 if held is None or len(card.photo_ids) > len(held.photo_ids):
                     newest[key] = card
-        return sorted(newest.values(), key=lambda c: len(c.photo_ids), reverse=True)
+        return sorted(
+            newest.values(),
+            key=lambda c: (len(c.group.photos), len(c.photo_ids)),
+            reverse=True,
+        )
+
+    def _held_batches(self, *batches: list[Card]) -> list[list[Card]]:
+        """The cards of the open batch, of every stashed batch and ``batches``."""
+        return [
+            self._model.cards,
+            *(s["cards"] for s in self._stashed.values()),
+            *batches,
+        ]
+
+    def _catch_up_uploads(self, cards: list[Card], *batches: list[Card]) -> None:
+        """Record on each card with an observation the photos any held card
+        for that observation (see _held_batches) attached since, so a retry
+        does not send them a second time."""
+        attached = {
+            (c.obs_id, key): photo_id
+            for batch in self._held_batches(*batches)
+            for c in batch
+            if c.obs_id is not None
+            for key, photo_id in c.photo_ids.items()
+        }
+        for card in cards:
+            if card.obs_id is None:
+                continue
+            found = {
+                p.key: attached[(card.obs_id, p.key)]
+                for p in card.group.photos
+                if p.key not in card.photo_ids and (card.obs_id, p.key) in attached
+            }
+            if found:
+                card.photo_ids.update(found)
+                self._settle_upload_status(card)
+
+    def _settle_upload_status(self, card: Card) -> None:
+        """Status of a card with an observation, from which of its photos are
+        attached to it."""
+        missing = sum(1 for p in card.group.photos if p.key not in card.photo_ids)
+        if missing:
+            card.status = STATUS_ERROR
+            card.status_text = card.upload_error = (
+                f"{missing} of {len(card.group.photos)} photo(s) not attached. "
+                "Upload again to attach the rest."
+            )
+        else:
+            card.status = STATUS_UPLOADED
+            card.status_text = (
+                "Photos added to your existing observation"
+                if card.attach_to is not None and card.obs_id == card.attach_to.id
+                else "Uploaded"
+            )
+            card.upload_error = ""
 
     def _restore_batch(self, state: dict[str, Any]) -> bool:
         """Bring back a batch put aside earlier; False when it is out of date."""
         cards = state["cards"]
-        uploaded_cards = self._uploaded_cards()
         # A photo that went up from another batch since is on iNaturalist now;
         # an old card offering it again would upload it twice. Building the
         # batch afresh keeps the card that uploaded it instead.
-        uploaded = {p.key for c in uploaded_cards for p in c.group.photos}
+        uploaded = {p.key for c in self._uploaded_cards() for p in c.group.photos}
         if any(
             p.key in uploaded for c in cards if not c.locked for p in c.group.photos
         ):
             return False
         # A card of this batch whose upload stopped partway may have been
-        # finished from another batch since: it takes on what that copy knows
-        # is attached, so a retry here does not send a photo a second time.
-        newest = {(c.obs_id, self._photo_set(c)): c for c in uploaded_cards}
-        for card in cards:
-            if not card.locked:
-                continue
-            other = newest.get((card.obs_id, self._photo_set(card)))
-            if other is not None and len(other.photo_ids) > len(card.photo_ids):
-                card.photo_ids = {**card.photo_ids, **other.photo_ids}
-                card.status = other.status
-                card.status_text = other.status_text
-                card.upload_error = other.upload_error
+        # finished from another batch since (the same photos in another order,
+        # or only the missing ones).
+        self._catch_up_uploads([c for c in cards if c.locked])
         state = dict(state)
         state.pop("cards")
         for name, value in state.items():
@@ -1268,14 +1313,28 @@ class INatUploadController(QObject):
         for card in old_cards if locked is None else locked:
             if not card.locked:
                 continue
-            keys = [p.key for p in card.group.photos]
-            if keys and all(k in by_key for k in keys) and not claimed & set(keys):
-                card.group = ObservationGroup(
-                    [by_key[k] for k in keys], ordered=card.group.ordered
-                )
-                card.selected = False
-                kept.append(card)
-                claimed.update(keys)
+            keys = [
+                p.key
+                for p in card.group.photos
+                if p.key in by_key and p.key not in claimed
+            ]
+            if not keys:
+                continue
+            partial = len(keys) < len(card.group.photos)
+            card.group = ObservationGroup(
+                [by_key[k] for k in keys], ordered=card.group.ordered
+            )
+            if partial:
+                # Only some of its photos are in this batch. They belong to its
+                # observation still: a card for just those keeps them on it -
+                # attached ones shown uploaded, the others going to it on a
+                # retry - instead of offering them as a new observation.
+                self._settle_upload_status(card)
+            card.selected = False
+            kept.append(card)
+            claimed.update(keys)
+        if locked is not None:
+            self._catch_up_uploads(kept, locked)
         reusable = {self._photo_set(c): c for c in old_cards if not c.locked}
         groups = initial_grouping(
             [p for p in self._photos if p.key not in claimed],
@@ -3247,6 +3306,7 @@ class INatUploadController(QObject):
         try:
             groups = [c.group.photos for c in self._model.cards]
             pairs = pairs_from_groups(groups, haversine_m)
+            batch = tuple(self._opened_keys)
             self._history.record(
                 self._folder,
                 self._time_gap_s,
@@ -3255,10 +3315,14 @@ class INatUploadController(QObject):
                 photos=len(self._photos),
                 observations=len(groups),
                 # Upload pressed again on this batch (a retry) is the same
-                # decision, not a second batch to learn from.
-                replace_last=self._grouping_recorded,
+                # decision, not a second batch to learn from. Once another
+                # batch was recorded after it, the newest entry is that
+                # batch's, and replacing it would lose it.
+                replace_last=self._grouping_recorded
+                and self._history_newest == batch,
             )
             self._grouping_recorded = True
+            self._history_newest = batch
         except Exception:
             log.debug("Could not record grouping history", exc_info=True)
 

@@ -623,6 +623,8 @@ Window {
         height: Math.min(installPopup.maxHeight, installColumn.implicitHeight + 24)
         padding: 12
         modal: true
+        // Esc closes a popup only while it has the keyboard focus.
+        focus: true
         closePolicy: Popup.CloseOnEscape
         // Driven by st.promptVisible (open()/close(), not a visible binding,
         // which Esc would break).
@@ -1142,7 +1144,9 @@ Window {
                                          : "Remove halo: paint over a stacking halo (downloads an AI model the first time)")
                         onClicked: {
                             if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_halo_brush_mode()
-                            compactEditor.focusKeyboardHandler()
+                            // The first press opens the download prompt, which keeps
+                            // the focus (for Esc) until it is dismissed.
+                            if (!haloInstallPopup.visible) compactEditor.focusKeyboardHandler()
                         }
                         contentItem: Text {
                             text: "Halo"
@@ -1181,7 +1185,7 @@ Window {
                                       : "Select the background by depth (downloads an AI model the first time)"
                         onClicked: {
                             if (compactEditor.controllerRef) compactEditor.controllerRef.select_background()
-                            compactEditor.focusKeyboardHandler()
+                            if (!depthInstallPopup.visible) compactEditor.focusKeyboardHandler()
                         }
                         contentItem: Text {
                             text: "Bkgd"

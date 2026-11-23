@@ -2905,7 +2905,8 @@ class ImageEditor:
         keep highlights; None keeps it tied to ``threshold_percent``. It never
         touches the shadow end: when it would put the white point on the
         black point (in a frame that is not flat at ``threshold_percent``),
-        only the white stretch is dropped, and p_high comes back as 255.
+        only the white stretch is dropped, and p_high comes back as 255. A
+        frame flat at ``threshold_percent`` gets no stretch whatever it is.
 
         ``black_threshold_percent`` clips the shadow end independently of
         ``threshold_percent``. The black point can never sit above this
@@ -3048,15 +3049,22 @@ class ImageEditor:
         else:
             p_low = min(luma_low, min(chan_lows)) * bin_to_255
         p_low = max(0.0, min(255.0, p_low))
-        p_high = white_point(white_threshold_percent)
 
-        # A white point on the black point would stretch without limit. When
-        # the frame is not flat at the shared threshold, only a wider Whites
-        # clip took it there: drop the white stretch alone (white point back
-        # at 255) and keep the black point, which the Whites clip has no say
-        # in. Resetting both would let the Whites clip undo the blacks.
-        if (p_high - p_low) < 1.0 and white_point(threshold_percent) - p_low >= 1.0:
-            p_high = 255.0
+        # Whether the frame is flat is decided at the shared threshold, never
+        # by the Whites clip: a tiny one reaches a few stray bright pixels in
+        # a flat frame, and the black point would then land on the whole
+        # frame and turn it black. A flat frame keeps the shared white point,
+        # so the range check below leaves it alone.
+        p_high = white_point(threshold_percent)
+        if (p_high - p_low) >= 1.0:
+            p_high = white_point(white_threshold_percent)
+            # A white point on the black point would stretch without limit.
+            # The frame is not flat, so only a wider Whites clip took it
+            # there: drop the white stretch alone (white point back at 255)
+            # and keep the black point, which the Whites clip has no say in.
+            # Resetting both would let the Whites clip undo the blacks.
+            if (p_high - p_low) < 1.0:
+                p_high = 255.0
 
         # Check for degenerate range (e.g. flat image) to prevent extreme stretching
         if (p_high - p_low) < 1.0:

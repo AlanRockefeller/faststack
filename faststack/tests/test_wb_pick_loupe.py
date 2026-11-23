@@ -160,6 +160,25 @@ _PROBE = textwrap.dedent(
     settle(10)
     after = main_image.mapToScene(QPointF(0, 0))
     result["chordAfterPick"] = [after.x() - before.x(), after.y() - before.y()]
+
+    # Middle-drag while picking, then a left click picks: once both buttons
+    # are up, moving the mouse must not keep panning.
+    ui.insert("isWbPicking", True)
+    settle(5)
+    QTest.mousePress(window, Qt.MiddleButton, Qt.NoModifier, centre)
+    QTest.mouseMove(window, QPoint(centre.x() + 5, centre.y() + 5))
+    settle(2)
+    QTest.mousePress(window, Qt.LeftButton, Qt.NoModifier, centre)
+    settle(2)
+    QTest.mouseRelease(window, Qt.LeftButton, Qt.NoModifier, centre)
+    QTest.mouseRelease(window, Qt.MiddleButton, Qt.NoModifier, centre)
+    settle(5)
+    before = main_image.mapToScene(QPointF(0, 0))
+    for k in range(1, 8):
+        QTest.mouseMove(window, QPoint(centre.x() + 15 * k, centre.y() + 10 * k))
+        settle(2)
+    after = main_image.mapToScene(QPointF(0, 0))
+    result["hoverAfterMiddleThenPick"] = [after.x() - before.x(), after.y() - before.y()]
     result["calls"] = controller.calls
     print("RESULT " + json.dumps(result))
     """
@@ -219,7 +238,7 @@ def test_the_press_that_picked_does_not_pan(probe):
 
 
 def test_right_click_cancels_instead_of_cropping(probe):
-    assert [c[0] for c in probe["calls"]] == ["pick", "pick", "cancel", "pick"]
+    assert [c[0] for c in probe["calls"]] == ["pick", "pick", "cancel", "pick", "pick"]
     assert ["crop"] not in probe["calls"]
     assert ["stroke"] not in probe["calls"]
     assert probe["rightDragWhilePicking"] == [0.0, 0.0]
@@ -231,3 +250,7 @@ def test_right_click_cancels_instead_of_cropping(probe):
 def test_second_button_during_a_pick_neither_crops_nor_pans(probe):
     # The calls check above covers the crop; this covers the pan.
     assert probe["chordAfterPick"] == [0.0, 0.0]
+
+
+def test_hover_after_a_middle_drag_the_picker_took_over_does_not_pan(probe):
+    assert probe["hoverAfterMiddleThenPick"] == [0.0, 0.0]

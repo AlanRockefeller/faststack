@@ -15110,6 +15110,9 @@ class AppController(
             id(source),
             id(editor.float_preview),
             id(editor.float_image),
+            # A background (depth) layer renders only once its depth map has
+            # arrived, so its arrival must re-render the hover too.
+            id(editor._depth_map),
             repr(sorted((k, v) for k, v in edits.items() if k != "local_layers")),
             tuple(recipe_layers),
         )

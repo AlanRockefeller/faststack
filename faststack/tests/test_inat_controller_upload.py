@@ -59,10 +59,10 @@ class ScriptedTransport:
             return HttpResponse(404, {}, b"{}")
 
 
-def _photos(tmp_path, n):
+def _photos(tmp_path, n, first=0):
     paths = []
     for i in range(n):
-        p = tmp_path / f"IMG_{i}.jpg"
+        p = tmp_path / f"IMG_{first + i}.jpg"
         img = Image.new("RGB", (400, 300), (i * 30, 90, 50))
         exif = Image.Exif()
         exif[0x0132] = f"2026:11:01 10:{i:02d}:00"
@@ -553,4 +553,106 @@ def test_rejected_restore_keeps_the_batch_own_uploaded_cards(qapp, tmp_path):
     up.uploadAll()
     _pump(qapp, up)
     assert _uploads(transport) == (3, 4)
+    up.shutdown()
+
+
+def test_photos_of_an_uploaded_card_opened_alone_stay_on_its_observation(
+    qapp, tmp_path
+):
+    """A card of photos 0 and 1 is uploaded; another batch, then photo 0
+    alone: it is shown on that observation, not offered as a new one."""
+    transport = ScriptedTransport()
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 2)
+    other = tmp_path / "other"
+    other.mkdir()
+    assert up.open(paths)
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (1, 2)
+    assert up.open(_photos(other, 1))
+
+    assert up.open(paths[:1])
+    card = up._model.cards[0]
+    assert [p.key for p in card.group.photos] == paths[:1]
+    assert card.locked and card.obs_id == 1001
+    assert card.status == ctl.STATUS_UPLOADED
+    assert card.group.photos[0] is up._photos[0]
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (1, 2)
+    up.shutdown()
+
+
+def test_photo_left_over_from_a_partial_upload_goes_to_its_observation(
+    qapp, tmp_path
+):
+    """Photo 1 of a card failed to attach. Opened alone it goes to the card's
+    observation on a retry; the whole card, rebuilt or restored, then knows
+    it is there and sends nothing twice."""
+    transport = ScriptedTransport(fail_photo_names={"IMG_1.jpg"})
+    up = _make_controller(qapp, transport, tmp_path)
+    paths = _photos(tmp_path, 3)
+    assert up.open(paths[:2])
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (1, 2)
+
+    assert up.open(paths[1:2])
+    card = up._model.cards[0]
+    assert card.locked and card.obs_id == 1001
+    assert card.status == ctl.STATUS_ERROR
+    transport.fail_photo_names.clear()
+    up.uploadAll()
+    _pump(qapp, up)
+    assert card.status == ctl.STATUS_UPLOADED
+    assert _uploads(transport) == (1, 3)  # to observation 1001, no new one
+
+    assert up.open(paths)  # rebuilt: photos 0 and 1 come back as one card
+    by_photo = {p.key: c for c in up._model.cards for p in c.group.photos}
+    assert by_photo[paths[0]] is by_photo[paths[1]]
+    assert by_photo[paths[0]].status == ctl.STATUS_UPLOADED
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (2, 4)  # only photo 2, as its own observation
+
+    assert up.open(paths[:2])  # restored as it was left, but caught up
+    card = up._model.cards[0]
+    assert card.status == ctl.STATUS_UPLOADED
+    assert set(card.photo_ids) == set(paths[:2])
+    up.uploadAll()
+    _pump(qapp, up)
+    assert _uploads(transport) == (2, 4)
+    up.shutdown()
+
+
+def test_retry_of_a_restored_batch_keeps_another_batch_grouping_record(
+    qapp, tmp_path
+):
+    """A fails, B (same folder) is uploaded, A is retried: the history keeps
+    B's grouping, and a second retry of A does not add another record."""
+    transport = ScriptedTransport(fail_create=True)
+    up = _make_controller(qapp, transport, tmp_path)
+    first = _photos(tmp_path, 2)
+    second = _photos(tmp_path, 3, first=10)
+    assert up.open(first)
+    up.uploadAll()
+    _pump(qapp, up)
+    assert [b.photos for b in up._history.batches] == [2]
+    transport.fail_create = False
+    assert up.open(second)
+    up.uploadAll()
+    _pump(qapp, up)
+    assert [b.photos for b in up._history.batches] == [2, 3]
+
+    transport.fail_create = True
+    assert up.open(first)
+    up.uploadAll()
+    _pump(qapp, up)
+    assert [b.photos for b in up._history.batches] == [2, 3, 2]
+    transport.fail_create = False
+    up.uploadAll()  # a retry right after: the same decision, replaced
+    _pump(qapp, up)
+    assert all(c.status == ctl.STATUS_UPLOADED for c in up._model.cards)
+    assert [b.photos for b in up._history.batches] == [2, 3, 2]
     up.shutdown()

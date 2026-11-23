@@ -828,3 +828,24 @@ def test_releasing_ctrl_keeps_the_mask_while_a_depth_slider_is_dragged():
     stub.set_depth_slider_active(False)
     assert not stub.ui_state.localOverlayHeld
     assert stub.updates == 2  # shown once, hidden once
+
+
+def test_stack_hover_rerenders_when_the_depth_map_arrives():
+    # Stack paint's hover preview renders the background layer too, which
+    # only takes effect once the depth map is there: its arrival has to
+    # change the hover's signature, or the stale preview is kept.
+    from types import SimpleNamespace
+
+    from faststack.app import AppController
+
+    editor = SimpleNamespace(
+        current_edits={"local_layers": []},
+        _mask_assets={},
+        float_preview=None,
+        float_image=None,
+        _depth_map=None,
+    )
+    stub = SimpleNamespace(image_editor=editor)
+    before = AppController._stack_hover_signature(stub, "a.jpg", None)
+    editor._depth_map = _depth_map()
+    assert AppController._stack_hover_signature(stub, "a.jpg", None) != before

@@ -497,6 +497,8 @@ class DepthSelectMixin:
         editor._depth_map = result
         editor.invalidate_render_cache()
         self._kick_preview_worker()
+        # Stack paint's hover preview shows the background layer too.
+        self._schedule_stack_hover()
         self._set_depth_state()
         self._refresh_local_brush_ui()
         self._update_local_overlay()

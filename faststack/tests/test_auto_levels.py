@@ -227,10 +227,13 @@ def test_wide_whites_clip_keeps_the_black_point():
         assert rec["noop_reason"] is None
 
 
-@pytest.mark.parametrize("white", [None, 0.1, 10.0])
+@pytest.mark.parametrize("white", [None, 0.0001, 0.1, 10.0])
 def test_flat_frame_with_stray_pixels_stays_untouched(white):
     # Flat but for a few stray pixels (within the clip budget at either
-    # end): no stretch, however wide the Whites clip.
+    # end): no stretch, whatever the Whites clip. A tiny one (0.0001, which
+    # the Settings tooltip suggests for almost no clipping) reached the stray
+    # bright pixels, and the black point then landed on the whole frame,
+    # turning it black.
     arr = np.full((200, 200, 3), 128, np.uint8)
     arr[0, :10] = 250
     arr[1, :10] = 5
@@ -240,6 +243,10 @@ def test_flat_frame_with_stray_pixels_stays_untouched(white):
     )
     assert (blacks, whites) == (0.0, 0.0)
     assert p_low == _approx_255(128.0) and p_high == _approx_255(128.0)
+    if white is not None:
+        rec = _recommend(editor, white=white)
+        assert (rec["base_blacks"], rec["base_whites"]) == (0.0, 0.0)
+        assert rec["noop_reason"] == "flat image"
 
 
 def _recommend(editor, white=0.0):
