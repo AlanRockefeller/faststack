@@ -1221,3 +1221,60 @@ def test_carried_session_drops_halo_and_depth_of_the_old_pixels(qt_app, tmp_path
     assert controller._halo_token == 1 and controller._depth_token == 1
     controller._schedule_halo_jobs.assert_called_once()
     controller._schedule_depth_job.assert_called_once()
+
+
+# -- Third review round --------------------------------------------------------
+
+
+def test_safe_replace_checks_before_every_rename_attempt(tmp_path, monkeypatch):
+    from faststack.imaging import editor as editor_mod
+
+    target = tmp_path / "a.jpg"
+    target.write_bytes(b"old")
+    tmp = tmp_path / "a.tmp"
+    tmp.write_bytes(b"new")
+    monkeypatch.setattr(editor_mod, "_REPLACE_RETRY_DELAY", 0)
+    real_replace = os.replace
+    attempts = []
+
+    def flaky_replace(src, dst):
+        attempts.append("rename")
+        if len(attempts) == 1:
+            raise PermissionError("locked")
+        real_replace(src, dst)
+
+    calls = []
+
+    def check():
+        calls.append(len(attempts))
+        if len(calls) == 2:
+            raise rawb._JpgChanged
+
+    monkeypatch.setattr(editor_mod.os, "replace", flaky_replace)
+    with pytest.raises(rawb._JpgChanged):
+        editor_mod._safe_replace(tmp, target, check=check)
+    # Checked before the first attempt and again before the retry, which
+    # was then abandoned with the target untouched.
+    assert calls == [0, 1]
+    assert target.read_bytes() == b"old"
+
+
+def test_write_during_the_backup_is_not_replaced(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    real_backup = rawb.create_backup_file
+
+    def backup_then_outside_write(path):
+        backup = real_backup(path)
+        _touch_externally(path)
+        return backup
+
+    with patch.object(rawb, "create_backup_file", backup_then_outside_write):
+        controller.raw_white_balance_to_jpg()
+        _wait(controller)
+
+    outside = Image.open(jpg).convert("RGB").getpixel((5, 5))
+    assert outside[1] > 150  # still the outside write's green
+    assert "changed while RawTherapee was running" in controller.status_messages[-1]
+    assert not list(tmp_path.glob("*backup*"))
+    assert not list(tmp_path.glob(".*.raw-awb.tmp"))

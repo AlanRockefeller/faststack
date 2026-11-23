@@ -461,18 +461,29 @@ def _normalized_wb_gains(by: float, mg: float) -> Tuple[float, float, float]:
     return r_gain, g_gain, b_gain
 
 
-def _safe_replace(tmp_path: Path, target_path: Path) -> None:
+def _safe_replace(
+    tmp_path: Path,
+    target_path: Path,
+    *,
+    check: Optional[Callable[[], None]] = None,
+) -> None:
     """Durably and atomically replace target with tmp.
 
     The temporary file's data is flushed before the rename and the parent
     directory afterwards, so a crash or power loss leaves either the old or the
     new file under ``target_path`` rather than a truncated one. Retries on
     Windows file-lock errors.
+
+    ``check`` runs immediately before each rename attempt (after the flush and
+    any retry delay); it raises to abort with the target left untouched. It
+    must not raise OSError, which is retried.
     """
     # Strict: a write-back error must fail the save rather than replace the
     # original with data that never reached the disk.
     fsync_file(tmp_path, strict=True)
     for attempt in range(_REPLACE_MAX_RETRIES):
+        if check is not None:
+            check()
         try:
             os.replace(str(tmp_path), str(target_path))
             fsync_directory(Path(target_path).parent)

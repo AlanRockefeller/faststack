@@ -1408,22 +1408,26 @@ class RawWhiteBalanceMixin:
         backup_path = create_backup_file(jpg_path)
         if backup_path is None:
             return f"could not back up {jpg_path.name}."
-        if self._file_state_fingerprint(jpg_path) != operation.jpg_fingerprint:
-            # Written to while it was being backed up.
-            try:
-                backup_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return f"{jpg_path.name} changed while RawTherapee was running."
+
+        def unchanged() -> None:
+            # Checked again right before each rename attempt (after the flush
+            # and any retry delay), so a write made while the JPG was backed
+            # up, or since, is not replaced. A stat and a rename are still two
+            # steps; without a conditional replace this is as narrow as it gets.
+            if self._file_state_fingerprint(jpg_path) != operation.jpg_fingerprint:
+                raise _JpgChanged
+
         self._suppress_watcher_paths(jpg_path, backup_path)
         try:
-            _safe_replace(staged, jpg_path)
-        except OSError as exc:
-            log.exception("Could not replace %s", jpg_path)
+            _safe_replace(staged, jpg_path, check=unchanged)
+        except (OSError, _JpgChanged) as exc:
             try:
                 backup_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            if isinstance(exc, _JpgChanged):
+                return f"{jpg_path.name} changed while RawTherapee was running."
+            log.exception("Could not replace %s", jpg_path)
             return f"could not replace {jpg_path.name}: {exc}"
         # Keep the capture-time file date, as FastStack's own saves do, so a
         # folder sorted by date does not move the photo.
@@ -1718,3 +1722,7 @@ class RawWhiteBalanceMixin:
 
 class _Cancelled(Exception):
     pass
+
+
+class _JpgChanged(Exception):
+    """The JPG changed outside FastStack before W could replace it."""
