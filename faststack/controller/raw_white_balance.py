@@ -969,28 +969,65 @@ class RawWhiteBalanceMixin:
         return True
 
     def _raw_awb_release_parked(
-        self, operation: RawWhiteBalanceOperation, *, onto_new_pixels: bool
+        self,
+        operation: RawWhiteBalanceOperation,
+        *,
+        new_snapshot: Optional[dict] = None,
     ) -> bool:
-        """Submit the held save, rendered from the new JPG when
-        ``onto_new_pixels``. Returns True when it was submitted."""
+        """Submit the held save: rendered from the new JPG when given its
+        ``new_snapshot``, else unchanged (onto the old pixels). Returns True
+        when it was submitted or queued."""
         parked, operation.parked = operation.parked, None
         if not parked:
             return False
         request = parked["request"]
-        if onto_new_pixels:
-            try:
-                self._raw_awb_rebase_request(request, operation.jpg_path)
-            except Exception:
-                log.exception(
-                    "Could not move the edits of %s onto the new JPG",
-                    operation.jpg_path,
-                )
-                self._raw_awb_forget_request(request)
-                return False
-        return bool(
-            self._submit_save_request_async(
-                request, saving_status=parked.get("saving_status")
-            )
+        if new_snapshot is not None:
+            self._raw_awb_rebase_request(request, new_snapshot)
+        if self._submit_save_request_async(
+            request, saving_status=parked.get("saving_status")
+        ):
+            return True
+        # Not accepted now (another save of the file is in flight): keep it
+        # for the retry at quit, as a failed background save is kept.
+        target = request.get("context", {}).get("target")
+        if not target:
+            return False
+        self._pending_save_recovery[target] = request
+        log.warning(
+            "Edits held for RAW white balance on %s queued for the save at quit",
+            operation.jpg_path.name,
+        )
+        return True
+
+    def _raw_awb_drop_parked(self, operation: RawWhiteBalanceOperation) -> bool:
+        """The JPG changed outside FastStack while W ran: the held save
+        renders the pixels from before that change, so writing it would
+        replace the outside change. It is dropped, as FastStack drops its
+        deferred saves when Photoshop takes a file over; edits still open in
+        the editor on the photo read as unsaved again. Returns True when a
+        save was dropped."""
+        parked, operation.parked = operation.parked, None
+        if not parked:
+            return False
+        request = parked["request"]
+        self._raw_awb_forget_request(request)
+        if (
+            self._current_image_path_key() == operation.jpg_key
+            and self._raw_awb_editor_holds(operation.jpg_path)
+        ):
+            revision = request.get("context", {}).get("save_revision")
+            if revision is not None:
+                self._mark_current_live_edit_session_save_failed(int(revision))
+        log.warning(
+            "%s changed outside FastStack during RAW white balance; the edits "
+            "held for it were not written",
+            operation.jpg_path.name,
+        )
+        return True
+
+    def _raw_awb_jpg_unchanged(self, operation: RawWhiteBalanceOperation) -> bool:
+        return self._file_state_fingerprint(operation.jpg_path) == (
+            operation.jpg_fingerprint
         )
 
     def _raw_awb_forget_request(self, request: dict) -> None:
@@ -1010,11 +1047,36 @@ class RawWhiteBalanceMixin:
             raise RuntimeError(f"could not load {jpg_path.name}")
         return editor
 
-    def _raw_awb_rebase_request(self, request: dict, jpg_path: Path) -> None:
+    def _raw_awb_new_pixels(
+        self, staged: Path, jpg_path: Path, *, snapshot: bool
+    ) -> tuple[ImageEditor, Optional[dict]]:
+        """Decode RawTherapee's JPG (still staged) for the edits that move
+        onto it. Done before the swap, so that once the JPG is replaced,
+        moving the edits cannot fail on a decode."""
+        fresh = self._raw_awb_fresh_editor(staged)
+        fresh._ensure_float_image()
+        new_snapshot = (
+            fresh.snapshot_for_export(save_target_path=jpg_path) if snapshot else None
+        )
+        return fresh, new_snapshot
+
+    @staticmethod
+    def _raw_awb_point_at(
+        fresh: ImageEditor, new_snapshot: Optional[dict], jpg_path: Path, mtime: float
+    ) -> None:
+        """After the swap: the decoded pixels are the JPG's now, not the
+        staged file's (the edit restore matches requests by these)."""
+        fresh.current_filepath = jpg_path
+        fresh.source_filepath = jpg_path
+        fresh.current_mtime = mtime
+        if new_snapshot is not None:
+            new_snapshot["filepath_snapshot"] = jpg_path
+            new_snapshot["source_filepath"] = jpg_path
+            new_snapshot["current_mtime"] = mtime
+
+    def _raw_awb_rebase_request(self, request: dict, new_snapshot: dict) -> None:
         """Point a captured save request at the new JPG's pixels, keeping its
         edits, masks and layers."""
-        fresh = self._raw_awb_fresh_editor(jpg_path)
-        new = fresh.snapshot_for_export(save_target_path=jpg_path)
         snapshot = request["snapshot"]
         for key in (
             "source_arr",
@@ -1027,7 +1089,7 @@ class RawWhiteBalanceMixin:
             "source_exif",
             "source_icc_bytes",
         ):
-            snapshot[key] = new[key]
+            snapshot[key] = new_snapshot[key]
         # Results worked out on the old pixels do not fit the new ones, even
         # at the same size (the trimmed render usually is); the save works
         # them out again.
@@ -1036,20 +1098,15 @@ class RawWhiteBalanceMixin:
         snapshot["export_cache"] = LayerDensityCache()
         # The saved edit state must name the new JPG (then its backup) as the
         # source, or reopening the editor would bring the camera JPG back.
-        request["context"]["edit_source_path"] = str(jpg_path)
+        request["context"]["edit_source_path"] = str(new_snapshot["filepath_snapshot"])
 
-    def _raw_awb_carry_live_session(self, jpg_path: Path) -> bool:
-        """Put the new JPG's pixels under the open editor session's edits.
+    def _raw_awb_carry_live_session(self, jpg_path: Path, fresh: ImageEditor) -> bool:
+        """Put the new JPG's pixels (decoded into ``fresh``) under the open
+        editor session's edits.
 
         The session stays unsaved, so it is saved like any live edit (on
         navigation, Ctrl+S, quit).
         """
-        try:
-            fresh = self._raw_awb_fresh_editor(jpg_path)
-            fresh._ensure_float_image()
-        except Exception:
-            log.exception("Could not load the new %s into the editor", jpg_path)
-            return False
         editor = self.image_editor
         with editor._lock:
             editor.original_image = fresh.original_image
@@ -1294,10 +1351,20 @@ class RawWhiteBalanceMixin:
                     log.warning("Could not remove %s", staged, exc_info=True)
 
     def _raw_awb_fail(self, operation: RawWhiteBalanceOperation, message: str) -> None:
-        """W did not replace the JPG: edits held for it go onto the old one."""
-        released = self._raw_awb_release_parked(operation, onto_new_pixels=False)
-        if not released:
-            self._raw_awb_restore_stash(operation)
+        """W did not replace the JPG: edits held for it go onto the old one,
+        unless the JPG changed outside FastStack meanwhile."""
+        # Decided by the file, not by why W failed: RawTherapee can also fail
+        # while another program rewrites the JPG.
+        if self._raw_awb_jpg_unchanged(operation):
+            self._raw_awb_release_parked(operation)
+        elif self._raw_awb_drop_parked(operation):
+            message = message.rstrip(".") + (
+                f". {operation.jpg_path.name} changed outside FastStack, so the "
+                "edits saved while RawTherapee ran were not written over it."
+            )
+        # The saved recipe is the editor's again (a held save, when written,
+        # records a newer one).
+        self._raw_awb_restore_stash(operation)
         self._raw_awb_meter_end(operation.operation_id, ok=False)
         self.update_status_message(message, timeout=8000)
 
@@ -1324,6 +1391,15 @@ class RawWhiteBalanceMixin:
             and self._raw_awb_editor_holds(jpg_path)
             and self._current_live_session_has_meaningful_edits()
         )
+        fresh = new_snapshot = None
+        if live or parked_request is not None:
+            try:
+                fresh, new_snapshot = self._raw_awb_new_pixels(
+                    staged, jpg_path, snapshot=parked_request is not None
+                )
+            except Exception as exc:
+                log.exception("Could not decode RawTherapee's JPG %s", staged)
+                return f"could not read RawTherapee's JPG ({exc})."
 
         try:
             original_stat = jpg_path.stat()
@@ -1355,6 +1431,12 @@ class RawWhiteBalanceMixin:
             os.utime(jpg_path, (original_stat.st_atime, original_stat.st_mtime))
         except OSError:
             log.warning("Could not restore timestamps on %s", jpg_path)
+        if fresh is not None:
+            try:
+                new_mtime = jpg_path.stat().st_mtime
+            except OSError:
+                new_mtime = original_stat.st_mtime
+            self._raw_awb_point_at(fresh, new_snapshot, jpg_path, new_mtime)
         log.info(
             "RAW auto white balance replaced %s (backup %s)", jpg_path, backup_path
         )
@@ -1391,13 +1473,13 @@ class RawWhiteBalanceMixin:
             )
         )
 
-        live_carried = live and self._raw_awb_carry_live_session(jpg_path)
+        live_carried = live and self._raw_awb_carry_live_session(jpg_path, fresh)
         saved = False
         if parked_request is not None:
             # The held save is written from the new pixels even when the
             # editor stays open on the photo (Ctrl+S, then kept editing):
             # the JPG gets what was saved, and later edits stay live.
-            saved = self._raw_awb_release_parked(operation, onto_new_pixels=True)
+            saved = self._raw_awb_release_parked(operation, new_snapshot=new_snapshot)
 
         self._refresh_after_raw_awb(
             jpg_path, on_current=on_current, keep_editor=live_carried
@@ -1410,9 +1492,7 @@ class RawWhiteBalanceMixin:
         if live_carried or saved:
             parts.append("your edits moved onto it")
         elif parked_request is not None:
-            parts.append(
-                "but the edits saved while it ran could not be moved onto it"
-            )
+            parts.append("but the edits saved while it ran could not be moved onto it")
         self.update_status_message(", ".join(parts) + " (Ctrl+Z to undo).")
         return None
 
@@ -1595,12 +1675,19 @@ class RawWhiteBalanceMixin:
         if not operations:
             return
         with self._raw_awb_lock:
-            held = []
-            for operation in operations.values():
-                if operation.parked:
-                    held.append(operation.parked)
-                    operation.parked = None
+            pending = list(operations.values())
+            for operation in pending:
                 operation.cancel_requested = True
+        held = []
+        for operation in pending:
+            if not operation.parked:
+                continue
+            if self._raw_awb_jpg_unchanged(operation):
+                held.append(operation.parked)
+                operation.parked = None
+            else:
+                # Changed outside FastStack: the held save would replace it.
+                self._raw_awb_drop_parked(operation)
         for parked in held:
             try:
                 self._run_save_request_sync(parked["request"], saving_status=None)

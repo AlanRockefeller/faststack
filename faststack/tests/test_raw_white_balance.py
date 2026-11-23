@@ -6,7 +6,7 @@ import sys
 import textwrap
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -55,9 +55,7 @@ def _fake_cli(
     log_path = tmp_path / "cli-log.json"
     script = tmp_path / "bin" / "rawtherapee-cli"
     script.parent.mkdir()
-    script.write_text(
-        textwrap.dedent(
-            f"""\
+    script.write_text(textwrap.dedent(f"""\
             #!{sys.executable}
             import json, sys
             from pathlib import Path
@@ -80,9 +78,7 @@ def _fake_cli(
                 Image.new("RGB", {size!r}, (128, 128, 128)).save(out, "JPEG")
             print("Processing " + argv[-1])
             sys.exit({exit_code!r})
-            """
-        )
-    )
+            """))
     script.chmod(0o755)
     return script
 
@@ -854,6 +850,8 @@ def test_held_save_is_written_unchanged_when_w_fails(qt_app, tmp_path):
 
     assert submitted == [request]
     assert request["snapshot"]["source_arr"] is original
+    # The photo's saved recipe is not left hidden for the rest of the session.
+    assert controller.raw_awb_recipe_hidden(controller._key(jpg)) is False
 
 
 def test_live_edits_stay_live_on_the_new_pixels(qt_app, tmp_path):
@@ -871,7 +869,7 @@ def test_live_edits_stay_live_on_the_new_pixels(qt_app, tmp_path):
     gate.set()
     _wait(controller)
 
-    controller._raw_awb_carry_live_session.assert_called_once_with(jpg)
+    controller._raw_awb_carry_live_session.assert_called_once_with(jpg, ANY)
     controller._refresh_after_raw_awb.assert_called_once_with(
         jpg, on_current=True, keep_editor=True
     )
@@ -1003,7 +1001,7 @@ def test_ctrl_s_with_the_editor_left_open_is_written(qt_app, tmp_path):
     gate.set()
     _wait(controller)
 
-    controller._raw_awb_carry_live_session.assert_called_once_with(jpg)
+    controller._raw_awb_carry_live_session.assert_called_once_with(jpg, ANY)
     assert submitted == [request]
     assert request["snapshot"]["source_arr"].mean() == pytest.approx(
         128 / 255, abs=0.02
@@ -1013,20 +1011,134 @@ def test_ctrl_s_with_the_editor_left_open_is_written(qt_app, tmp_path):
     )
 
 
-def test_held_edits_that_cannot_be_moved_are_reported(qt_app, tmp_path):
+def test_unreadable_render_leaves_the_jpg_and_writes_held_edits(qt_app, tmp_path):
+    # RawTherapee's JPG is decoded before the swap: if that fails, W is not
+    # applied, and the held save goes onto the JPG it was made on.
     cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    before = jpg.read_bytes()
+    submitted = _capture_submits(controller)
+    gate = _gated(controller)
+    controller._raw_awb_new_pixels = MagicMock(side_effect=RuntimeError("nope"))
+
+    controller.raw_white_balance_to_jpg()
+    request = _save_request(jpg, controller._key(jpg))
+    original = request["snapshot"]["source_arr"]
+    controller._raw_awb_park_save(request, None)
+    gate.set()
+    _wait(controller)
+
+    assert jpg.read_bytes() == before
+    assert submitted == [request]
+    assert request["snapshot"]["source_arr"] is original
+    assert "could not read RawTherapee's JPG" in controller.status_messages[-1]
+    assert controller.raw_awb_recipe_hidden(controller._key(jpg)) is False
+
+
+def test_held_save_points_at_the_jpg_not_the_staged_file(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path, size=(60, 40))
     controller, jpg, _raw = _controller(tmp_path, cli)
     submitted = _capture_submits(controller)
     gate = _gated(controller)
-    controller._raw_awb_rebase_request = MagicMock(side_effect=RuntimeError("nope"))
 
     controller.raw_white_balance_to_jpg()
-    controller._raw_awb_park_save(_save_request(jpg, controller._key(jpg)), None)
+    request = _save_request(jpg, controller._key(jpg))
+    controller._raw_awb_park_save(request, None)
+    gate.set()
+    _wait(controller)
+
+    assert submitted == [request]
+    snapshot = request["snapshot"]
+    assert Path(snapshot["filepath_snapshot"]) == jpg
+    assert Path(snapshot["source_filepath"]) == jpg
+    assert snapshot["current_mtime"] == jpg.stat().st_mtime
+    assert not list(tmp_path.glob(".*.raw-awb.tmp"))
+
+
+def test_held_save_is_queued_for_quit_when_it_cannot_be_submitted(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path, size=(60, 40))
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller._mark_current_live_edit_session_submitted = MagicMock()
+    controller._remember_pending_edit_save_request = MagicMock()
+    controller._submit_save_request_async = MagicMock(return_value=False)
+    gate = _gated(controller)
+
+    controller.raw_white_balance_to_jpg()
+    request = _save_request(jpg, controller._key(jpg))
+    controller._raw_awb_park_save(request, None)
+    gate.set()
+    _wait(controller)
+
+    # Rebased onto the new pixels, and written by the shutdown recovery.
+    assert controller._pending_save_recovery[str(jpg)] is request
+    assert request["snapshot"]["source_arr"].mean() == pytest.approx(
+        128 / 255, abs=0.02
+    )
+
+
+def _touch_externally(jpg):
+    _write_jpg(jpg, (60, 40), (10, 200, 10))
+    st = jpg.stat()
+    os.utime(jpg, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+
+
+def test_held_save_is_not_written_over_an_outside_change(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    submitted = _capture_submits(controller)
+    controller._mark_current_live_edit_session_save_failed = MagicMock()
+    gate = _gated(controller)
+
+    controller.raw_white_balance_to_jpg()
+    request = _save_request(jpg, controller._key(jpg))
+    controller._raw_awb_park_save(request, None)
+    controller._pending_edit_save_requests[controller._key(jpg)] = request
+    _touch_externally(jpg)
+    outside = jpg.read_bytes()
     gate.set()
     _wait(controller)
 
     assert submitted == []
-    assert "could not be moved" in controller.status_messages[-1]
+    assert jpg.read_bytes() == outside
+    # Not restored on return to the photo either: it renders the old pixels.
+    assert controller._key(jpg) not in controller._pending_edit_save_requests
+    assert "were not written over it" in controller.status_messages[-1]
+
+
+def test_cli_failure_with_an_outside_change_drops_the_held_save(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path, exit_code=3, write=False)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    submitted = _capture_submits(controller)
+    controller._mark_current_live_edit_session_save_failed = MagicMock()
+    gate = _gated(controller)
+
+    controller.raw_white_balance_to_jpg()
+    controller._raw_awb_park_save(_save_request(jpg, controller._key(jpg)), None)
+    _touch_externally(jpg)
+    gate.set()
+    _wait(controller)
+
+    assert submitted == []
+    assert "were not written over it" in controller.status_messages[-1]
+
+
+def test_quit_does_not_write_a_held_save_over_an_outside_change(qt_app, tmp_path):
+    cli = _fake_cli(tmp_path)
+    controller, jpg, _raw = _controller(tmp_path, cli)
+    controller._mark_current_live_edit_session_submitted = MagicMock()
+    controller._remember_pending_edit_save_request = MagicMock()
+    controller._mark_current_live_edit_session_save_failed = MagicMock()
+    controller._run_save_request_sync = MagicMock(return_value=True)
+    gate = _gated(controller)
+
+    controller.raw_white_balance_to_jpg()
+    controller._raw_awb_park_save(_save_request(jpg, controller._key(jpg)), None)
+    _touch_externally(jpg)
+    controller._flush_raw_awb_parked_saves()
+
+    controller._run_save_request_sync.assert_not_called()
+    gate.set()
+    controller._cancel_raw_white_balance_operations()
 
 
 def test_save_on_quit_is_not_overwritten_by_an_older_held_save(qt_app, tmp_path):
@@ -1036,8 +1148,7 @@ def test_save_on_quit_is_not_overwritten_by_an_older_held_save(qt_app, tmp_path)
     controller._remember_pending_edit_save_request = MagicMock()
     written = []
     controller._run_save_request_sync = MagicMock(
-        side_effect=lambda request, saving_status=None: written.append(request)
-        or True
+        side_effect=lambda request, saving_status=None: written.append(request) or True
     )
     gate = _gated(controller)
 
@@ -1070,9 +1181,7 @@ def test_held_save_of_another_photo_is_still_written_on_quit(qt_app, tmp_path):
     controller._raw_awb_park_save(held, None)
     controller._raw_awb_drop_parked_for(str(tmp_path / "other.jpg"))
     controller._flush_raw_awb_parked_saves()
-    controller._run_save_request_sync.assert_called_once_with(
-        held, saving_status=None
-    )
+    controller._run_save_request_sync.assert_called_once_with(held, saving_status=None)
     gate.set()
     controller._cancel_raw_white_balance_operations()
 
@@ -1100,9 +1209,11 @@ def test_carried_session_drops_halo_and_depth_of_the_old_pixels(qt_app, tmp_path
     controller._schedule_halo_jobs = MagicMock()
     controller._schedule_depth_job = MagicMock()
     # The new JPG has the same size as the old one.
-    _write_jpg(jpg, (60, 40), (128, 128, 128))
+    staged = tmp_path / ".a.jpg.0000.raw-awb.tmp"
+    _write_jpg(staged, (60, 40), (128, 128, 128))
+    fresh, _ = controller._raw_awb_new_pixels(staged, jpg, snapshot=False)
 
-    assert controller._raw_awb_carry_live_session(jpg) is True
+    assert controller._raw_awb_carry_live_session(jpg, fresh) is True
     editor = controller.image_editor
     assert editor.float_image.mean() == pytest.approx(128 / 255, abs=0.02)
     assert editor._halo_results == {} and editor._depth_map is None
