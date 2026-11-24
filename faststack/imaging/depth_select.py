@@ -77,6 +77,11 @@ _FEATHER_MAX = 0.4
 # the depth keeps those out of the selection.
 _SHARP_LO = 0.005
 _SHARP_HI = 0.012
+# Soft patches enclosed by sharp ones and smaller than this share of the map
+# (about 66 pixels across at DEPTH_MAP_LONG_EDGE) count as sharp as their
+# surroundings, checked at each of these levels; see _fill_sharp_holes.
+_SHARP_HOLE_FRACTION = 1.0 / 400.0
+_SHARP_HOLE_LEVELS = tuple(np.float32(v / 10.0) for v in range(1, 10))
 
 # Joint bilateral upsampling: low-resolution neighbours on each side, and how
 # quickly a neighbour's weight falls with colour difference (sRGB 0..1).
@@ -202,6 +207,30 @@ def _regional_sharpness(rgb: np.ndarray, sharp: np.ndarray) -> np.ndarray:
     coarse = cv2.resize(sharp, (cw, ch), interpolation=cv2.INTER_AREA)
     up = joint_bilateral_upsample(guide, coarse.astype(np.float32))
     return cv2.resize(up, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _fill_sharp_holes(sharp: np.ndarray) -> np.ndarray:
+    """*sharp* with small soft patches enclosed by sharper ones raised.
+
+    Smooth spots in in-focus bark or soil measure as half sharp and, at a
+    high Amount, poke speckles of selection into the in-focus ground. For
+    each level, every region below it that is small (_SHARP_HOLE_FRACTION
+    of the map) is raised to that level: a hole closes up to about the
+    sharpness around it, while the out-of-focus background, one large
+    region reaching the edges, is left as it is.
+    """
+    cv2 = get_cv2()
+    h, w = sharp.shape
+    limit = h * w * _SHARP_HOLE_FRACTION
+    out = sharp.copy()
+    for level in _SHARP_HOLE_LEVELS:
+        below = (sharp < level).astype(np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(below, connectivity=4)
+        small = np.zeros(n, bool)
+        small[1:] = stats[1:, cv2.CC_STAT_AREA] < limit
+        if small.any():
+            np.maximum(out, np.where(small[labels], level, 0.0), out=out)
+    return out
 
 
 def joint_bilateral_upsample(
@@ -352,6 +381,7 @@ def compute_depth_map(
     if cancelled is not None and cancelled():
         return None
     sharp = np.maximum(sharp, _regional_sharpness(rgb, sharp))
+    sharp = _fill_sharp_holes(sharp.astype(np.float32, copy=False))
     near = np.clip(near, 0.0, 1.0).astype(np.float32, copy=False)
     sharp = np.clip(sharp, 0.0, 1.0).astype(np.float32, copy=False)
     near.setflags(write=False)

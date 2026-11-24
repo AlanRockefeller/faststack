@@ -181,6 +181,16 @@ class LocalAdjustments:
     def roi(self) -> Tuple[slice, slice]:
         return slice(self.y0, self.y1), slice(self.x0, self.x1)
 
+    def rows(self, top: int, bottom: int) -> "LocalAdjustments":
+        """Rows ``top:bottom`` of the ROI (relative to y0) as their own
+        adjustments; the maps are views, not copies."""
+        return dataclasses.replace(
+            self,
+            y0=self.y0 + top,
+            y1=self.y0 + bottom,
+            maps={key: delta[top:bottom] for key, delta in self.maps.items()},
+        )
+
     def has_any(self, keys: Iterable[str]) -> bool:
         return any(key in self.maps for key in keys)
 

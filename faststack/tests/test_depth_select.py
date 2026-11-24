@@ -849,3 +849,68 @@ def test_stack_hover_rerenders_when_the_depth_map_arrives():
     before = AppController._stack_hover_signature(stub, "a.jpg", None)
     editor._depth_map = _depth_map()
     assert AppController._stack_hover_signature(stub, "a.jpg", None) != before
+
+
+def test_small_soft_patches_inside_sharp_ground_count_as_sharp():
+    """Smooth spots in in-focus bark measure half sharp; enclosed and small,
+    they take the sharpness around them, so Keep sharp does not speckle the
+    in-focus ground. The large out-of-focus background stays unsharp."""
+    from faststack.imaging.depth_select import _fill_sharp_holes
+
+    sharp = np.zeros((200, 300), np.float32)
+    sharp[100:, :] = 1.0  # in-focus ground in the lower half
+    sharp[140:150, 100:110] = 0.4  # a smooth spot in it
+    sharp[160:170, 200:210] = 0.0
+    out = _fill_sharp_holes(sharp)
+    assert out[140:150, 100:110].min() >= 0.9
+    assert out[160:170, 200:210].min() >= 0.9
+    assert out[:100].max() == 0.0  # the background is one large region
+    assert out.dtype == np.float32
+
+
+def test_banded_export_of_layers_matches_a_single_pass(monkeypatch):
+    """Big exports run the layers' sRGB step (and the headroom shoulder) in
+    row bands on several threads; the pixels must not change."""
+    from faststack.imaging import editor as editor_mod
+
+    h, w = 96, 128
+    rng = np.random.default_rng(5)
+    base = (rng.random((h, w, 3)) * 0.9 + 0.05).astype(np.float32)
+    mask = MaskData()
+    mask.add_stroke(
+        MaskStroke(points=[(0.3, 0.3), (0.7, 0.6)], radius=0.1, hardness=0.5)
+    )
+    ed = editor_mod.ImageEditor()
+    edits = {
+        **ed.current_edits,
+        "exposure": 0.8,  # some pixels go above 1.0 before the shoulder
+        "local_layers": normalize_local_layers(
+            [
+                _layer(
+                    0.6,
+                    0.3,
+                    {"exposure": -1.0, "vibrance": -0.5, "contrast": 0.3, "whites": 0.4},
+                ),
+                {"id": "L2", "visible": True, "recipe": {"brightness": 0.5, "blacks": -0.2}},
+            ]
+        ),
+    }
+
+    def render():
+        return ed._apply_edits(
+            base,
+            edits,
+            for_export=True,
+            mask_assets_override={"L2": mask},
+            cache_override=LayerDensityCache(),
+            depth_map_override=_depth_map(h, w),
+            protect_input=True,
+            update_highlight_state=False,
+        )
+
+    monkeypatch.setattr(editor_mod, "_EXPORT_PARALLEL_MIN_PIXELS", 10**12)
+    single = render()
+    monkeypatch.setattr(editor_mod, "_EXPORT_PARALLEL_MIN_PIXELS", 0)
+    monkeypatch.setattr(editor_mod.os, "cpu_count", lambda: 4)
+    banded = render()
+    np.testing.assert_array_equal(single, banded)
