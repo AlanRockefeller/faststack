@@ -135,17 +135,19 @@ def _apply_headroom_shoulder(x: np.ndarray, max_overshoot: float = 0.05) -> np.n
         x: Float32 array in linear light, may have values > 1.0
         max_overshoot: Maximum amount to overshoot 1.0 (e.g. 0.05 means max 1.05)
     """
-    mask = x > 1.0
-    if not np.any(mask):
+    if not (x > 1.0).any():
         return x
 
-    out = x.copy()
-    excess = x[mask] - 1.0
     # Rational compression targeting asymptote of 'max_overshoot'
     # y = saturation * x / (saturation + x)  -> asymptotes to saturation
-    # Here x=excess, saturation=max_overshoot
-    compressed_excess = max_overshoot * excess / (max_overshoot + excess)
-    out[mask] = 1.0 + compressed_excess
+    # Here x=excess, saturation=max_overshoot. Elementwise over the whole
+    # array (excess 0 leaves a pixel exactly as it was): gathering and
+    # scattering the pixels above 1.0 by a boolean mask is several times
+    # slower on a full frame.
+    m = np.asarray(max_overshoot, dtype=x.dtype)
+    excess = np.maximum(x - 1.0, 0.0, dtype=x.dtype)
+    out = np.minimum(x, 1.0, dtype=x.dtype)
+    out += m * excess / (m + excess)
     return out
 
 

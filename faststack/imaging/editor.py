@@ -254,6 +254,49 @@ def _apply_in_parallel_bands(operation, source: np.ndarray) -> np.ndarray:
     return output
 
 
+def _apply_local_srgb_in_bands(
+    region_in: np.ndarray, edits: dict, local, *, levels_soft_knee: bool
+) -> np.ndarray:
+    """``apply_local_srgb_block`` over horizontal bands on several threads.
+
+    The block maps every pixel on its own (its numpy passes release the
+    GIL), so each band gets the matching rows of the layer maps and the
+    result is the same as one call; on a 20 MP export with a background
+    layer it is the slowest step by far.
+    """
+    rows = region_in.shape[0]
+    workers = max(1, min(_EXPORT_BAND_WORKERS, os.cpu_count() or 1))
+    if workers < 2 or rows < workers:
+        return apply_local_srgb_block(
+            region_in, edits, local, levels_soft_knee=levels_soft_knee
+        )
+    output = np.empty(region_in.shape, np.float32)
+    band_height = math.ceil(rows / workers)
+
+    def _band(top: int, bottom: int) -> None:
+        output[top:bottom] = apply_local_srgb_block(
+            region_in[top:bottom],
+            edits,
+            local.rows(top, bottom),
+            levels_soft_knee=levels_soft_knee,
+        )
+
+    executor = create_daemon_threadpool_executor(
+        max_workers=workers,
+        thread_name_prefix="ExportPixels",
+    )
+    try:
+        futures = [
+            executor.submit(_band, top, min(rows, top + band_height))
+            for top in range(0, rows, band_height)
+        ]
+        for future in futures:
+            future.result()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    return output
+
+
 # _LEVELS_MIN_SPAN (from local_adjust, shared with the painted ramp) is the
 # narrowest black-to-white span the levels ramp accepts. The Whites/Blacks
 # sliders reach far enough that the endpoints could otherwise cross and turn
@@ -2674,6 +2717,7 @@ class ImageEditor:
             arr = _cancellable_rows(
                 lambda band: _apply_headroom_shoulder(band, max_overshoot=0.05),
                 arr,
+                parallel_export=True,
             )
 
             # 13. Conversion back to sRGB
@@ -2807,12 +2851,25 @@ class ImageEditor:
         _check_cancelled()
 
         if local_srgb_in is not None:
-            region = apply_local_srgb_block(
-                local_srgb_in,
-                edits,
-                local,
-                levels_soft_knee=use_levels_soft_knee,
-            )
+            if (
+                for_export
+                and cancel_check is None
+                and local_srgb_in.shape[0] * local_srgb_in.shape[1]
+                >= _EXPORT_PARALLEL_MIN_PIXELS
+            ):
+                region = _apply_local_srgb_in_bands(
+                    local_srgb_in,
+                    edits,
+                    local,
+                    levels_soft_knee=use_levels_soft_knee,
+                )
+            else:
+                region = apply_local_srgb_block(
+                    local_srgb_in,
+                    edits,
+                    local,
+                    levels_soft_knee=use_levels_soft_knee,
+                )
             if np.may_share_memory(arr, img_arr):
                 arr = arr.copy()  # never write into a shared input buffer
             arr[local.roi] = region
