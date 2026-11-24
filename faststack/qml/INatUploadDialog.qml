@@ -4,6 +4,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Controls.Material 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import "TouchpadScroll.js" as TouchpadScroll
 
 // Actions -> iNaturalist upload. Groups the batch into observation cards,
 // identifies each with MycoMap Vision, lets the user fix the grouping
@@ -80,7 +81,10 @@ Window {
         if (visible) {
             clearPhotoSelection()
             if (controllerRef) controllerRef.dialog_opened("qml-inat-upload")
-            if (uploader && !(uploader.hasInatToken && uploader.hasVisionKey)) settingsPopup.open()
+            // Settings only when there is no usable token: none saved, or
+            // one that has expired. A token iNaturalist turns down opens
+            // them too, once checkToken hears back (onTokenRejected).
+            if (uploader && (!uploader.hasInatToken || uploader.tokenSecondsLeft === 0)) settingsPopup.open()
             if (uploader) uploader.checkToken()
         } else {
             photoViewer.close()
@@ -103,6 +107,10 @@ Window {
             return
         }
         if (uploader) uploader.cancelIdentify()
+        // A name or note still being typed is only saved on editingFinished,
+        // which closing the window does not send: save it here.
+        var focused = dialog.activeFocusItem
+        if (focused && typeof focused.commitEdit === "function") focused.commitEdit()
     }
 
     // Upload, after asking about a token in its last minutes and about
@@ -641,6 +649,12 @@ Window {
             Layout.fillHeight: true
             clip: true
             contentWidth: availableWidth
+            // The vertical scroll bar sits on the right edge of the view; keep
+            // a fixed gutter for it so it runs beside the cards, not over
+            // them. A constant, wide enough for the bar in mouse and touch
+            // modes (Material: 8-16 px), so the cards never reflow (and
+            // re-run applyHold) when the bar appears or changes width.
+            rightPadding: 22
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             Column {
@@ -653,7 +667,8 @@ Window {
 
                 // The mouse wheel moves the list a good part of a card per
                 // notch; the Flickable's own step is a few text lines, which
-                // crawls past cards this tall. A touchpad keeps its own pace.
+                // crawls past cards this tall. A touchpad's pixel deltas are
+                // scaled up by TouchpadScroll for the same reason.
                 WheelHandler {
                     acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
                     onWheel: function(event) {
@@ -662,7 +677,7 @@ Window {
                         var touchpad = event.device.type === PointerDevice.TouchPad && event.pixelDelta.y !== 0
                         if (touchpad) {
                             wheelScroll.stop()
-                            flick.contentY = Math.max(0, Math.min(maxY, flick.contentY - event.pixelDelta.y))
+                            flick.contentY = Math.max(0, Math.min(maxY, flick.contentY - TouchpadScroll.pixels(event.pixelDelta.y)))
                             return
                         }
                         if (event.angleDelta.y === 0) return
@@ -2148,10 +2163,13 @@ Window {
                     placeholderText: card.attached ? "The existing observation keeps its own name" : "Scientific name (or leave blank)"
                     enabled: card.status !== "uploading" && card.status !== "uploaded" && !card.attached
                     // Upright on purpose: italics are correct for a name but harder to read while typing.
+                    function commitEdit() {
+                        if (text !== card.model.chosenName) dialog.uploader.setChosenName(card.cardId, text, "")
+                    }
                     onEditingFinished: {
                         suggestTimer.stop()
                         suggestPopup.close()
-                        if (text !== card.model.chosenName) dialog.uploader.setChosenName(card.cardId, text, "")
+                        commitEdit()
                     }
 
                     // Autocomplete from iNaturalist. "p semilanc" offers Psilocybe semilanceata.
@@ -2276,6 +2294,9 @@ Window {
                     text: card.model.description
                     placeholderText: "Description for iNaturalist (habitat, substrate, smell…)"
                     enabled: card.status !== "uploading" && card.status !== "uploaded" && !card.attached
+                    function commitEdit() {
+                        if (text !== card.model.description) dialog.uploader.setDescription(card.cardId, text)
+                    }
                     onEditingFinished: dialog.uploader.setDescription(card.cardId, text)
                 }
             }

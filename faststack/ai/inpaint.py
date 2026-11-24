@@ -68,7 +68,52 @@ LAMA_BYTES = 208_044_816
 LAMA_FILENAME = "lama_fp32.onnx"
 LAMA_INPUT = 512
 
-_USER_AGENT = "FastStack (inpainting model download)"
+
+@dataclasses.dataclass(frozen=True)
+class ModelSpec:
+    """One downloadable ONNX model: where it comes from and how to verify it.
+
+    Each feature downloads only its own model (plus the shared ONNX Runtime),
+    so neither needs the other's download.
+    """
+
+    label: str  # shown in the download progress, e.g. "LaMa model"
+    url: str
+    sha256: str
+    size: int
+    filename: str
+    part_prefix: str  # of the temporary file while downloading
+
+    @property
+    def path(self) -> Path:
+        return ai_dir() / "models" / self.filename
+
+    def installed(self) -> bool:
+        try:
+            return self.path.is_file() and self.path.stat().st_size == self.size
+        except OSError:
+            return False
+
+
+LAMA_MODEL = ModelSpec(
+    label="LaMa model",
+    url=LAMA_URL,
+    sha256=LAMA_SHA256,
+    size=LAMA_BYTES,
+    filename=LAMA_FILENAME,
+    part_prefix=".lama-",
+)
+
+# Every model's temporary-file prefix, for ``sweep_leftovers``.
+_PART_PREFIXES = {LAMA_MODEL.part_prefix}
+
+
+def register_model(spec: ModelSpec) -> ModelSpec:
+    """Let ``sweep_leftovers`` clean up after *spec*'s interrupted downloads."""
+    _PART_PREFIXES.add(spec.part_prefix)
+    return spec
+
+_USER_AGENT = "FastStack (model download)"
 _CHUNK = 1 << 20
 
 ProgressFn = Callable[[int, int, str], None]  # (done_bytes, total_bytes, what)
@@ -87,7 +132,7 @@ def ai_dir() -> Path:
 
 
 def model_path() -> Path:
-    return ai_dir() / "models" / LAMA_FILENAME
+    return LAMA_MODEL.path
 
 
 def _python_tag() -> str:
@@ -124,11 +169,7 @@ def runtime_installed() -> bool:
 
 
 def model_installed() -> bool:
-    path = model_path()
-    try:
-        return path.is_file() and path.stat().st_size == LAMA_BYTES
-    except OSError:
-        return False
+    return LAMA_MODEL.installed()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,14 +185,15 @@ class InstallStatus:
         return self.runtime_ready and self.model_ready
 
 
-def install_status() -> InstallStatus:
+def install_status(spec: ModelSpec = LAMA_MODEL) -> InstallStatus:
+    """What *spec*'s feature still needs downloaded (the runtime is shared)."""
     runtime_ready = runtime_installed()
-    model_ready = model_installed()
+    model_ready = spec.installed()
     download = (0 if runtime_ready else ORT_APPROX_BYTES) + (
-        0 if model_ready else LAMA_BYTES
+        0 if model_ready else spec.size
     )
     disk = (0 if runtime_ready else ORT_APPROX_INSTALLED_BYTES) + (
-        0 if model_ready else LAMA_BYTES
+        0 if model_ready else spec.size
     )
     return InstallStatus(runtime_ready, model_ready, download, disk, str(ai_dir()))
 
@@ -283,19 +325,22 @@ def _install_model(
     cancelled: Optional[Callable[[], bool]],
     done_before: int,
     total: int,
+    spec: ModelSpec = LAMA_MODEL,
 ) -> int:
-    dest = model_path()
+    dest = spec.path
     dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".lama-", suffix=".part", dir=dest.parent)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=spec.part_prefix, suffix=".part", dir=dest.parent
+    )
     os.close(fd)
     tmp = Path(tmp_name)
     try:
         got = _download(
-            LAMA_URL,
+            spec.url,
             tmp,
-            LAMA_SHA256,
-            LAMA_BYTES,
-            "LaMa model",
+            spec.sha256,
+            spec.size,
+            spec.label,
             progress,
             cancelled,
             done_before,
@@ -304,7 +349,7 @@ def _install_model(
         tmp.replace(dest)
     finally:
         tmp.unlink(missing_ok=True)
-    log.info("Installed LaMa model into %s", dest)
+    log.info("Installed %s into %s", spec.label, dest)
     return got
 
 
@@ -335,7 +380,9 @@ def sweep_leftovers(max_age_s: float = _LEFTOVER_AGE_S) -> None:
     now is left alone.
     """
     root = ai_dir()
-    candidates = list(root.glob(".ort-*")) + list((root / "models").glob(".lama-*.part"))
+    candidates = list(root.glob(".ort-*"))
+    for prefix in sorted(_PART_PREFIXES):
+        candidates += list((root / "models").glob(f"{prefix}*.part"))
     now = time.time()
     for path in candidates:
         try:
@@ -353,23 +400,25 @@ def sweep_leftovers(max_age_s: float = _LEFTOVER_AGE_S) -> None:
 def install(
     progress: Optional[ProgressFn] = None,
     cancelled: Optional[Callable[[], bool]] = None,
+    spec: ModelSpec = LAMA_MODEL,
 ) -> None:
-    """Download and install whatever is missing.  Runs on a worker thread.
+    """Download and install whatever *spec*'s feature is missing.  Runs on a
+    worker thread; two installs must not run at once (they share the runtime).
 
     Raises DownloadCancelled, InpaintUnavailable or OSError (network, disk,
     checksum).  A failed or cancelled download leaves nothing half-installed;
     one cut short by quitting is cleaned up by ``sweep_leftovers``.
     """
     sweep_leftovers()
-    status = install_status()
+    status = install_status(spec)
     total = status.download_bytes
     done = 0
     if not status.runtime_ready:
         done += _install_runtime(progress, cancelled, done, total)
         # The approximate size was only for the prompt; keep the bar honest.
-        total = max(total, done + (0 if status.model_ready else LAMA_BYTES))
+        total = max(total, done + (0 if status.model_ready else spec.size))
     if not status.model_ready:
-        done += _install_model(progress, cancelled, done, total)
+        done += _install_model(progress, cancelled, done, total, spec)
     if progress is not None:
         progress(done, max(total, done), "done")
 
@@ -377,6 +426,11 @@ def install(
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
+
+
+def load_onnxruntime() -> ModuleType:
+    """Import ONNX Runtime (ours, else a system one); raises InpaintUnavailable."""
+    return _load_onnxruntime()
 
 
 def _load_onnxruntime() -> ModuleType:

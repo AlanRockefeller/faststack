@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls
+import "TouchpadScroll.js" as TouchpadScroll
 
 // Main grid view for thumbnail browser
 Item {
@@ -490,7 +491,8 @@ Item {
     // drags still reach the tiles. Qt on Wayland reports plain mouse wheels as
     // device type TouchPad, so device type can't be trusted: notched wheels
     // arrive with pixelDelta == 0, real touchpad scrolls with pixelDelta set.
-    // Touchpad deltas are applied here pixel-for-pixel: once this handler has
+    // Touchpad deltas are applied here too, scaled by TouchpadScroll (raw
+    // pixel deltas crawl through a long folder): once this handler has
     // taken the event, setting event.accepted = false does not reliably hand
     // it back to the GridView, so "falling through" would drop the scroll.
     Item {
@@ -503,7 +505,7 @@ Item {
                     angleAccum = 0
                     thumbnailGrid.cancelFlick()
                     thumbnailGrid.contentY = gridViewRoot.clampContentY(
-                        thumbnailGrid.contentY - event.pixelDelta.y)
+                        thumbnailGrid.contentY - TouchpadScroll.pixels(event.pixelDelta.y))
                     return
                 }
                 angleAccum += event.angleDelta.y

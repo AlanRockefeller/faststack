@@ -15,6 +15,7 @@ from datetime import date, datetime, timezone
 import os
 import re
 import shutil
+import tempfile
 import uuid
 import functools
 from contextlib import contextmanager
@@ -132,7 +133,7 @@ from faststack.imaging.prefetch import (
     held_navigation_quality_max_dimension,
     normalize_held_navigation_quality,
 )
-from faststack.ui.keystrokes import Keybinder
+from faststack.ui.keystrokes import Keybinder, bracket_size_step
 from faststack.imaging.editor import (
     ASPECT_RATIOS,
     DEFAULT_PREVIEW_MASTER_BOX,
@@ -158,6 +159,7 @@ from faststack.imaging.mask_engine import (
 from faststack.imaging.metadata import get_exif_data
 from faststack.imaging.optional_deps import get_cv2
 from faststack.imaging.halo_fix import halo_layers, is_halo_layer
+from faststack.imaging.depth_select import depth_layer_density, is_depth_layer
 from faststack.imaging.stack_paint import (
     BASE_SPACE_EDITS,
     STACK_OUTPUT_SOURCE,
@@ -499,9 +501,12 @@ from faststack.controller.image_editor_handoff import (
     PhotoshopHandoffState,
 )
 from faststack.controller.halo_removal import HaloRemovalMixin
+from faststack.controller.depth_select import DepthSelectMixin
 from faststack.controller.loupe_display import LoupeDisplayMixin
 from faststack.controller.navigation import NavigationMixin
+from faststack.controller.raw_white_balance import RawWhiteBalanceMixin
 from faststack.controller.save_pipeline import SavePipelineMixin
+from faststack.controller.white_balance_picker import WhiteBalancePickerMixin
 
 
 class AppController(
@@ -510,6 +515,9 @@ class AppController(
     SavePipelineMixin,
     ImageEditorHandoffMixin,
     HaloRemovalMixin,
+    RawWhiteBalanceMixin,
+    DepthSelectMixin,
+    WhiteBalancePickerMixin,
     QObject,
 ):
     dataChanged = Signal()  # New signal for general data changes
@@ -548,6 +556,8 @@ class AppController(
     editSourceModeChanged = Signal(str)  # Notify when JPEG/RAW mode changes
     rawDevelopmentStateChanged = Signal()  # Notify when RAW development starts/stops
     _rawDevelopmentFinished = Signal(object)
+    _rawWhiteBalanceFinished = Signal(object)  # W: RawTherapee auto-WB JPG
+    _rawWhiteBalanceProgress = Signal(object)  # W: stage updates for the meter
     _saveFinished = Signal(
         object
     )  # Signal for save completion (result or error from background)
@@ -561,6 +571,9 @@ class AppController(
     _haloResultReady = Signal(object)  # Halo removal: one layer's correction
     _haloInstallProgress = Signal(object)  # Halo removal: download progress
     _haloInstallDone = Signal(object)  # Halo removal: download finished/failed
+    _depthResultReady = Signal(object)  # Background selection: the depth map
+    _depthInstallProgress = Signal(object)  # Depth model: download progress
+    _depthInstallDone = Signal(object)  # Depth model: download finished/failed
     _stackHoverReady = Signal(object)  # Stack paint: hover preview render
     # (SidecarManager, outcome) from the background session-position write
     _sessionSidecarWriteFinished = Signal(object, str)
@@ -1107,6 +1120,11 @@ class AppController(
         self.ui_state.isDecoding = False  # Initialize decoding indicator
         # Halo removal brush (faststack/controller/halo_removal.py).
         self._init_halo_removal()
+        # W: re-render the JPG from its RAW with auto white balance
+        # (faststack/controller/raw_white_balance.py).
+        self._init_raw_white_balance()
+        # Background selection by depth (faststack/controller/depth_select.py).
+        self._init_depth_select()
         self.is_zoomed = False  # Track zoom state for high-res loading logic
 
         # Connect model selection changes to UIState for QML property notification
@@ -1338,6 +1356,10 @@ class AppController(
         self.auto_level_black_threshold = config.getfloat(
             "core", "auto_level_black_threshold", 0.0
         )
+        # 0 == follow auto_level_threshold. See _white_threshold_percent().
+        self.auto_level_white_threshold = config.getfloat(
+            "core", "auto_level_white_threshold", 0.0
+        )
         self.auto_level_strength = config.getfloat("core", "auto_level_strength", 1.0)
         self.auto_level_strength_auto = config.getboolean(
             "core", "auto_level_strength_auto", False
@@ -1348,9 +1370,7 @@ class AppController(
         self.auto_level_midtone = config.getboolean("core", "auto_level_midtone", True)
         # Swap what the left and right buttons do in the image view, the
         # thumbnail grid and the map picker (left-handed use).
-        self.swap_mouse_buttons = config.getboolean(
-            "core", "swap_mouse_buttons", False
-        )
+        self.swap_mouse_buttons = config.getboolean("core", "swap_mouse_buttons", False)
         self.auto_level_midtone_target = config.getfloat(
             "core", "auto_level_midtone_target", 0.38
         )
@@ -2817,6 +2837,12 @@ class AppController(
                 and self._handle_brush_mode_key(event)
             ):
                 return True
+            if (
+                self.ui_state.isWbPicking
+                and not self._is_grid_view_active
+                and self._handle_wb_pick_key(event)
+            ):
+                return True
             if event.key() == Qt.Key_Space and self._can_show_original_compare(event):
                 if not event.isAutoRepeat():
                     self.start_original_compare_preview()
@@ -2928,8 +2954,9 @@ class AppController(
                 return False  # Esc closes the histogram first, as elsewhere
             self.exit_local_brush_mode()
             return True
-        if key in (Qt.Key_BracketLeft, Qt.Key_BracketRight) and not mods:
-            self.adjust_brush_size(1 if key == Qt.Key_BracketRight else -1)
+        step = bracket_size_step(event)
+        if step:
+            self.adjust_brush_size(step)
             return True
         if key == Qt.Key_Z and mods == Qt.ControlModifier:
             self.undo_local_stroke()
@@ -4236,6 +4263,19 @@ class AppController(
         """Switch loupe view to a different variant file."""
         norm = norm_path(Path(path_str))
 
+        if (
+            self.image_files
+            and self.current_index < len(self.image_files)
+            and norm != norm_path(self.image_files[self.current_index].path)
+            and self.raw_awb_pending_for_current()
+        ):
+            # A save from a backup view writes the main JPG, which W is
+            # replacing (faststack/controller/raw_white_balance.py).
+            self.update_status_message(
+                "RAW white balance is still running; switch versions when it is done."
+            )
+            return
+
         # If selecting main, clear override
         if self.image_files and self.current_index < len(self.image_files):
             main_norm = norm_path(self.image_files[self.current_index].path)
@@ -4459,6 +4499,9 @@ class AppController(
         """
         try:
             current = str(Path(self.image_dir).expanduser().resolve())
+            # A temp folder is never resumed, so keep the real last folder.
+            if _is_temporary_directory(current):
+                return
             if current and current != self._last_persisted_dir:
                 config.set("core", "last_directory", current)
                 config.save()
@@ -4791,6 +4834,9 @@ class AppController(
         ):
             mask_data = self.image_editor._mask_assets.get(layer["id"])
             if mask_data is not None and mask_data.has_strokes():
+                return True
+            # A background selection needs no strokes to change the photo.
+            if is_depth_layer(layer) and layer["depth"].get("amount", 0.0) > 0.0:
                 return True
 
         return False
@@ -5187,6 +5233,11 @@ class AppController(
         value = self.auto_level_black_threshold
         return value if value > 0.0 else None
 
+    def _white_threshold_percent(self) -> Optional[float]:
+        """Highlight-end clip percentile, or None to follow the shared threshold."""
+        value = self.auto_level_white_threshold
+        return value if value > 0.0 else None
+
     def _compute_auto_levels_recommendation(self) -> dict[str, Any]:
         """Compute the current baseline auto-level recommendation."""
         blacks, whites, p_low, p_high = self.image_editor.analyze_auto_levels(
@@ -5194,6 +5245,7 @@ class AppController(
             reset_levels=True,
             channel_budget=self.auto_level_channel_budget,
             black_threshold_percent=self._black_threshold_percent(),
+            white_threshold_percent=self._white_threshold_percent(),
         )
 
         dynamic_range = p_high - p_low
@@ -5283,6 +5335,28 @@ class AppController(
                     factor = max(
                         _AUTO_MIDTONE_MAX_DROP, min(_AUTO_MIDTONE_MAX_LIFT, factor)
                     )
+                    if factor > 1.0 and self._white_threshold_percent() is not None:
+                        # Positive contrast renders after brightness but is
+                        # already in p_high, so the projection below would be
+                        # wrong; skip the lift rather than guess.
+                        try:
+                            contrast = float(
+                                self.image_editor.get_edit_value("contrast", 0.0) or 0.0
+                            )
+                        except (TypeError, ValueError):
+                            contrast = 0.0
+                        if contrast > 0.001:
+                            factor = 1.0
+                        # An explicit Whites Clip % is the user's highlight
+                        # budget, so the lift may not spend more of it. A
+                        # positive Brightness rolls everything above 0.9
+                        # output toward white; keep the post-stretch white
+                        # point below that knee. A full stretch already puts
+                        # it at 1.0, which leaves no room to lift, while a
+                        # dark photo whose stretch hit the cap still has room.
+                        white_ref = (p_high / 255.0 - bp) / span
+                        if white_ref > 0.0:
+                            factor = min(factor, max(1.0, 0.9 / white_ref))
                     if abs(factor - 1.0) >= 0.02:
                         base_brightness = factor - 1.0
 
@@ -5821,6 +5895,8 @@ class AppController(
 
         if active and self.ui_state.isBrushMode:
             self.exit_local_brush_mode()
+        if active:
+            self.cancel_white_balance_pick()
         self._is_grid_view_active = active
 
         if active:
@@ -7803,9 +7879,7 @@ class AppController(
         log.info("Clearing all defined stacks.")
         undo_data = self._snapshot_stacks_for_undo()
         if undo_data is not None:
-            undo_data["live_edit_mark"] = (
-                self._get_current_preview_session_provenance()
-            )
+            undo_data["live_edit_mark"] = self._get_current_preview_session_provenance()
             # Recorded before the write so a failed persist is still undoable.
             self.undo_history.append(("clear_stacks", undo_data, time.time()))
         self.stacks = []
@@ -9084,6 +9158,18 @@ class AppController(
         value = max(0.0, min(50.0, value))
         self.auto_level_black_threshold = value
         config.set("core", "auto_level_black_threshold", f"{value:.6g}")
+        config.save()
+
+    @Slot(result=float)
+    def get_auto_level_white_threshold(self):
+        return self.auto_level_white_threshold
+
+    @Slot(float)
+    def set_auto_level_white_threshold(self, value):
+        # 0 means "follow the shared clip threshold"; same bounds as it.
+        value = max(0.0, min(1.0, value))
+        self.auto_level_white_threshold = value
+        config.set("core", "auto_level_white_threshold", f"{value:.6g}")
         config.save()
 
     @Slot(result=float)
@@ -11559,6 +11645,8 @@ class AppController(
             "auto_levels",
             "auto_adjust",
             "crop",
+            # W; RAW_WHITE_BALANCE_ACTION in controller/raw_white_balance.py
+            "raw_white_balance",
         }:
             try:
                 (
@@ -11605,6 +11693,8 @@ class AppController(
                         self.update_status_message("Undid auto levels")
                     elif action_type == "auto_adjust":
                         self.update_status_message("Undid auto adjust")
+                    elif action_type == "raw_white_balance":
+                        self.update_status_message("Undid RAW white balance")
                     else:
                         self.update_status_message("Undid crop")
             except (FileNotFoundError, OSError, shutil.Error) as e:
@@ -11614,6 +11704,8 @@ class AppController(
 
     def shutdown_qt(self):
         """Shutdown Qt objects only - MUST run on main/Qt thread."""
+        # Edits parked behind a running W are written before anything else.
+        self._flush_raw_awb_parked_saves()
         # Persist the current live edit session before tearing down Qt so
         # preview-only quick actions and editor changes are not lost on exit.
         if not self._shutdown_flush_prepared:
@@ -11750,6 +11842,7 @@ class AppController(
                 log.debug("iNat upload shutdown failed", exc_info=True)
         self._exif_pending_path = None  # optional but consistent with shutdown_qt
         self._cancel_raw_development_operations()
+        self._cancel_raw_white_balance_operations()
 
         if self._pending_delete_jobs:
             log.info(
@@ -11796,6 +11889,7 @@ class AppController(
             wait=False,
         )
         self._shutdown_halo_removal()
+        self._shutdown_depth_select()
         # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
         self._safe_shutdown_executor(
             self._save_executor, "save", wait=True, cancel_futures=False
@@ -12859,7 +12953,9 @@ class AppController(
             if not img.path.exists():
                 continue
             is_developed_artifact = img.path.stem.lower().endswith("-developed")
-            if (in_raw_mode or is_developed_artifact) and img.developed_jpg_path.exists():
+            if (
+                in_raw_mode or is_developed_artifact
+            ) and img.developed_jpg_path.exists():
                 send.append(img.developed_jpg_path)
             else:
                 send.append(img.path)
@@ -13685,6 +13781,7 @@ class AppController(
         self._refresh_stack_inputs()
         self._ensure_stack_sources_for_edits()
         self._schedule_halo_jobs()
+        self._schedule_depth_job()
         edits = self.image_editor.current_edits
         for key, value in edits.items():
             if hasattr(self.ui_state, key):
@@ -13943,6 +14040,7 @@ class AppController(
         """
         if self.ui_state.isBrushMode:
             self.exit_local_brush_mode()
+        self.cancel_white_balance_pick()
         self._local_brush_recipe = {}
         editor = self.image_editor
         if (
@@ -13960,6 +14058,8 @@ class AppController(
         editor._stack_sources_session_id = None
         editor._halo_results = {}
         self._halo_reset_for_navigation()
+        editor._depth_map = None
+        self._depth_reset_for_navigation()
         if editor.current_edits.get("local_layers"):
             editor.set_local_layers([])
         self._reset_local_brush_session_state()
@@ -14008,6 +14108,7 @@ class AppController(
             self.ui_state.isEditorOpen = True
         if not self._prepare_local_brush_image_state():
             return False
+        self.cancel_white_balance_pick()
         if self._local_painting_layer_id is not None:
             self.finish_local_stroke()
         self.ui_state.brushTool = tool
@@ -14057,9 +14158,13 @@ class AppController(
 
     @Slot()
     def exit_local_brush_mode(self):
+        # Everything that ends the brushes (crop, grid view, closing the
+        # editor) ends the white balance picker's ring too.
+        self.cancel_white_balance_pick()
         if self._local_painting_layer_id is not None:
             self.finish_local_stroke()
         self.ui_state.brushPanHeld = False
+        self._local_overlay_hold_sources = frozenset()
         self.ui_state.localOverlayHeld = False
         self._clear_stack_hover()
         if self.ui_state.isBrushMode:
@@ -14077,6 +14182,8 @@ class AppController(
         # get a fresh correction; before the refresh, so the layer list
         # shows the new job.
         self._schedule_halo_jobs(refresh_ui=False)
+        # A new depth layer needs the photo's depth estimated.
+        self._schedule_depth_job()
         self._refresh_local_brush_ui()
 
     @Slot(str, float)
@@ -14101,6 +14208,8 @@ class AppController(
             for layer in self._local_layers()
         ]
         self._commit_local_layers(layers, f"local layer recipe changed '{key}'")
+        # A background selection changes the photo without strokes.
+        self._auto_add_depth_edit_to_batch({**editing, "recipe": recipe})
 
     @Slot(str)
     def select_local_layer(self, layer_id: str):
@@ -14114,7 +14223,12 @@ class AppController(
         if not layer_id or layer_id == self._local_editing_layer_id:
             previous = self._local_layer(self._local_editing_layer_id)
             self._local_editing_layer_id = None
-            if previous is not None:
+            if is_depth_layer(previous):
+                # Leaving a background selection for ordinary dodge & burn:
+                # start from a clean brush, not the background's recipe.
+                self._local_brush_recipe = {}
+                self._local_active_layer_id = None
+            elif previous is not None:
                 # Keep painting the layer just edited unless the recipe moves.
                 self._local_brush_recipe = dict(previous["recipe"])
                 self._local_active_layer_id = previous["id"]
@@ -14186,7 +14300,12 @@ class AppController(
             if active is None:
                 self.update_status_message("Nothing to erase on this layer")
             return active["id"] if active is not None else None
-        if active is not None and active["recipe"] == self._local_brush_recipe:
+        if (
+            active is not None
+            and active["recipe"] == self._local_brush_recipe
+            # A background selection is only painted on while it is selected.
+            and not is_depth_layer(active)
+        ):
             return active["id"]
         if not self._local_brush_recipe:
             self.update_status_message(
@@ -14393,7 +14512,10 @@ class AppController(
         emptied = []
         for layer_id in targets:
             assets[layer_id].undo_last_stroke()
-            if not assets[layer_id].has_strokes():
+            # A background selection is still a layer without its strokes.
+            if not assets[layer_id].has_strokes() and not is_depth_layer(
+                self._local_layer(layer_id)
+            ):
                 emptied.append(layer_id)
         # An emptied layer is just clutter in the list.
         for layer_id in emptied:
@@ -14423,7 +14545,20 @@ class AppController(
         self.ui_state.localOverlayVisible = not self.ui_state.localOverlayVisible
         self._update_local_overlay()
 
-    def _set_local_overlay_held(self, held: bool) -> None:
+    # What is holding the dodge & burn mask on screen: "key" (Ctrl held) and
+    # "slider" (a background slider being dragged). Either one keeps it
+    # shown, so letting go of one does not hide it while the other holds.
+    # A class default: test stubs and mixins may skip __init__.
+    _local_overlay_hold_sources: frozenset = frozenset()
+
+    def _set_local_overlay_held(self, held: bool, source: str = "key") -> None:
+        sources = set(self._local_overlay_hold_sources)
+        if held:
+            sources.add(source)
+        else:
+            sources.discard(source)
+        self._local_overlay_hold_sources = frozenset(sources)
+        held = bool(sources)
         if self.ui_state.localOverlayHeld != held:
             self.ui_state.localOverlayHeld = held
             self._update_local_overlay()
@@ -14461,10 +14596,15 @@ class AppController(
             mask = self.image_editor._mask_assets.get(layer["id"])
             stack = is_stack_layer(layer)
             halo = is_halo_layer(layer)
+            depth = is_depth_layer(layer)
             rows.append(
                 {
                     "id": layer["id"],
-                    "kind": "stack" if stack else ("halo" if halo else "recipe"),
+                    "kind": (
+                        "stack"
+                        if stack
+                        else ("halo" if halo else ("depth" if depth else "recipe"))
+                    ),
                     "source": layer.get("source", ""),
                     "name": f"Layer {layer['id'].removeprefix('L')}",
                     "visible": bool(layer.get("visible", True)),
@@ -14474,7 +14614,11 @@ class AppController(
                         else (
                             self._halo_layer_summary(layer)
                             if halo
-                            else self._local_recipe_summary(layer["recipe"])
+                            else (
+                                self._depth_layer_summary(layer)
+                                if depth
+                                else self._local_recipe_summary(layer["recipe"])
+                            )
                         )
                     ),
                     "strokes": len(mask.strokes) if mask is not None else 0,
@@ -14489,7 +14633,14 @@ class AppController(
         recipe = editing["recipe"] if editing is not None else self._local_brush_recipe
         ui.localRecipe = dict(recipe)
         ui.localBrushSummary = self._local_recipe_summary(self._local_brush_recipe)
+        # The Amount / Softness sliders follow the selected depth layer.
+        self._set_depth_state()
+        self._refresh_brush_crop_scale()
 
+    def _refresh_brush_crop_scale(self) -> None:
+        """Push the crop's share of the uncropped frame, which sizes the
+        brush ring (and the white balance picker's) on screen."""
+        ui = self.ui_state
         crop_box = self.image_editor.current_edits.get("crop_box")
         cw = ch = 1.0
         if crop_box is not None and len(crop_box) == 4:
@@ -14632,15 +14783,28 @@ class AppController(
                     self.image_editor.current_edits, base_shape
                 )
             for layer_id, mask in masks:
-                density = rasterize_layer_density(
-                    layer_id,
-                    mask,
-                    shape,
-                    self.image_editor.current_edits,
-                    cache=self._local_overlay_cache,
-                    base_shape=base_shape,
-                    point_transform=point_transform,
-                )
+                layer = self._local_layer(layer_id)
+                if is_depth_layer(layer) and point_transform is not None:
+                    density = depth_layer_density(
+                        layer,
+                        mask,
+                        shape,
+                        self.image_editor.current_edits,
+                        self.image_editor._depth_map,
+                        point_transform,
+                        cache=self._local_overlay_cache,
+                        base_shape=base_shape,
+                    )
+                else:
+                    density = rasterize_layer_density(
+                        layer_id,
+                        mask,
+                        shape,
+                        self.image_editor.current_edits,
+                        cache=self._local_overlay_cache,
+                        base_shape=base_shape,
+                        point_transform=point_transform,
+                    )
                 if density is None:
                     continue
                 # One coat shows at 35% opacity; more coats build to 80%.
@@ -14959,6 +15123,9 @@ class AppController(
             id(source),
             id(editor.float_preview),
             id(editor.float_image),
+            # A background (depth) layer renders only once its depth map has
+            # arrived, so its arrival must re-render the hover too.
+            id(editor._depth_map),
             repr(sorted((k, v) for k, v in edits.items() if k != "local_layers")),
             tuple(recipe_layers),
         )
@@ -16412,6 +16579,12 @@ class AppController(
             # Block if a save is already in progress for this image.
             current_path = self.image_files[self.current_index].path
             if self._block_if_saving(current_path):
+                return
+            # W is about to replace these pixels; a crop would be thrown away.
+            if self.raw_awb_pending_for_current():
+                self.update_status_message(
+                    "RAW white balance is still running; crop when it is done."
+                )
                 return
 
             self._begin_direct_image_transition("crop mode activated")
@@ -18300,6 +18473,32 @@ class AppController(
         return result
 
 
+def _is_temporary_directory(directory) -> bool:
+    """Return True if ``directory`` is inside the system temp folder.
+
+    Folders there are throwaway runs (test fixtures, a quick look at an
+    extracted archive) that vanish or go stale, so startup never offers to
+    reopen them and they never replace the remembered last folder. Opening
+    one explicitly (a command-line path) still works.
+    """
+    if not directory:
+        return False
+    roots = [tempfile.gettempdir()]
+    if os.name != "nt":
+        roots.append("/tmp")
+    try:
+        path = Path(directory).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    for root in roots:
+        try:
+            if path.is_relative_to(Path(root).resolve()):
+                return True
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return False
+
+
 def _directory_has_images(directory: Path) -> bool:
     """Return True if ``directory`` directly contains at least one image file.
 
@@ -18575,6 +18774,19 @@ def main(
         except Exception as e:
             log.warning("Failed to scan for previous sessions: %s", e)
             stale_records, stale_paths = [], []
+        # Never offer to reopen a folder in the system temp dir (see
+        # _is_temporary_directory). Its record stays in stale_paths, so it is
+        # pruned below rather than offered again next launch.
+        skipped_temp = [
+            r for r in stale_records if _is_temporary_directory(r.get("dir", ""))
+        ]
+        if skipped_temp:
+            log.info(
+                "Not offering to reopen %d temporary folder(s): %s",
+                len(skipped_temp),
+                ", ".join(r.get("dir", "") for r in skipped_temp),
+            )
+            stale_records = [r for r in stale_records if r not in skipped_temp]
 
         # Session files whose folder the user asked for but which we failed to
         # actually reopen. These must survive pruning so the next launch can
@@ -18642,12 +18854,13 @@ def main(
                 if (
                     last_dir_path.is_absolute()
                     and last_dir_path.is_dir()
+                    and not _is_temporary_directory(last_dir_path)
                     and _directory_has_images(last_dir_path)
                 ):
                     image_dir_str = str(last_dir_path.resolve())
                 else:
                     log.info(
-                        "Not resuming last directory %s: missing or has no images",
+                        "Not resuming last directory %s: missing, temporary or has no images",
                         last_dir,
                     )
         if not image_dir_str:

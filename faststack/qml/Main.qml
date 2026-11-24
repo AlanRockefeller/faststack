@@ -1542,9 +1542,12 @@ ApplicationWindow {
     Shortcut {
         sequence: "Escape"
         context: Qt.ApplicationShortcut
+        // While picking white balance, Esc cancels the picker first (the
+        // controller's key handler); the next Esc leaves full screen.
         enabled: root.fullScreenLoupe
                  && (!root.uiStateRef
-                     || (!root.uiStateRef.isCropping && !root.uiStateRef.isDialogOpen))
+                     || (!root.uiStateRef.isCropping && !root.uiStateRef.isDialogOpen
+                         && !root.uiStateRef.isWbPicking))
         onActivated: root.exitFullScreenLoupe()
     }
 
@@ -2126,6 +2129,34 @@ ApplicationWindow {
                 font.pixelSize: (root.uiStateRef && root.uiStateRef.isSaving) ? 14 : 12
                 visible: root.uiStateRef ? (root.uiStateRef.statusMessage !== "") : false
                 Layout.rightMargin: 10
+                // Shrink with "…" instead of running off the window; hover
+                // shows the whole message.
+                // Rounded up: a layout width a fraction short of the text
+                // would elide even a short message.
+                Layout.fillWidth: true
+                Layout.preferredWidth: Math.ceil(implicitWidth) + 1
+                Layout.maximumWidth: Math.ceil(implicitWidth) + 1
+                Layout.minimumWidth: Math.min(Math.ceil(implicitWidth) + 1, 200)
+                elide: Text.ElideRight
+
+                MouseArea {
+                    id: statusMessageHover
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.NoButton
+                }
+                ToolTip.visible: statusMessageLabel.truncated && statusMessageHover.containsMouse
+                ToolTip.text: statusMessageLabel.text
+                ToolTip.delay: 300
+            }
+
+            // W (RAW white balance) progress meter.
+            RawAwbMeter {
+                info: root.uiStateRef ? root.uiStateRef.rawAwbProgress : ({ active: false })
+                Layout.preferredWidth: implicitWidth
+                Layout.preferredHeight: implicitHeight
+                Layout.rightMargin: 10
+                Layout.alignment: Qt.AlignVCenter
             }
 
             // Grid view controls (visible when in grid view) - right side
@@ -2350,6 +2381,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;&nbsp;&nbsp;S: Save&nbsp;&nbsp;E / Esc: Close&nbsp;&nbsp;O: Crop<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;B, F, D, I, etc. work as in the main view<br>" +
                           "&nbsp;&nbsp;A: Quick auto white balance (live)<br>" +
+                          "&nbsp;&nbsp;W: Redo the JPG from its RAW with RawTherapee auto white balance and highlight recovery (for flash shots; Ctrl+Z restores)<br>" +
                           "&nbsp;&nbsp;l: Quick auto levels + vibrance (live)<br>" +
                           "&nbsp;&nbsp;L: Quick auto white balance + auto levels + vibrance (live)<br>" +
                           "&nbsp;&nbsp;-: Darken current auto-adjust highlights/whites (live)<br>" +
@@ -2361,6 +2393,8 @@ ApplicationWindow {
                           "&nbsp;&nbsp;&nbsp;&nbsp;Each stroke adds one coat; overlapping strokes build up<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;[ / ]: Brush size&nbsp;&nbsp;Space+drag: Pan&nbsp;&nbsp;Ctrl+Z: Undo stroke<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;M: Toggle mask overlay&nbsp;&nbsp;Hold Ctrl: Show overlay&nbsp;&nbsp;Esc: Leave brush<br>" +
+                          "&nbsp;&nbsp;Pick (compact editor, COLOR): Click a white or grey spot to set white balance<br>" +
+                          "&nbsp;&nbsp;&nbsp;&nbsp;[ / ]: Spot size&nbsp;&nbsp;Space+drag: Pan&nbsp;&nbsp;Esc or right-click: Cancel<br>" +
                           "&nbsp;&nbsp;O (or right-click): Toggle crop mode<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;Aspect Ratio panel: pick a ratio, toggle the grid, or Rotate<br>" +
                           "&nbsp;&nbsp;&nbsp;&nbsp;Enter: Apply crop to live session<br>" +

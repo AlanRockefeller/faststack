@@ -7,16 +7,22 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import QtCore
 import "WindowPlacement.js" as WP
+import "SliderCurve.js" as SliderCurve
+import "SliderInput.js" as SliderInput
 
 Window {
     id: compactEditor
-    width: 320
+    // Wide enough for the header on one line with the scrollbar showing; a
+    // saved width replaces it, and it can be made much thinner (minimumWidth).
+    width: 370
     height: Screen.desktopAvailableHeight * 0.85
-    // Never narrower than the widest row needs: the header's buttons have
-    // fixed widths, and a viewport narrower than them pushes every row right
-    // (the slider readouts end up under the scrollbar and clipped). Fonts
-    // decide the exact figure, so it is measured rather than hard-coded.
-    minimumWidth: Math.min(maximumWidth, Math.max(280, Math.ceil(editorColumn.implicitWidth)
+    // Can be made about half its usual width. Below the usual width the
+    // header's tool buttons wrap and the rows shrink their labels (see
+    // narrowLayout), so only the rotate / expand / close buttons, which never
+    // wrap, set a floor. Deliberately not measured from the content's
+    // implicit width: that is its comfortable width, and it would hold the
+    // window there.
+    minimumWidth: Math.min(maximumWidth, Math.max(170, Math.ceil(windowButtons.implicitWidth)
                   + editorScroll.anchors.leftMargin + editorScroll.anchors.rightMargin
                   + editorScroll.leftPadding + editorScroll.rightPadding))
     maximumWidth: 400
@@ -157,10 +163,18 @@ Window {
     readonly property bool stackMode: compactEditor.brushMode && !!compactEditor.uiStateRef && compactEditor.uiStateRef.brushTool === "stack"
     readonly property bool haloMode: compactEditor.brushMode && !!compactEditor.uiStateRef && compactEditor.uiStateRef.brushTool === "halo"
     readonly property bool recipeMode: compactEditor.brushMode && !compactEditor.stackMode && !compactEditor.haloMode
+    // White balance picker ("Pick" next to COLOR's Auto): the next click on
+    // the photo sets Temp and Tint from the spot under the ring.
+    readonly property bool wbPicking: compactEditor.uiStateRef ? !!compactEditor.uiStateRef.isWbPicking : false
     // Halo removal: install prompt, download progress and work status.
     readonly property var haloState: compactEditor.uiStateRef ? compactEditor.uiStateRef.haloState : ({})
     readonly property color haloAccent: "#38bdf8"
     readonly property color haloAccentHover: "#7dd3fc"
+    // Background selection by depth: install prompt, download progress, and
+    // the Amount / Softness of the selected depth layer (a dodge & burn
+    // layer whose mask is the background, so it lives in recipeMode).
+    readonly property var depthState: compactEditor.uiStateRef ? compactEditor.uiStateRef.depthState : ({})
+    readonly property bool depthLayerSelected: compactEditor.recipeMode && !!compactEditor.depthState.layerId
     // Stack paint needs an in-camera stacked JPG whose input JPGs were found.
     readonly property bool stackPaintAvailable: !!compactEditor.uiStateRef && compactEditor.uiStateRef.stackInputs.length > 0
     readonly property int stackInputIndex: {
@@ -191,6 +205,11 @@ Window {
     Material.accent: compactEditor.accentColor
 
     property int updatePulse: 0
+    // A panel made thinner than usual: rows tighten their spacing and the
+    // footer buttons share the width. Slider labels shrink with the panel
+    // (elided) down to sliderLabelWidth's floor.
+    readonly property bool narrowLayout: editorColumn.width < 240
+    readonly property int sliderLabelWidth: Math.round(Math.max(44, Math.min(70, editorColumn.width * 0.3)))
     // Whether the per-hue COLOR MIX section is expanded (collapsed by default).
     property bool colorMixExpanded: false
     readonly property bool cropActive: compactEditor.uiStateRef ? compactEditor.uiStateRef.isCropping : false
@@ -232,7 +251,12 @@ Window {
         // Convert the stored edit-space value into slider space, step it, clamp,
         // then convert back to edit space the way the sliders do.
         var sliderVal = compactEditor.getBackendValue(key) / scale * 100
-        sliderVal = Math.max(-100, Math.min(100, sliderVal + delta))
+        // A value already past the slider's end (an extreme auto-levels
+        // result) may step back toward the range but must not snap to it.
+        var range = compactEditor.sliderRange(key)
+        var lo = Math.min(range.min, sliderVal)
+        var hi = Math.max(range.max, sliderVal)
+        sliderVal = Math.max(lo, Math.min(hi, sliderVal + delta))
         compactEditor.setEditValue(key, sliderVal / 100 * scale)
         compactEditor.updatePulse++  // refreshes sliders + histogram
     }
@@ -424,6 +448,16 @@ Window {
         else compactEditor.controllerRef.set_edit_parameter(key, value)
     }
 
+    // Slider units are always 100 per edit unit (x editScale). Whites and
+    // Blacks reach past +/-100 because auto levels (L) routinely sets them
+    // there; a +/-100 cap would show +100 while the edit is really stronger.
+    // Keep in sync with the Whites/Blacks ListElements below.
+    function sliderRange(key) {
+        if (key === "whites") return { min: -100, max: 300 }
+        if (key === "blacks") return { min: -300, max: 100 }
+        return { min: -100, max: 100 }
+    }
+
     function sliderEditScale(key) {
         if (key === "contrast") return 0.5
         return (key === "exposure" || key === "whites") ? 2.0 : 1.0
@@ -496,6 +530,8 @@ Window {
             } else if (event.key === Qt.Key_Escape) {
                 if (compactEditor.brushMode) {
                     if (compactEditor.controllerRef) compactEditor.controllerRef.exit_local_brush_mode()
+                } else if (compactEditor.wbPicking) {
+                    if (compactEditor.controllerRef) compactEditor.controllerRef.cancel_white_balance_pick()
                 } else {
                     compactEditor.requestClose()
                 }
@@ -559,54 +595,70 @@ Window {
         "• Everything runs on this computer; nothing is uploaded.<br>" +
         "• The layer is saved with the edit and recomputed when the photo is reopened."
 
-    // First use of halo removal: say what would be downloaded, from where,
-    // how big, what it does and what to keep in mind, before anything is
-    // fetched. Turns into the download's progress once accepted.
-    Popup {
-        id: haloInstallPopup
+    // First use of an AI feature (halo removal, background selection): say
+    // what would be downloaded, from where, how big, what it does and what
+    // to keep in mind, before anything is fetched. Turns into the download's
+    // progress once accepted. An inline component cannot see this file's
+    // ids, so everything it shows comes in through properties.
+    component AiInstallPopup: Popup {
+        id: installPopup
+        // The feature's state map: promptVisible, downloading, progress,
+        // progressText, error, runtimeNeeded, modelNeeded, runtimeVersion,
+        // downloadMB, diskMB, folder.
+        property var st: ({})
+        property string title
+        property string whatYouGet
+        property string modelIntro
+        property string modelLine
+        property string goodToKnow
+        property color accent
+        property color accentHover
+        property real maxHeight: 400
+        signal installRequested()
+        signal installDeclined()
+        signal dismissed()
+
         x: 8
         y: 40
-        width: compactEditor.width - 16
-        height: Math.min(compactEditor.height - 56, haloInstallColumn.implicitHeight + 24)
+        height: Math.min(installPopup.maxHeight, installColumn.implicitHeight + 24)
         padding: 12
         modal: true
+        // Esc closes a popup only while it has the keyboard focus.
+        focus: true
         closePolicy: Popup.CloseOnEscape
-        // Driven by haloState.promptVisible (open()/close(), not a visible
-        // binding, which Esc would break).
-        Connections {
-            target: compactEditor
-            function onHaloStateChanged() {
-                var want = !!compactEditor.haloState.promptVisible
-                if (want && !haloInstallPopup.opened) haloInstallPopup.open()
-                else if (!want && haloInstallPopup.opened) haloInstallPopup.close()
-            }
+        // Driven by st.promptVisible (open()/close(), not a visible binding,
+        // which Esc would break).
+        onStChanged: {
+            var want = !!installPopup.st.promptVisible
+            if (want && !installPopup.opened) installPopup.open()
+            else if (!want && installPopup.opened) installPopup.close()
         }
         onClosed: {
-            if (compactEditor.haloState.promptVisible && compactEditor.controllerRef)
-                compactEditor.controllerRef.halo_install_decline()
-            compactEditor.focusKeyboardHandler()
+            if (installPopup.st.promptVisible) installPopup.installDeclined()
+            installPopup.dismissed()
         }
         background: Rectangle {
             color: "#262626"
             radius: 6
-            border.color: compactEditor.haloAccent
+            border.color: installPopup.accent
             border.width: 1
         }
 
         Flickable {
             anchors.fill: parent
-            contentHeight: haloInstallColumn.implicitHeight
+            contentHeight: installColumn.implicitHeight
             clip: true
             boundsBehavior: Flickable.StopAtBounds
 
             ColumnLayout {
-                id: haloInstallColumn
+                id: installColumn
                 width: parent.width
                 spacing: 8
 
                 Text {
                     Layout.fillWidth: true
-                    text: "Download halo removal?"
+                    wrapMode: Text.WordWrap
+                    text: installPopup.title
                     color: "#e8e6e3"
                     font.pixelSize: 13
                     font.weight: Font.DemiBold
@@ -614,40 +666,34 @@ Window {
 
                 Text {
                     Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
+                    // Wrap: a long folder path breaks mid-word in a thin window.
+                    wrapMode: Text.Wrap
                     textFormat: Text.StyledText
                     color: "#e8e6e3"
                     font.pixelSize: 11
                     text: {
-                        var st = compactEditor.haloState
+                        var st = installPopup.st
                         var parts = []
                         if (st.runtimeNeeded)
                             parts.push("• <b>ONNX Runtime " + st.runtimeVersion + "</b> — the engine that runs the model " +
                                        "(Microsoft, MIT licence), from PyPI")
                         if (st.modelNeeded)
-                            parts.push("• <b>LaMa inpainting model</b> — fills in background " +
-                                       "(Samsung AI Center, Apache-2.0 licence), from Hugging Face")
+                            parts.push(installPopup.modelLine)
                         return "<b>What you get</b><br>" +
-                            "Paint over the halo around a focus-stacked subject — the dark ring, ghost edge and glow — " +
-                            "and FastStack rebuilds the background there from its surroundings. " +
-                            "The subject itself is kept as it is.<br><br>" +
+                            installPopup.whatYouGet + "<br><br>" +
                             "<b>What gets downloaded</b><br>" +
-                            "Halo removal uses an AI inpainting model that is not part of FastStack:<br>" +
+                            installPopup.modelIntro + "<br>" +
                             parts.join("<br>") + "<br>" +
                             "Download: about " + st.downloadMB + " MB &nbsp;·&nbsp; disk space: about " + st.diskMB + " MB, in<br>" +
                             "<i>" + st.folder + "</i><br><br>" +
                             "<b>Good to know</b><br>" +
-                            "• It runs on this computer and works offline after the download. Your photos are never uploaded.<br>" +
-                            "• Each brush stroke takes roughly 10–30 seconds to process, on the CPU.<br>" +
-                            "• The rebuilt background is generated from the surrounding pixels, not recorded by the camera: " +
-                            "right for a blurred background, not where the background itself is what the photo documents.<br>" +
-                            "• Both files are checked against published checksums before use. Deleting the folder above removes them."
+                            installPopup.goodToKnow
                     }
                 }
 
                 // Download progress.
                 ColumnLayout {
-                    visible: !!compactEditor.haloState.downloading
+                    visible: !!installPopup.st.downloading
                     Layout.fillWidth: true
                     spacing: 4
 
@@ -657,15 +703,15 @@ Window {
                         radius: 3
                         color: "#18ffffff"
                         Rectangle {
-                            width: parent.width * Math.max(0, Math.min(1, compactEditor.haloState.progress || 0))
+                            width: parent.width * Math.max(0, Math.min(1, installPopup.st.progress || 0))
                             height: parent.height
                             radius: 3
-                            color: compactEditor.haloAccent
+                            color: installPopup.accent
                         }
                     }
                     Text {
                         Layout.fillWidth: true
-                        text: compactEditor.haloState.progressText || ""
+                        text: installPopup.st.progressText || ""
                         color: "#9a9795"
                         font.pixelSize: 10
                         elide: Text.ElideRight
@@ -673,50 +719,31 @@ Window {
                 }
 
                 Text {
-                    visible: !!compactEditor.haloState.error
+                    visible: !!installPopup.st.error
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
-                    text: compactEditor.haloState.error || ""
+                    text: installPopup.st.error || ""
                     color: "#f87171"
                     font.pixelSize: 11
                 }
 
-                RowLayout {
+                // Right-aligned; in a thin window the buttons wrap rather than
+                // run off the edge. RightToLeft, so Download comes first here.
+                Flow {
                     Layout.fillWidth: true
+                    layoutDirection: Qt.RightToLeft
                     spacing: 6
 
-                    Item { Layout.fillWidth: true }
-
                     Button {
-                        id: haloDeclineBtn
+                        id: installAcceptBtn
+                        visible: !installPopup.st.downloading
                         implicitHeight: 26
                         leftPadding: 10; rightPadding: 10
                         flat: true
-                        onClicked: if (compactEditor.controllerRef) compactEditor.controllerRef.halo_install_decline()
+                        onClicked: installPopup.installRequested()
                         contentItem: Text {
-                            text: compactEditor.haloState.downloading ? "Cancel" : "Not now"
-                            font.pixelSize: 11
-                            color: haloDeclineBtn.hovered ? "#e8e6e3" : "#9a9795"
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        background: Rectangle {
-                            radius: 4
-                            color: haloDeclineBtn.hovered ? "#30ffffff" : "#18ffffff"
-                            border.color: "#3a3a3a"; border.width: 1
-                        }
-                    }
-
-                    Button {
-                        id: haloAcceptBtn
-                        visible: !compactEditor.haloState.downloading
-                        implicitHeight: 26
-                        leftPadding: 10; rightPadding: 10
-                        flat: true
-                        onClicked: if (compactEditor.controllerRef) compactEditor.controllerRef.halo_install_accept()
-                        contentItem: Text {
-                            text: (compactEditor.haloState.error ? "Try again" : "Download") +
-                                  " (" + compactEditor.haloState.downloadMB + " MB)"
+                            text: (installPopup.st.error ? "Try again" : "Download") +
+                                  " (" + installPopup.st.downloadMB + " MB)"
                             font.pixelSize: 11
                             font.weight: Font.DemiBold
                             color: "#1e1e1e"
@@ -725,12 +752,80 @@ Window {
                         }
                         background: Rectangle {
                             radius: 4
-                            color: haloAcceptBtn.hovered ? compactEditor.haloAccentHover : compactEditor.haloAccent
+                            color: installAcceptBtn.hovered ? installPopup.accentHover : installPopup.accent
+                        }
+                    }
+
+                    Button {
+                        id: installDeclineBtn
+                        implicitHeight: 26
+                        leftPadding: 10; rightPadding: 10
+                        flat: true
+                        onClicked: installPopup.installDeclined()
+                        contentItem: Text {
+                            text: installPopup.st.downloading ? "Cancel" : "Not now"
+                            font.pixelSize: 11
+                            color: installDeclineBtn.hovered ? "#e8e6e3" : "#9a9795"
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: installDeclineBtn.hovered ? "#30ffffff" : "#18ffffff"
+                            border.color: "#3a3a3a"; border.width: 1
                         }
                     }
                 }
             }
         }
+    }
+
+    AiInstallPopup {
+        id: haloInstallPopup
+        st: compactEditor.haloState
+        width: compactEditor.width - 16
+        maxHeight: compactEditor.height - 56
+        accent: compactEditor.haloAccent
+        accentHover: compactEditor.haloAccentHover
+        title: "Download halo removal?"
+        whatYouGet: "Paint over the halo around a focus-stacked subject — the dark ring, ghost edge and glow — " +
+                    "and FastStack rebuilds the background there from its surroundings. " +
+                    "The subject itself is kept as it is."
+        modelIntro: "Halo removal uses an AI inpainting model that is not part of FastStack:"
+        modelLine: "• <b>LaMa inpainting model</b> — fills in background " +
+                   "(Samsung AI Center, Apache-2.0 licence), from Hugging Face"
+        goodToKnow: "• It runs on this computer and works offline after the download. Your photos are never uploaded.<br>" +
+                    "• Each brush stroke takes roughly 10–30 seconds to process, on the CPU.<br>" +
+                    "• The rebuilt background is generated from the surrounding pixels, not recorded by the camera: " +
+                    "right for a blurred background, not where the background itself is what the photo documents.<br>" +
+                    "• Both files are checked against published checksums before use. Deleting the folder above removes them."
+        onInstallRequested: if (compactEditor.controllerRef) compactEditor.controllerRef.halo_install_accept()
+        onInstallDeclined: if (compactEditor.controllerRef) compactEditor.controllerRef.halo_install_decline()
+        onDismissed: compactEditor.focusKeyboardHandler()
+    }
+
+    AiInstallPopup {
+        id: depthInstallPopup
+        st: compactEditor.depthState
+        width: compactEditor.width - 16
+        maxHeight: compactEditor.height - 56
+        accent: "#f59e0b"
+        accentHover: "#fbbf24"
+        title: "Download background selection?"
+        whatYouGet: "FastStack works out which parts of the photo are far from the camera and selects them as a " +
+                    "dodge &amp; burn layer, so the sliders change only the background. " +
+                    "An Amount slider sets how much of the scene, back to front, is selected."
+        modelIntro: "Background selection uses an AI depth model that is not part of FastStack:"
+        modelLine: "• <b>Depth Anything V2 Small</b> — estimates how far away each part of a photo is " +
+                   "(Yang et al., Apache-2.0 licence), from Hugging Face"
+        goodToKnow: "• It runs on this computer and works offline after the download. Your photos are never uploaded.<br>" +
+                      "• Estimating a photo's depth takes a few seconds, on the CPU, once each time the photo is opened.<br>" +
+                      "• Depth is estimated from the single photo, not measured: it separates a subject from a distant background " +
+                      "well, but not from the ground it sits on, and fine hairs come out soft. The brush fixes what it gets wrong.<br>" +
+                      "• The download is checked against published checksums before use. Deleting the folder above removes it."
+        onInstallRequested: if (compactEditor.controllerRef) compactEditor.controllerRef.depth_install_accept()
+        onInstallDeclined: if (compactEditor.controllerRef) compactEditor.controllerRef.depth_install_decline()
+        onDismissed: compactEditor.focusKeyboardHandler()
     }
 
     // Brush quick reference (the ? button in brush mode).
@@ -778,6 +873,11 @@ Window {
                       "• If you change the sliders after painting, the next stroke starts a new layer, so earlier strokes keep their look.<br>" +
                       "• Click a layer to change its sliders after painting; all of its strokes update. Click it again (or <i>New strokes</i>) to go back.<br>" +
                       "• ◉ hides/shows a layer, × deletes it.<br><br>" +
+                      "<b>Selecting the background</b><br>" +
+                      "• <i>Bkgd</i> adds a layer that covers the background instead of brush strokes: FastStack estimates how far away each part of the photo is and selects the far parts.<br>" +
+                      "• <i>Amount</i> sets how much is selected, from the farthest background towards the camera; <i>Softness</i> how gradually it fades in; <i>Keep sharp</i> keeps in-focus detail (stems, hairs) out of it. The mask shows while you drag.<br>" +
+                      "• While the layer is selected the sliders set what happens to the background (e.g. Exposure −40 to darken it), and painting adds to the selection, right-drag removes from it.<br>" +
+                      "• <i>Brush dodge &amp; burn on top</i> (or <i>New strokes</i>) goes back to ordinary dodge &amp; burn; click the Background layer to change it again.<br><br>" +
                       "<b>Painting</b><br>" +
                       "• Left-drag: paint one coat<br>" +
                       "• Paint over the same spot again to build it up (2 coats = twice the recipe)<br>" +
@@ -803,7 +903,7 @@ Window {
         title: "Discard Edits?"
         modal: true
         anchors.centerIn: parent
-        width: 260
+        width: Math.min(260, compactEditor.width - 16)
         standardButtons: Dialog.Yes | Dialog.No
 
         onAboutToShow: {
@@ -833,10 +933,16 @@ Window {
         // Room for the scrollbar only while there is something to scroll: an
         // AsNeeded bar stays "visible" (just faded out) when everything fits,
         // which left a lopsided gap on the right.
-        rightPadding: editorScroll.ScrollBar.vertical.size < 1.0 ? editorScroll.ScrollBar.vertical.width + 4 : 0
+        rightPadding: editorScroll.canScroll ? editorScroll.ScrollBar.vertical.width + 4 : 0
+        // With nothing to scroll the bar is faded out but still sits over the
+        // right edge of the content and takes its clicks (the right third of
+        // the Auto buttons, the slider readouts), so it is only there while
+        // it has its own gap to sit in.
+        readonly property bool canScroll: editorScroll.ScrollBar.vertical.size < 1.0
         clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         ScrollBar.vertical.policy: ScrollBar.AsNeeded
+        ScrollBar.vertical.visible: editorScroll.canScroll
         contentWidth: editorScroll.availableWidth
 
         ColumnLayout {
@@ -845,19 +951,33 @@ Window {
             spacing: 6
 
             // --- Header ---
-            RowLayout {
+            // The brush tools wrap (a Flow) and drop below the window buttons
+            // when the panel is too narrow for one line, so the header never
+            // decides how thin the window can be.
+            Item {
+                id: headerBar
                 Layout.fillWidth: true
-                spacing: 4
+                readonly property real toolsLineWidth: brushModeBtn.implicitWidth + stackModeBtn.implicitWidth
+                                                       + stackInputCombo.implicitWidth + haloModeBtn.implicitWidth
+                                                       + depthSelectBtn.implicitWidth + 4 * toolsFlow.spacing
+                readonly property bool oneLine: headerBar.width >= headerBar.toolsLineWidth + 4 + windowButtons.implicitWidth
+                implicitWidth: windowButtons.implicitWidth
+                implicitHeight: headerBar.oneLine
+                                ? Math.max(toolsFlow.implicitHeight, windowButtons.implicitHeight)
+                                : windowButtons.implicitHeight + 4 + toolsFlow.implicitHeight
 
                 // Brush tools: dodge & burn ("Burn", Shift+D) and stack paint
                 // with its input-frame picker.
-                RowLayout {
+                Flow {
+                    id: toolsFlow
+                    y: headerBar.oneLine ? 0 : windowButtons.implicitHeight + 4
+                    // +1: a line exactly as wide as its buttons can round onto two.
+                    width: headerBar.oneLine ? headerBar.toolsLineWidth + 1 : headerBar.width
                     spacing: 2
 
                     Button {
                         id: brushModeBtn
                         implicitHeight: 26
-                        Layout.preferredHeight: 26
                         enabled: !compactEditor.cropActive
                         padding: 0
                         leftPadding: 6; rightPadding: 6
@@ -892,7 +1012,6 @@ Window {
                     Button {
                         id: stackModeBtn
                         implicitHeight: 26
-                        Layout.preferredHeight: 26
                         enabled: !compactEditor.cropActive && compactEditor.stackPaintAvailable
                         padding: 0
                         leftPadding: 6; rightPadding: 6
@@ -928,8 +1047,6 @@ Window {
                     ComboBox {
                         id: stackInputCombo
                         implicitWidth: 34; implicitHeight: 26
-                        Layout.minimumWidth: 34; Layout.preferredWidth: 34; Layout.maximumWidth: 34
-                        Layout.preferredHeight: 26
                         enabled: !compactEditor.cropActive && compactEditor.stackPaintAvailable
                         focusPolicy: Qt.NoFocus
                         model: compactEditor.uiStateRef ? compactEditor.uiStateRef.stackInputs : []
@@ -973,11 +1090,13 @@ Window {
                             id: stackInputDelegate
                             required property var modelData
                             required property int index
-                            width: 176
+                            width: stackInputCombo.popup.width - 4
                             height: 22
+                            topPadding: 0; bottomPadding: 0  // room for the (elided) label
                             highlighted: stackInputCombo.highlightedIndex === stackInputDelegate.index
                             contentItem: Text {
                                 text: stackInputDelegate.modelData.label
+                                elide: Text.ElideRight
                                 font.pixelSize: 10
                                 color: stackInputDelegate.index === stackInputCombo.currentIndex ? compactEditor.stackAccentHover : "#e8e6e3"
                                 verticalAlignment: Text.AlignVCenter
@@ -988,7 +1107,9 @@ Window {
                         }
                         popup: Popup {
                             y: stackInputCombo.height
-                            width: 180
+                            // No wider than the window: margins keeps it on
+                            // screen, but cannot shrink it.
+                            width: Math.min(180, compactEditor.width - 8)
                             margins: 4
                             padding: 2
                             implicitHeight: contentItem.implicitHeight + 4
@@ -1012,7 +1133,6 @@ Window {
                     Button {
                         id: haloModeBtn
                         implicitHeight: 26
-                        Layout.preferredHeight: 26
                         enabled: !compactEditor.cropActive
                         padding: 0
                         leftPadding: 6; rightPadding: 6
@@ -1024,7 +1144,9 @@ Window {
                                          : "Remove halo: paint over a stacking halo (downloads an AI model the first time)")
                         onClicked: {
                             if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_halo_brush_mode()
-                            compactEditor.focusKeyboardHandler()
+                            // The first press opens the download prompt, which keeps
+                            // the focus (for Esc) until it is dismissed.
+                            if (!haloInstallPopup.visible) compactEditor.focusKeyboardHandler()
                         }
                         contentItem: Text {
                             text: "Halo"
@@ -1045,115 +1167,149 @@ Window {
                             border.width: 1
                         }
                     }
-                }
 
-                Item { Layout.fillWidth: true }
-
-                Button {
-                    id: rotateCcwBtn
-                    implicitWidth: 26; implicitHeight: 26
-                    Layout.minimumWidth: 26; Layout.preferredWidth: 26; Layout.maximumWidth: 26
-                    Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
-                    enabled: !compactEditor.cropActive
-                    padding: 0
-                    flat: true
-                    ToolTip.visible: hovered
-                    ToolTip.delay: 500
-                    ToolTip.text: "Rotate counter-clockwise"
-                    onClicked: {
-                        compactEditor.ensureEditorLoaded("rotate-ccw")
-                        if (compactEditor.controllerRef) compactEditor.controllerRef.rotate_image_ccw()
-                    }
-                    contentItem: Text {
-                        text: "↺"
-                        font.pixelSize: 16
-                        color: rotateCcwBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                    background: Rectangle {
-                        radius: 4
-                        color: rotateCcwBtn.hovered ? "#30ffffff" : "transparent"
-                    }
-                }
-
-                Button {
-                    id: rotateCwBtn
-                    implicitWidth: 26; implicitHeight: 26
-                    Layout.minimumWidth: 26; Layout.preferredWidth: 26; Layout.maximumWidth: 26
-                    Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
-                    enabled: !compactEditor.cropActive
-                    padding: 0
-                    flat: true
-                    ToolTip.visible: hovered
-                    ToolTip.delay: 500
-                    ToolTip.text: "Rotate clockwise"
-                    onClicked: {
-                        compactEditor.ensureEditorLoaded("rotate-cw")
-                        if (compactEditor.controllerRef) compactEditor.controllerRef.rotate_image_cw()
-                    }
-                    contentItem: Text {
-                        text: "↻"
-                        font.pixelSize: 16
-                        color: rotateCwBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                    background: Rectangle {
-                        radius: 4
-                        color: rotateCwBtn.hovered ? "#30ffffff" : "transparent"
+                    // Select the background by depth: adds a dodge & burn
+                    // layer masked by the photo's estimated depth (downloads
+                    // its model the first time).
+                    Button {
+                        id: depthSelectBtn
+                        implicitHeight: 26
+                        enabled: !compactEditor.cropActive
+                        padding: 0
+                        leftPadding: 6; rightPadding: 6
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.depthState.installed
+                                      ? "Select the background by depth, as a dodge & burn layer"
+                                      : "Select the background by depth (downloads an AI model the first time)"
+                        onClicked: {
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.select_background()
+                            if (!depthInstallPopup.visible) compactEditor.focusKeyboardHandler()
+                        }
+                        contentItem: Text {
+                            text: "Bkgd"
+                            font.pixelSize: 11
+                            font.weight: compactEditor.depthLayerSelected ? Font.DemiBold : Font.Normal
+                            color: !depthSelectBtn.enabled ? "#55524f"
+                                   : (depthSelectBtn.hovered ? "#fbbf24" : compactEditor.textColor)
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: depthSelectBtn.hovered ? "#30ffffff" : "transparent"
+                            border.color: compactEditor.depthLayerSelected ? "#f59e0b"
+                                          : (depthSelectBtn.enabled ? compactEditor.controlBorder : "#18ffffff")
+                            border.width: 1
+                        }
                     }
                 }
 
-                // Expand button
-                Button {
-                    id: expandBtn
-                    implicitWidth: 26; implicitHeight: 26
-                    Layout.minimumWidth: 26; Layout.preferredWidth: 26; Layout.maximumWidth: 26
-                    Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
-                    enabled: !compactEditor.cropActive
-                    padding: 0
-                    flat: true
-                    onClicked: {
-                        compactEditor.ensureEditorLoaded("expand")
-                        if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorExpanded = true
-                    }
-                    contentItem: Text {
-                        text: "⤢"
-                        font.pixelSize: 16
-                        color: compactEditor.textColor
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                    background: Rectangle {
-                        radius: 4
-                        color: expandBtn.hovered ? "#30ffffff" : "transparent"
-                    }
-                }
+                // Rotate, expand and close stay in the top-right corner.
+                Row {
+                    id: windowButtons
+                    anchors.right: parent.right
+                    spacing: 4
 
-                // Close/discard button
-                Button {
-                    id: discardBtn
-                    implicitWidth: 26; implicitHeight: 26
-                    Layout.minimumWidth: 26; Layout.preferredWidth: 26; Layout.maximumWidth: 26
-                    Layout.minimumHeight: 26; Layout.preferredHeight: 26; Layout.maximumHeight: 26
-                    padding: 0
-                    flat: true
-                    ToolTip.visible: hovered
-                    ToolTip.delay: 500
-                    ToolTip.text: compactEditor.closeTooltip
-                    onHoveredChanged: if (hovered) compactEditor.refreshCloseTooltip()
-                    onClicked: compactEditor.requestClose()
-                    contentItem: Text {
-                        text: "✕"
-                        font.pixelSize: 13
-                        color: discardBtn.hovered ? "#ff6060" : compactEditor.mutedText
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
+                    Button {
+                        id: rotateCcwBtn
+                        implicitWidth: 26; implicitHeight: 26
+                        enabled: !compactEditor.cropActive
+                        padding: 0
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: "Rotate counter-clockwise"
+                        onClicked: {
+                            compactEditor.ensureEditorLoaded("rotate-ccw")
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.rotate_image_ccw()
+                        }
+                        contentItem: Text {
+                            text: "↺"
+                            font.pixelSize: 16
+                            color: rotateCcwBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: rotateCcwBtn.hovered ? "#30ffffff" : "transparent"
+                        }
                     }
-                    background: Rectangle {
-                        radius: 4
-                        color: discardBtn.hovered ? "#40ff4040" : "transparent"
+
+                    Button {
+                        id: rotateCwBtn
+                        implicitWidth: 26; implicitHeight: 26
+                        enabled: !compactEditor.cropActive
+                        padding: 0
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: "Rotate clockwise"
+                        onClicked: {
+                            compactEditor.ensureEditorLoaded("rotate-cw")
+                            if (compactEditor.controllerRef) compactEditor.controllerRef.rotate_image_cw()
+                        }
+                        contentItem: Text {
+                            text: "↻"
+                            font.pixelSize: 16
+                            color: rotateCwBtn.hovered ? compactEditor.accentColorHover : compactEditor.textColor
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: rotateCwBtn.hovered ? "#30ffffff" : "transparent"
+                        }
+                    }
+
+                    // Expand button
+                    Button {
+                        id: expandBtn
+                        implicitWidth: 26; implicitHeight: 26
+                        enabled: !compactEditor.cropActive
+                        padding: 0
+                        flat: true
+                        onClicked: {
+                            compactEditor.ensureEditorLoaded("expand")
+                            if (compactEditor.uiStateRef) compactEditor.uiStateRef.isEditorExpanded = true
+                        }
+                        contentItem: Text {
+                            text: "⤢"
+                            font.pixelSize: 16
+                            color: compactEditor.textColor
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: expandBtn.hovered ? "#30ffffff" : "transparent"
+                        }
+                    }
+
+                    // Close/discard button
+                    Button {
+                        id: discardBtn
+                        implicitWidth: 26; implicitHeight: 26
+                        padding: 0
+                        flat: true
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 500
+                        ToolTip.text: compactEditor.closeTooltip
+                        onHoveredChanged: if (hovered) compactEditor.refreshCloseTooltip()
+                        onClicked: compactEditor.requestClose()
+                        contentItem: Text {
+                            text: "✕"
+                            font.pixelSize: 13
+                            color: discardBtn.hovered ? "#ff6060" : compactEditor.mutedText
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4
+                            color: discardBtn.hovered ? "#40ff4040" : "transparent"
+                        }
                     }
                 }
             }
@@ -1165,15 +1321,17 @@ Window {
                 Layout.fillWidth: true
                 spacing: 4
 
+                // Takes the row's spare width and elides in a thin panel.
                 Text {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     text: "HISTOGRAM"
+                    elide: Text.ElideRight
                     font.pixelSize: 9
                     font.weight: Font.DemiBold
                     font.letterSpacing: 1.0
                     color: "#9a9795"
                 }
-
-                Item { Layout.fillWidth: true }
 
                 // Tiny toggle for histogram mode
                 Row {
@@ -1288,20 +1446,27 @@ Window {
                         { label: "B", preKey: "b_preclip", clipKey: "b_clip", dimColor: "#404080", hotColor: "#8080ff" },
                     ]
 
+                    // Equal thirds whatever the counts; a thin panel elides them.
                     delegate: Column {
+                        id: clipStat
                         required property var modelData
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         spacing: 0
 
                         Text {
-                            anchors.horizontalCenter: parent.horizontalCenter
+                            width: clipStat.width
+                            horizontalAlignment: Text.AlignHCenter
+                            elide: Text.ElideRight
                             text: modelData.label + " pre:" + (compactEditor.uiStateRef && compactEditor.uiStateRef.histogramData ? (compactEditor.uiStateRef.histogramData[modelData.preKey] || 0) : 0)
                             font.pixelSize: 8; font.family: "IBM Plex Mono"
                             color: modelData.dimColor
                         }
                         Text {
                             property int clipVal: compactEditor.uiStateRef && compactEditor.uiStateRef.histogramData ? (compactEditor.uiStateRef.histogramData[modelData.clipKey] || 0) : 0
-                            anchors.horizontalCenter: parent.horizontalCenter
+                            width: clipStat.width
+                            horizontalAlignment: Text.AlignHCenter
+                            elide: Text.ElideRight
                             text: "clip:" + clipVal
                             font.pixelSize: 8; font.family: "IBM Plex Mono"
                             font.bold: clipVal > 0
@@ -1326,15 +1491,17 @@ Window {
                     Layout.fillWidth: true
                     spacing: 4
 
+                    // Takes the row's spare width and elides in a thin panel.
                     Text {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         text: compactEditor.stackMode ? "STACK PAINT" : compactEditor.haloMode ? "REMOVE HALO" : "DODGE & BURN"
+                        elide: Text.ElideRight
                         font.pixelSize: 9
                         font.weight: Font.DemiBold
                         font.letterSpacing: 1.0
                         color: compactEditor.panelAccentHover
                     }
-
-                    Item { Layout.fillWidth: true }
 
                     // Show-mask toggle (same as M).
                     CheckBox {
@@ -1484,7 +1651,9 @@ Window {
                         anchors.leftMargin: 6
                         anchors.rightMargin: 6
                         verticalAlignment: Text.AlignVCenter
-                        text: "New strokes: " + (compactEditor.uiStateRef ? compactEditor.uiStateRef.localBrushSummary : "")
+                        text: compactEditor.depthLayerSelected
+                              ? "New strokes: click here to brush dodge & burn"
+                              : "New strokes: " + (compactEditor.uiStateRef ? compactEditor.uiStateRef.localBrushSummary : "")
                         color: compactEditor.textColor
                         font.pixelSize: 10
                         elide: Text.ElideRight
@@ -1588,14 +1757,278 @@ Window {
                     }
                 }
 
+                // Background selection: how much of the scene the selected
+                // depth layer covers. Outside the layer Repeater, whose
+                // delegates are rebuilt on every change (it would drop a drag).
+                Rectangle {
+                    visible: compactEditor.depthLayerSelected
+                    Layout.fillWidth: true
+                    implicitHeight: depthPanelColumn.implicitHeight + 10
+                    radius: 3
+                    color: "#1af59e0b"
+                    border.color: "#60f59e0b"
+                    border.width: 1
+
+                    ColumnLayout {
+                        id: depthPanelColumn
+                        anchors.fill: parent
+                        anchors.margins: 5
+                        anchors.leftMargin: 6
+                        anchors.rightMargin: 6
+                        spacing: 2
+
+                        Text {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            color: compactEditor.textColor
+                            font.pixelSize: 10
+                            text: compactEditor.depthState.busy ? "Background: estimating depth…"
+                                  : compactEditor.depthState.failed ? "Background: " + compactEditor.depthState.failed
+                                  : !compactEditor.depthState.ready ? "Background: waiting for the depth map…"
+                                  : "Background: the sliders above change what is selected."
+                        }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: compactEditor.narrowLayout ? 3 : 6
+
+                        Text {
+                            Layout.preferredWidth: Math.min(64, compactEditor.sliderLabelWidth)
+                            elide: Text.ElideRight
+                            text: "Amount"
+                            color: compactEditor.textColor
+                            font.pixelSize: 11
+                        }
+
+                        Slider {
+                            id: depthAmountSlider
+                            Layout.preferredHeight: 20
+                            Layout.fillWidth: true
+                            focusPolicy: Qt.NoFocus
+                            from: 0; to: 100
+                            ToolTip.visible: hovered && !pressed
+                            ToolTip.delay: 500
+                            ToolTip.text: "How much of the scene is selected, from the farthest background (low) towards the camera (high)"
+                            background: Rectangle {
+                                x: depthAmountSlider.leftPadding
+                                y: depthAmountSlider.topPadding + depthAmountSlider.availableHeight / 2 - height / 2
+                                width: depthAmountSlider.availableWidth
+                                height: 4; radius: 2
+                                color: "#2e2e2e"; border.color: "#383838"; border.width: 1
+                                Rectangle {
+                                    width: depthAmountSlider.visualPosition * parent.width
+                                    height: parent.height; radius: 2
+                                    color: compactEditor.panelAccent; opacity: 0.6
+                                }
+                            }
+                            handle: Rectangle {
+                                x: depthAmountSlider.leftPadding + depthAmountSlider.visualPosition * (depthAmountSlider.availableWidth - width)
+                                y: depthAmountSlider.topPadding + depthAmountSlider.availableHeight / 2 - height / 2
+                                width: 10; height: 10; radius: 5
+                                color: "#e8e6e3"
+                                border.color: depthAmountSlider.pressed ? compactEditor.panelAccent : "#5a5755"
+                                border.width: 1
+                            }
+                            Binding {
+                                target: depthAmountSlider
+                                property: "value"
+                                when: !depthAmountSlider.pressed
+                                value: (compactEditor.depthState.amount || 0) * 100
+                            }
+                            onMoved: if (compactEditor.controllerRef) compactEditor.controllerRef.set_depth_param("amount", value / 100)
+                            // The mask shows while dragging: a layer whose
+                            // sliders are all at zero changes nothing itself.
+                            onPressedChanged: {
+                                if (compactEditor.controllerRef) compactEditor.controllerRef.set_depth_slider_active(pressed)
+                                if (!pressed) compactEditor.focusKeyboardHandler()
+                            }
+                        }
+
+                        Text {
+                            Layout.preferredWidth: compactEditor.narrowLayout ? 26 : 32
+                            horizontalAlignment: Text.AlignRight
+                            text: Math.round(depthAmountSlider.value)
+                            font.family: "IBM Plex Mono"
+                            font.pixelSize: 10
+                            color: "#e8e6e3"
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: compactEditor.narrowLayout ? 3 : 6
+
+                        Text {
+                            Layout.preferredWidth: Math.min(64, compactEditor.sliderLabelWidth)
+                            elide: Text.ElideRight
+                            text: "Softness"
+                            color: compactEditor.textColor
+                            font.pixelSize: 11
+                        }
+
+                        Slider {
+                            id: depthFeatherSlider
+                            Layout.preferredHeight: 20
+                            Layout.fillWidth: true
+                            focusPolicy: Qt.NoFocus
+                            from: 0; to: 100
+                            ToolTip.visible: hovered && !pressed
+                            ToolTip.delay: 500
+                            ToolTip.text: "How gradually the selection fades in across its near edge"
+                            background: Rectangle {
+                                x: depthFeatherSlider.leftPadding
+                                y: depthFeatherSlider.topPadding + depthFeatherSlider.availableHeight / 2 - height / 2
+                                width: depthFeatherSlider.availableWidth
+                                height: 4; radius: 2
+                                color: "#2e2e2e"; border.color: "#383838"; border.width: 1
+                                Rectangle {
+                                    width: depthFeatherSlider.visualPosition * parent.width
+                                    height: parent.height; radius: 2
+                                    color: compactEditor.panelAccent; opacity: 0.6
+                                }
+                            }
+                            handle: Rectangle {
+                                x: depthFeatherSlider.leftPadding + depthFeatherSlider.visualPosition * (depthFeatherSlider.availableWidth - width)
+                                y: depthFeatherSlider.topPadding + depthFeatherSlider.availableHeight / 2 - height / 2
+                                width: 10; height: 10; radius: 5
+                                color: "#e8e6e3"
+                                border.color: depthFeatherSlider.pressed ? compactEditor.panelAccent : "#5a5755"
+                                border.width: 1
+                            }
+                            Binding {
+                                target: depthFeatherSlider
+                                property: "value"
+                                when: !depthFeatherSlider.pressed
+                                value: (compactEditor.depthState.feather || 0) * 100
+                            }
+                            onMoved: if (compactEditor.controllerRef) compactEditor.controllerRef.set_depth_param("feather", value / 100)
+                            // The mask shows while dragging: a layer whose
+                            // sliders are all at zero changes nothing itself.
+                            onPressedChanged: {
+                                if (compactEditor.controllerRef) compactEditor.controllerRef.set_depth_slider_active(pressed)
+                                if (!pressed) compactEditor.focusKeyboardHandler()
+                            }
+                        }
+
+                        Text {
+                            Layout.preferredWidth: compactEditor.narrowLayout ? 26 : 32
+                            horizontalAlignment: Text.AlignRight
+                            text: Math.round(depthFeatherSlider.value)
+                            font.family: "IBM Plex Mono"
+                            font.pixelSize: 10
+                            color: "#e8e6e3"
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: compactEditor.narrowLayout ? 3 : 6
+
+                        Text {
+                            Layout.preferredWidth: Math.min(64, compactEditor.sliderLabelWidth)
+                            elide: Text.ElideRight
+                            text: "Keep sharp"
+                            color: compactEditor.textColor
+                            font.pixelSize: 11
+                        }
+
+                        Slider {
+                            id: depthKeepSharpSlider
+                            Layout.preferredHeight: 20
+                            Layout.fillWidth: true
+                            focusPolicy: Qt.NoFocus
+                            from: 0; to: 100
+                            ToolTip.visible: hovered && !pressed
+                            ToolTip.delay: 500
+                            ToolTip.text: "How much in-focus detail (stems, hairs, bark) is kept out of the selection, whatever its depth"
+                            background: Rectangle {
+                                x: depthKeepSharpSlider.leftPadding
+                                y: depthKeepSharpSlider.topPadding + depthKeepSharpSlider.availableHeight / 2 - height / 2
+                                width: depthKeepSharpSlider.availableWidth
+                                height: 4; radius: 2
+                                color: "#2e2e2e"; border.color: "#383838"; border.width: 1
+                                Rectangle {
+                                    width: depthKeepSharpSlider.visualPosition * parent.width
+                                    height: parent.height; radius: 2
+                                    color: compactEditor.panelAccent; opacity: 0.6
+                                }
+                            }
+                            handle: Rectangle {
+                                x: depthKeepSharpSlider.leftPadding + depthKeepSharpSlider.visualPosition * (depthKeepSharpSlider.availableWidth - width)
+                                y: depthKeepSharpSlider.topPadding + depthKeepSharpSlider.availableHeight / 2 - height / 2
+                                width: 10; height: 10; radius: 5
+                                color: "#e8e6e3"
+                                border.color: depthKeepSharpSlider.pressed ? compactEditor.panelAccent : "#5a5755"
+                                border.width: 1
+                            }
+                            Binding {
+                                target: depthKeepSharpSlider
+                                property: "value"
+                                when: !depthKeepSharpSlider.pressed
+                                value: (compactEditor.depthState.keep_sharp || 0) * 100
+                            }
+                            onMoved: if (compactEditor.controllerRef) compactEditor.controllerRef.set_depth_param("keep_sharp", value / 100)
+                            // The mask shows while dragging: a layer whose
+                            // sliders are all at zero changes nothing itself.
+                            onPressedChanged: {
+                                if (compactEditor.controllerRef) compactEditor.controllerRef.set_depth_slider_active(pressed)
+                                if (!pressed) compactEditor.focusKeyboardHandler()
+                            }
+                        }
+
+                        Text {
+                            Layout.preferredWidth: compactEditor.narrowLayout ? 26 : 32
+                            horizontalAlignment: Text.AlignRight
+                            text: Math.round(depthKeepSharpSlider.value)
+                            font.family: "IBM Plex Mono"
+                            font.pixelSize: 10
+                            color: "#e8e6e3"
+                        }
+                    }
+
+                        // Back to ordinary dodge & burn: the sliders set new
+                        // brush strokes again, painted on their own layers.
+                        Button {
+                            id: depthDoneBtn
+                            Layout.fillWidth: true
+                            Layout.topMargin: 2
+                            implicitHeight: 22
+                            verticalPadding: 0  // room for the (elided) label
+                            flat: true
+                            focusPolicy: Qt.NoFocus
+                            ToolTip.visible: hovered
+                            ToolTip.delay: 500
+                            ToolTip.text: "Leave the background layer: the sliders set new brush strokes again, painted on top"
+                            onClicked: {
+                                if (compactEditor.controllerRef) compactEditor.controllerRef.paint_dodge_burn()
+                                compactEditor.focusKeyboardHandler()
+                            }
+                            contentItem: Text {
+                                text: "Brush dodge & burn on top  →"
+                                elide: Text.ElideRight
+                                font.pixelSize: 10
+                                color: depthDoneBtn.hovered ? "#1e1e1e" : "#fbbf24"
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 3
+                                color: depthDoneBtn.hovered ? "#f59e0b" : "transparent"
+                                border.color: "#f59e0b"
+                                border.width: 1
+                            }
+                        }
+                    }
+                }
+
                 // Brush size (log scale: 0.2% .. 25% of the image diagonal)
                 // and hardness.
                 RowLayout {
                     Layout.fillWidth: true
-                    spacing: 6
+                    spacing: compactEditor.narrowLayout ? 3 : 6
 
                     Text {
-                        Layout.preferredWidth: 70
+                        Layout.preferredWidth: compactEditor.sliderLabelWidth
+                        elide: Text.ElideRight
                         text: "Size  [ ]"
                         color: compactEditor.textColor
                         font.pixelSize: 11
@@ -1642,7 +2075,7 @@ Window {
                     }
 
                     Text {
-                        Layout.preferredWidth: 32
+                        Layout.preferredWidth: compactEditor.narrowLayout ? 26 : 32
                         horizontalAlignment: Text.AlignRight
                         text: compactEditor.uiStateRef ? (compactEditor.uiStateRef.brushRadius * 100).toFixed(1) : ""
                         font.family: "IBM Plex Mono"
@@ -1653,10 +2086,11 @@ Window {
 
                 RowLayout {
                     Layout.fillWidth: true
-                    spacing: 6
+                    spacing: compactEditor.narrowLayout ? 3 : 6
 
                     Text {
-                        Layout.preferredWidth: 70
+                        Layout.preferredWidth: compactEditor.sliderLabelWidth
+                        elide: Text.ElideRight
                         text: "Hardness"
                         color: compactEditor.textColor
                         font.pixelSize: 11
@@ -1698,7 +2132,7 @@ Window {
                     }
 
                     Text {
-                        Layout.preferredWidth: 32
+                        Layout.preferredWidth: compactEditor.narrowLayout ? 26 : 32
                         horizontalAlignment: Text.AlignRight
                         text: compactEditor.uiStateRef ? Math.round(compactEditor.uiStateRef.brushHardness * 100) : ""
                         font.family: "IBM Plex Mono"
@@ -1738,6 +2172,11 @@ Window {
                     id: autoLevelsBtn
                     visible: !compactEditor.recipeMode  // auto tools act on the global edit
                     implicitWidth: 36; implicitHeight: 16
+                    // Draw the box over the whole clickable area (Material insets
+                    // it 6px top and bottom, leaving a 4px sliver) and centre the
+                    // label in it (Material's verticalPadding outranks padding).
+                    topInset: 0; bottomInset: 0
+                    verticalPadding: 0
                     Layout.minimumWidth: 36; Layout.preferredWidth: 36; Layout.maximumWidth: 36
                     Layout.minimumHeight: 16; Layout.preferredHeight: 16; Layout.maximumHeight: 16
                     enabled: !compactEditor.cropActive
@@ -1769,9 +2208,9 @@ Window {
                 ListElement { name: "Brightness"; key: "brightness"; min: -100; max: 100 }
                 ListElement { name: "Contrast"; key: "contrast"; min: -100; max: 100 }
                 ListElement { name: "Highlights"; key: "highlights"; min: -100; max: 100 }
-                ListElement { name: "Whites"; key: "whites"; min: -100; max: 100 }
+                ListElement { name: "Whites"; key: "whites"; min: -100; max: 300 }
                 ListElement { name: "Shadows"; key: "shadows"; min: -100; max: 100 }
-                ListElement { name: "Blacks"; key: "blacks"; min: -100; max: 100 }
+                ListElement { name: "Blacks"; key: "blacks"; min: -300; max: 100 }
             }
             Repeater { model: lightModel; delegate: compactSlider }
 
@@ -1797,6 +2236,11 @@ Window {
                     id: autoWbBtn
                     visible: !compactEditor.recipeMode  // auto tools act on the global edit
                     implicitWidth: 36; implicitHeight: 16
+                    // Draw the box over the whole clickable area (Material insets
+                    // it 6px top and bottom, leaving a 4px sliver) and centre the
+                    // label in it (Material's verticalPadding outranks padding).
+                    topInset: 0; bottomInset: 0
+                    verticalPadding: 0
                     Layout.minimumWidth: 36; Layout.preferredWidth: 36; Layout.maximumWidth: 36
                     Layout.minimumHeight: 16; Layout.preferredHeight: 16; Layout.maximumHeight: 16
                     enabled: !compactEditor.cropActive
@@ -1818,6 +2262,47 @@ Window {
                         radius: 2
                         color: autoWbBtn.hovered ? "#30ffffff" : "#18ffffff"
                         border.color: "#3a3a3a"; border.width: 1
+                    }
+                }
+
+                // Targeted white balance: click a white or grey spot.
+                Button {
+                    id: pickWbBtn
+                    visible: !compactEditor.recipeMode  // sets the global edit, like Auto
+                    implicitWidth: 36; implicitHeight: 16
+                    // Same box as Auto (see autoLevelsBtn for the insets).
+                    topInset: 0; bottomInset: 0
+                    verticalPadding: 0
+                    Layout.minimumWidth: 36; Layout.preferredWidth: 36; Layout.maximumWidth: 36
+                    Layout.minimumHeight: 16; Layout.preferredHeight: 16; Layout.maximumHeight: 16
+                    enabled: !compactEditor.cropActive
+                    padding: 0
+                    flat: true
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 500
+                    ToolTip.text: compactEditor.wbPicking
+                                  ? "Stop picking white balance (Esc)"
+                                  : "Pick white balance: click a white or grey spot in the photo to make it neutral. [ ] sets the spot size"
+                    onClicked: {
+                        compactEditor.ensureEditorLoaded("pick-white-balance")
+                        if (compactEditor.controllerRef) compactEditor.controllerRef.toggle_white_balance_pick()
+                        compactEditor.focusKeyboardHandler()
+                    }
+                    contentItem: Text {
+                        text: "Pick"
+                        font.pixelSize: 8
+                        font.weight: compactEditor.wbPicking ? Font.DemiBold : Font.Normal
+                        color: compactEditor.wbPicking ? "#ffffff"
+                               : (pickWbBtn.hovered ? "#e8e6e3" : "#9a9795")
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 2
+                        color: compactEditor.wbPicking ? compactEditor.accentColor
+                               : (pickWbBtn.hovered ? "#30ffffff" : "#18ffffff")
+                        border.color: compactEditor.wbPicking ? "transparent" : "#3a3a3a"
+                        border.width: 1
                     }
                 }
             }
@@ -1869,15 +2354,22 @@ Window {
             // --- Footer Buttons ---
             Item { Layout.fillHeight: true; Layout.minimumHeight: 10 }
 
+            // In a thin panel the three buttons share the row equally.
             RowLayout {
                 Layout.fillWidth: true
-                spacing: 8
+                spacing: compactEditor.narrowLayout ? 4 : 8
 
                 Button {
                     text: "Reset"
                     flat: true
-                    Layout.preferredWidth: 60
+                    Layout.fillWidth: compactEditor.narrowLayout
+                    Layout.preferredWidth: compactEditor.narrowLayout ? 0 : 60
                     Layout.preferredHeight: 28
+                    leftPadding: 4; rightPadding: 4
+                    // Here and on Close / Save: Material's 14px vertical
+                    // padding leaves a 28px button's label a zero-height box,
+                    // where an elided Text (Save) draws nothing.
+                    verticalPadding: 0
                     enabled: !compactEditor.cropActive
                     font.pixelSize: 11
                     Material.foreground: compactEditor.mutedText
@@ -1891,13 +2383,15 @@ Window {
                     }
                 }
 
-                Item { Layout.fillWidth: true }
+                Item { visible: !compactEditor.narrowLayout; Layout.fillWidth: true }
 
                 Button {
                     id: closeBtn
                     text: "Close"
-                    Layout.preferredWidth: 60
+                    Layout.fillWidth: compactEditor.narrowLayout
+                    Layout.preferredWidth: compactEditor.narrowLayout ? 0 : 60
                     Layout.preferredHeight: 28
+                    leftPadding: 4; rightPadding: 4; verticalPadding: 0
                     font.pixelSize: 11
                     ToolTip.visible: hovered
                     ToolTip.delay: 500
@@ -1922,8 +2416,10 @@ Window {
                 Button {
                     id: saveBtn
                     text: compactEditor.uiStateRef && compactEditor.uiStateRef.isSaving ? "Saving..." : "Save"
-                    Layout.preferredWidth: 80
+                    Layout.fillWidth: compactEditor.narrowLayout
+                    Layout.preferredWidth: compactEditor.narrowLayout ? 0 : 80
                     Layout.preferredHeight: 28
+                    leftPadding: 4; rightPadding: 4; verticalPadding: 0
                     font.pixelSize: 11
                     enabled: compactEditor.uiStateRef ? (!compactEditor.uiStateRef.isSaving && !compactEditor.cropActive) : true
                     onClicked: {
@@ -1932,6 +2428,7 @@ Window {
                     }
                     contentItem: Text {
                         text: saveBtn.text
+                        elide: Text.ElideRight
                         font: saveBtn.font
                         color: "white"
                         horizontalAlignment: Text.AlignHCenter
@@ -1960,7 +2457,7 @@ Window {
             required property real max
 
             Layout.fillWidth: true
-            spacing: 6
+            spacing: compactEditor.narrowLayout ? 3 : 6
 
             readonly property bool isHighlighted: compactEditor.highlightedSliderKey === sliderRow.key
             onIsHighlightedChanged: {
@@ -1970,7 +2467,7 @@ Window {
             // Clickable label. Clicking it makes this the slider that the
             // Up/Down arrow keys adjust; the highlighted row is tinted.
             Rectangle {
-                Layout.preferredWidth: 70
+                Layout.preferredWidth: compactEditor.sliderLabelWidth
                 Layout.preferredHeight: 18
                 Layout.alignment: Qt.AlignVCenter
                 radius: 3
@@ -2007,21 +2504,30 @@ Window {
                 Layout.alignment: Qt.AlignVCenter
                 enabled: !compactEditor.cropActive
                 focusPolicy: Qt.NoFocus
-                from: sliderRow.min
-                to: sliderRow.max
+                // slider.value is the handle position (-100..+100, 0 in the
+                // middle); sliderRow.min/max are the value range, which can
+                // reach further on one side (see SliderCurve.js).
+                from: sliderRow.min < 0 ? -100 : 0
+                to: sliderRow.max > 0 ? 100 : 0
                 stepSize: 1
                 property real editScale: compactEditor.sliderEditScale(sliderRow.key)
 
-                property real backendValue: compactEditor.getBackendValue(sliderRow.key) / slider.editScale * sliderRow.max
+                // The edit in display units (100 per edit unit x editScale).
+                property real backendValue: compactEditor.getBackendValue(sliderRow.key) / slider.editScale * 100
+                property real backendPosition: SliderCurve.positionForValue(slider.backendValue, sliderRow.min, sliderRow.max)
 
-                function editValueFromSliderValue(sliderValue) {
-                    return sliderValue / sliderRow.max * slider.editScale
+                function displayValueForPosition(pos) {
+                    return SliderCurve.valueForPosition(pos, sliderRow.min, sliderRow.max)
+                }
+
+                function editValueFromSliderValue(pos) {
+                    return slider.displayValueForPosition(pos) / 100 * slider.editScale
                 }
 
                 Binding {
                     target: slider
                     property: "value"
-                    value: slider.backendValue
+                    value: slider.backendPosition
                     when: !slider.pressed && !slider.isResetting
                 }
 
@@ -2068,8 +2574,34 @@ Window {
                     resetTimer.restart()
                 }
 
+                // A press beside the handle jumps there; a press on the handle
+                // only grabs it until the pointer moves (SliderInput.js). A
+                // click selects the row and leaves the edit as it is, even one
+                // past the slider's end.
+                property real _pressValue: 0
+                property bool _grabbed: false
+                property real _grabValue: 0
+                property bool _dragging: false
+
+                // Some Qt versions (reported for 6.5) emit no moved for a
+                // press on the handle's centre, as the handle stays put; the
+                // first moved is then the pointer's own travel, which must not
+                // become the grab point. Once Qt has handled the press, one
+                // that no moved has classified yet grabs the handle where it is.
+                function grabIfUnmoved() {
+                    if (slider.pressed && !slider._grabbed && !slider._dragging) {
+                        slider._grabbed = true
+                        slider._grabValue = slider.value
+                    }
+                }
+
                 onPressedChanged: {
                     if (pressed) {
+                        // Qt has not moved the handle to the press point yet.
+                        slider._pressValue = value
+                        slider._grabbed = false
+                        slider._dragging = false
+                        Qt.callLater(slider.grabIfUnmoved)
                         if (compactEditor.controllerRef) compactEditor.controllerRef.set_editor_slider_drag_active(true)
                         compactEditor.ensureEditorLoaded("slider-change")
                         compactEditor.highlightedSliderKey = sliderRow.key
@@ -2081,9 +2613,11 @@ Window {
                         }
                     } else {
                         sendTimer.stop()
+                        var dragged = slider._dragging
+                        slider._dragging = false
                         if (slider.isResetting) {
                             compactEditor.setEditValue(sliderRow.key, 0.0)
-                        } else {
+                        } else if (dragged) {
                             compactEditor.setEditValue(sliderRow.key, slider.editValueFromSliderValue(value))
                         }
                         if (compactEditor.controllerRef) compactEditor.controllerRef.update_histogram()
@@ -2094,6 +2628,17 @@ Window {
                 onMoved: {
                     if (slider.isResetting) return
                     compactEditor.highlightedSliderKey = sliderRow.key
+                    if (slider.pressed && !slider._dragging) {
+                        var step = SliderInput.pressMove(slider._pressValue, slider._grabbed, slider._grabValue, value,
+                                                         slider.handle ? slider.handle.width : 0,
+                                                         slider.availableWidth, slider.from, slider.to)
+                        if (step === "grab") {
+                            slider._grabbed = true
+                            slider._grabValue = value
+                        }
+                        if (step !== "drag") return
+                        slider._dragging = true
+                    }
                     _pendingValue = value
                     if (!sendTimer.running) sendTimer.start()
                 }
@@ -2143,9 +2688,11 @@ Window {
 
             Text {
                 id: valueReadout
-                property int displayValue: Math.round(slider.value)
+                // Read the edit itself when idle so a value past the slider's
+                // end shows its real number instead of the pinned endpoint.
+                property int displayValue: Math.round(slider.pressed ? slider.displayValueForPosition(slider.value) : slider.backendValue)
                 text: displayValue === 0 ? "0" : (displayValue > 0 ? "+" + displayValue : "−" + Math.abs(displayValue))
-                Layout.preferredWidth: 32
+                Layout.preferredWidth: compactEditor.narrowLayout ? 26 : 32
                 Layout.alignment: Qt.AlignVCenter
                 horizontalAlignment: Text.AlignRight
                 font.family: "IBM Plex Mono"

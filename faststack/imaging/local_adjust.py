@@ -15,6 +15,8 @@ JSON-safe dicts ``{"id": str, "visible": bool, "recipe": {key: float}}``.
 A layer with a ``"source"`` key is a stack layer instead (see
 ``faststack.imaging.stack_paint``), and one with ``"halo": True`` a halo
 removal layer (see ``faststack.imaging.halo_fix``); neither has a recipe.
+A recipe layer with a ``"depth"`` key also selects the background by
+estimated depth (see ``faststack.imaging.depth_select``).
 The list and its dicts are treated as immutable — the controller replaces
 them on every change — so shallow edit snapshots are safe to hand to the
 render and save workers.
@@ -31,6 +33,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+from faststack.imaging.depth_select import (
+    DepthMap,
+    depth_layer_density,
+    is_depth_layer,
+    normalize_depth_params,
+)
 from faststack.imaging.mask import MaskData
 from faststack.imaging.mask_engine import LayerDensityCache, rasterize_layer_density
 
@@ -123,6 +131,12 @@ def normalize_local_layers(value: Any) -> List[Dict[str, Any]]:
         elif item.get("halo") is True:
             layer["halo"] = True
             layer["recipe"] = {}
+        else:
+            # Depth layers (faststack.imaging.depth_select) select the
+            # background by estimated depth, as well as by their strokes.
+            depth = normalize_depth_params(item.get("depth"))
+            if depth is not None:
+                layer["depth"] = depth
         layers.append(layer)
     return layers
 
@@ -186,8 +200,13 @@ def build_local_adjustments(
     cache: Optional[LayerDensityCache] = None,
     base_shape: Optional[Tuple[int, int]] = None,
     point_transform: Optional[np.ndarray] = None,
+    depth_map: Optional[DepthMap] = None,
 ) -> Optional[LocalAdjustments]:
-    """Rasterise every effective layer at *shape* into recipe delta maps."""
+    """Rasterise every effective layer at *shape* into recipe delta maps.
+
+    *depth_map* is the photo's estimated depth for depth layers; without it
+    (not computed yet) they apply only where they were painted.
+    """
     layers = effective_layers(edits)
     if cache is not None:
         cache.prune({layer.get("id") for layer in edits.get("local_layers") or ()})
@@ -197,17 +216,29 @@ def build_local_adjustments(
     painted = []
     for layer in layers:
         mask_data = mask_assets.get(layer["id"])
-        if mask_data is None:
+        if is_depth_layer(layer) and point_transform is not None:
+            density = depth_layer_density(
+                layer,
+                mask_data,
+                shape,
+                edits,
+                depth_map,
+                point_transform,
+                cache=cache,
+                base_shape=base_shape,
+            )
+        elif mask_data is None:
             continue
-        density = rasterize_layer_density(
-            layer["id"],
-            mask_data,
-            shape,
-            edits,
-            cache=cache,
-            base_shape=base_shape,
-            point_transform=point_transform,
-        )
+        else:
+            density = rasterize_layer_density(
+                layer["id"],
+                mask_data,
+                shape,
+                edits,
+                cache=cache,
+                base_shape=base_shape,
+                point_transform=point_transform,
+            )
         if density is not None:
             painted.append((layer, mask_data, density))
     if not painted:
@@ -233,14 +264,23 @@ def build_local_adjustments(
             sorted((k, v) for k, v in layer["recipe"].items() if k in LOCAL_LINEAR_KEYS)
         )
         if linear:
-            live = mask_data.live_stroke
+            live = mask_data.live_stroke if mask_data is not None else None
+            depth = layer.get("depth") if is_depth_layer(layer) else None
             linear_identity.append(
                 (
                     layer["id"],
-                    mask_data.revision,
-                    len(mask_data.strokes),
+                    mask_data.revision if mask_data is not None else -1,
+                    len(mask_data.strokes) if mask_data is not None else 0,
                     len(live.points) if live is not None else -1,
                     linear,
+                    (
+                        (
+                            tuple(sorted(depth.items())),
+                            depth_map.uid if depth_map is not None else 0,
+                        )
+                        if depth is not None
+                        else None
+                    ),
                 )
             )
     return LocalAdjustments(y0, y1, x0, x1, maps, tuple(linear_identity))
@@ -306,12 +346,25 @@ def apply_local_shadows(arr: np.ndarray, shadows: np.ndarray) -> np.ndarray:
     return arr * factor[..., None].astype(np.float32, copy=False)
 
 
+# Narrowest black-to-white span a levels ramp accepts (a 20x stretch), shared
+# with the global ramp in editor._levels_endpoints. Spans the old +/-100
+# sliders could produce are >= 0.55, so it never changes an existing edit.
+LEVELS_MIN_SPAN = 0.05
+
+
 def _levels_ramp_map(arr: np.ndarray, blacks: np.ndarray, whites: np.ndarray):
     bp = -blacks * 0.15
     wp = 1.0 - whites * 0.15
-    # The global ramp only nudges a degenerate span; built-up local coats can
-    # push it negative, which would invert the image, so floor it instead.
-    span = np.maximum(wp - bp, 0.0001)
+    # Same rule as the global ramp, per pixel: endpoints closer than the
+    # minimum span (or crossed, which would invert the image) are spread
+    # evenly about their midpoint, so a painted region meets the rest of the
+    # image with the same tonal mapping.
+    narrow = (wp - bp) < LEVELS_MIN_SPAN
+    if np.any(narrow):
+        mid = 0.5 * (bp + wp)
+        bp = np.where(narrow, mid - 0.5 * LEVELS_MIN_SPAN, bp)
+        wp = np.where(narrow, mid + 0.5 * LEVELS_MIN_SPAN, wp)
+    span = wp - bp
     return (arr - bp[..., None]) / span[..., None]
 
 
@@ -362,8 +415,11 @@ def _basic_srgb_map(
 
     v_active = np.abs(vibrance) > 0.001
     if v_active.any():
-        cmax = arr.max(axis=2)
-        cmin = arr.min(axis=2)
+        # Elementwise across the three channels: numpy's reduction over a
+        # length-3 last axis is several times slower on a full frame.
+        r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+        cmax = np.maximum(np.maximum(r, g), b)
+        cmin = np.minimum(np.minimum(r, g), b)
         sat = np.zeros_like(cmax)
         np.divide(cmax - cmin, cmax, out=sat, where=cmax > 0.0001)
         sat_mask = np.clip(1.0 - sat, 0.0, 1.0)

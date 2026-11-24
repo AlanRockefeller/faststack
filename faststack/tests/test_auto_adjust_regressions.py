@@ -98,6 +98,7 @@ class _Qt(IntFlag):
     Key_CapsLock = 145
     Key_NumLock = 146
     Key_ScrollLock = 147
+    Key_W = 148
 
 
 def _load_keybinder_class():

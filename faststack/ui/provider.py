@@ -707,6 +707,7 @@ class UIState(QObject):
     imageEditorUnsavedPromptRequested = Signal(str, bool)
     autoLevelClippingThresholdChanged = Signal(float)
     autoLevelBlackThresholdChanged = Signal(float)
+    autoLevelWhiteThresholdChanged = Signal(float)
     autoLevelStrengthChanged = Signal(float)
     autoLevelStrengthAutoChanged = Signal(bool)
     autoVibranceEnabledChanged = Signal(bool)
@@ -769,6 +770,9 @@ class UIState(QObject):
     brush_hardness_changed = Signal(float)
     brush_crop_scale_changed = Signal()
     brush_pan_held_changed = Signal(bool)
+    # White balance picker (the compact editor's "Pick" button)
+    is_wb_picking_changed = Signal(bool)
+    wb_pick_radius_changed = Signal(float)
     local_overlay_visible_changed = Signal(bool)
     local_overlay_held_changed = Signal(bool)
     local_overlay_generation_changed = Signal()
@@ -780,6 +784,7 @@ class UIState(QObject):
     stack_inputs_changed = Signal()
     stack_input_name_changed = Signal(str)
     halo_state_changed = Signal()
+    depth_state_changed = Signal()
     stack_hover_generation_changed = Signal()
 
     # Debug Cache Signals
@@ -870,6 +875,12 @@ class UIState(QObject):
         self._brush_hardness = 0.5
         self._brush_crop_scale = [1.0, 1.0]
         self._brush_pan_held = False
+        # White balance picker: on while the next click on the photo sets
+        # white balance; the spot radius is a fraction of the image diagonal,
+        # like brushRadius, but kept apart: a grey spot is usually far smaller
+        # than a dodge & burn brush.
+        self._is_wb_picking = False
+        self._wb_pick_radius = 0.01
         self._local_overlay_visible = False
         self._local_overlay_held = False
         self._local_overlay_generation = 0
@@ -891,6 +902,10 @@ class UIState(QObject):
         # Halo removal: download prompt/progress and work status, one map so
         # QML binds to a single property (see AppController._set_halo_state).
         self._halo_state: dict = {}
+        # Background selection by depth: download prompt/progress, work
+        # status and the selected depth layer's sliders, likewise one map
+        # (see AppController._set_depth_state).
+        self._depth_state: dict = {}
 
         # Debug Cache State
         self._debug_cache = False
@@ -1291,6 +1306,19 @@ class UIState(QObject):
         if self._status_message_color != value:
             self._status_message_color = value
             self.statusMessageColorChanged.emit()
+
+    # W (RAW white balance) progress for the status bar meter; see
+    # RawWhiteBalanceMixin._publish_raw_awb_progress for the keys.
+    rawAwbProgressChanged = Signal()
+
+    @Property("QVariantMap", notify=rawAwbProgressChanged)
+    def rawAwbProgress(self):
+        return getattr(self, "_raw_awb_progress", None) or {"active": False}
+
+    @rawAwbProgress.setter
+    def rawAwbProgress(self, value):
+        self._raw_awb_progress = dict(value or {})
+        self.rawAwbProgressChanged.emit()
 
     @Property(bool, notify=automaticMonitoringAvailableChanged)
     def automaticMonitoringAvailable(self) -> bool:
@@ -1709,6 +1737,17 @@ class UIState(QObject):
             return
         self.app_controller.set_auto_level_black_threshold(value)
         self.autoLevelBlackThresholdChanged.emit(value)
+
+    @Property(float, notify=autoLevelWhiteThresholdChanged)
+    def autoLevelWhiteThreshold(self):
+        return self.app_controller.get_auto_level_white_threshold()
+
+    @autoLevelWhiteThreshold.setter
+    def autoLevelWhiteThreshold(self, value):
+        if self.app_controller.get_auto_level_white_threshold() == value:
+            return
+        self.app_controller.set_auto_level_white_threshold(value)
+        self.autoLevelWhiteThresholdChanged.emit(value)
 
     @Property(float, notify=autoLevelStrengthChanged)
     def autoLevelStrength(self):
@@ -2535,6 +2574,29 @@ class UIState(QObject):
             self._brush_pan_held = new_value
             self.brush_pan_held_changed.emit(new_value)
 
+    @Property(bool, notify=is_wb_picking_changed)
+    def isWbPicking(self) -> bool:
+        """True while the next click on the photo picks white balance."""
+        return self._is_wb_picking
+
+    @isWbPicking.setter
+    def isWbPicking(self, new_value: bool):
+        if self._is_wb_picking != new_value:
+            self._is_wb_picking = new_value
+            self.is_wb_picking_changed.emit(new_value)
+
+    @Property(float, notify=wb_pick_radius_changed)
+    def wbPickRadius(self) -> float:
+        """White balance picker spot radius, as a fraction of the uncropped
+        image diagonal (the same units as brushRadius)."""
+        return self._wb_pick_radius
+
+    @wbPickRadius.setter
+    def wbPickRadius(self, new_value: float):
+        if self._wb_pick_radius != new_value:
+            self._wb_pick_radius = new_value
+            self.wb_pick_radius_changed.emit(new_value)
+
     @Property(bool, notify=local_overlay_visible_changed)
     def localOverlayVisible(self) -> bool:
         return self._local_overlay_visible
@@ -2635,6 +2697,17 @@ class UIState(QObject):
         if self._halo_state != new_value:
             self._halo_state = dict(new_value)
             self.halo_state_changed.emit()
+
+    @Property("QVariantMap", notify=depth_state_changed)
+    def depthState(self) -> dict:
+        """Background selection: install prompt, progress, selected layer."""
+        return self._depth_state
+
+    @depthState.setter
+    def depthState(self, new_value: dict):
+        if self._depth_state != new_value:
+            self._depth_state = dict(new_value)
+            self.depth_state_changed.emit()
 
     @Property(str, notify=stack_input_name_changed)
     def stackInputName(self) -> str:

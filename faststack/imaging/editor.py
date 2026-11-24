@@ -21,6 +21,7 @@ from faststack.imaging.jpeg import TURBO_AVAILABLE, decode_jpeg_rgb
 
 # Local adjustment layers (dodge & burn)
 from faststack.imaging.local_adjust import (
+    LEVELS_MIN_SPAN as _LEVELS_MIN_SPAN,
     LOCAL_GAIN_KEYS,
     LOCAL_LINEAR_KEYS,
     LOCAL_SRGB_KEYS,
@@ -48,6 +49,8 @@ from faststack.imaging.math_utils import (
 from faststack.imaging.orientation import apply_orientation_to_np, get_exif_orientation
 from faststack.imaging.prefetch import apply_loupe_color_correction
 
+from faststack.imaging.depth_select import DepthMap, edits_need_depth_map
+
 # Stack paint: focus-stack input pixels painted over the stacked output
 from faststack.imaging.halo_fix import (
     HaloResult,
@@ -66,6 +69,7 @@ from faststack.imaging.stack_paint import (
     stack_layers,
     warp_source_to_base,
 )
+from faststack.imaging.wb_pick import read_disc
 from faststack.io.indexer import JPG_EXTENSIONS
 from faststack.io.utils import fsync_directory, fsync_file
 from faststack.models import DecodedImage
@@ -82,6 +86,9 @@ log = logging.getLogger(__name__)
 
 _CV2_UNLOADED = object()
 cv2: Any = _CV2_UNLOADED
+
+# _apply_edits default for depth_map_override: use the live editor's map.
+_LIVE_DEPTH_MAP: Any = object()
 
 
 def _get_cv2():
@@ -247,12 +254,27 @@ def _apply_in_parallel_bands(operation, source: np.ndarray) -> np.ndarray:
     return output
 
 
-def _apply_levels_ramp(arr: np.ndarray, blacks: float, whites: float) -> np.ndarray:
-    """Set the working black/white range without clipping or mutating input."""
+# _LEVELS_MIN_SPAN (from local_adjust, shared with the painted ramp) is the
+# narrowest black-to-white span the levels ramp accepts. The Whites/Blacks
+# sliders reach far enough that the endpoints could otherwise cross and turn
+# the image into a negative.
+
+
+def _levels_endpoints(blacks: float, whites: float) -> Tuple[float, float]:
+    """Black and white points (bp, wp) of the levels ramp, never crossed."""
     bp = -blacks * 0.15
     wp = 1.0 - whites * 0.15
-    if abs(wp - bp) < 0.0001:
-        wp = bp + 0.0001
+    if wp - bp < _LEVELS_MIN_SPAN:
+        # Split the shortfall so neither slider alone wins the collision.
+        mid = 0.5 * (bp + wp)
+        bp = mid - 0.5 * _LEVELS_MIN_SPAN
+        wp = mid + 0.5 * _LEVELS_MIN_SPAN
+    return bp, wp
+
+
+def _apply_levels_ramp(arr: np.ndarray, blacks: float, whites: float) -> np.ndarray:
+    """Set the working black/white range without clipping or mutating input."""
+    bp, wp = _levels_endpoints(blacks, whites)
     return (arr - bp) / (wp - bp)
 
 
@@ -439,18 +461,29 @@ def _normalized_wb_gains(by: float, mg: float) -> Tuple[float, float, float]:
     return r_gain, g_gain, b_gain
 
 
-def _safe_replace(tmp_path: Path, target_path: Path) -> None:
+def _safe_replace(
+    tmp_path: Path,
+    target_path: Path,
+    *,
+    check: Optional[Callable[[], None]] = None,
+) -> None:
     """Durably and atomically replace target with tmp.
 
     The temporary file's data is flushed before the rename and the parent
     directory afterwards, so a crash or power loss leaves either the old or the
     new file under ``target_path`` rather than a truncated one. Retries on
     Windows file-lock errors.
+
+    ``check`` runs immediately before each rename attempt (after the flush and
+    any retry delay); it raises to abort with the target left untouched. It
+    must not raise OSError, which is retried.
     """
     # Strict: a write-back error must fail the save rather than replace the
     # original with data that never reached the disk.
     fsync_file(tmp_path, strict=True)
     for attempt in range(_REPLACE_MAX_RETRIES):
+        if check is not None:
+            check()
         try:
             os.replace(str(tmp_path), str(target_path))
             fsync_directory(Path(target_path).parent)
@@ -1098,6 +1131,11 @@ class ImageEditor:
         # controller on a worker for this load session (HaloResult is
         # immutable; the dict is only rebound on the GUI thread).
         self._halo_results: Dict[str, HaloResult] = {}
+        # Background selection: the photo's estimated depth, computed by the
+        # controller's worker (faststack/controller/depth_select.py) or the
+        # save worker. Replaced wholesale, never mutated, so the render and
+        # save workers read it without locking.
+        self._depth_map: Optional[DepthMap] = None
 
         # Rendering preferences pushed in from AppController config:
         # soft shoulder/toe on the levels ramp, and TPDF dither on 8-bit
@@ -1155,6 +1193,7 @@ class ImageEditor:
             self._local_density_cache.clear()
             self._stack_sources = {}
             self._halo_results = {}
+            self._depth_map = None
             self._stack_sources_session_id = None
 
     def set_source_exif(self, exif_bytes: Optional[bytes]):
@@ -1353,6 +1392,7 @@ class ImageEditor:
                 self._local_density_cache.clear()
                 self._stack_sources = {}
                 self._halo_results = {}
+                self._depth_map = None
                 self._stack_sources_session_id = None
             log.error("Image file not found: %s", filepath)
             return False
@@ -1379,6 +1419,7 @@ class ImageEditor:
             # reload gets a fresh set rather than reusing path-keyed sources.
             self._stack_sources = {}
             self._halo_results = {}
+            self._depth_map = None
             self._stack_sources_session_id = None
 
         _is_tiff = load_filepath.suffix.lower() in (".tif", ".tiff")
@@ -1739,6 +1780,7 @@ class ImageEditor:
                 self._local_density_cache.clear()
                 self._stack_sources = {}
                 self._halo_results = {}
+                self._depth_map = None
                 self._stack_sources_session_id = None
             return False
 
@@ -1814,6 +1856,7 @@ class ImageEditor:
         cache_override: Optional["LayerDensityCache"] = None,
         stack_sources_override: Optional[Dict[str, StackSource]] = None,
         halo_results_override: Optional[Dict[str, HaloResult]] = None,
+        depth_map_override: Any = _LIVE_DEPTH_MAP,
         cache_context: Optional[dict] = None,
         update_highlight_state: bool = True,
         downscale_long_edge: Optional[int] = None,
@@ -1856,7 +1899,11 @@ class ImageEditor:
         ``stack_sources_override`` likewise supplies the registered stack
         inputs for stack layers (default: the live ``_stack_sources``), and
         ``halo_results_override`` the halo layers' corrected pixels (default:
-        the live ``_halo_results``).
+        the live ``_halo_results``).  ``depth_map_override`` is the estimated
+        depth for depth layers (default: the live ``_depth_map``); an explicit
+        None means "no depth map", so an export whose map could not be
+        computed never falls back to the live editor's, which may belong to
+        another photo by then.
         """
         cv2 = _get_cv2()
         if edits is None:
@@ -2137,6 +2184,11 @@ class ImageEditor:
                 ),
                 base_shape=mask_base_shape,
                 point_transform=mask_point_transform,
+                depth_map=(
+                    self._depth_map
+                    if depth_map_override is _LIVE_DEPTH_MAP
+                    else depth_map_override
+                ),
             )
             _mark("local_masks")
 
@@ -2854,8 +2906,18 @@ class ImageEditor:
         reset_levels: bool = True,
         channel_budget: float = 3.0,
         black_threshold_percent: Optional[float] = None,
+        white_threshold_percent: Optional[float] = None,
     ) -> Tuple[float, float, float, float]:
         """Analyze auto-levels on the current edited baseline without mutating edits.
+
+        ``white_threshold_percent`` is the highlight-end counterpart: the
+        share of pixels the white point may clip (luma, with each channel
+        allowed ``channel_budget`` times that). Lower it to brighten less and
+        keep highlights; None keeps it tied to ``threshold_percent``. It never
+        touches the shadow end: when it would put the white point on the
+        black point (in a frame that is not flat at ``threshold_percent``),
+        only the white stretch is dropped, and p_high comes back as 255. A
+        frame flat at ``threshold_percent`` gets no stretch whatever it is.
 
         ``black_threshold_percent`` clips the shadow end independently of
         ``threshold_percent``. The black point can never sit above this
@@ -2873,6 +2935,10 @@ class ImageEditor:
             black_threshold_percent = threshold_percent
         else:
             black_threshold_percent = max(0.0, min(50.0, black_threshold_percent))
+        if white_threshold_percent is None:
+            white_threshold_percent = threshold_percent
+        else:
+            white_threshold_percent = max(0.0, min(10.0, white_threshold_percent))
 
         # Auto-levels is an aggregate percentile estimate: sample the source
         # down before rendering so analysis follows source pixels without
@@ -2931,22 +2997,31 @@ class ImageEditor:
         # threshold rather than disabling the stretch outright the moment a
         # few specular pixels sit at 255.
         chan_lows = []
-        chan_highs = []
+        chan_hists = []
         for c in range(3):
             hist = np.bincount(quantized[:, :, c].reshape(-1), minlength=nbins)
             chan_lows.append(self._percentile_from_hist(hist, chan_t, method="lower"))
-            chan_highs.append(
-                self._percentile_from_hist(hist, 100.0 - chan_t, method="higher")
-            )
+            chan_hists.append(hist)
 
         luma_q = (_rec601_gray(scaled) * (nbins - 1)).astype(np.uint16)
         luma_hist = np.bincount(luma_q.reshape(-1), minlength=nbins)
         luma_low = self._percentile_from_hist(
             luma_hist, black_threshold_percent, method="lower"
         )
-        luma_high = self._percentile_from_hist(
-            luma_hist, 100.0 - threshold_percent, method="higher"
-        )
+
+        def white_point(white_t: float) -> float:
+            """0-255 white point clipping *white_t* percent: luma-driven,
+            floored by the per-channel budgets."""
+            chan_t_high = min(50.0, white_t * channel_budget)
+            luma_high = self._percentile_from_hist(
+                luma_hist, 100.0 - white_t, method="higher"
+            )
+            chan_highs = [
+                self._percentile_from_hist(h, 100.0 - chan_t_high, method="higher")
+                for h in chan_hists
+            ]
+            return max(0.0, min(255.0, max(luma_high, max(chan_highs)) * bin_to_255))
+
         median_luma = self._percentile_from_hist(luma_hist, 50.0, method="lower") / (
             nbins - 1
         )
@@ -2984,12 +3059,23 @@ class ImageEditor:
             p_low = luma_low * bin_to_255
         else:
             p_low = min(luma_low, min(chan_lows)) * bin_to_255
-        # White point: luma-driven target, floored by the per-channel budgets.
-        p_high = max(luma_high, max(chan_highs)) * bin_to_255
-
-        # Safety
         p_low = max(0.0, min(255.0, p_low))
-        p_high = max(0.0, min(255.0, p_high))
+
+        # Whether the frame is flat is decided at the shared threshold, never
+        # by the Whites clip: a tiny one reaches a few stray bright pixels in
+        # a flat frame, and the black point would then land on the whole
+        # frame and turn it black. A flat frame keeps the shared white point,
+        # so the range check below leaves it alone.
+        p_high = white_point(threshold_percent)
+        if (p_high - p_low) >= 1.0:
+            p_high = white_point(white_threshold_percent)
+            # A white point on the black point would stretch without limit.
+            # The frame is not flat, so only a wider Whites clip took it
+            # there: drop the white stretch alone (white point back at 255)
+            # and keep the black point, which the Whites clip has no say in.
+            # Resetting both would let the Whites clip undo the blacks.
+            if (p_high - p_low) < 1.0:
+                p_high = 255.0
 
         # Check for degenerate range (e.g. flat image) to prevent extreme stretching
         if (p_high - p_low) < 1.0:
@@ -3307,6 +3393,33 @@ class ImageEditor:
             view[::stride, ::stride], dtype=np.float32, copy=True, order="C"
         )
         return sample, stride, label
+
+    def read_base_disc(
+        self, u: float, v: float, radius: float
+    ) -> Optional[np.ndarray]:
+        """sRGB pixels, (N, 3) in [0, 1], of a disc on the unedited image.
+
+        ``(u, v)`` is in the oriented base image's [0, 1] coordinates (what
+        the brushes map a click to) and ``radius`` a fraction of its diagonal.
+        These are the pixels white balance works on: every edit that changes
+        colour comes after it. Reads the float master, else the 8-bit original
+        (the same pixels; see _sample_source_for_analysis), else the preview.
+        None when no image is loaded or the centre is off the image.
+        """
+        with self._lock:
+            master = self.float_image
+            original = self.original_image
+            preview = self.float_preview
+            eight_bit = self.bit_depth == 8
+        if master is not None:
+            source = master
+        elif original is not None and eight_bit:
+            source = original
+        elif preview is not None:
+            source = preview
+        else:
+            return None
+        return read_disc(source, u, v, radius)
 
     def estimate_auto_white_balance(
         self,
@@ -4723,6 +4836,7 @@ class ImageEditor:
             # --- Stack paint inputs (immutable objects; copy the dict) ---
             stack_sources_snapshot = dict(self._stack_sources)
             halo_results_snapshot = dict(self._halo_results)
+            depth_map_snapshot = self._depth_map
 
             # --- Paths ---
             filepath_snapshot = self.current_filepath
@@ -4763,6 +4877,7 @@ class ImageEditor:
             "mask_assets": mask_assets_snapshot,
             "stack_sources": stack_sources_snapshot,
             "halo_results": halo_results_snapshot,
+            "depth_map": depth_map_snapshot,
             # Optional callable(name) -> Path the controller may add so the
             # save worker can load stack inputs that were not loaded yet.
             "stack_source_resolver": None,
@@ -4792,9 +4907,8 @@ class ImageEditor:
             whites = float(edits.get("whites", 0.0))
         except (TypeError, ValueError):
             return final_float
-        bp = -blacks * 0.15
-        wp = 1.0 - (whites * 0.15)
-        gain = 1.0 / max(wp - bp, 1e-4)
+        bp, wp = _levels_endpoints(blacks, whites)
+        gain = 1.0 / (wp - bp)
         if gain < _EXPORT_DITHER_MIN_GAIN:
             return final_float
 
@@ -4859,6 +4973,11 @@ class ImageEditor:
             source_arr,
             stack_sources,
         )
+        # The depth map a background selection needs but the preview has
+        # not finished is computed here too.
+        depth_map = self._depth_map_for_export(
+            edits_snapshot, snapshot.get("depth_map"), source_arr
+        )
 
         # 1. Apply edits to full resolution — uses only snapshot data
         # Use isolated snapshot context so background export doesn't pollute self._cached_*
@@ -4872,6 +4991,7 @@ class ImageEditor:
             cache_override=export_cache,
             stack_sources_override=stack_sources,
             halo_results_override=halo_results,
+            depth_map_override=depth_map,
             cache_context=export_cache_context,
             update_highlight_state=False,
             # The snapshot shares the live editor's float_image (see
@@ -5039,6 +5159,40 @@ class ImageEditor:
         finally:
             for tmp_output, _destination in temp_outputs:
                 tmp_output.unlink(missing_ok=True)
+
+    @staticmethod
+    def _depth_map_for_export(
+        edits: Dict[str, Any],
+        depth_map: Optional[DepthMap],
+        source_arr: np.ndarray,
+    ) -> Optional[DepthMap]:
+        """The depth map the export needs; runs on the save worker.
+
+        Computes it when the preview's is missing (a save right after
+        selecting the background, or of a restored edit).  When it cannot be
+        computed here (the model is not installed on this machine), depth
+        layers apply only where they were painted, as the preview shows them,
+        rather than failing the save.
+        """
+        if not edits_need_depth_map(edits):
+            return None
+        shape = tuple(source_arr.shape[:2])
+        if depth_map is not None and depth_map.base_shape == shape:
+            return depth_map
+        from faststack.ai import depth as ai_depth
+        from faststack.imaging.depth_select import compute_depth_map
+
+        try:
+            return compute_depth_map(source_arr, ai_depth.get_estimator().estimate)
+        except ai_depth.DepthUnavailable as exc:
+            log.warning(
+                "Background selection left out of the saved photo: %s", exc
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            # ONNX Runtime, OpenCV or numpy failing on this photo: leave the
+            # selection out rather than fail every save of it.
+            log.exception("Background selection left out of the saved photo")
+        return None
 
     @staticmethod
     def _halo_results_for_export(
@@ -5282,10 +5436,7 @@ class ImageEditor:
         if abs(blacks) <= 0.001 and abs(whites) <= 0.001:
             return None
 
-        bp = -blacks * 0.15
-        wp = 1.0 - (whites * 0.15)
-        if abs(wp - bp) < 0.0001:
-            wp = bp + 0.0001
+        bp, wp = _levels_endpoints(blacks, whites)
 
         # A LUT cannot dither (it is pointwise), so when the stretch is strong
         # enough to band 8-bit sources, decline the fast path and let the

@@ -10,6 +10,7 @@ private ``_*Done`` signals, which Qt queues back to the controller's thread.
 
 from __future__ import annotations
 
+import copy
 import logging
 import statistics
 import threading
@@ -143,6 +144,46 @@ MAX_ACCURACY_M = 1_000_000
 # warns, and Upload asks first: a run that outlives the token fails partway.
 TOKEN_WARN_SECONDS = 15 * 60
 TOKEN_TICK_MS = 30_000
+# Batches the dialog was last opened for, kept (until the app exits) so going
+# back to one picks up its cards where they were left.
+MAX_STASHED_BATCHES = 8
+# Vision answers kept (until the app exits) for photo sets no card shows any
+# more; enough for every card of the stashed batches.
+MAX_VISION_CACHE = 1000
+# Everything open() and _reset_existing() set up for one batch. A batch that
+# is put aside saves these together with its cards; restoring only some of
+# them would let the next rematch or regroup throw the cards away. The Vision
+# cache is not one of them: it is shared by every batch, so an answer given
+# while one batch was open is not asked for again from another.
+_BATCH_STATE_ATTRS = (
+    "_photos",
+    "_opened_keys",
+    "_uploaded_paths",
+    "_manual_edits",
+    "_grouping_recorded",
+    "_token_failed_run",
+    "_resume_after_verify",
+    "_upload_done",
+    "_upload_total",
+    "_upload_results",
+    "_folder",
+    "_time_gap_s",
+    "_distance_m",
+    "_thresholds_source",
+    "_thresholds_note",
+    "_existing",
+    "_existing_complete",
+    "_existing_by_id",
+    "_existing_fetched",
+    "_existing_status",
+    "_clock",
+    "_clock_saved",
+    "_clock_decisions",
+    "_camera_days",
+    "_regrouped_for_clock",
+    "_dismissed",
+    "_match_signature",
+)
 
 
 @dataclass
@@ -173,6 +214,15 @@ class Card:
     # Where the new photos go among the observation's own: "inat:<index>"
     # for its photos, photo keys for this card's. None = after them.
     merged_order: Optional[list[str]] = None
+    # A card for only the photos of an uploaded card that a later batch has:
+    # the whole card's order on iNaturalist (photo keys, "inat:<index>" for
+    # an existing observation's own), so a retry from the part puts its
+    # photos where the whole card would have rather than first.
+    upload_order: Optional[list[str]] = None
+    # Set when this card's photos went to an existing observation after
+    # another card's (two cards adding to one): the place its first photo
+    # went to. A part card of it keeps those places.
+    attach_base: Optional[int] = None
 
     @property
     def locked(self) -> bool:
@@ -352,8 +402,9 @@ class INatUploadController(QObject):
     # Observations uploaded, then one {cardId, number, name, message} per failure.
     uploadFailed = Signal(int, list)
 
-    _identifyDone = Signal(int, int, object, str)  # card id, token, result, error
-    _identifyProgress = Signal(int, int, str)  # card id, token, status line
+    # card id, token, identify run, result, error
+    _identifyDone = Signal(int, int, int, object, str)
+    _identifyProgress = Signal(int, int, int, str)  # card id, token, run, status line
     # card id, token, obs id, keys of photos attached this run, error, and
     # why the photos of an existing observation could not be put in order
     _uploadCardDone = Signal(int, int, object, object, str, str)
@@ -380,6 +431,11 @@ class INatUploadController(QObject):
         self._credentials = CredentialStore()
         self._model = CardModel(self)
         self._photos: list[PhotoRecord] = []
+        # The paths open() was asked for: a photo that could not be read is
+        # missing from _photos, and must not stop the same batch resuming.
+        self._opened_keys: list[str] = []
+        # Batches put aside when another one was opened, newest last.
+        self._stashed: dict[tuple[str, ...], dict[str, Any]] = {}
         self._next_card_id = 1
         self._busy_jobs = 0
         self._status_text = ""
@@ -399,6 +455,11 @@ class INatUploadController(QObject):
         # an upload or a taxon lookup on the shared pool.
         self._identify_executor = create_daemon_threadpool_executor(1, "inat-identify")
         self._cancel_identify = threading.Event()
+        # Moves on with every cancelIdentify(). A card the dialog brings back
+        # from a stashed batch has the token it had then, which an answer
+        # asked for since (from another batch sharing the card) can carry too;
+        # the run it was asked in tells the two apart.
+        self._identify_run = 0
         # Name autocomplete has its own thread too, so typing is answered
         # while an upload holds the shared pool.
         self._suggest_executor = create_daemon_threadpool_executor(1, "inat-suggest")
@@ -411,6 +472,10 @@ class INatUploadController(QObject):
         self._token_failed_run = False
         self._resume_after_verify = False
         self._grouping_recorded = False
+        # The batch (its photo paths) that made the newest grouping-history
+        # entry. Not kept per batch: a stashed batch's retry must not replace
+        # an entry another batch made since.
+        self._history_newest: Optional[tuple[str, ...]] = None
         # iNat taxon for a (name, rank) the user or Vision chose. Regrouping
         # re-creates cards with the same names; asking iNaturalist again for
         # each one on every slider move would hit its rate limit.
@@ -418,6 +483,8 @@ class INatUploadController(QObject):
         # Cards waiting on a lookup that is already in flight, per (name, rank).
         self._taxon_waiting: dict[tuple[str, str], list[tuple[int, int]]] = {}
         self._history = GroupingHistory(get_app_data_dir() / HISTORY_FILE)
+        # Vision's answer per photo set (photo keys), oldest first, for every
+        # batch: a card with the same photos never asks Vision twice.
         self._vision_cache: dict[frozenset, VisionResult] = {}
         self._time_gap_s = float(self.timeGapMinutes * 60)
         self._distance_m = float(self.distanceMeters)
@@ -1025,15 +1092,17 @@ class INatUploadController(QObject):
             # The dialog is modal and refuses to close mid-upload, so this is
             # only a safety net: never rebuild the cards under a running upload.
             return True
-        if self._model.cards and [str(p) for p in existing] == [
-            p.key for p in self._photos
-        ]:
-            # Thumbnails are re-read: a photo may have been edited meanwhile.
-            self._batch_generation += 1
-            self._model.reset(list(self._model.cards))
-            self._set_status("Picked up where you left off with these photos.")
-            self.cardsChanged.emit()
-            self.refreshUsage()
+        keys = [str(p) for p in existing]
+        if self._model.cards and keys == self._opened_keys:
+            self._resume_batch()
+            return True
+        self.cancelIdentify()  # nothing of this batch may land on the next
+        # Taken out before the current batch is put aside: with the stash
+        # full, that drops the oldest batch, which may be the one asked for.
+        wanted = self._stashed.pop(tuple(keys), None)
+        self._stash_batch()
+        if wanted is not None and self._restore_batch(wanted):
+            self._resume_batch()
             return True
 
         records: list[PhotoRecord] = []
@@ -1045,13 +1114,8 @@ class INatUploadController(QObject):
         if not records:
             return False
         self._photos = records
+        self._opened_keys = keys
         self._uploaded_paths = []
-        keys = {p.key for p in records}
-        self._vision_cache = {
-            photo_set: result
-            for photo_set, result in self._vision_cache.items()
-            if photo_set <= keys
-        }
         self._manual_edits = False
         self._grouping_recorded = False
         self._token_failed_run = False
@@ -1088,12 +1152,159 @@ class INatUploadController(QObject):
         self._regrouped_for_clock.add(
             frozenset((p.camera, p.clock_offset_s) for p in self._photos)
         )
-        self._regroup(announce=True)
+        # Cards uploaded from any batch still held - the one asked for too,
+        # when it could not come back as it was - are observations on
+        # iNaturalist: the new grouping keeps them instead of offering their
+        # photos again. Copies, so the stashed batches stay as they were left.
+        uploaded = self._uploaded_cards(wanted["cards"] if wanted is not None else [])
+        self._regroup(announce=True, locked=copy.deepcopy(uploaded))
         self.refreshUsage()
         self.checkExisting()
         return True
 
-    def _regroup(self, announce: bool = False) -> None:
+    def _resume_batch(self) -> None:
+        """Show the current batch again, cards as they were left."""
+        # Thumbnails are re-read: a photo may have been edited meanwhile.
+        self._batch_generation += 1
+        self._model.reset(list(self._model.cards))
+        self._set_status("Picked up where you left off with these photos.")
+        self.thresholdsChanged.emit()
+        self.uploadProgressChanged.emit()
+        self.existingChanged.emit()
+        self.cardsChanged.emit()
+        self.refreshUsage()
+        self._check_existing_if_due()
+
+    def _stash_batch(self) -> None:
+        """Put the current batch aside before another one is opened."""
+        if not self._model.cards or not self._opened_keys:
+            return
+        state = {name: getattr(self, name) for name in _BATCH_STATE_ATTRS}
+        state["cards"] = list(self._model.cards)
+        # A copy: the next batch's regroup reuses (and edits) these cards when
+        # the two batches share photos. One deepcopy keeps the references
+        # between cards, photos and observations pointing at each other.
+        state = copy.deepcopy(state)
+        key = tuple(self._opened_keys)
+        self._stashed.pop(key, None)
+        self._stashed[key] = state
+        while len(self._stashed) > MAX_STASHED_BATCHES:
+            self._stashed.pop(next(iter(self._stashed)))
+
+    def _uploaded_cards(self, *batches: list[Card]) -> list[Card]:
+        """Every card with an observation on iNaturalist that is still held:
+        the open batch's, the stashed batches' and those of ``batches``.
+
+        The same card can be held by several batches (the same photos opened
+        in another order share it), each copy as it was when its batch was
+        left. Uploads only ever add photos to a card, so the copy with the
+        most photos attached is what is on iNaturalist now: only that one is
+        returned. Bigger cards come first, so a regroup keeps a card whole
+        rather than the part of it a batch with only some of its photos had.
+        """
+        newest: dict[tuple[Optional[int], frozenset], Card] = {}
+        for batch in self._held_batches(*batches):
+            for card in batch:
+                if not card.locked:
+                    continue
+                # Two cards may add photos to one existing observation.
+                key = (card.obs_id, self._photo_set(card))
+                held = newest.get(key)
+                if held is None or len(card.photo_ids) > len(held.photo_ids):
+                    newest[key] = card
+        return sorted(
+            newest.values(),
+            key=lambda c: (len(c.group.photos), len(c.photo_ids)),
+            reverse=True,
+        )
+
+    def _held_batches(self, *batches: list[Card]) -> list[list[Card]]:
+        """The cards of the open batch, of every stashed batch and ``batches``."""
+        return [
+            self._model.cards,
+            *(s["cards"] for s in self._stashed.values()),
+            *batches,
+        ]
+
+    def _catch_up_uploads(self, cards: list[Card], *batches: list[Card]) -> None:
+        """Record on each card with an observation the photos any held card
+        for that observation (see _held_batches) attached since, so a retry
+        does not send them a second time."""
+        attached = {
+            (c.obs_id, key): photo_id
+            for batch in self._held_batches(*batches)
+            for c in batch
+            if c.obs_id is not None
+            for key, photo_id in c.photo_ids.items()
+        }
+        for card in cards:
+            if card.obs_id is None:
+                continue
+            found = {
+                p.key: attached[(card.obs_id, p.key)]
+                for p in card.group.photos
+                if p.key not in card.photo_ids and (card.obs_id, p.key) in attached
+            }
+            if found:
+                card.photo_ids.update(found)
+                self._settle_upload_status(card)
+
+    def _settle_upload_status(self, card: Card) -> None:
+        """Status of a card with an observation, from which of its photos are
+        attached to it."""
+        missing = sum(1 for p in card.group.photos if p.key not in card.photo_ids)
+        if missing:
+            card.status = STATUS_ERROR
+            card.status_text = card.upload_error = (
+                f"{missing} of {len(card.group.photos)} photo(s) not attached. "
+                "Upload again to attach the rest."
+            )
+        else:
+            card.status = STATUS_UPLOADED
+            card.status_text = (
+                "Photos added to your existing observation"
+                if card.attach_to is not None and card.obs_id == card.attach_to.id
+                else "Uploaded"
+            )
+            card.upload_error = ""
+
+    def _restore_batch(self, state: dict[str, Any]) -> bool:
+        """Bring back a batch put aside earlier; False when it is out of date."""
+        cards = state["cards"]
+        # A photo that went up from another batch since is on iNaturalist now;
+        # an old card offering it again would upload it twice. Building the
+        # batch afresh keeps the card that uploaded it instead.
+        uploaded = {p.key for c in self._uploaded_cards() for p in c.group.photos}
+        if any(
+            p.key in uploaded for c in cards if not c.locked for p in c.group.photos
+        ):
+            return False
+        # A card of this batch whose upload stopped partway may have been
+        # finished from another batch since (the same photos in another order,
+        # or only the missing ones).
+        self._catch_up_uploads([c for c in cards if c.locked])
+        state = dict(state)
+        state.pop("cards")
+        for name, value in state.items():
+            setattr(self, name, value)
+        # Answers still on their way were for the batch just put aside.
+        self._existing_seq += 1
+        self._existing_busy = False
+        self._clock_version += 1
+        self._dismiss_version += 1
+        self._cancel_upload.clear()
+        for card in cards:
+            card.selected = False
+            # Vision may have answered for these photos while another batch
+            # was open; a name typed here meanwhile stays.
+            if not card.locked and card.vision is None and not card.identify_pending:
+                self._apply_cached_vision(card, keep_name=True)
+        self._model.reset(cards)
+        return True
+
+    def _regroup(
+        self, announce: bool = False, locked: Optional[list[Card]] = None
+    ) -> None:
         """Group the batch, keeping every card whose photos did not change.
 
         A card with the same photos as before is the same observation: its
@@ -1101,22 +1312,57 @@ class INatUploadController(QObject):
         being thrown away by a slider nudge. A card that already has an
         observation on iNaturalist is never regrouped at all - its photos
         are taken out of the pool first - so it cannot be uploaded twice.
+        ``locked`` lists those cards when they are not only the shown ones
+        (open() hands in those of every batch it holds), first come first kept.
         """
         old_cards = list(self._model.cards)
         by_key = {p.key: p for p in self._photos}
         kept: list[Card] = []
         claimed: set[str] = set()
-        for card in old_cards:
+        # An upload's answer finds its card by id, so no two shown cards may
+        # share one. Copies of one card from different batches do when each
+        # holds a part of it, or when the card was split differently in each.
+        taken = {c.id for c in old_cards if not c.locked}
+        for card in old_cards if locked is None else locked:
             if not card.locked:
                 continue
-            keys = [p.key for p in card.group.photos]
-            if keys and all(k in by_key for k in keys) and not claimed & set(keys):
-                card.group = ObservationGroup(
-                    [by_key[k] for k in keys], ordered=card.group.ordered
-                )
-                card.selected = False
-                kept.append(card)
-                claimed.update(keys)
+            keys = [
+                p.key
+                for p in card.group.photos
+                if p.key in by_key and p.key not in claimed
+            ]
+            if not keys:
+                continue
+            partial = len(keys) < len(card.group.photos)
+            if partial and card.upload_order is None:
+                if card.attach_base is not None:
+                    # Its photos went after another card's ("slot:" marks a
+                    # place taken by a photo that is not this card's).
+                    card.upload_order = [
+                        f"slot:{i}" for i in range(card.attach_base)
+                    ] + [p.key for p in card.group.sorted_photos()]
+                else:
+                    card.upload_order = self._combined_order(card) or [
+                        p.key for p in card.group.sorted_photos()
+                    ]
+            card.group = ObservationGroup(
+                [by_key[k] for k in keys], ordered=card.group.ordered
+            )
+            if partial or card.id in taken:
+                card.id = self._next_card_id
+                self._next_card_id += 1
+            if partial:
+                # Only some of its photos are in this batch. They belong to its
+                # observation still: a card for just those keeps them on it -
+                # attached ones shown uploaded, the others going to it on a
+                # retry - instead of offering them as a new observation.
+                self._settle_upload_status(card)
+            card.selected = False
+            kept.append(card)
+            claimed.update(keys)
+            taken.add(card.id)
+        if locked is not None:
+            self._catch_up_uploads(kept, locked)
         reusable = {self._photo_set(c): c for c in old_cards if not c.locked}
         groups = initial_grouping(
             [p for p in self._photos if p.key not in claimed],
@@ -1217,15 +1463,19 @@ class INatUploadController(QObject):
     def _photo_set(card: Card) -> frozenset:
         return frozenset(p.key for p in card.group.photos)
 
-    def _apply_cached_vision(self, card: Card) -> None:
-        """Reuse an earlier Vision answer when the card's photo set is the same."""
+    def _apply_cached_vision(self, card: Card, keep_name: bool = False) -> None:
+        """Reuse an earlier Vision answer when the card's photo set is the same.
+
+        ``keep_name`` leaves a name already chosen on the card in place of
+        Vision's suggestion.
+        """
         result = self._vision_cache.get(self._photo_set(card))
         if result is None:
             return
         card.vision = result
         card.status = STATUS_IDENTIFIED
         card.status_text = self._vision_status_text(result)
-        if result.suggested_name:
+        if result.suggested_name and not (keep_name and card.chosen_name):
             card.chosen_name = result.suggested_name
             card.chosen_rank = result.suggested_rank
             self._lookup_taxon(card)
@@ -2679,11 +2929,13 @@ class INatUploadController(QObject):
         """Drop identifications that are queued, waiting or in flight.
 
         Called when the dialog closes. Their results are ignored (the card
-        token moves on) and each card goes back to how it was, so closing
-        never has to wait out a slow or rate-limited Vision call.
+        token and the identify run move on) and each card goes back to how
+        it was, so closing never has to wait out a slow or rate-limited
+        Vision call.
         """
         self._cancel_identify.set()
         self._cancel_identify = threading.Event()  # for the next batch of calls
+        self._identify_run += 1
         for card in self._model.cards:
             if not card.identify_pending:
                 continue
@@ -2719,12 +2971,13 @@ class INatUploadController(QObject):
         loc = card.location(float(self.spreadWarningMeters))
         observed, _ = self._observed_at(card, exif_only=True)
         cancel = self._cancel_identify
+        run = self._identify_run
         self._begin_job()
 
         def work():
             try:
                 if cancel.is_set():
-                    self._identifyDone.emit(card.id, token, None, "Cancelled")
+                    self._identifyDone.emit(card.id, token, run, None, "Cancelled")
                     return
                 payload = [
                     (p.path.name, images.prepare_jpeg(p.path, images.VISION_LONG_EDGE))
@@ -2761,6 +3014,7 @@ class INatUploadController(QObject):
                         self._identifyProgress.emit(
                             card.id,
                             token,
+                            run,
                             f"MycoMap Vision {reason}; "
                             f"trying again in {int(delay)} s...",
                         )
@@ -2768,35 +3022,44 @@ class INatUploadController(QObject):
                             raise
                         waited += delay
                         self._identifyProgress.emit(
-                            card.id, token, "Asking MycoMap Vision..."
+                            card.id, token, run, "Asking MycoMap Vision..."
                         )
                 result.photo_keys = [p.key for p in photos[:10]]
-                self._identifyDone.emit(card.id, token, result, "")
+                self._identifyDone.emit(card.id, token, run, result, "")
             except ApiError as exc:
                 self._identifyDone.emit(
-                    card.id, token, None, describe_vision_error(exc)
+                    card.id, token, run, None, describe_vision_error(exc)
                 )
             except Exception as exc:
                 log.exception("Identify failed")
                 self._identifyDone.emit(
-                    card.id, token, None, f"Identification failed: {exc}"
+                    card.id, token, run, None, f"Identification failed: {exc}"
                 )
 
         self._identify_executor.submit(work)
 
-    @Slot(int, int, str)
-    def _on_identify_progress(self, card_id: int, token: int, text: str) -> None:
+    @Slot(int, int, int, str)
+    def _on_identify_progress(
+        self, card_id: int, token: int, run: int, text: str
+    ) -> None:
         card = self._card(card_id)
-        if card is None or card.token != token or not card.identify_pending:
+        if (
+            card is None
+            or run != self._identify_run
+            or card.token != token
+            or not card.identify_pending
+        ):
             return
         card.status_text = text
         self._model.refresh(card, "statusText")
 
-    @Slot(int, int, object, str)
-    def _on_identify_done(self, card_id: int, token: int, result, error: str) -> None:
+    @Slot(int, int, int, object, str)
+    def _on_identify_done(
+        self, card_id: int, token: int, run: int, result, error: str
+    ) -> None:
         self._end_job()
         card = self._card(card_id)
-        if card is None or card.token != token:
+        if card is None or run != self._identify_run or card.token != token:
             return
         card.identify_pending = False
         if error:
@@ -2805,7 +3068,11 @@ class INatUploadController(QObject):
             self._model.refresh(card, "status", "statusText")
             return
         card.vision = result
-        self._vision_cache[self._photo_set(card)] = result
+        photo_set = self._photo_set(card)
+        self._vision_cache.pop(photo_set, None)  # newest last
+        self._vision_cache[photo_set] = result
+        while len(self._vision_cache) > MAX_VISION_CACHE:
+            self._vision_cache.pop(next(iter(self._vision_cache)))
         card.status = STATUS_IDENTIFIED
         card.status_text = self._vision_status_text(result)
         if result.usage:
@@ -2881,7 +3148,13 @@ class INatUploadController(QObject):
                     and card.obs_id in (None, card.attach_to.id)
                 ):
                     target = card.attach_to.id
-                    if target in attach_next:
+                    if card.upload_order is not None:
+                        # A part card holds its whole card's places: the
+                        # cursor goes past them, and never back.
+                        attach_next[target] = max(
+                            attach_next.get(target, 0), len(card.upload_order)
+                        )
+                    elif target in attach_next:
                         attach_next[target] += len(card.group.sorted_photos())
                     else:
                         attach_next[target] = len(self._combined_order(card))
@@ -2913,34 +3186,45 @@ class INatUploadController(QObject):
             # only some of its photos) resumes: no second observation, only
             # the photos still missing go up.
             card_photos = card.group.sorted_photos()
+            # A part card's order also has the whole card's other photos.
+            own_keys = {p.key for p in card_photos}
             target = card.obs_id
             reposition: list[tuple[int, int]] = []
             if card.attach_to is not None and target in (None, card.attach_to.id):
                 # Photos for an observation that is already on iNaturalist
                 # (a phone observation, an earlier upload): no new one.
                 target = card.attach_to.id
-                if target in attach_next:
+                if target in attach_next and card.upload_order is None:
                     # A second card adding to it: after the first card's.
+                    # (A part card has its whole card's places to go to.)
                     base = attach_next[target]
                     positions.update(
                         {p.key: base + i for i, p in enumerate(card_photos)}
                     )
                     attach_next[target] = base + len(card_photos)
+                    card.attach_base = base
                 else:
                     # Every photo goes to its place in the order shown;
                     # the observation's own photos move only if theirs
                     # changed (or never had one).
-                    order = self._combined_order(card)
+                    if card.upload_order is None:
+                        card.attach_base = None  # first to add to it now
+                    order = card.upload_order or self._combined_order(card)
                     for index, entry in enumerate(order):
                         if entry.startswith("inat:"):
                             photo = card.attach_to.photos[int(entry[5:])]
                             if photo.op_id and photo.position != index:
                                 reposition.append((photo.op_id, index))
-                        else:
+                        elif entry in own_keys:
                             positions[entry] = index
-                    attach_next[target] = len(order)
+                    # Never back: an earlier part card may have a longer
+                    # whole-card order, and its places are taken.
+                    attach_next[target] = max(attach_next.get(target, 0), len(order))
             else:
-                positions.update({p.key: i for i, p in enumerate(card_photos)})
+                order = card.upload_order or [p.key for p in card_photos]
+                positions.update(
+                    {key: i for i, key in enumerate(order) if key in own_keys}
+                )
             pending_photos = [p for p in card_photos if p.key not in card.photo_ids]
             jobs.append(
                 (
@@ -3067,6 +3351,7 @@ class INatUploadController(QObject):
         try:
             groups = [c.group.photos for c in self._model.cards]
             pairs = pairs_from_groups(groups, haversine_m)
+            batch = tuple(self._opened_keys)
             self._history.record(
                 self._folder,
                 self._time_gap_s,
@@ -3075,10 +3360,14 @@ class INatUploadController(QObject):
                 photos=len(self._photos),
                 observations=len(groups),
                 # Upload pressed again on this batch (a retry) is the same
-                # decision, not a second batch to learn from.
-                replace_last=self._grouping_recorded,
+                # decision, not a second batch to learn from. Once another
+                # batch was recorded after it, the newest entry is that
+                # batch's, and replacing it would lose it.
+                replace_last=self._grouping_recorded
+                and self._history_newest == batch,
             )
             self._grouping_recorded = True
+            self._history_newest = batch
         except Exception:
             log.debug("Could not record grouping history", exc_info=True)
 

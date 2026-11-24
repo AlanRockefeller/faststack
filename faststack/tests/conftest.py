@@ -10,6 +10,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Render every Qt window offscreen so the suite never pops windows onto the
+# developer's desktop. This must be forced (not setdefault): desktop sessions
+# commonly export QT_QPA_PLATFORM (e.g. "wayland;xcb"), which would otherwise
+# win. It runs before any PySide6/faststack import, and child processes the
+# tests spawn inherit it. Set FASTSTACK_TEST_SHOW_WINDOWS=1 to watch them.
+if os.environ.get("FASTSTACK_TEST_SHOW_WINDOWS") != "1":
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    # Qt 6.11 can still load the host GTK platform theme under offscreen,
+    # which needs a display; see faststack/__init__.py.
+    os.environ["QT_QPA_PLATFORMTHEME"] = "none"
+
 # Point the app data dir (config INI, session records, logs) at a throwaway
 # directory before any faststack module is imported, so the suite never reads
 # or overwrites the developer's real ~/.faststack or %APPDATA%\faststack.

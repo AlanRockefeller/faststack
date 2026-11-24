@@ -87,6 +87,26 @@ class TestConfigSetters(unittest.TestCase):
         self.assertEqual(self.controller.get_auto_level_clipping_threshold(), 0.0)
         self.mock_config.set.assert_called_with("core", "auto_level_threshold", "0")
 
+    def test_set_auto_level_white_threshold(self):
+        self.mock_config.set.reset_mock()
+        self.mock_config.save.reset_mock()
+
+        self.controller.set_auto_level_white_threshold(0.02)
+        self.assertEqual(self.controller.get_auto_level_white_threshold(), 0.02)
+        self.mock_config.set.assert_called_with(
+            "core", "auto_level_white_threshold", "0.02"
+        )
+        self.mock_config.save.assert_called_once()
+        self.assertEqual(self.controller._white_threshold_percent(), 0.02)
+
+        # 0 means "follow the shared threshold".
+        self.controller.set_auto_level_white_threshold(-1.0)
+        self.assertEqual(self.controller.get_auto_level_white_threshold(), 0.0)
+        self.assertIsNone(self.controller._white_threshold_percent())
+
+        self.controller.set_auto_level_white_threshold(5.0)
+        self.assertEqual(self.controller.get_auto_level_white_threshold(), 1.0)
+
     def test_set_auto_level_strength(self):
         self.mock_config.set.reset_mock()
         self.mock_config.save.reset_mock()

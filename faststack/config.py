@@ -697,8 +697,15 @@ DEFAULT_CONFIG = {
         #     cannot raise that ceiling. Raise it (1-3) if backgrounds that
         #     should read as black come out grey; it clips that share of the
         #     darkest pixels, so shadow detail goes with them.
+        #   - auto_level_white_threshold: same units, highlight end only. 0 means
+        #     "follow auto_level_threshold". Lower it (e.g. 0.01) when auto
+        #     levels brightens too far and blows highlights. While set, it also
+        #     caps the midtone lift so it cannot roll the white point toward
+        #     white. A dark photo with no bright pixels is still stretched
+        #     all the way up.
         "auto_level_threshold": "0.1",
         "auto_level_black_threshold": "0",
+        "auto_level_white_threshold": "0",
         "auto_level_strength": "1.0",
         "auto_level_strength_auto": "False",
         "auto_vibrance_enabled": "True",
@@ -730,6 +737,14 @@ DEFAULT_CONFIG = {
     "rawtherapee": {
         "exe": DEFAULT_RT_PATH,
         "args": "",
+        # W (RAW white balance): RawTherapee's [White Balance] Setting and the
+        # JPEG quality of the JPG it writes. "Auto" works on every version;
+        # 5.9+ also takes "autold" (RGB grey) or "autitcgreen".
+        "awb_method": "Auto",
+        "awb_jpeg_quality": "95",
+        # W: "auto" renders again with highlight compression when the first
+        # render clips; "off" never does; a number (0-500) always uses it.
+        "awb_highlights": "auto",
     },
     "raw": {
         "source_dir": "",

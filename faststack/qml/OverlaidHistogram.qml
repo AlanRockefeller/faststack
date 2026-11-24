@@ -14,6 +14,9 @@ Item {
     property int gPreClip: 0
     property int bPreClip: 0
     property color gridLineColor: "#2e2e2e"
+    // A thin panel (the compact editor made narrow) gets shorter stat labels
+    // so the three channels' figures don't run into each other.
+    readonly property bool shortStatLabels: root.width < 260
 
     onRDataChanged: canvas.requestPaint()
     onGDataChanged: canvas.requestPaint()
@@ -116,24 +119,30 @@ Item {
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: 8
-                anchors.rightMargin: 8
-                spacing: 10
+                anchors.leftMargin: root.shortStatLabels ? 4 : 8
+                anchors.rightMargin: root.shortStatLabels ? 4 : 8
+                spacing: root.shortStatLabels ? 4 : 10
 
                 Column {
+                    id: rStat
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0  // equal thirds
                     Layout.alignment: Qt.AlignVCenter
                     spacing: 1
                     Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "R Preclip: " + root.rPreClip
+                        width: rStat.width
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: (root.shortStatLabels ? "R pre: " : "R Preclip: ") + root.rPreClip
                         font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         color: "#804040"
                     }
                     Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Clipped: " + root.rClip
+                        width: rStat.width
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: (root.shortStatLabels ? "Clip: " : "Clipped: ") + root.rClip
                         font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         font.bold: root.rClip > 0
@@ -142,19 +151,25 @@ Item {
                 }
 
                 Column {
+                    id: gStat
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0  // equal thirds
                     Layout.alignment: Qt.AlignVCenter
                     spacing: 1
                     Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "G Preclip: " + root.gPreClip
+                        width: gStat.width
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: (root.shortStatLabels ? "G pre: " : "G Preclip: ") + root.gPreClip
                         font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         color: "#407040"
                     }
                     Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Clipped: " + root.gClip
+                        width: gStat.width
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: (root.shortStatLabels ? "Clip: " : "Clipped: ") + root.gClip
                         font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         font.bold: root.gClip > 0
@@ -163,19 +178,25 @@ Item {
                 }
 
                 Column {
+                    id: bStat
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0  // equal thirds
                     Layout.alignment: Qt.AlignVCenter
                     spacing: 1
                     Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "B Preclip: " + root.bPreClip
+                        width: bStat.width
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: (root.shortStatLabels ? "B pre: " : "B Preclip: ") + root.bPreClip
                         font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         color: "#404080"
                     }
                     Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Clipped: " + root.bClip
+                        width: bStat.width
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: (root.shortStatLabels ? "Clip: " : "Clipped: ") + root.bClip
                         font.pixelSize: 9
                         font.family: "IBM Plex Mono"
                         font.bold: root.bClip > 0
