@@ -914,3 +914,43 @@ def test_banded_export_of_layers_matches_a_single_pass(monkeypatch):
     monkeypatch.setattr(editor_mod.os, "cpu_count", lambda: 4)
     banded = render()
     np.testing.assert_array_equal(single, banded)
+
+
+def test_soft_patch_at_the_frame_edge_is_not_filled():
+    """A small soft region reaching the edge of the frame is not enclosed:
+    it may be background the photo cuts off, so it stays unsharp."""
+    from faststack.imaging.depth_select import _fill_sharp_holes
+
+    sharp = np.ones((200, 300), np.float32)
+    sharp[:10, :10] = 0.0
+    out = _fill_sharp_holes(sharp)
+    assert out[:10, :10].max() == 0.0
+
+
+def test_local_block_in_bands_matches_one_pass_with_a_neutral_band():
+    """Vibrance and colour mix only on the top band: pixels of the neutral
+    bottom band come out the same as in one pass over both."""
+    from faststack.imaging.local_adjust import LocalAdjustments, apply_local_srgb_block
+
+    h, w = 8, 4
+    arr = np.full((h, w, 3), 0.4, np.float32)
+    arr[...] = np.array([2.0**-26, 1.0, 0.0], np.float32)
+    maps = {
+        "vibrance": np.zeros((h, w), np.float32),
+        "color_sat_green": np.zeros((h, w), np.float32),
+    }
+    maps["vibrance"][:4] = 0.5
+    maps["color_sat_green"][:4] = 0.5
+    local = LocalAdjustments(0, h, 0, w, maps, ())
+    edits = {}
+    one = apply_local_srgb_block(arr, edits, local, levels_soft_knee=False)
+    bands = np.concatenate(
+        [
+            apply_local_srgb_block(
+                arr[top:bottom], edits, local.rows(top, bottom), levels_soft_knee=False
+            )
+            for top, bottom in ((0, 4), (4, 8))
+        ]
+    )
+    np.testing.assert_array_equal(one, bands)
+    np.testing.assert_array_equal(one[4:], arr[4:])

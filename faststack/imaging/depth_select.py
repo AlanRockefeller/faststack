@@ -228,6 +228,10 @@ def _fill_sharp_holes(sharp: np.ndarray) -> np.ndarray:
         n, labels, stats, _ = cv2.connectedComponentsWithStats(below, connectivity=4)
         small = np.zeros(n, bool)
         small[1:] = stats[1:, cv2.CC_STAT_AREA] < limit
+        # A region reaching the frame's edge is not enclosed: it may be a
+        # bit of background the photo cuts off.
+        for edge in (labels[0], labels[-1], labels[:, 0], labels[:, -1]):
+            small[edge] = False
         if small.any():
             np.maximum(out, np.where(small[labels], level, 0.0), out=out)
     return out

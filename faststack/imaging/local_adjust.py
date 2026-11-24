@@ -433,9 +433,12 @@ def _basic_srgb_map(
         sat = np.zeros_like(cmax)
         np.divide(cmax - cmin, cmax, out=sat, where=cmax > 0.0001)
         sat_mask = np.clip(1.0 - sat, 0.0, 1.0)
-        factor = np.where(v_active, 1.0 + vibrance * sat_mask, 1.0)
+        factor = 1.0 + vibrance * sat_mask
         gray = _rec601_gray(np.ascontiguousarray(arr, dtype=np.float32))[..., None]
-        arr = gray + (arr - gray) * factor[..., None]
+        # Pixels without vibrance keep their exact values (recomposing them
+        # from grey can round), so a band of the image gives the same
+        # pixels whether or not another band has vibrance.
+        arr = np.where(v_active[..., None], gray + (arr - gray) * factor[..., None], arr)
 
     return arr.astype(np.float32, copy=False)
 
@@ -460,7 +463,9 @@ def _color_mix_map(arr: np.ndarray, values: Dict[str, np.ndarray]) -> np.ndarray
         return arr
     hue = _hsv_hue_degrees(arr)
     factor = np.zeros(arr.shape[:2], dtype=np.float32)
+    active = np.zeros(arr.shape[:2], dtype=bool)
     for center, value in bands:
+        active |= np.abs(value) > 0.001
         dist = np.abs(((hue - center + 180.0) % 360.0) - 180.0)
         weight = np.where(
             dist < _COLOR_MIX_HALF_WIDTH,
@@ -469,7 +474,10 @@ def _color_mix_map(arr: np.ndarray, values: Dict[str, np.ndarray]) -> np.ndarray
         )
         factor += np.where(np.abs(value) > 0.001, value, 0.0) * _COLOR_MIX_GAIN * weight
     gray = _rec601_gray(np.ascontiguousarray(arr, dtype=np.float32))[..., None]
-    return (gray + (arr - gray) * (1.0 + factor)[..., None]).astype(np.float32)
+    # Pixels without a colour-mix value keep their exact values, as in
+    # _basic_srgb_map's vibrance step.
+    mixed = gray + (arr - gray) * (1.0 + factor)[..., None]
+    return np.where(active[..., None], mixed, arr).astype(np.float32)
 
 
 def apply_local_srgb_block(
