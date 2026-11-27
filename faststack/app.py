@@ -15760,6 +15760,26 @@ class AppController(
             self.ui_state is None or self.ui_state.isCropping or self.ui_state.isZoomed
         )
 
+    def _kick_preview_for_background_layer_result(self) -> None:
+        """Re-render after a depth map or halo correction lands, if needed.
+
+        A clean, just-reopened photo shows the saved file's sharp
+        full-resolution decode, which already includes the saved layers.
+        Re-rendering there would swap it for a preview-resolution render
+        (blur, a slight shift, and a zoom/1:1 that counts preview pixels),
+        as _sync_editor_state_from_session explains. Render only when the
+        session has unsaved edits or an editor render is already on screen,
+        since that render was made without the result.
+        """
+        if self._is_current_live_edit_session_dirty() or (
+            self._has_current_live_preview_for_index(self.current_index)
+        ):
+            self._kick_preview_worker()
+        elif self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
+            # What the kick would have done besides rendering: stack paint's
+            # hover preview shows these layers too.
+            self._schedule_stack_hover()
+
     def _kick_preview_worker(self, *, full_resolution: Optional[bool] = None):
         """Kicks off a background preview render task."""
         if getattr(self, "_shutting_down", False):
