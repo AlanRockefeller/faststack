@@ -83,6 +83,10 @@ class Keybinder:
         self.modifier_key_map = {
             (Qt.Key_D, Qt.ShiftModifier): "toggle_local_brush_mode",
             (Qt.Key_C, Qt.ControlModifier): "copy_path_to_clipboard",
+            (
+                Qt.Key_C,
+                Qt.ControlModifier | Qt.ShiftModifier,
+            ): "copy_image_to_clipboard",
             (Qt.Key_Right, Qt.ShiftModifier): "next_image_by_10",
             (Qt.Key_Left, Qt.ShiftModifier): "prev_image_by_10",
             (Qt.Key_0, Qt.ControlModifier): "reset_zoom_pan",
