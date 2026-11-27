@@ -19,6 +19,7 @@ are saved first, as for drag-and-drop.
 
 from __future__ import annotations
 
+import io
 import logging
 import sys
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QMimeData, Slot
-from PySide6.QtGui import QImage, QImageReader
+from PySide6.QtGui import QColorSpace, QImage, QImageReader
 from PySide6.QtWidgets import QApplication
 
 from faststack.io.indexer import JPG_EXTENSIONS, RAW_EXTENSIONS
@@ -51,6 +52,17 @@ class ClipboardImage:
     error: Optional[str] = None
 
 
+def _embedded_icc(data: bytes) -> Optional[bytes]:
+    """The JPEG's ICC profile, read from its header only."""
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as im:
+            return im.info.get("icc_profile") or None
+    except Exception:
+        return None
+
+
 def _decode(path: Path, data: bytes) -> QImage:
     """The photo upright, as Format_RGB888 (owns its pixels)."""
     if path.suffix.lower() in JPG_EXTENSIONS:
@@ -68,9 +80,18 @@ def _decode(path: Path, data: bytes) -> QImage:
             rgb = apply_orientation_to_np(rgb, read_orientation(data))
             height, width = rgb.shape[:2]
             # copy(): the QImage must not point into the numpy buffer.
-            return QImage(
+            image = QImage(
                 rgb.data, width, height, rgb.strides[0], QImage.Format_RGB888
             ).copy()
+            # The pixels are as stored, not converted to sRGB, so the PNG
+            # carries the JPG's profile (Adobe RGB, say) for them to mean
+            # the same colours. Qt writes it as the PNG's iCCP chunk.
+            icc = _embedded_icc(data)
+            if icc is not None:
+                space = QColorSpace.fromIccProfile(icc)
+                if space.isValid():
+                    image.setColorSpace(space)
+            return image
     # Anything else Qt can read (and a JPG turbojpeg refused).
     buffer = QBuffer()
     buffer.setData(QByteArray(data))
@@ -146,7 +167,13 @@ class ClipboardImageMixin:
                 saving_status="Saving edits before copying..."
             ):
                 return
-        path = self._export_path_for(img)
+        # The file on screen: a backup picked with the variant badges, else
+        # the developed JPG in RAW mode, else the photo.
+        path = (
+            Path(self.view_override_path)
+            if getattr(self, "view_override_path", None)
+            else self._export_path_for(img)
+        )
         if self._block_if_saving(img.path, path):
             return
         if path.suffix.lower() in RAW_EXTENSIONS:
@@ -173,6 +200,10 @@ class ClipboardImageMixin:
             self._clipboard_image_executor.submit(work)
         except RuntimeError:
             log.debug("Clipboard image worker is shut down", exc_info=True)
+
+    def _cancel_pending_clipboard_image(self) -> None:
+        """A later clipboard copy (Ctrl+C) wins over an image still encoding."""
+        self._clipboard_image_token += 1
 
     def _on_clipboard_image_ready(self, result: ClipboardImage) -> None:
         if result.token != self._clipboard_image_token:

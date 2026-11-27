@@ -202,3 +202,53 @@ def test_real_worker_hands_the_result_to_the_gui_thread(app_controller, tmp_path
     thread_id, formats = calls[0]
     assert thread_id == threading.get_ident()
     assert "image/png" in formats and "image/jpeg" in formats
+
+
+def test_jpeg_colour_profile_is_kept_in_the_png(tmp_path):
+    from PySide6.QtGui import QColorSpace
+
+    icc = QColorSpace(QColorSpace.AdobeRgb).iccProfile().data()
+    path = tmp_path / "adobe.jpg"
+    Image.new("RGB", (8, 8), (40, 120, 200)).save(path, "JPEG", icc_profile=icc)
+
+    result = build_clipboard_image(1, path)
+
+    assert Image.open(io.BytesIO(result.png)).info.get("icc_profile") == icc
+
+
+def test_jpeg_without_profile_gives_png_without_one(tmp_path):
+    path = tmp_path / "A.jpg"
+    _write_jpeg(path, 8, 8)
+    result = build_clipboard_image(1, path)
+    assert not Image.open(io.BytesIO(result.png)).info.get("icc_profile")
+
+
+def test_copies_the_backup_on_screen(app_controller, tmp_path):
+    path = tmp_path / "A.jpg"
+    backup = tmp_path / "A-backup.jpg"
+    _write_jpeg(path, 8, 8)
+    backup_bytes = _write_jpeg(backup, 12, 6)
+    app_controller.image_files = [ImageFile(path=path)]
+    app_controller.current_index = 0
+    app_controller.view_override_path = str(backup)
+
+    results = _copy_and_finish(app_controller)
+
+    assert results[0].path == backup
+    assert results[0].jpeg == backup_bytes
+
+
+def test_ctrl_c_during_an_image_copy_keeps_the_path(app_controller, tmp_path):
+    path = tmp_path / "A.jpg"
+    _write_jpeg(path, 8, 8)
+    app_controller.image_files = [ImageFile(path=path)]
+    app_controller.current_index = 0
+    results = _copy_and_finish(app_controller)  # still "encoding"
+
+    with patch("faststack.app.QApplication") as app_qapp:
+        app_controller.copy_path_to_clipboard()
+    app_qapp.clipboard.return_value.setText.assert_called_once_with(str(path))
+
+    with patch.object(clipboard_image, "QApplication") as qapp:
+        app_controller._on_clipboard_image_ready(results[0])
+    qapp.clipboard.assert_not_called()

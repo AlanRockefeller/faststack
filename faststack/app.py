@@ -12300,6 +12300,7 @@ class AppController(
             return
 
         current_image_path = str(self.image_files[self.current_index].path)
+        self._cancel_pending_clipboard_image()
         QApplication.clipboard().setText(current_image_path)
         self.update_status_message(f"Copied: {current_image_path}")
         log.info("Copied path to clipboard: %s", current_image_path)
