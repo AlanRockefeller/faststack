@@ -2405,6 +2405,7 @@ ApplicationWindow {
                           "&nbsp;&nbsp;R: Open the paired RAW in RawTherapee<br>" +
                           "&nbsp;&nbsp;H: Toggle histogram window<br>" +
                           "&nbsp;&nbsp;Ctrl+C: Copy image path to clipboard<br>" +
+                          "&nbsp;&nbsp;Ctrl+Shift+C: Copy the image itself, to paste into other programs<br>" +
                           "&nbsp;&nbsp;Esc: Close dialog/editor, switch to grid view, or exit fullscreen"
                     padding: 10
                     wrapMode: Text.WordWrap

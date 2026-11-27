@@ -1,25 +1,21 @@
+from types import SimpleNamespace
+
+from faststack.app import AppController
 from faststack.models import ImageFile
 
-# We can't easily instantiate AppController without complex mocks for QML engine, etc.
-# So we test the logic extracted from start_drag_current_image.
+# AppController is heavy to build, so the drag path choice is tested through
+# AppController._export_path_for (shared by drag, iNaturalist upload and
+# Ctrl+Shift+C) on a stand-in controller.
 
 
 def get_drag_paths(
     image_files, current_index, existing_indices, current_edit_source_mode
 ):
-    file_paths = []
-    for idx in existing_indices:
-        img = image_files[idx]
-
-        # logic from app.py
-        is_developed_artifact = img.path.stem.lower().endswith("-developed")
-        in_raw_mode = current_edit_source_mode == "raw"
-
-        if (in_raw_mode or is_developed_artifact) and img.developed_jpg_path.exists():
-            file_paths.append(img.developed_jpg_path)
-        else:
-            file_paths.append(img.path)
-    return file_paths
+    fake = SimpleNamespace(current_edit_source_mode=current_edit_source_mode)
+    return [
+        AppController._export_path_for(fake, image_files[idx])
+        for idx in existing_indices
+    ]
 
 
 def test_drag_logic_jpeg_mode(tmp_path):

@@ -954,3 +954,51 @@ def test_local_block_in_bands_matches_one_pass_with_a_neutral_band():
     )
     np.testing.assert_array_equal(one, bands)
     np.testing.assert_array_equal(one[4:], arr[4:])
+
+
+@pytest.mark.parametrize(
+    "dirty, render_shown, kicked",
+    [(False, False, False), (True, False, True), (False, True, True)],
+)
+def test_depth_result_keeps_sharp_decode_of_clean_reopened_photo(
+    dirty, render_shown, kicked
+):
+    """A clean reopened photo shows the saved file's full-resolution decode;
+    the depth map landing must not swap it for a preview-resolution render."""
+    from types import SimpleNamespace
+
+    from faststack.app import AppController
+
+    kicks = []
+    ctrl = SimpleNamespace(
+        current_index=0,
+        _is_current_live_edit_session_dirty=lambda: dirty,
+        _has_current_live_preview_for_index=lambda index: render_shown,
+        _kick_preview_worker=lambda: kicks.append(1),
+        ui_state=SimpleNamespace(isBrushMode=False, brushTool=""),
+    )
+    AppController._kick_preview_for_background_layer_result(ctrl)
+    assert bool(kicks) is kicked
+
+
+def test_depth_result_goes_through_the_gated_kick():
+    stub = _BkgdStub([_layer()])
+    calls = []
+    stub.image_editor.session_id = "s1"
+    stub.image_editor.invalidate_render_cache = lambda: None
+    stub._depth_token = 3
+    stub._depth_job_session = "s1"
+    stub._kick_preview_worker = lambda: calls.append("ungated")
+    stub._kick_preview_for_background_layer_result = lambda: calls.append("gated")
+    stub._schedule_stack_hover = lambda: None
+    stub._on_depth_result_ready(
+        {
+            "token": 3,
+            "session_id": "s1",
+            "editor_path": "/photos/a.jpg",
+            "result": _depth_map(),
+            "error": None,
+        }
+    )
+    assert calls == ["gated"]
+    assert stub.image_editor._depth_map is not None

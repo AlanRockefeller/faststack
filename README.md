@@ -217,6 +217,7 @@ faststack "C:\path\to\photos"
 - `Esc`: Close active dialog, editor, cancel crop, or exit fullscreen
 - `H`: Toggle histogram window
 - `Ctrl+C`: Copy image path to clipboard
+- `Ctrl+Shift+C`: Copy the image itself to the clipboard, to paste into other programs
 - `Ctrl+0`: Reset zoom and pan to fit window
 - `Ctrl+1`: Zoom to 100%
 - `Ctrl+2`: Zoom to 200%

@@ -496,7 +496,8 @@ class DepthSelectMixin:
         # Rebind, never mutate: the render worker may be reading the old one.
         editor._depth_map = result
         editor.invalidate_render_cache()
-        self._kick_preview_worker()
+        # Keeps the sharp decode of a clean, reopened photo on screen.
+        self._kick_preview_for_background_layer_result()
         # Stack paint's hover preview shows the background layer too.
         self._schedule_stack_hover()
         self._set_depth_state()

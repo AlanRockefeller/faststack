@@ -475,7 +475,8 @@ class HaloRemovalMixin:
         # Rebind, never mutate: the render worker may be iterating the old dict.
         editor._halo_results = results
         editor.invalidate_render_cache()
-        self._kick_preview_worker()
+        # Keeps the sharp decode of a clean, reopened photo on screen.
+        self._kick_preview_for_background_layer_result()
         self._set_halo_state()
         self._refresh_local_brush_ui()
         if not self._halo_jobs:

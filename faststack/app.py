@@ -500,6 +500,7 @@ from faststack.controller.image_editor_handoff import (
     ImageEditorHandoffMixin,
     PhotoshopHandoffState,
 )
+from faststack.controller.clipboard_image import ClipboardImageMixin
 from faststack.controller.halo_removal import HaloRemovalMixin
 from faststack.controller.depth_select import DepthSelectMixin
 from faststack.controller.loupe_display import LoupeDisplayMixin
@@ -518,6 +519,7 @@ class AppController(
     RawWhiteBalanceMixin,
     DepthSelectMixin,
     WhiteBalancePickerMixin,
+    ClipboardImageMixin,
     QObject,
 ):
     dataChanged = Signal()  # New signal for general data changes
@@ -569,6 +571,7 @@ class AppController(
     _stackInputsReady = Signal(object)  # Stack paint: input JPG discovery result
     _stackSourceReady = Signal(object)  # Stack paint: decoded + registered input
     _haloResultReady = Signal(object)  # Halo removal: one layer's correction
+    _clipboardImageReady = Signal(object)  # Ctrl+Shift+C: encoded photo
     _haloInstallProgress = Signal(object)  # Halo removal: download progress
     _haloInstallDone = Signal(object)  # Halo removal: download finished/failed
     _depthResultReady = Signal(object)  # Background selection: the depth map
@@ -1125,6 +1128,8 @@ class AppController(
         self._init_raw_white_balance()
         # Background selection by depth (faststack/controller/depth_select.py).
         self._init_depth_select()
+        # Ctrl+Shift+C: copy the photo itself (faststack/controller/clipboard_image.py).
+        self._init_clipboard_image()
         self.is_zoomed = False  # Track zoom state for high-res loading logic
 
         # Connect model selection changes to UIState for QML property notification
@@ -11890,6 +11895,7 @@ class AppController(
         )
         self._shutdown_halo_removal()
         self._shutdown_depth_select()
+        self._shutdown_clipboard_image()
         # wait=True ensures pending saves/deletes complete to avoid data loss/corruption
         self._safe_shutdown_executor(
             self._save_executor, "save", wait=True, cancel_futures=False
@@ -12294,6 +12300,7 @@ class AppController(
             return
 
         current_image_path = str(self.image_files[self.current_index].path)
+        self._cancel_pending_clipboard_image()
         QApplication.clipboard().setText(current_image_path)
         self.update_status_message(f"Copied: {current_image_path}")
         log.info("Copied path to clipboard: %s", current_image_path)
@@ -12665,21 +12672,9 @@ class AppController(
 
         # Prefer dragging the developed JPG if it exists (for external export),
         # but only when RAW mode is active or we are dragging a developed file itself.
-        file_paths = []
-        for idx in existing_indices:
-            img = self.image_files[idx]
-
-            # Suggestion: only prefer -developed.jpg when RAW mode is active
-            # or when the current entry is itself the working/developed artifact.
-            is_developed_artifact = img.path.stem.lower().endswith("-developed")
-            in_raw_mode = getattr(self, "current_edit_source_mode", "jpeg") == "raw"
-
-            if (
-                in_raw_mode or is_developed_artifact
-            ) and img.developed_jpg_path.exists():
-                file_paths.append(img.developed_jpg_path)
-            else:
-                file_paths.append(img.path)
+        file_paths = [
+            self._export_path_for(self.image_files[idx]) for idx in existing_indices
+        ]
 
         if not file_paths:
             log.error("No valid files to drag")
@@ -12947,20 +12942,22 @@ class AppController(
             indices.add(self.current_index)
         send: list[Path] = []
         catalogue: list[Path] = []
-        in_raw_mode = getattr(self, "current_edit_source_mode", "jpeg") == "raw"
         for idx in sorted(indices):
             img = self.image_files[idx]
             if not img.path.exists():
                 continue
-            is_developed_artifact = img.path.stem.lower().endswith("-developed")
-            if (
-                in_raw_mode or is_developed_artifact
-            ) and img.developed_jpg_path.exists():
-                send.append(img.developed_jpg_path)
-            else:
-                send.append(img.path)
+            send.append(self._export_path_for(img))
             catalogue.append(img.path)
         return send, catalogue
+
+    def _export_path_for(self, img: ImageFile) -> Path:
+        """The file to hand to another program for *img*: its developed JPG
+        in RAW mode (or when *img* is itself the developed file), else *img*."""
+        in_raw_mode = getattr(self, "current_edit_source_mode", "jpeg") == "raw"
+        is_developed_artifact = img.path.stem.lower().endswith("-developed")
+        if (in_raw_mode or is_developed_artifact) and img.developed_jpg_path.exists():
+            return img.developed_jpg_path
+        return img.path
 
     @Slot(result=bool)
     def open_inat_upload(self) -> bool:
@@ -15759,6 +15756,26 @@ class AppController(
         return not (
             self.ui_state is None or self.ui_state.isCropping or self.ui_state.isZoomed
         )
+
+    def _kick_preview_for_background_layer_result(self) -> None:
+        """Re-render after a depth map or halo correction lands, if needed.
+
+        A clean, just-reopened photo shows the saved file's sharp
+        full-resolution decode, which already includes the saved layers.
+        Re-rendering there would swap it for a preview-resolution render
+        (blur, a slight shift, and a zoom/1:1 that counts preview pixels),
+        as _sync_editor_state_from_session explains. Render only when the
+        session has unsaved edits or an editor render is already on screen,
+        since that render was made without the result.
+        """
+        if self._is_current_live_edit_session_dirty() or (
+            self._has_current_live_preview_for_index(self.current_index)
+        ):
+            self._kick_preview_worker()
+        elif self.ui_state.isBrushMode and self.ui_state.brushTool == "stack":
+            # What the kick would have done besides rendering: stack paint's
+            # hover preview shows these layers too.
+            self._schedule_stack_hover()
 
     def _kick_preview_worker(self, *, full_resolution: Optional[bool] = None):
         """Kicks off a background preview render task."""
